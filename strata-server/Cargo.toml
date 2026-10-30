@@ -40,6 +40,7 @@ protox = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
+base64 = "0.22"
 
 # CI's tests (cargo test --profile ci). The same as release, which keeps
 # cargo's defaults here; every crate's CI runs the ci profile.

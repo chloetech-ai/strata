@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+pub use crate::media::MediaKind;
 pub use crate::text::analyzer::Analyzer;
 
 /// How a vector field is indexed (every vector field also keeps float32
@@ -185,6 +186,13 @@ pub struct Field {
     /// the database format 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzer: Option<Analyzer>,
+    /// A MEDIA field ([`crate::media`]): a stored KEYWORD column whose
+    /// value is a file's [`crate::media::Media`] as JSON, of this kind,
+    /// indexed by its `sha256`. Neither the key, a reference, a list nor a
+    /// source of other fields. Makes the database format 3 (feature
+    /// `media`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaKind>,
     /// A KEYWORD[] that holds the semantic ID of the row's vector, every
     /// prefix of it (feature `semantic_id`; [`crate::sid`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +248,7 @@ impl Field {
             not_null: false,
             default: None,
             analyzer: None,
+            media: None,
             semantic_id: None,
         }
     }
@@ -251,9 +260,17 @@ impl Field {
     pub fn timestamp(name: &str) -> Self {
         Field { logical: Some(Logical::Timestamp), ..Field::new(name, FieldType::Int) }
     }
+    /// A MEDIA field of `kind` ([`Field::media`]).
+    pub fn media(name: &str, kind: MediaKind) -> Self {
+        Field { media: Some(kind), ..Field::new(name, FieldType::Keyword) }
+    }
     /// The field's type in SQL: `BOOL` and `TIMESTAMP` for those
-    /// ([`Logical`]), else [`type_name`] of its type.
+    /// ([`Logical`]), `MEDIA` for a media field, else [`type_name`] of its
+    /// type.
     pub fn type_name(&self) -> &'static str {
+        if self.media.is_some() {
+            return "MEDIA";
+        }
         self.logical.map_or_else(|| type_name(&self.ty), Logical::type_name)
     }
     /// `v` in the form this field's column stores: a BOOL field's value
@@ -447,6 +464,7 @@ impl Schema {
                 return Err(Error::Schema(format!("field {}: a {} field holds one value, and is neither the primary key nor a reference", f.name, l.type_name())));
             }
         }
+        s.check_media()?;
         for (i, f) in s.fields.iter_mut().enumerate() {
             // The key always holds a value: saying so needs no feature.
             if s.primary_key == Some(i) {
@@ -498,7 +516,7 @@ impl Schema {
         if self.primary_key == Some(i) {
             return bad("rows are placed by their key already; leave shard_by out");
         }
-        if f.multi || f.logical.is_some() || !matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored {
+        if f.multi || f.logical.is_some() || f.media.is_some() || !matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored {
             return bad("rows are placed by a stored, single-valued KEYWORD or INT field");
         }
         if !f.not_null {
@@ -512,6 +530,30 @@ impl Schema {
     /// ([`Schema::with_shard_by`]).
     pub fn shard_by_field(&self) -> Option<usize> {
         self.shard_by.as_deref().and_then(|f| self.field_index(f))
+    }
+
+    /// Checks the MEDIA fields ([`Field::media`]).
+    fn check_media(&self) -> Result<()> {
+        for (i, f) in self.fields.iter().enumerate() {
+            if f.media.is_none() {
+                continue;
+            }
+            let bad = |m: &str| Err(Error::Schema(format!("field {}: {m}", f.name)));
+            if f.ty != FieldType::Keyword || f.logical.is_some() || f.analyzer.is_some() || !f.generated_from.is_empty() {
+                return bad("a MEDIA field is a KEYWORD column of JSON values");
+            }
+            if f.multi || self.primary_key == Some(i) || f.references.is_some() || f.default.is_some() {
+                return bad("a MEDIA field holds one file per row, and is neither the key, a reference nor given a default");
+            }
+            if !f.stored {
+                return bad("a MEDIA field is stored: its value is the file's reference");
+            }
+            let source = |names: &[String]| names.iter().any(|n| self.field_index(n) == Some(i));
+            if let Some(g) = self.fields.iter().find(|g| source(&g.generated_from) || g.embed.as_ref().is_some_and(|e| source(&e.from))) {
+                return Err(Error::Schema(format!("field {}: a MEDIA field ({}) is not a source of text", g.name, f.name)));
+            }
+        }
+        Ok(())
     }
 
     /// An indexed TEXT or SPARSE field that is neither stored nor
@@ -578,11 +620,11 @@ impl Schema {
 
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
-    /// `semantic_id` and [`Analyzer::feature`], and `shard_by`
-    /// ([`Schema::with_shard_by`]).
+    /// `semantic_id`, [`Analyzer::feature`] and `media` ([`Field::media`]),
+    /// and `shard_by` ([`Schema::with_shard_by`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
         let fields = self.fields.iter().flat_map(|f| {
-            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id")];
+            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id"), f.media.map(|_| "media")];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
         fields.chain(self.shard_by.as_ref().map(|_| "shard_by".to_string()))
@@ -677,8 +719,11 @@ impl Schema {
     /// ```
     ///
     /// Types are `text`, `keyword`, `int`, `float`, `bool`, `timestamp`,
-    /// `vector`, `sparse` and `edges` (`bool` and `timestamp` hold one
-    /// value, and make the database format 3: [`Logical`]). A vector `embed`ded by a model Strata knows may leave out
+    /// `vector`, `sparse`, `edges` and `media` (`bool` and `timestamp` hold
+    /// one value, and make the database format 3: [`Logical`]; `media`
+    /// holds a file's reference, of the `"kind"` `"image"`, `"audio"`,
+    /// `"video"` or `"pdf"` when it says so, and makes the database format
+    /// 3: [`Field::media`]). A vector `embed`ded by a model Strata knows may leave out
     /// `dim`. Every field is stored and indexed unless it says otherwise
     /// (`"stored": false`, `"indexed": false`), except that vectors and
     /// generated text (`from`) are not stored. Text keeps positions (for
@@ -750,6 +795,12 @@ impl Schema {
                             m.insert("positions".into(), json!(false));
                         }
                         ("text", f.generated_from.is_empty())
+                    }
+                    FieldType::Keyword if f.media.is_some() => {
+                        if let Some(k) = f.media.filter(|k| *k != MediaKind::Any) {
+                            m.insert("kind".into(), json!(k.as_str()));
+                        }
+                        ("media", true)
                     }
                     FieldType::Keyword => ("keyword", true),
                     FieldType::Int => (f.logical.map_or("int", Logical::feature), true),
@@ -836,7 +887,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer", "semantic_id"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -855,8 +906,12 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
             Some(_) => Err(bad(&format!("{k} lists field names"))),
         }
     };
-    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, bool, timestamp, vector, sparse or edges)"))?;
+    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, bool, timestamp, vector, sparse, edges or media)"))?;
     let mut logical = None;
+    let mut media = None;
+    if j.get("kind").is_some_and(|k| !k.is_null()) && !ty_name.eq_ignore_ascii_case("media") {
+        return Err(bad("kind is an option of a media field"));
+    }
     let from = names("from")?;
     let ty = match ty_name.to_ascii_lowercase().as_str() {
         "text" => FieldType::Text { positions: flag("positions")?.unwrap_or(true) },
@@ -873,6 +928,13 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
         "float" | "double" | "real" => FieldType::Float,
         "sparse" => FieldType::Sparse,
         "edges" => FieldType::Edges,
+        "media" => {
+            media = Some(match j.get("kind") {
+                None | Some(J::Null) => MediaKind::Any,
+                Some(k) => k.as_str().and_then(MediaKind::parse).ok_or_else(|| bad("kind is \"image\", \"audio\", \"video\", \"pdf\" or \"any\""))?,
+            });
+            FieldType::Keyword
+        }
         "vector" => {
             let model_dim = j.get("embed").and_then(|e| e.get("model")).and_then(J::as_str).and_then(crate::embed::known_dim);
             let dim = match j.get("dim") {
@@ -896,11 +958,12 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
             };
             FieldType::Vector { dim, index }
         }
-        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, bool, timestamp, vector, sparse or edges)"))),
+        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, bool, timestamp, vector, sparse, edges or media)"))),
     };
     let is_vector = matches!(ty, FieldType::Vector { .. });
     let mut f = Field::new(name, ty);
     f.logical = logical;
+    f.media = media;
     f.generated_from = from;
     f.stored = flag("stored")?.unwrap_or(!is_vector && f.generated_from.is_empty());
     f.indexed = flag("indexed")?.unwrap_or(true);

@@ -468,6 +468,12 @@ pub(crate) fn coerced(field: &Field, v: Value) -> Result<Value> {
     coerce(field, v)
 }
 
+/// What a write gives MEDIA field `field` as text: a URI, or a JSON
+/// object's text ([`crate::media::input_text`]), resolved before the writer.
+fn media_input(field: &Field, text: String) -> Result<Value> {
+    crate::media::input_text(&serde_json::Value::String(text)).map(Value::Str).map_err(|e| err(format!("{}: {e}", field.name)))
+}
+
 /// The value an expression gives `field` in `SET` ([`Assign::Expr`]), in
 /// the form its column holds: [`coerce`]d, a whole FLOAT as an INT, and
 /// one value as a multi-valued field's list of it.
@@ -486,6 +492,8 @@ pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
     Ok(match (&field.ty, v) {
         (_, Value::Null) => Value::Null,
         (FieldType::Vector { .. }, v @ Value::Vector(_)) => v,
+        (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
+        (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: SET gives it a URI or a JSON object's text, not {v:?}", field.name))),
         (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
         (FieldType::Sparse, v @ Value::Str(_)) => {
             crate::text::sparse::parse(&v)?;
@@ -1599,6 +1607,8 @@ impl<'a> Binder<'a> {
         Ok(match (&field.ty, v) {
             (_, Value::Null) => Value::Null,
             (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
+            (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
+            (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: give it a URI or a JSON object's text, not {v:?}", field.name))),
             (_, v @ Value::List(_)) if field.multi => v,
             (FieldType::Text { .. } | FieldType::Edges, v @ Value::Str(_)) => v,
             (FieldType::Sparse, v @ Value::Str(_)) => {
