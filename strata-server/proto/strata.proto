@@ -564,6 +564,8 @@ enum Func {
   FUNC_CLAMP = 14;
   // dot(a, b) of two vectors; plan feature "maxsim".
   FUNC_DOT = 15;
+  // A semantic ID's prefix (plan feature "semantic_id").
+  FUNC_SID_AT = 16;
 }
 
 message Match {

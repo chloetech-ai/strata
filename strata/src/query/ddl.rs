@@ -30,7 +30,10 @@
 //! `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'`
 //! or `'binary'`), `dim`, and `embed` with `model` (the fields a VECTOR
 //! field is the model's embedding of). Field lists are a string, `'title,
-//! abstract'`, or `ARRAY['title', 'abstract']`.
+//! abstract'`, or `ARRAY['title', 'abstract']`. A KEYWORD[] column with
+//! `semantic_id = 'emb'` and `codebook = 'name'` holds the semantic IDs of
+//! VECTOR column `emb`'s vectors ([`crate::sid`]; feature `semantic_id`):
+//! `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`.
 //!
 //! The key is a column's `PRIMARY KEY` or a `PRIMARY KEY (column)`
 //! constraint. `REFERENCES table [(key)]` on a column, or `FOREIGN KEY
@@ -242,10 +245,14 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
+        "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
         _ => &["stored", "indexed"],
     };
+    if !allowed.contains(&"semantic_id") && (opts.contains_key("semantic_id") || opts.contains_key("codebook")) {
+        return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
+    }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "dim", "embed", "model", "semantic_id", "codebook"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -302,6 +309,13 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     }
     if let Some(from) = opts.remove("from") {
         f.insert("from".into(), json!(names(&from).map_err(|m| bad(format!("from {m}")))?));
+    }
+    match (opts.remove("semantic_id"), opts.remove("codebook")) {
+        (None, None) => {}
+        (Some(J::String(from)), Some(J::String(codebook))) => {
+            f.insert("semantic_id".into(), json!({"from": from, "codebook": codebook}));
+        }
+        _ => return Err(bad("a semantic-ID column takes semantic_id = 'vector column' and codebook = 'name'".into())),
     }
     for (k, v) in opts {
         match k.as_str() {

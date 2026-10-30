@@ -202,6 +202,7 @@ fn expr(e: &Expr) -> E {
                 Func::Sigmoid => pb::Func::Sigmoid,
                 Func::Clamp => pb::Func::Clamp,
                 Func::Dot => pb::Func::Dot,
+                Func::SidAt => pb::Func::SidAt,
             } as i32,
             args: args.iter().map(ex).collect(),
         }),
@@ -510,6 +511,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Sigmoid => Func::Sigmoid,
                 pb::Func::Clamp => Func::Clamp,
                 pb::Func::Dot => Func::Dot,
+                pb::Func::SidAt => Func::SidAt,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
         }

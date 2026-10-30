@@ -177,15 +177,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             db
         } else if let Some(n) = o.demo {
             fill = Some(Fill::Demo(n));
-            Db::create(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
+            Db::create_in(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
             let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
             let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
             fill = o.copy_from.clone().map(Fill::Copy);
-            Db::create(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
+            Db::create_in(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
         } else {
             return Err(format!("{} does not exist: pass --schema FILE or --demo N to create it", path.display()));
         };
+        for (field, why) in db.open_codebooks(&o.models) {
+            tracing::warn!(field = %field, error = %why, "cannot give this field semantic IDs: writes must carry them");
+        }
         if o.seq_no {
             db.storage().start_seq_no().map_err(|e| format!("--seq-no on {}: {e}", path.display()))?;
         }
@@ -340,7 +343,7 @@ pub fn import_files(path: &Path, schema: Option<&Path>, table: Option<&str>, mod
         let s = schema.ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
         let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
         let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
-        Db::create(path, schema, opts).map_err(|e| format!("create {}: {e}", path.display()))?
+        Db::create_in(path, schema, opts, models).map_err(|e| format!("create {}: {e}", path.display()))?
     };
     for (field, why) in db.open_embedders(models) {
         tracing::warn!(field = %field, error = %why, "cannot embed this field: its vectors must be in the files");
