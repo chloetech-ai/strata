@@ -124,6 +124,15 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     Ok(out)
 }
 
+/// Whether `q` scores BM25 (a `bm25` leaf of its ranking, alone or in an
+/// expression), so that a coordinator sums its shards' statistics of the
+/// terms first ([`ExecOptions::stats`]) and they score like one database.
+pub fn scores_bm25(q: &Select) -> bool {
+    let mut leaves = Vec::new();
+    crate::query::exec::bm25_leaves(q, &mut leaves);
+    !leaves.is_empty()
+}
+
 /// Whether a fetch phase reads less than one round would: `q` returns a
 /// page of rows (not groups or counts, and with a LIMIT, as a query
 /// without one keeps every shard's rows) and selects a column besides the
