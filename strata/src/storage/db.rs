@@ -46,7 +46,7 @@ use crate::storage::io;
 use crate::storage::dir::{self, Current};
 use crate::storage::live::LiveDocs;
 use crate::storage::lock;
-use crate::storage::manifest::{Manifest, Numbering, SegmentMeta, SeqNo, TableMeta};
+use crate::storage::manifest::{sources_schema, Manifest, Numbering, SegmentMeta, SeqNo, TableMeta, SOURCES, SOURCES_ID};
 use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
@@ -975,9 +975,11 @@ impl Database {
     }
 
     /// The schemas of the database's tables, in creation order (the first
-    /// is the table the database was created with).
+    /// is the table the database was created with). The system table
+    /// [`SOURCES`] is not among them: [`Self::table`] and SQL read it by
+    /// name.
     pub fn tables(&self) -> Vec<Arc<Schema>> {
-        lock(&self.state).tables.iter().map(|t| t.schema.clone()).collect()
+        lock(&self.state).tables.iter().filter(|t| t.id != SOURCES_ID).map(|t| t.schema.clone()).collect()
     }
 
     /// The schema of the table named `name` (any case).
@@ -1000,6 +1002,9 @@ impl Database {
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         check_table_name(&schema.table)?;
+        if schema.table.eq_ignore_ascii_case(SOURCES) {
+            return Err(Error::Schema(format!("{SOURCES} is a system table, which streams make and write (Database::ensure_sources)")));
+        }
         if self.table(&schema.table).is_some() {
             return Err(Error::Schema(format!("table {} already exists", schema.table)));
         }
@@ -1028,6 +1033,37 @@ impl Database {
         vw.manifest.next_table_id += 1;
         vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new() });
         let c = vw.commit(&mut wal)?;
+        self.publish(c, |_| {})
+    }
+
+    /// Adds the system table [`SOURCES`] if the database lacks it, in one
+    /// commit: streams keep there, per source, the offset of the last
+    /// event they wrote, in the transaction that wrote it. Every copy of a
+    /// database gives it the same id ([`SOURCES_ID`]), so a replica makes
+    /// its own when its primary's first offset arrives
+    /// ([`Database::apply_shipped`]). The database then needs feature
+    /// `sources`, so versions of Strata before it refuse to open it.
+    pub fn ensure_sources(&self) -> Result<()> {
+        if self.has_sources() {
+            return Ok(());
+        }
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        self.add_sources(&mut wal)
+    }
+
+    fn has_sources(&self) -> bool {
+        lock(&self.state).tables.iter().any(|t| t.id == SOURCES_ID)
+    }
+
+    /// [`Database::ensure_sources`], under the writer lock.
+    fn add_sources(&self, wal: &mut Wal) -> Result<()> {
+        if self.has_sources() {
+            return Ok(());
+        }
+        let mut vw = VersionWriter::begin(self);
+        vw.manifest.tables.push(TableMeta { id: SOURCES_ID, schema: sources_schema(), segments: Vec::new() });
+        let c = vw.commit(wal)?;
         self.publish(c, |_| {})
     }
 
@@ -1157,7 +1193,12 @@ impl Database {
             return Ok(Applied::Mismatch { seq: last.seq, term: last.term });
         }
         let Some(WriteTxn { mut wal, .. }) = held else { return Ok(Applied::At(prev)) };
-        let schemas: Vec<(u32, Arc<Schema>)> = lock(&self.state).tables.iter().map(|t| (t.id, t.schema.clone())).collect();
+        let mut schemas: Vec<(u32, Arc<Schema>)> = lock(&self.state).tables.iter().map(|t| (t.id, t.schema.clone())).collect();
+        // The primary's sources' offsets, before this copy has a table for
+        // them: it makes its own, as the primary did.
+        if !schemas.iter().any(|(id, _)| *id == SOURCES_ID) {
+            schemas.push((SOURCES_ID, Arc::new(sources_schema())));
+        }
         let fits = |table: u32, op: &Op| schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op));
         let mut shipped = Vec::with_capacity(txns.len());
         let mut at = now.last();
@@ -1177,6 +1218,9 @@ impl Database {
             }
             at = s;
             shipped.push((s, t.ops));
+        }
+        if shipped.iter().any(|(_, ops)| ops.iter().any(|(id, _)| *id == SOURCES_ID)) {
+            self.add_sources(&mut wal)?;
         }
         let mut at = now.last();
         let mut failed = None;
@@ -1265,27 +1309,37 @@ impl Database {
             let st = lock(&copy.state);
             let n = st.manifest.seq_no.clone().ok_or_else(|| Error::Schema("the copy does not number its writes".into()))?;
             let mut tables = Vec::new();
+            let mut sources = None;
             for t in &st.manifest.tables {
                 let segs = t.segments.iter().map(|m| Ok((m.n_docs, st.handle(m.id).cloned().ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?))).collect::<Result<Vec<_>>>()?;
-                tables.push((t.schema.clone(), segs));
+                match t.id == SOURCES_ID {
+                    true => sources = Some(segs),
+                    false => tables.push((t.schema.clone(), segs)),
+                }
             }
-            (Numbering { seq: st.seq, ..n }, tables)
+            (Numbering { seq: st.seq, ..n }, (tables, sources))
         };
+        let (tables, sources) = tables;
         // No background flush may seal the log in between.
         let _one = lock(&self.background);
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         let ours = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
         {
+            // Sources aside, which either may have made first.
             let st = lock(&self.state);
+            let mine: Vec<&Schema> = st.manifest.tables.iter().filter(|t| t.id != SOURCES_ID).map(|t| &t.schema).collect();
             let names = |ts: &mut dyn Iterator<Item = &Schema>| ts.map(|s| s.table.clone()).collect::<Vec<_>>().join(", ");
-            if st.manifest.tables.len() != tables.len() || st.manifest.tables.iter().zip(&tables).any(|(t, (s, _))| t.schema != *s) {
+            if mine.len() != tables.len() || mine.iter().zip(&tables).any(|(t, (s, _))| **t != *s) {
                 return Err(Error::Schema(format!(
                     "the copy's tables ({}) are not this database's ({}), or their schemas differ",
                     names(&mut tables.iter().map(|t| &t.0)),
-                    names(&mut st.manifest.tables.iter().map(|t| &t.schema))
+                    names(&mut mine.into_iter())
                 )));
             }
+        }
+        if sources.is_some() {
+            self.add_sources(&mut wal)?;
         }
         if theirs.term < ours.term {
             return Err(Error::Schema(format!("the copy is of term {}, older than this database's ({}): it is a copy of a replaced primary", theirs.term, ours.term)));
@@ -1299,11 +1353,15 @@ impl Database {
             wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
         }
         let mut vw = VersionWriter::begin(self);
-        let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
+        let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).filter(|&id| id != SOURCES_ID).collect();
         for id in vw.manifest.tables.iter().flat_map(|t| &t.segments).map(|s| s.id).collect::<Vec<_>>() {
             vw.remove_segment(id);
         }
-        for ((_, segs), &to) in tables.iter().zip(&ids) {
+        let mut into: Vec<_> = ids.into_iter().zip(tables.iter().map(|(_, segs)| segs)).collect();
+        if let Some(segs) = &sources {
+            into.push((SOURCES_ID, segs));
+        }
+        for (to, segs) in into {
             for (n_docs, h) in segs {
                 vw.add_segment(to, None, h.file.image(), *n_docs, h.base.as_deref(), h.updates.as_deref())?;
             }
@@ -1366,6 +1424,8 @@ impl Database {
                     None if opts.if_exists => {}
                     None => return Err(Error::Schema(format!("no table {name}"))),
                     Some(t) if t.id == 0 => return Err(Error::Schema(format!("{} is the database's first table, which cannot be dropped", t.schema.table))),
+                    // A replica's would come back with its primary's next offset.
+                    Some(t) if t.id == SOURCES_ID => return Err(Error::Schema(format!("{SOURCES} is a system table, which cannot be dropped: delete its rows to forget sources"))),
                     Some(t) if ids.contains(&t.id) => {}
                     Some(t) => {
                         ids.push(t.id);
@@ -1617,6 +1677,22 @@ impl Database {
     fn flush_due(&self) -> bool {
         let st = lock(&self.state);
         st.mem_len() + st.n_pending > self.opts.memtable_max_docs
+    }
+
+    /// Whether writes fell behind the flusher: past twice
+    /// `memtable_max_docs` while the flusher flushes (or is about to), a
+    /// commit waits for its flush ([`Self::spawn_flusher`]). A server stops
+    /// reading a stream meanwhile and refuses plain writes (429). Not while
+    /// the flusher is idle, as after a reopen replays a long log: then the
+    /// next commit flushes, or wakes it; nor while flushes fail, which
+    /// commits report.
+    pub fn backlogged(&self) -> bool {
+        let Some(sig) = self.flush_signal.get() else { return false };
+        if !self.over_twice() || self.flush_error().is_some() {
+            return false;
+        }
+        let w = lock(&sig.state);
+        (w.running || w.due) && !w.closed
     }
 
     /// Whether the memtables and pending deletes are past twice
@@ -2471,7 +2547,10 @@ impl Database {
         let o = DbOptions { layout, sync: true, publish_snapshots: false, doc_source: None, ..DbOptions::default() };
         let out = Database::create(tmp, manifest.tables[0].schema.clone(), o)?;
         for t in &manifest.tables[1..] {
-            out.create_table(t.schema.clone())?;
+            match t.id == SOURCES_ID {
+                true => out.ensure_sources()?,
+                false => out.create_table(t.schema.clone())?,
+            }
         }
         let mut stats = CheckpointStats { tables: manifest.tables.len(), ..CheckpointStats::default() };
         {
@@ -3185,6 +3264,13 @@ impl TableTxn<'_, '_> {
         self.txn.add_in(&self.t, key, field, delta)
     }
 
+    /// Field `field` of the live row with this key, as this transaction
+    /// finds it, its own writes included; `None` when no row with the key
+    /// is live.
+    pub fn value(&mut self, key: &Value, field: &str) -> Result<Option<Value>> {
+        self.txn.value_in(&self.t, key, field)
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.t.schema
     }
@@ -3195,6 +3281,28 @@ impl<'a> WriteTxn<'a> {
     pub fn table(&mut self, name: &str) -> Result<TableTxn<'_, 'a>> {
         let t = self.db.table_ref(Some(name))?;
         Ok(TableTxn { txn: self, t })
+    }
+
+    /// The offset of the last event written from stream source `name`, as
+    /// this transaction finds it ([`SOURCES`]); `None` for a source not
+    /// written yet.
+    pub fn source_offset(&mut self, name: &str) -> Result<Option<i64>> {
+        if !self.db.has_sources() {
+            return Ok(None);
+        }
+        let v = self.table(SOURCES)?.value(&Value::Str(name.to_string()), "last_offset")?;
+        Ok(v.and_then(|v| v.as_i64()))
+    }
+
+    /// Records `offset` as the last event written from source `name`, at
+    /// `now` (microseconds since the epoch), in this transaction: committed
+    /// with the rows the events wrote, or not at all. The database needs
+    /// the table first ([`Database::ensure_sources`]).
+    pub fn set_source(&mut self, name: &str, offset: i64, now: i64) -> Result<()> {
+        if !self.db.has_sources() {
+            return Err(Error::Schema(format!("the database has no {SOURCES} table yet: Database::ensure_sources makes it")));
+        }
+        self.table(SOURCES)?.upsert(vec![Value::Str(name.to_string()), Value::Int(offset), Value::Timestamp(now)])
     }
 
     /// Inserts a document; its primary key must not be live.
@@ -3376,17 +3484,7 @@ impl<'a> WriteTxn<'a> {
         if let Some(l) = t.schema.fields[i].logical {
             return Err(Error::Schema(format!("{field} is a {}: set it rather than add to it", l.type_name())));
         }
-        if !self.is_live(t, &k, key) {
-            return Ok(false);
-        }
-        let keys = self.keys(t.id);
-        let base = match (keys.touched.get(&k), keys.written.get(&k)) {
-            (Some(true), Some(d)) => d[i].clone(),
-            _ => match keys.sets.get(&(k.clone(), i)) {
-                Some(v) => v.clone(),
-                None => self.db.live_value(t, key, i)?,
-            },
-        };
+        let Some(base) = self.value_of(t, &k, key, i)? else { return Ok(false) };
         let overflow = || Error::Schema(format!("{field} + {delta:?} overflows"));
         let sum = match (&t.schema.fields[i].ty, delta) {
             (FieldType::Int, Value::Int(x)) => Value::Int(base.as_i64().unwrap_or(0).checked_add(*x).ok_or_else(overflow)?),
@@ -3402,6 +3500,30 @@ impl<'a> WriteTxn<'a> {
             _ => return Err(Error::Schema(format!("{field} is not a numeric field"))),
         };
         self.set_in(t, key, field, sum)
+    }
+
+    /// Field `field` of the live row with this key, as this transaction
+    /// finds it, its own writes included; `None` when no row with the key is
+    /// live.
+    fn value_in(&mut self, t: &TableRef, key: &Value, field: &str) -> Result<Option<Value>> {
+        let k = t.key_of(key)?;
+        let i = t.schema.fields.iter().position(|f| f.name == field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        self.value_of(t, &k, key, i)
+    }
+
+    fn value_of(&mut self, t: &TableRef, k: &Key, key: &Value, i: usize) -> Result<Option<Value>> {
+        if !self.is_live(t, k, key) {
+            return Ok(None);
+        }
+        let keys = self.keys(t.id);
+        let v = match (keys.touched.get(k), keys.written.get(k)) {
+            (Some(true), Some(d)) => d[i].clone(),
+            _ => match keys.sets.get(&(k.clone(), i)) {
+                Some(v) => v.clone(),
+                None => self.db.live_value(t, key, i)?,
+            },
+        };
+        Ok(Some(v))
     }
 
     /// Operations buffered so far.

@@ -217,12 +217,14 @@ pub struct SemanticId {
 
 /// A VECTOR field that is the embedding of other fields: `model`'s vector
 /// of their non-empty values joined by newlines (the text a generated
-/// field holds). Writes that leave the vector out get it computed, and
-/// rewrites that change a source recompute it; a vector a write supplies
-/// is kept as given. Queries embed their text with the same model.
+/// field holds), or of the image a MEDIA field holds. Writes that leave
+/// the vector out get it computed, and rewrites that change a source
+/// recompute it; a vector a write supplies is kept as given. Queries embed
+/// their text, or an image, with the same model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Embed {
-    /// Stored or generated TEXT or KEYWORD fields.
+    /// Stored or generated TEXT or KEYWORD fields, or one MEDIA field of
+    /// kind image.
     pub from: Vec<String>,
     /// The model, by the name [`crate::embed::open`] finds it under, such
     /// as `potion-retrieval-32M`, `bge-small-en-v1.5` or `hash:64`; or the
@@ -440,10 +442,19 @@ impl Schema {
             if e.from.is_empty() || e.model.is_empty() {
                 return bad("an embedded field needs source fields and a model".into());
             }
+            if let Some(m) = e.from.iter().find_map(|src| s.field(src).filter(|g| g.media.is_some())) {
+                if e.from.len() > 1 {
+                    return bad(format!("an embedded field embeds one MEDIA field ({}), or text fields, not both", m.name));
+                }
+                if m.media != Some(MediaKind::Image) {
+                    return bad(format!("source {}: the MEDIA field an embedded field embeds is of kind image", m.name));
+                }
+                continue;
+            }
             for src in &e.from {
                 let ok = s.field(src).is_some_and(|g| (g.stored || !g.generated_from.is_empty()) && matches!(g.ty, FieldType::Text { .. } | FieldType::Keyword) && !g.multi);
                 if !ok {
-                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field"));
+                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field, or a MEDIA field of images"));
                 }
             }
         }
@@ -548,8 +559,7 @@ impl Schema {
             if !f.stored {
                 return bad("a MEDIA field is stored: its value is the file's reference");
             }
-            let source = |names: &[String]| names.iter().any(|n| self.field_index(n) == Some(i));
-            if let Some(g) = self.fields.iter().find(|g| source(&g.generated_from) || g.embed.as_ref().is_some_and(|e| source(&e.from))) {
+            if let Some(g) = self.fields.iter().find(|g| g.generated_from.iter().any(|n| self.field_index(n) == Some(i))) {
                 return Err(Error::Schema(format!("field {}: a MEDIA field ({}) is not a source of text", g.name, f.name)));
             }
         }
@@ -671,8 +681,18 @@ impl Schema {
 
     /// The text embedded field `f` is the embedding of, in `doc` (generated
     /// fields filled in).
+    /// For a field that embeds a MEDIA field ([`Schema::embeds_media`]),
+    /// that field's value.
     pub fn embed_text(&self, f: usize, doc: &[crate::value::Value]) -> String {
         self.fields[f].embed.as_ref().map(|e| self.joined(&e.from, doc)).unwrap_or_default()
+    }
+
+    /// The MEDIA field that field `f` is the embedding of, if it embeds
+    /// one (images) rather than text.
+    pub fn embeds_media(&self, f: usize) -> Option<usize> {
+        let e = self.fields[f].embed.as_ref()?;
+        let i = self.field_index(e.from.first()?)?;
+        self.fields[i].media.is_some().then_some(i)
     }
 
     /// The non-empty values of `sources` in `doc`, joined by newlines.
