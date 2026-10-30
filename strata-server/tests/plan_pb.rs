@@ -187,6 +187,27 @@ fn every_plan_round_trips() {
     let weighted = Plan::new(Plan::from_json(&j).unwrap().root);
     assert!(weighted.features.iter().any(|f| f == ir::MAXSIM), "{:?}", weighted.features);
     check(weighted);
+    // A walk over an edge table, which names the table; its field is the
+    // key.
+    let sql = "SELECT id FROM papers ORDER BY ppr(cites, 'p1') DESC LIMIT 5";
+    let mut j = Plan::of_select(&schema, &bind(sql, &schema, &params()).unwrap()).to_json().unwrap();
+    fn over_table(j: &mut serde_json::Value) -> bool {
+        match j {
+            serde_json::Value::Object(m) => match m.get_mut("ppr") {
+                Some(serde_json::Value::Object(g)) => {
+                    g.insert("field".into(), serde_json::json!(0));
+                    g.insert("edges".into(), serde_json::json!("cooc")).is_none()
+                }
+                _ => m.values_mut().any(over_table),
+            },
+            serde_json::Value::Array(xs) => xs.iter_mut().any(over_table),
+            _ => false,
+        }
+    }
+    assert!(over_table(&mut j));
+    let walked = Plan::new(Plan::from_json(&j).unwrap().root);
+    assert!(walked.features.iter().any(|f| f == ir::EDGE_TABLE), "{:?}", walked.features);
+    check(walked);
     for sql in WRITES {
         let Command::Write { write, .. } = bind_command(sql, &[&schema], &params()).unwrap_or_else(|e| panic!("{sql}: {e}")) else { panic!("{sql}") };
         check(Plan::of_write(&schema, &write));

@@ -211,6 +211,7 @@ impl Lower<'_> {
         };
         Graph {
             field: g.field as u32,
+            edges: g.edges.clone(),
             seeds,
             weights,
             kind: match &g.kind {
