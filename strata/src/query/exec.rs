@@ -1414,15 +1414,16 @@ impl<'a> Executor<'a> {
     /// the word it misspells.
     fn bm25_query(&self, field: usize, text: &str, opts: &Opts) -> Result<Bm25Query> {
         let analyzer = self.schema.fields[field].text_analyzer();
-        let seq = query_term_seq(text, opts, analyzer);
         let expand = Expand::from_opts(opts).map_err(err)?;
-        let mut out = Bm25Query::default();
-        for t in &seq {
-            match out.terms.iter_mut().find(|(x, _)| x == t) {
-                Some((_, w)) => *w += 1.0,
+        let (weighted, filter) = ranked_terms(text, opts, analyzer)?;
+        let seq: Vec<String> = weighted.iter().map(|(t, _)| t.clone()).collect();
+        let mut out = Bm25Query { filter: filter.map(|query| Pred::Match { field, query, expand }), ..Bm25Query::default() };
+        for (t, x) in &weighted {
+            match out.terms.iter_mut().find(|(y, _)| y == t) {
+                Some((_, w)) => *w += x,
                 None => {
                     out.groups.push(vec![out.terms.len()]);
-                    out.terms.push((t.clone(), 1.0));
+                    out.terms.push((t.clone(), *x));
                 }
             }
         }
@@ -1445,8 +1446,9 @@ impl<'a> Executor<'a> {
                         // A one-word synonym of one word stands for it; the
                         // words of longer ones score on their own.
                         let g = if len == 1 && alt.len() == 1 { base_of(&seq[i], &out) } else { None };
+                        let w = g.map_or(1.0, |g| out.terms[g].1);
                         for t in alt {
-                            add(t, 1.0, g, &mut out);
+                            add(t, w, g, &mut out);
                         }
                     }
                 }
@@ -1454,14 +1456,14 @@ impl<'a> Executor<'a> {
         }
         if let Some(fz) = expand.fuzzy {
             for b in 0..n_base {
-                let t = out.terms[b].0.clone();
+                let (t, w) = out.terms[b].clone();
                 let len = t.chars().count();
                 let e = fz.edits(len);
                 if e == 0 {
                     continue;
                 }
                 for (near, _, d) in self.near_terms(field, &t, e)?.iter().filter(|x| x.2 > 0).take(MAX_FUZZY_TERMS) {
-                    add(near, text::fuzzy::weight(*d, len), Some(b), &mut out);
+                    add(near, w * text::fuzzy::weight(*d, len), Some(b), &mut out);
                 }
             }
         }
@@ -1627,6 +1629,7 @@ impl<'a> Executor<'a> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        let p = &with_filter(p, &q.filter);
         let names: Vec<String> = terms.iter().map(|(t, _)| t.clone()).collect();
         if terms.len() > q.n_base {
             let added: Vec<&str> = names[q.n_base..].iter().map(|t| t.as_str()).collect();
@@ -1892,18 +1895,19 @@ impl<'a> Executor<'a> {
             return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
         }
         // The text score's terms, statistics and parameters.
-        let (field, terms, bm25, algo) = match rank.leaves[text] {
+        let (field, terms, bm25, algo, filter) = match rank.leaves[text] {
             Score::Bm25 { field, text: query, opts } => {
                 let (q, stats) = self.bm25_scoring(*field, query, opts)?;
                 let (params, algo) = self.bm25_params(opts)?;
-                (*field, q.terms, Some((stats, params)), algo)
+                (*field, q.terms, Some((stats, params)), algo, q.filter)
             }
-            Score::Sparse { field, terms, opts } => (*field, terms.clone(), None, self.bm25_params(opts)?.1),
+            Score::Sparse { field, terms, opts } => (*field, terms.clone(), None, self.bm25_params(opts)?.1, None),
             _ => return Err(err("a rank-safe boost is driven by bm25 or a sparse similarity")),
         };
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        let p = &with_filter(p, &filter);
         let per = self.per_segment(|ex, s, l| {
             let t = ex.text(s, field)?;
             let candidates = terms.iter().map(|(w, _)| t.doc_freq(w) as f64).sum::<f64>() * 0.3;
@@ -1983,7 +1987,12 @@ impl<'a> Executor<'a> {
                     let s = &self.seg_by_ord(seg);
                     let docs: Vec<DocId> = cands[range.clone()].iter().map(|c| c.1).collect();
                     let sc = self.text(s, *field)?.score_weighted(&terms, &stats, params, &docs);
-                    out[range].iter_mut().zip(sc).for_each(|(o, x)| *o = x.into());
+                    // A row without a required word, or with an excluded
+                    // one, does not match: 0, as a row with none of the words.
+                    let keep = q.filter.as_ref().map(|f| self.materialize(s, f)).transpose()?;
+                    for ((o, x), d) in out[range].iter_mut().zip(sc).zip(&docs) {
+                        *o = if keep.as_ref().is_none_or(|k| k.contains(*d)) { x.into() } else { 0.0 };
+                    }
                 }
             }
             Score::Sparse { field, terms, .. } => {
@@ -2361,18 +2370,66 @@ fn has_graphs(q: &Select) -> bool {
     !q.graphs.is_empty()
 }
 
-/// The terms of a `bm25` query in order, repeats included, as the field's
-/// `analyzer` analyses them; `stopwords => 0` keeps query stopwords and
-/// `stopwords => 1` drops them (by default only an `english` field does).
-fn query_term_seq(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Vec<String> {
+/// How `bm25` reads its text (`syntax => ...`): with its operators
+/// (`'query'`, the default), or as plain words (`'plain'`), for text
+/// passed on as it came, such as a prompt or a document.
+pub(crate) fn plain_syntax(opts: &Opts) -> Result<bool> {
+    match opts.get("syntax") {
+        None => Ok(false),
+        Some(v) => match v.as_str() {
+            Some("query") => Ok(false),
+            Some("plain") => Ok(true),
+            _ => Err(err(format!("bm25's syntax is 'query' or 'plain', not {v:?}"))),
+        },
+    }
+}
+
+/// The scored terms of a `bm25` query in order, each with the weight of
+/// the word or phrase it comes from (repeats included), and the `MATCH`
+/// query of its required (`+`) and excluded (`-`) words, as the field's
+/// `analyzer` analyses them ([`text::query::ranked_items`]; `syntax =>
+/// 'plain'`: every word, weighing 1, none required). `stopwords => 0`
+/// keeps query stopwords and `stopwords => 1` drops them (by default only
+/// an `english` field does); a word or phrase they leave no term of is
+/// not one. A weight of 0 scores nothing, but a required word still
+/// filters.
+fn ranked_terms(q: &str, opts: &Opts, analyzer: text::Analyzer) -> Result<(Vec<(String, f32)>, Option<String>)> {
     let drop = opts.get("stopwords").and_then(|v| v.as_f64()).map_or(analyzer.drops_query_stopwords(), |x| x != 0.0);
-    analyzer.query_term_seq(q, drop)
+    if plain_syntax(opts)? {
+        return Ok((analyzer.query_term_seq(q, drop).into_iter().map(|t| (t, 1.0)).collect(), None));
+    }
+    let (mut terms, mut must, mut not) = (Vec::new(), Vec::new(), Vec::new());
+    for item in text::query::ranked_items(q) {
+        let seq = analyzer.query_term_seq(item.text, drop);
+        if seq.is_empty() {
+            continue;
+        }
+        // As a MATCH phrase: the words, quotes left out.
+        let phrase = format!("\"{}\"", item.text.replace('"', " "));
+        match item.occur {
+            text::query::Occur::MustNot => {
+                not.push(format!("NOT {phrase}"));
+                continue;
+            }
+            text::query::Occur::Must => must.push(phrase),
+            text::query::Occur::Should => {}
+        }
+        let w = item.weight.unwrap_or(1.0);
+        if w > 0.0 {
+            terms.extend(seq.into_iter().map(|t| (t, w)));
+        }
+    }
+    must.extend(not);
+    Ok((terms, (!must.is_empty()).then(|| must.join(" "))))
 }
 
 /// The weighted terms of a `bm25` query ([`Executor::bm25_query`]).
 #[derive(Default)]
 struct Bm25Query {
     terms: Vec<(String, f32)>,
+    /// The rows it matches beyond having one of `terms`: its required and
+    /// excluded words, as a `MATCH`.
+    filter: Option<Pred>,
     /// Indices into `terms` that stand for one query term.
     groups: Vec<Vec<usize>>,
     /// The query's own terms, before its expansions.
@@ -2388,6 +2445,14 @@ fn blend_groups(q: &Bm25Query, stats: &mut CollectionStats) {
         for &i in g {
             stats.df.insert(q.terms[i].0.clone(), df);
         }
+    }
+}
+
+/// `p` and a `bm25`'s own filter ([`Bm25Query::filter`]).
+fn with_filter(p: &Pred, filter: &Option<Pred>) -> Pred {
+    match filter {
+        Some(f) => Pred::And(vec![p.clone(), f.clone()]).simplify(),
+        None => p.clone(),
     }
 }
 

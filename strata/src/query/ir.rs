@@ -61,7 +61,7 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 9] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS];
+pub const FEATURES: [&str; 10] = [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, TEXT_OPERATORS];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -102,6 +102,12 @@ pub const RANK_PROFILES: &str = "rank_profiles";
 
 /// The feature of a plan that ranks with a model ([`Expr::Gbdt`]).
 pub const RANK_MODELS: &str = "rank_models";
+
+/// The feature of a plan whose text a Strata from before text operators
+/// reads as other words: a `bm25` with a sign or weight (`+word`, `-word`,
+/// `word^2`; [`crate::text::query::has_operators`]), or a `MATCH` with a
+/// weight.
+pub const TEXT_OPERATORS: &str = "text_operators";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -864,6 +870,19 @@ impl Node {
         }
     }
 
+    /// Whether a text of the plan has operators ([`TEXT_OPERATORS`]).
+    pub fn has_text_operators(&self) -> bool {
+        let mut found = false;
+        self.visit_exprs(&mut |e| {
+            found |= match e {
+                Expr::Bm25 { text, opts, .. } => !crate::query::exec::plain_syntax(opts).unwrap_or(false) && crate::text::query::has_operators(text),
+                Expr::Match { query, .. } => crate::text::query::match_has_weights(query),
+                _ => false,
+            }
+        });
+        found
+    }
+
     /// Whether the plan ranks with a model ([`RANK_MODELS`]).
     pub fn has_models(&self) -> bool {
         let mut found = false;
@@ -1330,6 +1349,9 @@ impl Plan {
         }
         if root.has_models() {
             features.push(RANK_MODELS.to_string());
+        }
+        if root.has_text_operators() {
+            features.push(TEXT_OPERATORS.to_string());
         }
         Plan { version: VERSION, features, root }
     }

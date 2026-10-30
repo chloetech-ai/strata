@@ -356,13 +356,13 @@ fn hybrid_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json>
     let alphas = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
     let exact_ok = db.snapshot().n_live_docs() <= 200_000;
     let mut methods: Vec<(String, String)> = vec![
-        ("bm25".into(), "ORDER BY bm25(body, '{t}') DESC".into()),
+        ("bm25".into(), "ORDER BY bm25(body, '{t}', syntax => 'plain') DESC".into()),
         ("vector".into(), "ORDER BY similarity(emb, :q) DESC".into()),
         ("vector_exact".into(), "ORDER BY similarity(emb, :q, strategy => 'flat', rerank => 100) DESC".into()),
-        ("rrf".into(), "ORDER BY rrf(bm25(body, '{t}'), similarity(emb, :q), depth => 100) DESC".into()),
+        ("rrf".into(), "ORDER BY rrf(bm25(body, '{t}', syntax => 'plain'), similarity(emb, :q), depth => 100) DESC".into()),
     ];
     for a in alphas.iter().filter(|&&a| a > 0.0 && a < 1.0) {
-        methods.push((format!("weighted_{a:.1}"), format!("ORDER BY {a} * minmax(bm25(body, '{{t}}')) + {:.1} * minmax(similarity(emb, :q)) DESC", 1.0 - a)));
+        methods.push((format!("weighted_{a:.1}"), format!("ORDER BY {a} * minmax(bm25(body, '{{t}}', syntax => 'plain')) + {:.1} * minmax(similarity(emb, :q)) DESC", 1.0 - a)));
     }
     let mut ndcg: HashMap<String, Vec<f64>> = HashMap::new();
     let mut lat: HashMap<String, Vec<f64>> = HashMap::new();

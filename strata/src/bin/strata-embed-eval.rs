@@ -82,11 +82,11 @@ fn main() {
     eprintln!("loaded and embedded 3 fields in {load_s:.1} s ({empty_titles} documents without a title get no title vector)");
 
     // Rankings: (name, ORDER BY, which query vector :q is).
-    let mut runs: Vec<(String, String, Option<&str>)> = vec![("bm25 (title + text)".into(), "bm25(body, :t)".into(), None)];
+    let mut runs: Vec<(String, String, Option<&str>)> = vec![("bm25 (title + text)".into(), "bm25(body, :t, syntax => 'plain')".into(), None)];
     for (name, from) in FIELDS {
         runs.push((format!("{} vector of {}", a.model, from.join(" + ")), format!("similarity({name}, :q)"), Some("model")));
     }
-    runs.push((format!("rrf(bm25, {} vector of title + text)", a.model), "rrf(bm25(body, :t), similarity(emb_both, :q))".into(), Some("model")));
+    runs.push((format!("rrf(bm25, {} vector of title + text)", a.model), "rrf(bm25(body, :t, syntax => 'plain'), similarity(emb_both, :q))".into(), Some("model")));
     runs.push(("reference: Cohere embed-english-v3 vector of title + text".into(), "similarity(cohere, :q)".into(), Some("cohere")));
 
     let judged: Vec<_> = coll.queries.iter().filter(|q| coll.qrels.get(&q.id).is_some_and(|j| j.values().any(|&g| g > 0))).collect();

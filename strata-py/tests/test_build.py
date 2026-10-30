@@ -39,6 +39,18 @@ def test_builder_runs_as_its_sql(db):
     same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
 
 
+def test_bm25_weighs_requires_and_excludes_words(db):
+    t = db.table()
+    q = '+dragon ship^2 -river "secret garden"'
+    r = same(db, t.select("id", "description", score()).order_by(bm25("description", q)).limit(20),
+             f"SELECT id, description, score() FROM books ORDER BY bm25(description, '{q}') DESC LIMIT 20")
+    assert len(r) > 0 and all("dragon" in d and "river" not in d for _, d, _ in r.rows)
+    plain = same(db, t.select("id", score()).order_by(bm25("description", q, syntax="plain")).limit(20),
+                 f"SELECT id, score() FROM books ORDER BY bm25(description, '{q}', syntax => 'plain') DESC LIMIT 20")
+    assert plain.rows != r.rows
+    with pytest.raises(strata.StrataError, match="'query' or 'plain'"):
+        db.run(t.select("id").order_by(bm25("description", q, syntax="lucene")).limit(5))
+
 def test_ranking_expressions_run_as_their_sql(db):
     """Arithmetic, functions, minmax(), rank() and case() rank as SQL's
     expressions do: `+` adds raw values, and NULL ranks last."""
