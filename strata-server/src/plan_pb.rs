@@ -404,7 +404,9 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
             let phases = s.phases.into_iter().map(|p| Ok(Phase { count: p.count, expr: from_ex(p.expr)?, global: p.global })).collect::<Result<_, ApiError>>()?;
             let profile = s.profile.map(|r| ProfileRef { name: r.name, hash: r.hash });
             let guard = s.guard.map(from_guard).transpose()?.map(Box::new);
-            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases, profile, guard })
+            // The typed plan does not carry Search::per, a hint the operator
+            // above a Search does without.
+            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases, profile, guard, per: None })
         }
         N::Aggregate(a) => {
             let a = *a;

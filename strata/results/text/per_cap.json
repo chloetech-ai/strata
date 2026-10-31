@@ -14,8 +14,8 @@
   "variants": {
     "max_1_per_debate": {
       "debates_in_top20": 20.0,
-      "ms_p50": 6.106342,
-      "ms_p99": 25.549612,
+      "ms_p50": 2.367833,
+      "ms_p99": 5.393416,
       "ndcg10": 0.30648470578959586,
       "rows": 20.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC MAX 1 PER debate LIMIT 20",
@@ -23,8 +23,8 @@
     },
     "max_1_per_topic": {
       "debates_in_top20": 14.867709815078236,
-      "ms_p50": 549.097899,
-      "ms_p99": 634.6940079999999,
+      "ms_p50": 2.792291,
+      "ms_p99": 5.6591890000000005,
       "ndcg10": 0.3005002763221553,
       "rows": 15.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC MAX 1 PER topic LIMIT 20",
@@ -32,8 +32,8 @@
     },
     "max_2_per_debate": {
       "debates_in_top20": 14.546941678520627,
-      "ms_p50": 5.972824,
-      "ms_p99": 12.586112,
+      "ms_p50": 2.3231800000000002,
+      "ms_p99": 5.013757,
       "ndcg10": 0.37910864519933635,
       "rows": 20.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC MAX 2 PER debate LIMIT 20",
@@ -41,8 +41,8 @@
     },
     "max_2_per_topic": {
       "debates_in_top20": 16.336415362731152,
-      "ms_p50": 18.792967,
-      "ms_p99": 35.846389,
+      "ms_p50": 2.608698,
+      "ms_p99": 5.4035660000000005,
       "ndcg10": 0.3755226666257874,
       "rows": 20.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC MAX 2 PER topic LIMIT 20",
@@ -50,8 +50,8 @@
     },
     "max_3_per_debate": {
       "debates_in_top20": 12.551209103840684,
-      "ms_p50": 5.999872,
-      "ms_p99": 11.333041999999999,
+      "ms_p50": 2.343596,
+      "ms_p99": 5.468637999999999,
       "ndcg10": 0.41908533710913654,
       "rows": 20.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC MAX 3 PER debate LIMIT 20",
@@ -59,8 +59,8 @@
     },
     "max_3_per_topic": {
       "debates_in_top20": 14.23968705547653,
-      "ms_p50": 7.077642,
-      "ms_p99": 30.083042000000003,
+      "ms_p50": 2.392491,
+      "ms_p99": 5.420956,
       "ndcg10": 0.41610917381356577,
       "rows": 20.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC MAX 3 PER topic LIMIT 20",
@@ -68,8 +68,8 @@
     },
     "uncapped": {
       "debates_in_top20": 7.514935988620199,
-      "ms_p50": 3.2917810000000003,
-      "ms_p99": 8.015166,
+      "ms_p50": 1.6319329999999999,
+      "ms_p99": 4.046929,
       "ndcg10": 0.4891789418989393,
       "rows": 20.0,
       "sql": "SELECT id, topic, debate FROM docs WHERE id <> :qid ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT 20",

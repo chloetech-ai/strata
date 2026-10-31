@@ -190,7 +190,7 @@ fn by_start_views(data: &[Clip]) -> Vec<Clip> {
 }
 
 #[test]
-fn groups_read_the_scan_in_growing_slices() {
+fn the_scan_keeps_each_groups_first_rows() {
     let dir = tempfile::tempdir().unwrap();
     let data = clips();
     let db = load(dir.path(), &data);
@@ -199,16 +199,22 @@ fn groups_read_the_scan_in_growing_slices() {
         // A line per run of the scan: "query: <rows> rows: <its plan>".
         rs.stats.plan.iter().filter(|l| l.starts_with("query: ") && l.contains("Search clips")).map(|l| l.split(' ').nth(1).unwrap().parse().unwrap()).collect()
     };
-    // Four times the rows asked for, at least 32: enough videos.
+    let plan = |q: &str| db.query(q, &Params::new()).unwrap().stats.plan.join("\n");
+    // Ranked by BM25, the scan keeps each video's first row as it scores:
+    // it returns the rows asked for, once.
     let q = "SELECT DISTINCT ON (video) id FROM clips ORDER BY bm25(transcript, 'dog') DESC LIMIT 5";
-    assert_eq!(read(q), [32]);
-    // Few clips per row read are of a new video, so the scan grows.
+    assert_eq!(read(q), [5]);
+    assert!(plan(q).contains("max 1 per video: kept as bm25 scores each segment"), "{}", plan(q));
+    // By a column, the executor reads growing slices of the ranking (four
+    // times the rows asked for, then four times as many) until enough
+    // videos have a row, and the scan returns those.
     let q = "SELECT DISTINCT ON (video) id FROM clips ORDER BY views DESC LIMIT 38";
-    let reads = read(q);
-    assert!(reads.len() > 1 && reads.windows(2).all(|w| w[0] < w[1]), "{reads:?}");
-    // More groups than there are: the scan reads every row, and stops.
+    assert_eq!(read(q), [38]);
+    assert!(plan(q).contains(&format!("max 1 per video: read until enough rows are left ({CLIPS} read)")), "{}", plan(q));
+    // More groups than there are: every row is read, and each video's first
+    // returned.
     let q = "SELECT DISTINCT ON (video) id FROM clips ORDER BY views DESC LIMIT 1000";
-    assert_eq!(read(q).last(), Some(&CLIPS));
+    assert_eq!(read(q), [VIDEOS]);
     // Ordered in memory, the scan reads every row once.
     let q = "SELECT DISTINCT ON (video) id FROM clips ORDER BY views DESC, id LIMIT 5";
     assert_eq!(read(q), [CLIPS]);

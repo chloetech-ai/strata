@@ -396,6 +396,24 @@ pub struct RankParts {
     pub phases: Vec<Vec<Vec<Option<f64>>>>,
 }
 
+/// What a `MAX k PER` the executor keeps counts rows by
+/// ([`Executor::per_group`]): their value of a keyword or INT `field`, at
+/// most `per` rows of each.
+#[derive(Clone, Copy, Debug)]
+struct PerGroup {
+    field: usize,
+    per: usize,
+    int: bool,
+}
+
+/// A row's value that a `MAX k PER` counts it by, over segments (None
+/// for rows without one).
+#[derive(Hash, PartialEq, Eq)]
+enum GroupKey<'k> {
+    Str(&'k str),
+    Int(i64),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Hit {
     seg: usize,
@@ -1100,6 +1118,12 @@ impl<'a> Executor<'a> {
     }
 
     fn ordered_hits_to(&mut self, q: &Select, want: Option<usize>) -> Result<Vec<Hit>> {
+        // A shard answers its rows uncapped, for the coordinator to cap.
+        if let (Some(per), Some(want), Some(_), 0, false) = (q.per, want, q.limit, q.offset, self.opts.shard) {
+            if let Some(g) = self.per_group(per) {
+                return self.capped(q, g, want);
+            }
+        }
         Ok(match &q.order {
             None => self.unordered(&q.filter, want)?,
             Some(OrderBy::Score { score: Score::Column { field }, desc, nulls_first }) => {
@@ -1115,6 +1139,74 @@ impl<'a> Executor<'a> {
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
             Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
         })
+    }
+
+    /// The cap of a `MAX k PER` ([`Select::per`]) that the executor keeps
+    /// itself: by a keyword field's column or an INT field's.
+    fn per_group(&self, per: crate::query::logical::Per) -> Option<PerGroup> {
+        let f = self.schema.fields.get(per.field)?;
+        let int = matches!(f.ty, FieldType::Int) && f.indexed && !f.multi;
+        (per.k > 0 && (int || self.keyword_column(per.field))).then_some(PerGroup { field: per.field, per: per.k, int })
+    }
+
+    /// The first `want` rows of `q` in its order (rows tied on score by
+    /// key) that are among the first `g.per` of their group: what the
+    /// `MAX k PER` above the scan keeps of all its rows. BM25 keeps the cap
+    /// as it scores each segment ([`TextFieldReader::top_k_capped`]); other
+    /// orders read a growing number of rows (four times those wanted, at
+    /// least 32, then four times as many) until enough are left or none.
+    fn capped(&mut self, q: &Select, g: PerGroup, want: usize) -> Result<Vec<Hit>> {
+        let name = &self.schema.fields[g.field].name;
+        if let (Some(OrderBy::Score { score: Score::Bm25 { field, text, opts }, desc: true, .. }), None | Some(Tiebreak::Key { .. })) = (&q.order, &q.tiebreak) {
+            let plan = format!("max {} per {name}: kept as bm25 scores each segment", g.per);
+            let key_desc = matches!(q.tiebreak, Some(Tiebreak::Key { desc: true }));
+            let mut hits = self.bm25_rows(*field, text, opts, &q.filter, want, true, Some(g))?;
+            self.order_ties_by_key(&mut hits, key_desc);
+            self.stats.plan.push(plan);
+            return self.first_per(hits, g, want);
+        }
+        let plan = format!("max {} per {name}: read until enough rows are left", g.per);
+        let unique = Select { per: None, ..q.clone() };
+        let live = self.n_live();
+        let mut k = want.saturating_mul(4).max(32);
+        loop {
+            let k_now = k.min(live);
+            let hits = self.ordered_hits_to(&Select { limit: Some(k_now), ..unique.clone() }, Some(k_now))?;
+            let ran_out = hits.len() < k_now || k_now >= live;
+            let kept = self.first_per(hits, g, want)?;
+            if kept.len() >= want || ran_out {
+                self.stats.plan.push(format!("{plan} ({k_now} read)"));
+                return Ok(kept);
+            }
+            k = k.saturating_mul(4);
+        }
+    }
+
+    /// The first `want` of `hits`, in their order, that are among the first
+    /// `g.per` of their group (rows without a value one group, as
+    /// `MAX k PER` counts them).
+    fn first_per(&self, hits: Vec<Hit>, g: PerGroup, want: usize) -> Result<Vec<Hit>> {
+        let at: HashMap<usize, &Seg<'a>> = self.segs.iter().map(|s| (s.ord, s)).collect();
+        let mut seen: HashMap<Option<GroupKey<'_>>, usize> = HashMap::new();
+        let mut out = Vec::with_capacity(want.min(hits.len()));
+        for h in hits {
+            if out.len() >= want {
+                break;
+            }
+            let s = at.get(&h.seg).ok_or_else(|| err("a row of an unknown segment"))?;
+            let key = if g.int {
+                let col = self.numeric(s, g.field)?.col();
+                self.int_value(s, g.field, col, h.doc).map(GroupKey::Int)
+            } else {
+                self.keyword(s, g.field)?.value_of_doc(h.doc).map(GroupKey::Str)
+            };
+            let n = seen.entry(key).or_default();
+            if *n < g.per {
+                *n += 1;
+                out.push(h);
+            }
+        }
+        Ok(out)
     }
 
     // ---- readers ---------------------------------------------------------
@@ -2345,6 +2437,14 @@ impl<'a> Executor<'a> {
     /// The top `k` rows by BM25; with `ties`, also every row tied with the
     /// `k`-th.
     fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool) -> Result<Vec<Hit>> {
+        self.bm25_rows(field, query, opts, p, k, ties, None)
+    }
+
+    /// [`Self::bm25_top`]; with a cap on each group's rows, every row that
+    /// can be among the first `k` once each group keeps its first `per`
+    /// ([`TextFieldReader::top_k_capped`]), by decreasing score.
+    #[allow(clippy::too_many_arguments)]
+    fn bm25_rows(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool, cap: Option<PerGroup>) -> Result<Vec<Hit>> {
         let (q, stats) = self.bm25_scoring(field, query, opts)?;
         let terms = &q.terms;
         if terms.is_empty() {
@@ -2369,11 +2469,24 @@ impl<'a> Executor<'a> {
                 }
             };
             let f = ex.seg_filter_l(s, p, mode, l)?;
-            let hits = t.top_k_weighted(terms, &stats, params, k, f.as_dyn(), algo, ties);
+            let hits = match cap {
+                None => t.top_k_weighted(terms, &stats, params, k, f.as_dyn(), algo, ties),
+                Some(g) if g.int => {
+                    let col = ex.numeric(s, g.field)?.col();
+                    t.top_k_capped(terms, &stats, params, k, g.per, &|d: DocId| ex.int_value(s, g.field, col, d).map(|v| v as u64), f.as_dyn(), algo)
+                }
+                Some(g) => {
+                    let col = ex.keyword(s, g.field)?;
+                    t.top_k_capped(terms, &stats, params, k, g.per, &|d: DocId| col.code_of_doc(d).map(u64::from), f.as_dyn(), algo)
+                }
+            };
             l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
             Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
         })?;
         let mut hits = merge_top(per.concat(), usize::MAX);
+        if cap.is_some() {
+            return Ok(hits);
+        }
         let keep = if ties && k > 0 && hits.len() > k { k + hits[k..].iter().take_while(|h| h.score == hits[k - 1].score).count() } else { k };
         hits.truncate(keep);
         Ok(hits)

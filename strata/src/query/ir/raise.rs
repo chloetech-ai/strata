@@ -160,6 +160,13 @@ impl<'a> Raise<'a> {
         self.table(&search.table)?;
         let filter = self.filter(&search.filter)?;
         let guard = search.guard.as_deref().map(|g| self.guard(g)).transpose()?;
+        // A cap the executor can keep: a single-valued field of the table,
+        // under a ranked, ungrouped Search; any other is left to the node
+        // above.
+        let per = search.per.and_then(|c| {
+            let f = self.schema.fields.get(c.field as usize)?;
+            (!f.multi && c.k > 0).then(|| logical::Per { field: c.field as usize, k: usize::try_from(c.k).unwrap_or(usize::MAX) })
+        });
         let pk = self.schema.primary_key;
         let mut phases = Vec::new();
         let (projection, group_by, having, order, tiebreak) = match aggregate {
@@ -249,7 +256,8 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard })
+        let per = per.filter(|_| group_by.is_empty() && phases.is_empty() && order.is_some());
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard, per })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.

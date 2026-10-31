@@ -759,7 +759,7 @@ SELECT DISTINCT ON (country) country, seller, SUM(price) AS total FROM sales GRO
 
 - **Keys** are expressions of the rows (`video`, `lower(lang)`, `year % 10`), or columns of the answer by name or number (`DISTINCT ON (2)`), and need not be selected. Keys are equal when their values are: `NULL` with `NULL`, and a multi-valued column's list with the same list.
 - **The order.** PostgreSQL requires `ORDER BY` to start with the keys; Strata does not, so `ORDER BY` a score gives the best row of each group, the best groups first. When `ORDER BY` does start with the keys, the answer is PostgreSQL's. Without `ORDER BY`, which row of a group is kept is not defined.
-- **Reads.** When the query's order is the scan's (a score, or one numeric column), a `LIMIT` reads the scan in growing slices: four times the rows asked for (at least 32), then four times as many, until that many groups have a row or the scan runs out. A group with many rows near the top costs more reads, never a wrong answer. Ordered by several columns, the rows are sorted in memory, and the scan holds at most 1,000,000 rows.
+- **Reads.** When the query's order is the scan's (a score, or one numeric column), a `LIMIT` reads the scan in growing slices: four times the rows asked for (at least 32), then four times as many, until that many groups have a row or the scan runs out. A group with many rows near the top costs more reads, never a wrong answer. `DISTINCT ON` one keyword or `INT` field of a table ranked by `bm25` reads less: each segment keeps each group's first row as it scores ([`MAX k PER`](#at-most-k-rows-of-a-value-max-k-per) does the same with k rows), so the scan returns the rows asked for. Ordered by several columns, the rows are sorted in memory, and the scan holds at most 1,000,000 rows.
 - **Shards.** A coordinator keeps the first rows over its shards' merged rows, so three shards give what one database does, whether or not the table is placed by the keys (`shard_by`).
 
 The plan's node is `DistinctOn` (`Distinct on: video` in `EXPLAIN`), and its JSON needs the plan features `operators` and `distinct_on`; a version of Strata from before it refuses the plan by that name.
@@ -783,7 +783,7 @@ SELECT id FROM clips WHERE MATCH(transcript, 'dog')
 - **It ends `ORDER BY`**, and needs one: the rows a value keeps are its first in that order. `k` is a whole number, 1 or more, and `MAX 1 PER x` is `DISTINCT ON (x)`, with the same plan.
 - **A field of one value.** `field` is a field of the rows (`video`, `t.brand` in a join), and `NULL` is one value of its own. A multi-valued field is refused, since a row with several values would be in several groups.
 - **Not with `DISTINCT`** or `DISTINCT ON`, which already keep one row of each.
-- **Reads** are those of [`DISTINCT ON`](#the-first-row-of-each-group-distinct-on): growing slices of the scan until `LIMIT` rows are kept or the scan runs out. A field whose values cannot fill the `LIMIT`, such as one row of each of 15 topics for a `LIMIT` of 20, reads every row that matches.
+- **Reads.** A table's own rows ranked by `bm25` and capped by a keyword or `INT` field keep the cap as they are scored: each segment keeps each value's best k rows (and the rows tied with its k-th) and skips the rows that can no longer reach the `LIMIT`, so the query reads its rows once. Other rankings, and caps over joined or derived rows or by other fields, read growing slices of the ranking until `LIMIT` rows are kept or it runs out, as [`DISTINCT ON`](#the-first-row-of-each-group-distinct-on) does. A field whose values cannot fill the `LIMIT`, such as one row of each of 15 topics for a `LIMIT` of 20, reads every row that matches either way, and returns 15.
 - **Shards.** A coordinator keeps each value's first rows over its shards' merged rows, so three shards give what one database does.
 
 The plan's node is `DistinctOn` with `per` (`At most 2 per: video` in `EXPLAIN`). With `k` above 1 its JSON needs the plan feature `per_cap`, so a version of Strata from before it refuses the plan rather than keeping one row of each value. Python's builder writes it `.max_per(2, "video")`.
@@ -792,15 +792,15 @@ On ArguAna (BEIR's 8,674 arguments from 592 debates on 15 topics; a document's d
 
 | top 20 | nDCG@10 | debates | topics | p50 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|
-| uncapped | 0.489 | 7.5 | 3.8 | 3.3 | 8.0 |
-| `MAX 1 PER debate` | 0.307 | 20.0 | 7.2 | 6.1 | 25.6 |
-| `MAX 2 PER debate` | 0.379 | 14.5 | 5.9 | 6.0 | 12.6 |
-| `MAX 3 PER debate` | 0.419 | 12.6 | 5.4 | 6.0 | 11.3 |
-| `MAX 1 PER topic` | 0.301 | 14.9 | 15.0 | 549 | 635 |
-| `MAX 2 PER topic` | 0.376 | 16.3 | 11.4 | 18.8 | 35.9 |
-| `MAX 3 PER topic` | 0.416 | 14.2 | 9.1 | 7.1 | 30.1 |
+| uncapped | 0.489 | 7.5 | 3.8 | 1.6 | 4.1 |
+| `MAX 1 PER debate` | 0.307 | 20.0 | 7.2 | 2.4 | 5.4 |
+| `MAX 2 PER debate` | 0.379 | 14.5 | 5.9 | 2.3 | 5.0 |
+| `MAX 3 PER debate` | 0.419 | 12.6 | 5.4 | 2.3 | 5.5 |
+| `MAX 1 PER topic` | 0.301 | 14.9 | 15.0 | 2.8 | 5.7 |
+| `MAX 2 PER topic` | 0.376 | 16.3 | 11.4 | 2.6 | 5.4 |
+| `MAX 3 PER topic` | 0.416 | 14.2 | 9.1 | 2.4 | 5.4 |
 
-Debates and topics are the mean number of each in a query's answer. A cap of debates costs about twice the uncapped query, for the growing slices, and the fewer a field's values the deeper a cap reads: two per topic take 18.8 ms. One row of each of the 15 topics cannot fill 20 rows, so that query reads every argument that matches and returns 15.
+Debates and topics are the mean number of each in a query's answer. Each segment keeps the cap as it scores, so a cap costs about 1.5 times the uncapped query whatever the field: BM25 can skip fewer rows, since the 20th row kept scores lower than the 20th of all. One row of each of the 15 topics cannot fill 20 rows, so that query scores every argument that matches, once, and returns 15. Before the scan kept the cap, the same queries read growing slices of the ranking: 6.0 to 6.1 ms by debate, 7.1 and 18.8 ms for three and two per topic, and 549 ms for one per topic, which read every row again at each slice (with the uncapped query at 3.3 ms in that run).
 
 Caps trade relevance for spread. ArguAna's answer to a query is the argument against it, in the query's own debate, so a cap on debates also caps how many of the right debate's arguments the ranking can show: nDCG@10 falls from 0.489 to 0.307 with one per debate, and to 0.419 with three. The run is `strata-per-cap-bench` ([`results/text/per_cap.json`](https://github.com/rkonow/strata/blob/main/strata/results/text/per_cap.json)).
 
