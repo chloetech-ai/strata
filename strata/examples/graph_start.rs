@@ -36,7 +36,8 @@ fn clustered(n: usize, rng: &mut impl Rng, centres: &[Vec<f32>]) -> Vec<Vec<f32>
 }
 
 fn recall(seg: &SegmentFile, queries: &[Vec<f32>], ef: usize) -> f64 {
-    let r = VectorReader::open(seg, "emb").unwrap();
+    // Field emb, the table's second (id 1), names its sections f1.
+    let r = VectorReader::open(seg, "f1").unwrap();
     let params = SearchParams { strategy: Strategy::Hnsw, ef, ..SearchParams::default() };
     let mut found = 0;
     for q in queries {

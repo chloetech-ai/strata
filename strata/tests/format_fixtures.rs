@@ -1,12 +1,16 @@
-//! The format 2 and format 3 fixtures (`tests/fixtures/README.md`), which
-//! older versions of Strata wrote, open with this one in both layouts:
-//! their rows, filters and searches are as written, they take writes,
-//! flushes and merges and stay in the format they were written in. So do
-//! the fixtures of numbered writes, which go on counting from theirs, and
-//! those of rank profiles, which rank as they were written to until the
-//! last is dropped. And this version still writes the same bytes for the
-//! same writes, so a
-//! change to what Strata writes is a choice, made with a new fixture set.
+//! The fixture sets (`tests/fixtures/README.md`). Those that versions of
+//! Strata from before field ids wrote (format 2 and format 3, numbered
+//! writes, rank profiles) are refused by a plain open, which names
+//! `strata::upgrade`; opened to be copied (`DbOptions::open_old`), their
+//! rows, filters and searches are as written, they take writes, flushes
+//! and merges and stay in the format they were written in, the numbered
+//! ones go on counting from theirs and the profiles rank as they were
+//! written to until the last is dropped. `strata::upgrade` copies each
+//! into a database of this version that holds the same, but the numbered
+//! ones, which it refuses. The sets this version wrote (`fieldids/`, the
+//! same writes) open as any database does and pass the same checks. And
+//! this version still writes their bytes for the same writes, so a change
+//! to what Strata writes is a choice, made with a new fixture set.
 
 #[path = "fixtures/writer.rs"]
 mod writer;
@@ -20,6 +24,7 @@ use strata::db::{Db, SqlResult};
 use strata::query::Params;
 use strata::storage::pager::{Meta, PAGE};
 use strata::storage::{DbOptions, Layout, MergePolicy};
+use strata::upgrade::{needs_upgrade, old_path, upgrade};
 use strata::value::Value;
 use writer::OCT1;
 
@@ -29,16 +34,36 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// The fixture sets of one format: `format3`, which this version writes,
-/// and any older set kept as `format3-<commit>`.
-fn sets(format: &str) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(fixtures())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.is_dir() && p.file_name().unwrap().to_str().unwrap().split('-').next() == Some(format))
-        .collect();
+/// Whether a set was written before field ids, or by this version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Era {
+    /// Opens only to be copied (`DbOptions::open_old`), and stays in the
+    /// format it was written in.
+    Old,
+    /// Format 3 with `field_ids`.
+    Ids,
+}
+
+/// The sets of one kind of writes (`format2`, `format3`, `seqno`,
+/// `profiles`): those written before field ids, at the top (and any older
+/// copy kept as `<name>-<commit>`), and those under `fieldids/` (and any
+/// older `fieldids-<commit>/`).
+fn sets(name: &str) -> Vec<(PathBuf, Era)> {
+    let first = |p: &Path| p.file_name().unwrap().to_str().unwrap().split('-').next().unwrap().to_string();
+    let mut v: Vec<(PathBuf, Era)> = Vec::new();
+    for e in std::fs::read_dir(fixtures()).unwrap() {
+        let p = e.unwrap().path();
+        if !p.is_dir() {
+            continue;
+        }
+        if first(&p) == name {
+            v.push((p, Era::Old));
+        } else if first(&p) == "fieldids" && p.join(name).is_dir() {
+            v.push((p.join(name), Era::Ids));
+        }
+    }
     v.sort();
-    assert!(!v.is_empty(), "no {format} fixtures");
+    assert!(v.iter().any(|s| s.1 == Era::Old) && v.iter().any(|s| s.1 == Era::Ids), "{name}: {v:?}");
     v
 }
 
@@ -54,9 +79,21 @@ fn copies(set: &Path, dir: &Path) -> [PathBuf; 2] {
     [dir.join("db.strata"), dir.join("db.dir")]
 }
 
-fn options(path: &Path) -> DbOptions {
+fn options(path: &Path, era: Era) -> DbOptions {
     let layout = if path.is_dir() { Layout::Directory } else { Layout::SingleFile };
-    DbOptions { layout, sync: false, ..DbOptions::default() }
+    DbOptions { layout, sync: false, open_old: era == Era::Old, ..DbOptions::default() }
+}
+
+/// Opens a set's copy as its era opens; a set from before field ids is
+/// refused without `open_old`, by a message that names the upgrade.
+fn open(path: &Path, era: Era) -> Db {
+    let what = path.display();
+    if era == Era::Old {
+        let e = Db::open(path, options(path, Era::Ids)).err().unwrap_or_else(|| panic!("{what}: opened without open_old")).to_string();
+        assert!(e.contains("before field ids") && e.contains("strata::upgrade"), "{what}: {e}");
+    }
+    assert_eq!(needs_upgrade(path).unwrap(), era == Era::Old, "{what}");
+    Db::open(path, options(path, era)).unwrap_or_else(|e| panic!("{what}: {e}"))
 }
 
 fn run(db: &Db, sql: &str) -> SqlResult {
@@ -157,13 +194,13 @@ impl Format2 {
 }
 
 #[test]
-fn format_2_fixtures_open_and_stay_format_2() {
-    for set in sets("format2") {
+fn format_2_fixtures_open_and_stay_in_their_format() {
+    for (set, era) in sets("format2") {
         let dir = tempfile::tempdir().unwrap();
         for path in copies(&set, dir.path()) {
             let what = path.display().to_string();
             let mut model = Format2::written();
-            let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let db = open(&path, era);
             model.check(&db);
 
             run(&db, "INSERT INTO t (id, n, body) VALUES ('k000100', 9, 'document 100 version 1 lorem ipsum')");
@@ -181,10 +218,10 @@ fn format_2_fixtures_open_and_stay_format_2() {
             merge(&db);
             db.storage().check().unwrap();
             model.check(&db);
-            assert_eq!(format_on_disk(&path), 2, "{what}");
+            assert_eq!(format_on_disk(&path), if era == Era::Old { 2 } else { 3 }, "{what}");
             drop(db);
 
-            let db = Db::open(&path, options(&path)).unwrap();
+            let db = open(&path, era);
             model.check(&db);
         }
     }
@@ -246,12 +283,12 @@ impl Format3 {
 
 #[test]
 fn format_3_fixtures_open_and_stay_format_3() {
-    for set in sets("format3") {
+    for (set, era) in sets("format3") {
         let dir = tempfile::tempdir().unwrap();
         for path in copies(&set, dir.path()) {
             let what = path.display().to_string();
             let mut model = Format3::written();
-            let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let db = open(&path, era);
             model.check(&db);
 
             // done, priority and state take their defaults.
@@ -279,7 +316,7 @@ fn format_3_fixtures_open_and_stay_format_3() {
             assert_eq!(format_on_disk(&path), 3, "{what}");
             drop(db);
 
-            let db = Db::open(&path, options(&path)).unwrap();
+            let db = open(&path, era);
             model.check(&db);
         }
     }
@@ -292,7 +329,7 @@ fn format_3_fixtures_open_and_stay_format_3() {
 #[test]
 fn numbered_fixtures_open_and_go_on_counting() {
     use strata::storage::SeqNo;
-    for set in sets("seqno") {
+    for (set, era) in sets("seqno") {
         let dir = tempfile::tempdir().unwrap();
         for path in copies(&set, dir.path()) {
             let what = path.display().to_string();
@@ -314,7 +351,7 @@ fn numbered_fixtures_open_and_go_on_counting() {
                     assert_eq!(db.storage().seq_of(None, &Value::Str(key(i))).unwrap(), seqs.get(&i).copied(), "{what}: {}", key(i));
                 }
             };
-            let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let db = open(&path, era);
             check(&db, &t);
             assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 5 }), "{what}");
             assert_eq!(db.storage().numbering().unwrap().terms, vec![(1, 1), (2, 1)], "{what}");
@@ -336,7 +373,7 @@ fn numbered_fixtures_open_and_go_on_counting() {
             assert_eq!(format_on_disk(&path), 3, "{what}");
             drop(db);
 
-            let db = Db::open(&path, options(&path)).unwrap();
+            let db = open(&path, era);
             check(&db, &t);
             assert_eq!(db.storage().seq_no(), Some(SeqNo { term: 2, seq: 7 }), "{what}");
             check_seqs(&db, &seqs);
@@ -348,11 +385,12 @@ fn numbered_fixtures_open_and_go_on_counting() {
 /// replaced in the WAL (its other profile, flushed into the manifest, was
 /// dropped there) and `u` has `notes`, logged there too. Profiles change
 /// and survive a flush, a merge and opening again; once the last is
-/// dropped and flushed, the database is format 2 again and its log names
-/// no feature.
+/// dropped and flushed, a set from before field ids is format 2 again
+/// (one of this version stays format 3, for its ids), and its log names no
+/// feature.
 #[test]
 fn profile_fixtures_rank_as_written() {
-    for set in sets("profiles") {
+    for (set, era) in sets("profiles") {
         let dir = tempfile::tempdir().unwrap();
         for path in copies(&set, dir.path()) {
             let what = path.display().to_string();
@@ -363,7 +401,8 @@ fn profile_fixtures_rank_as_written() {
             assert_eq!(format_on_disk(&path), 3, "{what}");
             if path.is_dir() {
                 let (_, m) = strata::storage::dir::read_current(&path).unwrap();
-                assert_eq!(m.features(), ["rank_profiles"], "{what}");
+                let features: &[&str] = if era == Era::Old { &["rank_profiles"] } else { &["field_ids", "rank_profiles"] };
+                assert_eq!(m.features(), features, "{what}");
                 let names: Vec<&str> = m.tables[0].profiles.iter().map(|p| p.name.as_str()).collect();
                 assert_eq!(names, ["by_n", "phased"], "{what}: flushed with the deletes");
             }
@@ -376,7 +415,7 @@ fn profile_fixtures_rank_as_written() {
                 let (a, b) = (rows(db, "SELECT id, score() FROM u ORDER BY rank_profile('notes') LIMIT 5"), rows(db, "SELECT id, score() FROM u ORDER BY bm25(note, 'cats') DESC LIMIT 5"));
                 assert!(a.len() == 5 && a == b, "{what}: {a:?}");
             };
-            let db = Db::open(&path, options(&path)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let db = open(&path, era);
             assert_eq!(profiles(&db), [vec!["by_n: SELECT * FROM t ORDER BY n".to_string()], vec!["notes: SELECT * FROM u ORDER BY bm25(note, :q) DESC".to_string()]], "{what}");
             check(&db, "n");
             run(&db, "CREATE OR REPLACE RANK PROFILE by_n ON t AS SELECT * FROM t ORDER BY n DESC");
@@ -388,7 +427,7 @@ fn profile_fixtures_rank_as_written() {
             assert_eq!(format_on_disk(&path), 3, "{what}");
             drop(db);
 
-            let db = Db::open(&path, options(&path)).unwrap();
+            let db = open(&path, era);
             check(&db, "n DESC");
             let [t, u] = profiles(&db);
             assert_eq!((t.len(), u.len()), (2, 1), "{what}: {t:?}");
@@ -399,10 +438,10 @@ fn profile_fixtures_rank_as_written() {
                 run(&db, &format!("DROP RANK PROFILE {p} ON {t}"));
             }
             db.storage().flush().unwrap();
-            assert_eq!(format_on_disk(&path), 2, "{what}: no table has a profile");
+            assert_eq!(format_on_disk(&path), if era == Era::Old { 2 } else { 3 }, "{what}: no table has a profile");
             assert_eq!(std::fs::read(&wal).unwrap()[..8], *b"STRWAL01", "{what}");
             drop(db);
-            let db = Db::open(&path, options(&path)).unwrap();
+            let db = open(&path, era);
             Format2::written().check(&db);
             assert_eq!(profiles(&db), [Vec::<String>::new(), Vec::new()], "{what}");
         }
@@ -437,12 +476,14 @@ fn same_bytes(old: &Path, new: &Path) {
     );
 }
 
+/// The sets this version writes, by the writes in `writer.rs`, are those in
+/// `fieldids/`.
 #[test]
 fn this_version_writes_the_fixtures_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     writer::write_all(dir.path());
     for set in ["format2", "format3", "seqno", "profiles"] {
-        let (old, new) = (fixtures().join(set), dir.path().join(set));
+        let (old, new) = (fixtures().join("fieldids").join(set), dir.path().join(set));
         same_bytes(&old.join("db.strata"), &new.join("db.strata"));
         same_bytes(&old.join("db.strata-wal"), &new.join("db.strata-wal"));
         let names = |d: &Path| {
@@ -466,5 +507,132 @@ fn this_version_writes_the_fixtures_byte_for_byte() {
                 _ => same_bytes(&old.join(&name), &new.join(&name)),
             }
         }
+    }
+}
+
+/// `strata::upgrade` copies a set from before field ids into a database of
+/// this version, in the same layout, that holds the same rows, filters,
+/// searches and rank profiles and takes writes; it keeps the old database
+/// beside it, which still opens to be copied, and a second call does
+/// nothing.
+#[test]
+fn upgrade_copies_the_sets_from_before_field_ids() {
+    for name in ["format2", "format3", "profiles"] {
+        for (set, era) in sets(name) {
+            if era != Era::Old {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            for path in copies(&set, dir.path()) {
+                let what = path.display().to_string();
+                let before = {
+                    let db = open(&path, Era::Old);
+                    db.storage().tables().iter().map(|t| (t.table.clone(), db.storage().rank_profiles(&t.table).unwrap())).collect::<Vec<_>>()
+                };
+                let up = upgrade(&path).unwrap().unwrap_or_else(|| panic!("{what}: nothing to upgrade"));
+                assert_eq!(up.old, old_path(&path), "{what}");
+                assert_eq!(up.tables, before.len(), "{what}");
+                assert_eq!(path.is_dir(), up.old.is_dir(), "{what}: the same layout");
+                assert_eq!(upgrade(&path).unwrap(), None, "{what}: upgraded already");
+
+                let db = open(&path, Era::Ids);
+                assert_eq!(format_on_disk(&path), 3, "{what}");
+                let after: Vec<_> = db.storage().tables().iter().map(|t| (t.table.clone(), db.storage().rank_profiles(&t.table).unwrap())).collect();
+                assert_eq!(after, before, "{what}: tables and profiles");
+                match name {
+                    "format3" => {
+                        let mut model = Format3::written();
+                        model.check(&db);
+                        assert_eq!(up.rows, model.0.len() as u64, "{what}");
+                        run(&db, "UPDATE tasks SET done = TRUE, priority = 4 WHERE id = 'k000005'");
+                        let t = model.0.get_mut(&5).unwrap();
+                        (t.done, t.priority) = (true, 4);
+                        db.storage().flush().unwrap();
+                        model.check(&db);
+                    }
+                    _ => {
+                        let mut model = Format2::written();
+                        model.check(&db);
+                        assert_eq!(up.rows, (model.t.len() + model.u.len()) as u64, "{what}");
+                        // A second segment beside the copy's, to merge.
+                        run(&db, "INSERT INTO t (id, n, body) VALUES ('k000100', 9, 'document 100 version 1 lorem ipsum')");
+                        model.t.insert(100, (9, 1));
+                        db.storage().flush().unwrap();
+                        run(&db, "UPDATE t SET n = 9 WHERE id = 'k000012'");
+                        run(&db, "DELETE FROM u WHERE id = 0");
+                        model.t.get_mut(&12).unwrap().0 = 9;
+                        model.u.remove(&0);
+                        db.storage().flush().unwrap();
+                        merge(&db);
+                        model.check(&db);
+                    }
+                }
+                db.storage().check().unwrap();
+                drop(db);
+                // The old database is as it was: it still needs the upgrade.
+                assert!(needs_upgrade(&up.old).unwrap(), "{what}");
+                drop(open(&up.old, Era::Old));
+            }
+        }
+    }
+}
+
+/// A database that numbers its writes is not copied: its copy could not go
+/// on from its numbers. The upgrade leaves it as it was.
+#[test]
+fn upgrade_refuses_numbered_writes() {
+    for (set, era) in sets("seqno") {
+        if era != Era::Old {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for path in copies(&set, dir.path()) {
+            let what = path.display().to_string();
+            let e = upgrade(&path).unwrap_err().to_string();
+            assert!(e.contains("numbers its writes"), "{what}: {e}");
+            assert!(!old_path(&path).exists(), "{what}");
+            let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            assert!(!names.iter().any(|n| n.contains("upgrading")), "{what}: {names:?}");
+            drop(open(&path, Era::Old));
+        }
+    }
+}
+
+/// An upgrade cut short between its two renames (the old database moved
+/// aside, the copy not yet in its place) is finished by the next call; one
+/// cut short while copying starts again.
+#[test]
+fn an_upgrade_cut_short_is_finished() {
+    let (set, _) = sets("format2").into_iter().find(|s| s.1 == Era::Old).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for path in copies(&set, dir.path()) {
+        let what = path.display().to_string();
+        let mut upgrading = path.clone().into_os_string();
+        upgrading.push(".upgrading");
+        let upgrading = PathBuf::from(upgrading);
+        // Cut short while copying: a partial copy is left beside it.
+        if path.is_dir() {
+            std::fs::create_dir(&upgrading).unwrap();
+            std::fs::write(upgrading.join("CURRENT"), b"partial").unwrap();
+        } else {
+            std::fs::write(&upgrading, b"partial").unwrap();
+        }
+        upgrade(&path).unwrap().unwrap();
+        assert!(!upgrading.exists(), "{what}");
+        // Cut short between the renames: move the copy back.
+        let wal = |p: &Path| {
+            let mut w = p.to_path_buf().into_os_string();
+            w.push("-wal");
+            PathBuf::from(w)
+        };
+        std::fs::rename(&path, &upgrading).unwrap();
+        if wal(&path).exists() {
+            std::fs::rename(wal(&path), wal(&upgrading)).unwrap();
+        }
+        assert!(!path.exists());
+        assert!(upgrade(&path).unwrap().is_some(), "{what}");
+        assert!(!upgrading.exists(), "{what}");
+        let db = open(&path, Era::Ids);
+        Format2::written().check(&db);
     }
 }

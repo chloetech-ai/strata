@@ -655,10 +655,21 @@ fn train_codebook(py: Python<'_>, vectors: &Bound<'_, PyAny>, name: &str, models
     py.detach(|| Codebook::train(&flat, dim, &opts)?.save(name, &models)).map_err(err)
 }
 
+/// Copies the database at `path`, written by a version of Strata from
+/// before field ids (which no longer opens), into this version's format in
+/// its place, keeping the old one as `<path>.before-field-ids`. Returns
+/// `None` when it needs no upgrade, else the old database's path, the
+/// tables copied and their rows.
+#[pyfunction]
+fn upgrade(py: Python<'_>, path: PathBuf) -> PyResult<Option<(PathBuf, usize, u64)>> {
+    Ok(py.detach(|| strata::upgrade::upgrade(&path)).map_err(err)?.map(|u| (u.old, u.tables, u.rows)))
+}
+
 #[pymodule]
 fn _strata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
     m.add_function(wrap_pyfunction!(train_codebook, m)?)?;
+    m.add_function(wrap_pyfunction!(upgrade, m)?)?;
     m.add("StrataError", m.py().get_type::<StrataError>())?;
     Ok(())
 }

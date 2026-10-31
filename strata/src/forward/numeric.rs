@@ -286,6 +286,8 @@ impl Histogram {
 /// INT or FLOAT field.
 pub(crate) struct NumericBuilder {
     name: String,
+    /// Names its sections ([`Field::key`]).
+    key: String,
     float: bool,
     ints: Vec<Option<i64>>,
     floats: Vec<Option<f64>>,
@@ -297,6 +299,7 @@ impl NumericBuilder {
         let buckets = super::usize_option(opts, "forward.range_buckets", DEFAULT_BUCKETS)?;
         Ok(NumericBuilder {
             name: field.name.clone(),
+            key: field.key(),
             float: matches!(field.ty, FieldType::Float),
             ints: Vec::new(),
             floats: Vec::new(),
@@ -335,14 +338,14 @@ impl FieldIndexBuilder for NumericBuilder {
         w.u64(k);
         w.u64(s);
         write_blocks(&keys, &mut w);
-        out.put(format!("col.{}", self.name), w.finish());
+        out.put(format!("col.{}", self.key), w.finish());
 
         let mut sorted: Vec<i64> = keys.iter().flatten().copied().collect();
         sorted.sort_unstable();
         let (lo, hi, count) = if self.buckets > 0 { equi_depth(&sorted, self.buckets) } else { Default::default() };
-        out.put(format!("col.{}.hist", self.name), Histogram::write(&lo, &hi, &count));
+        out.put(format!("col.{}.hist", self.key), Histogram::write(&lo, &hi, &count));
         if self.buckets > 0 {
-            out.put(format!("range.{}", self.name), super::range::write_buckets(&keys, &lo, &hi));
+            out.put(format!("range.{}", self.key), super::range::write_buckets(&keys, &lo, &hi));
         }
         Ok(())
     }

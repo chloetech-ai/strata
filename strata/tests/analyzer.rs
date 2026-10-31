@@ -30,6 +30,11 @@ fn ids(db: &Db, sql: &str) -> Vec<String> {
     v
 }
 
+/// The features the database at `path` needs.
+fn required(path: &Path) -> Vec<String> {
+    strata::storage::manifest::read(path).unwrap().features()
+}
+
 fn format_on_disk(path: &Path) -> u32 {
     if path.is_dir() {
         let cur: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("CURRENT")).unwrap()).unwrap();
@@ -109,9 +114,10 @@ fn through_sql(path: &Path, layout: Layout) {
     let opts = || DbOptions { sync: false, layout, ..DbOptions::default() };
     let plain = Schema::new("papers", vec![Field::new("id", FieldType::Keyword), Field::new("title", FieldType::Text { positions: true })], Some("id")).unwrap();
     let db = Db::create(path, plain, opts()).unwrap();
-    // english by name is english: it needs no feature.
+    // english by name is english: it needs no feature (but field ids, as
+    // every database does).
     run(&db, "CREATE TABLE plain (id KEYWORD PRIMARY KEY, body TEXT OPTIONS(analyzer = 'english'))");
-    assert_eq!(format_on_disk(path), 2);
+    assert_eq!(required(path), ["field_ids"]);
     assert_eq!(db.storage().table("plain").unwrap().fields[1].analyzer, None);
     for bad in [
         "CREATE TABLE t (id KEYWORD PRIMARY KEY, body TEXT OPTIONS(analyzer = 'french'))",
@@ -123,9 +129,7 @@ fn through_sql(path: &Path, layout: Layout) {
 
     run(&db, NOTES);
     assert_eq!(format_on_disk(path), 3);
-    if layout == Layout::Directory {
-        assert_eq!(manifest(path).0["features"]["required"], serde_json::json!(["analyzer:simple:1"]));
-    }
+    assert_eq!(required(path), ["analyzer:simple:1", "field_ids"]);
     let notes = db.storage().table("notes").unwrap();
     assert_eq!(notes.fields[1].analyzer, Some(Analyzer::Simple));
     assert_eq!(notes.to_short_json()["fields"][1], serde_json::json!({"name": "title", "type": "text", "analyzer": "simple"}));
@@ -147,9 +151,9 @@ fn through_sql(path: &Path, layout: Layout) {
     let db = Db::open(path, opts()).unwrap();
     searches(&db);
     run(&db, "DROP TABLE notes");
-    assert_eq!(format_on_disk(path), 2);
+    assert_eq!(required(path), ["field_ids"]);
     run(&db, "DROP TABLE plain");
-    assert_eq!(format_on_disk(path), 1);
+    assert_eq!((format_on_disk(path), required(path)), (3, vec!["field_ids".to_string()]));
 }
 
 // A version of Strata without an analyzer refuses the database by the
@@ -162,10 +166,10 @@ fn a_missing_analyzer_is_refused_by_name() {
     let schema = Schema::new("notes", vec![Field::new("id", FieldType::Keyword), Field::new("title", FieldType::Text { positions: true }).analyzer(Analyzer::Simple)], Some("id")).unwrap();
     Db::create(&path, schema, opts()).unwrap();
     let (mut m, mut rewrite) = manifest(&path);
-    assert_eq!(m["features"]["required"], serde_json::json!(["analyzer:simple:1"]));
+    assert_eq!(m["features"]["required"], serde_json::json!(["analyzer:simple:1", "field_ids"]));
     assert_eq!(m["tables"][0]["schema"]["fields"][1]["analyzer"], serde_json::json!({"name": "simple", "version": 1}));
     // As a later version would write a field analysed by simple version 2.
-    m["features"]["required"] = serde_json::json!(["analyzer:simple:2"]);
+    m["features"]["required"] = serde_json::json!(["analyzer:simple:2", "field_ids"]);
     m["tables"][0]["schema"]["fields"][1]["analyzer"]["version"] = 2.into();
     rewrite(&m);
     let e = Db::open(&path, opts()).err().expect("a missing analyzer is refused").to_string();
