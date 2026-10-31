@@ -5,6 +5,7 @@ import topology from "./topology.js";
 import performance from "./performance.js";
 import alerts from "./alerts.js";
 import queries from "./queries.js";
+import profile from "./profile.js";
 import logs from "./logs.js";
 import access from "./access.js";
 import system from "./system.js";
@@ -21,4 +22,4 @@ import graph from "./graph.js";
 import classic from "./classic.js";
 
 export const GROUPS = ["Monitor", "Workload", "Data", "Tune", "Explore", "Admin", "More"];
-export const VIEWS = [overview, topology, performance, alerts, queries, logs, sql, builder, schema, importer, relevance, recsys, sid, autocomplete, media, graph, access, system, classic];
+export const VIEWS = [overview, topology, performance, alerts, queries, profile, logs, sql, builder, schema, importer, relevance, recsys, sid, autocomplete, media, graph, access, system, classic];

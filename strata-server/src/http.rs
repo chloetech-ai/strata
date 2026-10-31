@@ -8,7 +8,7 @@
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
 //! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
 //! | `GET /metrics` | | Prometheus text |
-//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?}` | rows; with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?}`) also `request` and `logged` ([`strata::rank_log`]) |
+//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?, trace?, profile?}` | rows, and in `stats.steps` the query's timed steps (with `profile`, their CPU time too, and with `trace` or `profile` the request's spans in `trace`); with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?}`) also `request` and `logged` ([`strata::rank_log`]) |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/rank_log/export` | `{table?, since?, until?, events?, history?, window?, grades?}` | NDJSON: one record per logged row ([`strata::rank_log::export`]) |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
@@ -28,6 +28,8 @@
 //! | `DELETE /v1/queries/:id` | | `{cancelled}`: the query stops at its next check and answers 499 |
 //! | `GET /v1/queries/recent?since=ms&limit=n`, `/v1/queries/slow?limit=n` | | `{queries}`: the latest that ended (or the slow ones), the newest first, each with its trace |
 //! | `GET /v1/queries/request/:id` | | `{queries}`: those a request (its `x-request-id`) ran |
+//! | `GET /v1/queries/finished/:id` | | one ended query with its whole profile: trace, steps ([`strata::query::steps`]) and plan lines (the lists give each without them, unless `full=true`) |
+//! | `GET /v1/profile/settings`, `PUT /v1/profile/settings` | `{slow_ms?, cpu_all?}` | the slow threshold (until restarted) and whether every query's CPU time is measured |
 //! | `GET /v1/queries/stats?limit=n`, `POST /v1/queries/stats/reset` | | statistics per statement shape, by time spent ([`crate::telemetry::Statements`]) |
 //! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
 //! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
@@ -141,6 +143,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/queries/recent", get(recent_queries))
         .route("/v1/queries/slow", get(slow_queries))
         .route("/v1/queries/request/:id", get(request_queries))
+        .route("/v1/queries/finished/:id", get(finished_query))
+        .route("/v1/profile/settings", get(profile_settings).merge(put(put_profile_settings)))
         .route("/v1/queries/stats", get(query_stats))
         .route("/v1/queries/stats/reset", post(reset_query_stats))
         .route("/v1/timeseries", get(timeseries))
@@ -258,7 +262,7 @@ fn route_scope(method: &axum::http::Method, route: &str) -> Scope {
         "/v1/export" => Scope::Admin,
         "/v1/synonyms" if method == Method::PUT => Scope::Admin,
         "/v1/alerts/rules" => Scope::Admin,
-        r if r.starts_with("/v1/admin/") || r.starts_with("/v1/queries") || r.starts_with("/v1/logs") => Scope::Admin,
+        r if r.starts_with("/v1/admin/") || r.starts_with("/v1/queries") || r.starts_with("/v1/logs") || r.starts_with("/v1/profile") => Scope::Admin,
         _ => Scope::Read,
     }
 }
@@ -392,6 +396,7 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
         snapshot: body_u64(&b, "snapshot"),
         partial: b.get("partial").and_then(|v| v.as_bool()),
         after: after(&b)?,
+        profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true),
         ..Default::default()
     };
     if let Some(log) = b.get("log") {
@@ -403,8 +408,9 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
     }
     let a = app.svc.query(req).await?;
     let mut j = answer(&a);
-    // `"trace": true`: the timed steps the query took.
-    if b.get("trace").and_then(|v| v.as_bool()) == Some(true) {
+    // `"trace": true`: the timed steps the request took; `"profile":
+    // true` answers them too, beside its steps' CPU time.
+    if b.get("trace").and_then(|v| v.as_bool()) == Some(true) || b.get("profile").and_then(|v| v.as_bool()) == Some(true) {
         j["trace"] = json!(telemetry::trace().map(|t| t.spans()).unwrap_or_default());
     }
     Ok(AxJson(j))
@@ -900,7 +906,7 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
             Some(rows.iter().take(n as usize).map(|r| names.iter().zip(r.as_array().into_iter().flatten()).map(|(c, v)| (c.as_str().unwrap_or("").to_string(), v.clone())).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>())
         }
     };
-    let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await?;
+    let a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true), ..Default::default() }).await?;
     let mut out = json!({
         "kind": a.kind,
         "logical": logical,
@@ -909,6 +915,7 @@ async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         "plan": a.rs.stats.plan,
         "filter_docs": a.rs.stats.filter_docs,
         "scored": a.rs.stats.scored,
+        "steps": a.rs.stats.steps,
         "rows": a.rs.rows.len(),
         "took_ms": a.took_ms,
     });
@@ -1058,14 +1065,76 @@ async fn cancel_query(State(app): State<App>, axum::extract::Path(id): axum::ext
     }
 }
 
+/// Ended queries as a list shows them: without their steps and plan
+/// lines (`GET /v1/queries/finished/:id` has them), unless `full=true`.
+fn finished_list(qs: Vec<Arc<telemetry::Finished>>, q: &std::collections::HashMap<String, String>) -> Json {
+    match q.get("full").map(String::as_str) {
+        Some("true" | "1") => json!(qs),
+        _ => Json::Array(qs.iter().map(|f| f.summary()).collect()),
+    }
+}
+
 async fn recent_queries(State(app): State<App>, Query(q): Params) -> Res {
     let (since, limit) = (param_u64(&q, "since", 0)?, param_u64(&q, "limit", 100)? as usize);
-    Ok(AxJson(json!({"queries": app.svc.query_log.recent(since, limit.min(telemetry::RECENT)), "now_ms": telemetry::now_ms()})))
+    Ok(AxJson(json!({"queries": finished_list(app.svc.query_log.recent(since, limit.min(telemetry::RECENT)), &q), "now_ms": telemetry::now_ms()})))
 }
 
 async fn slow_queries(State(app): State<App>, Query(q): Params) -> Res {
     let limit = param_u64(&q, "limit", 100)? as usize;
-    Ok(AxJson(json!({"queries": app.svc.query_log.slow(limit.min(telemetry::SLOW)), "slow_ms": app.svc.slow.map(|d| d.as_millis() as u64)})))
+    Ok(AxJson(json!({"queries": finished_list(app.svc.query_log.slow(limit.min(telemetry::SLOW)), &q), "slow_ms": app.svc.slow_after().map(|d| d.as_secs_f64() * 1e3)})))
+}
+
+/// One ended query with its whole profile: its trace, its steps and what
+/// ran ([`telemetry::Finished`]).
+async fn finished_query(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<u64>) -> Res {
+    match app.svc.query_log.finished(id) {
+        Some(f) => Ok(AxJson(json!(f))),
+        None => Err(ApiError { status: 404, message: format!("query {id} is no longer kept: the server keeps the latest {} and the slowest {}", telemetry::RECENT, telemetry::SLOW) }),
+    }
+}
+
+/// What profiling does now: the slow threshold (`slow_ms`, `null` for
+/// none; as started with `--slow-ms` unless changed) and whether every
+/// query's CPU time is measured (`cpu_all`).
+fn profile_settings_json(app: &App) -> Json {
+    json!({
+        "slow_ms": app.svc.slow_after().map(|d| d.as_secs_f64() * 1e3),
+        "started_slow_ms": app.svc.slow.map(|d| d.as_secs_f64() * 1e3),
+        "cpu_all": app.svc.profiling.cpu_all.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+async fn profile_settings(State(app): State<App>) -> AxJson<Json> {
+    AxJson(profile_settings_json(&app))
+}
+
+/// `{"slow_ms": 50}` keeps every query that takes 50 ms or longer with
+/// its profile among the slow ones (`null`: none, `0`: every query);
+/// `{"cpu_all": true}` measures every query's CPU time, step by step.
+/// Either may come alone. Until the server restarts.
+async fn put_profile_settings(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let mut did = Vec::new();
+    if let Some(v) = b.get("slow_ms") {
+        let slow = match v {
+            Json::Null => None,
+            v => match v.as_f64() {
+                Some(ms) if ms >= 0.0 && ms.is_finite() => Some(Duration::from_secs_f64(ms / 1e3)),
+                _ => return Err(ApiError::bad("slow_ms is a number of milliseconds, 0 or more, or null for no slow queries")),
+            },
+        };
+        app.svc.profiling.set_slow(slow);
+        did.push(format!("slow_ms {}", slow.map_or("off".to_string(), |d| format!("{}", d.as_secs_f64() * 1e3))));
+    }
+    if let Some(v) = b.get("cpu_all") {
+        let on = v.as_bool().ok_or_else(|| ApiError::bad("cpu_all is true or false"))?;
+        app.svc.profiling.cpu_all.store(on, std::sync::atomic::Ordering::Relaxed);
+        did.push(format!("cpu_all {on}"));
+    }
+    if did.is_empty() {
+        return Err(ApiError::bad("the body sets slow_ms (milliseconds, or null) or cpu_all (true or false)"));
+    }
+    tracing::info!(settings = %did.join(", "), "profiling settings changed");
+    Ok(audited(profile_settings_json(&app), format!("profiling: {}", did.join(", "))))
 }
 
 async fn request_queries(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> AxJson<Json> {

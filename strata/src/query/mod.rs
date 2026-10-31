@@ -10,6 +10,7 @@
 //! * [`agg`]: aggregates and groups.
 //! * [`stats`]: collection statistics exchanged with a coordinator.
 //! * [`memory`]: the memory breaker queries count what they hold against.
+//! * [`steps`]: a query's profile, the timed steps of its execution.
 //! * [`model`]: ranking models (`gbdt()`), read from LightGBM and XGBoost
 //!   files.
 //! * [`cross_encoder`]: cross-encoders (`cross_encoder()`), which a global
@@ -34,6 +35,7 @@ pub mod rank;
 pub mod sequence;
 pub mod sql;
 pub mod stats;
+pub mod steps;
 pub mod tables;
 
 pub use logical::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy, GraphKind, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};

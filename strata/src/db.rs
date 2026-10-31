@@ -1106,8 +1106,19 @@ impl Db {
     }
 
     pub fn execute(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<ResultSet> {
+        // Fixed before the first query's first step begins.
+        crate::query::steps::epoch();
+        let t0 = std::time::Instant::now();
         let readers = self.readers(snap)?;
-        Executor::new(snap, &readers, opts).execute(select)
+        let opened = t0.elapsed();
+        let mut rs = Executor::new(snap, &readers, opts).execute(select)?;
+        // Opening segments' readers takes microseconds once they are
+        // cached; a step when it took longer (a cold cache, new segments).
+        if opened.as_micros() >= 20 {
+            let step = crate::query::steps::Step { op: "open readers".into(), detail: format!("{} segments", readers.len()), start_us: crate::query::steps::us_at(t0), us: crate::query::steps::tenth(opened.as_nanos() as f64 / 1e3), ..Default::default() };
+            rs.stats.steps.insert(0, step);
+        }
+        Ok(rs)
     }
 
     /// This database's BM25 statistics for the terms `select` scores with,
