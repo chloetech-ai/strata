@@ -271,7 +271,7 @@ function diagram(host, bar, { openDesigner }) {
           h("span", { class: "mono" }, `${l.from.table}${l.from.field ? "." + l.from.field : ""}`), h("span", { class: "muted" }, (KIND[l.kind] || KIND.ref).label), h("span", { class: "mono" }, `${l.to.table}${l.to.field ? "." + l.to.field : ""}`))))) : null,
         (t.embeddings || []).length || (t.profiles || []).length || (t.derived || []).length ? h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Models and rank profiles")),
           h("div", { class: "bd stack", style: { gap: "6px" } },
-            (t.embeddings || []).map((e) => h("div", { class: "row nw small" }, e.error ? h("span", { class: "pill bad" }, "error") : e.loaded ? h("span", { class: "pill ok" }, "loaded") : h("span", { class: "pill" }, "not loaded"), h("b", {}, e.field), h("span", { class: "dim" }, `embeds ${[].concat(e.from).join(", ")} with ${e.model}`), e.error ? h("span", { class: "error small" }, e.error) : null)),
+            (t.embeddings || []).map((e) => h("div", { class: "row nw small" }, e.error ? h("span", { class: "pill bad" }, "error") : e.loaded ? h("span", { class: "pill ok" }, "loaded") : h("span", { class: "pill" }, "not loaded"), h("b", {}, e.field), h("span", { class: "dim" }, `embeds ${[].concat(e.from).join(", ")} with ${e.model}`), e.error ? h("span", { class: "error small" }, e.error) : null, backfillNote(e.backfill))),
             (t.derived || []).map((e) => h("div", { class: "row nw small" }, h("span", { class: "pill" }, "derived"), h("b", {}, e.field), h("span", { class: "dim" }, JSON.stringify(e)))),
             (t.profiles || []).map((p) => h("div", { class: "row nw small" }, h("span", { class: "pill info" }, "profile"), h("b", {}, p.name || p.profile || ""), h("span", { class: "mono dim ellipsis" }, p.sql || p.expression || JSON.stringify(p)))))) : null,
         h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "CREATE TABLE"), h("div", { class: "tools" }, h("button", { class: "btn sm ghost", onclick: () => copy(t.sql, "CREATE TABLE copied") }, icon("copy"), "Copy"))),
@@ -307,6 +307,15 @@ async function tableSizes(ts) {
   return out;
 }
 
+// Rows stored without a vector while the model was not open, filled in
+// since it opened (/v1/schema's backfill).
+function backfillNote(b) {
+  if (!b) return null;
+  if (b.state === "running") return h("span", { class: "pill" }, `filling in vectors: ${b.embedded} of ${b.missing} rows`);
+  if (b.state === "failed") return h("span", { class: "error small" }, `filling in vectors stopped after ${b.embedded} rows (tried again in five minutes): ${b.error}`);
+  return h("span", { class: "dim" }, `${b.embedded} rows stored without a vector were given one`);
+}
+
 // ------------------------------------------------------------ the designer
 const PALETTE = [
   ["text", false, "Words to search"], ["keyword", false, "An exact value"], ["keyword", true, "A list of values: tags"], ["int", false, "A whole number"], ["float", false, "A number"],
@@ -319,6 +328,34 @@ const TEMPLATES = {
   "Documents": { table: "docs", key: "id", fields: [{ name: "id", type: "keyword" }, { name: "title", type: "text" }, { name: "body", type: "text" }, { name: "source", type: "keyword" }, { name: "published", type: "timestamp" }, { name: "emb", type: "vector", embed: { from: ["title", "body"], model: "potion-retrieval-32M" }, index: "hnsw" }] },
 };
 const MODELS = ["potion-retrieval-32M", "potion-base-8M", "hash:64"];
+// The models a schema can name and whether each opens on this server
+// (GET /v1/models): fetched here, or hosted with its key set.
+let catalogOf = null;
+const modelCatalog = () => (catalogOf ||= api("/v1/models").then((j) => j.models || []).catch(() => []));
+
+// A picker of embedding models: those ready here first, then those that
+// need fetching or a key, each saying so.
+function modelSelect(f, changed) {
+  const sel = h("select", { class: "select sm", onchange: (e) => { f.embed.model = e.target.value; note(); changed(false); } });
+  const hint = h("div", { class: "small muted" });
+  let known = [];
+  const opt = (m) => h("option", { value: m.name, selected: m.name === f.embed.model }, m.name + (m.dim ? ` · ${m.dim}` : "") + (m.hosted ? " · hosted" : ""));
+  const note = () => {
+    const m = known.find((x) => x.name === f.embed.model);
+    hint.textContent = !m ? "" : m.ready ? m.what : `${m.what}. Not ready here: ${m.error}`;
+    hint.className = `small ${m && !m.ready ? "error" : "muted"}`;
+  };
+  const fill = (list) => {
+    known = list.length ? list : MODELS.map((name) => ({ name, ready: true, what: "" }));
+    if (!known.some((m) => m.name === f.embed.model)) known = [{ name: f.embed.model, ready: true, what: "" }, ...known];
+    const ready = known.filter((m) => m.ready), not = known.filter((m) => !m.ready);
+    clear(sel, h("optgroup", { label: "Ready on this server" }, ready.map(opt)), not.length ? h("optgroup", { label: "Needs fetching or an API key" }, not.map(opt)) : null);
+    note();
+  };
+  fill([]);
+  modelCatalog().then(fill);
+  return h("div", { class: "stack", style: { gap: "3px" } }, sel, hint);
+}
 
 function designer(host, bar, { seed, onCreated }) {
   const uid = () => Math.random().toString(36).slice(2, 9);
@@ -457,7 +494,7 @@ function designer(host, bar, { seed, onCreated }) {
       const emb = !!f.embed;
       out.push(lab("Vectors from", "Embed these text fields with a model when rows are written, and text in queries", seg([["model", "a model"], ["given", "the rows"]], emb ? "model" : "given", (v) => { if (v === "model") { f.embed = { from: others((x) => x.type === "text").slice(0, 2), model: MODELS[0] }; delete f.dim; } else { delete f.embed; f.dim = 384; } changed(); })));
       if (emb) {
-        out.push(lab("Model", "Strata knows the dimensions of the models it ships", h("select", { class: "select sm", onchange: (e) => { f.embed.model = e.target.value; changed(false); } }, [...new Set([...MODELS, f.embed.model])].map((x) => h("option", { value: x, selected: x === f.embed.model }, x)))));
+        out.push(lab("Model", "Computed here, or behind an API (OpenAI, Cohere, Voyage, Gemini, Mistral, Jina, Ollama) with its key in the server's environment", modelSelect(f, changed)));
         out.push(lab("Of the fields", "", multiSel(f.embed, "from", others((x) => x.type === "text" || x.type === "keyword"))));
       } else out.push(lab("Dimensions", "", h("input", { class: "input sm num", type: "number", min: 1, value: f.dim || "", style: { width: "90px" }, oninput: (e) => { f.dim = Number(e.target.value) || undefined; changed(false); } })));
       const ix = typeof f.index === "object" ? Object.keys(f.index)[0] : f.index || "hnsw";

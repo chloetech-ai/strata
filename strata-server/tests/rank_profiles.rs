@@ -40,7 +40,7 @@ fn create(dir: &Path, name: &str, ship: bool, keep: impl Fn(usize) -> bool) -> A
 }
 
 fn service(db: Arc<Db>) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10))
 }
 
@@ -225,5 +225,7 @@ async fn a_primary_ships_its_profiles_to_its_replicas() {
     assert!(held(&rdb).is_empty());
     // A table's DDL still does not reach replicas, so a primary refuses it.
     let e = sql(&p, "CREATE TABLE notes (id INT PRIMARY KEY)").await.err().unwrap();
+    assert!(e.contains("do not reach replicas yet"), "{e}");
+    let e = sql(&p, "ALTER TABLE products ADD COLUMN stock INT").await.err().unwrap();
     assert!(e.contains("do not reach replicas yet"), "{e}");
 }

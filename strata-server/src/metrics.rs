@@ -172,7 +172,7 @@ pub fn kind(q: &Select) -> &'static str {
 }
 
 /// A label value escaped for the text format.
-fn esc(v: &str) -> String {
+pub fn esc(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
@@ -408,7 +408,7 @@ impl Metrics {
         for (what, n) in &m.slow {
             let _ = writeln!(o, "strata_slow_requests_total{{what=\"{what}\"}} {n}");
         }
-        head(o, "strata_embedded_texts_total", "counter", "Texts embedded by the server's models: rows of writes, and query parameters.");
+        head(o, "strata_embedded_texts_total", "counter", "Texts embedded by the server's models: rows of writes, query parameters, and rows stored without vectors.");
         for (what, n) in &m.embedded {
             let _ = writeln!(o, "strata_embedded_texts_total{{for=\"{what}\"}} {n}");
         }

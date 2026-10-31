@@ -26,7 +26,7 @@ use crate::query::model::Models;
 use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
 use crate::rank_log::{self, Export, Log, Logged};
-use crate::schema::{Derive, Embed, FieldType, Schema};
+use crate::schema::{Alter, Derive, Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Mask, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
@@ -54,6 +54,10 @@ pub struct PreparedWrite {
     mask: Option<Arc<Mask>>,
     /// Asked as the write runs ([`PreparedWrite::guarded`]).
     guard: Option<Guard>,
+    /// An UPDATE that fills in the vectors of this embedded field
+    /// ([`Db::prepare_backfill`]): it passes over the rows that have one
+    /// when it runs, and those whose sources are all empty.
+    backfill: Option<usize>,
 }
 
 /// A check a write passes as it runs, under the writer lock, answering the
@@ -138,7 +142,7 @@ pub struct Db {
     /// On-disk segments keep their id for life (deletes travel with the
     /// snapshot, not the readers), but a vacuum can move their bytes;
     /// in-memory ones get a fresh id per rebuild.
-    readers: RwLock<HashMap<u64, (usize, Arc<SegmentReaders>)>>,
+    readers: RwLock<HashMap<u64, (usize, Arc<Schema>, Arc<SegmentReaders>)>>,
     pub exec: ExecOptions,
     /// Models of embedded VECTOR fields ([`Db::set_embedder_in`]).
     embedders: RwLock<Vec<Model>>,
@@ -228,7 +232,7 @@ impl Db {
 
     /// The schema of the database's first table, which the methods here
     /// that name no table write.
-    pub fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> Arc<Schema> {
         self.storage.schema()
     }
 
@@ -289,6 +293,53 @@ impl Db {
             self.open_embedders_of(&name, &dir);
         }
         self.open_codebooks_of(&name, &models);
+        Ok(())
+    }
+
+    /// Changes the columns of the table named `table`
+    /// ([`Database::alter_table`], SQL `ALTER TABLE`). The models of its
+    /// embedded and derived columns follow them: a renamed column keeps
+    /// its, and so does one whose sources are renamed; an added one gets
+    /// its as a new table's columns do, after [`Db::open_embedders`].
+    pub fn alter_table(&self, table: &str, alters: &[Alter]) -> Result<()> {
+        let before = self.table(table)?;
+        self.storage.alter_table(table, alters)?;
+        let after = self.table(table)?;
+        // A model serves a field by its table's and its own name, and the
+        // spec it was given; the field it served, by id, now.
+        let now = |field: &str| before.field(field).and_then(|b| after.fields.iter().find(|a| a.id == b.id).map(|a| (b, a)));
+        let ours = |t: &str| t.eq_ignore_ascii_case(&before.table);
+        self.embedders.write().unwrap_or_else(|e| e.into_inner()).retain_mut(|m| {
+            if !ours(&m.table) {
+                return true;
+            }
+            let Some((b, a)) = now(&m.field) else { return false };
+            if let (Some(was), Some(is)) = (&b.embed, &a.embed) {
+                if *was == m.embed {
+                    m.embed = is.clone();
+                }
+            }
+            m.field = a.name.clone();
+            true
+        });
+        self.derivers.write().unwrap_or_else(|e| e.into_inner()).retain_mut(|m| {
+            if !ours(&m.table) {
+                return true;
+            }
+            let Some((b, a)) = now(&m.field) else { return false };
+            if let (Some(was), Some(is)) = (&b.derive, &a.derive) {
+                if *was == m.derive {
+                    m.derive = is.clone();
+                }
+            }
+            m.field = a.name.clone();
+            true
+        });
+        let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(dir) = dir {
+            let added = |f: &crate::schema::Field| before.fields.iter().all(|b| b.id != f.id);
+            self.open_models_of(&after.table, &dir, added);
+        }
         Ok(())
     }
 
@@ -655,11 +706,16 @@ impl Db {
     }
 
     fn open_embedders_of(&self, table: &str, models: &Path) -> Vec<(String, Error)> {
+        self.open_models_of(table, models, |_| true)
+    }
+
+    /// [`Db::open_embedders_of`], for the fields `which` picks.
+    fn open_models_of(&self, table: &str, models: &Path, which: impl Fn(&crate::schema::Field) -> bool) -> Vec<(String, Error)> {
         let Some(schema) = self.storage.table(table) else { return Vec::new() };
         let mut failed = Vec::new();
-        for f in &schema.fields {
+        for f in schema.fields.iter().filter(|f| which(f)) {
             let opened = match (&f.embed, &f.derive) {
-                (Some(spec), _) => crate::embed::open(&spec.model, models).and_then(|m| self.set_embedder_in(table, &f.name, m)),
+                (Some(spec), _) => crate::embed::open_for(&spec.model, match f.ty { FieldType::Vector { dim, .. } => Some(dim), _ => None }, models).and_then(|m| self.set_embedder_in(table, &f.name, m)),
                 (_, Some(spec)) => crate::derive::open(&spec.model, models).and_then(|m| self.set_deriver_in(table, &f.name, m)),
                 _ => continue,
             };
@@ -708,6 +764,70 @@ impl Db {
             return Err(Error::Schema(format!("{table}.{field} holds no vectors to train a codebook on")));
         }
         crate::sid::Codebook::train(&vectors, dim, opts)?.save(name, models)
+    }
+
+    /// The primary keys of the live rows of the table named `table` whose
+    /// embedded VECTOR field `field` has no vector: rows written while the
+    /// field had no model open here (no API key yet, the model not
+    /// fetched), and rows whose sources are all empty, which get none.
+    /// [`Db::embed_backfill`] fills in the others.
+    pub fn missing_vectors(&self, table: &str, field: &str) -> Result<Vec<Value>> {
+        let snap = self.snapshot().table(table).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+        let schema = snap.schema();
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("{table} has no field {field}")))?;
+        if f.embed.is_none() || !matches!(f.ty, FieldType::Vector { .. }) {
+            return Err(Error::Schema(format!("{table}.{field} is not an embedded VECTOR field")));
+        }
+        if schema.primary_key.is_none() {
+            return Err(Error::Schema(format!("{table} has no primary key: rows without {field}'s vector can only be written again")));
+        }
+        let key = f.key();
+        let mut keys = Vec::new();
+        for (i, v) in snap.segments().iter().enumerate() {
+            // A segment written before the field existed has no vectors of it.
+            let r = match v.file.has(&crate::vector::section(&key, "meta")) {
+                true => Some(VectorReader::open(&v.file, &key)?),
+                false => None,
+            };
+            for d in 0..v.file.n_docs() as DocId {
+                if v.live.as_ref().is_none_or(|l| l.contains(d)) && !r.as_ref().is_some_and(|r| r.has_vector(d)) {
+                    keys.extend(snap.key(i, d));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// A write giving the rows of the table named `table` with primary
+    /// keys `keys` the vectors of embedded field `field` they lack, from
+    /// its model ([`Db::set_embedder_in`]). It is an UPDATE of those rows
+    /// which, as it runs under the writer lock, passes over the rows that
+    /// have a vector by then and those whose sources are all empty; the
+    /// vectors are computed here, before the writer lock, as any write's
+    /// are. Run it with [`Db::write_prepared`]; it writes each row again,
+    /// its other fields as they are.
+    pub fn prepare_backfill(&self, table: &str, field: &str, keys: Vec<Value>) -> Result<PreparedWrite> {
+        let schema = self.table(table)?;
+        let f = schema.field_index(field).ok_or_else(|| Error::Schema(format!("{table} has no field {field}")))?;
+        if self.models_of(&schema)[f].is_none() {
+            return Err(Error::Schema(format!("{table}.{field} has no model open here to fill in its vectors")));
+        }
+        let write = Write::Update { select: qsql::keyed_rows(&schema, keys)?, sets: vec![(f, Assign::Value(Value::Null))] };
+        self.prepare_as(schema, write, Some(f))
+    }
+
+    /// Fills in the vectors of embedded field `field` of the table named
+    /// `table` that its rows lack ([`Db::missing_vectors`]) with the
+    /// field's model, `batch` rows a write ([`Db::prepare_backfill`]);
+    /// returns the rows written. Rows whose sources are all empty stay
+    /// without one. A server does this itself when a field's model opens.
+    pub fn embed_backfill(&self, table: &str, field: &str, batch: usize) -> Result<u64> {
+        let keys = self.missing_vectors(table, field)?;
+        let mut n = 0;
+        for chunk in keys.chunks(batch.max(1)) {
+            n += self.write_prepared(&self.prepare_backfill(table, field, chunk.to_vec())?)?;
+        }
+        Ok(n)
     }
 
     /// Computes the embedded vectors that documents of the first table
@@ -951,6 +1071,12 @@ impl Db {
                 self.drop_tables(&names, opts)?;
                 Ok(SqlResult::Written(0))
             }
+            Command::AlterTable { table, alters } => {
+                if let Some(t) = table.filter(|_| !alters.is_empty()) {
+                    self.alter_table(&t, &alters)?;
+                }
+                Ok(SqlResult::Written(0))
+            }
             Command::CreateRankProfile { table, profile, replace } => {
                 self.storage.set_rank_profile(&table, profile, replace)?;
                 Ok(SqlResult::Written(0))
@@ -1029,7 +1155,11 @@ impl Db {
         Ok(Some(self.prepare(schema.clone(), write)?))
     }
 
-    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> Result<PreparedWrite> {
+    fn prepare(&self, schema: Arc<Schema>, write: Write) -> Result<PreparedWrite> {
+        self.prepare_as(schema, write, None)
+    }
+
+    fn prepare_as(&self, schema: Arc<Schema>, mut write: Write, backfill: Option<usize>) -> Result<PreparedWrite> {
         let media = self.media_resolver();
         let mut held = Held::new();
         match &mut write {
@@ -1043,8 +1173,8 @@ impl Db {
             Write::Update { sets, .. } => held = resolve_sets(&media, &schema, sets)?,
             Write::Delete { .. } => {}
         }
-        let (known, derived) = self.embed_ahead(&schema, &write, &Files { resolver: &media, held })?;
-        Ok(PreparedWrite { schema, write, known, derived, mask: None, guard: None })
+        let (known, derived) = self.embed_ahead(&schema, &write, &Files { resolver: &media, held }, backfill)?;
+        Ok(PreparedWrite { schema, write, known, derived, mask: None, guard: None, backfill })
     }
 
     /// The text `write` will derive and the vectors it will compute, from
@@ -1054,7 +1184,7 @@ impl Db {
     /// reading the rows (the table dropped, a sum that overflows) is left
     /// for the write to report; an image that cannot be read fails the
     /// statement.
-    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files) -> Result<(Known, Derived)> {
+    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files, backfill: Option<usize>) -> Result<(Known, Derived)> {
         let models = self.models_of(schema);
         let derivers = self.derivers_of(schema);
         if models.iter().all(Option::is_none) && derivers.iter().all(Option::is_none) {
@@ -1077,7 +1207,7 @@ impl Db {
                 // Numbers set in place embed nothing.
                 Write::Update { sets, .. } if in_place(schema, sets) => Vec::new(),
                 Write::Update { select, sets } => {
-                    let rows = self.execute(&snap, select, &self.exec)?.rows;
+                    let rows = lacking(schema, backfill, self.execute(&snap, select, &self.exec)?.rows);
                     plan_sets(schema, &models, &derivers, rows.into_iter().map(|r| (r, Vec::new())).collect(), sets)?.rewrites
                 }
                 Write::Delete { .. } => Vec::new(),
@@ -1107,7 +1237,7 @@ impl Db {
         let mut t = self.storage.begin()?;
         let mut tt = t.table(&schema.table)?;
         if tt.schema() != schema {
-            return Err(Error::Query(format!("table {} was dropped and created again while the statement ran; run it again", schema.table)));
+            return Err(Error::Query(format!("table {} was altered, or dropped and created again, while the statement ran; run it again", schema.table)));
         }
         let models = self.models_of(schema);
         let derivers = self.derivers_of(schema);
@@ -1178,7 +1308,7 @@ impl Db {
                 }
             }
             Write::Update { select, sets } => {
-                let rows = self.execute(&snap, &select, &self.exec)?.rows;
+                let rows = lacking(schema, p.backfill, self.execute(&snap, &select, &self.exec)?.rows);
                 n += set_rows(&mut tt, schema, (&models, &derivers), rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, (&p.known, &p.derived), &files)?;
             }
         }
@@ -1315,9 +1445,14 @@ impl Db {
     /// Readers for every segment of `snap`, opened on first use.
     pub fn readers(&self, snap: &Snapshot) -> Result<Vec<Arc<SegmentReaders>>> {
         let at = |v: &crate::storage::SegmentView| v.file.image().as_ptr() as usize;
+        // Readers are opened for one schema: an ALTER TABLE gives the
+        // table's segments new ones. The cache holds the schema it opened
+        // them with, so its address is not reused while an entry names it.
+        let schema = snap.shared_schema();
+        let fits = |(p, s, _): &&(usize, Arc<Schema>, Arc<SegmentReaders>), v: &crate::storage::SegmentView| *p == at(v) && Arc::ptr_eq(s, schema);
         {
             let cache = self.readers.read().unwrap_or_else(|e| e.into_inner());
-            let hit = |v: &crate::storage::SegmentView| cache.get(&v.id).filter(|(p, _)| *p == at(v)).map(|(_, r)| r.clone());
+            let hit = |v: &crate::storage::SegmentView| cache.get(&v.id).filter(|e| fits(e, v)).map(|(_, _, r)| r.clone());
             if let Some(all) = snap.segments().iter().map(hit).collect() {
                 return Ok(all);
             }
@@ -1325,11 +1460,11 @@ impl Db {
         let mut cache = self.readers.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(snap.segments().len());
         for v in snap.segments() {
-            let r = match cache.get(&v.id).filter(|(p, _)| *p == at(v)) {
-                Some((_, r)) => r.clone(),
+            let r = match cache.get(&v.id).filter(|e| fits(e, v)) {
+                Some((_, _, r)) => r.clone(),
                 None => {
-                    let r = Arc::new(SegmentReaders::open(&v.file, snap.schema())?);
-                    cache.insert(v.id, (at(v), r.clone()));
+                    let r = Arc::new(SegmentReaders::open(&v.file, schema)?);
+                    cache.insert(v.id, (at(v), schema.clone(), r.clone()));
                     r
                 }
             };
@@ -1485,7 +1620,7 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
 /// [`Schema::embed_text`] gives them): of the texts, or of the images or
 /// sounds that the MEDIA values name, decoded a batch at a time.
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
-    let Some(m) = schema.embeds_media(f) else { return Ok(embed_all(e, sources)) };
+    let Some(m) = schema.embeds_media(f) else { return embed_all(e, sources) };
     if schema.fields[m].media == Some(crate::media::MediaKind::Audio) {
         return in_sound_batches(&schema.fields[m].name, sources, files, |inputs| e.embed_inputs(inputs));
     }
@@ -1729,6 +1864,20 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], derivers: &[
     Ok(Planned { in_place, rewrites, rows: n })
 }
 
+/// The rows an UPDATE filling in embedded field `backfill`'s vectors
+/// writes ([`Db::prepare_backfill`]): those still without one whose
+/// sources are not all empty. Every row of any other UPDATE.
+fn lacking(schema: &Schema, backfill: Option<usize>, mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    if let Some(f) = backfill {
+        rows.retain(|r| {
+            let mut d = r.clone();
+            schema.fill_generated(&mut d);
+            matches!(r[f], Value::Null) && !schema.embed_text(f, &d).is_empty()
+        });
+    }
+    rows
+}
+
 /// Whether setting `sets` changes rows in place: every field set is a
 /// single-valued number.
 fn in_place(schema: &Schema, sets: &[(usize, Assign)]) -> bool {
@@ -1767,17 +1916,26 @@ fn not_live(snap: &Snapshot, pk: usize, mut docs: Vec<Document>) -> Vec<Document
     docs
 }
 
-/// `e`'s vectors of `texts`, split across the cores.
-fn embed_all(e: &dyn Embedder, texts: &[String]) -> Vec<Vec<f32>> {
+/// `e`'s vectors of `texts`, split across the cores for a model computed
+/// here ([`Embedder::parallel`]).
+fn embed_all(e: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 64).max(1);
-    if threads == 1 {
-        return e.embed(&refs);
+    let threads = if e.parallel() { std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 64).max(1) } else { 1 };
+    let vectors = if threads == 1 {
+        e.embed(&refs)?
+    } else {
+        std::thread::scope(|s| {
+            let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || e.embed(c))).collect();
+            parts.into_iter().map(|p| p.join().expect("embedding thread")).collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    if vectors.len() != texts.len() {
+        return Err(Error::Schema(format!("model {} made {} vectors of {} texts", e.name(), vectors.len(), texts.len())));
     }
-    std::thread::scope(|s| {
-        let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || e.embed(c))).collect();
-        parts.into_iter().flat_map(|p| p.join().expect("embedding thread")).collect()
-    })
+    Ok(vectors)
 }
 
 fn with_source(mut opts: DbOptions) -> DbOptions {

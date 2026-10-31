@@ -73,6 +73,9 @@ pub struct Options {
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
     pub coord: CoordOptions,
+    /// With `shards`: the `StrataCluster` (`namespace/name`) that runs this
+    /// coordinator on Kubernetes, which the command center shows and scales.
+    pub kube_cluster: Option<String>,
     pub timeout_ms: u64,
     /// The longest deadline a request may ask for (0: the larger of
     /// `timeout_ms` and 60 s).
@@ -97,6 +100,12 @@ pub struct Options {
     pub api_base: String,
     /// Where embedded fields' models are ([`strata::embed::open`]).
     pub models: PathBuf,
+    /// Fill in the vectors of rows stored while their embedded field had
+    /// no model open, once it has one ([`Service::keep_models`]).
+    pub backfill: bool,
+    /// Fetch the models Strata knows ([`strata::embed::KNOWN_MODELS`]) that
+    /// an embedded field names and `models` lacks.
+    pub fetch_models: bool,
     /// The synonym list for `synonyms => 1` searches (Solr format), read at
     /// start if it exists and written by `PUT /v1/synonyms`.
     pub synonyms: Option<PathBuf>,
@@ -272,7 +281,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         if let Some(b) = db.storage().merge_status().memory_budget {
             tracing::info!(threads = o.merger.threads.max(1), memory_mib = b >> 20, "merging in the background");
         }
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         (Backend::Local(db), schema)
     };
     let mut svc = Service::new(backend, schema, agent, o.max_concurrent.max(1), timeout);
@@ -280,6 +289,15 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.keep_slots_in(path)?;
         if let Some((m, shard)) = svc.slots() {
             tracing::info!(epoch = m.epoch, shard, of = m.shards(), "holds slots");
+        }
+    }
+    if let Some(c) = o.kube_cluster.as_deref().filter(|_| !o.shards.is_empty()) {
+        match crate::operator::kube::Link::new(c) {
+            Ok(l) => {
+                tracing::info!(cluster = %c, "run by the Kubernetes operator: the command center shows and scales the StrataCluster");
+                svc.kube = Some(l);
+            }
+            Err(e) => tracing::warn!(cluster = %c, error = %e, "cannot reach the StrataCluster that runs this coordinator"),
         }
     }
     if o.max_timeout_ms > 0 {
@@ -307,6 +325,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     svc.audit = Audit::new(o.audit_log.clone())?;
     svc.alerts = Alerts::new(o.alerts.clone(), o.alert_webhook.clone())?;
+    (svc.backfill, svc.fetch_models) = (o.backfill, o.fetch_models);
     svc.open_models(&o.models);
     for m in svc.models().iter() {
         match &m.model {
@@ -394,6 +413,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     spawn_sampler(&svc);
+    tokio::spawn(svc.clone().keep_models());
     svc.start_failover();
     // The cluster's keys: a coordinator takes them from its shards before
     // it serves, and a coordinator or primary passes changes on.

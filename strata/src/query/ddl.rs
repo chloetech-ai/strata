@@ -72,7 +72,7 @@ use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
 use sqlparser::ast::{self as sql, ColumnOption, DataType, Expr, TableConstraint};
 
 use crate::error::{Error, Result};
-use crate::schema::Schema;
+use crate::schema::{Alter, Field, Schema};
 use crate::storage::DropOptions;
 
 fn err(m: impl Into<String>) -> Error {
@@ -123,48 +123,14 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
     let mut refs: Vec<(String, String, Option<String>)> = Vec::new();
     let mut fields = Vec::with_capacity(ct.columns.len());
     for c in &ct.columns {
-        let mut opts = Map::new();
-        let (mut null, mut not_null, mut default) = (false, false, None);
-        for o in &c.options {
-            if let Some(n) = &o.name {
-                return Err(err(format!("column {}: constraint names ({n}) are not supported", c.name.value)));
-            }
-            match &o.option {
-                ColumnOption::Null => null = true,
-                ColumnOption::NotNull => not_null = true,
-                ColumnOption::Default(e) => {
-                    if default.replace(default_value(e).map_err(|m| err(format!("column {}: {m}", c.name.value)))?).is_some() {
-                        return Err(err(format!("column {}: DEFAULT is given twice", c.name.value)));
-                    }
-                }
-                ColumnOption::Unique { is_primary: true, characteristics: None } => set_key(&c.name.value)?,
-                ColumnOption::ForeignKey { foreign_table, referred_columns, on_delete, on_update, characteristics } => {
-                    refs.push((c.name.value.clone(), reference(foreign_table, referred_columns, on_delete, on_update, characteristics)?, referred_columns.first().map(|k| k.value.clone())));
-                }
-                ColumnOption::Options(kv) => {
-                    for o in kv {
-                        let sql::SqlOption::KeyValue { key, value } = o else { return Err(err(format!("column {}: OPTIONS takes key = value pairs, not {o}", c.name.value))) };
-                        if opts.insert(key.value.to_ascii_lowercase(), option_value(value)?).is_some() {
-                            return Err(err(format!("column {}: option {} is given twice", c.name.value, key.value)));
-                        }
-                    }
-                }
-                ColumnOption::Unique { is_primary: false, .. } => return Err(err(format!("column {}: UNIQUE is not supported (the primary key is unique)", c.name.value))),
-                o => return Err(err(format!("column {}: {o} is not supported", c.name.value))),
-            }
+        let col = column(c)?;
+        if col.key {
+            set_key(&c.name.value)?;
         }
-        if null && not_null {
-            return Err(err(format!("column {}: NULL and NOT NULL", c.name.value)));
-        }
-        let mut f = field(&c.name.value, &c.data_type, opts)?;
-        if not_null {
-            f["not_null"] = json!(true);
-        }
-        if let Some(d) = default {
-            f["default"] = d;
-        }
-        fields.push(f);
+        refs.extend(col.refs.into_iter().map(|(t, k)| (c.name.value.clone(), t, k)));
+        fields.push(col.field);
     }
+    let column_refs = refs.len();
     for t in &ct.constraints {
         match t {
             TableConstraint::PrimaryKey { name: None, index_name: None, index_type: None, columns, index_options, characteristics: None } if index_options.is_empty() => {
@@ -181,7 +147,8 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
             t => return Err(err(format!("{t} is not supported; the form is {CREATE_FORM}"))),
         }
     }
-    for (column, table, _) in &refs {
+    // FOREIGN KEY constraints; a column's own REFERENCES is in its field.
+    for (column, table, _) in &refs[column_refs..] {
         let f = fields.iter_mut().find(|f| f["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(column))).ok_or_else(|| err(format!("no such column: {column}")))?;
         if f.get("references").is_some() {
             return Err(err(format!("column {column} references a table twice")));
@@ -220,6 +187,152 @@ pub(crate) fn create_table(ct: &sql::CreateTable, tables: &[&Schema]) -> Result<
         }
     }
     Ok((schema, ct.if_not_exists))
+}
+
+/// A column definition, read as [`create_table`] reads one.
+struct Column {
+    /// The field, in the short JSON form ([`Schema::from_json`]).
+    field: J,
+    /// Whether it says PRIMARY KEY.
+    key: bool,
+    /// The tables its REFERENCES name, each with the key it names if it
+    /// names one.
+    refs: Vec<(String, Option<String>)>,
+}
+
+fn column(c: &sql::ColumnDef) -> Result<Column> {
+    let mut opts = Map::new();
+    let (mut null, mut not_null, mut default, mut key) = (false, false, None, false);
+    let mut refs = Vec::new();
+    for o in &c.options {
+        if let Some(n) = &o.name {
+            return Err(err(format!("column {}: constraint names ({n}) are not supported", c.name.value)));
+        }
+        match &o.option {
+            ColumnOption::Null => null = true,
+            ColumnOption::NotNull => not_null = true,
+            ColumnOption::Default(e) => {
+                if default.replace(default_value(e).map_err(|m| err(format!("column {}: {m}", c.name.value)))?).is_some() {
+                    return Err(err(format!("column {}: DEFAULT is given twice", c.name.value)));
+                }
+            }
+            ColumnOption::Unique { is_primary: true, characteristics: None } => {
+                if std::mem::replace(&mut key, true) {
+                    return Err(err("a table has one primary key, of one column"));
+                }
+            }
+            ColumnOption::ForeignKey { foreign_table, referred_columns, on_delete, on_update, characteristics } => {
+                refs.push((reference(foreign_table, referred_columns, on_delete, on_update, characteristics)?, referred_columns.first().map(|k| k.value.clone())));
+            }
+            ColumnOption::Options(kv) => {
+                for o in kv {
+                    let sql::SqlOption::KeyValue { key, value } = o else { return Err(err(format!("column {}: OPTIONS takes key = value pairs, not {o}", c.name.value))) };
+                    if opts.insert(key.value.to_ascii_lowercase(), option_value(value)?).is_some() {
+                        return Err(err(format!("column {}: option {} is given twice", c.name.value, key.value)));
+                    }
+                }
+            }
+            ColumnOption::Unique { is_primary: false, .. } => return Err(err(format!("column {}: UNIQUE is not supported (the primary key is unique)", c.name.value))),
+            o => return Err(err(format!("column {}: {o} is not supported", c.name.value))),
+        }
+    }
+    if null && not_null {
+        return Err(err(format!("column {}: NULL and NOT NULL", c.name.value)));
+    }
+    let mut f = field(&c.name.value, &c.data_type, opts)?;
+    if not_null {
+        f["not_null"] = json!(true);
+    }
+    if let Some(d) = default {
+        f["default"] = d;
+    }
+    if let [(t, _)] = refs.as_slice() {
+        f["references"] = json!(t);
+    } else if refs.len() > 1 {
+        return Err(err(format!("column {} references a table twice", c.name.value)));
+    }
+    Ok(Column { field: f, key, refs })
+}
+
+/// The forms of `ALTER TABLE` this module binds, for error messages.
+const ALTER_FORM: &str = "ALTER TABLE [IF EXISTS] name ADD [COLUMN] [IF NOT EXISTS] column TYPE [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], DROP [COLUMN] [IF EXISTS] column, or RENAME COLUMN column TO name, one or more separated by commas";
+
+/// The table an `ALTER TABLE` statement changes and its changes, in
+/// order: `ADD [COLUMN] [IF NOT EXISTS] column TYPE ...` (a column as
+/// `CREATE TABLE` takes one, without PRIMARY KEY), `DROP [COLUMN] [IF
+/// EXISTS] column [RESTRICT]` and `RENAME COLUMN a TO b`
+/// ([`crate::schema::Alter`]). `tables` are the database's tables: a
+/// change that `IF NOT EXISTS` or `IF EXISTS` skips is left out, as the
+/// table stands after the changes before it, and `ALTER TABLE IF EXISTS`
+/// of no table changes nothing (`None`).
+pub(crate) fn alter_table(stmt: &sql::Statement, tables: &[&Schema]) -> Result<Option<(String, Vec<Alter>)>> {
+    let sql::Statement::AlterTable { name, if_exists, only, operations, location, on_cluster, iceberg, end_token: _ } = stmt else {
+        return Err(err("not an ALTER TABLE statement"));
+    };
+    if *only || location.is_some() || on_cluster.is_some() || *iceberg {
+        return Err(err(format!("this form of ALTER TABLE is not supported; the forms are {ALTER_FORM}")));
+    }
+    let table = single_name(name)?;
+    let Some(schema) = tables.iter().find(|t| t.table.eq_ignore_ascii_case(&table)) else {
+        return match if_exists {
+            true => Ok(None),
+            false => Err(err(format!("no such table: {table}"))),
+        };
+    };
+    if operations.is_empty() {
+        return Err(err(format!("ALTER TABLE {table} changes nothing; the forms are {ALTER_FORM}")));
+    }
+    // As the table stands after the changes so far, for IF [NOT] EXISTS.
+    let mut now: Schema = (*schema).clone();
+    let mut alters = Vec::new();
+    let mut push = |a: Alter, now: &mut Schema| -> Result<()> {
+        *now = now.altered(&a)?;
+        alters.push(a);
+        Ok(())
+    };
+    for op in operations {
+        match op {
+            sql::AlterTableOperation::AddColumn { column_keyword: _, if_not_exists, column_def, column_position: None } => {
+                if *if_not_exists && now.field(&column_def.name.value).is_some() {
+                    continue;
+                }
+                let col = column(column_def)?;
+                if col.key {
+                    return Err(err(format!("column {}: a table's primary key is given when it is created", column_def.name.value)));
+                }
+                for (t, named) in &col.refs {
+                    let target = if t.eq_ignore_ascii_case(&now.table) { Some(&now) } else { tables.iter().copied().find(|s| s.table.eq_ignore_ascii_case(t)) };
+                    let Some(target) = target else { return Err(err(format!("column {} references {t}, which is not a table", column_def.name.value))) };
+                    let pk = target.primary_key.map(|k| target.fields[k].name.as_str());
+                    if named.as_ref().is_some_and(|n| !pk.is_some_and(|k| k.eq_ignore_ascii_case(n))) {
+                        return Err(err(format!(
+                            "column {} references {t} ({}): a reference names its table's primary key, {}",
+                            column_def.name.value,
+                            named.as_deref().unwrap_or_default(),
+                            pk.map_or(format!("and {} has none", target.table), |k| format!("which is {k}"))
+                        )));
+                    }
+                }
+                push(Alter::AddField(Field::from_short_json(&col.field)?), &mut now)?;
+            }
+            sql::AlterTableOperation::DropColumn { has_column_keyword: _, column_names, if_exists, drop_behavior } => {
+                if matches!(drop_behavior, Some(sql::DropBehavior::Cascade)) {
+                    return Err(err("DROP COLUMN ... CASCADE is not supported: drop or change what names the column first"));
+                }
+                for c in column_names {
+                    if *if_exists && now.field(&c.value).is_none() {
+                        continue;
+                    }
+                    push(Alter::DropField(c.value.clone()), &mut now)?;
+                }
+            }
+            sql::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                push(Alter::RenameField { from: old_column_name.value.clone(), to: new_column_name.value.clone() }, &mut now)?;
+            }
+            o => return Err(err(format!("ALTER TABLE ... {o} is not supported; the forms are {ALTER_FORM}"))),
+        }
+    }
+    Ok(Some((schema.table.clone(), alters)))
 }
 
 /// The table a reference names, checked for the clauses references do not

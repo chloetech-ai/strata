@@ -44,7 +44,7 @@ fn imports(path: &str, js: &str) -> Vec<String> {
 async fn the_command_center_is_served_with_every_module_it_imports() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::create(&dir.path().join("ui.strata"), demo::schema(10), DbOptions::default()).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let agent = AgentConfig { api_key: None, model: String::new(), base_url: String::new() };
     let svc = Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent, 4, Duration::from_secs(5)));
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

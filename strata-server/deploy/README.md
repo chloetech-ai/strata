@@ -15,7 +15,7 @@ replicas dies, how to move to more shards, and what network latency does.
 | `k8s/shards.yaml` | a set of N shards × R replicas: a headless Service, and per shard a StatefulSet of R pods on different nodes; replica r of shard i serves `/data/<collection>.shard<i>of<N>.strata` (r = 0) or its own copy `...shard<i>of<N>.r<r>.strata` |
 | `k8s/coordinator.yaml` | the coordinator, a Deployment pointed at one set of shards (`--shards`, replicas of a shard joined by `\|`) |
 | `k8s/single.yaml` | one database holding the whole collection, to compare answers and latency with |
-| `k8s/operator/operator.yaml` | the operator: its namespace (`strata-system`), service account, cluster role and Deployment |
+| `k8s/operator/operator.yaml` | the operator: its namespace (`strata-system`), service account, cluster role (which includes making each cluster's Role for its coordinators) and Deployment |
 | `k8s/operator/crd.json` | the `StrataCluster` resource definition, which the operator installs when it starts (`strata-server operator --print-crd` writes it) |
 | `k8s/operator/cluster.yaml` | a cluster for it to make: 2 shards of 3 copies, 10,000 demo products |
 | `kind-test.sh` | creates the kind cluster and runs each step below |
@@ -48,6 +48,7 @@ kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
 | `failoverAfterMs` | 3000 | every server's `--failover-after-ms`: a shard elects a new primary on its own when its primary's pod dies |
 | `writeAcks` | `all` | every primary's `--write-acks` |
 | `tokenSecret` | | a Secret whose key `token` every server and coordinator requires; without it they run with `--no-token`, open to whatever reaches them |
+| `clusterTokenSecret` | | a Secret whose key `token` is the cluster's own token (`--cluster-token`), which the servers and coordinators send each other and clients never hold; with it, the `tokenSecret` token goes to the coordinators alone, as the admin token (the operator's too), and may not make the calls between servers. Needs `tokenSecret` |
 | `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args` | `strata-server:dev` | the servers' image, containers and further arguments |
 
 What a change does:
@@ -67,6 +68,13 @@ What a change does:
 - The coordinators' `--shards` list follows the cluster's servers, so that
   a coordinator that starts again finds the cluster; their number follows
   `coordinators`.
+
+The coordinators run as the service account `<cluster>-coordinator`, which
+a Role lets read and patch their own `StrataCluster` and nothing else: the
+command center's **Cluster** view (`kubectl -n strata port-forward svc/demo
+7700`, then `http://127.0.0.1:7700/#/cluster`) shows the operator's phase
+and message and changes the shards, copies per shard and coordinators,
+which the operator then makes as above.
 
 The operator does not choose primaries: the copies of a shard elect one
 among themselves ([failover](../../docs/strata/server.md#failover)), so a
@@ -157,7 +165,9 @@ put a cluster token in a Secret and give it to every server, coordinators
 included (they send it to each other, and only it makes the calls between
 servers), give the coordinators an admin token of their own, drop
 `--no-token`, and serve TLS. Clients get API keys made on a coordinator,
-which every server then holds:
+which every server then holds. The operator does this for a
+`StrataCluster` that names both Secrets (`tokenSecret` and
+`clusterTokenSecret`, above):
 
 ```bash
 kubectl -n strata create secret generic strata-cluster-token --from-literal=token="$(openssl rand -hex 32)"

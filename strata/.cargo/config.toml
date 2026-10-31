@@ -6,3 +6,11 @@
 # and the Python package build that way.
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+# Every Apple silicon CPU has AES and SHA-2: the target assumes them, and ring
+# (the TLS of hosted embedding models, strata::hosted) refuses to build
+# without them. `native` on a virtual Mac (GitHub's macOS runners) names no
+# CPU and leaves them out, so they are named here. A target's flags replace
+# [build]'s, so this repeats target-cpu=native.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+aes,+sha2"]

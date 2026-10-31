@@ -29,7 +29,7 @@ fn items() -> Schema {
 
 async fn http(dir: &std::path::Path) -> String {
     let db = Db::create(&dir.join("e.strata"), items(), DbOptions { segment_max_docs: 400, memtable_chunk_docs: 128, publish_snapshots: true, ..DbOptions::default() }).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let agent = AgentConfig { api_key: None, model: strata_server::agent::DEFAULT_MODEL.into(), base_url: "http://unused".into() };
     let svc = Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(20)));
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -20,6 +20,7 @@
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
 //! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
+//! | `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name, and whether each would open here |
 //! | `GET /v1/media/<sha256>` | | the bytes of the file a row's MEDIA value names, by its hash, read as writes read files (`--media-store`, `--media-fetch`); 404 when no row names it, 400 from a coordinator |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
@@ -143,6 +144,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/embed", post(embed))
+        .route("/v1/models", get(models))
         .route("/v1/media/:sha256", get(media_file))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
@@ -186,6 +188,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/logs/store", get(log_store))
         .route("/v1/system", get(system))
         .route("/v1/cluster", get(cluster))
+        .route("/v1/kube", get(kube))
+        .route("/v1/admin/kube", post(kube_scale))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -377,7 +381,7 @@ async fn stats(State(app): State<App>) -> AxJson<Json> {
 async fn schema(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Res {
     let s = match q.get("table") {
         Some(t) => app.svc.table(t).await?,
-        None => Arc::new(app.svc.schema.clone()),
+        None => app.svc.first_table(),
     };
     Ok(AxJson(table_json(&app.svc, &s)))
 }
@@ -404,6 +408,10 @@ fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json
         "embeddings": svc.models().iter().filter(|m| m.table.eq_ignore_ascii_case(&s.table)).map(|m| json!({
             "field": m.field, "from": m.spec.from, "model": m.spec.model,
             "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
+            // A model behind an API: the requests it sent.
+            "usage": m.model.as_ref().ok().and_then(|e| e.usage()).map(|u| json!({"requests": u.requests, "retries": u.retries, "failures": u.failures, "texts": u.texts, "tokens": u.tokens})),
+            // Rows stored without a vector, filled in once the model opened.
+            "backfill": svc.backfill_of(&m.table, &m.field).map(|b| json!({"state": b.state, "missing": b.missing, "embedded": b.embedded, "error": b.error})),
         })).collect::<Vec<_>>(),
         // Each derived TEXT field: its MEDIA field, model, and whether this
         // server makes its text (null on a coordinator: its shards do).
@@ -896,6 +904,17 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
 /// The vector of a text, or of an image or sound file (`"image"` or
 /// `"audio"`, base64), as `{"embed": ...}` gives a query's parameter: for
 /// a plan, whose vectors are values.
+/// The embedding models a schema can name, local and hosted, and whether
+/// each would open on this server ([`strata::embed::catalog`]): fetched,
+/// its key set, its feature built. Nothing is loaded or sent.
+async fn models(State(app): State<App>) -> Res {
+    let dir = app.svc.models_dir();
+    let d = dir.clone();
+    let list = tokio::task::spawn_blocking(move || strata::embed::catalog(&d)).await.map_err(ApiError::internal)?;
+    let models: Vec<Json> = list.iter().map(|m| json!({"name": m.name, "dim": m.dim, "hosted": m.hosted, "what": m.what, "ready": m.ready.is_ok(), "error": m.ready.as_ref().err()})).collect();
+    Ok(AxJson(json!({"dir": dir.display().to_string(), "models": models})))
+}
+
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let file = ["image", "audio"].into_iter().find_map(|k| b.get(k).map(|v| (k, v)));
     let what = match file {
@@ -1445,6 +1464,30 @@ async fn system(State(app): State<App>) -> AxJson<Json> {
 
 async fn cluster(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.cluster().await)
+}
+
+/// `GET /v1/kube`: the `StrataCluster` that runs this coordinator on
+/// Kubernetes (its spec, and the operator's status), or `managed: false`.
+async fn kube(State(app): State<App>) -> Res {
+    match &app.svc.kube {
+        None => Ok(AxJson(json!({"managed": false}))),
+        Some(l) => l.get().await.map(AxJson).map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") }),
+    }
+}
+
+/// `POST /v1/admin/kube {"shards"?, "replicas"?, "coordinators"?}`:
+/// changes the `StrataCluster`'s sizes; the operator then makes the change.
+async fn kube_scale(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let l = app.svc.kube.as_ref().ok_or_else(|| ApiError::bad("this coordinator is not run by the Kubernetes operator: change the cluster with /v1/admin/shards"))?;
+    let n = |k: &str| match b.get(k) {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| ApiError::bad(format!("{k} is a number"))),
+    };
+    let (shards, replicas, coordinators) = (n("shards")?, n("replicas")?, n("coordinators")?);
+    let spec = crate::operator::kube::Link::sizes(shards, replicas, coordinators).map_err(ApiError::bad)?;
+    let j = l.scale(&spec).await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
+    let said: Vec<String> = [("shards", shards), ("copies per shard", replicas), ("coordinators", coordinators)].iter().filter_map(|(k, v)| v.map(|v| format!("{v} {k}"))).collect();
+    Ok(audited(j, format!("asked the operator for {} ({}/{})", said.join(", "), l.namespace, l.name)))
 }
 
 async fn routes(State(app): State<App>) -> AxJson<Json> {
