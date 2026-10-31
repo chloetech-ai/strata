@@ -34,6 +34,7 @@ use crate::idem;
 use crate::replication::{Acks, Follow, Primary, PrimaryOptions, READ_WAIT};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
+use crate::telemetry::{self, LiveQueries, QueryLog, Sample, Series};
 use crate::{json as js, obs, pb, ApiError};
 
 /// Binds one SELECT into its plan, and gives back what the executor runs
@@ -148,6 +149,14 @@ pub struct Service {
     pub schema: Schema,
     pub metrics: Metrics,
     pub agent: AgentConfig,
+    /// The queries running now ([`telemetry::LiveQueries`]).
+    pub live: Arc<LiveQueries>,
+    /// The latest and slow queries, and statistics per statement.
+    pub query_log: QueryLog,
+    /// Rates and gauges every few seconds ([`Self::sample`]).
+    pub series: Series,
+    /// When the server started.
+    pub started: std::time::SystemTime,
     /// The embedded VECTOR fields' models, of every table
     /// ([`Service::open_models`], [`Service::models`]).
     models: RwLock<Arc<Vec<FieldModel>>>,
@@ -186,6 +195,7 @@ pub struct Service {
     next_lease: AtomicU64,
     /// Queries allowed to run at once; the rest wait until their deadline.
     admission: Arc<Semaphore>,
+    pub max_concurrent: usize,
     /// Texts embedded at once (one per core): writes' and queries'.
     embedding: Arc<Semaphore>,
     cores: usize,
@@ -247,6 +257,10 @@ impl Service {
             schema,
             metrics: Metrics::default(),
             agent,
+            live: Arc::new(LiveQueries::default()),
+            query_log: QueryLog::default(),
+            series: Series::default(),
+            started: std::time::SystemTime::now(),
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
             ranking: Models::default(),
@@ -263,6 +277,7 @@ impl Service {
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
             admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            max_concurrent: max_concurrent.max(1),
             embedding: Arc::new(Semaphore::new(cores)),
             cores,
             running: Arc::new(AtomicUsize::new(0)),
@@ -1230,14 +1245,22 @@ impl Service {
     async fn select(self: &Arc<Self>, mut req: QueryReq, schema: Arc<Schema>, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = metrics::kind(&select);
         let mut lease = 0;
+        let live = self.live.start(&req.sql, kind, req.shard);
         let res = match &self.backend {
             Backend::Local(db) => {
                 let stats = req.stats.take().map(Arc::new);
-                async {
+                LiveQueries::run(&live, async {
                     // A read on a replica may wait for a write it must see,
                     // before it takes a query slot.
+                    let tw = Instant::now();
                     let snap = self.read_snapshot(db, req.snapshot, &req.after, t0 + timeout).await?;
-                    let permit = self.admit(timeout).await.ok_or_else(too_many)?;
+                    if req.after != After::Any {
+                        telemetry::record("wait for writes", tw, "ok");
+                    }
+                    let ta = Instant::now();
+                    let permit = self.admit(timeout).await.ok_or_else(too_many);
+                    telemetry::record("admission", ta, if permit.is_ok() { "ok" } else { "rejected" });
+                    let permit = permit?;
                     lease = self.held(&req, &snap, timeout)?;
                     let view = snap.table(&schema.table).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", schema.table)))?;
                     let (running, n) = Running::start(&self.running);
@@ -1261,22 +1284,27 @@ impl Service {
                     let db = db.clone();
                     // The work holds the slot and the count until it ends,
                     // and stops at its next check if this future is dropped.
+                    let te = Instant::now();
                     let r = tokio::task::spawn_blocking(move || {
                         let _held = (permit, running);
                         db.execute(&view, &select, &opts)
                     })
                     .await;
                     drop(cancel);
+                    telemetry::record("execute", te, if matches!(r, Ok(Ok(_))) { "ok" } else { "error" });
                     match r {
                         Ok(r) => r.map(|rs| (rs, Vec::new())).map_err(ApiError::from),
                         Err(e) => Err(ApiError::internal(e)),
                     }
-                }
+                })
                 .await
             }
-            Backend::Cluster(c) => match self.admit(timeout).await {
-                None => Err(too_many()),
-                Some(permit) => {
+            Backend::Cluster(c) => {
+                LiveQueries::run(&live, async {
+                    let ta = Instant::now();
+                    let permit = self.admit(timeout).await;
+                    telemetry::record("admission", ta, if permit.is_some() { "ok" } else { "rejected" });
+                    let permit = permit.ok_or_else(too_many)?;
                     let reach = select.limit.unwrap_or(0).saturating_add(select.offset);
                     let r = match self.max_rows.filter(|&m| reach > m) {
                         Some(m) => Err(ApiError::bad(format!("query error: LIMIT and OFFSET reach row {reach}; a query returns at most {m} rows"))),
@@ -1284,11 +1312,13 @@ impl Service {
                     };
                     drop(permit);
                     r
-                }
-            },
+                })
+                .await
+            }
         };
+        drop(live);
         // A shard's answer to a coordinator is not a client's.
-        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), res);
+        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, res);
         // A lease made for a query that failed holds nothing to fetch.
         let made = (lease != req.snapshot).then_some(lease).filter(|_| a.is_err());
         if let Some(l) = (req.release && req.snapshot != 0).then_some(req.snapshot).or(made) {
@@ -1300,7 +1330,7 @@ impl Service {
     /// Counts a query's outcome, logs it if it was slow, and makes its
     /// answer. One with more rows than `window` (a compound query's, or a
     /// coordinator's without a LIMIT) fails.
-    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
+    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
         let res = match (res, window) {
             (Ok((rs, _)), Some(m)) if rs.rows.len() > m => Err(ApiError::bad(format!("query error: the query matches more than {m} rows, the most a query returns; add a LIMIT"))),
             (r, _) => r,
@@ -1312,14 +1342,17 @@ impl Service {
             Err(e) if e.status == 504 => "timeout",
             // Out of query memory, or a shard was.
             Err(e) if e.status == 429 => "rejected",
+            Err(e) if e.status == 499 => "cancelled",
             Err(_) => "error",
         };
         self.metrics.query(kind, outcome, secs);
-        if self.slow.is_some_and(|s| t0.elapsed() >= s) {
+        let rows = res.as_ref().map_or(0, |(rs, _)| rs.rows.len());
+        let slow = self.slow.is_some_and(|s| t0.elapsed() >= s);
+        if slow {
             self.metrics.slow("query");
-            let rows = res.as_ref().map_or(0, |(rs, _)| rs.rows.len());
             tracing::warn!(kind, outcome, secs, rows, sql = %obs::truncate(sql, 2000), "slow query");
         }
+        self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow);
         res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing, lease: 0 })
     }
 
@@ -1331,6 +1364,19 @@ impl Service {
         let catalog = self.catalog();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
+        let live = self.live.start(&req.sql, kind, req.shard);
+        let r = LiveQueries::run(&live, self.compound_run(req, plan, catalog, t0, timeout)).await;
+        drop(live);
+        let res = match r {
+            Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
+            r => r,
+        };
+        self.done(&req_sql, kind, t0, self.max_rows, false, res)
+    }
+
+    /// The work of [`Self::compound`]; [`Self::done`] counts it.
+    async fn compound_run(self: &Arc<Self>, req: QueryReq, plan: Arc<Plan>, catalog: Vec<Arc<Schema>>, t0: Instant, timeout: Duration) -> Result<(ResultSet, Vec<String>), ApiError> {
+        let deadline = t0 + timeout;
         // Each leaf checks it: the caller may have stopped waiting.
         let cancel = Cancel::default();
         let r = match &self.backend {
@@ -1338,7 +1384,7 @@ impl Service {
                 // A read on a replica may wait for a write it must see,
                 // before it takes a query slot.
                 let snap = self.read_snapshot(db, req.snapshot, &req.after, deadline).await?;
-                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected(kind, t0)) };
+                let Some(permit) = self.admit(timeout).await else { return Err(too_many()) };
                 let (running, n) = Running::start(&self.running);
                 // Leaves hold up to compound::MAX_ROWS rows; the answer is
                 // held to the window below.
@@ -1369,13 +1415,14 @@ impl Service {
                 r.map(|r| r.map(|rs| (rs, Vec::new())))
             }
             Backend::Cluster(c) => {
-                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected(kind, t0)) };
+                let Some(permit) = self.admit(timeout).await else { return Err(too_many()) };
                 let c = c.clone();
                 let rt = tokio::runtime::Handle::current();
                 let stop = cancel.0.clone();
                 let memory = self.query_memory.clone();
                 // The leaves' calls to the shards carry the request's id.
                 let id = obs::current();
+                let trace = telemetry::trace();
                 tokio::task::spawn_blocking(move || {
                     let _held = permit;
                     // Shards any leaf was answered without (partial answers).
@@ -1389,7 +1436,7 @@ impl Service {
                         // The shards run the leaf's plan; its text names it in their logs.
                         let sql = leaf.explain(&tables).join(" / ");
                         let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), ..Default::default() };
-                        let m = rt.block_on(obs::scope(id.clone(), c.query(&step, schema, &select, deadline))).map_err(|e| strata::Error::Query(e.message))?;
+                        let m = rt.block_on(telemetry::within(trace.clone(), obs::scope(id.clone(), c.query(&step, schema, &select, deadline)))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
                                 missing.push(s);
@@ -1403,15 +1450,10 @@ impl Service {
             }
         };
         drop(cancel);
-        let res = match r {
+        match r {
             Ok(r) => r.map_err(ApiError::from),
             Err(e) => Err(ApiError::internal(e)),
-        };
-        let res = match res {
-            Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
-            r => r,
-        };
-        self.done(&req_sql, kind, t0, self.max_rows, res)
+        }
     }
 
     /// Counts a query refused for want of a slot, and says so (429).
@@ -1994,6 +2036,129 @@ impl Service {
             Backend::Cluster(_) => (Json::Null, Json::Null),
         };
         json!({"health": self.health().await, "storage": storage, "merges": merges, "metrics": self.metrics.summary()})
+    }
+
+    /// The counters and gauges of this moment, for the series
+    /// ([`telemetry::Series`]). Reads no shard: a coordinator's own.
+    pub fn sample(&self) -> Sample {
+        let mut s = Sample { at: Some(Instant::now()), ts_ms: telemetry::now_ms(), ..Default::default() };
+        self.metrics.totals(&mut s);
+        let (rss, cpu) = telemetry::process_usage();
+        s.cpu_s = cpu;
+        let g = &mut s.gauges;
+        if let Some(r) = rss {
+            g.insert("rss_bytes", r as f64);
+        }
+        g.insert("running", self.running() as f64);
+        g.insert("live", self.live.len() as f64);
+        g.insert("slots_free", self.admission.available_permits() as f64);
+        if let Some(b) = &self.query_memory {
+            g.insert("query_memory_bytes", b.used() as f64);
+            g.insert("query_memory_limit_bytes", b.limit() as f64);
+        }
+        if let Backend::Local(db) = &self.backend {
+            let snap = db.snapshot();
+            let f = db.storage().file_stats();
+            let m = db.storage().merge_status();
+            let deleted: u64 = f.segments.iter().map(|s| s.n_deleted as u64).sum::<u64>() + f.pending_deletes as u64;
+            for (k, v) in [
+                ("docs", snap.n_live_docs() as f64),
+                ("segments", snap.segments().len() as f64),
+                ("deleted_docs", deleted as f64),
+                ("memtable_docs", f.memtable_docs as f64),
+                ("file_bytes", f.file_bytes as f64),
+                ("wal_bytes", f.wal_bytes as f64),
+                ("reusable_bytes", (f.free_pages * strata::storage::pager::PAGE) as f64),
+                ("merges_running", m.running as f64),
+                ("merge_memory_bytes", m.memory as f64),
+                ("write_queue", self.writer_state.queued.load(Ordering::Relaxed) as f64),
+                ("leases", self.leases.lock().unwrap_or_else(|e| e.into_inner()).len() as f64),
+                ("failing", self.failing().is_some() as u8 as f64),
+                ("flush_failing", db.storage().flush_error().is_some() as u8 as f64),
+                ("merge_failing", m.error.is_some() as u8 as f64),
+                ("pool_queued", strata::query::pool::Pool::global().queued() as f64),
+            ] {
+                g.insert(k, v);
+            }
+            if let Some((total, _, avail)) = telemetry::disk(db.storage().path()) {
+                g.insert("disk_total_bytes", total as f64);
+                g.insert("disk_free_bytes", avail as f64);
+            }
+            match &self.replication() {
+                Replication::None => {}
+                Replication::Primary(p) => {
+                    let h = p.health();
+                    let rs = h["replicas"].as_array().cloned().unwrap_or_default();
+                    g.insert("replicas", rs.len() as f64);
+                    g.insert("replicas_in_sync", rs.iter().filter(|r| r["in_sync"] == true).count() as f64);
+                    g.insert("replica_behind_max", rs.iter().filter_map(|r| r["behind"].as_f64()).fold(0.0, f64::max));
+                    g.insert("seq_no", h["seq_no"].as_f64().unwrap_or(0.0));
+                }
+                Replication::Replica(f) => {
+                    g.insert("seq_no", db.storage().numbering().map_or(0, |n| n.seq) as f64);
+                    g.insert("serves_reads", f.serves_reads() as u8 as f64);
+                }
+            }
+        }
+        s
+    }
+
+    /// The process, its limits and where its database is
+    /// (`GET /v1/system`).
+    pub fn system(&self) -> Json {
+        let (rss, cpu) = telemetry::process_usage();
+        let started = self.started.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let uptime = self.started.elapsed().map_or(0.0, |d| d.as_secs_f64());
+        let db = match &self.backend {
+            Backend::Local(db) => {
+                let path = db.storage().path();
+                let disk = telemetry::disk(path).map(|(total, free, avail)| json!({"total_bytes": total, "free_bytes": free, "available_bytes": avail}));
+                json!({"path": path.display().to_string(), "disk": disk, "tables": self.catalog().len(), "seq_no": db.storage().numbering().map(|n| json!({"term": n.term, "seq": n.seq}))})
+            }
+            Backend::Cluster(_) => Json::Null,
+        };
+        json!({
+            "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(), "started_ms": started, "uptime_s": uptime,
+            "cores": self.cores, "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "simd": strata::simd::describe(),
+            "rss_bytes": rss, "cpu_seconds": cpu, "memory_limit_bytes": strata::storage::memory_limit(),
+            "backend": match self.backend { Backend::Local(_) => "local", Backend::Cluster(_) => "coordinator" },
+            "role": self.role().as_str_name().to_lowercase(),
+            "db": db,
+            "limits": {
+                "timeout_ms": self.timeout.as_millis() as u64, "max_timeout_ms": self.max_timeout.as_millis() as u64,
+                "max_concurrent": self.max_concurrent, "max_rows": self.max_rows, "max_groups": self.max_groups,
+                "query_memory_bytes": self.query_memory.as_ref().map(|b| b.limit()), "max_queued_writes": self.max_queued_writes,
+                "max_body_bytes": self.max_body, "slow_ms": self.slow.map(|d| d.as_millis() as u64), "lease_ttl_s": self.lease_ttl.as_secs(),
+            },
+            "features": {
+                "synonyms": self.synonyms().map_or(0, |s| s.rules()), "backup_dir": self.backup_dir.as_ref().map(|p| p.display().to_string()),
+                "models": self.models().len(), "agent_key": self.agent.api_key.is_some(),
+            },
+            "sampling": {"interval_ms": self.series.interval.as_millis() as u64, "points": telemetry::POINTS},
+        })
+    }
+
+    /// Where this server is in its cluster, and how each copy is doing
+    /// (`GET /v1/cluster`): a server's own health and latest point; a
+    /// coordinator asks every replica of every shard
+    /// ([`Coordinator::cluster`]).
+    pub async fn cluster(self: &Arc<Self>) -> Json {
+        match &self.backend {
+            Backend::Local(_) => json!({"role": self.role().as_str_name().to_lowercase(), "node": self.detail().await}),
+            Backend::Cluster(c) => {
+                let mut j = c.cluster().await;
+                j["coordinator"] = json!({"load": self.series.last().map(|p| (*p).clone()), "health": {"retries": j["retries"], "hedges": j["hedges"]}});
+                j
+            }
+        }
+    }
+
+    /// This server's health and latest point, as a coordinator's
+    /// `/v1/cluster` shows each shard's copy.
+    pub async fn detail(self: &Arc<Self>) -> Json {
+        let health = self.health().await;
+        let load = self.series.last().map(|p| (*p).clone());
+        json!({"health": health, "load": load, "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores}, "running": self.live.len()})
     }
 
     /// The metrics (`GET /metrics`). A coordinator does not ask its shards

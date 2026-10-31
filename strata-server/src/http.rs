@@ -23,6 +23,15 @@
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
+//! | `GET /v1/queries` | | `{queries, running}`: the queries running now, the longest first, each with its trace so far |
+//! | `DELETE /v1/queries/:id` | | `{cancelled}`: the query stops at its next check and answers 499 |
+//! | `GET /v1/queries/recent?since=ms&limit=n`, `/v1/queries/slow?limit=n` | | `{queries}`: the latest that ended (or the slow ones), the newest first, each with its trace |
+//! | `GET /v1/queries/request/:id` | | `{queries}`: those a request (its `x-request-id`) ran |
+//! | `GET /v1/queries/stats?limit=n`, `POST /v1/queries/stats/reset` | | statistics per statement shape, by time spent ([`crate::telemetry::Statements`]) |
+//! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
+//! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
+//! | `PUT /v1/logs/filter` | `{filter}` (as `--log`) | `{filter}`: what is logged from now on |
+//! | `GET /v1/system`, `/v1/cluster`, `/v1/routes` | | the process and its limits; the cluster's copies; requests by route and queries by kind |
 //!
 //! Every answer carries the request's id in `x-request-id`: the one the
 //! client sent, if it is 1 to 64 letters, digits, '-', '_', '.' or ':', or
@@ -54,7 +63,7 @@ use strata::storage::Layout;
 use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
-use crate::{agent, json as js, obs, ApiError};
+use crate::{agent, json as js, obs, telemetry, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
 
@@ -121,6 +130,19 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/verify", post(admin_verify))
         .route("/v1/admin/promote", post(admin_promote))
         .route("/v1/agent", post(agent_run))
+        .route("/v1/queries", get(live_queries))
+        .route("/v1/queries/:id", axum::routing::delete(cancel_query))
+        .route("/v1/queries/recent", get(recent_queries))
+        .route("/v1/queries/slow", get(slow_queries))
+        .route("/v1/queries/request/:id", get(request_queries))
+        .route("/v1/queries/stats", get(query_stats))
+        .route("/v1/queries/stats/reset", post(reset_query_stats))
+        .route("/v1/timeseries", get(timeseries))
+        .route("/v1/logs", get(logs))
+        .route("/v1/logs/filter", put(log_filter))
+        .route("/v1/system", get(system))
+        .route("/v1/cluster", get(cluster))
+        .route("/v1/routes", get(routes))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .route("/", get(|| async { Html(UI) }))
@@ -142,7 +164,7 @@ async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
     let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
     let span = tracing::info_span!("request", id = %id, method = %req.method(), route = %route);
     let t0 = Instant::now();
-    let mut res = obs::scope(Some(id.clone()), next.run(req)).instrument(span.clone()).await;
+    let mut res = telemetry::traced(telemetry::Trace::new(), obs::scope(Some(id.clone()), next.run(req))).instrument(span.clone()).await;
     let secs = t0.elapsed().as_secs_f64();
     let status = res.status().as_u16();
     app.svc.metrics.http(&route, status, secs);
@@ -301,7 +323,12 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         return logged(&app, req, log).await;
     }
     let a = app.svc.query(req).await?;
-    Ok(AxJson(answer(&a)))
+    let mut j = answer(&a);
+    // `"trace": true`: the timed steps the query took.
+    if b.get("trace").and_then(|v| v.as_bool()) == Some(true) {
+        j["trace"] = json!(telemetry::trace().map(|t| t.spans()).unwrap_or_default());
+    }
+    Ok(AxJson(j))
 }
 
 /// A query run and logged ([`Service::query_logged`]): its answer, with
@@ -905,4 +932,81 @@ async fn agent_run(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     app.svc.metrics.agent_run();
     Ok(AxJson(agent::run(&app.svc, req).await?))
+}
+
+type Params = Query<std::collections::HashMap<String, String>>;
+
+fn param_u64(q: &std::collections::HashMap<String, String>, k: &str, default: u64) -> Result<u64, ApiError> {
+    q.get(k).map_or(Ok(default), |v| v.parse().map_err(|_| ApiError::bad(format!("{k} is a whole number, not {v:?}"))))
+}
+
+async fn live_queries(State(app): State<App>) -> AxJson<Json> {
+    AxJson(json!({"queries": app.svc.live.list(), "running": app.svc.running()}))
+}
+
+async fn cancel_query(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<u64>) -> Res {
+    match app.svc.live.cancel(id) {
+        true => {
+            tracing::info!(query = id, "query cancelled by an operator");
+            Ok(AxJson(json!({"cancelled": true, "id": id})))
+        }
+        false => Err(ApiError { status: 404, message: format!("query {id} is not running") }),
+    }
+}
+
+async fn recent_queries(State(app): State<App>, Query(q): Params) -> Res {
+    let (since, limit) = (param_u64(&q, "since", 0)?, param_u64(&q, "limit", 100)? as usize);
+    Ok(AxJson(json!({"queries": app.svc.query_log.recent(since, limit.min(telemetry::RECENT)), "now_ms": telemetry::now_ms()})))
+}
+
+async fn slow_queries(State(app): State<App>, Query(q): Params) -> Res {
+    let limit = param_u64(&q, "limit", 100)? as usize;
+    Ok(AxJson(json!({"queries": app.svc.query_log.slow(limit.min(telemetry::SLOW)), "slow_ms": app.svc.slow.map(|d| d.as_millis() as u64)})))
+}
+
+async fn request_queries(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> AxJson<Json> {
+    AxJson(json!({"queries": app.svc.query_log.by_request(&id)}))
+}
+
+async fn query_stats(State(app): State<App>, Query(q): Params) -> Res {
+    Ok(AxJson(app.svc.query_log.statements.list(param_u64(&q, "limit", 200)? as usize)))
+}
+
+async fn reset_query_stats(State(app): State<App>) -> AxJson<Json> {
+    app.svc.query_log.statements.reset();
+    AxJson(json!({"reset": true}))
+}
+
+async fn timeseries(State(app): State<App>, Query(q): Params) -> Res {
+    let since = param_u64(&q, "since", 0)?;
+    Ok(AxJson(json!({"interval_ms": app.svc.series.interval.as_millis() as u64, "points": app.svc.series.since(since), "now_ms": telemetry::now_ms()})))
+}
+
+async fn logs(Query(q): Params) -> Res {
+    let (after, limit) = (param_u64(&q, "after", 0)?, param_u64(&q, "limit", 500)?.min(obs::RING_LINES as u64) as usize);
+    let ring = obs::ring();
+    let lines = ring.lines(after, q.get("level").map(String::as_str), q.get("request").map(String::as_str), q.get("q").map(String::as_str).filter(|t| !t.is_empty()), limit);
+    Ok(AxJson(json!({"lines": lines, "last": ring.last(), "filter": obs::log_filter()})))
+}
+
+async fn log_filter(AxJson(b): AxJson<Json>) -> Res {
+    let filter = body_str(&b, "filter")?;
+    obs::set_log_filter(filter).map_err(ApiError::bad)?;
+    tracing::info!(filter, "log filter changed");
+    Ok(AxJson(json!({"filter": filter})))
+}
+
+async fn system(State(app): State<App>) -> AxJson<Json> {
+    let mut j = app.svc.system();
+    j["auth"] = json!({"token": app.token.is_some()});
+    j["logs"] = json!({"filter": obs::log_filter()});
+    AxJson(j)
+}
+
+async fn cluster(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.cluster().await)
+}
+
+async fn routes(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.metrics.routes())
 }

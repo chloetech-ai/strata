@@ -197,7 +197,7 @@ impl Grpc {
         let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
         let span = tracing::info_span!("request", id = %id, method);
         let t0 = Instant::now();
-        let r = obs::scope(Some(id.clone()), f(self.0.clone(), req.into_inner())).instrument(span.clone()).await;
+        let r = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), f(self.0.clone(), req.into_inner()))).instrument(span.clone()).await;
         let secs = t0.elapsed().as_secs_f64();
         let _in = span.enter();
         let (code, r) = match r {
@@ -396,13 +396,15 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn health(&self, req: Request<pb::Empty>) -> Result<Response<pb::HealthResponse>, Status> {
         self.serve("Health", req, |svc, _| async move {
-            let h = svc.health().await;
+            let d = svc.detail().await;
+            let h = &d["health"];
             let n = |k: &str| h[k].as_u64().unwrap_or(0);
             Ok(pb::HealthResponse {
                 status: h["status"].as_str().unwrap_or("unknown").to_string(),
                 docs: n("docs"),
                 segments: n("segments"),
                 txn: n("txn"),
+                detail: d.to_string(),
             })
         })
         .await
