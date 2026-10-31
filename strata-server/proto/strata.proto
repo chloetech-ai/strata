@@ -41,6 +41,11 @@
 // every replica of every shard in shard mode and merges their answers, and
 // a server from before it answers Unimplemented.
 //
+// Keys take no protocol version: the servers of a cluster hold the same
+// API keys, which a coordinator merges with every server of every shard,
+// and a primary with its replicas (`Keys`), and a server from before it
+// answers Unimplemented and keeps its own.
+//
 // Tables take no protocol version either: a server names every table it
 // serves in `Schema` (`tables_json`), which a server from before tables
 // leaves out, and a coordinator serves the tables that every replica of
@@ -146,6 +151,13 @@ service Strata {
   // A server older than the call answers Unimplemented; no protocol
   // version is needed.
   rpc Profile(ProfileRequest) returns (ProfileResponse);
+  // Merges the caller's API keys into the server's, keys by id and
+  // revocations, which win, and answers the keys the server then holds. A
+  // call between the servers of a cluster, which needs the cluster's token
+  // (or the token of a server without one); a server with no token
+  // refuses it (FailedPrecondition), since keys would close it to the
+  // servers that gave them.
+  rpc Keys(KeysRequest) returns (KeysResponse);
 }
 
 message VoteRequest {
@@ -347,6 +359,19 @@ message CleanupRequest {
 
 message CleanupResponse {
   uint64 deleted = 1;
+}
+
+message KeysRequest {
+  // The caller's keys as JSON: {"keys": [{"id", "name", "scope",
+  // "created_ms", "expires_ms", "sha256", "last_used_ms"}, ...],
+  // "revoked": [{"id", "revoked_ms"}, ...]}, the SHA-256 of each secret,
+  // never the secret. Empty: only ask.
+  bytes keys_json = 1;
+}
+
+message KeysResponse {
+  // The server's keys once merged, in the same form.
+  bytes keys_json = 1;
 }
 
 message ReleaseRequest {
