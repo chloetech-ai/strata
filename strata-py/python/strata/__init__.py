@@ -35,7 +35,7 @@ import json
 import os
 from typing import Any, Iterable, Mapping
 
-from . import _strata, train
+from . import _strata, ngrams, train
 from ._search import Search, ordered_schema, params as _params
 from .build import (
     Expr,
@@ -71,6 +71,7 @@ from .build import (
 )
 from ._strata import StrataError
 from .client import Client
+from .ngrams import next_items
 from .result import Result
 
 __all__ = [
@@ -113,6 +114,8 @@ __all__ = [
     "path",
     "ppr",
     "train",
+    "ngrams",
+    "next_items",
 ]
 
 
@@ -245,6 +248,13 @@ class Database(Search):
         """Deletes the rows with this key or these keys; returns how many
         there were."""
         return self._db.delete(keys, table)
+
+    def write(self, ops: list[dict]) -> int:
+        """Write operations as `Client.write` and /v1/write take them
+        ({"op": "insert", "doc": {...}}, {"op": "add", "key": k, "field":
+        "n", "value": 1}, ...), in one transaction. Returns the rows
+        written."""
+        return self._db.write(ops)
 
     def import_file(self, path: str | os.PathLike, format: str | None = None, *, table: str | None = None) -> dict:
         """Loads a JSON Lines, JSON (an array), CSV or TSV file, in `format`
