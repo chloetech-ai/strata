@@ -645,6 +645,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
@@ -713,6 +716,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
     }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
@@ -983,6 +989,9 @@ impl pb::strata_server::Strata for Recording {
     async fn restore(&self, r: tonic::Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<tonic::Response<pb::ReplicateResponse>, tonic::Status> {
         self.up()?;
         self.inner.restore(r).await
+    }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
     }
     type WriteStreamStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::WriteStreamStream;
     async fn write_stream(&self, r: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
