@@ -10,7 +10,9 @@
 //!   query the table.
 //! * [`replication`]: a primary shipping its writes to its replicas.
 //! * [`media`]: fetching the files MEDIA fields name over HTTP(S).
-//! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves.
+//! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves;
+//!   [`telemetry`]: the running and latest queries, their traces, and the
+//!   series of rates and gauges the UI draws.
 
 pub mod agent;
 pub mod auth;
@@ -28,6 +30,7 @@ pub mod replication;
 pub mod server;
 pub mod service;
 pub mod slots;
+pub mod telemetry;
 
 pub mod pb {
     tonic::include_proto!("strata.v1");
