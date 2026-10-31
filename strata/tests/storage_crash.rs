@@ -270,7 +270,7 @@ fn killed_writer_recovers(name: &str, clustered: bool) {
         if clustered {
             // Every segment on disk holds its rows in order of n.
             for v in snap.segments().iter().filter(|v| !v.in_memory) {
-                let n = strata::forward::NumericColumn::open(&v.file, "n").unwrap();
+                let n = strata::forward::NumericColumn::open(&v.file, &self::clustered().key_of("n").unwrap()).unwrap();
                 let ns: Vec<Option<i64>> = (0..v.file.n_docs() as u32).map(|d| n.get_i64(d)).collect();
                 assert!(ns.is_sorted(), "iteration {iter}: segment {} is not in order of n", v.id);
             }

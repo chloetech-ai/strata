@@ -68,15 +68,22 @@ the first error). Results of a full run on a Mac are in
 These manifests serve a test cluster open: every server runs with
 `--no-token`, which a server listening beyond loopback needs when it has no
 token. Anything that can reach a pod can read and write. On a real cluster,
-put a token in a Secret and give it to every server (the coordinator sends
-it to its shards), drop `--no-token`, and serve TLS:
+put a cluster token in a Secret and give it to every server, coordinators
+included (they send it to each other, and only it makes the calls between
+servers), give the coordinators an admin token of their own, drop
+`--no-token`, and serve TLS. Clients get API keys made on a coordinator,
+which every server then holds:
 
 ```bash
+kubectl -n strata create secret generic strata-cluster-token --from-literal=token="$(openssl rand -hex 32)"
 kubectl -n strata create secret generic strata-token --from-literal=token="$(openssl rand -hex 32)"
 ```
 
 ```yaml
           env:
+            - name: STRATA_CLUSTER_TOKEN
+              valueFrom: {secretKeyRef: {name: strata-cluster-token, key: token}}
+            # the coordinators only:
             - name: STRATA_TOKEN
               valueFrom: {secretKeyRef: {name: strata-token, key: token}}
 ```

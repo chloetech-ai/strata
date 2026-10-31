@@ -645,6 +645,12 @@ impl pb::strata_server::Strata for Stuck {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
+    }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
@@ -659,6 +665,16 @@ impl pb::strata_server::Strata for Stuck {
         Err(tonic::Status::unimplemented("no guards here"))
     }
     async fn configure(&self, _: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    type ExportSlotsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::ExportSlotsChunk, tonic::Status>> + Send>>;
+    async fn export_slots(&self, _: tonic::Request<pb::ExportSlotsRequest>) -> Result<tonic::Response<Self::ExportSlotsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn freeze_slots(&self, _: tonic::Request<pb::FreezeRequest>) -> Result<tonic::Response<pb::FreezeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn cleanup_slots(&self, _: tonic::Request<pb::CleanupRequest>) -> Result<tonic::Response<pb::CleanupResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
 }
@@ -704,6 +720,12 @@ impl pb::strata_server::Strata for Overloaded {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
+    }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
@@ -718,6 +740,16 @@ impl pb::strata_server::Strata for Overloaded {
         Err(tonic::Status::unimplemented("no guards here"))
     }
     async fn configure(&self, _: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    type ExportSlotsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::ExportSlotsChunk, tonic::Status>> + Send>>;
+    async fn export_slots(&self, _: tonic::Request<pb::ExportSlotsRequest>) -> Result<tonic::Response<Self::ExportSlotsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn freeze_slots(&self, _: tonic::Request<pb::FreezeRequest>) -> Result<tonic::Response<pb::FreezeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn cleanup_slots(&self, _: tonic::Request<pb::CleanupRequest>) -> Result<tonic::Response<pb::CleanupResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
 }
@@ -964,6 +996,9 @@ impl pb::strata_server::Strata for Recording {
         self.up()?;
         self.inner.restore(r).await
     }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::WriteStreamStream;
     async fn write_stream(&self, r: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         self.up()?;
@@ -978,6 +1013,9 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
     }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;
@@ -998,6 +1036,19 @@ impl pb::strata_server::Strata for Recording {
     async fn configure(&self, r: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
         self.up()?;
         self.inner.configure(r).await
+    }
+    type ExportSlotsStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::ExportSlotsStream;
+    async fn export_slots(&self, r: tonic::Request<pb::ExportSlotsRequest>) -> Result<tonic::Response<Self::ExportSlotsStream>, tonic::Status> {
+        self.up()?;
+        self.inner.export_slots(r).await
+    }
+    async fn freeze_slots(&self, r: tonic::Request<pb::FreezeRequest>) -> Result<tonic::Response<pb::FreezeResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.freeze_slots(r).await
+    }
+    async fn cleanup_slots(&self, r: tonic::Request<pb::CleanupRequest>) -> Result<tonic::Response<pb::CleanupResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.cleanup_slots(r).await
     }
 }
 

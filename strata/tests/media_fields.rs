@@ -140,7 +140,7 @@ fn files_are_given_by_bytes_by_path_or_by_value() {
     assert_eq!(std::fs::read(store.join(&hb)).unwrap(), b);
     let in_db: Vec<u8> = walk(&path).into_iter().flat_map(|p| std::fs::read(p).unwrap()).collect();
     assert!(!in_db.windows(b.len()).any(|w| w == b), "the bytes of b are in the database");
-    assert_eq!(required_features(&path), json!(["media"]));
+    assert_eq!(required_features(&path), json!(["field_ids", "media"]));
 
     // Merged, and opened again: the same values and lookups.
     db.storage().flush().unwrap();
@@ -212,14 +212,14 @@ fn the_feature_is_recorded_while_a_table_has_a_media_field() {
     let path = dir.path().join("db");
     let papers = Schema::new("papers", vec![Field::new("id", FieldType::Keyword)], Some("id")).unwrap();
     let db = Db::create(&path, papers, opts()).unwrap();
-    assert!(required_features(&path).is_null());
+    assert_eq!(required_features(&path), json!(["field_ids"]));
     run(&db, "CREATE TABLE scans (id KEYWORD PRIMARY KEY, page MEDIA OPTIONS(kind = 'pdf'))").unwrap();
-    assert_eq!(required_features(&path), json!(["media"]));
+    assert_eq!(required_features(&path), json!(["field_ids", "media"]));
     let pdf = b"%PDF-1.4\n2 0 obj << /Type /Pages /Count 3 >>";
     let row = json!({"uri": "s3://b/a.pdf", "data": b64(pdf)}).to_string();
     run(&db, &format!("INSERT INTO scans (id, page) VALUES ('s', '{row}')")).unwrap();
     let r = rows(&db, "SELECT page FROM scans");
     assert_eq!(Media::parse(r[0][0].as_str().unwrap()).unwrap().pages, Some(3));
     run(&db, "DROP TABLE scans").unwrap();
-    assert!(required_features(&path).is_null());
+    assert_eq!(required_features(&path), json!(["field_ids"]));
 }

@@ -45,12 +45,17 @@ fn docs(vectors: &[Vec<f32>], ids: std::ops::Range<usize>) -> Vec<Vec<Value>> {
     ids.map(|i| vec![Value::Int(i as i64), if i % 13 == 5 { Value::Null } else { Value::Vector(Arc::from(vectors[i].as_slice())) }]).collect()
 }
 
+/// The name of field `emb`'s sections (by its id).
+fn emb() -> String {
+    schema(16).key_of("emb").unwrap()
+}
+
 fn opts(seed: u64) -> BuildOptions {
     BuildOptions::default().set("vector.seed", seed).set("vector.threads", 1)
 }
 
 fn graph(seg: &SegmentFile) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let s = |part: &str| seg.require(&format!("vec.emb.{part}")).unwrap().to_vec();
+    let s = |part: &str| seg.require(&format!("vec.{}.{part}", emb())).unwrap().to_vec();
     (s("meta"), s("hnsw"), s("hnsw_upper"))
 }
 
@@ -60,7 +65,7 @@ fn segment(image: Vec<u8>) -> SegmentFile {
 
 /// Recall@10 of the graph over `queries` against an exact scan.
 fn recall(seg: &SegmentFile, queries: &[Vec<f32>]) -> f64 {
-    let r = VectorReader::open(seg, "emb").unwrap();
+    let r = VectorReader::open(seg, &emb()).unwrap();
     let params = SearchParams { strategy: Strategy::Hnsw, ef: 100, ..SearchParams::default() };
     let mut found = 0;
     for q in queries {
@@ -136,7 +141,7 @@ fn merged_segments_start_from_their_largest_whole_input() {
     let got = recall(&segs[0].file, &queries);
     assert!(got >= 0.9, "recall@10 {got:.3}");
     // Every live document is still found by its own vector.
-    let r = VectorReader::open(&segs[0].file, "emb").unwrap();
+    let r = VectorReader::open(&segs[0].file, &emb()).unwrap();
     let params = SearchParams { strategy: Strategy::Hnsw, ef: 40, ..SearchParams::default() };
     for d in (0..8900).step_by(97).filter(|&d| r.has_vector(d)) {
         assert_eq!(r.search(r.vector(d), 1, &params, None).hits[0].doc, d);

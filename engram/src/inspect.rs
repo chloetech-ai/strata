@@ -78,7 +78,7 @@ pub fn layout(store: &Store) -> Result<Json> {
         .segments()
         .iter()
         .map(|v| {
-            let mut sections: Vec<(String, usize)> = v.file.section_sizes();
+            let mut sections: Vec<(String, usize)> = v.file.section_sizes().into_iter().map(|(k, n)| (strata::segment::label(snap.schema(), &k), n)).collect();
             sections.sort_by(|a, b| b.1.cmp(&a.1));
             let sections: Map<String, Json> = sections.into_iter().map(|(k, n)| (k, json!(n))).collect();
             json!({"id": v.id, "in_memory": v.in_memory, "n_docs": v.file.n_docs(), "n_live": v.n_live, "sections": sections})
@@ -123,6 +123,10 @@ mod tests {
         assert!(query(&s, &json!({"sql": "DELETE FROM memory"})).is_err());
         let l = layout(&s).unwrap();
         assert_eq!(l["schema"]["table"], json!("memory"));
+        // Sections are named by field id on disk, by field name here.
+        s.flush().unwrap();
+        let l = layout(&s).unwrap();
+        assert!(l["segments"].as_array().unwrap().iter().any(|g| g["sections"].get("text.body.dict").is_some()), "{}", l["segments"]);
         assert_eq!(l["live_docs"], json!(3)); // two records and one entity
         assert_eq!(embed(&s, &json!({"text": "x"})).unwrap()["dim"], json!(64));
     }

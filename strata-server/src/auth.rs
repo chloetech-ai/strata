@@ -1,6 +1,8 @@
 //! Who may call the server. A bearer token guards the HTTP API and every
 //! gRPC call, compared in constant time; a server refuses to listen beyond
-//! loopback without one. A browser on another site is kept out by the Host
+//! loopback without one. The servers of a cluster call each other with a
+//! cluster token of their own, which clients never hold
+//! ([`crate::keys`]). A browser on another site is kept out by the Host
 //! check (a DNS-rebinding page names its own host) and the Origin check (a
 //! page's cross-site POST names its origin), and an import must say what
 //! it sends with a content type a page cannot send without asking first.
@@ -15,6 +17,10 @@ pub struct Access {
     /// The token every API route and every gRPC call needs, as
     /// `Authorization: Bearer <token>`.
     pub token: Option<Secret>,
+    /// The token the servers of a cluster send each other
+    /// (`--cluster-token`): with one, only it may make the calls between
+    /// servers, and `token` is an admin's ([`crate::keys::Keys::resolve`]).
+    pub cluster: Option<Secret>,
     /// The host names the HTTP server answers to (`None`: any).
     pub hosts: Option<Vec<String>>,
     /// A certificate chain and its key, as PEM, for both listeners.

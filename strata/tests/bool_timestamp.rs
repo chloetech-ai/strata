@@ -81,6 +81,11 @@ fn t(micros: i64) -> Value {
 }
 
 /// The format of the version on disk: CURRENT's, or the newest meta slot's.
+/// The features the database at `path` needs.
+fn required(path: &Path) -> Vec<String> {
+    strata::storage::manifest::read(path).unwrap().features()
+}
+
 fn format_on_disk(path: &Path) -> u32 {
     if path.is_dir() {
         let cur: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("CURRENT")).unwrap()).unwrap();
@@ -115,15 +120,15 @@ fn through_sql(layout: Layout) {
     let path = dir.path().join("t.strata");
     let opts = || DbOptions { layout, sync: false, ..DbOptions::default() };
     let db = Db::create(&path, papers(), opts()).unwrap();
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!((format_on_disk(&path), required(&path)), (3, vec!["field_ids".to_string()]));
 
     // Neither type can be a key, and DATE points to TIMESTAMP.
     assert!(fails(&db, "CREATE TABLE z (id BOOL PRIMARY KEY)").contains("primary key"));
     assert!(fails(&db, "CREATE TABLE z (id KEYWORD PRIMARY KEY, d DATE)").contains("TIMESTAMP"));
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(required(&path), ["field_ids"]);
 
     written(&db, "CREATE TABLE tasks (id KEYWORD PRIMARY KEY, title TEXT, done BOOL, due TIMESTAMP, n INT)");
-    assert_eq!(format_on_disk(&path), 3);
+    assert_eq!(required(&path), ["bool", "field_ids", "timestamp"]);
     let n = written(
         &db,
         "INSERT INTO tasks (id, title, done, due, n) VALUES \
@@ -233,18 +238,18 @@ fn through_sql(layout: Layout) {
     assert_eq!(rows(&db, "SELECT done, due FROM tasks WHERE id = 'c'"), [vec![Value::Bool(false), t(OCT1 + 31 * DAY)]]);
     assert!(fails(&db, "INSERT INTO tasks (id, n) VALUES ('c', 1) ON CONFLICT (id) DO UPDATE SET done = excluded.n").contains("done"));
 
-    // A database whose tables use no feature is written in the older
-    // format again, in both meta slots of a single file.
+    // Once no table uses them, the database needs field ids alone (as a
+    // database from before field ids went back to an older format).
     written(&db, "DROP TABLE tasks");
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(required(&path), ["field_ids"]);
     if layout == Layout::SingleFile {
         let slots = meta_slots(&path);
-        assert!(slots.iter().all(|m| m.is_some_and(|m| m.format == 1)), "{slots:?}");
+        assert!(slots.iter().all(|m| m.is_some_and(|m| m.format == 3)), "{slots:?}");
     }
     drop(db);
     let db = Db::open(&path, opts()).unwrap();
     assert_eq!(db.catalog().len(), 1);
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(required(&path), ["field_ids"]);
 }
 
 #[test]
@@ -402,7 +407,7 @@ fn an_unknown_feature_is_refused_by_name() {
     let mut cur: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("CURRENT")).unwrap()).unwrap();
     let name = cur["manifest"].as_str().unwrap().to_string();
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join(&name)).unwrap()).unwrap();
-    assert_eq!(manifest["features"]["required"], serde_json::json!(["bool", "timestamp"]));
+    assert_eq!(manifest["features"]["required"], serde_json::json!(["bool", "field_ids", "timestamp"]));
     let mut rewrite = |m: &serde_json::Value| {
         let bytes = serde_json::to_vec(m).unwrap();
         std::fs::write(path.join(&name), &bytes).unwrap();
@@ -412,7 +417,7 @@ fn an_unknown_feature_is_refused_by_name() {
     manifest["features"]["optional"] = serde_json::json!(["page-cache-hints"]);
     rewrite(&manifest);
     Db::open(&path, opts()).unwrap();
-    manifest["features"]["required"] = serde_json::json!(["bool", "geo", "timestamp"]);
+    manifest["features"]["required"] = serde_json::json!(["bool", "field_ids", "geo", "timestamp"]);
     rewrite(&manifest);
     let e = Db::open(&path, opts()).err().expect("an unknown feature is refused").to_string();
     assert!(e.contains("\"geo\"") && e.contains("newer"), "{e}");

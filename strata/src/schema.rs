@@ -133,6 +133,17 @@ impl Logical {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
+    /// The field's id in its table: given when the field is created
+    /// ([`Schema::new`], from [`Schema::next_field_id`]), never changed and
+    /// never given to another field of the table, even once this one is
+    /// gone. Everything written down names a field by its id (its sections
+    /// [`Field::key`], the doc store's columns, values written in place),
+    /// so that its position and name can change without rewriting what was
+    /// written. [`NO_ID`] in a database written before field ids
+    /// ([`Schema::is_legacy`]), which is opened only to be copied
+    /// ([`crate::upgrade`]).
+    #[serde(default = "no_id", skip_serializing_if = "is_no_id")]
+    pub id: u32,
     pub name: String,
     pub ty: FieldType,
     /// Kept in the doc store and returned by `SELECT`. (Vector fields are
@@ -268,9 +279,31 @@ pub struct Embed {
     pub model: String,
 }
 
+/// The id of a field that has none yet ([`Field::new`]: [`Schema::new`]
+/// gives it one), or that a database written before field ids holds.
+pub const NO_ID: u32 = u32::MAX;
+
+/// How many fields a table can have had over its life: ids are below it,
+/// so that values written in place name a field in 16 bits
+/// ([`crate::storage::updates`]).
+pub const MAX_FIELDS: u32 = u16::MAX as u32;
+
+fn no_id() -> u32 {
+    NO_ID
+}
+
+fn is_no_id(id: &u32) -> bool {
+    *id == NO_ID
+}
+
+fn is_zero(x: &u32) -> bool {
+    *x == 0
+}
+
 impl Field {
     pub fn new(name: &str, ty: FieldType) -> Self {
         Field {
+            id: NO_ID,
             name: name.to_string(),
             ty,
             stored: true,
@@ -291,6 +324,19 @@ impl Field {
             derive: None,
         }
     }
+    /// What the field's sections are named by in a segment
+    /// (`text.<key>.dict`, `col.<key>`, `vec.<key>.meta`, ...): `f` and its
+    /// id, as in `f3`, so that renaming a field renames none of them. A
+    /// field of a database written before field ids ([`NO_ID`]) has its
+    /// name there instead.
+    pub fn key(&self) -> String {
+        if self.id == NO_ID {
+            self.name.clone()
+        } else {
+            format!("f{}", self.id)
+        }
+    }
+
     /// A BOOL field ([`Logical::Bool`]).
     pub fn boolean(name: &str) -> Self {
         Field { logical: Some(Logical::Bool), ..Field::new(name, FieldType::Int) }
@@ -458,6 +504,11 @@ impl Field {
 pub struct Schema {
     pub table: String,
     pub fields: Vec<Field>,
+    /// The id the table's next new field gets ([`Field::id`]): one more
+    /// than the largest any of its fields has had. 0 in a database
+    /// written before field ids.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub next_field_id: u32,
     /// Index into `fields` of the primary key (a Keyword or Int field).
     pub primary_key: Option<usize>,
     /// The field whose value places a row on a shard instead of its key
@@ -544,8 +595,9 @@ impl Retain {
 
 impl Schema {
     pub fn new(table: &str, fields: Vec<Field>, primary_key: Option<&str>) -> Result<Self> {
-        let s = Schema { table: table.to_string(), fields, primary_key: None, shard_by: None, cluster_by: None, retain: None, edges: None };
+        let s = Schema { table: table.to_string(), fields, next_field_id: 0, primary_key: None, shard_by: None, cluster_by: None, retain: None, edges: None };
         let mut s = s;
+        s.give_ids()?;
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
             if !matches!(s.fields[i].ty, FieldType::Keyword | FieldType::Int) {
@@ -952,6 +1004,101 @@ impl Schema {
 
     pub fn field(&self, name: &str) -> Option<&Field> {
         self.field_index(name).map(|i| &self.fields[i])
+    }
+
+    /// The position of the field whose id is `id`, if the table has it.
+    pub fn position_of(&self, id: u32) -> Option<usize> {
+        if self.is_legacy() {
+            return (id as usize).lt(&self.fields.len()).then_some(id as usize);
+        }
+        self.fields.iter().position(|f| f.id == id)
+    }
+
+    /// The id of the field at position `i`: [`Field::id`], or in a
+    /// database written before field ids its position, which is what such
+    /// a database wrote down.
+    pub fn id_of(&self, i: usize) -> u32 {
+        match self.fields[i].id {
+            NO_ID => i as u32,
+            id => id,
+        }
+    }
+
+    /// [`Field::key`] of the field named `name` (any case).
+    pub fn key_of(&self, name: &str) -> Option<String> {
+        self.field(name).map(Field::key)
+    }
+
+    /// Whether the table comes from a database written before field ids:
+    /// its fields have none ([`NO_ID`]), its sections are named by the
+    /// fields' names, and positions stand for ids.
+    pub fn is_legacy(&self) -> bool {
+        self.fields.first().is_some_and(|f| f.id == NO_ID)
+    }
+
+    /// Gives each field without an id ([`NO_ID`]) the next one, in order,
+    /// and checks the ids: unique, and below [`Schema::next_field_id`],
+    /// which is raised past them. A table's fields either all have ids or,
+    /// read from a database written before field ids, none do
+    /// ([`Schema::check_ids`]).
+    fn give_ids(&mut self) -> Result<()> {
+        let top = self.fields.iter().filter(|f| f.id != NO_ID).map(|f| f.id + 1).max().unwrap_or(0);
+        self.next_field_id = self.next_field_id.max(top);
+        for f in self.fields.iter_mut().filter(|f| f.id == NO_ID) {
+            if self.next_field_id >= MAX_FIELDS {
+                return Err(Error::Schema(format!("table {} has had {MAX_FIELDS} fields, as many as a table can have had", self.table)));
+            }
+            f.id = self.next_field_id;
+            self.next_field_id += 1;
+        }
+        self.check_ids()
+    }
+
+    /// Checks a table's field ids as a manifest holds them: every field has
+    /// one, no two the same, each below [`Schema::next_field_id`]; or, for
+    /// a table written before field ids, no field has one and
+    /// `next_field_id` is 0.
+    pub fn check_ids(&self) -> Result<()> {
+        let bad = |m: String| Err(Error::Schema(format!("table {}: {m}", self.table)));
+        if self.is_legacy() {
+            if self.next_field_id != 0 || self.fields.iter().any(|f| f.id != NO_ID) {
+                return bad("some fields have ids and some do not".into());
+            }
+            return Ok(());
+        }
+        let mut ids: Vec<u32> = self.fields.iter().map(|f| f.id).collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|w| w[0] == w[1]) {
+            return bad("two fields have the same id".into());
+        }
+        if self.next_field_id > MAX_FIELDS {
+            return bad(format!("the next field id is {}, past the most a table can have had", self.next_field_id));
+        }
+        if let Some(f) = self.fields.iter().find(|f| f.id == NO_ID || f.id >= self.next_field_id) {
+            return bad(format!("field {} has id {}, and the next field id is {}", f.name, f.id, self.next_field_id));
+        }
+        Ok(())
+    }
+
+    /// This table as a database written before field ids holds it: no
+    /// field has an id ([`Schema::is_legacy`]). A table created in such a
+    /// database, opened to be copied, is made so.
+    pub fn without_ids(&self) -> Schema {
+        let mut s = self.clone();
+        s.next_field_id = 0;
+        for f in &mut s.fields {
+            f.id = NO_ID;
+        }
+        s
+    }
+
+    /// This table with ids given afresh, as a new table would get them
+    /// (positions, from 0): how a table read from a database written before
+    /// field ids is created again ([`crate::upgrade`]).
+    pub fn with_new_ids(&self) -> Result<Schema> {
+        let mut s = self.without_ids();
+        s.give_ids()?;
+        Ok(s)
     }
 
     /// Fills generated fields of `doc` from their sources.

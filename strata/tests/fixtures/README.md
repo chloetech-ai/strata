@@ -12,10 +12,15 @@ once, and a database someone wrote with that version looks the same.
 | `format3/` | 3, with `analyzer:simple:1`, `bool`, `default`, `not_null` and `timestamp` | 835ca9a | `tests/format_fixtures.rs` |
 | `seqno/` | 3, with `seq_no`: numbered writes and rows, and a numbered WAL (`STRWAL02`) | c0d46c2 | `tests/format_fixtures.rs` |
 | `profiles/` | 3, with `rank_profiles`: rank profiles in the manifest, and profile records in a WAL that names the feature (`STRWAL02`) | b43bfb2 | `tests/format_fixtures.rs` |
+| `fieldids/` | 3, with `field_ids`: the writes of `format2/`, `format3/`, `seqno/` and `profiles/`, in subdirectories of those names, as the first version with field ids writes them | the commit that adds this row | `tests/format_fixtures.rs` |
 
-`format2/`, `format3/`, `seqno/` and `profiles/` each hold `db.strata` (with its WAL,
+All but `format1/` were written by [`writer.rs`](writer.rs). The sets from
+before field ids (`format1/` to `profiles/`), which named fields by position
+and name, are what this version refuses to open and copies with
+`strata::upgrade`. `format2/`, `format3/`, `seqno/` and `profiles/`, and
+each subdirectory of `fieldids/`, hold `db.strata` (with its WAL,
 `db.strata-wal`) and `db.dir`: the same writes in the single-file and the
-directory layout. [`writer.rs`](writer.rs) makes the writes:
+directory layout. `writer.rs` makes the writes:
 
 - format 2: tables `t` and `u` (whose `parent` names rows of `t`), rows
   written and flushed, then deletes in both and `n` set in place on three
@@ -36,28 +41,34 @@ directory layout. [`writer.rs`](writer.rs) makes the writes:
   `u` (`notes`), `by_n` replaced and `phased` dropped.
 
 `tests/format_fixtures.rs` opens copies of every set in both layouts with
-the current code, checks their rows, filters and searches (`simple` against
-`english`, `BOOL` and `TIMESTAMP` filters, defaults and `NOT NULL` on new
-rows), writes, flushes and merges, checks that each stays in its format and
-opens it again. A numbered set must also go on counting from its last
-number and give each row the number of its last write, and the profiles
-set must rank as its profiles say and go back to format 2 once they are
-dropped.
+the current code. A set from before field ids must be refused by a plain
+open, with a message that names `strata::upgrade`; opened to be copied
+(`DbOptions::open_old`), it is checked as before and stays in its format.
+A set of `fieldids/` opens as any database does. The test checks their
+rows, filters and searches (`simple` against `english`, `BOOL` and
+`TIMESTAMP` filters, defaults and `NOT NULL` on new rows), writes, flushes
+and merges, checks that each stays in its format and opens it again. A
+numbered set must also go on counting from its last number and give each
+row the number of its last write, and the profiles set must rank as its
+profiles say and, from before field ids, go back to format 2 once they are
+dropped. It also upgrades copies of the sets from before field ids
+(refusing the numbered one) and checks that the copies hold the same.
 
 It also writes the sets again with `writer.rs` and checks that the bytes
-are the same, but for the database id (in the single file's meta pages,
-`CURRENT` and the WAL header). The writes are deterministic, so a failure
-there means Strata now writes something else for the same writes. If that
-is deliberate, keep the old set and add the new one: move `format3/` to
-`format3-<commit that wrote it>/` (the tests open every `format3*` set),
-write a new `format3/` with the current code, from `strata/`:
+are those of `fieldids/`, but for the database id (in the single file's
+meta pages, `CURRENT` and the WAL header). The writes are deterministic, so
+a failure there means Strata now writes something else for the same
+writes. If that is deliberate, keep the old set and add the new one: move
+`fieldids/` to `fieldids-<commit that wrote it>/` (the tests open every
+`fieldids*` set), write a new `fieldids/` with the current code, from
+`strata/`:
 
 ```bash
 cargo run --release --example format_fixtures -- /tmp/fixtures
-cp -r /tmp/fixtures/format3 tests/fixtures/format3
+mkdir tests/fixtures/fieldids && cp -r /tmp/fixtures/* tests/fixtures/fieldids/
 ```
 
 and add a row to the table above. Do not change the writes in `writer.rs`:
-the tests expect every set of a format to hold the same rows. A new format,
+the tests expect every set of a kind to hold the same rows. A new format,
 or a feature the sets do not cover, gets a new function there, a set with a
 name of its own and its own test.

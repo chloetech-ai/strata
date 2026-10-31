@@ -11,6 +11,9 @@ use strata::segment::{DocFilter, DocSet, SegmentFile};
 use strata::vector::{Hit, HnswFilterMode, SearchParams, Strategy, VectorReader};
 use strata::{Field, FieldType, Schema, Value, VectorIndexKind};
 
+/// The sections of field `emb`, the table's only field (id 0).
+const EMB: &str = "f0";
+
 /// Box-Muller normal samples (keeps the test free of extra dependencies).
 mod rand_distr_free {
     use rand::Rng;
@@ -67,7 +70,7 @@ fn flat_with_full_rerank_is_exact_search() {
     let dim = 50;
     let vecs: Vec<Option<Vec<f32>>> = clustered(1500, dim, 12, 1).into_iter().map(Some).collect();
     let seg = segment(&vecs, dim, &opts("flat"));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     assert_eq!((r.dim(), r.n_docs(), r.index_kind()), (dim, 1500, "flat"));
     assert!(r.is_zero_copy());
     let queries = clustered(20, dim, 12, 2);
@@ -91,7 +94,7 @@ fn prefilter_returns_exact_filtered_top_k() {
     let n = 3000;
     let vecs: Vec<Option<Vec<f32>>> = clustered(n, dim, 16, 3).into_iter().map(Some).collect();
     let seg = segment(&vecs, dim, &opts("flat"));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     let mut rng = rand::rngs::StdRng::seed_from_u64(4);
     let queries = clustered(25, dim, 16, 5);
     let mut found = 0;
@@ -125,7 +128,7 @@ fn every_strategy_returns_only_members() {
         [0.002, 0.02, 0.2, 0.9].iter().map(|&p| DocSet::from_sorted((0..n as u32).filter(|_| rng.gen_bool(p)).collect(), n as u32)).collect();
     for kind in ["flat", "ivf", "hnsw"] {
         let seg = segment(&vecs, dim, &opts(kind));
-        let r = VectorReader::open(&seg, "emb").unwrap();
+        let r = VectorReader::open(&seg, EMB).unwrap();
         assert_eq!(r.index_kind(), kind);
         assert!(r.is_zero_copy(), "{kind}");
         for f in &filters {
@@ -173,7 +176,7 @@ fn documents_without_vectors_are_never_returned() {
     let queries = clustered(8, dim, 6, 10);
     for kind in ["flat", "ivf", "hnsw"] {
         let seg = segment(&vecs, dim, &opts(kind));
-        let r = VectorReader::open(&seg, "emb").unwrap();
+        let r = VectorReader::open(&seg, EMB).unwrap();
         assert!(!r.has_vector(0) && r.has_vector(1));
         assert!(r.vector(0).iter().all(|&x| x == 0.0));
         for s in [Strategy::Flat, Strategy::Ivf, Strategy::Hnsw] {
@@ -193,22 +196,22 @@ fn build_options_select_the_index() {
     let dim = 16;
     let vecs: Vec<Option<Vec<f32>>> = clustered(300, dim, 4, 11).into_iter().map(Some).collect();
     let seg = segment(&vecs, dim, &BuildOptions::default().set("vector.index", "ivf").set("vector.ivf.nlist", 7));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     assert_eq!((r.index_kind(), r.info().nlist), ("ivf", Some(7)));
     let seg = segment(&vecs, dim, &BuildOptions::default().set("vector.index", "hnsw").set("vector.hnsw.m", 8));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     assert_eq!((r.index_kind(), r.info().m), ("hnsw", Some(8)));
     let schema = Schema::new("t", vec![Field::new("emb", FieldType::Vector { dim, index: VectorIndexKind::Flat })], None).unwrap();
     let docs = vec![vec![Value::Vector(Arc::from(vec![0f32; dim]))]];
     assert!(build_segment(&schema, &docs, &BuildOptions::default().set("vector.index", "lsh")).is_err());
     // An IVF over fewer documents than lists still works.
     let seg = segment(&vecs[..3], dim, &BuildOptions::default().set("vector.index", "ivf").set("vector.ivf.nlist", 50));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     let out = r.search(vecs[1].as_deref().unwrap(), 2, &SearchParams { strategy: Strategy::Ivf, ..Default::default() }, None);
     assert_eq!(out.hits[0].doc, 1);
     // An empty segment.
     let seg = segment(&[], dim, &BuildOptions::default().set("vector.index", "hnsw"));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     assert!(r.search(&[0.5; 16], 5, &SearchParams::default(), None).hits.is_empty());
 }
 
@@ -218,7 +221,7 @@ fn auto_follows_the_cost_model() {
     let n = 4000;
     let vecs: Vec<Option<Vec<f32>>> = clustered(n, dim, 10, 12).into_iter().map(Some).collect();
     let seg = segment(&vecs, dim, &opts("hnsw"));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     let p = SearchParams::default();
     // A tiny filter is scanned; no filter uses the graph.
     assert_eq!(r.plan(10, Some(4), &p), Strategy::PreFilter);
@@ -241,7 +244,7 @@ fn io_hints_do_not_change_results() {
     let f = DocSet::from_sorted((0..n as u32).filter(|d| d % 7 == 3).collect(), n as u32);
     for kind in ["flat", "ivf", "hnsw"] {
         let seg = segment(&vecs, dim, &opts(kind));
-        let mut r = VectorReader::open(&seg, "emb").unwrap();
+        let mut r = VectorReader::open(&seg, EMB).unwrap();
         for s in Strategy::ALL {
             let p = SearchParams { strategy: s, ..Default::default() };
             for q in &queries {

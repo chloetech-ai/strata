@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
 use crate::service::{After, QueryReq, Service, Stream};
-use crate::keys::{self, Principal, Scope};
+use crate::keys::{self, KeySet, Principal, Scope};
 use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
@@ -146,8 +146,9 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         hold: r.hold,
         release: r.release,
         after: After::of(r.min_seq_no, r.min_seq_nos)?,
-        // A shard measures CPU time when set to for every query.
-        profile: false,
+        // A coordinator's query that asked for its steps' CPU time; a shard
+        // also measures it when set to for every query.
+        profile: r.profile,
         quiet: false,
     })
 }
@@ -201,16 +202,18 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 }
 
 /// The least a method's credential needs ([`crate::keys`]): the internal
-/// methods the root (the token the servers of a cluster share), writes a
-/// write key, the log store an admin key (it shows every client's SQL),
+/// methods the root (the cluster's token, or the token of a server
+/// without one), writes a write key, the log store and a profile an admin
+/// key (the log store shows every client's SQL; a profile as
+/// `/v1/profile` over HTTP),
 /// the rest any key. What a call then does (a `Write` of a
 /// table's statement needs an admin key) the service checks, as for HTTP.
 /// Every method is named, so that a new one must say what it needs.
 fn method_scope(method: &str) -> Option<Scope> {
     match method {
-        "Replicate" | "Restore" | "Verify" | "Slots" | "Configure" => None,
+        "Replicate" | "Restore" | "Verify" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" | "Keys" => None,
         "Write" | "WriteStream" => Some(Scope::Write),
-        "Logs" => Some(Scope::Admin),
+        "Logs" | "Profile" => Some(Scope::Admin),
         "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
         // An unknown method is the root's.
         _ => None,
@@ -221,7 +224,7 @@ fn method_scope(method: &str) -> Option<Scope> {
 fn may_call<T>(req: &Request<T>, method: &str) -> (Principal, Result<(), ApiError>) {
     let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
     let r = match method_scope(method) {
-        None if !who.root => Err(ApiError { status: 403, message: format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name) }),
+        None if !who.root => Err(ApiError { status: 403, message: format!("{method} is a call between the servers of a cluster: it needs the cluster's token ({:?} may not make it)", who.name) }),
         None => Ok(()),
         Some(need) => who.may(need, method),
     };
@@ -265,7 +268,7 @@ impl Grpc {
             obs::scope(Some(id.clone()), async { audit(&self.0, &who, method, e.status, t0, None) }).await;
             return Err(Status::from(e));
         }
-        let call = keys::noting(f(self.0.clone(), who.clone(), req.into_inner()));
+        let call = keys::noting(crate::service::ROUTED.scope(std::cell::Cell::new(0), f(self.0.clone(), who.clone(), req.into_inner())));
         let (r, note) = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), call)).instrument(span.clone()).await;
         let status = r.as_ref().map_or_else(|e| e.status, |_| 200);
         obs::scope(Some(id.clone()), async { audit(&self.0, &who, method, status, t0, note) }).await;
@@ -363,14 +366,32 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
+        if req.get_ref().moved {
+            // Rows of moving slots: a call between the servers of a cluster.
+            let (who, may) = may_call(&req, "Write (moved)");
+            if let Err(e) = may {
+                self.0.metrics.grpc("Write", "PermissionDenied", 0.0);
+                audit(&self.0, &who, "Write (moved)", e.status, Instant::now(), None);
+                return Err(Status::from(e));
+            }
+        }
         self.serve("Write", req, |svc, who, r| async move {
             svc.check_epoch(r.epoch)?;
             let w = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
-                svc.write_ops(ops, key).await?
+                svc.write_ops_as(ops, key, r.moved).await?
+            } else if r.moved {
+                return Err(ApiError::bad("rows of moving slots come as write operations (ops_json), not SQL"));
             } else {
-                match svc.sql(&who, &r.sql, &params_from_pb(r.params), After::Any, 0).await? {
+                let slots = match r.slots_json.is_empty() {
+                    true => None,
+                    false => {
+                        let ranges: Vec<(usize, usize)> = from_json(&r.slots_json, "slots")?;
+                        Some(ranges.into_iter().flat_map(|(a, b)| a..b.min(crate::slots::SLOTS)).collect())
+                    }
+                };
+                match svc.sql_in(&who, &r.sql, &params_from_pb(r.params), After::Any, 0, slots).await? {
                     crate::service::SqlAnswer::Written { w, .. } => w,
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
@@ -504,10 +525,75 @@ impl pb::strata_server::Strata for Grpc {
         .await
     }
 
+    type ExportSlotsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::ExportSlotsChunk, Status>> + Send>>;
+
+    async fn export_slots(&self, req: Request<pb::ExportSlotsRequest>) -> Result<Response<Self::ExportSlotsStream>, Status> {
+        let rx = self
+            .serve("ExportSlots", req, |svc, _who, r| async move {
+                svc.check_epoch(r.epoch)?;
+                svc.export_slots(r.changes, if r.batch_rows == 0 { 1000 } else { r.batch_rows as usize }).await
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(|c| c.map_err(Status::from)))))
+    }
+
+    async fn freeze_slots(&self, req: Request<pb::FreezeRequest>) -> Result<Response<pb::FreezeResponse>, Status> {
+        self.serve("FreezeSlots", req, |svc, _who, r| async move {
+            svc.check_epoch(r.epoch)?;
+            let ttl = match r.ttl_ms {
+                0 => crate::service::FREEZE_TTL,
+                ms => std::time::Duration::from_millis(ms.min(600_000) as u64),
+            };
+            Ok(pb::FreezeResponse { seq_no: svc.freeze_slots(ttl, r.thaw).await? })
+        })
+        .await
+    }
+
+    async fn cleanup_slots(&self, req: Request<pb::CleanupRequest>) -> Result<Response<pb::CleanupResponse>, Status> {
+        self.serve("CleanupSlots", req, |svc, _who, r| async move {
+            svc.check_epoch(r.epoch)?;
+            Ok(pb::CleanupResponse { deleted: svc.cleanup_slots().await? })
+        })
+        .await
+    }
+
+    async fn keys(&self, req: Request<pb::KeysRequest>) -> Result<Response<pb::KeysResponse>, Status> {
+        self.serve("Keys", req, |svc, who, r| async move {
+            if who.is_open() {
+                return Err(ApiError {
+                    status: 409,
+                    message: "this server has no token: keys would close it to the servers that gave them, which send it none. Give the cluster's servers a --cluster-token to share keys".into(),
+                });
+            }
+            if !r.keys_json.is_empty() {
+                let given = KeySet::from_json(&r.keys_json).map_err(|e| ApiError::bad(format!("keys_json: {e}")))?;
+                let before = svc.keys.set();
+                if svc.keys.merge(&given)? {
+                    let after = svc.keys.set();
+                    keys::note(format!("merged keys from the cluster: {} keys, {} revoked (were {} and {})", after.keys.len(), after.revoked.len(), before.keys.len(), before.revoked.len()));
+                }
+            }
+            Ok(pb::KeysResponse { keys_json: serde_json::to_vec(&svc.keys.set()).map_err(ApiError::internal)? })
+        })
+        .await
+    }
+
     async fn release(&self, req: Request<pb::ReleaseRequest>) -> Result<Response<pb::Empty>, Status> {
         self.serve("Release", req, |svc, _who, r| async move {
             svc.release(&r.snapshots);
             Ok(pb::Empty {})
+        })
+        .await
+    }
+
+    async fn profile(&self, req: Request<pb::ProfileRequest>) -> Result<Response<pb::ProfileResponse>, Status> {
+        self.serve("Profile", req, |svc, _, r| async move {
+            let body: serde_json::Value = if r.body_json.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&r.body_json).map_err(|e| ApiError::bad(format!("bad profile body: {e}")))? };
+            let asked = crate::profiling::Asked { kind: crate::profiling::Kind::of(&r.kind)?, body, folded: r.folded, in_use: r.in_use };
+            // Audited as an admin's request over HTTP is.
+            keys::note(format!("a {} profile", asked.kind.name()));
+            Ok(pb::ProfileResponse { body: crate::profiling::take(&svc, asked).await?.bytes() })
         })
         .await
     }

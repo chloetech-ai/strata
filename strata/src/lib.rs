@@ -58,6 +58,7 @@ pub mod sqlite;
 pub mod storage;
 pub mod text;
 pub mod timestamp;
+pub mod upgrade;
 pub mod value;
 pub mod vector;
 pub mod workload;
