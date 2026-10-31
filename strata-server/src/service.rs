@@ -39,6 +39,25 @@ use crate::keys::{self, Audit, Keys, Principal, Scope};
 use crate::telemetry::{self, LiveQueries, QueryLog, Sample, Series};
 use crate::{json as js, obs, pb, ApiError};
 
+mod failover;
+mod moving;
+
+pub use failover::tuned as failover_tuned;
+pub(crate) use moving::Moving;
+pub use moving::FREEZE_TTL;
+
+tokio::task_local! {
+    /// The cluster map epoch the request being served routes by, as
+    /// [`Service::check_epoch`] checked it (0: none): a read takes its
+    /// version and a write checks its keys against the map then.
+    pub static ROUTED: std::cell::Cell<u64>;
+}
+
+/// The epoch the request being served routes by ([`ROUTED`]).
+fn routed() -> u64 {
+    ROUTED.try_with(std::cell::Cell::get).unwrap_or(0)
+}
+
 /// Binds one SELECT into its plan, and gives back what the executor runs
 /// of it: every query runs as a plan ([`strata::query::ir`]).
 fn bind(sql: &str, schema: &Schema, params: &Params) -> strata::Result<Select> {
@@ -241,6 +260,8 @@ pub struct Service {
     /// writes here correctly ([`Service::check_epoch`]).
     slots_since: AtomicU64,
     slots_file: tokio::sync::Mutex<Option<PathBuf>>,
+    /// Its part in moving slots between shards ([`moving`]).
+    pub(crate) moving: Moving,
     /// Its part in replication ([`crate::replication`]), which a replica's
     /// promotion changes ([`Self::promote`]).
     replication: RwLock<Replication>,
@@ -251,6 +272,10 @@ pub struct Service {
     promoting: tokio::sync::Mutex<()>,
     /// Where its part in replication is kept (`<db>.replication`).
     replication_file: Option<PathBuf>,
+    /// How long a replica hears nothing from its primary before it asks
+    /// its shard's other copies to elect it (`--failover-after-ms`; zero:
+    /// never), as [`Self::start_failover`] does.
+    pub failover_after: Duration,
 }
 
 /// A server's part in replication.
@@ -331,10 +356,12 @@ impl Service {
             slots: RwLock::new(None),
             slots_since: AtomicU64::new(0),
             slots_file: tokio::sync::Mutex::new(None),
+            moving: Moving::default(),
             replication: RwLock::new(Replication::None),
             promote_options: None,
             promoting: tokio::sync::Mutex::new(()),
             replication_file: None,
+            failover_after: Duration::ZERO,
         }
     }
 
@@ -438,53 +465,78 @@ impl Service {
         }
     }
 
-    /// The shard's other copies, as this replica knows them (its
-    /// `--replicas`): the only servers a promotion asked for with a key
-    /// calls, and so sends the cluster's token to.
+    /// The shard's copies, as this replica knows them: its `--replicas`,
+    /// and the servers its cluster map names for its shard (which only the
+    /// cluster's token sets). The only servers a promotion asked for with
+    /// a key calls, and so sends the cluster's token to.
     pub fn known_copies(&self) -> Vec<String> {
-        self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default()
+        let mut known = self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default();
+        if let Some((m, shard)) = self.slots() {
+            for url in m.replicas().get(shard).into_iter().flatten() {
+                if !known.contains(url) {
+                    known.push(url.clone());
+                }
+            }
+        }
+        known
     }
 
     /// Makes this replica the primary of a new term, shipping to
-    /// `replicas` under `acks` ([`Follow::promote`]); with `force`, even
-    /// when one of them holds transactions this replica does not. No
-    /// `replicas`: its [`Self::known_copies`]. Promotion calls each copy
-    /// with the cluster's token, so a key's promotion may name only known
-    /// copies; the token's holder, who could send the token anywhere
-    /// anyway, may name others.
+    /// `replicas` under `acks` ([`Follow::promote`]), once a majority of
+    /// its shard's copies voted for it: the servers its cluster map names
+    /// for its shard, or else `replicas`. With no `replicas`, it ships to
+    /// the shard's other copies, or without a cluster map to its
+    /// `--replicas`. With `force`, it asks for no votes, and is promoted
+    /// even when a copy holds transactions it does not. Promotion calls
+    /// each copy with the cluster's token, so a key's promotion may name
+    /// only [`Self::known_copies`]; the token's holder, who could send the
+    /// token anywhere anyway, may name others.
     pub async fn promote(&self, who: &Principal, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
         who.may(Scope::Admin, "a promotion")?;
         let known = self.known_copies();
-        let replicas = match replicas.is_empty() {
-            true => known,
-            false => {
-                let unknown: Vec<&String> = replicas.iter().filter(|u| !known.contains(u)).collect();
-                if !who.root && !unknown.is_empty() {
-                    let known = match known.is_empty() {
-                        true => "none: start the replica with --replicas naming them".to_string(),
-                        false => known.join(", "),
-                    };
-                    return Err(ApiError {
-                        status: 403,
-                        message: format!(
-                            "{} {} not among this shard's copies, which promotion calls with the cluster's token; known copies: {known}",
-                            unknown.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(", "),
-                            if unknown.len() == 1 { "is" } else { "are" }
-                        ),
-                    });
-                }
-                replicas
-            }
-        };
-        keys::note(format!("promote, shipping to {}", if replicas.is_empty() { "no replica".to_string() } else { replicas.join(", ") }));
+        let unknown: Vec<&String> = replicas.iter().filter(|u| !known.contains(u)).collect();
+        if !who.root && !unknown.is_empty() {
+            let known = match known.is_empty() {
+                true => "none: start the replica with --replicas naming them, or add it to a cluster".to_string(),
+                false => known.join(", "),
+            };
+            return Err(ApiError {
+                status: 403,
+                message: format!(
+                    "{} {} not among this shard's copies, which promotion calls with the cluster's token; known copies: {known}",
+                    unknown.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(", "),
+                    if unknown.len() == 1 { "is" } else { "are" }
+                ),
+            });
+        }
         let _one = self.promoting.lock().await;
         let Replication::Replica(f) = self.replication() else {
             return Err(conflict("this server is not a replica (--replica): only a replica is promoted".into()));
         };
-        let opts = PrimaryOptions { replicas, acks, ..self.promote_options.clone().unwrap_or_default() };
-        let (p, answer) = f.promote(opts, force).await?;
+        let voters = self.slots().and_then(|(m, shard)| m.replicas().get(shard).cloned()).filter(|v| v.len() > 1);
+        // None named, and no cluster map: the copies it was started with.
+        let replicas = match (replicas.is_empty(), &voters) {
+            (true, None) => self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default(),
+            _ => replicas,
+        };
+        keys::note(format!(
+            "promote, shipping to {}",
+            match (replicas.is_empty(), &voters) {
+                (false, _) => replicas.join(", "),
+                (true, Some(_)) => "the shard's other copies".to_string(),
+                (true, None) => "no replica".to_string(),
+            }
+        ));
+        let opts = PrimaryOptions { replicas, acks, ..self.primary_options() };
+        let (p, answer) = f.promote(opts, voters, force).await?;
         *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::Primary(p);
         Ok(answer)
+    }
+
+    /// How this server ships once promoted ([`Self::promote_options`]),
+    /// with the lease on reads automatic failover needs.
+    fn primary_options(&self) -> PrimaryOptions {
+        failover::tuned(self.promote_options.clone().unwrap_or_default(), self.failover_after)
     }
 
     /// Sets this server's part in replication while it serves
@@ -514,7 +566,7 @@ impl Service {
                 if db.storage().numbering().is_none() {
                     return Err(ApiError::bad("a primary numbers its writes, and this server's database does not: start it with --seq-no"));
                 }
-                let opts = PrimaryOptions { replicas, acks: acks.unwrap_or_default(), joining: true, ..self.promote_options.clone().unwrap_or_default() };
+                let opts = PrimaryOptions { replicas, acks: acks.unwrap_or_default(), joining: true, ..self.primary_options() };
                 let p = Primary::start(db.clone(), file.as_deref(), opts).map_err(|e| conflict(e))?;
                 tracing::info!(replicas = %p.replicas().join(", "), write_acks = p.acks().name(), "configured: the primary of its shard");
                 Some(Replication::Primary(p))
@@ -551,12 +603,17 @@ impl Service {
         if let Some(r) = next {
             *self.replication.write().unwrap_or_else(|e| e.into_inner()) = r;
         }
-        let n = db.storage().numbering().unwrap_or_default();
+        Ok(self.configured())
+    }
+
+    /// Its part in replication, as `Configure` answers it.
+    pub fn configured(&self) -> pb::ConfigureResponse {
+        let n = self.local().and_then(|db| db.storage().numbering()).unwrap_or_default();
         let (replicas, write_acks) = match &self.replication() {
             Replication::Primary(p) => (p.replicas().to_vec(), p.acks().name().to_string()),
             _ => (Vec::new(), String::new()),
         };
-        Ok(pb::ConfigureResponse { role: self.role() as i32, term: n.term, seq_no: n.seq, replicas, write_acks })
+        pb::ConfigureResponse { role: self.role() as i32, term: n.term, seq_no: n.seq, replicas, write_acks }
     }
 
     /// Keeps its part in replication in `path` (`<db>.replication`), for
@@ -574,6 +631,7 @@ impl Service {
             let map = SlotMap::from_json(&j["map"]).map_err(|e| format!("{}: {e}", path.display()))?;
             let shard = j["shard"].as_u64().map(|s| s as usize).filter(|&s| s < map.shards()).ok_or_else(|| format!("{}: no shard of the map", path.display()))?;
             *self.slots_since.get_mut() = j["since"].as_u64().unwrap_or(map.epoch).min(map.epoch);
+            self.hide_residue(&map, shard);
             *self.slots.get_mut().unwrap_or_else(|e| e.into_inner()) = Some((map, shard));
         }
         *self.slots_file.get_mut() = Some(path);
@@ -635,7 +693,9 @@ impl Service {
             true => self.slots_since.load(Ordering::Relaxed).min(map.epoch),
             false => map.epoch,
         };
-        if !same {
+        // A move's next step: the coordinator moved the rows itself.
+        let stepped = held.as_ref().is_some_and(|(m, s)| *s == shard && m.shards() == map.shards() && m.moves_to(&map));
+        if !same && !stepped {
             let m = map.clone();
             let elsewhere = tokio::task::spawn_blocking(move || rows_elsewhere(&db, &m, shard)).await.map_err(ApiError::internal)??;
             if let Some((n, key)) = elsewhere {
@@ -652,8 +712,11 @@ impl Service {
             save_slots(path, &map, shard, since).map_err(|e| ApiError::internal(format!("keep the slot map in {}: {e}", path.display())))?;
         }
         let epoch = map.epoch;
+        // The rows a read sees change with the map: a read takes its
+        // version under this lock ([`Self::latest`]).
         let mut held = self.slots.write().unwrap_or_else(|e| e.into_inner());
         self.slots_since.store(since, Ordering::Relaxed);
+        self.hide_residue(&map, shard);
         *held = Some((map, shard));
         Ok(epoch)
     }
@@ -666,15 +729,22 @@ impl Service {
     /// refused as unavailable (503), so that the coordinator asks again
     /// and sends its map.
     pub fn check_epoch(&self, epoch: u64) -> Result<(), ApiError> {
+        let _ = ROUTED.try_with(|r| r.set(epoch));
+        let held = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        self.epoch_ok(held.as_ref().map_or(0, |(m, _)| m.epoch), epoch)
+    }
+
+    /// [`Self::check_epoch`] against a map of epoch `held` (0: none).
+    fn epoch_ok(&self, held: u64, epoch: u64) -> Result<(), ApiError> {
         if epoch == 0 {
             return Ok(());
         }
-        match self.slot_epoch() {
+        match held {
             e if e == epoch => Ok(()),
             e if e > epoch && epoch >= self.slots_since.load(Ordering::Relaxed) => Ok(()),
             e if e > epoch => Err(conflict(format!("slot map epoch {epoch} is older than this shard's ({e}): the coordinator must load the newer map (--slot-map)"))),
-            0 => Err(ApiError { status: 503, message: format!("this shard has no slot map; the request's is epoch {epoch}") }),
-            e => Err(ApiError { status: 503, message: format!("this shard has slot map epoch {e}, older than the request's {epoch}") }),
+            0 => Err(ApiError { status: 503, message: format!("{NO_MAP_YET}; the request's is epoch {epoch}") }),
+            e => Err(ApiError { status: 503, message: format!("this shard has slot map epoch {e}, {OLDER_THAN_REQUEST} {epoch}") }),
         }
     }
 
@@ -682,19 +752,28 @@ impl Service {
     /// when this shard has a slot map: by its key, or by its table's
     /// shard_by value ([`op_place`]), each named by `what` (`key`, or the
     /// shard_by field's name).
-    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = (&'a str, &'a Value)>) -> Result<(), ApiError> {
+    /// Rows of slots moving to or from the shard pass with `moved`, as
+    /// the coordinator moving them writes them. A request routed by an
+    /// older map that this one changed since it was checked is refused
+    /// for its coordinator to route it again (409).
+    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = (&'a str, &'a Value)>, moved: bool) -> Result<(), ApiError> {
         let held = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let Some((map, shard)) = &*held else { return Ok(()) };
         for (what, key) in keys {
             let s = slots::slot(key);
-            if map.owner(s) != *shard {
-                return Err(ApiError::bad(format!(
-                    "{what} {} is in slot {s}, which shard {} holds under slot map epoch {}, not this shard ({shard}): write through the coordinator",
-                    js::to_json(key),
-                    map.owner(s),
-                    map.epoch
-                )));
+            if map.owner(s) == *shard || (moved && map.takes_moved(*shard, s)) {
+                continue;
             }
+            let e = routed();
+            if e > 0 && e < map.epoch {
+                return Err(conflict(format!("slot map epoch {e} is older than this shard's ({}), under which slot {s} is shard {}'s: the coordinator must load the newer map", map.epoch, map.owner(s))));
+            }
+            return Err(ApiError::bad(format!(
+                "{what} {} is in slot {s}, which shard {} holds under slot map epoch {}, not this shard ({shard}): write through the coordinator",
+                js::to_json(key),
+                map.owner(s),
+                map.epoch
+            )));
         }
         Ok(())
     }
@@ -981,24 +1060,36 @@ impl Service {
 
     /// Hands a write to the writer thread and waits for its commit. The
     /// writer records `key`'s outcome, even if this future is dropped.
-    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue) -> Result<Written, ApiError> {
+    /// Writes marked `moved` are rows of moving slots, from the
+    /// coordinator moving them ([`Self::check_keys`]); while slots move
+    /// from this shard, a write to them, or an UPDATE or DELETE statement,
+    /// holds the move's gate until it commits ([`Self::pass_gate`]).
+    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue, moved: bool) -> Result<Written, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
-        if self.slots().is_some() {
-            match &job {
-                WriteJob::Ops(ops) => {
-                    let catalog = self.catalog();
-                    let places = ops.iter().filter(|op| !is_mark(op)).map(|op| op_schema(&catalog, op).and_then(|t| Ok((place_name(t), op_place(t, op)?)))).collect::<Result<Vec<_>, _>>()?;
-                    self.check_keys(places.iter().map(|(w, v)| (*w, v)))?
-                }
+        // Counted in before it looks at the map, which a move may change.
+        let entry = self.moving.enter();
+        let pass = if self.slots().is_none() {
+            moving::Pass::Entry(entry)
+        } else {
+            let catalog = self.catalog();
+            let places: Vec<(&str, Value)> = match &job {
+                WriteJob::Ops(ops) => ops.iter().filter(|op| !is_mark(op)).map(|op| op_schema(&catalog, op).and_then(|t| Ok((place_name(t), op_place(t, op)?)))).collect::<Result<Vec<_>, _>>()?,
                 WriteJob::Sql(p) => {
                     let what = place_name(p.table());
-                    self.check_keys(p.inserted_places().into_iter().map(|v| (what, v)))?
+                    p.inserted_places().into_iter().map(|v| (what, v.clone())).collect()
                 }
-            }
-        }
+            };
+            let statement = matches!(&job, WriteJob::Sql(_)) && places.is_empty();
+            let pass = match moved {
+                true => moving::Pass::Entry(entry),
+                false => self.pass_gate(entry, &places, statement).await?,
+            };
+            self.check_keys(places.iter().map(|(w, v)| (*w, v)), moved)?;
+            pass
+        };
         let (reply, rx) = tokio::sync::oneshot::channel();
         let keys = self.idempotency.clone();
-        tx.send(Queued { job, deadline, reply: Some(reply), key, keys, queued: Some(queued) }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
+        tx.send(Queued { job, deadline, reply: Some(reply), key, keys, queued: Some(queued), pass: Some(pass) }).map_err(|_| ApiError::internal("the writer thread stopped"))?;
         rx.await.map_err(|_| ApiError::internal("the writer thread stopped"))?
     }
 
@@ -1160,13 +1251,27 @@ impl Service {
     /// The latest version, for a read that does not name a lease: refused
     /// on a replica its primary has not found caught up (503,
     /// [`Follow::readable`]).
+    ///
+    /// The version is taken under the cluster map it is read by: rows of
+    /// moving slots this shard holds without serving them are hidden
+    /// ([`Self::hide_residue`]), and a read routed by a map this shard has
+    /// left since its epoch was checked is refused (409), as the rows it
+    /// would read are another map's.
     fn latest(&self, db: &Db) -> Result<Snapshot, ApiError> {
         match &self.replication() {
             Replication::Replica(f) => f.readable()?,
             Replication::Primary(p) => p.readable()?,
             Replication::None => {}
         }
-        Ok(db.snapshot())
+        let held = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        self.epoch_ok(held.as_ref().map_or(0, |(m, _)| m.epoch), routed())?;
+        let snap = db.snapshot();
+        let mask = self.moving.mask();
+        drop(held);
+        match mask {
+            Some(m) => Ok(snap.masked(&m)?),
+            None => Ok(snap),
+        }
     }
 
     /// The version a read reads: lease `lease`, or the latest
@@ -1857,6 +1962,13 @@ impl Service {
     /// The statement needs the scope of its kind ([`command_scope`]), which
     /// `who` must have; a table's or rank profile's statement is audited.
     pub async fn sql(self: &Arc<Self>, who: &Principal, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        self.sql_in(who, sql, params, after, timeout_ms, None).await
+    }
+
+    /// [`Self::sql`]; with `slots`, an UPDATE or DELETE over the rows of
+    /// those slots alone, as a coordinator sends one again to the shard
+    /// slots moved to while it ran.
+    pub async fn sql_in(self: &Arc<Self>, who: &Principal, sql: &str, params: &Params, after: After, timeout_ms: u64, slots: Option<Vec<usize>>) -> Result<SqlAnswer, ApiError> {
         let command = self.bound(|tables| bind_command(sql, tables, params)).await?;
         let need = command_scope(&command);
         who.may(need, &format!("a {} statement", match need { Scope::Read => "query", Scope::Write => "write", Scope::Admin => "table or rank profile" }))?;
@@ -1881,7 +1993,23 @@ impl Service {
             (_, Some(ddl)) => self.ddl(sql, params, ddl, timeout_ms).await,
             (Backend::Local(db), None) => {
                 let (text, p) = (sql.to_string(), params.clone());
-                self.write_local(db, move |db| db.prepare_write(&text, &p), timeout_ms).await
+                let only = slots.map(|s| moving::mask_outside(&s));
+                let refused = Arc::new(Mutex::new(None));
+                let guard = self.statement_guard(routed(), refused.clone());
+                let prepare = move |db: &Db| {
+                    let Some(w) = db.prepare_write(&text, &p)? else { return Ok(None) };
+                    let w = match only {
+                        Some(m) => w.masked(m)?,
+                        None => w,
+                    };
+                    Ok(Some(w.guarded(guard)))
+                };
+                let r = self.write_local(db, prepare, timeout_ms).await;
+                let refusal = refused.lock().unwrap_or_else(|e| e.into_inner()).take();
+                match refusal {
+                    Some(e) if r.is_err() => Err(e),
+                    _ => r,
+                }
             }
             (Backend::Cluster(c), None) => c.sql(sql, params).await,
         };
@@ -1951,7 +2079,7 @@ impl Service {
         .ok_or_else(|| ApiError::bad("not a write statement"))?;
         // The deadline bounds the wait for the writer, not the embedding.
         let deadline = Instant::now() + self.timeout_of(timeout_ms);
-        let w = self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q).await?;
+        let w = self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q, false).await?;
         self.replicated(w, self.timeout_of(timeout_ms)).await
     }
 
@@ -1959,7 +2087,13 @@ impl Service {
     /// transaction per server, which other requests waiting at the same
     /// time may share (see [`writer`]). With an idempotency `key`, a retry
     /// of a request that committed returns its answer unapplied.
-    pub async fn write_ops(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>) -> Result<Written, ApiError> {
+    pub async fn write_ops(self: &Arc<Self>, ops: Vec<Json>, key: Option<String>) -> Result<Written, ApiError> {
+        self.write_ops_as(ops, key, false).await
+    }
+
+    /// [`Self::write_ops`], of rows of moving slots from the coordinator
+    /// moving them when `moved` ([`Self::write`]).
+    pub async fn write_ops_as(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>, moved: bool) -> Result<Written, ApiError> {
         let t0 = Instant::now();
         let n = match &self.backend {
             Backend::Local(db) => {
@@ -2002,7 +2136,7 @@ impl Service {
                         .map_err(ApiError::internal)??;
                     }
                     // The deadline bounds the wait for the writer, not the embedding.
-                    let w = self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone(), queued).await?;
+                    let w = self.write(WriteJob::Ops(ops), Instant::now() + self.timeout, key.clone(), queued, moved).await?;
                     // Visible now: how long after its event each row is.
                     let now = strata::timestamp::now();
                     for &ts in &w.stamps {
@@ -2463,6 +2597,16 @@ impl Service {
         })
     }
 
+    /// A profile of `node`, a server of this coordinator's cluster
+    /// ([`Coordinator::profile`]); a server that is not a coordinator has
+    /// no other node to profile.
+    pub async fn profile_node(&self, node: &str, a: crate::profiling::Asked) -> Result<crate::profiling::Answer, ApiError> {
+        match &self.backend {
+            Backend::Local(_) => Err(ApiError::bad("node names a server of a coordinator's cluster: this server is not a coordinator, so leave node out to profile it")),
+            Backend::Cluster(c) => c.profile(node, a).await,
+        }
+    }
+
     /// Where this server is in its cluster, and how each copy is doing
     /// (`GET /v1/cluster`): a server's own health and latest point; a
     /// coordinator asks every replica of every shard
@@ -2612,6 +2756,18 @@ fn conflict(message: String) -> ApiError {
     ApiError { status: 409, message }
 }
 
+/// What a shard says of a request routed by a newer cluster map than the
+/// one it holds (503): its coordinator gives it the map and asks again.
+pub const OLDER_THAN_REQUEST: &str = "older than the request's";
+
+/// What a shard without a cluster map says of a request routed by one
+/// (503): it is being given one, or its coordinator gives it one.
+pub const NO_MAP_YET: &str = "this shard has no slot map";
+
+/// In the message of a request a shard refuses (409) as routed by a map
+/// older than its own: one the cluster changed since.
+pub const OLDER_THAN_SHARD: &str = "is older than this shard's";
+
 /// Why a write refuses `min_seq_no` and `min_seq_nos`.
 const FOR_READS: &str = "min_seq_no and min_seq_nos are for reads: a write sees every write before it";
 
@@ -2638,7 +2794,10 @@ fn rows_elsewhere(db: &Db, map: &SlotMap, shard: usize) -> Result<Option<(usize,
             Some(_) => rs.rows.into_iter().filter_map(|r| r.into_iter().next()).collect(),
             None => rs.keys,
         };
-        for v in values.into_iter().filter(|v| map.shard_of(v) != shard) {
+        // Rows of slots moving that the shard holds without serving are
+        // in place too.
+        let residue = map.residue(shard).unwrap_or_default();
+        for v in values.into_iter().filter(|v| map.shard_of(v) != shard && residue.binary_search(&slots::slot(v)).is_err()) {
             match &mut out {
                 Some((n, _)) => *n += 1,
                 None => out = Some((1, v)),
@@ -2736,6 +2895,9 @@ struct Queued {
     keys: Arc<idem::Keys>,
     /// Counts the request as queued until it is answered (`None` then).
     queued: Option<InQueue>,
+    /// Held until the write commits, for a hold on writes to moving slots
+    /// to wait for ([`Service::pass_gate`]).
+    pass: Option<moving::Pass>,
 }
 
 impl Queued {
@@ -2747,6 +2909,7 @@ impl Queued {
         // Uncounted before the answer, which its caller may follow with a
         // look at the metrics.
         self.queued = None;
+        self.pass = None;
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(r);
         }
@@ -3269,7 +3432,7 @@ mod tests {
         assert_eq!(keys.begin("k", 1), idem::Begin::New);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let state = WriterState::default();
-        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone(), queued: InQueue::start(&state, 1) };
+        let q = Queued { job: WriteJob::Ops(Vec::new()), deadline: Instant::now(), reply: Some(tx), key: Some("k".into()), keys: keys.clone(), queued: InQueue::start(&state, 1), pass: None };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _held = q;
             panic!("a bug while applying a write");

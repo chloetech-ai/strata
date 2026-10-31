@@ -107,7 +107,7 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.graph[field], || {
             Ok(match f.ty {
-                FieldType::Edges if f.indexed => GraphReader::open(&self.seg, &f.name)?,
+                FieldType::Edges if f.indexed => GraphReader::open(&self.seg, &f.key())?,
                 _ => None,
             })
         })
@@ -117,7 +117,7 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.text[field], || {
             Ok(match f.ty {
-                FieldType::Text { .. } | FieldType::Sparse if f.indexed => Some(TextFieldReader::open(&self.seg, &f.name)?),
+                FieldType::Text { .. } | FieldType::Sparse if f.indexed => Some(TextFieldReader::open(&self.seg, &f.key())?),
                 _ => None,
             })
         })
@@ -127,9 +127,9 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.numeric[field], || {
             Ok(match f.ty {
-                FieldType::Int | FieldType::Float if f.indexed && !f.multi => Some(match RangeIndex::open_if_present(&self.seg, &f.name)? {
+                FieldType::Int | FieldType::Float if f.indexed && !f.multi => Some(match RangeIndex::open_if_present(&self.seg, &f.key())? {
                     Some(idx) => Numeric::Indexed(idx),
-                    None => Numeric::Plain(NumericColumn::open(&self.seg, &f.name)?),
+                    None => Numeric::Plain(NumericColumn::open(&self.seg, &f.key())?),
                 }),
                 _ => None,
             })
@@ -143,7 +143,7 @@ impl SegmentReaders {
             if !(f.indexed && (matches!(f.ty, FieldType::Keyword) || matches!(f.ty, FieldType::Int) && f.multi)) {
                 return Ok(None);
             }
-            let mut col = KeywordColumn::open(&self.seg, &f.name)?;
+            let mut col = KeywordColumn::open(&self.seg, &f.key())?;
             if col.needs_values() {
                 // Multi-valued fields are stored.
                 let store = self.store()?.ok_or_else(|| crate::error::corrupt(format!("keyword column {}: no stored values to repair it from", f.name)))?;
@@ -157,7 +157,7 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.vector[field], || {
             Ok(match f.ty {
-                FieldType::Vector { .. } => Some(VectorReader::open(&self.seg, &f.name)?),
+                FieldType::Vector { .. } => Some(VectorReader::open(&self.seg, &f.key())?),
                 _ => None,
             })
         })

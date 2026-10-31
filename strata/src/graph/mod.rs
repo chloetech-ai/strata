@@ -195,13 +195,15 @@ pub fn keyless_builder(field: &Field, schema: &Schema) -> Result<GraphBuilder> {
     if schema.primary_key.is_none() {
         return Err(Error::Schema(format!("EDGES field {} needs a primary key", field.name)));
     }
-    Ok(GraphBuilder { name: field.name.clone(), int_keys: int_keys(schema), offsets: vec![0], ..Default::default() })
+    Ok(GraphBuilder { name: field.name.clone(), key: field.key(), int_keys: int_keys(schema), offsets: vec![0], ..Default::default() })
 }
 
 /// Builds `graph.<f>` for an indexed EDGES field.
 #[derive(Default)]
 pub struct GraphBuilder {
     name: String,
+    /// Names its sections ([`crate::schema::Field::key`]).
+    key: String,
     int_keys: bool,
     offsets: Vec<u64>,
     edge_src: Vec<u32>,
@@ -360,7 +362,7 @@ impl GraphBuilder {
         w.array(&in_src);
         w.array(&in_edges);
         w.array(&local);
-        out.put(section(&b.name), w.finish());
+        out.put(section(&b.key), w.finish());
         Ok(())
     }
 }
@@ -605,7 +607,7 @@ mod tests {
         }
         let mut w = SegmentWriter::new(values.len());
         b.finish(&mut w).unwrap();
-        GraphReader::open(&SegmentFile::from_vec(w.finish()).unwrap(), "links").unwrap().unwrap()
+        GraphReader::open(&SegmentFile::from_vec(w.finish()).unwrap(), &schema.fields[1].key()).unwrap().unwrap()
     }
 
     #[test]

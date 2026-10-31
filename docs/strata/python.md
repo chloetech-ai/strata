@@ -66,6 +66,8 @@ db.close()
 
 `strata.open(path, schema)` opens the database at `path`, or creates it with `schema` if it does not exist. The schema is a dict, JSON text or the path of a JSON file, in the [form the server takes](server.md#schemas). `Database.create(path, schema)` and `Database.open(path)` do one or the other. `models=` says where embedding and [ranking](query-language.md#ranking-models-gbdtmodel-features) models, and the captioners of [text made from media](server.md#text-from-media), are (default `$STRATA_MODELS`, else `~/.local/share/strata/models`; `strata-server fetch-model NAME` downloads one there), and `directory=True` creates the database as a directory of segment files.
 
+A database written by a version of Strata from before [field ids](index.md#wal-memtable-and-snapshots) does not open: `strata.upgrade(path)` copies it into this version's format in its place, keeps the old one as `<path>.before-field-ids`, and returns `(old_path, tables, rows)`, or `None` when the database needs no upgrade. Nothing may have it open meanwhile.
+
 A database file can be open in one process at a time. Within that process, threads can query at once: every call releases the GIL while it runs. To share a database between processes, serve it with `strata-server` and use the client below. A `with` block, or `close()`, merges the small segments that writes left and closes the file.
 
 ## Writing

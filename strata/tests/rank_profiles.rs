@@ -293,7 +293,7 @@ fn profiles_are_logged_and_replayed() {
         db.storage().flush().unwrap();
         if layout == Layout::Directory {
             let (_, m) = strata::storage::dir::read_current(&path).unwrap();
-            assert_eq!(m.features(), [RANK_PROFILES]);
+            assert_eq!(m.features(), ["field_ids", RANK_PROFILES]);
             assert_eq!(m.tables[0].profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["by_n"]);
         }
         drop(db);

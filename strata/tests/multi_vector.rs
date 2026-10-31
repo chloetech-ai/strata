@@ -156,7 +156,10 @@ fn sq8_scores_without_float32_are_close() {
     let db = open(dir.path(), "sq8.strata", &docs, schema(strata::schema::DEFAULT_HNSW, false));
     let f32db = open(dir.path(), "f32.strata", &docs, schema(strata::schema::DEFAULT_HNSW, true));
     // SQ8 codes to score with instead of float32.
-    let sections = |db: &Db| db.snapshot().segments()[0].file.section_sizes().into_iter().map(|s| s.0).filter(|n| n.starts_with("vec.patches")).collect::<Vec<_>>();
+    let sections = |db: &Db| {
+        let snap = db.snapshot();
+        snap.segments()[0].file.section_sizes().into_iter().map(|s| strata::segment::label(snap.schema(), &s.0)).filter(|n| n.starts_with("vec.patches")).collect::<Vec<_>>()
+    };
     assert!(sections(&db).iter().any(|n| n.ends_with(".rescore")) && !sections(&db).iter().any(|n| n.ends_with(".f32")), "{:?}", sections(&db));
     assert!(sections(&f32db).iter().any(|n| n.ends_with(".f32")) && !sections(&f32db).iter().any(|n| n.ends_with(".rescore")), "{:?}", sections(&f32db));
     let mut rng = StdRng::seed_from_u64(4);

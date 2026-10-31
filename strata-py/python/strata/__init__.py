@@ -126,7 +126,18 @@ __all__ = [
     "train",
     "ngrams",
     "next_items",
+    "upgrade",
 ]
+
+
+def upgrade(path: str | os.PathLike) -> tuple[str, int, int] | None:
+    """Copy the database at `path`, written by a version of Strata from
+    before field ids (which no longer opens), into this version's format in
+    its place. The old one is kept as ``<path>.before-field-ids``. Returns
+    None when it needs no upgrade, else (the old database's path, tables
+    copied, rows copied)."""
+    r = _strata.upgrade(os.fspath(path))
+    return None if r is None else (os.fspath(r[0]), r[1], r[2])
 
 
 def _schema_json(schema: Any) -> str:

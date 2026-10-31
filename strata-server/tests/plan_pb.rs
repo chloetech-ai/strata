@@ -105,6 +105,8 @@ const COMPOUND: &[&str] = &[
     "SELECT d.id FROM (SELECT id, year FROM papers WHERE year > 2000) AS d ORDER BY d.year LIMIT 3",
     "SELECT a.category, COUNT(*) FROM papers a JOIN papers b ON a.cites = b.id GROUP BY a.category HAVING COUNT(*) > 1",
     "SELECT DISTINCT a.category, b.year FROM papers a JOIN papers b ON a.cites = b.id ORDER BY b.year LIMIT 4",
+    // DISTINCT over joined rows is GROUP BY its columns; over groups, a Distinct of its own.
+    "SELECT DISTINCT a.category, COUNT(*) AS n FROM papers a JOIN papers b ON a.cites = b.id GROUP BY a.category, b.year",
     "SELECT id, dot(emb, :v) FROM papers WHERE year > 2000",
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), maxsim(emb, (SELECT emb FROM papers WHERE category = 'ml' LIMIT 4))) DESC LIMIT 5",
     "SELECT DISTINCT ON (category, year % 3) id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC LIMIT 3",

@@ -1,7 +1,9 @@
 # strata-server on Kubernetes
 
-A Docker image and Kubernetes manifests for running Strata as shards behind
-a coordinator, and a script that runs them on a local multi-node cluster
+An operator that runs Strata clusters on Kubernetes and changes them as
+their resource says (below), a Docker image, the manifests of a fixed
+layout of shards behind a coordinator, and a script that runs them on a
+local multi-node cluster
 ([kind](https://kind.sigs.k8s.io/), Kubernetes in Docker) to test the
 distributed behaviour: whether the shards answer as one database would,
 what the scatter-gather costs, what happens when a shard or one of its
@@ -13,7 +15,90 @@ replicas dies, how to move to more shards, and what network latency does.
 | `k8s/shards.yaml` | a set of N shards × R replicas: a headless Service, and per shard a StatefulSet of R pods on different nodes; replica r of shard i serves `/data/<collection>.shard<i>of<N>.strata` (r = 0) or its own copy `...shard<i>of<N>.r<r>.strata` |
 | `k8s/coordinator.yaml` | the coordinator, a Deployment pointed at one set of shards (`--shards`, replicas of a shard joined by `\|`) |
 | `k8s/single.yaml` | one database holding the whole collection, to compare answers and latency with |
+| `k8s/operator/operator.yaml` | the operator: its namespace (`strata-system`), service account, cluster role and Deployment |
+| `k8s/operator/crd.json` | the `StrataCluster` resource definition, which the operator installs when it starts (`strata-server operator --print-crd` writes it) |
+| `k8s/operator/cluster.yaml` | a cluster for it to make: 2 shards of 3 copies, 10,000 demo products |
 | `kind-test.sh` | creates the kind cluster and runs each step below |
+
+## The operator
+
+`strata-server operator` keeps each `StrataCluster` as its spec says. It
+makes a StatefulSet of copies per shard (each copy a pod with a volume of
+its own), their headless Service, and the coordinators (a Deployment
+behind the Service named as the cluster, port 7700: the API and the
+command center), then lays the cluster out and changes it through the
+coordinator's admin calls, one step every few seconds, writing what it
+found in the resource's status:
+
+```bash
+kubectl apply -f strata-server/deploy/k8s/operator/operator.yaml
+kubectl apply -f strata-server/deploy/k8s/operator/cluster.yaml
+kubectl -n strata get strata -o wide          # NAME SHARDS COPIES PHASE MESSAGE
+kubectl -n strata patch strata demo --type merge -p '{"spec": {"shards": 3, "replicas": 2}}'
+kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
+```
+
+| spec | default | |
+|---|---|---|
+| `shards` | 1 | shards, each holding a part of the 4,096 slots |
+| `replicas` | 3 | copies of each shard: a primary and its replicas, on different nodes when there are |
+| `coordinators` | 1 | coordinators behind the cluster's Service |
+| `schema` or `demo` | | the first table's schema (as `--schema` takes it), or this many demo products split over the shards the cluster starts with |
+| `storage` | `{size: 10Gi}` | each copy's volume (`size`, `storageClassName`) |
+| `failoverAfterMs` | 3000 | every server's `--failover-after-ms`: a shard elects a new primary on its own when its primary's pod dies |
+| `writeAcks` | `all` | every primary's `--write-acks` |
+| `tokenSecret` | | a Secret whose key `token` every server and coordinator requires; without it they run with `--no-token`, open to whatever reaches them |
+| `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args` | `strata-server:dev` | the servers' image, containers and further arguments |
+
+What a change does:
+
+- **More shards**: a StatefulSet for each new shard; once its first copy
+  is ready the shard joins the cluster, then slots move to it until each
+  shard holds the same number (give or take one), while the cluster
+  serves. **Fewer**: the newest shard is drained (its slots move to the
+  others), leaves the cluster, and its StatefulSet and volumes are deleted.
+- **More copies**: the StatefulSets grow, and each new pod, started empty
+  with the schema, joins its shard as a replica and is sent a copy of the
+  primary. **Fewer**: the highest pod of each set leaves its shard first
+  (when it is the primary, the operator hands the primary over to a replica
+  that answers), then the set shrinks and the pod's volume is deleted.
+- A pod that comes back without its volume (its node was replaced) leaves
+  its shard and joins again, and is sent a copy.
+- The coordinators' `--shards` list follows the cluster's servers, so that
+  a coordinator that starts again finds the cluster; their number follows
+  `coordinators`.
+
+The operator does not choose primaries: the copies of a shard elect one
+among themselves ([failover](../../docs/strata/server.md#failover)), so a
+dead pod costs a few seconds of writes to its shard whether the operator
+runs or not. It takes no step while slots are moving or the cluster map
+cannot change, and the status says why (`Creating`, `Scaling`, `Ready`,
+`Degraded` with the servers that do not answer, or `Failed` with what is
+wrong with the spec). Deleting a `StrataCluster` deletes its pods and keeps
+its volumes (`data-<cluster>-s<shard>-<copy>`).
+
+It reaches each cluster's coordinators through their Service, so it runs
+in the cluster; `--namespace` limits it to one namespace, and `--no-crd`
+leaves the resource definition to you. On kind:
+
+```bash
+strata-server/deploy/kind-test.sh up          # no STRATA_WORK or STRATA_DATA needed for the operator
+strata-server/deploy/kind-test.sh image
+strata-server/deploy/kind-test.sh operator    # follows the cluster until it is Ready
+strata-server/deploy/kind-test.sh scale 3 3   # a third shard
+strata-server/deploy/kind-test.sh scale 2 2   # back to two, a copy fewer each
+```
+
+Its tests: `tests/operator.rs` runs the same steps with server processes
+standing in for pods (a cluster made, grown, healed and shrunk, every row
+kept), and `tests/operator_kube.rs` makes a cluster's objects on a real API
+server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
+as `setup-envtest` downloads them).
+
+## The fixed layout
+
+The rest of this page runs Strata from the manifests under `k8s/` without
+the operator, to test what sharding costs.
 
 The databases are files on a volume: the manifests read them from a
 `hostPath` at `/data`, which `kind-test.sh up` mounts from the Mac into every
@@ -68,15 +153,22 @@ the first error). Results of a full run on a Mac are in
 These manifests serve a test cluster open: every server runs with
 `--no-token`, which a server listening beyond loopback needs when it has no
 token. Anything that can reach a pod can read and write. On a real cluster,
-put a token in a Secret and give it to every server (the coordinator sends
-it to its shards), drop `--no-token`, and serve TLS:
+put a cluster token in a Secret and give it to every server, coordinators
+included (they send it to each other, and only it makes the calls between
+servers), give the coordinators an admin token of their own, drop
+`--no-token`, and serve TLS. Clients get API keys made on a coordinator,
+which every server then holds:
 
 ```bash
+kubectl -n strata create secret generic strata-cluster-token --from-literal=token="$(openssl rand -hex 32)"
 kubectl -n strata create secret generic strata-token --from-literal=token="$(openssl rand -hex 32)"
 ```
 
 ```yaml
           env:
+            - name: STRATA_CLUSTER_TOKEN
+              valueFrom: {secretKeyRef: {name: strata-cluster-token, key: token}}
+            # the coordinators only:
             - name: STRATA_TOKEN
               valueFrom: {secretKeyRef: {name: strata-token, key: token}}
 ```

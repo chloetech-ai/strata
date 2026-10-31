@@ -30,10 +30,10 @@
 //! | `GET /v1/queries/request/:id` | | `{queries}`: those a request (its `x-request-id`) ran |
 //! | `GET /v1/queries/finished/:id` | | one ended query with its whole profile: trace, steps ([`strata::query::steps`]) and plan lines (the lists give each without them, unless `full=true`) |
 //! | `GET /v1/profile/settings`, `PUT /v1/profile/settings` | `{slow_ms?, cpu_all?}` | the slow threshold (until restarted) and whether every query's CPU time is measured |
-//! | `POST /v1/profile/cpu?format=folded` | `{seconds?, hz?, sql?, params?, clients?}` | a CPU profile ([`crate::profiler`]) of the whole server for `seconds`, or of `sql` run again and again for that long by `clients` callers at once (1 to 64): every thread's stacks, sampled `hz` times a CPU second; `format=folded` answers folded lines (flamegraph.pl, speedscope); 409 while another is taken |
-//! | `GET /v1/profile/memory` | | the heap ([`crate::heap`]: bytes in use and their peak, bytes allocated, allocations and frees), the resident memory and its peak, and the threads |
-//! | `POST /v1/profile/heap?format=folded&value=in_use` | `{seconds?, every?, sql?, params?, clients?}` | an allocation profile ([`crate::heap::take`]): about one allocation in every `every` bytes (default 2 MiB) a thread allocates, sampled for `seconds`, with its stack; by stack, the bytes allocated and those still in use at the end; a query in a loop as for a CPU profile |
-//! | `GET /v1/profile/threads` | | each thread of the process: its name, state, CPU time and context switches (Linux) |
+//! | `POST /v1/profile/cpu?format=folded&node=` | `{seconds?, hz?, sql?, params?, clients?}` | a CPU profile ([`crate::profiler`]) of the whole server for `seconds`, or of `sql` run again and again for that long by `clients` callers at once (1 to 64): every thread's stacks, sampled `hz` times a CPU second; `format=folded` answers folded lines (flamegraph.pl, speedscope); 409 while another is taken |
+//! | `GET /v1/profile/memory?node=` | | the heap ([`crate::heap`]: bytes in use and their peak, bytes allocated, allocations and frees), the resident memory and its peak, and the threads |
+//! | `POST /v1/profile/heap?format=folded&value=in_use&node=` | `{seconds?, every?, sql?, params?, clients?}` | an allocation profile ([`crate::heap::take`]): about one allocation in every `every` bytes (default 2 MiB) a thread allocates, sampled for `seconds`, with its stack; by stack, the bytes allocated and those still in use at the end; a query in a loop as for a CPU profile |
+//! | `GET /v1/profile/threads?node=` | | each thread of the process: its name, state, CPU time and context switches (Linux); on a coordinator, each of these four with `node` (a replica URL of `/v1/cluster`) is that server's, asked over gRPC (`Profile`) |
 //! | `GET /v1/queries/stats?limit=n`, `POST /v1/queries/stats/reset` | | statistics per statement shape, by time spent ([`crate::telemetry::Statements`]) |
 //! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
 //! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
@@ -42,7 +42,7 @@
 //! | `GET /v1/logs/store` | | `{store, schemas, nodes?}`: the log store (its path, rows, bytes, retention, what it wrote, dropped and deleted; null without one), its tables, and on a coordinator every server's |
 //! | `GET /v1/system`, `/v1/cluster`, `/v1/routes` | | the process and its limits; the cluster's copies; requests by route and queries by kind |
 //! | `GET /v1/whoami` | | `{name, key, scope, root}`: who the request's credential is ([`crate::keys`]) |
-//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id` | `{name, scope, expires_days?}` | the API keys; a new one's secret is answered once |
+//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id` | `{name, scope, expires_days?}` | the API keys, how many were revoked, and how the last merge of keys went with each server of the cluster (`peers`, [`crate::keysync`]); a new one's secret is answered once |
 //! | `GET /v1/admin/audit?limit=n` | | the latest requests that needed the admin scope or were refused |
 //! | `GET /v1/alerts`, `PUT /v1/alerts/rules` | `{rules}` | the alert rules with their states and the latest changes ([`crate::alerts`]) |
 //!
@@ -50,9 +50,9 @@
 //! client sent, if it is 1 to 64 letters, digits, '-', '_', '.' or ':', or
 //! a new one ([`crate::obs`]).
 //!
-//! With a token set or an API key made, every route but `/`, `/livez`,
-//! `/readyz` and `/v1/health` needs `Authorization: Bearer <token or
-//! key>`, and a key the scope of its route ([`route_scope`]). Every route checks the `Host` header
+//! With a token or a cluster token set, or an API key made, every route but
+//! `/`, `/livez`, `/readyz` and `/v1/health` needs `Authorization: Bearer
+//! <token or key>`, and a key the scope of its route ([`route_scope`]). Every route checks the `Host` header
 //! and, on a request that can change something, the `Origin` header
 //! ([`crate::auth`]).
 
@@ -77,7 +77,7 @@ use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
 use crate::keys::{self, Principal, Scope};
-use crate::{agent, heap, json as js, obs, profiler, telemetry, ui, ApiError};
+use crate::{agent, json as js, obs, profiling, telemetry, ui, ApiError};
 
 
 /// Why a request failed on the server's side, for [`observe`] to log.
@@ -106,13 +106,22 @@ type Res = Result<AxJson<Json>, ApiError>;
 struct App {
     svc: Arc<Service>,
     token: Option<Secret>,
+    cluster: Option<Secret>,
     hosts: Option<Arc<[String]>>,
+}
+
+impl App {
+    /// Whether callers must prove themselves by more than a key: a token or
+    /// the cluster's.
+    fn guarded(&self) -> bool {
+        self.token.is_some() || self.cluster.is_some()
+    }
 }
 
 pub fn router(svc: Arc<Service>, access: &Access) -> Router {
     // Rows come in writes and imports; every other body is small.
     let rows = DefaultBodyLimit::max(svc.max_body);
-    let app = App { svc, token: access.token.clone(), hosts: access.hosts.clone().map(Into::into) };
+    let app = App { svc, token: access.token.clone(), cluster: access.cluster.clone(), hosts: access.hosts.clone().map(Into::into) };
     let api = Router::new()
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
@@ -146,6 +155,12 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/shards", post(add_shard))
         .route("/v1/admin/shards/:i", axum::routing::delete(remove_shard))
         .route("/v1/admin/shards/:i/replicas", post(add_replica).merge(axum::routing::delete(remove_replica)))
+        .route("/v1/admin/shards/:i/drain", post(drain_shard))
+        .route("/v1/admin/shards/:i/promote", post(promote_in_shard))
+        .route("/v1/admin/rebalance", post(rebalance))
+        .route("/v1/admin/moves", get(moves).merge(post(move_slots)))
+        .route("/v1/admin/moves/stop", post(stop_moves))
+        .route("/v1/admin/moves/finish", post(finish_move))
         .route("/v1/agent", post(agent_run))
         .route("/v1/queries", get(live_queries))
         .route("/v1/queries/:id", axum::routing::delete(cancel_query))
@@ -229,7 +244,7 @@ async fn auth(State(app): State<App>, headers: HeaderMap, mut req: Request, next
     let t0 = Instant::now();
     let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
     let method = req.method().clone();
-    let who = app.svc.keys.resolve(app.token.as_ref(), header_str(&headers, header::AUTHORIZATION));
+    let who = app.svc.keys.resolve(app.token.as_ref(), app.cluster.as_ref(), header_str(&headers, header::AUTHORIZATION));
     let need = route_scope(&method, &route);
     let refused = match &who {
         None => Some(ApiError { status: 401, message: "missing or wrong token".into() }),
@@ -1082,12 +1097,82 @@ async fn add_replica(State(app): State<App>, axum::extract::Path(i): axum::extra
     Ok(audited(j, format!("added {url} to shard {i}")))
 }
 
+/// `POST /v1/admin/shards/:i/promote {"url", "force"?}`: makes that
+/// replica shard `i`'s primary, by a majority of the shard's votes.
+async fn promote_in_shard(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let url = body_str(&b, "url")?.to_string();
+    let j = app.svc.coordinator()?.promote(i, &url, body_bool(&b, "force")?).await?;
+    Ok(audited(j, format!("promoted {url} in shard {i}")))
+}
+
 /// `DELETE /v1/admin/shards/:i/replicas?url=`: one server fewer for shard
 /// `i`.
 async fn remove_replica(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, Query(q): Params) -> Result<Response, ApiError> {
     let url = q.get("url").filter(|u| !u.is_empty()).ok_or_else(|| ApiError::bad("url is the gRPC URL of the server to remove (?url=http://host:port)"))?;
     let j = app.svc.coordinator()?.remove_replica(i, url).await?;
     Ok(audited(j, format!("removed {url} from shard {i}")))
+}
+
+/// The most slots each move of a rebalance or drain takes: the body's
+/// `"chunk"`, or [`crate::coord::MOVE_SLOTS`].
+fn chunk(b: &Option<AxJson<Json>>) -> Result<usize, ApiError> {
+    match b.as_ref().and_then(|b| b.get("chunk")) {
+        None | Some(Json::Null) => Ok(crate::coord::MOVE_SLOTS),
+        Some(v) => v.as_u64().filter(|&c| (1..=crate::slots::SLOTS as u64).contains(&c)).map(|c| c as usize).ok_or_else(|| ApiError::bad(format!("chunk is the most slots one move takes: 1 to {}", crate::slots::SLOTS))),
+    }
+}
+
+/// `POST /v1/admin/rebalance {"chunk"?}`: evens out the slots over the
+/// shards, in the background (`GET /v1/admin/moves` follows it).
+async fn rebalance(State(app): State<App>, body: Option<AxJson<Json>>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.rebalance(chunk(&body)?)?;
+    let detail = format!("rebalancing: {} moves", j["job"]["of"]);
+    Ok(audited(j, detail))
+}
+
+/// `POST /v1/admin/shards/:i/drain {"chunk"?}`: moves every slot of shard
+/// `i` to the others, in the background, so that it can be removed.
+async fn drain_shard(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, body: Option<AxJson<Json>>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.drain(i, chunk(&body)?)?;
+    let detail = format!("draining shard {i}: {} moves", j["job"]["of"]);
+    Ok(audited(j, detail))
+}
+
+/// `GET /v1/admin/moves`: the job of moves running or last run here, and
+/// the move under way in the cluster map.
+async fn moves(State(app): State<App>) -> Res {
+    Ok(AxJson(app.svc.coordinator()?.moves()))
+}
+
+/// `POST /v1/admin/moves {"slots": [[start, end], ...], "to": shard}`:
+/// moves slots of one shard to another, in the background.
+async fn move_slots(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let bad = || ApiError::bad("slots is a list of slots or of [start, end) ranges of them, all held by one shard");
+    let mut slots = Vec::new();
+    for v in b.get("slots").and_then(Json::as_array).ok_or_else(bad)? {
+        match (v.as_u64(), v.as_array().map(|r| r.iter().map(Json::as_u64).collect::<Vec<_>>())) {
+            (Some(s), _) => slots.push(s as usize),
+            (_, Some(r)) if matches!(r[..], [Some(a), Some(b)] if a < b && b <= crate::slots::SLOTS as u64) => slots.extend(r[0].unwrap_or(0) as usize..r[1].unwrap_or(0) as usize),
+            _ => return Err(bad()),
+        }
+    }
+    let to = b.get("to").and_then(Json::as_u64).ok_or_else(|| ApiError::bad("to is the shard the slots move to"))? as usize;
+    let j = app.svc.coordinator()?.start_move(slots.clone(), to)?;
+    Ok(audited(j, format!("moving {} slots to shard {to}", slots.len())))
+}
+
+/// `POST /v1/admin/moves/stop`: the job running here stops once its move
+/// under way ends.
+async fn stop_moves(State(app): State<App>) -> Result<Response, ApiError> {
+    Ok(audited(app.svc.coordinator()?.stop_moves(), "stopping the job of moves".into()))
+}
+
+/// `POST /v1/admin/moves/finish`: ends the move a stopped coordinator
+/// left in the cluster map (completed if it had flipped, given up if not).
+async fn finish_move(State(app): State<App>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.finish_move().await?;
+    let detail = format!("finished the move left in the cluster map: {}", j["finished"]);
+    Ok(audited(j, detail))
 }
 
 /// How long `POST /v1/admin/verify` waits for the replicas' digests by
@@ -1198,140 +1283,44 @@ async fn put_profile_settings(State(app): State<App>, AxJson(b): AxJson<Json>) -
     Ok(audited(profile_settings_json(&app), format!("profiling: {}", did.join(", "))))
 }
 
-/// What a profile runs while it is taken: nothing (the whole server, as
-/// its clients use it), or a query run again and again by `clients`
-/// callers at once until the profile ends or a run fails, its run times
-/// kept.
-struct Load {
-    during: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    runs: Option<(usize, std::sync::Arc<std::sync::Mutex<(Vec<f64>, Option<ApiError>)>>)>,
-}
-
-impl Load {
-    async fn of(app: &App, b: &Json) -> Result<Load, ApiError> {
-        let Some(_) = b.get("sql").filter(|s| !s.is_null()) else { return Ok(Load { during: Box::pin(std::future::pending()), runs: None }) };
-        let clients = match b.get("clients") {
-            None | Some(Json::Null) => 1,
-            Some(v) => v.as_u64().filter(|c| (1..=64).contains(c)).ok_or_else(|| ApiError::bad("clients is a whole number from 1 to 64"))? as usize,
-        };
-        let req = QueryReq { sql: body_str(b, "sql")?.to_string(), params: app.svc.params(b.get("params")).await?, quiet: true, ..Default::default() };
-        // Once first: a query that fails answers at once, and the caches it
-        // reads are warm when the profile starts.
-        app.svc.query(req.clone()).await?;
-        let runs: std::sync::Arc<std::sync::Mutex<(Vec<f64>, Option<ApiError>)>> = Default::default();
-        let (svc, kept) = (app.svc.clone(), runs.clone());
-        let during = async move {
-            futures::future::join_all((0..clients).map(|_| async {
-                loop {
-                    let t = Instant::now();
-                    let r = svc.query(req.clone()).await;
-                    let mut k = kept.lock().unwrap_or_else(|e| e.into_inner());
-                    if k.1.is_some() {
-                        return;
-                    }
-                    match r {
-                        Ok(_) => k.0.push(t.elapsed().as_secs_f64() * 1e3),
-                        Err(e) => {
-                            k.1 = Some(e);
-                            return;
-                        }
-                    }
-                }
-            }))
-            .await;
-        };
-        Ok(Load { during: Box::pin(during), runs: Some((clients, runs)) })
-    }
-
-    /// The runs' times, for the answer.
-    fn runs(&self) -> Option<Json> {
-        let (clients, runs) = self.runs.as_ref()?;
-        let (mut ms, error) = std::mem::take(&mut *runs.lock().unwrap_or_else(|e| e.into_inner()));
-        ms.sort_by(f64::total_cmp);
-        let at = |f: f64| ms.get(((ms.len() as f64 - 1.0) * f).round() as usize).copied();
-        Some(json!({"count": ms.len(), "clients": clients, "min_ms": at(0.0), "median_ms": at(0.5), "p99_ms": at(0.99), "max_ms": at(1.0), "error": error.map(|e| e.message)}))
-    }
-}
-
-fn seconds_of(b: &Json, max: f64) -> Result<f64, ApiError> {
-    match b.get("seconds") {
-        None | Some(Json::Null) => Ok(5.0),
-        Some(v) => v.as_f64().filter(|s| *s > 0.0 && *s <= max).ok_or_else(|| ApiError::bad(format!("seconds is a number above 0 and at most {max}"))),
-    }
-}
-
-fn refused(e: profiler::Refused) -> ApiError {
-    match e {
-        profiler::Refused::Busy => ApiError { status: 409, message: "a profile of this kind is being taken: one at a time".into() },
-        profiler::Refused::Unavailable(m) => ApiError { status: 501, message: format!("no profile: {m}") },
-    }
-}
-
-/// A CPU profile ([`profiler`]): of the whole server for `seconds`
-/// (default 5), or of `sql` run again and again ([`Load`]). It answers the
-/// profile with how busy the server was (`cores`), the samples delivered
-/// a CPU second (`rate`) and, for a query, its runs and their times; with
-/// `?format=folded`, folded lines to download.
-async fn cpu_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
-    let seconds = seconds_of(&b, profiler::MAX_SECONDS)?;
-    let hz = match b.get("hz") {
-        None | Some(Json::Null) => 99,
-        Some(v) => v.as_i64().filter(|h| (1..=profiler::MAX_HZ as i64).contains(h)).ok_or_else(|| ApiError::bad(format!("hz is a whole number from 1 to {}", profiler::MAX_HZ)))? as i32,
+/// A profile ([`profiling`]) of this server, or with `?node=` on a
+/// coordinator, of that server of its cluster (one of `GET /v1/cluster`'s
+/// replica URLs, over gRPC: [`crate::coord::Coordinator::profile`]).
+/// `?format=folded` (`&value=in_use`) answers folded lines to download.
+async fn profile(app: &App, kind: profiling::Kind, q: &std::collections::HashMap<String, String>, body: Json) -> Result<Response, ApiError> {
+    let asked = profiling::Asked { kind, body, folded: q.get("format").map(String::as_str) == Some("folded"), in_use: q.get("value").map(String::as_str) == Some("in_use") };
+    let answer = match q.get("node").map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        Some(node) => app.svc.profile_node(node, asked).await?,
+        None => profiling::take(&app.svc, asked).await?,
     };
-    let mut load = Load::of(&app, &b).await?;
-    let (p, _) = profiler::take(hz, seconds, &mut load.during).await.map_err(refused)?;
-    tracing::info!(seconds = p.seconds, hz, samples = p.samples, query = load.runs.is_some(), "CPU profile taken");
-    if q.get("format").map(String::as_str) == Some("folded") {
-        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"strata-cpu.folded\"")], p.folded()).into_response());
-    }
-    let mut j = json!(p);
-    j["cores"] = json!(p.cores());
-    j["rate"] = json!(p.rate());
-    if let Some(r) = load.runs() {
-        j["runs"] = r;
-    }
-    Ok(AxJson(j).into_response())
+    Ok(match answer {
+        profiling::Answer::Json(j) => AxJson(j).into_response(),
+        profiling::Answer::Folded(file, text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\""))], text).into_response(),
+    })
+}
+
+/// A CPU profile ([`crate::profiler`]): of the whole server for `seconds`
+/// (default 5), or of `sql` run again and again by `clients` callers. It
+/// answers the profile with how busy the server was (`cores`), the samples
+/// delivered a CPU second (`rate`) and, for a query, its runs and their
+/// times.
+async fn cpu_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    profile(&app, profiling::Kind::Cpu, &q, b).await
 }
 
 /// The heap's counts, the process's resident memory, and its threads.
-async fn memory(State(app): State<App>) -> AxJson<Json> {
-    let (rss, _) = telemetry::process_usage();
-    let threads = profiler::threads();
-    AxJson(json!({
-        "heap": heap::stats(),
-        "rss_bytes": rss,
-        "peak_rss_bytes": telemetry::peak_rss(),
-        "memory_limit_bytes": strata::storage::memory_limit(),
-        "query_memory_bytes": app.svc.query_memory.as_ref().map(|b| b.used()),
-        "threads": threads.len(),
-    }))
+async fn memory(State(app): State<App>, Query(q): Params) -> Result<Response, ApiError> {
+    profile(&app, profiling::Kind::Memory, &q, Json::Null).await
 }
 
-/// An allocation profile ([`heap::take`]), of the whole server or of a
-/// query in a loop as [`cpu_profile`]; `?format=folded` answers the bytes
-/// allocated by stack, or with `&value=in_use` those still in use.
+/// An allocation profile ([`crate::heap::take`]), of the whole server or of a
+/// query in a loop as [`cpu_profile`].
 async fn heap_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
-    let seconds = seconds_of(&b, heap::MAX_SECONDS)?;
-    let every = match b.get("every") {
-        None | Some(Json::Null) => heap::EVERY_DEFAULT,
-        Some(v) => v.as_u64().filter(|e| (heap::MIN_EVERY..=heap::MAX_EVERY).contains(e)).ok_or_else(|| ApiError::bad(format!("every is a number of bytes from {} to {}", heap::MIN_EVERY, heap::MAX_EVERY)))?,
-    };
-    let mut load = Load::of(&app, &b).await?;
-    let (p, _) = heap::take(every, seconds, &mut load.during).await.map_err(refused)?;
-    tracing::info!(seconds = p.seconds, every, samples = p.samples, query = load.runs.is_some(), "allocation profile taken");
-    if q.get("format").map(String::as_str) == Some("folded") {
-        let in_use = q.get("value").map(String::as_str) == Some("in_use");
-        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"strata-heap.folded\"")], p.folded(in_use)).into_response());
-    }
-    let mut j = json!(p);
-    if let Some(r) = load.runs() {
-        j["runs"] = r;
-    }
-    Ok(AxJson(j).into_response())
+    profile(&app, profiling::Kind::Heap, &q, b).await
 }
 
-async fn threads() -> AxJson<Json> {
-    AxJson(json!({"threads": profiler::threads(), "at_ms": telemetry::now_ms()}))
+async fn threads(State(app): State<App>, Query(q): Params) -> Result<Response, ApiError> {
+    profile(&app, profiling::Kind::Threads, &q, Json::Null).await
 }
 
 async fn request_queries(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> AxJson<Json> {
@@ -1415,7 +1404,7 @@ async fn log_store(State(app): State<App>) -> AxJson<Json> {
 
 async fn system(State(app): State<App>) -> AxJson<Json> {
     let mut j = app.svc.system();
-    j["auth"] = json!({"token": app.token.is_some()});
+    j["auth"] = json!({"token": app.token.is_some(), "cluster_token": app.cluster.is_some()});
     j["logs"] = json!({"filter": obs::log_filter()});
     AxJson(j)
 }
@@ -1431,12 +1420,12 @@ async fn routes(State(app): State<App>) -> AxJson<Json> {
 async fn whoami(State(app): State<App>, w: Option<axum::Extension<Principal>>) -> AxJson<Json> {
     let w = who(w);
     let mut j = w.json();
-    j["auth"] = json!({"token": app.token.is_some(), "keys": !app.svc.keys.is_empty(), "open": app.token.is_none() && app.svc.keys.is_empty()});
+    j["auth"] = json!({"token": app.token.is_some(), "cluster_token": app.cluster.is_some(), "keys": !app.svc.keys.is_empty(), "open": !app.guarded() && app.svc.keys.is_empty()});
     AxJson(j)
 }
 
 async fn list_keys(State(app): State<App>) -> AxJson<Json> {
-    AxJson(json!({"keys": app.svc.keys.list(), "file": app.svc.keys.file().map(|p| p.display().to_string())}))
+    AxJson(json!({"keys": app.svc.keys.list(), "revoked": app.svc.keys.set().revoked.len(), "file": app.svc.keys.file().map(|p| p.display().to_string()), "peers": app.svc.keys.peers()}))
 }
 
 /// `{"name": ..., "scope": "read" | "write" | "admin", "expires_days": n}`:
@@ -1448,15 +1437,17 @@ async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<R
         None | Some(Json::Null) => None,
         Some(v) => Some(telemetry::now_ms() + v.as_f64().filter(|d| *d > 0.0).ok_or_else(|| ApiError::bad("expires_days is a number of days above 0"))?.mul_add(86_400_000.0, 0.0) as u64),
     };
-    let open = app.token.is_none() && app.svc.keys.is_empty();
-    let (key, secret) = app.svc.keys.create(name, scope, expires, app.token.is_some())?;
+    let open = !app.guarded() && app.svc.keys.is_empty();
+    // A shard, or a copy in replication, whose callers send no credential.
+    let in_cluster = app.svc.slots().is_some() || app.svc.role() != crate::pb::Role::Standalone;
+    let (key, secret) = app.svc.keys.create(name, scope, expires, app.guarded(), in_cluster)?;
     tracing::info!(key = %key.id, name = %key.name, scope = scope.name(), "API key created");
     let detail = format!("created key {} ({}, {})", key.name, key.id, scope.name());
     Ok(audited(json!({"key": key.json(), "secret": secret, "closed": open}), detail))
 }
 
 async fn revoke_key(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
-    match app.svc.keys.revoke(&id, app.token.is_some())? {
+    match app.svc.keys.revoke(&id, app.guarded())? {
         true => {
             tracing::info!(key = %id, "API key revoked");
             Ok(audited(json!({"revoked": id}), format!("revoked key {id}")))

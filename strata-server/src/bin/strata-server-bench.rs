@@ -172,8 +172,11 @@ fn build(args: &Args, name: &str, path: &Path, codes: VectorCodes, dim: usize, d
     let mut components: BTreeMap<String, u64> = BTreeMap::new();
     let mut code_bytes = 0u64;
     let snap = db.snapshot();
+    // Sections are named by field id, not by the field's name.
+    let emb = snap.schema().key_of("emb").expect("the BEIR table has an emb field");
     for v in snap.segments() {
         for (name, len) in v.file.section_sizes() {
+            let name = strata::segment::label(snap.schema(), &name);
             let mut parts = name.split('.');
             let key = match parts.next().unwrap_or("") {
                 "text" => format!("text index ({})", parts.next().unwrap_or("")),
@@ -187,7 +190,7 @@ fn build(args: &Args, name: &str, path: &Path, codes: VectorCodes, dim: usize, d
             };
             *components.entry(key).or_insert(0) += len as u64;
         }
-        code_bytes += VectorReader::open(&v.file, "emb")?.code_bytes() as u64;
+        code_bytes += VectorReader::open(&v.file, &emb)?.code_bytes() as u64;
     }
     let docs = snap.n_live_docs() as usize;
     let file_bytes = db.storage().file_stats().file_bytes;

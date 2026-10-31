@@ -32,6 +32,13 @@ fn key(i: usize) -> Value {
 
 /// A numbered database at `dir/name` of the demo products `keep` keeps.
 fn create(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Arc<Db> {
+    let db = create_unnumbered(dir, name, keep);
+    db.storage().start_seq_no().unwrap();
+    db
+}
+
+/// [`create`], of a database that does not number its writes.
+fn create_unnumbered(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Arc<Db> {
     let opts = DbOptions { publish_snapshots: true, ship_log_bytes: 16 << 20, ..DbOptions::default() };
     let db = Db::create(&dir.join(name), demo::schema(N), opts).unwrap();
     db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
@@ -39,7 +46,6 @@ fn create(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Arc<Db> {
     if !docs.is_empty() {
         db.load(docs).unwrap();
     }
-    db.storage().start_seq_no().unwrap();
     Arc::new(db)
 }
 
@@ -247,6 +253,22 @@ async fn replicas_join_and_leave_a_shard() {
     assert_eq!(ids(&svc_a).await.len(), N - 1);
     let health = shards[0].health().await;
     assert_eq!(health["replication"]["replicas"].as_array().unwrap().len(), 1, "{health}");
+
+    // A replica that joined a shard holding no transaction (its rows came
+    // in the copy) is handed the primary: no copy holds a transaction it
+    // lacks.
+    let r2db = create(d, "r2.strata", |_| false);
+    let (r2, u_r2) = serve(r2db.clone(), d, "r2.strata").await;
+    a.add_replica(1, &u_r2, false).await.unwrap();
+    until("the new replica serves reads", || async {
+        r2.query(QueryReq { sql: "SELECT id FROM products LIMIT 10000".into(), ..Default::default() }).await.is_ok()
+    })
+    .await;
+    let j = a.promote(1, &u_r2, false).await.unwrap();
+    assert_eq!((&j["primary"], &j["seq_no"]), (&serde_json::json!(u_r2.clone()), &serde_json::json!(0)), "{j}");
+    assert_eq!((r2.role(), shards[1].role()), (pb::Role::Primary, pb::Role::Replica));
+    sql(&svc_a, &format!("DELETE FROM products WHERE id = '{}'", all.iter().find(|id| !mine.contains(id)).unwrap())).await.unwrap();
+    assert_eq!(ids(&svc_a).await.len(), N - 2);
 }
 
 /// `Configure` refuses the changes of part that would lose writes.
@@ -256,7 +278,7 @@ async fn configure_refuses_what_would_lose_writes() {
     let d = dir.path();
     let (_, u) = serve(create(d, "a.strata", |i| i < 10), d, "a.strata").await;
     let mut c = pb::strata_client::StrataClient::connect(u.clone()).await.unwrap();
-    let ask = |role: pb::Role, replicas: Vec<String>, force: bool| pb::ConfigureRequest { role: role as i32, replicas, write_acks: String::new(), force };
+    let ask = |role: pb::Role, replicas: Vec<String>, force: bool| pb::ConfigureRequest { role: role as i32, replicas, write_acks: String::new(), force, promote: false };
     let e = c.configure(ask(pb::Role::Replica, vec![], false)).await.unwrap_err();
     assert!(e.message().contains("holds 10 rows"), "{}", e.message());
     let (_, r) = serve(create(d, "b.strata", |_| false), d, "b.strata").await;
@@ -270,4 +292,240 @@ async fn configure_refuses_what_would_lose_writes() {
     let a = c.configure(ask(pb::Role::Standalone, vec![], false)).await.unwrap().into_inner();
     assert_eq!(a.role(), pb::Role::Standalone);
     assert_eq!(replication::kept_role(&d.join("a.strata")).unwrap().0, None);
+}
+
+/// The products (`p…`) a coordinator serves, with their `sold`, and every
+/// other key it serves; panics on a key served twice.
+async fn rows(svc: &Arc<Service>) -> (std::collections::BTreeMap<String, i64>, std::collections::BTreeMap<String, f64>) {
+    let a = svc.query(QueryReq { sql: "SELECT id, sold, price FROM products LIMIT 100000".into(), ..Default::default() }).await.unwrap();
+    let (mut products, mut others) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
+    for r in &a.rs.rows {
+        let id = r[0].as_str().unwrap().to_string();
+        let twice = match id.starts_with('p') {
+            true => products.insert(id.clone(), r[1].as_i64().unwrap()).is_some(),
+            false => others.insert(id.clone(), r[2].as_f64().unwrap()).is_some(),
+        };
+        if twice {
+            let m = svc.coordinator().map(|c| c.map().map(|m| m.to_json())).ok().flatten();
+            panic!("{id} (slot {}) is served twice; map {m:?}", slots::slot(&Value::Str(id.clone())));
+        }
+    }
+    (products, others)
+}
+
+async fn job_done(c: &Coordinator) -> serde_json::Value {
+    let t0 = Instant::now();
+    loop {
+        let m = c.moves();
+        if m["job"]["state"] != "running" {
+            return m;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(120), "the job of moves runs still: {m}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Slots move between shards while writes and reads go on through two
+/// coordinators: rebalancing onto a shard just added, then draining the
+/// first to remove it. Every read sees each row once; every acknowledged
+/// write is kept, a statement on every shard (UPDATE) changes each row
+/// once, and rows placed by a column (shard_by) move with their slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slots_move_while_the_cluster_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let (s0, u0) = serve(create(d, "s0.strata", |_| true), d, "s0.strata").await;
+    let (a, svc_a) = coordinator(&[u0.clone()]).await;
+    sql(&svc_a, "CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, n INT) OPTIONS(shard_by = 'usr')").await.unwrap();
+    let values: Vec<String> = (0..200).map(|i| format!("({i}, 'u{}', {i})", i % 13)).collect();
+    sql(&svc_a, &format!("INSERT INTO events (id, usr, n) VALUES {}", values.join(", "))).await.unwrap();
+    let (before, _) = rows(&svc_a).await;
+    assert_eq!(before.len(), N);
+    let (_, u1) = serve(create(d, "s1.strata", |_| false), d, "s1.strata").await;
+    a.add_shard(vec![u1.clone()], Acks::All).await.unwrap();
+    let (b, svc_b) = coordinator(&[u0.clone()]).await;
+    assert_eq!(b.map().unwrap().shards(), 2, "a coordinator started on the first shard follows the map");
+
+    // Writers: rows by key through one coordinator, statements on every
+    // shard through the other; a reader through both.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let acked: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Option<f64>>>> = Default::default();
+    let updates = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let mut tasks = Vec::new();
+    {
+        let (svc, stop, acked) = (svc_a.clone(), stop.clone(), acked.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut r = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let k = format!("w{:03}", r % 97);
+                let price = r as f64;
+                let q = if r % 7 == 3 { format!("DELETE FROM products WHERE id = '{k}'") } else { format!("INSERT OR REPLACE INTO products (id, title, description, price) VALUES ('{k}', 'Writer kettle', 'Round {r}', {price})") };
+                match svc.sql(&Principal::open(), &q, &Params::new(), After::Any, 0).await {
+                    Ok(_) => {
+                        acked.lock().unwrap().insert(k, (r % 7 != 3).then_some(price));
+                    }
+                    Err(e) => panic!("{q}: {}", e.message),
+                }
+                r += 1;
+            }
+            r
+        }));
+    }
+    {
+        let (svc, stop, updates) = (svc_b.clone(), stop.clone(), updates.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut n = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match svc.sql(&Principal::open(), "UPDATE products SET sold = sold + 1", &Params::new(), After::Any, 0).await {
+                    Ok(_) => {
+                        updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => panic!("UPDATE: {}", e.message),
+                }
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            n
+        }));
+    }
+    for svc in [svc_a.clone(), svc_b.clone()] {
+        let stop = stop.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut n = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (products, _) = rows(&svc).await;
+                assert_eq!(products.len(), N, "every product, once, in every read");
+                n += 1;
+            }
+            n
+        }));
+    }
+
+    // Rebalance onto the new shard, in moves of 512 slots.
+    let j = a.rebalance(512).unwrap();
+    assert_eq!(j["job"]["of"], 4, "{j}");
+    let done = job_done(&a).await;
+    assert_eq!(done["job"]["state"], "done", "{done}");
+    assert_eq!(done["job"]["slots_moved"], 2048);
+    assert!(done["moving"].is_null(), "{done}");
+    let map = a.map().unwrap();
+    assert_eq!((map.count(0), map.count(1), map.moving().is_none()), (2048, 2048, true));
+    for m in done["job"]["moves"].as_array().unwrap() {
+        assert!(m["held_ms"].as_f64().unwrap() < 5_000.0, "{m}");
+    }
+
+    // Drain the first shard, then remove it.
+    a.drain(0, 1024).unwrap();
+    let done = job_done(&a).await;
+    assert_eq!(done["job"]["state"], "done", "{done}");
+    assert_eq!(a.map().unwrap().count(0), 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut counts = Vec::new();
+    for t in tasks {
+        counts.push(t.await.unwrap());
+    }
+    assert!(counts.iter().all(|&n| n > 0), "{counts:?}");
+    a.remove_shard(0).await.unwrap();
+    assert_eq!(a.map().unwrap().replicas().to_vec(), vec![vec![u1.clone()]]);
+
+    // Every acknowledged write, and each UPDATE once on every product.
+    let (products, others) = rows(&svc_a).await;
+    let n = updates.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(n > 0);
+    for (id, sold) in &products {
+        assert_eq!(*sold, before[id] + n, "{id}: sold {sold}, was {}, {n} updates", before[id]);
+    }
+    let acked = acked.lock().unwrap().clone();
+    let kept: std::collections::BTreeMap<String, f64> = acked.iter().filter_map(|(k, p)| p.map(|p| (k.clone(), p))).collect();
+    assert_eq!(others, kept, "the rows written by key are those last acknowledged");
+    let a_events = svc_a.query(QueryReq { sql: "SELECT usr, COUNT(*) FROM events GROUP BY usr ORDER BY usr LIMIT 100".into(), ..Default::default() }).await.unwrap();
+    assert_eq!(a_events.rs.rows.len(), 13);
+    assert_eq!(a_events.rs.rows.iter().map(|r| r[1].as_i64().unwrap()).sum::<i64>(), 200);
+    // The drained shard kept nothing it serves no more; the other holds
+    // every row, hiding none.
+    assert_eq!(s0.local_db().unwrap().snapshot().n_live_docs(), 0);
+    let (_, svc_b2) = coordinator(&[u1.clone()]).await;
+    assert_eq!(rows(&svc_b2).await.0.len(), N);
+}
+
+/// The slots of the products a server holds (raw, hiding nothing).
+fn held_slots(svc: &Service) -> Vec<usize> {
+    let snap = svc.local_db().unwrap().snapshot();
+    (0..N).filter(|&i| snap.lookup(&key(i)).is_some()).map(|i| slots::slot(&key(i))).collect()
+}
+
+/// Shards that cannot tell what changed (they do not number their
+/// writes) move slots holding the writes to them from the start; a move a
+/// coordinator left half done is finished by another: one copying is
+/// given up, and the rows it sent deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unnumbered_shards_move_and_a_move_left_is_given_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let (s0, u0) = serve(create_unnumbered(d, "s0.strata", |_| true), d, "s0.strata").await;
+    let (s1, u1) = serve(create_unnumbered(d, "s1.strata", |_| false), d, "s1.strata").await;
+    let (a, svc_a) = coordinator(&[u0.clone()]).await;
+    a.add_shard(vec![u1.clone()], Acks::All).await.unwrap();
+
+    // A move from an unnumbered shard: writes held throughout, each row
+    // copied once.
+    let j = a.start_move((0..1024).collect(), 1).unwrap();
+    assert_eq!(j["job"]["kind"], "move", "{j}");
+    let done = job_done(&a).await;
+    assert_eq!(done["job"]["state"], "done", "{done}");
+    let step = &done["job"]["moves"][0];
+    assert_eq!(step["rounds"], 0, "{step}");
+    assert!(step["held_ms"].as_f64().is_some(), "{step}");
+    let map = a.map().unwrap();
+    assert_eq!((map.count(0), map.count(1), map.moving().is_none()), (3072, 1024, true));
+    assert!(held_slots(&s1).iter().all(|&s| s < 1024) && !held_slots(&s1).is_empty());
+    assert!(held_slots(&s0).iter().all(|&s| s >= 1024));
+    assert_eq!(ids(&svc_a).await.len(), N);
+    assert!(!s0.frozen().await, "the hold ends with the move");
+
+    // A coordinator starts a move and copies part of it, then stops: the
+    // map says copying, and the shard the slots were to go to holds rows
+    // it does not serve.
+    let moving: Vec<usize> = (1024..1536).collect();
+    let started = map.start_move(&moving, 1).unwrap();
+    s0.set_slots(started.clone(), 0).await.unwrap();
+    s1.set_slots(started.clone(), 1).await.unwrap();
+    let mut rx = s0.export_slots(false, 10).await.unwrap();
+    let mut sent = 0;
+    while let Some(chunk) = rx.recv().await {
+        let chunk = chunk.unwrap();
+        if chunk.last {
+            assert!(chunk.frozen, "an unnumbered shard holds writes from the start");
+            break;
+        }
+        let ops: Vec<serde_json::Value> = serde_json::from_slice(&chunk.ops_json).unwrap();
+        sent += ops.len();
+        s1.write_ops_as(ops, None, true).await.unwrap();
+        // Half of it.
+        if sent >= 20 {
+            break;
+        }
+    }
+    drop(rx);
+    assert!(s0.frozen().await);
+    assert!(held_slots(&s1).iter().any(|s| moving.contains(s)), "rows were sent");
+    assert_eq!(ids(&svc_a).await.len(), N, "rows sent are not served before the flip");
+
+    // Another coordinator finishes it: given up.
+    let (b, svc_b) = coordinator(&[u0.clone()]).await;
+    let f = b.finish_move().await.unwrap();
+    assert_eq!(f["finished"]["was"], "copying", "{f}");
+    assert_eq!(f["finished"]["moved"], false, "{f}");
+    let map = b.map().unwrap();
+    assert!(map.moving().is_none());
+    assert_eq!((map.count(0), map.count(1)), (3072, 1024));
+    assert!(held_slots(&s1).iter().all(|&s| s < 1024), "the rows sent are deleted");
+    assert!(!s0.frozen().await, "giving up ends the hold");
+    assert_eq!(ids(&svc_b).await.len(), N);
+    sql(&svc_b, "UPDATE products SET sold = 1").await.unwrap();
+    let a_sold = svc_a.query(QueryReq { sql: "SELECT COUNT(*) FROM products WHERE sold = 1".into(), ..Default::default() }).await.unwrap();
+    assert_eq!(a_sold.rs.rows[0][0].as_i64(), Some(N as i64));
+    // Nothing is left to finish.
+    assert!(b.finish_move().await.unwrap()["finished"].is_null());
 }

@@ -13,6 +13,7 @@
 //! strata-server import --db my.strata --schema my.json rows.jsonl more.csv   # load files
 //! strata-server import --db shop.strata shop.sqlite    # a SQLite database's tables
 //! strata-server export --db shop.strata shop-copy.sqlite   # and back to SQLite
+//! strata-server upgrade my.strata                      # copy a database from before field ids into this version's format
 //! ```
 
 use std::path::PathBuf;
@@ -110,6 +111,13 @@ struct Args {
     /// copy of the primary (0: only when asked, POST /v1/admin/verify).
     #[arg(long, default_value_t = 600)]
     verify_every_s: u64,
+    /// With --replicas or --replica, in a cluster (servers holding a
+    /// cluster map): a replica that hears nothing from its primary for this
+    /// many milliseconds asks its shard's copies to elect it primary, and a
+    /// primary that does not hear from a majority of its copies for most of
+    /// it serves no reads (0: no automatic failover; promote by hand).
+    #[arg(long, default_value_t = 0)]
+    failover_after_ms: u64,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|'). Servers of protocol 9 hold the cluster
     /// map, which names every shard's servers: the coordinator then routes
@@ -153,10 +161,14 @@ struct Args {
     /// The private key of --tls-cert (PEM).
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
-    /// With --shards or --replicas: the token the shards or replicas
-    /// require (default: --token).
-    #[arg(long, env = "STRATA_SHARD_TOKEN", hide_env_values = true)]
-    shard_token: Option<String>,
+    /// The token the servers of a cluster send each other: a coordinator
+    /// its shards, a primary its replicas. Give every server of the
+    /// cluster the same one. With it, only it may make the calls between
+    /// servers (replication, slots, keys), and --token is an admin's
+    /// credential that may not; clients get API keys. Without it, --token
+    /// plays both parts.
+    #[arg(long, env = "STRATA_CLUSTER_TOKEN", hide_env_values = true)]
+    cluster_token: Option<String>,
     /// With --shards or --replicas: a CA certificate (PEM) for https://
     /// shards or replicas, besides the public roots.
     #[arg(long)]
@@ -252,9 +264,10 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     slow_ms: u64,
     /// The API keys' file (default: DB.keys.json beside --db; a
-    /// coordinator keeps its keys in memory without it). Keys have scopes
-    /// (read, write, admin) and are made in the UI or with POST
-    /// /v1/admin/keys; --token stays the root credential.
+    /// coordinator keeps its keys in memory without it, and takes them
+    /// from its shards when it starts). Keys have scopes (read, write,
+    /// admin), are made in the UI or with POST /v1/admin/keys, and are
+    /// passed on to the cluster's other servers.
     #[arg(long)]
     keys: Option<PathBuf>,
     /// Append the requests that need the admin scope, and refused ones, to
@@ -303,6 +316,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Copy a database written by a version of Strata from before field
+    /// ids, which no longer opens, into this version's format in its place;
+    /// the old one is kept as <db>.before-field-ids. The server must not
+    /// have it open.
+    Upgrade {
+        /// The database: a file, or a directory in the directory layout.
+        db: PathBuf,
+    },
     /// Download an embedding model from Hugging Face into the models directory.
     FetchModel {
         /// A known name (potion-retrieval-32M, potion-base-8M, bge-small-en-v1.5,
@@ -316,30 +337,61 @@ enum Command {
         models: Option<PathBuf>,
     },
     /// Make a running replica the primary of a new term (POST
-    /// /v1/admin/promote): it ships to --replicas from then on. It refuses
-    /// while one of them holds transactions it does not, unless --force.
+    /// /v1/admin/promote), once a majority of its shard's copies vote for
+    /// it: a primary that serves steps down. It refuses while a copy holds
+    /// transactions it does not, or when it is not elected, unless --force.
     Promote {
         /// The replica's HTTP URL, as http://host:7700.
         url: String,
-        /// The copies it is to ship to (comma-separated gRPC URLs): the
-        /// shard's other replicas, and the old primary, which is sent a
-        /// copy once it starts again with --replica. None: the copies the
-        /// replica was started with (its --replicas). Promotion calls each
-        /// with the cluster's token, so with an API key only those may be
-        /// named; with the token, any.
+        /// The copies it is to ship to (comma-separated gRPC URLs), which
+        /// vote: the shard's other replicas, and the old primary, which is
+        /// sent a copy once it starts again with --replica. None: the
+        /// servers its cluster map names for its shard, or without a map
+        /// the copies it was started with (its --replicas). Promotion calls
+        /// each with the cluster's token, so with an API key only those may
+        /// be named; with the token, any.
         #[arg(long, value_delimiter = ',')]
         replicas: Vec<String>,
         /// The copies that hold a write before it is answered, as
         /// --write-acks: all, majority or primary.
         #[arg(long, default_value = "all")]
         write_acks: String,
-        /// Promote it though a copy holds transactions it does not, which
-        /// a copy of the new primary then drops.
+        /// Promote it with no votes, though a copy holds transactions it
+        /// does not, which a copy of the new primary then drops: only when
+        /// a majority of the shard's copies is lost for good.
         #[arg(long)]
         force: bool,
         /// The replica's --token.
         #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
         token: Option<String>,
+    },
+    /// Run the Kubernetes operator: it makes and changes the Strata clusters
+    /// that StrataCluster resources describe (see deploy/README.md). In a
+    /// pod it talks to the API server as its service account.
+    Operator {
+        /// Only the clusters of this namespace (default: every namespace).
+        #[arg(long)]
+        namespace: Option<String>,
+        /// How often each cluster is looked at, in milliseconds.
+        #[arg(long, default_value_t = 3000)]
+        every_ms: u64,
+        /// Do not install or update the StrataCluster resource definition
+        /// when starting (it needs to be there already).
+        #[arg(long)]
+        no_crd: bool,
+        /// Print the resource definition (JSON, for kubectl apply -f) and
+        /// exit.
+        #[arg(long)]
+        print_crd: bool,
+        /// The API server, outside a pod (as https://host:6443).
+        #[arg(long)]
+        kube_api: Option<String>,
+        /// A bearer token for --kube-api.
+        #[arg(long, env = "STRATA_KUBE_TOKEN", hide_env_values = true)]
+        kube_token: Option<String>,
+        /// The CA of --kube-api, PEM.
+        #[arg(long)]
+        kube_ca: Option<PathBuf>,
     },
     /// Load rows from JSON Lines, JSON, CSV or TSV files, and the tables of
     /// SQLite databases, into a database. A database that does not exist
@@ -429,6 +481,14 @@ async fn main() {
         obs::sink().start();
     }
     match &a.command {
+        Some(Command::Upgrade { db }) => {
+            match strata::upgrade::upgrade(db) {
+                Ok(Some(u)) => println!("copied {} rows of {} tables of {} into this version's format; the old database is {}", u.rows, u.tables, db.display(), u.old.display()),
+                Ok(None) => println!("{} needs no upgrade", db.display()),
+                Err(e) => fail(&format!("upgrade {}: {e}", db.display())),
+            }
+            return;
+        }
         Some(Command::FetchModel { name, models }) => {
             let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
             match server::fetch_model(name, &dir).await {
@@ -441,6 +501,25 @@ async fn main() {
             match server::promote(url, replicas, write_acks, *force, token.as_deref()).await {
                 Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
                 Err(e) => fail(&e),
+            }
+            return;
+        }
+        Some(Command::Operator { namespace, every_ms, no_crd, print_crd, kube_api, kube_token, kube_ca }) => {
+            if *print_crd {
+                println!("{}", serde_json::to_string_pretty(&strata_server::operator::crd()).unwrap_or_default());
+                return;
+            }
+            let ca = kube_ca.as_ref().map(|p| std::fs::read(p).unwrap_or_else(|e| fail(&format!("--kube-ca {}: {e}", p.display()))));
+            let o = strata_server::operator::kube::Options {
+                api: kube_api.clone(),
+                token: kube_token.clone(),
+                ca,
+                namespace: namespace.clone(),
+                every: std::time::Duration::from_millis((*every_ms).max(100)),
+                install_crd: !no_crd,
+            };
+            if let Err(e) = strata_server::operator::kube::run(o).await {
+                fail(&e);
             }
             return;
         }
@@ -475,6 +554,10 @@ async fn main() {
         auth::server_config(t).unwrap_or_else(|e| fail(&e));
     }
     let token = a.token.clone().filter(|t| !t.is_empty()).map(Secret::new);
+    let cluster = a.cluster_token.clone().filter(|t| !t.is_empty()).map(Secret::new);
+    if cluster.is_some() && cluster == token {
+        tracing::warn!("--cluster-token is --token: whoever holds the token can make the calls between servers. Give the cluster a token of its own");
+    }
     let write_acks = strata_server::replication::Acks::parse(&a.write_acks).unwrap_or_else(|| fail(&format!("--write-acks is all, majority or primary, not {:?}", a.write_acks)));
     if a.replica && a.grpc == "off" {
         fail("a replica takes its primary's writes over gRPC: --replica needs --grpc");
@@ -495,12 +578,13 @@ async fn main() {
         write_acks,
         ship_log_mb: a.ship_log_mb,
         verify_every_s: a.verify_every_s,
+        failover_after_ms: a.failover_after_ms,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
             shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),
             partial: a.partial,
-            token: a.shard_token.clone().filter(|t| !t.is_empty()).map(Secret::new).or_else(|| token.clone()),
+            token: cluster.clone().or_else(|| token.clone()),
             ca: a.shard_ca.as_ref().map(read),
             slots: a.slot_map.as_ref().map(|p| {
                 let j: serde_json::Value = serde_json::from_slice(&read(p)).unwrap_or_else(|e| fail(&format!("{}: {e}", p.display())));
@@ -553,13 +637,13 @@ async fn main() {
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
-    if token.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
+    if token.is_none() && cluster.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
         tracing::warn!("this server has no token and no admin key that never expires: once its admin keys expire, only starting it with --token manages it. Make an admin key without expires_days");
     }
     let bind = |addr: &str| {
         let addr = addr.to_string();
         // API keys close a server as a token does.
-        let open = token.is_none() && svc.keys.is_empty() && !a.no_token;
+        let open = token.is_none() && cluster.is_none() && svc.keys.is_empty() && !a.no_token;
         async move {
             let l = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
             let ip = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}"))).ip();
@@ -570,7 +654,7 @@ async fn main() {
         }
     };
     let (http, ip) = bind(&a.listen).await;
-    let access = Access { token: token.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
+    let access = Access { token: token.clone(), cluster: cluster.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
     let h = svc.health().await;
     tracing::info!(table = %svc.schema.table, rows = %h["docs"], segments = %h["segments"], version = env!("CARGO_PKG_VERSION"), simd = %strata::simd::describe(), "serving");
     let scheme = if access.tls.is_some() { "https" } else { "http" };

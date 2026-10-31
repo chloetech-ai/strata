@@ -225,10 +225,11 @@ async fn stream(url: &str, evs: Arc<Vec<(usize, usize)>>, edges: Option<Arc<Vec<
     done
 }
 
-/// Bytes of the sections named `name` in a table's segments.
+/// Bytes of the sections named `name` (by field name, as
+/// [`strata::segment::label`] names them) in a table's segments.
 fn section_bytes(db: &Db, table: &str, name: &str) -> usize {
     let snap = db.snapshot().table(table).unwrap();
-    snap.segments().iter().filter(|v| !v.in_memory).flat_map(|v| v.file.section_sizes()).filter(|(n, _)| n == name).map(|(_, b)| b).sum()
+    snap.segments().iter().filter(|v| !v.in_memory).flat_map(|v| v.file.section_sizes()).filter(|(n, _)| strata::segment::label(snap.schema(), n) == name).map(|(_, b)| b).sum()
 }
 
 /// Flushes and merges `db` until one merge pass changes nothing.

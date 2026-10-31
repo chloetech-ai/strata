@@ -81,19 +81,19 @@ impl SegHandle {
     /// `MADV_RANDOM` ([`SegmentFile::advise_random_sections`]). The delete
     /// set and updates are checked against their checksums (they are small
     /// and read whole); the image as `check` says.
-    pub fn open(map: &OwnedBytes, meta: &SegmentMeta, read_ahead: bool, random_hints: bool, check: Check) -> Result<SegHandle> {
+    pub fn open(map: &OwnedBytes, meta: &SegmentMeta, schema: &Schema, read_ahead: bool, random_hints: bool, check: Check) -> Result<SegHandle> {
         let within = |e: &Extent| e.range().end <= map.len();
         if !within(&meta.extent) || [meta.deletes, meta.updates].iter().flatten().any(|e| !within(e)) {
             return Err(corrupt(format!("segment {} lies outside the file", meta.id)));
         }
         let deletes = meta.deletes.map(|e| map.slice(e.range()));
         let updates = meta.updates.map(|e| map.slice(e.range()));
-        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, updates, map.clone(), meta, read_ahead, random_hints, check)
+        SegHandle::from_bytes(map.slice(meta.extent.range()), deletes, updates, map.clone(), meta, schema, read_ahead, random_hints, check)
     }
 
     /// Opens a segment of the directory layout from its own files (see
     /// [`SegHandle::open`]).
-    pub fn open_in(dir: &Path, meta: &SegmentMeta, read_ahead: bool, random_hints: bool, check: Check) -> Result<SegHandle> {
+    pub fn open_in(dir: &Path, meta: &SegmentMeta, schema: &Schema, read_ahead: bool, random_hints: bool, check: Check) -> Result<SegHandle> {
         let name = meta.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", meta.id)))?;
         let map = crate::storage::dir::map(dir, name, read_ahead)?;
         if map.len() as u64 != meta.extent.len {
@@ -107,7 +107,7 @@ impl SegHandle {
             Some(u) => Some(OwnedBytes::new(std::fs::read(dir.join(u))?)),
             None => None,
         };
-        SegHandle::from_bytes(map.clone(), deletes, updates, map, meta, read_ahead, random_hints, check)
+        SegHandle::from_bytes(map.clone(), deletes, updates, map, meta, schema, read_ahead, random_hints, check)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -117,6 +117,7 @@ impl SegHandle {
         updates: Option<OwnedBytes>,
         map: OwnedBytes,
         meta: &SegmentMeta,
+        schema: &Schema,
         read_ahead: bool,
         random_hints: bool,
         check: Check,
@@ -141,7 +142,7 @@ impl SegHandle {
             None => None,
         };
         let updates = match updates {
-            Some(b) => Some(Arc::new(Updates::decode(&b)?)),
+            Some(b) => Some(Arc::new(Updates::decode(&b, schema)?)),
             None => None,
         };
         Ok(SegHandle { meta: meta.clone(), file, pk, base, updates, map })

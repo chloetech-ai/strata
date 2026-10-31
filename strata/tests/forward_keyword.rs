@@ -16,6 +16,11 @@ fn schema() -> Schema {
     Schema::new("t", vec![Field::new("k", FieldType::Keyword)], None).unwrap()
 }
 
+/// The name of field `name`'s sections (by its id).
+fn key(name: &str) -> String {
+    schema().key_of(name).unwrap()
+}
+
 /// Values of several shapes: Zipf-like over few values, many rare values,
 /// unique values, one value, with or without nulls.
 fn values(rng: &mut StdRng, n: usize, shape: usize) -> Vec<Option<String>> {
@@ -55,7 +60,7 @@ fn keyword_columns_match_naive() {
             let docs: Vec<Document> = vals.iter().map(|v| vec![v.clone().map_or(Value::Null, Value::Str)]).collect();
             for rare in [64usize, 1, 1_000_000] {
                 let seg = build(&schema(), &docs, &BuildOptions::default().set("forward.kw_rare", rare));
-                let col = KeywordColumn::open(&seg, "k").unwrap();
+                let col = KeywordColumn::open(&seg, &key("k")).unwrap();
                 assert!(col.is_view());
                 check(&col, &vals, &mut rng);
             }
@@ -124,7 +129,7 @@ fn rare_values_use_plain_arrays() {
     let vals = values(&mut rng, 20_000, 4); // unique ids
     let docs: Vec<Document> = vals.iter().map(|v| vec![Value::Str(v.clone().unwrap())]).collect();
     let seg = build(&schema(), &docs, &BuildOptions::default());
-    let col = KeywordColumn::open(&seg, "k").unwrap();
+    let col = KeywordColumn::open(&seg, &key("k")).unwrap();
     let sizes = col.byte_sizes();
     assert_eq!(sizes.lists, 0);
     // Every value on one document: docIDs only, offsets implied.
@@ -158,7 +163,7 @@ fn rare_values_with_as_many_documents_as_values_keep_their_offsets() {
             }
             let docs: Vec<Document> = vals.iter().map(|v| vec![v.clone().map_or(Value::Null, Value::Str)]).collect();
             let seg = build(&schema(), &docs, &BuildOptions::default());
-            let col = KeywordColumn::open(&seg, "k").unwrap();
+            let col = KeywordColumn::open(&seg, &key("k")).unwrap();
             assert!(!col.needs_values());
             assert!(col.is_view());
             check(&col, &vals, &mut rng);
@@ -223,7 +228,9 @@ fn columns_written_without_their_offsets_are_repaired() {
         }
         assert_eq!(counts, want, "{what}");
     };
-    let db = Db::open(&path, DbOptions::default()).unwrap();
+    // Written before field ids too: it opens to be copied.
+    let old = DbOptions { open_old: true, ..DbOptions::default() };
+    let db = Db::open(&path, old.clone()).unwrap();
     assert_eq!(db.snapshot().segments().len(), 1);
     check(&db, "as written", false);
     db.storage().check().unwrap();
@@ -237,6 +244,12 @@ fn columns_written_without_their_offsets_are_repaired() {
     assert_eq!(ids(&db, "tag = 'other'"), vec![70]);
     check(&db, "merged", true);
     drop(db);
-    let db = Db::open(&path, DbOptions::default()).unwrap();
+    let db = Db::open(&path, old).unwrap();
     check(&db, "reopened", true);
+    drop(db);
+    // And its copy holds the same.
+    strata::upgrade::upgrade(&path).unwrap().unwrap();
+    let db = Db::open(&path, DbOptions::default()).unwrap();
+    check(&db, "upgraded", true);
+    db.storage().check().unwrap();
 }

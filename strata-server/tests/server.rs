@@ -647,6 +647,12 @@ impl pb::strata_server::Strata for Stuck {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
+    }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
@@ -661,6 +667,19 @@ impl pb::strata_server::Strata for Stuck {
         Err(tonic::Status::unimplemented("no guards here"))
     }
     async fn configure(&self, _: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    type ExportSlotsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::ExportSlotsChunk, tonic::Status>> + Send>>;
+    async fn export_slots(&self, _: tonic::Request<pb::ExportSlotsRequest>) -> Result<tonic::Response<Self::ExportSlotsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn freeze_slots(&self, _: tonic::Request<pb::FreezeRequest>) -> Result<tonic::Response<pb::FreezeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn cleanup_slots(&self, _: tonic::Request<pb::CleanupRequest>) -> Result<tonic::Response<pb::CleanupResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn vote(&self, _: tonic::Request<pb::VoteRequest>) -> Result<tonic::Response<pb::VoteResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
 }
@@ -706,6 +725,12 @@ impl pb::strata_server::Strata for Overloaded {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
+    }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
@@ -720,6 +745,19 @@ impl pb::strata_server::Strata for Overloaded {
         Err(tonic::Status::unimplemented("no guards here"))
     }
     async fn configure(&self, _: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    type ExportSlotsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::ExportSlotsChunk, tonic::Status>> + Send>>;
+    async fn export_slots(&self, _: tonic::Request<pb::ExportSlotsRequest>) -> Result<tonic::Response<Self::ExportSlotsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn freeze_slots(&self, _: tonic::Request<pb::FreezeRequest>) -> Result<tonic::Response<pb::FreezeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn cleanup_slots(&self, _: tonic::Request<pb::CleanupRequest>) -> Result<tonic::Response<pb::CleanupResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn vote(&self, _: tonic::Request<pb::VoteRequest>) -> Result<tonic::Response<pb::VoteResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
 }
@@ -966,6 +1004,9 @@ impl pb::strata_server::Strata for Recording {
         self.up()?;
         self.inner.restore(r).await
     }
+    async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no profiles"))
+    }
     type WriteStreamStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::WriteStreamStream;
     async fn write_stream(&self, r: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         self.up()?;
@@ -980,6 +1021,9 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
     }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;
@@ -1000,6 +1044,23 @@ impl pb::strata_server::Strata for Recording {
     async fn configure(&self, r: tonic::Request<pb::ConfigureRequest>) -> Result<tonic::Response<pb::ConfigureResponse>, tonic::Status> {
         self.up()?;
         self.inner.configure(r).await
+    }
+    type ExportSlotsStream = <strata_server::grpc::Grpc as pb::strata_server::Strata>::ExportSlotsStream;
+    async fn export_slots(&self, r: tonic::Request<pb::ExportSlotsRequest>) -> Result<tonic::Response<Self::ExportSlotsStream>, tonic::Status> {
+        self.up()?;
+        self.inner.export_slots(r).await
+    }
+    async fn freeze_slots(&self, r: tonic::Request<pb::FreezeRequest>) -> Result<tonic::Response<pb::FreezeResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.freeze_slots(r).await
+    }
+    async fn cleanup_slots(&self, r: tonic::Request<pb::CleanupRequest>) -> Result<tonic::Response<pb::CleanupResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.cleanup_slots(r).await
+    }
+    async fn vote(&self, r: tonic::Request<pb::VoteRequest>) -> Result<tonic::Response<pb::VoteResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.vote(r).await
     }
 }
 
@@ -1193,8 +1254,9 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     let follow = Arc::new(Follow::open(rdb.clone(), None).unwrap());
     let r = service_with(rdb.clone(), |s| s.set_replication(Replication::Replica(follow)));
     let (ru, replica) = recording_of(r.clone(), 4).await;
-    // A transaction a batch, for the catch-up below.
-    let opts = PrimaryOptions { replicas: vec![ru.clone()], acks: Acks::All, heartbeat: Duration::from_millis(100), retry_max: Duration::from_millis(200), batch_bytes: 1, ..Default::default() };
+    // A transaction a batch, for the catch-up below; acknowledged by the
+    // primary alone, so that it takes writes while the replica is down.
+    let opts = PrimaryOptions { replicas: vec![ru.clone()], acks: Acks::Primary, heartbeat: Duration::from_millis(100), retry_max: Duration::from_millis(200), batch_bytes: 1, ..Default::default() };
     let p = service_with(pdb.clone(), |s| s.set_replication(Replication::Primary(Primary::start(pdb.clone(), None, opts).unwrap())));
     let pu = grpc(p.clone()).await;
     for _ in 0..200 {
@@ -1217,6 +1279,12 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     // Each pair of reads starts once at each copy.
     for v in 1..=4 {
         let w = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": v})], None).await.unwrap();
+        for _ in 0..200 {
+            if rdb.storage().seq_no().unwrap().seq >= w.seq_nos[0] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         for after in [w.seq_nos.clone(), w.seq_nos.clone(), Vec::new(), Vec::new()] {
             assert_eq!(sold(after).await, v);
         }
@@ -2767,15 +2835,12 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
     let (pu, old) = recording_of(p.clone(), 5).await;
     let coord = cluster(Coordinator::connect_with(vec![format!("{pu}|{ru}")], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap());
     assert_eq!(coord.write_ops(set(1), None).await.unwrap().seq_nos, vec![1]);
+    // The old primary votes for the replica, and steps down: it becomes a
+    // replica of the new one.
     let a = r.promote(&Principal::open(), vec![pu.clone()], Acks::All, false).await.unwrap();
     assert_eq!(a["replicas"][0]["role"], "primary", "{a}");
-    for _ in 0..200 {
-        if p.replaced_by() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(p.replaced_by(), 2);
+    assert_eq!(a["votes"][0]["granted"], true, "{a}");
+    assert_eq!(p.role(), pb::Role::Replica);
     // A conditional write the new primary refuses is refused once.
     let e = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": 9, "if_seq_no": 7})], None).await.err().unwrap();
     assert_eq!(e.status, 409, "{}", e.message);
@@ -2784,7 +2849,7 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
     assert_eq!(sold(&rdb), vec![Value::Int(2), Value::Int(2)]);
     assert_eq!(rdb.storage().numbering().unwrap().term_at(2), 2);
     let h = coord.health().await;
-    assert_eq!((&h["shards"][0]["replicas"][0]["role"], &h["shards"][0]["replicas"][1]["role"]), (&json!("primary"), &json!("primary")), "{h}");
+    assert_eq!((&h["shards"][0]["replicas"][0]["role"], &h["shards"][0]["replicas"][1]["role"]), (&json!("replica"), &json!("primary")), "{h}");
     // And the next write goes there at once; a conditional write the new
     // primary refuses asks it again, and no other copy.
     let (hellos, writes) = (old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed));
@@ -2792,7 +2857,7 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
     let e = coord.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": 9, "if_seq_no": 1})], None).await.err().unwrap();
     assert_eq!(e.status, 409, "{}", e.message);
     assert_eq!((old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed)), (hellos, writes), "the old primary was not asked");
-    assert_eq!(last_of(&pdb), 1, "the old primary took none of them");
+    assert_eq!(last_of(&pdb), 3, "the old primary holds the new one's writes, which ships to it");
 
     // The old primary is down, listed before the replica or after it.
     for old_first in [true, false] {
@@ -2805,10 +2870,21 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
         let coord = cluster(Coordinator::connect_with(vec![copies], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap());
         assert_eq!(coord.write_ops(set(1), None).await.unwrap().seq_nos, vec![1]);
         old.down.store(true, Ordering::Relaxed);
-        r.promote(&Principal::open(), Vec::new(), Acks::All, false).await.unwrap();
+        // One copy of two is no majority, and a replica that knows no other
+        // copy has none to ask: promoted only when forced.
+        let e = r.promote(&Principal::open(), vec![pu.clone()], Acks::All, false).await.unwrap_err();
+        assert!(e.status == 409 && e.message.contains("and it needs 2"), "{}", e.message);
+        let e = r.promote(&Principal::open(), Vec::new(), Acks::All, false).await.unwrap_err();
+        assert!(e.status == 409 && e.message.contains("knows no other copy"), "{}", e.message);
+        r.promote(&Principal::open(), Vec::new(), Acks::All, true).await.unwrap();
         let w = coord.write_ops(set(2), None).await.unwrap();
         assert_eq!(w.seq_nos, vec![2]);
         assert_eq!(sold(&rdb), vec![Value::Int(2), Value::Int(2)]);
+        // The coordinator flags the two copies that last said they were
+        // primaries: the old one has not heard of the new one.
+        let h = coord.health().await;
+        assert_eq!(h["shards"][0]["primaries"].as_array().map(Vec::len), Some(2), "{h}");
+        assert!(h["shards"][0]["warning"].as_str().unwrap().contains("2 copies say they are the shard's primary"), "{h}");
         // The next goes to the new primary, of the newer term, at once:
         // both say they are primaries, and the old one is not asked.
         let (hellos, writes) = (old.hellos.load(Ordering::Relaxed), old.writes.load(Ordering::Relaxed));

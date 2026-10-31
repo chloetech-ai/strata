@@ -155,7 +155,12 @@ impl Store {
         if opts.mem_flat {
             dbo.mem_build = Some(dbo.build.clone().set("vector.index", "flat"));
         }
-        let db = if path.exists() {
+        let db = if path.exists() || strata::upgrade::old_path(path).exists() {
+            // A store written before Strata had field ids is copied into
+            // this version's format once, the old one kept beside it.
+            if let Some(u) = strata::upgrade::upgrade(path)? {
+                eprintln!("engram: copied {} records of {} into the current store format (the old file is {})", u.rows, path.display(), u.old.display());
+            }
             let db = Db::open(path, dbo.clone())?;
             if db.schema().field("links").is_some() {
                 db

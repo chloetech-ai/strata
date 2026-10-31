@@ -20,6 +20,11 @@ use strata::Error;
 
 const DOCS: u64 = 300;
 
+/// The section of column `n`, named by the field's id.
+fn col_n() -> String {
+    format!("col.{}", schema().key_of("n").unwrap())
+}
+
 fn options(layout: Layout) -> DbOptions {
     DbOptions { sync: false, layout, ..DbOptions::default() }
 }
@@ -82,7 +87,7 @@ fn damaged(dir: &Path, layout: Layout) -> PathBuf {
     }
     let truth = ids(&Db::open(&path, options(layout)).unwrap(), TENS).unwrap();
     let (file, at) = first_segment(&path);
-    let (off, len) = section_at(&file, at, "col.n");
+    let (off, len) = section_at(&file, at, &col_n());
     for i in (len / 2..len).chain(0..len / 2) {
         flip(&file, at + off + i);
         let db = Db::open(&path, DbOptions { check_sections: false, ..options(layout) }).unwrap();
@@ -102,7 +107,7 @@ fn a_damaged_section_fails_the_queries_that_read_it() {
         let db = Db::open(&path, options(layout)).unwrap();
         for _ in 0..2 {
             match ids(&db, TENS) {
-                Err(Error::Corrupt(m)) => assert!(m.contains("section col.n fails its checksum"), "{m}"),
+                Err(Error::Corrupt(m)) => assert!(m.contains(&format!("section {} fails its checksum", col_n())), "{m}"),
                 other => panic!("{layout:?}: {other:?}"),
             }
         }
@@ -118,10 +123,10 @@ fn attaching_a_damaged_image_fails() {
     let db = Db::create(&dir.path().join("db.strata"), schema(), options(Layout::SingleFile)).unwrap();
     let image = dir.path().join("seg.img");
     Db::write_segment(&schema(), (0..DOCS).map(|i| doc(i, i as i64)).collect(), &Default::default(), &image).unwrap();
-    let (off, len) = section_at(&image, 0, "col.n");
+    let (off, len) = section_at(&image, 0, &col_n());
     flip(&image, off + len - 1);
     match db.attach_segments(&[image.clone()]) {
-        Err(Error::Schema(m)) => assert!(m.contains("section col.n fails its checksum") && m.contains("seg.img"), "{m}"),
+        Err(Error::Schema(m)) => assert!(m.contains(&format!("section {} fails its checksum", col_n())) && m.contains("seg.img"), "{m}"),
         other => panic!("{other:?}"),
     }
     flip(&image, off + len - 1);
