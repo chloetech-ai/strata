@@ -152,11 +152,11 @@ fn leaf(rng: &mut StdRng) -> Cond {
 fn need(rng: &mut StdRng, y: usize) -> (String, usize) {
     match rng.gen_range(0..3) {
         0 => {
-            let p = [0, 25, 50, 75, 100][rng.gen_range(0..5)];
+            let p = [1, 25, 50, 75, 100][rng.gen_range(0..5)];
             (format!("'{p}%'"), (y * p / 100).clamp(1, y))
         }
         _ => {
-            let n = rng.gen_range(0..=y + 1);
+            let n = rng.gen_range(1..=y + 1);
             (n.to_string(), n.clamp(1, y))
         }
     }
@@ -348,7 +348,7 @@ fn at_least_reads_counts_and_shares_and_refuses_the_rest() {
     let (db, rows) = table(&dir.path().join("t.strata"), &mut rng, 200);
     let three = "a > 0, c = 'x', tags = 'y'";
     let count = |r: &Row| [r.a.is_some_and(|a| a > 0), r.c == Some("x"), r.tags.contains(&"y")].iter().filter(|b| **b).count();
-    for (n, want) in [("0", 1), ("1", 1), ("2", 2), ("3", 3), ("9", 3), ("'50%'", 1), ("'67%'", 2), ("'100%'", 3), ("' 34% '", 1), (":n", 2)] {
+    for (n, want) in [("1", 1), ("2", 2), ("3", 3), ("9", 3), ("'50%'", 1), ("'67%'", 2), ("'100%'", 3), ("' 34% '", 1), (":n", 2)] {
         let expect: Vec<String> = rows.iter().filter(|r| count(r) >= want).map(|r| r.id.clone()).collect();
         let q = format!("SELECT id FROM t WHERE AT_LEAST({n}, {three})");
         let got = match db.sql(&q, &Params::new().set("n", Value::Int(2))).unwrap() {
@@ -367,6 +367,8 @@ fn at_least_reads_counts_and_shares_and_refuses_the_rest() {
     for (q, msg) in [
         ("SELECT id FROM t WHERE AT_LEAST(2)", "AT_LEAST(n, condition, ...)"),
         ("SELECT id FROM t WHERE AT_LEAST(-1, a > 0, c = 'x')", "a count (2) or a percentage ('75%')"),
+        ("SELECT id FROM t WHERE AT_LEAST(0, a > 0, c = 'x')", "above 0"),
+        ("SELECT id FROM t WHERE AT_LEAST('0%', a > 0, c = 'x')", "above 0"),
         ("SELECT id FROM t WHERE AT_LEAST(1.5, a > 0, c = 'x')", "a count (2) or a percentage ('75%')"),
         ("SELECT id FROM t WHERE AT_LEAST('120%', a > 0, c = 'x')", "a count (2) or a percentage ('75%')"),
         ("SELECT id FROM t WHERE AT_LEAST(2, a > 0, c = 'x', limit => 10)", "unknown option limit for AT_LEAST: min_rows, max_rows"),

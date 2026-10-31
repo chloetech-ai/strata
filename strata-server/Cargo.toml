@@ -29,10 +29,16 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 libc = "0.2"
 # The slot hash (`slots`): xxh3, 64 bits.
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"] }
+# The stacks of sampled allocations (`heap`).
+backtrace = "0.3"
 # SQLite files sent to `/v1/import` and written for `/v1/export`.
 tempfile = "3"
 # API keys are kept as the SHA-256 of their secrets (`keys`).
 sha2 = "0.10"
+
+# CPU profiles (`profiler`): every thread's stack, sampled on SIGPROF.
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", default-features = false }
 
 [features]
 # BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.

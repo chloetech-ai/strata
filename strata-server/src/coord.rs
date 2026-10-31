@@ -78,6 +78,7 @@ use strata::query::agg::Part;
 use strata::query::exec::ResultSet;
 use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
+use strata::query::steps::{self, Step};
 use strata::query::{bind_command, Command, Conflict, Params, Projection, Select, Write};
 use strata::schema::Schema;
 use strata::storage::RankProfile;
@@ -584,6 +585,26 @@ impl HedgeBudget {
         }
         false
     }
+}
+
+/// When each call to a shard's replica was sent and its answer came, by
+/// shard and replica ([`Coordinator::shard_answer`]).
+type Sent = Mutex<HashMap<(usize, usize), (Instant, Instant)>>;
+
+/// `call` to replica `r` of shard `i`, its times kept in `sent` when it
+/// answers.
+async fn timed<T>(sent: &Sent, i: usize, r: usize, call: impl Future<Output = Result<T, tonic::Status>>) -> Result<T, tonic::Status> {
+    let t0 = Instant::now();
+    let a = call.await;
+    if a.is_ok() {
+        sent.lock().unwrap_or_else(|e| e.into_inner()).insert((i, r), (t0, Instant::now()));
+    }
+    a
+}
+
+/// A step of the coordinator's own that began at `t0` and ends now.
+fn leaf_step(op: &str, detail: String, t0: Instant, rows: Option<u64>) -> Step {
+    Step { op: op.into(), detail, start_us: steps::us_at(t0), us: steps::tenth(t0.elapsed().as_nanos() as f64 / 1e3), rows, ..Step::default() }
 }
 
 fn ms_left(deadline: Instant) -> u32 {
@@ -1253,9 +1274,14 @@ impl Coordinator {
         // Per shard: the replica holding a lease for this query, and the lease.
         let mut leased: Vec<Option<(usize, u64)>> = vec![None; n];
         let mut failed = self.skipped(t, partial);
+        // What the coordinator does is in the query's steps
+        // ([`strata::query::steps`]), each shard's call with the shard's own
+        // steps inside it.
+        let mut own: Vec<Step> = Vec::new();
         let stats = match &req.stats {
             Some(s) => Some(s.clone()),
             None if ranked_text && n > 1 => {
+                let t0 = Instant::now();
                 let mut sum = TermStats::default();
                 let which = (0..n).filter(|&i| failed[i].is_none()).collect();
                 for (i, a) in self.shard_stats(t, read, protocol, which, start, deadline).await {
@@ -1267,6 +1293,7 @@ impl Coordinator {
                         Err(e) => self.leave_out(t, partial, i, e, &mut failed)?,
                     }
                 }
+                own.push(leaf_step("term statistics", format!("BM25 statistics summed over {n} shards"), t0, None));
                 Some(sum)
             }
             None => None,
@@ -1274,6 +1301,7 @@ impl Coordinator {
         let stats_json = stats.map(|s| serde_json::to_vec(&s).unwrap_or_default()).unwrap_or_default();
         let leased = &leased;
         let hold = ids.is_some();
+        let sent = &Sent::default();
         let calls = (0..n).filter(|&i| failed[i].is_none()).map(|i| {
             let stats_json = stats_json.clone();
             let first = leased[i].map(|(r, _)| r);
@@ -1289,7 +1317,7 @@ impl Coordinator {
                         // From protocol 3, the lease is held for the fetch
                         // round, or ended once answered.
                         let (hold, release) = (hold && p >= 3, !hold && snapshot != 0 && p >= 3);
-                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, hold, release, ..read.request(p, i) }).await
+                        timed(sent, i, r, c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, hold, release, ..read.request(p, i) })).await
                     }
                 });
                 (i, rs.await)
@@ -1302,24 +1330,32 @@ impl Coordinator {
             match a {
                 Ok((r, a)) => {
                     held.push((i, r, a.snapshot));
-                    shards.push(result_from_pb(a)?);
+                    shards.push(self.shard_answer(t, i, r, a, sent, "query")?);
                 }
                 Err(e) => self.leave_out(t, partial, i, e, &mut failed)?,
             }
         }
+
         if shards.is_empty() {
             let e = failed.into_iter().flatten().next();
             return Err(e.unwrap_or_else(|| ApiError::internal("no shard answered")));
         }
+        let mut merge_step = None;
+        let mut merge = |q: &Select, shards: Vec<ResultSet>| {
+            let t0 = Instant::now();
+            let rs = strata::cluster::merge(q, shards)?;
+            merge_step = Some(leaf_step("merge", format!("{} shard answers", held.len()), t0, Some(rs.rows.len() as u64)));
+            Ok::<_, ApiError>(rs)
+        };
         let rs = match &ids {
-            None => strata::cluster::merge(select, shards)?,
+            None => merge(select, shards)?,
             Some(ids) => {
                 // Each key's shard, for the fetch round.
                 let mut owner = HashMap::new();
                 for (&(i, _, _), a) in held.iter().zip(&shards) {
                     owner.extend(a.keys.iter().map(|k| (Part::of(k), i)));
                 }
-                let ranked = strata::cluster::merge(ids, shards)?;
+                let ranked = merge(ids, shards)?;
                 let mut keys = vec![Vec::new(); n];
                 for k in &ranked.keys {
                     let i = owner.get(&Part::of(k)).ok_or_else(|| ApiError::internal("a merged key no shard answered"))?;
@@ -1345,7 +1381,34 @@ impl Coordinator {
             }
         };
         let missing = failed.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| t.shards[i].clone()).collect();
+        let mut rs = rs;
+        // The term statistics came first; the merge (and a fetch round's
+        // calls, inside it) last.
+        rs.stats.steps.extend(merge_step);
+        rs.stats.steps.splice(0..0, own);
         Ok(Merged { rs, missing })
+    }
+
+    /// Shard `i`'s answer `a` from replica `r`, its steps moved onto this
+    /// server's clock, inside a `shard` step for the call (from sent to
+    /// received, as `sent` holds it) and an `on the shard` step for the
+    /// shard's own time (`took_ms`), centred in the call: what the network
+    /// took is the difference, half each way.
+    fn shard_answer(&self, t: &Topology, i: usize, r: usize, a: pb::QueryResponse, sent: &Sent, what: &str) -> Result<ResultSet, ApiError> {
+        let took_us = a.took_ms * 1e3;
+        let mut rs = result_from_pb(a)?;
+        let Some((t0, t1)) = sent.lock().unwrap_or_else(|e| e.into_inner()).get(&(i, r)).copied() else { return Ok(rs) };
+        let call_us = t1.saturating_duration_since(t0).as_nanos() as f64 / 1e3;
+        let start = steps::us_at(t0);
+        let on_shard = start + ((call_us - took_us) / 2.0).max(0.0);
+        steps::shift(&mut rs.stats.steps, on_shard);
+        let rows = Some(rs.rows.len() as u64);
+        let own = Step { op: "on the shard".into(), detail: format!("network {:.2} ms", ((call_us - took_us) / 1e3).max(0.0)), start_us: steps::tenth(on_shard), us: steps::tenth(took_us.min(call_us)), rows, ..Step::default() };
+        steps::wrap(&mut rs.stats.steps, 0, own);
+        let replica = &t.replicas[i][r].url;
+        let call = Step { op: "shard".into(), detail: format!("shard {i} {what}, {replica}"), start_us: start, us: steps::tenth(call_us), rows, shard: Some(i as u32), ..Step::default() };
+        steps::wrap(&mut rs.stats.steps, 0, call);
+        Ok(rs)
     }
 
     /// Whether query then fetch pays for its second round: when one round
@@ -1402,6 +1465,7 @@ impl Coordinator {
                 tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(5), c.release(pb::ReleaseRequest { snapshots: vec![lease] })).await });
             }
         }
+        let sent = &Sent::default();
         let calls = reads.iter().map(|(i, held_r, lease, read)| {
             let (i, held_r, lease) = (*i, *held_r, *lease);
             async move {
@@ -1412,7 +1476,7 @@ impl Coordinator {
                         let p = self.speak(t, i, r, &mut c, protocol).await?;
                         self.reads_after(t, i, r, read.min(i))?;
                         let stats_json = stats_json.to_vec();
-                        c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, release: snapshot != 0, ..read.request(p, i) }).await
+                        timed(sent, i, r, c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, release: snapshot != 0, ..read.request(p, i) })).await
                     }
                 });
                 (i, a.await)
@@ -1421,7 +1485,7 @@ impl Coordinator {
         let mut fetched = Vec::new();
         for (i, a) in join_all(calls).await {
             match a {
-                Ok((_, a)) => fetched.push(result_from_pb(a)?),
+                Ok((r, a)) => fetched.push(self.shard_answer(t, i, r, a, sent, "fetch")?),
                 Err(e) => self.leave_out(t, partial, i, e, failed)?,
             }
         }

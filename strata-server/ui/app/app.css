@@ -350,7 +350,7 @@ pre.code, .code { font-family: var(--mono); font-size: 12.5px; background: var(-
 .wf .nm { display: flex; gap: 6px; align-items: center; padding-right: 10px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .wf .lane { position: relative; height: 20px; background: repeating-linear-gradient(90deg, transparent 0 calc(10% - 1px), var(--grid) calc(10% - 1px) 10%); border-radius: 3px; }
 .wf .seg { position: absolute; top: 3px; height: 14px; border-radius: 4px; min-width: 2px; background: var(--s1); }
-.wf .seg.k-admission { background: var(--s4); } .wf .seg.k-execute { background: var(--s1); } .wf .seg.k-wait { background: var(--s7); } .wf .seg.k-rpc { background: var(--s3); } .wf .seg.bad { background: var(--crit); } .wf .seg.again { background-image: repeating-linear-gradient(45deg, transparent 0 4px, rgba(255,255,255,.35) 4px 7px); }
+.wf .seg.k-admission { background: var(--s4); } .wf .seg.k-execute { background: var(--s1); } .wf .seg.k-wait { background: var(--s7); } .wf .seg.k-plan { background: var(--s5); } .wf .seg.k-rpc { background: var(--s3); } .wf .seg.bad { background: var(--crit); } .wf .seg.again { background-image: repeating-linear-gradient(45deg, transparent 0 4px, rgba(255,255,255,.35) 4px 7px); }
 .wf .seg span { position: absolute; left: calc(100% + 6px); top: -1px; white-space: nowrap; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .wf .scale { grid-column: 2; display: flex; justify-content: space-between; color: var(--muted); font-size: 10.5px; padding-top: 2px; }
 
@@ -962,3 +962,18 @@ button.rx-node:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--
 .gx-rrow:first-child { border-top: 0; }
 .gx-rrow:hover { background: var(--surface-2); }
 @media (max-width: 1000px) { .gx-main { grid-template-columns: 1fr; } .gx { height: auto; } .gx-canvas { height: 70vh; } }
+
+/* ---------------------------------------------------------------- profiles */
+.prof .kpi .delta { max-width: 100%; }
+.flame { overflow: hidden; border-radius: var(--r-sm); }
+.flame .fl-bar:hover rect, .flame .fl-bar:focus-visible rect { opacity: 1 !important; stroke: var(--text); }
+.flame .fl-bar:focus { outline: none; }
+.prof-tree td { white-space: nowrap; }
+.prof-tree td:first-child { white-space: normal; }
+.prof-tree .prof-tg { width: 22px; height: 22px; padding: 0; }
+.prof-tree tr.prof-sum td { background: var(--surface-2); }
+.prof-runs { display: flex; align-items: flex-end; gap: 2px; height: 34px; }
+.prof-runs i { flex: 1 1 0; min-width: 3px; max-width: 22px; background: var(--s1); border-radius: 2px 2px 0 0; opacity: .75; }
+.prof-runs i.sel { opacity: 1; background: var(--s7); }
+.prof-set { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.prof-set .input { width: 110px; }

@@ -20,6 +20,7 @@ use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, Phase, Pred
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
+use crate::query::steps::{self, Clock, Mark, Step};
 use crate::query::logical::Seeds;
 use crate::schema::{FieldType, Schema};
 use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
@@ -234,6 +235,10 @@ pub struct ExecOptions {
     /// ([`crate::query::memory`];
     /// `None`: not counted).
     pub memory: Option<Arc<MemoryBudget>>,
+    /// Measure the CPU time of each step ([`ExecStats::steps`],
+    /// [`steps::thread_cpu_us`]), which costs a system call per step; the
+    /// steps' wall times are measured either way.
+    pub profile: bool,
 }
 
 impl Default for ExecOptions {
@@ -259,6 +264,7 @@ impl Default for ExecOptions {
             max_rows: None,
             max_groups: None,
             memory: None,
+            profile: false,
         }
     }
 }
@@ -320,6 +326,38 @@ pub struct ExecStats {
     /// phase scored one.
     #[serde(default)]
     pub reranked: u64,
+    /// The timed steps of execution, a tree in pre-order: what ran, on
+    /// which segment and thread, when, for how long, and with
+    /// [`ExecOptions::profile`] on how much CPU time ([`steps`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+    /// Steps not kept, past [`steps::MAX_STEPS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub steps_dropped: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+impl ExecStats {
+    /// Appends `inner`'s steps `depth` levels down (a leaf's under the
+    /// operator that ran it, a shard's under its call), counting what the
+    /// cap drops.
+    pub fn nest(&mut self, inner: &ExecStats, depth: u16) {
+        let dropped = steps::nest(&mut self.steps, &inner.steps, depth);
+        self.steps_dropped += inner.steps_dropped + dropped as u64;
+    }
+
+    /// Puts a step that began at `m` before the steps recorded since,
+    /// which move under it ([`steps::wrap`]).
+    pub fn wrap(&mut self, clock: &Clock, m: Mark, op: &str, detail: String, rows: Option<u64>) -> Option<usize> {
+        let at = clock.wrap(&mut self.steps, m, op, detail, rows);
+        if at.is_none() {
+            self.steps_dropped += 1;
+        }
+        at
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -356,6 +394,24 @@ pub struct RankParts {
     /// for a global phase each of its leaves' values (`None` for NULL).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<Vec<Vec<Option<f64>>>>,
+}
+
+/// What a `MAX k PER` the executor keeps counts rows by
+/// ([`Executor::per_group`]): their value of a keyword or INT `field`, at
+/// most `per` rows of each.
+#[derive(Clone, Copy, Debug)]
+struct PerGroup {
+    field: usize,
+    per: usize,
+    int: bool,
+}
+
+/// A row's value that a `MAX k PER` counts it by, over segments (None
+/// for rows without one).
+#[derive(Hash, PartialEq, Eq)]
+enum GroupKey<'k> {
+    Str(&'k str),
+    Int(i64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -464,6 +520,8 @@ impl DocFilter for ProbeFilter {
 #[derive(Default)]
 struct Local {
     plan: Vec<String>,
+    /// Steps, as [`ExecStats::steps`] (the segment's own first).
+    steps: Vec<Step>,
     filter_docs: u64,
     scored: u64,
     /// Filters materialised, by segment ordinal.
@@ -492,6 +550,8 @@ pub struct Executor<'a> {
     expanded: Mutex<Expanded>,
     /// What the query holds of [`ExecOptions::memory`].
     charge: Charge,
+    /// What times the query's steps.
+    clock: Clock,
 }
 
 /// Searches with their synonyms and typos resolved to indexed terms.
@@ -614,6 +674,47 @@ impl<'a> Executor<'a> {
             parts: None,
             expanded: Mutex::new(Expanded::default()),
             charge: Charge::new(opts.memory.clone()),
+            clock: Clock::new(opts.profile),
+        }
+    }
+
+    /// A step begins ([`steps`]).
+    fn mark(&self) -> Mark {
+        self.clock.mark(&self.stats.steps)
+    }
+
+    /// The step begun at `m` ends, with the steps recorded since inside it.
+    fn step(&mut self, m: Mark, op: &str, detail: String, rows: Option<u64>) {
+        self.stats.wrap(&self.clock, m, op, detail, rows);
+    }
+
+    /// A segment's step, begun at `m`, for work that goes through the
+    /// segments one after another on the query's thread.
+    fn seg_step(&mut self, m: Mark, s: &Seg<'a>, rows: Option<u64>) {
+        if let Some(at) = self.stats.wrap(&self.clock, m, "segment", format!("seg {}: {} rows", s.ord, s.view.n_live), rows) {
+            self.stats.steps[at].seg = Some(s.ord as u32);
+        }
+    }
+
+    /// A field's name, for steps.
+    fn field_name(&self, field: usize) -> &str {
+        self.schema.fields.get(field).map_or("?", |f| f.name.as_str())
+    }
+
+    /// What a leaf score's step is called, and what it searches.
+    fn leaf_label(&self, score: &Score) -> (&'static str, String) {
+        let short = |t: &str| crate::query::steps::short(t, 80);
+        match score {
+            Score::Bm25 { field, text, .. } => ("bm25", format!("{}: {}", self.field_name(*field), short(text))),
+            Score::Similarity { field, vector, .. } => ("vector", format!("{}: {} dimensions", self.field_name(*field), vector.len())),
+            Score::Sparse { field, terms, .. } => ("sparse", format!("{}: {} terms", self.field_name(*field), terms.len())),
+            Score::MaxSim { field, .. } => ("maxsim", self.field_name(*field).to_string()),
+            Score::Column { field } => ("column", self.field_name(*field).to_string()),
+            Score::Decay { field, .. } => ("decay", self.field_name(*field).to_string()),
+            Score::Ppr { graph } => ("graph", format!("ppr of graph {graph}")),
+            Score::Hops { graph, .. } => ("graph", format!("hops of graph {graph}")),
+            Score::Ranked { keys } => ("ranked", format!("{} keys", keys.len())),
+            _ => ("score", String::new()),
         }
     }
 
@@ -787,7 +888,11 @@ impl<'a> Executor<'a> {
     }
 
     pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
+        let m = self.mark();
         let settled = self.settle_guard(q)?;
+        if q.guard.is_some() {
+            self.step(m, "guard", String::new(), None);
+        }
         let q = settled.as_ref().unwrap_or(q);
         if let Some(m) = q.unopened_model(self.opts.shard) {
             return Err(err(format!("ranking model {m} is not open: Db::query and Db::run open the models of a query's plan (Db::open_ranking_models)")));
@@ -802,7 +907,11 @@ impl<'a> Executor<'a> {
         if self.opts.shard && has_graphs(q) {
             return Err(err("graph queries cannot be split across shards: edges cross them"));
         }
+        let m = self.mark();
         self.run_graphs(&q.graphs)?;
+        if !q.graphs.is_empty() {
+            self.step(m, "graphs", format!("{} graph{}", q.graphs.len(), if q.graphs.len() == 1 { "" } else { "s" }), None);
+        }
         let empty = |columns, rows, stats| ResultSet { columns, rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
         let grouped = !q.group_by.is_empty() || q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
         if grouped && q.projection.iter().any(|(_, p)| matches!(p, Projection::Feature(_))) {
@@ -810,7 +919,11 @@ impl<'a> Executor<'a> {
         }
         if !q.group_by.is_empty() || agg::is_general(q, |f| self.facet_field(f)) {
             let needed = agg::needed(q);
-            let groups = if agg::is_general(q, |f| self.facet_field(f)) { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
+            let m = self.mark();
+            let general = agg::is_general(q, |f| self.facet_field(f));
+            let groups = if general { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
+            let by = q.group_by.iter().map(|&f| self.field_name(f).to_string()).collect::<Vec<_>>().join(", ");
+            self.step(m, if general { "aggregate" } else { "facet" }, if by.is_empty() { "every row".into() } else { format!("by {by}") }, Some(groups.map.len() as u64));
             // Shards return every group with partial aggregates, for the
             // coordinator to combine.
             let rows = if self.opts.shard {
@@ -827,15 +940,22 @@ impl<'a> Executor<'a> {
             if q.projection.iter().any(|(_, p)| *p != Projection::Count) {
                 return Err(err("COUNT(*) with other columns needs GROUP BY"));
             }
+            let m = self.mark();
             let n = self.count(&q.filter)? as i64;
+            self.step(m, "count", String::new(), Some(n as u64));
             let one = self.opts.shard || (q.offset == 0 && q.limit != Some(0));
             let rows = if one { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
             return Ok(empty(columns, rows, self.stats));
         }
+        let m = self.mark();
         let hits = self.ordered_hits(q, self.opts.max_rows)?;
+        let (op, detail) = self.order_label(q);
+        self.step(m, op, detail, Some(hits.len() as u64));
         let skip = if self.opts.shard { 0 } else { q.offset };
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
+        let m = self.mark();
         let mut rows = self.project(q, &hits)?;
+        self.step(m, "project", format!("{} column{}", columns.len(), if columns.len() == 1 { "" } else { "s" }), Some(rows.len() as u64));
         // Shards answer with the stored integers, which the merge types.
         if !self.opts.shard {
             q.typed(&mut rows);
@@ -855,9 +975,28 @@ impl<'a> Executor<'a> {
         // A shard leaves its rows in the first phase's order, with what
         // each phase reranks them by.
         if self.opts.shard && !q.phases.is_empty() {
+            let m = self.mark();
             parts.get_or_insert_with(RankParts::default).phases = self.phase_parts(&q.phases, &hits)?;
+            self.step(m, "phase values", format!("{} phase{}", q.phases.len(), if q.phases.len() == 1 { "" } else { "s" }), Some(hits.len() as u64));
         }
         Ok(ResultSet { columns, rows, keys, scores, parts, stats: self.stats })
+    }
+
+    /// What the step that finds a query's rows is called, and its order.
+    fn order_label(&self, q: &Select) -> (&'static str, String) {
+        let cut = match q.limit {
+            Some(l) => format!(", top {}", l.saturating_add(q.offset)),
+            None => String::new(),
+        };
+        match &q.order {
+            None => ("scan", format!("rows WHERE keeps{cut}")),
+            Some(OrderBy::Score { score: Score::Column { field }, desc, .. }) => ("order", format!("by {} {}{cut}", self.field_name(*field), if *desc { "DESC" } else { "ASC" })),
+            Some(OrderBy::Score { score, .. }) => match Rank::of(score, 0) {
+                Some(rank) => ("rank", format!("by {}{cut}", rank.explain(&self.schema))),
+                None => ("rank", format!("by {}{cut}", self.leaf_label(score).0)),
+            },
+            Some(_) => ("order", cut),
+        }
     }
 
     /// The rows of a query without facets or counts, in order, before
@@ -919,11 +1058,13 @@ impl<'a> Executor<'a> {
         for p in &q.phases {
             self.check_deadline()?;
             hits.truncate(p.count);
+            let m = self.mark();
             let rank = Rank::of_phase(&p.score);
             let values = self.row_values(&rank, &hits)?;
             hits = rank.rerank(hits.len(), &values).into_iter().map(|(i, score)| Hit { score, ..hits[i] }).collect();
             self.stats.reranked += hits.len() as u64;
             self.stats.plan.push(format!("rerank {} rows by {}", hits.len(), rank.explain(&self.schema)));
+            self.step(m, "rerank", format!("by {}", rank.explain(&self.schema)), Some(hits.len() as u64));
         }
         if let Some(l) = q.limit {
             hits.truncate(l.saturating_add(q.offset));
@@ -977,6 +1118,12 @@ impl<'a> Executor<'a> {
     }
 
     fn ordered_hits_to(&mut self, q: &Select, want: Option<usize>) -> Result<Vec<Hit>> {
+        // A shard answers its rows uncapped, for the coordinator to cap.
+        if let (Some(per), Some(want), Some(_), 0, false) = (q.per, want, q.limit, q.offset, self.opts.shard) {
+            if let Some(g) = self.per_group(per) {
+                return self.capped(q, g, want);
+            }
+        }
         Ok(match &q.order {
             None => self.unordered(&q.filter, want)?,
             Some(OrderBy::Score { score: Score::Column { field }, desc, nulls_first }) => {
@@ -992,6 +1139,74 @@ impl<'a> Executor<'a> {
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
             Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
         })
+    }
+
+    /// The cap of a `MAX k PER` ([`Select::per`]) that the executor keeps
+    /// itself: by a keyword field's column or an INT field's.
+    fn per_group(&self, per: crate::query::logical::Per) -> Option<PerGroup> {
+        let f = self.schema.fields.get(per.field)?;
+        let int = matches!(f.ty, FieldType::Int) && f.indexed && !f.multi;
+        (per.k > 0 && (int || self.keyword_column(per.field))).then_some(PerGroup { field: per.field, per: per.k, int })
+    }
+
+    /// The first `want` rows of `q` in its order (rows tied on score by
+    /// key) that are among the first `g.per` of their group: what the
+    /// `MAX k PER` above the scan keeps of all its rows. BM25 keeps the cap
+    /// as it scores each segment ([`TextFieldReader::top_k_capped`]); other
+    /// orders read a growing number of rows (four times those wanted, at
+    /// least 32, then four times as many) until enough are left or none.
+    fn capped(&mut self, q: &Select, g: PerGroup, want: usize) -> Result<Vec<Hit>> {
+        let name = &self.schema.fields[g.field].name;
+        if let (Some(OrderBy::Score { score: Score::Bm25 { field, text, opts }, desc: true, .. }), None | Some(Tiebreak::Key { .. })) = (&q.order, &q.tiebreak) {
+            let plan = format!("max {} per {name}: kept as bm25 scores each segment", g.per);
+            let key_desc = matches!(q.tiebreak, Some(Tiebreak::Key { desc: true }));
+            let mut hits = self.bm25_rows(*field, text, opts, &q.filter, want, true, Some(g))?;
+            self.order_ties_by_key(&mut hits, key_desc);
+            self.stats.plan.push(plan);
+            return self.first_per(hits, g, want);
+        }
+        let plan = format!("max {} per {name}: read until enough rows are left", g.per);
+        let unique = Select { per: None, ..q.clone() };
+        let live = self.n_live();
+        let mut k = want.saturating_mul(4).max(32);
+        loop {
+            let k_now = k.min(live);
+            let hits = self.ordered_hits_to(&Select { limit: Some(k_now), ..unique.clone() }, Some(k_now))?;
+            let ran_out = hits.len() < k_now || k_now >= live;
+            let kept = self.first_per(hits, g, want)?;
+            if kept.len() >= want || ran_out {
+                self.stats.plan.push(format!("{plan} ({k_now} read)"));
+                return Ok(kept);
+            }
+            k = k.saturating_mul(4);
+        }
+    }
+
+    /// The first `want` of `hits`, in their order, that are among the first
+    /// `g.per` of their group (rows without a value one group, as
+    /// `MAX k PER` counts them).
+    fn first_per(&self, hits: Vec<Hit>, g: PerGroup, want: usize) -> Result<Vec<Hit>> {
+        let at: HashMap<usize, &Seg<'a>> = self.segs.iter().map(|s| (s.ord, s)).collect();
+        let mut seen: HashMap<Option<GroupKey<'_>>, usize> = HashMap::new();
+        let mut out = Vec::with_capacity(want.min(hits.len()));
+        for h in hits {
+            if out.len() >= want {
+                break;
+            }
+            let s = at.get(&h.seg).ok_or_else(|| err("a row of an unknown segment"))?;
+            let key = if g.int {
+                let col = self.numeric(s, g.field)?.col();
+                self.int_value(s, g.field, col, h.doc).map(GroupKey::Int)
+            } else {
+                self.keyword(s, g.field)?.value_of_doc(h.doc).map(GroupKey::Str)
+            };
+            let n = seen.entry(key).or_default();
+            if *n < g.per {
+                *n += 1;
+                out.push(h);
+            }
+        }
+        Ok(out)
     }
 
     // ---- readers ---------------------------------------------------------
@@ -1094,12 +1309,16 @@ impl<'a> Executor<'a> {
         if let Some(set) = self.sets.get(&s.ord).or_else(|| l.sets.iter().find(|(o, _)| *o == s.ord).map(|(_, x)| x)) {
             return Ok(set.clone());
         }
+        let t0 = Instant::now();
         let mut set = self.materialize(s, p)?;
         if let Some(live) = &s.view.live {
             set = DocSet::from_sorted(set.iter().filter(|&d| live.contains(d)).collect(), s.r.n_docs);
         }
         l.filter_docs += set.len() as u64;
         l.plan.push(format!("seg {}: filter materialised, {} docs", s.ord, set.len()));
+        let step = Step { op: "filter".into(), detail: "materialised".into(), start_us: steps::us_at(t0), us: steps::tenth(t0.elapsed().as_nanos() as f64 / 1e3), rows: Some(set.len() as u64), seg: Some(s.ord as u32), ..Step::default() };
+        let at = l.steps.len();
+        steps::wrap(&mut l.steps, at, step);
         let set = Arc::new(set);
         l.sets.push((s.ord, set.clone()));
         Ok(set)
@@ -1108,6 +1327,8 @@ impl<'a> Executor<'a> {
     /// Takes in what per-segment work recorded.
     fn absorb(&mut self, l: Local) {
         self.stats.plan.extend(l.plan);
+        let dropped = steps::nest(&mut self.stats.steps, &l.steps, 0);
+        self.stats.steps_dropped += dropped as u64;
         self.stats.filter_docs += l.filter_docs;
         self.stats.scored += l.scored;
         for (ord, set) in l.sets {
@@ -1126,11 +1347,20 @@ impl<'a> Executor<'a> {
         let segs = self.segs.clone();
         let threads = self.opts.threads.clamp(1, segs.len().max(1));
         let mut outs: Vec<Option<(Result<T>, Local)>> = (0..segs.len()).map(|_| None).collect();
+        // Each segment's work is a step, on the thread (`lane`) that ran it.
+        let run = |this: &Self, s: &Seg<'a>, lane: u32| {
+            let mut l = Local::default();
+            let m = this.clock.mark(&l.steps);
+            let r = this.check_deadline().and_then(|_| f(this, s, &mut l));
+            if let Some(at) = this.clock.wrap(&mut l.steps, m, "segment", format!("seg {}: {} rows", s.ord, s.view.n_live), None) {
+                l.steps[at].seg = Some(s.ord as u32);
+                l.steps[at].thread = lane;
+            }
+            (r, l)
+        };
         if threads == 1 {
             for (i, s) in segs.iter().enumerate() {
-                let mut l = Local::default();
-                let r = self.check_deadline().and_then(|_| f(self, s, &mut l));
-                outs[i] = Some((r, l));
+                outs[i] = Some(run(self, s, 0));
             }
         } else {
             let mut order: Vec<usize> = (0..segs.len()).collect();
@@ -1138,14 +1368,18 @@ impl<'a> Executor<'a> {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let slots: Vec<std::sync::Mutex<Option<(Result<T>, Local)>>> = (0..segs.len()).map(|_| std::sync::Mutex::new(None)).collect();
             let this = &*self;
+            let caller = std::thread::current().id();
+            let lanes = std::sync::atomic::AtomicU32::new(0);
             // This thread and up to `threads - 1` of the shared pool's,
             // each taking the next segment until none are left.
-            super::pool::Pool::global().run(threads - 1, &|| loop {
-                let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(&i) = order.get(j) else { break };
-                let mut l = Local::default();
-                let r = this.check_deadline().and_then(|_| f(this, &segs[i], &mut l));
-                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((r, l));
+            super::pool::Pool::global().run(threads - 1, &|| {
+                let lane = if std::thread::current().id() == caller { 0 } else { lanes.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 };
+                loop {
+                    let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&i) = order.get(j) else { break };
+                    let out = run(this, &segs[i], lane);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+                }
             });
             for (o, m) in outs.iter_mut().zip(slots) {
                 *o = m.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -1155,6 +1389,11 @@ impl<'a> Executor<'a> {
         let mut res = Vec::with_capacity(outs.len());
         for o in outs {
             let (r, l) = o.expect("every segment ran");
+            // A helper thread's CPU time and allocations count in the
+            // steps around it.
+            if let Some(seg) = l.steps.first().filter(|s| s.thread != 0) {
+                self.clock.helped_by(seg);
+            }
             self.absorb(l);
             res.push(r?);
         }
@@ -1316,7 +1555,8 @@ impl<'a> Executor<'a> {
         let segs = self.segs.clone();
         for s in segs.iter() {
             self.check_deadline()?;
-            total += match (p, &s.view.live) {
+            let m = self.mark();
+            let n = match (p, &s.view.live) {
                 (Pred::True, None) => s.r.n_docs as u64,
                 (Pred::Range { field, lo, hi }, None) if !self.schema.fields[*field].multi && self.updates(s, *field).is_none() => {
                     let num = self.numeric(s, *field)?;
@@ -1330,6 +1570,8 @@ impl<'a> Executor<'a> {
                 }
                 _ => self.filter_set(s, p)?.len() as u64,
             };
+            self.seg_step(m, s, Some(n));
+            total += n;
         }
         Ok(total)
     }
@@ -1711,6 +1953,14 @@ impl<'a> Executor<'a> {
     /// `depth`-th are read to the end of the tie, so that one database and
     /// its shards cut at the same rows and rank them alike.
     fn input_top(&mut self, score: &Score, p: &Pred, depth: usize, key_desc: bool) -> Result<Vec<Hit>> {
+        let m = self.mark();
+        let hits = self.input_top_untimed(score, p, depth, key_desc)?;
+        let (op, detail) = self.leaf_label(score);
+        self.step(m, op, format!("{detail}, top {depth}"), Some(hits.len() as u64));
+        Ok(hits)
+    }
+
+    fn input_top_untimed(&mut self, score: &Score, p: &Pred, depth: usize, key_desc: bool) -> Result<Vec<Hit>> {
         let mut hits = match score {
             // Scans of every row: they keep the whole tie at the cut and
             // order it by key themselves.
@@ -2095,6 +2345,7 @@ impl<'a> Executor<'a> {
         let mut tick = self.ticker();
         for s in segs.iter() {
             self.check_deadline()?;
+            let m = self.mark();
             let set = self.filter_set(s, &q.filter)?;
             self.stats.plan.push(format!("seg {}: aggregate {} rows into groups of {}", s.ord, set.len(), q.group_by.len()));
             // Multi-valued fields: each document's value codes, from the postings.
@@ -2142,6 +2393,7 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            self.seg_step(m, s, Some(set.len() as u64));
         }
         Ok(groups)
     }
@@ -2186,6 +2438,14 @@ impl<'a> Executor<'a> {
     /// The top `k` rows by BM25; with `ties`, also every row tied with the
     /// `k`-th.
     fn bm25_top(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool) -> Result<Vec<Hit>> {
+        self.bm25_rows(field, query, opts, p, k, ties, None)
+    }
+
+    /// [`Self::bm25_top`]; with a cap on each group's rows, every row that
+    /// can be among the first `k` once each group keeps its first `per`
+    /// ([`TextFieldReader::top_k_capped`]), by decreasing score.
+    #[allow(clippy::too_many_arguments)]
+    fn bm25_rows(&mut self, field: usize, query: &str, opts: &Opts, p: &Pred, k: usize, ties: bool, cap: Option<PerGroup>) -> Result<Vec<Hit>> {
         let (q, stats) = self.bm25_scoring(field, query, opts)?;
         let terms = &q.terms;
         if terms.is_empty() {
@@ -2210,11 +2470,24 @@ impl<'a> Executor<'a> {
                 }
             };
             let f = ex.seg_filter_l(s, p, mode, l)?;
-            let hits = t.top_k_weighted(terms, &stats, params, k, f.as_dyn(), algo, ties);
+            let hits = match cap {
+                None => t.top_k_weighted(terms, &stats, params, k, f.as_dyn(), algo, ties),
+                Some(g) if g.int => {
+                    let col = ex.numeric(s, g.field)?.col();
+                    t.top_k_capped(terms, &stats, params, k, g.per, &|d: DocId| ex.int_value(s, g.field, col, d).map(|v| v as u64), f.as_dyn(), algo)
+                }
+                Some(g) => {
+                    let col = ex.keyword(s, g.field)?;
+                    t.top_k_capped(terms, &stats, params, k, g.per, &|d: DocId| col.code_of_doc(d).map(u64::from), f.as_dyn(), algo)
+                }
+            };
             l.plan.push(format!("seg {}: bm25 {algo:?}, filter {mode:?}", s.ord));
             Ok(hits.into_iter().map(|(doc, sc)| Hit { seg: s.ord, doc, score: sc as f64 }).collect::<Vec<_>>())
         })?;
         let mut hits = merge_top(per.concat(), usize::MAX);
+        if cap.is_some() {
+            return Ok(hits);
+        }
         let keep = if ties && k > 0 && hits.len() > k { k + hits[k..].iter().take_while(|h| h.score == hits[k - 1].score).count() } else { k };
         hits.truncate(keep);
         Ok(hits)
@@ -2456,6 +2729,7 @@ impl<'a> Executor<'a> {
             let read = generates && (shard || rankings || (!rank.exact && driver.is_none()));
             lists.push(if read { self.input_top(s, p, depth, false)?.into_iter().map(|h| (h.seg, h.doc)).collect() } else { Vec::new() });
         }
+        let m = self.mark();
         let cands: Vec<(usize, DocId)> = if let Some(text) = driver {
             let mut cands = self.driven_top(rank, text, p, self.rows_at_most(k))?;
             if shard {
@@ -2476,12 +2750,20 @@ impl<'a> Executor<'a> {
         } else {
             rank.candidates(&lists)
         };
+        let how = match driver {
+            Some(_) => "driven by the text score's bounds",
+            None if rank.exact => "every row WHERE keeps",
+            None => "the inputs' top rows",
+        };
+        self.step(m, "candidates", how.into(), Some(cands.len() as u64));
         let mut values = Vec::new();
         if shard || rank.reads_values() {
+            let m = self.mark();
             for s in &rank.leaves {
                 values.push(self.exact_scores(s, &cands)?);
             }
             self.stats.scored += cands.len() as u64;
+            self.step(m, "exact scores", format!("{} score{} of each candidate", rank.leaves.len(), if rank.leaves.len() == 1 { "" } else { "s" }), Some(cands.len() as u64));
         }
         // Rankings by candidate, where RRF or a coordinator reads them.
         let ranks: Vec<Vec<usize>> = if shard || rankings {
@@ -2756,20 +3038,29 @@ impl<'a> Executor<'a> {
     // ---- facets ----------------------------------------------------------
 
     /// The groups of one keyword field and their counts, from the field's
-    /// facet counters (no per-document work).
+    /// facet counters (no per-document work). Rows without a value are the
+    /// NULL group, as [`Self::aggregate`] makes it.
     fn facets(&mut self, q: &Select, g: usize, needed: &[Projection]) -> Result<agg::Groups> {
         let mut counts: HashMap<String, u64> = HashMap::new();
+        let mut missing = 0u64;
         let segs = self.segs.clone();
         for s in segs.iter() {
             self.check_deadline()?;
+            let m = self.mark();
             let set = self.filter_set(s, &q.filter)?;
             let kw = self.keyword(s, g)?;
             let strategy = kw.choose_facet_strategy(&set);
             self.stats.plan.push(format!("seg {}: facet {strategy:?} over {} docs", s.ord, set.len()));
+            let code_counts = kw.facet_code_counts(&set, strategy);
+            // A row of a single-valued field has one code at most.
+            missing += match kw.is_multi() {
+                true => set.difference(&kw.present()).len() as u64,
+                false => (set.len() as u64).saturating_sub(code_counts.iter().sum()),
+            };
             if kw.is_multi() {
                 self.stats.plan.push(format!("seg {}: multi-valued, each value of a document counts", s.ord));
             }
-            for (code, c) in kw.facet_code_counts(&set, strategy).into_iter().enumerate() {
+            for (code, c) in code_counts.into_iter().enumerate() {
                 if c > 0 {
                     let n = counts.len();
                     let v = kw.value(code as u32);
@@ -2782,6 +3073,7 @@ impl<'a> Executor<'a> {
             if let Some(max) = self.opts.max_groups.filter(|&m| counts.len() > m) {
                 return Err(agg::too_many_groups(max));
             }
+            self.seg_step(m, s, Some(set.len() as u64));
         }
         // A multi-valued INT field's values are int_key strings.
         let ints = self.schema.fields[g].ty == FieldType::Int;
@@ -2790,6 +3082,11 @@ impl<'a> Executor<'a> {
             let key = if ints { forward::int_of_key(&v).map_or(agg::Part::Null, agg::Part::Int) } else { agg::Part::Str(v) };
             for a in groups.entry(vec![key], needed)? {
                 *a = agg::Acc::Count(c as i64);
+            }
+        }
+        if missing > 0 {
+            for a in groups.entry(vec![agg::Part::Null], needed)? {
+                *a = agg::Acc::Count(missing as i64);
             }
         }
         Ok(groups)
@@ -3091,9 +3388,9 @@ pub(crate) fn min_need(opts: &Opts) -> Result<Option<text::query::Need>> {
 pub(crate) fn need_of(v: &Value, what: &str) -> Result<text::query::Need> {
     let need = match v {
         Value::Str(s) => text::query::Need::parse(s.trim()),
-        v => v.as_f64().filter(|x| x.fract() == 0.0 && (0.0..1e9).contains(x)).map(|x| text::query::Need::Count(x as usize)),
+        v => v.as_f64().filter(|x| x.fract() == 0.0 && (1.0..1e9).contains(x)).map(|x| text::query::Need::Count(x as usize)),
     };
-    need.ok_or_else(|| err(format!("{what} a count (2) or a percentage ('75%'), not {v:?}")))
+    need.ok_or_else(|| err(format!("{what} a count (2) or a percentage ('75%'), above 0, not {v:?}")))
 }
 
 /// The scored terms of a `bm25` query in order, each with the weight of

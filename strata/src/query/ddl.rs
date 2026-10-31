@@ -393,12 +393,6 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
 /// of each write as `"now"` (`CURRENT_TIMESTAMP`, `now()`,
 /// `LOCALTIMESTAMP`), which a TIMESTAMP column takes.
 fn default_value(e: &Expr) -> std::result::Result<J, String> {
-    let now = |n: &str| matches!(n.to_ascii_lowercase().as_str(), "current_timestamp" | "now" | "localtimestamp");
-    let no_args = |f: &sql::Function| match &f.args {
-        sql::FunctionArguments::None => true,
-        sql::FunctionArguments::List(l) => l.args.is_empty(),
-        _ => false,
-    };
     match e {
         Expr::Nested(x) => default_value(x),
         Expr::Value(v) => match &v.value {
@@ -408,13 +402,13 @@ fn default_value(e: &Expr) -> std::result::Result<J, String> {
             sql::Value::Number(n, _) => n.parse::<i64>().map(|n| json!(n)).or_else(|_| n.parse::<f64>().map(|x| json!(x))).map_err(|_| format!("DEFAULT {n} is not a number")),
             _ => Err(format!("DEFAULT {e} is not a constant")),
         },
+        Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } if super::sql::negative_integer(expr).is_some() => Ok(json!(super::sql::negative_integer(expr))),
         Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match default_value(expr)? {
             J::Number(n) if n.is_i64() => Ok(json!(-n.as_i64().unwrap_or(0))),
             J::Number(n) if n.is_f64() => Ok(json!(-n.as_f64().unwrap_or(0.0))),
             _ => Err(format!("DEFAULT {e} is not a constant")),
         },
-        Expr::Function(f) if now(&f.name.to_string()) && no_args(f) => Ok(json!("now")),
-        Expr::Identifier(id) if id.quote_style.is_none() && now(&id.value) => Ok(json!("now")),
+        e if super::sql::is_now(e) => Ok(json!("now")),
         _ => Err(format!("DEFAULT {e} is not a constant (or CURRENT_TIMESTAMP for a TIMESTAMP)")),
     }
 }
