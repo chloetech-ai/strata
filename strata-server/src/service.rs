@@ -1,7 +1,7 @@
 //! The operations both front ends serve, over a local database or, as a
 //! coordinator, over shard servers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -163,6 +163,23 @@ pub struct FieldModel {
     pub model: Result<Arc<dyn Embedder>, String>,
 }
 
+/// The filling in of the vectors an embedded field's rows were stored
+/// without, while it had no model open ([`Service::keep_models`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Backfill {
+    /// `running`, `done` or `failed` (tried again five minutes later).
+    pub state: &'static str,
+    /// Rows found without a vector as it started, those whose sources are
+    /// all empty included (they get none).
+    pub missing: u64,
+    /// Rows given their vector.
+    pub embedded: u64,
+    pub error: Option<String>,
+}
+
+/// Rows a backfill write fills in.
+const BACKFILL_BATCH: usize = 256;
+
 /// The agent's model settings ([`crate::agent`]).
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -199,6 +216,19 @@ pub struct Service {
     /// Where [`Service::open_models`] opened them, for tables created
     /// later, and where ranking models are.
     models_dir: Option<PathBuf>,
+    /// Whether [`Service::keep_models`] fills in the vectors of rows stored
+    /// without one (`--no-backfill`: not), and fetches the models Strata
+    /// knows that a field names and the models directory lacks
+    /// (`--no-fetch-models`: not).
+    pub backfill: bool,
+    pub fetch_models: bool,
+    /// Told when the models may have changed: a table created or altered,
+    /// a model fetched, a replica promoted.
+    models_changed: tokio::sync::watch::Sender<u64>,
+    /// Each embedded field's backfill, by table (lower case) and field.
+    backfills: Mutex<HashMap<(String, String), Backfill>>,
+    /// The models a fetch was tried for, once each.
+    fetch_tried: Mutex<HashSet<String>>,
     /// A coordinator's ranking models ([`Service::open_ranking_models`]);
     /// a database keeps its own.
     ranking: Models,
@@ -328,6 +358,11 @@ impl Service {
             log_store: None,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
+            backfill: true,
+            fetch_models: false,
+            models_changed: tokio::sync::watch::Sender::new(0),
+            backfills: Mutex::new(HashMap::new()),
+            fetch_tried: Mutex::new(HashSet::new()),
             ranking: Models::default(),
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
@@ -530,6 +565,8 @@ impl Service {
         let opts = PrimaryOptions { replicas, acks, ..self.primary_options() };
         let (p, answer) = f.promote(opts, voters, force).await?;
         *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::Primary(p);
+        // A primary fills in what its rows lack.
+        self.models_changed.send_modify(|n| *n += 1);
         Ok(answer)
     }
 
@@ -839,13 +876,23 @@ impl Service {
     /// those already listed: after `CREATE TABLE`, and when a coordinator
     /// learns of new tables. Nothing before [`Service::open_models`].
     fn refresh_models(&self) {
+        self.list_models(false)
+    }
+
+    /// [`Self::refresh_models`], opening again the models that did not open
+    /// (after a fetch).
+    fn reopen_models(&self) {
+        self.list_models(true)
+    }
+
+    fn list_models(&self, reopen: bool) {
         let Some(dir) = &self.models_dir else { return };
         let old = self.models();
         let mut list = Vec::new();
         for t in self.catalog() {
             for f in &t.fields {
                 let Some(spec) = f.embed.clone() else { continue };
-                if let Some(m) = old.iter().find(|m| m.table.eq_ignore_ascii_case(&t.table) && m.field == f.name && m.spec == spec) {
+                if let Some(m) = old.iter().find(|m| m.table.eq_ignore_ascii_case(&t.table) && m.field == f.name && m.spec == spec).filter(|m| !reopen || m.model.is_ok()) {
                     list.push(m.clone());
                     continue;
                 }
@@ -863,7 +910,141 @@ impl Service {
                 list.push(FieldModel { table: t.table.clone(), field: f.name.clone(), spec, model: model.map_err(|e| e.to_string()) });
             }
         }
+        // A field with a model it did not have: its rows may lack vectors.
+        let opened = |l: &[FieldModel]| l.iter().filter(|m| m.model.is_ok()).map(|m| (m.table.to_lowercase(), m.field.clone(), m.spec.clone())).collect::<Vec<_>>();
+        let gained = opened(&list).iter().any(|m| !opened(&old).contains(m));
         *self.models.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(list);
+        if gained {
+            self.models_changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// Keeps the embedded fields' models, for the server's life: fetches
+    /// those of [`strata::embed::KNOWN_MODELS`] a field names that the
+    /// models directory lacks ([`Self::fetch_models`]), then fills in the
+    /// vectors of rows stored without one while their field had no model
+    /// open, on a database that takes writes ([`Self::backfill`]). It runs
+    /// at start and whenever a field gains a model (a table created or
+    /// altered, a model fetched) or a replica becomes primary; a backfill
+    /// a model failed is tried again five minutes later.
+    pub async fn keep_models(self: Arc<Self>) {
+        let mut changed = self.models_changed.subscribe();
+        loop {
+            // A change from here on is another pass.
+            changed.borrow_and_update();
+            if self.fetch_models {
+                self.fetch_known_models().await;
+            }
+            let again = self.backfill && self.backfill_all().await;
+            match again {
+                true => drop(tokio::time::timeout(Duration::from_secs(300), changed.changed()).await),
+                false => drop(changed.changed().await),
+            }
+        }
+    }
+
+    /// Fetches the models [`Self::keep_models`] fetches, each once, and
+    /// opens them.
+    async fn fetch_known_models(&self) {
+        let Some(dir) = self.models_dir.clone() else { return };
+        let mut fetched = false;
+        for m in self.models().iter().filter(|m| m.model.is_err()) {
+            let Some(name) = strata::embed::to_fetch(&m.spec.model, &dir) else { continue };
+            if !self.fetch_tried.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string()) {
+                continue;
+            }
+            tracing::info!(table = %m.table, field = %m.field, model = name, "fetching the model of an embedded field");
+            match crate::server::fetch_model(name, &dir).await {
+                Ok(_) => fetched = true,
+                Err(e) => tracing::warn!(model = name, error = %e, "could not fetch the model of an embedded field: fetch it with strata-server fetch-model, or start with --no-fetch-models"),
+            }
+        }
+        if fetched {
+            self.reopen_models();
+        }
+    }
+
+    /// Fills in the vectors each embedded field's rows lack
+    /// ([`Self::backfill_field`]); whether a model failed, for another try.
+    async fn backfill_all(self: &Arc<Self>) -> bool {
+        let Some(db) = self.local().cloned() else { return false };
+        let mut again = false;
+        for m in self.models().iter().filter(|m| m.model.is_ok()) {
+            // A replica's rows come from its primary.
+            if self.takes_writes().is_err() {
+                return false;
+            }
+            again |= self.backfill_field(&db, &m.table, &m.field).await;
+        }
+        again
+    }
+
+    /// Fills in the vectors of `table.field` that rows lack
+    /// ([`Db::missing_vectors`]), [`BACKFILL_BATCH`] rows a write, through
+    /// the writer as any statement goes; whether the model failed, for
+    /// another try later.
+    async fn backfill_field(self: &Arc<Self>, db: &Arc<Db>, table: &str, field: &str) -> bool {
+        let id = (table.to_lowercase(), field.to_string());
+        let set = |b: Backfill| {
+            self.backfills.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), b);
+        };
+        let (d, t, f) = (db.clone(), table.to_string(), field.to_string());
+        let keys = match tokio::task::spawn_blocking(move || d.missing_vectors(&t, &f)).await {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
+                tracing::warn!(table, field, error = %e, "cannot fill in the vectors rows lack");
+                set(Backfill { state: "failed", missing: 0, embedded: 0, error: Some(e.to_string()) });
+                return false;
+            }
+            Err(_) => return false,
+        };
+        let missing = keys.len() as u64;
+        let before = self.backfills.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+        // Rows without text get no vector: nothing to do again.
+        if before.as_ref().is_some_and(|b| b.state == "done" && b.missing - b.embedded == missing) || (before.is_none() && missing == 0) {
+            return false;
+        }
+        tracing::info!(table, field, rows = missing, "filling in the vectors of rows stored without one");
+        let t0 = Instant::now();
+        let mut b = Backfill { state: "running", missing, embedded: 0, error: None };
+        set(b.clone());
+        for chunk in keys.chunks(BACKFILL_BATCH) {
+            let mut busy = 0;
+            let written = loop {
+                let (t, f, chunk) = (table.to_string(), field.to_string(), chunk.to_vec());
+                let guard = self.statement_guard(0, Arc::new(Mutex::new(None)));
+                let prepare = move |db: &Db| db.prepare_backfill(&t, &f, chunk).map(|p| Some(p.guarded(guard)));
+                match self.write_local(db, prepare, 0).await {
+                    // The queue is full: clients' writes come first.
+                    Err(e) if e.status == 429 && busy < 600 => {
+                        busy += 1;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    r => break r,
+                }
+            };
+            match written {
+                Ok(w) => {
+                    b.embedded += w.rows;
+                    set(b.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(table, field, embedded = b.embedded, error = %e.message, "filling in vectors stopped; tried again in five minutes");
+                    set(Backfill { state: "failed", error: Some(e.message.clone()), ..b });
+                    return e.status >= 500 || e.status == 429;
+                }
+            }
+        }
+        self.metrics.embedded("backfill", b.embedded, t0.elapsed().as_secs_f64());
+        tracing::info!(table, field, embedded = b.embedded, without_text = missing - b.embedded, seconds = t0.elapsed().as_secs_f64(), "filled in the vectors of rows stored without one");
+        set(Backfill { state: "done", ..b });
+        false
+    }
+
+    /// The backfill of `table.field` ([`Self::keep_models`]), if it had
+    /// rows to fill in.
+    pub fn backfill_of(&self, table: &str, field: &str) -> Option<Backfill> {
+        self.backfills.lock().unwrap_or_else(|e| e.into_inner()).get(&(table.to_lowercase(), field.to_string())).cloned()
     }
 
     /// Whether this server embeds any field's text.

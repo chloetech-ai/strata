@@ -54,6 +54,10 @@ pub struct PreparedWrite {
     mask: Option<Arc<Mask>>,
     /// Asked as the write runs ([`PreparedWrite::guarded`]).
     guard: Option<Guard>,
+    /// An UPDATE that fills in the vectors of this embedded field
+    /// ([`Db::prepare_backfill`]): it passes over the rows that have one
+    /// when it runs, and those whose sources are all empty.
+    backfill: Option<usize>,
 }
 
 /// A check a write passes as it runs, under the writer lock, answering the
@@ -710,6 +714,70 @@ impl Db {
         crate::sid::Codebook::train(&vectors, dim, opts)?.save(name, models)
     }
 
+    /// The primary keys of the live rows of the table named `table` whose
+    /// embedded VECTOR field `field` has no vector: rows written while the
+    /// field had no model open here (no API key yet, the model not
+    /// fetched), and rows whose sources are all empty, which get none.
+    /// [`Db::embed_backfill`] fills in the others.
+    pub fn missing_vectors(&self, table: &str, field: &str) -> Result<Vec<Value>> {
+        let snap = self.snapshot().table(table).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+        let schema = snap.schema();
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("{table} has no field {field}")))?;
+        if f.embed.is_none() || !matches!(f.ty, FieldType::Vector { .. }) {
+            return Err(Error::Schema(format!("{table}.{field} is not an embedded VECTOR field")));
+        }
+        if schema.primary_key.is_none() {
+            return Err(Error::Schema(format!("{table} has no primary key: rows without {field}'s vector can only be written again")));
+        }
+        let key = f.key();
+        let mut keys = Vec::new();
+        for (i, v) in snap.segments().iter().enumerate() {
+            // A segment written before the field existed has no vectors of it.
+            let r = match v.file.has(&crate::vector::section(&key, "meta")) {
+                true => Some(VectorReader::open(&v.file, &key)?),
+                false => None,
+            };
+            for d in 0..v.file.n_docs() as DocId {
+                if v.live.as_ref().is_none_or(|l| l.contains(d)) && !r.as_ref().is_some_and(|r| r.has_vector(d)) {
+                    keys.extend(snap.key(i, d));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// A write giving the rows of the table named `table` with primary
+    /// keys `keys` the vectors of embedded field `field` they lack, from
+    /// its model ([`Db::set_embedder_in`]). It is an UPDATE of those rows
+    /// which, as it runs under the writer lock, passes over the rows that
+    /// have a vector by then and those whose sources are all empty; the
+    /// vectors are computed here, before the writer lock, as any write's
+    /// are. Run it with [`Db::write_prepared`]; it writes each row again,
+    /// its other fields as they are.
+    pub fn prepare_backfill(&self, table: &str, field: &str, keys: Vec<Value>) -> Result<PreparedWrite> {
+        let schema = self.table(table)?;
+        let f = schema.field_index(field).ok_or_else(|| Error::Schema(format!("{table} has no field {field}")))?;
+        if self.models_of(&schema)[f].is_none() {
+            return Err(Error::Schema(format!("{table}.{field} has no model open here to fill in its vectors")));
+        }
+        let write = Write::Update { select: qsql::keyed_rows(&schema, keys)?, sets: vec![(f, Assign::Value(Value::Null))] };
+        self.prepare_as(schema, write, Some(f))
+    }
+
+    /// Fills in the vectors of embedded field `field` of the table named
+    /// `table` that its rows lack ([`Db::missing_vectors`]) with the
+    /// field's model, `batch` rows a write ([`Db::prepare_backfill`]);
+    /// returns the rows written. Rows whose sources are all empty stay
+    /// without one. A server does this itself when a field's model opens.
+    pub fn embed_backfill(&self, table: &str, field: &str, batch: usize) -> Result<u64> {
+        let keys = self.missing_vectors(table, field)?;
+        let mut n = 0;
+        for chunk in keys.chunks(batch.max(1)) {
+            n += self.write_prepared(&self.prepare_backfill(table, field, chunk.to_vec())?)?;
+        }
+        Ok(n)
+    }
+
     /// Computes the embedded vectors that documents of the first table
     /// leave out (null) from their sources, one batch per field split
     /// across the cores. A document whose sources are all empty gets no
@@ -1006,7 +1074,11 @@ impl Db {
         Ok(Some(self.prepare(schema.clone(), write)?))
     }
 
-    fn prepare(&self, schema: Arc<Schema>, mut write: Write) -> Result<PreparedWrite> {
+    fn prepare(&self, schema: Arc<Schema>, write: Write) -> Result<PreparedWrite> {
+        self.prepare_as(schema, write, None)
+    }
+
+    fn prepare_as(&self, schema: Arc<Schema>, mut write: Write, backfill: Option<usize>) -> Result<PreparedWrite> {
         let media = self.media_resolver();
         let mut held = Held::new();
         match &mut write {
@@ -1020,8 +1092,8 @@ impl Db {
             Write::Update { sets, .. } => held = resolve_sets(&media, &schema, sets)?,
             Write::Delete { .. } => {}
         }
-        let (known, derived) = self.embed_ahead(&schema, &write, &Files { resolver: &media, held })?;
-        Ok(PreparedWrite { schema, write, known, derived, mask: None, guard: None })
+        let (known, derived) = self.embed_ahead(&schema, &write, &Files { resolver: &media, held }, backfill)?;
+        Ok(PreparedWrite { schema, write, known, derived, mask: None, guard: None, backfill })
     }
 
     /// The text `write` will derive and the vectors it will compute, from
@@ -1031,7 +1103,7 @@ impl Db {
     /// reading the rows (the table dropped, a sum that overflows) is left
     /// for the write to report; an image that cannot be read fails the
     /// statement.
-    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files) -> Result<(Known, Derived)> {
+    fn embed_ahead(&self, schema: &Schema, write: &Write, files: &Files, backfill: Option<usize>) -> Result<(Known, Derived)> {
         let models = self.models_of(schema);
         let derivers = self.derivers_of(schema);
         if models.iter().all(Option::is_none) && derivers.iter().all(Option::is_none) {
@@ -1054,7 +1126,7 @@ impl Db {
                 // Numbers set in place embed nothing.
                 Write::Update { sets, .. } if in_place(schema, sets) => Vec::new(),
                 Write::Update { select, sets } => {
-                    let rows = self.execute(&snap, select, &self.exec)?.rows;
+                    let rows = lacking(schema, backfill, self.execute(&snap, select, &self.exec)?.rows);
                     plan_sets(schema, &models, &derivers, rows.into_iter().map(|r| (r, Vec::new())).collect(), sets)?.rewrites
                 }
                 Write::Delete { .. } => Vec::new(),
@@ -1155,7 +1227,7 @@ impl Db {
                 }
             }
             Write::Update { select, sets } => {
-                let rows = self.execute(&snap, &select, &self.exec)?.rows;
+                let rows = lacking(schema, p.backfill, self.execute(&snap, &select, &self.exec)?.rows);
                 n += set_rows(&mut tt, schema, (&models, &derivers), rows.into_iter().map(|r| (r, Vec::new())).collect(), &sets, (&p.known, &p.derived), &files)?;
             }
         }
@@ -1704,6 +1776,20 @@ fn plan_sets(schema: &Schema, models: &[Option<Arc<dyn Embedder>>], derivers: &[
         n += 1;
     }
     Ok(Planned { in_place, rewrites, rows: n })
+}
+
+/// The rows an UPDATE filling in embedded field `backfill`'s vectors
+/// writes ([`Db::prepare_backfill`]): those still without one whose
+/// sources are not all empty. Every row of any other UPDATE.
+fn lacking(schema: &Schema, backfill: Option<usize>, mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    if let Some(f) = backfill {
+        rows.retain(|r| {
+            let mut d = r.clone();
+            schema.fill_generated(&mut d);
+            matches!(r[f], Value::Null) && !schema.embed_text(f, &d).is_empty()
+        });
+    }
+    rows
 }
 
 /// Whether setting `sets` changes rows in place: every field set is a
