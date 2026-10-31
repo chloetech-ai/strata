@@ -42,5 +42,13 @@ spec:
   # `token` (without it they run with --no-token: open to the cluster):
   #   kubectl -n strata create secret generic demo-token --from-literal=token="$(openssl rand -hex 32)"
   # tokenSecret: demo-token
+  # And the cluster's own token, which the servers and coordinators send
+  # each other and clients never hold. With it, the token above is the
+  # coordinators' admin token alone and cannot make the calls between
+  # servers. Give it when the cluster is made: added later, every pod
+  # restarts, and until the last has, the servers that have restarted and
+  # those that have not refuse each other's calls.
+  #   kubectl -n strata create secret generic demo-cluster-token --from-literal=token="$(openssl rand -hex 32)"
+  # clusterTokenSecret: demo-cluster-token
   resources:
     requests: {cpu: 100m, memory: 128Mi}

@@ -172,11 +172,23 @@ impl Cluster {
         format!("{}-s{id}", self.name)
     }
 
-    fn token_env(&self) -> Vec<Json> {
-        match &self.spec.token_secret {
-            Some(s) => vec![json!({"name": "STRATA_TOKEN", "valueFrom": {"secretKeyRef": {"name": s, "key": "token"}}})],
-            None => Vec::new(),
+    /// The servers' token: the cluster token when there is one (the
+    /// admin token then stays with the coordinators), else the token.
+    fn server_token_env(&self) -> Vec<Json> {
+        let s = &self.spec;
+        match (&s.cluster_token_secret, &s.token_secret) {
+            (Some(c), _) => vec![secret_env("STRATA_CLUSTER_TOKEN", c)],
+            (None, Some(t)) => vec![secret_env("STRATA_TOKEN", t)],
+            (None, None) => Vec::new(),
         }
+    }
+
+    /// The coordinators' tokens: the token, and the cluster token when
+    /// there is one, which they send to the servers.
+    fn coordinator_token_env(&self) -> Vec<Json> {
+        let s = &self.spec;
+        let token = s.token_secret.iter().map(|t| secret_env("STRATA_TOKEN", t));
+        token.chain(s.cluster_token_secret.iter().map(|c| secret_env("STRATA_CLUSTER_TOKEN", c))).collect()
     }
 
     /// The objects every cluster has: the schema, and the two Services.
@@ -216,7 +228,7 @@ impl Cluster {
             env.push(json!({"name": "STRATA_DEMO", "value": n.to_string()}));
             env.push(json!({"name": "STRATA_DEMO_SHARD", "value": format!("{i}/{of}")}));
         }
-        env.extend(self.token_env());
+        env.extend(self.server_token_env());
         let mut container = json!({
             "name": "strata",
             "image": s.image,
@@ -273,7 +285,7 @@ impl Cluster {
             args.push("--no-token".into());
         }
         let mut container = json!({
-            "name": "coordinator", "image": s.image, "args": args, "env": self.token_env(),
+            "name": "coordinator", "image": s.image, "args": args, "env": self.coordinator_token_env(),
             "ports": [{"name": "http", "containerPort": 7700}],
             "readinessProbe": {"httpGet": {"path": "/readyz", "port": 7700}, "periodSeconds": 2},
             "livenessProbe": {"httpGet": {"path": "/livez", "port": 7700}, "periodSeconds": 10, "failureThreshold": 6},
@@ -318,7 +330,7 @@ impl Cluster {
 /// created empty with the schema (it joins its shard and is sent a copy).
 const SERVER_SCRIPT: &str = r#"set -e
 set -- --db /data/db.strata --seq-no --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701 --failover-after-ms "$STRATA_FAILOVER_AFTER_MS" --write-acks "$STRATA_WRITE_ACKS"
-[ -n "$STRATA_TOKEN" ] || set -- "$@" --no-token
+[ -n "$STRATA_TOKEN$STRATA_CLUSTER_TOKEN" ] || set -- "$@" --no-token
 if [ ! -e /data/db.strata ]; then
   if [ "${HOSTNAME##*-}" = 0 ] && [ -n "$STRATA_DEMO" ]; then
     set -- "$@" --demo "$STRATA_DEMO" --demo-shard "$STRATA_DEMO_SHARD"
@@ -328,6 +340,11 @@ if [ ! -e /data/db.strata ]; then
 fi
 eval "exec strata-server \"\$@\" $STRATA_ARGS"
 "#;
+
+/// A variable read from key `token` of Secret `secret`.
+fn secret_env(name: &str, secret: &str) -> Json {
+    json!({"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": "token"}}})
+}
 
 /// `args` quoted for a POSIX shell.
 fn shell_words(args: &[String]) -> String {
@@ -542,6 +559,25 @@ mod tests {
     }
 
     #[test]
+    fn with_a_cluster_token_the_admin_token_stays_with_the_coordinators() {
+        let c = cluster(json!({"demo": 10, "tokenSecret": "admin", "clusterTokenSecret": "inner"}));
+        let names = |env: &Json| -> Vec<(String, String)> {
+            let e = env.as_array().unwrap().iter().filter(|e| e["valueFrom"].is_object());
+            e.map(|e| (e["name"].as_str().unwrap().to_string(), e["valueFrom"]["secretKeyRef"]["name"].as_str().unwrap().to_string())).collect()
+        };
+        let s = c.statefulset(0, 3, Some((0, 1)));
+        assert_eq!(names(&s["spec"]["template"]["spec"]["containers"][0]["env"]), [("STRATA_CLUSTER_TOKEN".to_string(), "inner".to_string())]);
+        let d = c.coordinator_deployment(&[vec!["a".into()]], 1);
+        let coordinator = &d["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(names(&coordinator["env"]), [("STRATA_TOKEN".to_string(), "admin".to_string()), ("STRATA_CLUSTER_TOKEN".to_string(), "inner".to_string())]);
+        assert!(!coordinator["args"].as_array().unwrap().contains(&json!("--no-token")));
+        // Without one, the token is everyone's, as before.
+        let c = cluster(json!({"demo": 10, "tokenSecret": "admin"}));
+        let d = c.coordinator_deployment(&[vec!["a".into()]], 1);
+        assert_eq!(names(&d["spec"]["template"]["spec"]["containers"][0]["env"]), [("STRATA_TOKEN".to_string(), "admin".to_string())]);
+    }
+
+    #[test]
     fn base64_as_secrets_hold_it() {
         assert_eq!(base64_decode("c2VjcmV0LXRva2Vu").unwrap(), b"secret-token");
         assert_eq!(base64_decode("YQ==").unwrap(), b"a");
@@ -558,18 +594,24 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let run = |host: &str, demo: bool| {
+        let run = |host: &str, demo: bool, env: &[(&str, &str)]| {
             let mut cmd = std::process::Command::new("sh");
             cmd.args(["-c", SERVER_SCRIPT]).env("PATH", format!("{}:/usr/bin:/bin", dir.path().display())).env("HOSTNAME", host);
             cmd.env("STRATA_FAILOVER_AFTER_MS", "3000").env("STRATA_WRITE_ACKS", "all").env("STRATA_ARGS", "'--max-rows' '5 0'");
             if demo {
                 cmd.env("STRATA_DEMO", "100").env("STRATA_DEMO_SHARD", "0/2");
             }
+            cmd.env_remove("STRATA_TOKEN").env_remove("STRATA_CLUSTER_TOKEN").envs(env.iter().copied());
             String::from_utf8(cmd.output().unwrap().stdout).unwrap()
         };
-        let first = run("orders-s0-0", true);
+        let first = run("orders-s0-0", true, &[]);
         assert!(first.contains("--demo\n100\n--demo-shard\n0/2\n") && first.contains("--no-token\n") && first.ends_with("--max-rows\n5 0\n"), "{first}");
-        let other = run("orders-s0-1", true);
+        let other = run("orders-s0-1", true, &[]);
         assert!(other.contains("--schema\n/etc/strata/schema.json\n") && !other.contains("--demo"), "{other}");
+        // A copy with either token is not served open.
+        for t in ["STRATA_TOKEN", "STRATA_CLUSTER_TOKEN"] {
+            let closed = run("orders-s0-1", false, &[(t, "x")]);
+            assert!(!closed.contains("--no-token") && closed.contains("--schema\n"), "{t}: {closed}");
+        }
     }
 }
