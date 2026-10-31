@@ -210,9 +210,10 @@ fn header_str<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'
 }
 
 /// Who the request is from ([`crate::keys`]), and whether that may call
-/// its route ([`route_scope`]); a statement's own scope is checked where
-/// it is read (`/v1/sql`, `/v1/plan`, a logged query). Requests that need
-/// the admin scope, and refused ones, go to the audit log.
+/// its route ([`route_scope`]); what the request then does (a statement, a
+/// plan, a logged query, an import that creates tables) is checked by the
+/// service, as for gRPC. Requests that need the admin scope, refused ones,
+/// and ones the service notes ([`keys::note`]) go to the audit log.
 async fn auth(State(app): State<App>, headers: HeaderMap, mut req: Request, next: Next) -> Response {
     let t0 = Instant::now();
     let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
@@ -223,17 +224,20 @@ async fn auth(State(app): State<App>, headers: HeaderMap, mut req: Request, next
         None => Some(ApiError { status: 401, message: "missing or wrong token".into() }),
         Some(w) => w.may(need, &format!("{method} {route}")).err(),
     };
-    let res = match refused {
-        Some(e) => e.into_response(),
+    let (res, note) = match refused {
+        Some(e) => (e.into_response(), None),
         None => {
             if let Some(w) = &who {
                 req.extensions_mut().insert(w.clone());
             }
-            next.run(req).await
+            keys::noting(next.run(req)).await
         }
     };
     let status = res.status().as_u16();
-    if need == Scope::Admin || status == 401 || status == 403 || res.extensions().get::<Audited>().is_some() {
+    // What the service noted of the request ([`keys::note`]), or its
+    // handler.
+    let detail = note.or_else(|| res.extensions().get::<Audited>().map(|a| a.0.clone()));
+    if need == Scope::Admin || status == 401 || status == 403 || detail.is_some() {
         app.svc.audit.add(keys::Entry {
             ts_ms: telemetry::now_ms(),
             who: who.as_ref().map_or("unknown".into(), |w| w.name.clone()),
@@ -244,7 +248,7 @@ async fn auth(State(app): State<App>, headers: HeaderMap, mut req: Request, next
             status,
             ms: t0.elapsed().as_secs_f64() * 1e3,
             request_id: obs::current().map(|id| id.to_string()),
-            detail: res.extensions().get::<Audited>().map(|a| a.0.clone()),
+            detail,
         });
     }
     res
@@ -411,8 +415,7 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
         if req.shard {
             return Err(ApiError::bad("a shard's query is not logged: log through the coordinator"));
         }
-        who(w).may(Scope::Write, "a logged query (it writes the rank log)")?;
-        return logged(&app, req, log).await;
+        return logged(&app, &who(w), req, log).await;
     }
     let a = app.svc.query(req).await?;
     let mut j = answer(&a);
@@ -427,9 +430,9 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
 /// A query run and logged ([`Service::query_logged`]): its answer, with
 /// the request's id (`"request"`) and the log's write (`"logged"`: the
 /// rows, and the write's sequence numbers as a write's answer gives them).
-async fn logged(app: &App, req: QueryReq, log: &Json) -> Res {
+async fn logged(app: &App, who: &Principal, req: QueryReq, log: &Json) -> Res {
     let log = strata::rank_log::Log::from_json(log)?;
-    let (a, request, w) = app.svc.query_logged(req, log).await?;
+    let (a, request, w) = app.svc.query_logged(who, req, log).await?;
     let mut j = answer(&a);
     j["request"] = json!(request);
     let mut l = json!({"rows": w.rows});
@@ -476,25 +479,16 @@ fn answer(a: &crate::service::Answer) -> Json {
     j
 }
 
-async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+/// Any statement: the service checks that the request's credential may
+/// run it ([`Service::sql`]), and audits a table's or rank profile's.
+async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
     let w = who(w);
-    let need = app.svc.statement_scope(body_str(&b, "sql")?, &params).await?;
-    w.may(need, &format!("a {} statement", match need { Scope::Read => "query", Scope::Write => "write", Scope::Admin => "table or rank profile" }))?;
-    let j = sql_answer(&app, &b, params).await?.0;
-    // A table's or rank profile's statement is the admin's: audited.
-    Ok(match need {
-        Scope::Admin => audited(j, obs::truncate(body_str(&b, "sql")?, 500).into_owned()),
-        _ => AxJson(j).into_response(),
-    })
-}
-
-async fn sql_answer(app: &App, b: &Json, params: strata::query::Params) -> Res {
     if let Some(log) = b.get("log") {
-        let req = QueryReq { sql: body_str(b, "sql")?.to_string(), params, timeout_ms: body_u64(b, "timeout_ms"), after: after(b)?, ..Default::default() };
-        return logged(app, req, log).await;
+        let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params, timeout_ms: body_u64(&b, "timeout_ms"), after: after(&b)?, ..Default::default() };
+        return logged(&app, &w, req, log).await;
     }
-    match app.svc.sql(body_str(b, "sql")?, &params, after(b)?, body_u64(b, "timeout_ms")).await? {
+    match app.svc.sql(&w, body_str(&b, "sql")?, &params, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
     }
@@ -520,10 +514,7 @@ fn written(w: Written, took_ms: f64) -> Json {
 /// Runs a plan ([`strata::query::ir`]) as `/v1/sql` runs a statement.
 async fn run_plan(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let plan = strata::query::ir::Plan::from_json(b.get("plan").ok_or_else(|| ApiError::bad("the body needs a \"plan\""))?)?;
-    if plan.is_write() {
-        who(w).may(Scope::Write, "a write plan")?;
-    }
-    match app.svc.run_plan(plan, after(&b)?, body_u64(&b, "timeout_ms")).await? {
+    match app.svc.run_plan(&who(w), plan, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
     }
@@ -553,7 +544,7 @@ async fn write(State(app): State<App>, headers: HeaderMap, AxJson(mut b): AxJson
 /// Rows in the body, in the format `?format=` names or the content type
 /// implies. The content type must not be one a page on another site may
 /// send without asking first (text/plain, a form, or none).
-async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>, headers: HeaderMap, body: Bytes) -> Res {
+async fn import(State(app): State<App>, w: Option<axum::Extension<Principal>>, Query(q): Query<std::collections::HashMap<String, String>>, headers: HeaderMap, body: Bytes) -> Res {
     if auth::simple_content_type(header_str(&headers, header::CONTENT_TYPE)) {
         return Err(ApiError {
             status: 415,
@@ -566,7 +557,7 @@ async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMa
         None => matches!(ct.as_str(), "application/vnd.sqlite3" | "application/x-sqlite3") || body.starts_with(strata::sqlite::MAGIC),
     };
     if sqlite {
-        return import_sqlite(&app, &q, body).await;
+        return import_sqlite(&app, &who(w), &q, body).await;
     }
     let format = match q.get("format") {
         Some(f) => Some(Format::parse(f).ok_or_else(|| ApiError::bad(format!("unknown format {f:?}: jsonl, json, csv, tsv or sqlite")))?),
@@ -610,14 +601,14 @@ fn tables_param(q: &std::collections::HashMap<String, String>) -> Vec<String> {
 /// imports only those, `?blobs_base64=true` keeps BLOB columns as base64
 /// text, and `?plan=true` answers what the import would do and writes
 /// nothing.
-async fn import_sqlite(app: &App, q: &std::collections::HashMap<String, String>, body: Bytes) -> Res {
+async fn import_sqlite(app: &App, who: &Principal, q: &std::collections::HashMap<String, String>, body: Bytes) -> Res {
     if q.contains_key("table") {
         return Err(ApiError::bad("table is for rows: a SQLite file's tables go to the tables of their names (?tables= picks them)"));
     }
     let opts = strata::sqlite::ImportOptions { tables: tables_param(q), schemas: Vec::new(), blobs_base64: flag(q, "blobs_base64", false)? };
     let plan = flag(q, "plan", false)?;
     let t0 = std::time::Instant::now();
-    let mut j = app.svc.import_sqlite(body, opts, plan, 0).await?;
+    let mut j = app.svc.import_sqlite(who, body, opts, plan, 0).await?;
     if !plan {
         let written: u64 = j["tables"].as_array().map_or(0, |t| t.iter().filter_map(|t| t["rows"].as_u64()).sum());
         j["written"] = json!(written);
@@ -1019,7 +1010,7 @@ async fn admin_verify(State(app): State<App>, body: Option<AxJson<Json>>) -> Res
 /// Makes this replica the primary of a new term: `{"replicas": [gRPC
 /// URLs], "write_acks": "all", "force": false}`
 /// ([`crate::service::Service::promote`]).
-async fn admin_promote(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+async fn admin_promote(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let urls = || ApiError::bad("replicas is a list of the gRPC URLs of the copies the new primary ships to");
     let replicas = match b.get("replicas") {
         None | Some(Json::Null) => Vec::new(),
@@ -1034,7 +1025,7 @@ async fn admin_promote(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         None | Some(Json::Null) => false,
         Some(v) => v.as_bool().ok_or_else(|| ApiError::bad("force is true or false"))?,
     };
-    Ok(AxJson(app.svc.promote(replicas, acks, force).await?))
+    Ok(AxJson(app.svc.promote(&who(w), replicas, acks, force).await?))
 }
 
 /// How long `POST /v1/admin/verify` waits for the replicas' digests by
@@ -1253,7 +1244,7 @@ async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<R
         Some(v) => Some(telemetry::now_ms() + v.as_f64().filter(|d| *d > 0.0).ok_or_else(|| ApiError::bad("expires_days is a number of days above 0"))?.mul_add(86_400_000.0, 0.0) as u64),
     };
     let open = app.token.is_none() && app.svc.keys.is_empty();
-    let (key, secret) = app.svc.keys.create(name, scope, expires, open)?;
+    let (key, secret) = app.svc.keys.create(name, scope, expires, app.token.is_some())?;
     tracing::info!(key = %key.id, name = %key.name, scope = scope.name(), "API key created");
     let detail = format!("created key {} ({}, {})", key.name, key.id, scope.name());
     Ok(audited(json!({"key": key.json(), "secret": secret, "closed": open}), detail))

@@ -26,7 +26,10 @@
 //! query (exact top 10, ties by key). With `--fuzzy auto` (or 1, 2), the
 //! prefix allows typos (`fuzzy => 'auto'`: none up to two letters, one up
 //! to five, else two), and the scan tests every prefix of every query by
-//! edit distance.
+//! edit distance. With `--exact-first` too, the completions rank by their
+//! fewest edits, exact ones first, each tier by count (a `CASE` of
+//! `PREFIX` conditions in the ranking expression), and the scan ranks
+//! them so.
 //!
 //! Writes `results/text/complete-<name>.json` and prints a table.
 
@@ -75,6 +78,11 @@ struct Args {
     /// 'auto')`.
     #[arg(long)]
     fuzzy: Option<String>,
+    /// With `--fuzzy`, rank completions by their edits, exact ones first,
+    /// each tier by count: `ORDER BY CASE WHEN PREFIX(id, :p) THEN 2 WHEN
+    /// PREFIX(id, :p, fuzzy => 1) THEN 1 ELSE 0 END * 1e9 + n DESC, id`.
+    #[arg(long)]
+    exact_first: bool,
 }
 
 /// The `PREFIX` condition timed, without typos or with `--fuzzy`'s.
@@ -88,22 +96,29 @@ fn prefix(a: &Args) -> String {
 }
 
 fn sql(a: &Args) -> String {
+    if a.exact_first {
+        assert!(a.fuzzy.is_some(), "--exact-first ranks typo completions: give --fuzzy");
+        return format!(
+            "SELECT id, n FROM queries WHERE {} ORDER BY CASE WHEN PREFIX(id, :p) THEN 2 WHEN PREFIX(id, :p, fuzzy => 1) THEN 1 ELSE 0 END * 1000000000 + n DESC, id LIMIT 10",
+            prefix(a)
+        );
+    }
     format!("SELECT id, n FROM queries WHERE {} ORDER BY n DESC, id LIMIT 10", prefix(a))
 }
 
-/// Whether query `q` matches prefix `p` as the timed query reads it: it
-/// starts with `p`, or with `--fuzzy` has a prefix within `p`'s edits
-/// whose first letter is `p`'s.
-fn matches(a: &Args, q: &str, p: &str) -> bool {
-    let Some(fuzzy) = a.fuzzy.as_deref() else { return q.starts_with(p) };
+/// Whether query `q` matches prefix `p` as the timed query reads it, and
+/// how: the fewest edits from `p` to a prefix of `q` whose first letter is
+/// `p`'s (0 without `--fuzzy`, which needs `q` to start with `p`).
+fn edits(a: &Args, q: &str, p: &str) -> Option<u8> {
+    let Some(fuzzy) = a.fuzzy.as_deref() else { return q.starts_with(p).then_some(0) };
     let p: Vec<char> = p.chars().collect();
     let k = fuzzy.parse().unwrap_or_else(|_| strata::text::query::auto_edits(p.len()));
     let mut v = q.chars();
     if v.next() != p.first().copied() {
-        return false;
+        return None;
     }
     let v: Vec<char> = q.chars().take(p.len() + k as usize).collect();
-    (1..=v.len()).any(|j| strata::text::fuzzy::within(&p, &v[..j].iter().collect::<String>(), k).is_some())
+    (1..=v.len()).filter_map(|j| strata::text::fuzzy::within(&p, &v[..j].iter().collect::<String>(), k)).min()
 }
 
 fn main() {
@@ -167,7 +182,7 @@ fn main() {
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
     let report = json!({
         "data": {"name": a.name, "queries": log.len(), "clicks": clicks},
-        "params": {"sql": sql(&a), "samples": a.samples, "threads_query": 1, "load_s": load_s, "cluster_by": a.cluster.then_some("id")},
+        "params": {"sql": sql(&a), "exact_first": a.exact_first, "samples": a.samples, "threads_query": 1, "load_s": load_s, "cluster_by": a.cluster.then_some("id")},
         "machine": {"cpu": machine, "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)},
         "states": states,
     });
@@ -218,9 +233,10 @@ fn run(db: &Db, a: &Args, lengths: &[usize], typed: &[&str], log: &[(String, i64
         rows.sort_by(f64::total_cmp);
         // The first prefixes against a scan of the log.
         for (p, s) in prefixes.iter().zip(&selects).take(a.check) {
-            let mut want: Vec<(i64, &str)> = log.iter().filter(|(q, _)| matches(a, q, p)).map(|(q, n)| (-n, q.as_str())).collect();
+            // Ranked by count, or with --exact-first by edits then count.
+            let mut want: Vec<(u8, i64, &str)> = log.iter().filter_map(|(q, n)| edits(a, q, p).map(|e| (if a.exact_first { e } else { 0 }, -n, q.as_str()))).collect();
             want.sort();
-            let want: Vec<&str> = want.into_iter().take(10).map(|(_, q)| q).collect();
+            let want: Vec<&str> = want.into_iter().take(10).map(|(_, _, q)| q).collect();
             let got = db.execute(&snap, s, &exec).unwrap();
             let got: Vec<&str> = got.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
             assert_eq!(got, want, "prefix {p:?}");

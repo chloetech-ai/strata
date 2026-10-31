@@ -14,6 +14,7 @@ use strata::query::Params;
 use strata::storage::{DbOptions, Layout};
 use strata::value::Value;
 use strata_server::auth::{self, Access, Secret, Tls};
+use strata_server::keys::Principal;
 use strata_server::replication::{Acks, Follow, Primary, PrimaryOptions};
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Replication, Service, MAX_LEASES};
 use strata_server::coord::{CoordOptions, Coordinator};
@@ -554,17 +555,17 @@ async fn coordinator_answers_like_one_database() {
             false => strata::query::ir::Plan::bind(sql, &coord.schema, &Params::new()).unwrap(),
         };
         let want = js::result(&whole.query(sql, &Params::new()).unwrap(), 0.0);
-        let Ok(strata_server::service::SqlAnswer::Rows(got)) = coord.run_plan(plan, After::Any, 0).await else { panic!("{sql}") };
+        let Ok(strata_server::service::SqlAnswer::Rows(got)) = coord.run_plan(&Principal::open(), plan, After::Any, 0).await else { panic!("{sql}") };
         same(sql, &want, &js::result(&got.rs, 0.0));
     }
     let strata::query::Command::Write { write, .. } = strata::query::bind_command("DELETE FROM products WHERE id = 'p0000001'", &[&coord.schema], &Params::new()).unwrap() else { panic!() };
-    let e = coord.run_plan(strata::query::ir::Plan::of_write(&coord.schema, &write), After::Any, 0).await.err().unwrap();
+    let e = coord.run_plan(&Principal::open(), strata::query::ir::Plan::of_write(&coord.schema, &write), After::Any, 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("coordinator"), "{}", e.message);
 
     // Writes: inserts go to their key's shard, UPDATE and DELETE to all.
     let sql = |s: String| {
         let coord = coord.clone();
-        async move { coord.sql(&s, &Params::new(), After::Any, 0).await.unwrap() }
+        async move { coord.sql(&Principal::open(), &s, &Params::new(), After::Any, 0).await.unwrap() }
     };
     let ids: Vec<String> = (0..30).map(|i| format!("new{i}")).collect();
     let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
@@ -802,7 +803,7 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
     let both = cluster(c);
     let ids: Vec<String> = (0..20).map(|i| format!("rep{i}")).collect();
     let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
-    both.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
+    both.sql(&Principal::open(), &format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
     let h = both.health().await;
     assert_eq!(h["status"], "ok", "{h}");
     for (s, shard) in h["shards"].as_array().unwrap().iter().enumerate() {
@@ -902,7 +903,7 @@ impl pb::strata_server::Strata for Recording {
         let a = self.inner.query(r).await?;
         let write = self.after_hold.lock().unwrap().take_if(|_| hold);
         if let Some(sql) = write {
-            self.inner.0.sql(&sql, &Params::new(), After::Any, 0).await.unwrap();
+            self.inner.0.sql(&Principal::open(), &sql, &Params::new(), After::Any, 0).await.unwrap();
         }
         Ok(a)
     }
@@ -1530,7 +1531,7 @@ async fn keys_live_in_their_slots() {
     // Writes land on the shard holding their key's slot.
     let ids: Vec<String> = (0..40).map(|i| format!("new{i}")).collect();
     let values: Vec<String> = ids.iter().map(|id| format!("('{id}', 'Tent {id}', 'outdoor', 10.0, 0)")).collect();
-    first.sql(&format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
+    first.sql(&Principal::open(), &format!("INSERT INTO products (id, title, category, price, sold) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
     for id in &ids {
         let k = Value::Str(id.clone());
         for (s, svc) in shards.iter().enumerate() {
@@ -1540,7 +1541,7 @@ async fn keys_live_in_their_slots() {
     }
     // A shard refuses a key another holds, however it is written.
     let theirs = (0..).map(|i| format!("x{i}")).find(|id| even.shard_of(&Value::Str(id.clone())) == 1).unwrap();
-    let e = shards[0].sql(&format!("INSERT INTO products (id, title) VALUES ('{theirs}', 'Lamp')"), &Params::new(), After::Any, 0).await.err().unwrap();
+    let e = shards[0].sql(&Principal::open(), &format!("INSERT INTO products (id, title) VALUES ('{theirs}', 'Lamp')"), &Params::new(), After::Any, 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("which shard 1 holds under slot map epoch 1"), "{}", e.message);
     let e = shards[0].write_ops(vec![json!({"op": "upsert", "doc": {"id": theirs, "title": "Lamp"}})], None).await.err().unwrap();
     assert_eq!(e.status, 400, "{}", e.message);
@@ -2292,7 +2293,7 @@ async fn bool_and_timestamp_fields_over_http_and_grpc() {
     assert_eq!(got.rs.rows, want.rows);
     assert!(!want.rows.is_empty());
     // An INSERT through the coordinator reaches its key's shard as written.
-    coord.sql("INSERT INTO tasks (id, done, at, n) VALUES ('y1', TRUE, '2026-10-31T23:59:59.5-03:00', 200)", &Params::new(), After::Any, 0).await.unwrap();
+    coord.sql(&Principal::open(), "INSERT INTO tasks (id, done, at, n) VALUES ('y1', TRUE, '2026-10-31T23:59:59.5-03:00', 200)", &Params::new(), After::Any, 0).await.unwrap();
     let got = coord.query(QueryReq { sql: "SELECT done, at FROM tasks WHERE id = 'y1'".into(), ..Default::default() }).await.unwrap();
     assert_eq!(js::result(&got.rs, 0.0)["rows"], json!([[true, "2026-11-01T02:59:59.500Z"]]));
 }
@@ -2344,13 +2345,13 @@ async fn defaults_and_not_null_over_http_and_grpc() {
     let coord = Coordinator::connect(urls).await.unwrap();
     let coord = Arc::new(Service::new(Backend::Cluster(Arc::new(coord)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10)));
     let values: Vec<String> = (0..20).map(|i| format!("('k{i}')")).collect();
-    coord.sql(&format!("INSERT INTO events (id) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
+    coord.sql(&Principal::open(), &format!("INSERT INTO events (id) VALUES {}", values.join(", ")), &Params::new(), After::Any, 0).await.unwrap();
     let got = coord.query(QueryReq { sql: "SELECT kind, n, COUNT(*), MIN(at), MAX(at) FROM events GROUP BY kind, n".into(), ..Default::default() }).await.unwrap();
     let rows = js::result(&got.rs, 0.0)["rows"].clone();
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!((&rows[0][0], &rows[0][1], &rows[0][2]), (&json!("click"), &json!(1), &json!(20)));
     assert_eq!(rows[0][3], rows[0][4], "one time for the statement: {rows}");
-    assert!(coord.sql("INSERT INTO events (id, kind) VALUES ('y', NULL)", &Params::new(), After::Any, 0).await.is_err());
+    assert!(coord.sql(&Principal::open(), "INSERT INTO events (id, kind) VALUES ('y', NULL)", &Params::new(), After::Any, 0).await.is_err());
 }
 
 /// A TEXT field's analyzer over HTTP: the schema names it, and searches
@@ -2737,7 +2738,7 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
     let (pu, old) = recording_of(p.clone(), 5).await;
     let coord = cluster(Coordinator::connect_with(vec![format!("{pu}|{ru}")], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap());
     assert_eq!(coord.write_ops(set(1), None).await.unwrap().seq_nos, vec![1]);
-    let a = r.promote(vec![pu.clone()], Acks::All, false).await.unwrap();
+    let a = r.promote(&Principal::open(), vec![pu.clone()], Acks::All, false).await.unwrap();
     assert_eq!(a["replicas"][0]["role"], "primary", "{a}");
     for _ in 0..200 {
         if p.replaced_by() == 2 {
@@ -2775,7 +2776,7 @@ async fn a_coordinator_writes_to_the_promoted_primary() {
         let coord = cluster(Coordinator::connect_with(vec![copies], CoordOptions { hedge: Duration::from_secs(60), ..Default::default() }).await.unwrap());
         assert_eq!(coord.write_ops(set(1), None).await.unwrap().seq_nos, vec![1]);
         old.down.store(true, Ordering::Relaxed);
-        r.promote(Vec::new(), Acks::All, false).await.unwrap();
+        r.promote(&Principal::open(), Vec::new(), Acks::All, false).await.unwrap();
         let w = coord.write_ops(set(2), None).await.unwrap();
         assert_eq!(w.seq_nos, vec![2]);
         assert_eq!(sold(&rdb), vec![Value::Int(2), Value::Int(2)]);

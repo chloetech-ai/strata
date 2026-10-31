@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
 use crate::service::{After, QueryReq, Service, Stream};
-use crate::keys::{Principal, Scope};
+use crate::keys::{self, Principal, Scope};
 use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
@@ -195,40 +195,75 @@ pub fn code_name(c: tonic::Code) -> &'static str {
     }
 }
 
-/// Refuses a call its credential may not make ([`crate::keys`]): the
-/// internal methods only the root may (the token the servers of a
-/// cluster share), writes a write or admin key, profiles an admin key (as
-/// `/v1/profile` over HTTP), the rest any key.
-fn may_call<T>(req: &Request<T>, method: &str) -> Result<(), Status> {
-    let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
-    let internal = matches!(method, "Replicate" | "Restore" | "Verify" | "Slots");
-    if internal && !who.root {
-        return Err(Status::permission_denied(format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name)));
+/// The least a method's credential needs ([`crate::keys`]): the internal
+/// methods the root (the token the servers of a cluster share), writes a
+/// write key, a profile an admin key (as `/v1/profile` over HTTP), the
+/// rest any key. What a call then does (a `Write` of a
+/// table's statement needs an admin key) the service checks, as for HTTP.
+/// Every method is named, so that a new one must say what it needs.
+fn method_scope(method: &str) -> Option<Scope> {
+    match method {
+        "Replicate" | "Restore" | "Verify" | "Slots" => None,
+        "Write" | "WriteStream" => Some(Scope::Write),
+        "Profile" => Some(Scope::Admin),
+        "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
+        // An unknown method is the root's.
+        _ => None,
     }
-    let need = match method {
-        "Write" | "WriteStream" => Scope::Write,
-        "Profile" => Scope::Admin,
-        _ => Scope::Read,
+}
+
+/// Who a call is from, and whether that may call its method.
+fn may_call<T>(req: &Request<T>, method: &str) -> (Principal, Result<(), ApiError>) {
+    let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
+    let r = match method_scope(method) {
+        None if !who.root => Err(ApiError { status: 403, message: format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name) }),
+        None => Ok(()),
+        Some(need) => who.may(need, method),
     };
-    who.may(need, method).map_err(|e| Status::permission_denied(e.message))
+    (who, r)
+}
+
+/// Keeps a call in the audit log ([`crate::keys::Audit`]), as HTTP keeps
+/// a request: a refused one, or one the service noted ([`keys::note`]).
+fn audit(svc: &Service, who: &Principal, method: &str, status: u16, t0: Instant, detail: Option<String>) {
+    if status != 401 && status != 403 && detail.is_none() {
+        return;
+    }
+    svc.audit.add(keys::Entry {
+        ts_ms: crate::telemetry::now_ms(),
+        who: who.name.clone(),
+        key: who.key.clone(),
+        scope: Some(who.scope.name()),
+        method: "gRPC".into(),
+        route: method.to_string(),
+        status,
+        ms: t0.elapsed().as_secs_f64() * 1e3,
+        request_id: obs::current().map(|id| id.to_string()),
+        detail,
+    });
 }
 
 impl Grpc {
     /// Serves one call: gives it its id (the caller's `x-request-id`, or a
     /// new one, sent back in the answer's metadata), runs it in a span that
     /// names it, counts it and logs it ([`crate::obs`]).
-    async fn serve<T, R, Fut>(&self, method: &'static str, req: Request<T>, f: impl FnOnce(Arc<Service>, T) -> Fut) -> Result<Response<R>, Status>
+    async fn serve<T, R, Fut>(&self, method: &'static str, req: Request<T>, f: impl FnOnce(Arc<Service>, Principal, T) -> Fut) -> Result<Response<R>, Status>
     where
         Fut: Future<Output = Result<R, ApiError>>,
     {
         let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
         let span = tracing::info_span!("request", id = %id, method);
-        if let Err(s) = may_call(&req, method) {
-            self.0.metrics.grpc(method, "PermissionDenied", 0.0);
-            return Err(s);
-        }
         let t0 = Instant::now();
-        let r = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), f(self.0.clone(), req.into_inner()))).instrument(span.clone()).await;
+        let (who, may) = may_call(&req, method);
+        if let Err(e) = may {
+            self.0.metrics.grpc(method, "PermissionDenied", 0.0);
+            obs::scope(Some(id.clone()), async { audit(&self.0, &who, method, e.status, t0, None) }).await;
+            return Err(Status::from(e));
+        }
+        let call = keys::noting(f(self.0.clone(), who.clone(), req.into_inner()));
+        let (r, note) = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), call)).instrument(span.clone()).await;
+        let status = r.as_ref().map_or_else(|e| e.status, |_| 200);
+        obs::scope(Some(id.clone()), async { audit(&self.0, &who, method, status, t0, note) }).await;
         let secs = t0.elapsed().as_secs_f64();
         let _in = span.enter();
         let (code, r) = match r {
@@ -263,7 +298,7 @@ impl Grpc {
 #[tonic::async_trait]
 impl pb::strata_server::Strata for Grpc {
     async fn query(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::QueryResponse>, Status> {
-        self.serve("Query", req, |svc, r| async move {
+        self.serve("Query", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
             let a = svc.query(query_req(r)?).await?;
             Ok(pb::QueryResponse { snapshot: a.lease, ..result_to_pb(&a.rs, a.took_ms) })
@@ -272,7 +307,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn term_stats(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::TermStatsResponse>, Status> {
-        self.serve("TermStats", req, |svc, r| async move {
+        self.serve("TermStats", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
             let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
             let after = After::of(r.min_seq_no, r.min_seq_nos)?;
@@ -283,7 +318,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn guard_counts(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::GuardCountsResponse>, Status> {
-        self.serve("GuardCounts", req, |svc, r| async move {
+        self.serve("GuardCounts", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
             let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
             let after = After::of(r.min_seq_no, r.min_seq_nos)?;
@@ -294,7 +329,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn sid_next(&self, req: Request<pb::SidNextRequest>) -> Result<Response<pb::SidNextResponse>, Status> {
-        self.serve("SidNext", req, |svc, r| async move {
+        self.serve("SidNext", req, |svc, _who, r| async move {
             let q = r.query.unwrap_or_default();
             svc.check_epoch(q.epoch)?;
             let plan = request_plan(q.protocol, q.plan, &q.plan_json)?;
@@ -310,14 +345,14 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
-        self.serve("Write", req, |svc, r| async move {
+        self.serve("Write", req, |svc, who, r| async move {
             svc.check_epoch(r.epoch)?;
             let w = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
                 svc.write_ops(ops, key).await?
             } else {
-                match svc.sql(&r.sql, &params_from_pb(r.params), After::Any, 0).await? {
+                match svc.sql(&who, &r.sql, &params_from_pb(r.params), After::Any, 0).await? {
                     crate::service::SqlAnswer::Written { w, .. } => w,
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
@@ -333,8 +368,13 @@ impl pb::strata_server::Strata for Grpc {
     /// it; the first that fails ends the stream with its error, so that no
     /// batch after it is applied ([`Service::stream_write`]).
     async fn write_stream(&self, req: Request<tonic::Streaming<pb::WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
-        may_call(&req, "WriteStream")?;
         let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
+        let (who, may) = may_call(&req, "WriteStream");
+        if let Err(e) = may {
+            self.0.metrics.grpc("WriteStream", "PermissionDenied", 0.0);
+            obs::scope(Some(id.clone()), async { audit(&self.0, &who, "WriteStream", e.status, Instant::now(), None) }).await;
+            return Err(Status::from(e));
+        }
         let mut input = req.into_inner();
         let svc = self.0.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -384,7 +424,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn sources(&self, req: Request<pb::SourcesRequest>) -> Result<Response<pb::SourcesResponse>, Status> {
-        self.serve("Sources", req, |svc, _| async move {
+        self.serve("Sources", req, |svc, _who, _| async move {
             let sources = svc.sources().await?;
             Ok(pb::SourcesResponse { sources: sources.into_iter().map(|s| pb::Source { name: s.name, offset: s.offset, updated_micros: s.updated.unwrap_or(0) }).collect() })
         })
@@ -392,7 +432,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn schema(&self, req: Request<pb::Empty>) -> Result<Response<pb::SchemaResponse>, Status> {
-        self.serve("Schema", req, |svc, _| async move {
+        self.serve("Schema", req, |svc, _who, _| async move {
             let tables = svc.catalog().iter().map(|t| serde_json::to_string(&**t).unwrap_or_default()).collect();
             let profiles = svc.rank_profiles().iter().map(|(t, p)| crate::coord::profile_json(t, p)).collect();
             Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default(), tables_json: tables, profiles_json: profiles })
@@ -401,7 +441,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
-        self.serve("Hello", req, |svc, _| async move {
+        self.serve("Hello", req, |svc, _who, _| async move {
             let n = svc.local_db().and_then(|db| db.storage().numbering()).unwrap_or_default();
             Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), role: svc.role() as i32, term: n.term, seq_no: n.seq, replaced_by_term: svc.replaced_by(), ..hello() })
         })
@@ -409,19 +449,19 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn replicate(&self, req: Request<pb::ReplicateRequest>) -> Result<Response<pb::ReplicateResponse>, Status> {
-        self.serve("Replicate", req, |svc, r| async move { svc.replicate(r).await }).await
+        self.serve("Replicate", req, |svc, _who, r| async move { svc.replicate(r).await }).await
     }
 
     async fn restore(&self, req: Request<tonic::Streaming<pb::RestoreChunk>>) -> Result<Response<pb::ReplicateResponse>, Status> {
-        self.serve("Restore", req, |svc, chunks| async move { svc.restore(chunks).await }).await
+        self.serve("Restore", req, |svc, _who, chunks| async move { svc.restore(chunks).await }).await
     }
 
     async fn verify(&self, req: Request<pb::VerifyRequest>) -> Result<Response<pb::VerifyResponse>, Status> {
-        self.serve("Verify", req, |svc, r| async move { svc.verify_for(r).await }).await
+        self.serve("Verify", req, |svc, _who, r| async move { svc.verify_for(r).await }).await
     }
 
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
-        self.serve("Slots", req, |svc, r| async move {
+        self.serve("Slots", req, |svc, _who, r| async move {
             let j: serde_json::Value = from_json(&r.map_json, "slot map")?;
             let map = crate::slots::SlotMap::from_json(&j).map_err(ApiError::bad)?;
             Ok(pb::SlotsResponse { epoch: svc.set_slots(map, r.shard as usize).await? })
@@ -430,7 +470,7 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn release(&self, req: Request<pb::ReleaseRequest>) -> Result<Response<pb::Empty>, Status> {
-        self.serve("Release", req, |svc, r| async move {
+        self.serve("Release", req, |svc, _who, r| async move {
             svc.release(&r.snapshots);
             Ok(pb::Empty {})
         })
@@ -438,16 +478,18 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn profile(&self, req: Request<pb::ProfileRequest>) -> Result<Response<pb::ProfileResponse>, Status> {
-        self.serve("Profile", req, |svc, r| async move {
+        self.serve("Profile", req, |svc, _, r| async move {
             let body: serde_json::Value = if r.body_json.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&r.body_json).map_err(|e| ApiError::bad(format!("bad profile body: {e}")))? };
             let asked = crate::profiling::Asked { kind: crate::profiling::Kind::of(&r.kind)?, body, folded: r.folded, in_use: r.in_use };
+            // Audited as an admin's request over HTTP is.
+            keys::note(format!("a {} profile", asked.kind.name()));
             Ok(pb::ProfileResponse { body: crate::profiling::take(&svc, asked).await?.bytes() })
         })
         .await
     }
 
     async fn health(&self, req: Request<pb::Empty>) -> Result<Response<pb::HealthResponse>, Status> {
-        self.serve("Health", req, |svc, _| async move {
+        self.serve("Health", req, |svc, _who, _| async move {
             let d = svc.detail().await;
             let h = &d["health"];
             let n = |k: &str| h[k].as_u64().unwrap_or(0);

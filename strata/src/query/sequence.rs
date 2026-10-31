@@ -35,6 +35,12 @@ use crate::vector::kernels::{dot_f32, dot_f32_4x4};
 /// The files of a sequence model in its directory.
 pub const CONFIG_FILE: &str = "config.json";
 pub const WEIGHTS_FILE: &str = "model.safetensors";
+/// The item vectors the model was trained with (learned with it, or read),
+/// which strata-py's trainer writes beside it: the F32 tensor `vectors`
+/// (one row an item) and the items' keys, a JSON array in the metadata's
+/// `keys`. A model with them is versioned with them (its hash covers the
+/// file), and serves only over a table whose vectors are those.
+pub const ITEMS_FILE: &str = "items.safetensors";
 
 /// The most events of a history a model may read.
 pub const MAX_LEN: usize = 4096;
@@ -139,7 +145,8 @@ pub struct Event<'a> {
 /// A sequence encoder ([module docs](self)).
 pub struct SequenceModel {
     pub name: String,
-    /// FNV-1a of the config and the weights, as 16 hex digits.
+    /// FNV-1a of the config, the weights and the item vectors (if it has
+    /// them), as 16 hex digits.
     pub hash: String,
     /// The item table and VECTOR field whose vectors the model reads and
     /// answers in, and their dimension.
@@ -153,6 +160,10 @@ pub struct SequenceModel {
     buckets: usize,
     /// Action names, by index; 0 is any other (and none).
     actions: HashMap<String, usize>,
+    /// The item vectors it was trained with ([`ITEMS_FILE`]): each item's
+    /// row in `item_rows`, by key.
+    items: HashMap<ItemKey, usize>,
+    item_rows: Vec<f32>,
     inp: Linear,
     action: Vec<f32>,
     gap: Vec<f32>,
@@ -175,8 +186,8 @@ impl PartialEq for SequenceModel {
 }
 
 /// The F32 tensors of a safetensors file, by name: their shapes and values.
-fn tensors(name: &str, raw: &[u8]) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>> {
-    let bad = |m: &str| bad(name, format!("{WEIGHTS_FILE}: {m}"));
+fn tensors(name: &str, file: &str, raw: &[u8]) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>> {
+    let bad = |m: &str| bad(name, format!("{file}: {m}"));
     let n = raw.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize).ok_or_else(|| bad("not a safetensors file"))?;
     let header: serde_json::Map<String, Json> = raw.get(8..8 + n).and_then(|h| serde_json::from_slice(h).ok()).ok_or_else(|| bad("a header that is not JSON"))?;
     let data = &raw[8 + n..];
@@ -197,15 +208,64 @@ fn tensors(name: &str, raw: &[u8]) -> Result<HashMap<String, (Vec<usize>, Vec<f3
     Ok(out)
 }
 
+/// An item's key as [`ITEMS_FILE`] lists it: text or a whole number.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ItemKey {
+    Str(String),
+    Int(i64),
+}
+
+/// The item vectors of an [`ITEMS_FILE`], `dim` components each.
+fn item_vectors(name: &str, raw: &[u8], dim: usize) -> Result<(HashMap<ItemKey, usize>, Vec<f32>)> {
+    let fail = |m: String| bad(name, format!("{ITEMS_FILE}: {m}"));
+    let n = raw.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize).ok_or_else(|| fail("not a safetensors file".into()))?;
+    let header: Json = raw.get(8..8 + n).and_then(|h| serde_json::from_slice(h).ok()).ok_or_else(|| fail("a header that is not JSON".into()))?;
+    let keys: Vec<Json> = header["__metadata__"]["keys"].as_str().and_then(|k| serde_json::from_str(k).ok()).ok_or_else(|| fail("no keys in its metadata (a JSON array)".into()))?;
+    let mut ts = tensors(name, ITEMS_FILE, raw)?;
+    let (shape, rows) = ts.remove("vectors").ok_or_else(|| fail("no tensor named vectors".into()))?;
+    if shape != [keys.len(), dim] {
+        return Err(fail(format!("vectors has shape {shape:?}, not {} keys by {dim}", keys.len())));
+    }
+    let mut index = HashMap::with_capacity(keys.len());
+    for (i, k) in keys.into_iter().enumerate() {
+        let key = match k {
+            Json::String(s) => ItemKey::Str(s),
+            Json::Number(n) if n.is_i64() => ItemKey::Int(n.as_i64().unwrap()),
+            k => return Err(fail(format!("a key is text or a whole number, not {k}"))),
+        };
+        if index.insert(key, i).is_some() {
+            return Err(fail("a key is listed twice".into()));
+        }
+    }
+    Ok((index, rows))
+}
+
 impl SequenceModel {
-    /// A model from its two files ([module docs](self)). The config is
+    /// The vector the model was trained with for item `key`, if it keeps
+    /// its items' ([`ITEMS_FILE`]) and has that one.
+    pub fn item_vector(&self, key: &crate::value::Value) -> Option<&[f32]> {
+        let k = match key {
+            crate::value::Value::Str(s) => ItemKey::Str(s.clone()),
+            crate::value::Value::Int(n) => ItemKey::Int(*n),
+            _ => return None,
+        };
+        self.items.get(&k).map(|&i| &self.item_rows[i * self.dim..(i + 1) * self.dim])
+    }
+
+    /// Whether the model keeps the item vectors it was trained with.
+    pub fn has_items(&self) -> bool {
+        !self.items.is_empty()
+    }
+
+    /// A model from its files ([module docs](self)), the item vectors'
+    /// ([`ITEMS_FILE`]) if it has them. The config is
     /// `{"table", "field", "dim", "width", "layers", "heads", "ffn",
     /// "max_len", "gap_buckets", "actions", "eps"}`; the weights are
     /// `inp` (dim to width), `action`, `gap`, `position` (embeddings),
     /// `layers.<i>.{ln1, qkv, proj, ln2, up, down}` and `ln`, `out` (width
     /// to dim), each `.weight` and `.bias` (`.weight` alone for an
     /// embedding).
-    pub fn parse(name: &str, config: &[u8], weights: &[u8]) -> Result<SequenceModel> {
+    pub fn parse(name: &str, config: &[u8], weights: &[u8], items: Option<&[u8]>) -> Result<SequenceModel> {
         let c: Json = serde_json::from_slice(config).map_err(|e| bad(name, format!("{CONFIG_FILE} is not JSON: {e}")))?;
         let num = |k: &str| c.get(k).and_then(|v| v.as_u64()).filter(|&v| v > 0).map(|v| v as usize).ok_or_else(|| bad(name, format!("{CONFIG_FILE} has no {k} (a positive whole number)")));
         let text = |k: &str| c.get(k).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| bad(name, format!("{CONFIG_FILE} has no {k}")));
@@ -221,7 +281,7 @@ impl SequenceModel {
         if actions.is_empty() {
             return Err(bad(name, "actions lists at least the action of index 0, \"\" (any other)"));
         }
-        let mut ts = tensors(name, weights)?;
+        let mut ts = tensors(name, WEIGHTS_FILE, weights)?;
         let mut take = |k: &str, shape: &[usize]| {
             let (s, v) = ts.remove(k).ok_or_else(|| bad(name, format!("{WEIGHTS_FILE} has no tensor {k}")))?;
             if s != shape {
@@ -252,6 +312,13 @@ impl SequenceModel {
         }
         let mut h = fnv(config);
         h = fnv_more(h, weights);
+        let (items, item_rows) = match items {
+            Some(raw) => {
+                h = fnv_more(h, raw);
+                item_vectors(name, raw, dim)?
+            }
+            None => (HashMap::new(), Vec::new()),
+        };
         Ok(SequenceModel {
             name: name.to_string(),
             hash: format!("{h:016x}"),
@@ -263,6 +330,8 @@ impl SequenceModel {
             heads,
             buckets,
             actions: actions.into_iter().enumerate().skip(1).map(|(i, a)| (a, i)).collect(),
+            items,
+            item_rows,
             inp,
             action,
             gap,
@@ -369,7 +438,7 @@ pub struct SequenceModels {
     open: Mutex<HashMap<PathBuf, (Stamp, Arc<SequenceModel>)>>,
 }
 
-type Stamp = [(SystemTime, u64); 2];
+type Stamp = [(SystemTime, u64); 3];
 
 impl SequenceModels {
     /// The model `name` of the directory `dir`.
@@ -382,14 +451,20 @@ impl SequenceModels {
         let stamp = |p: &Path| {
             std::fs::metadata(p).map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len())).map_err(|_| Error::Query(format!("no sequence model named {name}: no file {}", p.display())))
         };
-        let s = [stamp(&config)?, stamp(&weights)?];
+        let items = at.join(ITEMS_FILE);
+        let s = [stamp(&config)?, stamp(&weights)?, std::fs::metadata(&items).map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len())).unwrap_or((SystemTime::UNIX_EPOCH, 0))];
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((t, m)) = open.get(&at) {
             if *t == s {
                 return Ok(m.clone());
             }
         }
-        let m = Arc::new(SequenceModel::parse(name, &std::fs::read(&config)?, &std::fs::read(&weights)?)?);
+        let raw_items = match std::fs::read(&items) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let m = Arc::new(SequenceModel::parse(name, &std::fs::read(&config)?, &std::fs::read(&weights)?, raw_items.as_deref())?);
         open.insert(at, (s, m.clone()));
         Ok(m)
     }
