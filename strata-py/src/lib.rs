@@ -407,6 +407,66 @@ impl Database {
         .map_err(err)
     }
 
+    /// Applies write operations as strata-server's /v1/write takes them, in
+    /// one transaction: insert, upsert and delete, and set and add of a
+    /// numeric field in place (an add with a "doc" inserts it when no row
+    /// has its key). Returns the rows written.
+    fn write(&self, py: Python<'_>, ops: &Bound<'_, PyAny>) -> PyResult<u64> {
+        let db = self.get()?;
+        let ops = rows_json(ops)?;
+        py.detach(|| -> strata::Result<u64> {
+            let bad = |i: usize, m: &str| strata::Error::Query(format!("operation {}: {m}", i + 1));
+            let mut t = db.storage().begin()?;
+            let mut n = 0;
+            for (i, op) in ops.iter().enumerate() {
+                let get = |k: &str| op.get(k).filter(|v| !v.is_null());
+                let kind = get("op").and_then(Json::as_str).ok_or_else(|| bad(i, "it needs \"op\""))?;
+                let s = table_of(&db, get("table").and_then(Json::as_str))?;
+                let doc = || match get("doc") {
+                    Some(d) => Ok(Database::documents(&db, &s, std::slice::from_ref(d))?.remove(0)),
+                    None => Err(bad(i, &format!("{kind} needs \"doc\""))),
+                };
+                let key = || {
+                    let pk = s.primary_key.ok_or_else(|| bad(i, "writing by key needs a primary key"))?;
+                    ingest::value(&s, pk, get("key").ok_or_else(|| bad(i, &format!("{kind} needs \"key\"")))?)
+                };
+                let field = || get("field").and_then(Json::as_str).ok_or_else(|| bad(i, &format!("{kind} needs \"field\"")));
+                let mut tt = t.table(&s.table)?;
+                let wrote = match kind {
+                    "insert" => tt.insert(doc()?).map(|_| true)?,
+                    "upsert" => tt.upsert(doc()?).map(|_| true)?,
+                    "delete" => tt.delete(&key()?)?,
+                    "set" => {
+                        let f = field()?;
+                        let fi = s.field_index(f).ok_or_else(|| bad(i, &format!("no field {f}")))?;
+                        tt.set(&key()?, f, ingest::value(&s, fi, get("value").unwrap_or(&Json::Null))?)?
+                    }
+                    "add" => {
+                        let delta = match get("value") {
+                            Some(Json::Number(x)) => x.as_i64().map(Value::Int).or_else(|| x.as_f64().map(Value::Float)),
+                            _ => None,
+                        };
+                        let delta = delta.ok_or_else(|| bad(i, "add needs a numeric value"))?;
+                        if get("doc").is_some() {
+                            let d = doc()?;
+                            if get("key").is_some() && Some(&key()?) != s.primary_key.map(|pk| &d[pk]) {
+                                return Err(bad(i, "add's key and its doc's key differ: give one"));
+                            }
+                            tt.add_or_insert(d, field()?, &delta).map(|_| true)?
+                        } else {
+                            tt.add(&key()?, field()?, &delta)?
+                        }
+                    }
+                    other => return Err(bad(i, &format!("unknown op {other:?}"))),
+                };
+                n += wrote as u64;
+            }
+            t.commit()?;
+            Ok(n)
+        })
+        .map_err(err)
+    }
+
     /// Loads a JSON Lines, JSON, CSV or TSV file; returns (rows, bulk,
     /// skipped fields).
     #[pyo3(signature = (path, format = None, table = None))]

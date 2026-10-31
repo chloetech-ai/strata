@@ -1,0 +1,114 @@
+{
+  "data": {
+    "name": "amazon-beauty-5core",
+    "users": 22363,
+    "items": 12101,
+    "reviews": 198502,
+    "last_two_same_day": 0.4346017976121272
+  },
+  "protocol": "leave-one-out (each user's last item, from the items before it), full ranking; fewer than 10 scored items filled by frequency; reviews of one day in file order (by product), as the usual preprocessing leaves them",
+  "checked_users": 2000,
+  "params": {
+    "k": 10,
+    "threads_query": 1
+  },
+  "loads": [
+    {
+      "counts_before_last": 1,
+      "adds": 394239,
+      "rows": 370355,
+      "load_s": 6.467375126998377
+    },
+    {
+      "counts_before_last": 2,
+      "adds": 327150,
+      "rows": 306462,
+      "load_s": 5.7402269979975244
+    }
+  ],
+  "published": {
+    "sasrec": {
+      "recall_at_10": 0.0605,
+      "ndcg_at_10": 0.0318,
+      "source": "TIGER (arXiv 2305.05065) Table 1, from P5"
+    }
+  },
+  "machine": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4
+  },
+  "runs": [
+    {
+      "counts_before_last": 1,
+      "order": 1,
+      "backoff": 0.4,
+      "recall_at_10": 0.06881903143585387,
+      "ndcg_at_10": 0.045850335229279164,
+      "ms": {
+        "p50": 0.5741310014855117,
+        "p99": 1.4605360011046287,
+        "mean": 0.6430870161066682
+      }
+    },
+    {
+      "counts_before_last": 1,
+      "order": 2,
+      "backoff": 0.4,
+      "recall_at_10": 0.06940034879041274,
+      "ndcg_at_10": 0.044984649462515416,
+      "ms": {
+        "p50": 0.6409559973690193,
+        "p99": 1.6949589989962988,
+        "mean": 0.7184606546905813
+      }
+    },
+    {
+      "counts_before_last": 1,
+      "order": 3,
+      "backoff": 0.4,
+      "recall_at_10": 0.06935563207083129,
+      "ndcg_at_10": 0.044948168801973686,
+      "ms": {
+        "p50": 0.7206709997262806,
+        "p99": 1.7755849985405803,
+        "mean": 0.7974350183116878
+      }
+    },
+    {
+      "counts_before_last": 2,
+      "order": 1,
+      "backoff": 0.4,
+      "recall_at_10": 0.060680588472029694,
+      "ndcg_at_10": 0.04035495936204101,
+      "ms": {
+        "p50": 0.4881349996139761,
+        "p99": 1.227898999786703,
+        "mean": 0.5482764209605769
+      }
+    },
+    {
+      "counts_before_last": 2,
+      "order": 2,
+      "backoff": 0.4,
+      "recall_at_10": 0.06130662254617001,
+      "ndcg_at_10": 0.03978659086232104,
+      "ms": {
+        "p50": 0.566720002098009,
+        "p99": 1.382891001412645,
+        "mean": 0.6337234880488587
+      }
+    },
+    {
+      "counts_before_last": 2,
+      "order": 3,
+      "backoff": 0.4,
+      "recall_at_10": 0.06130662254617001,
+      "ndcg_at_10": 0.03971667148938288,
+      "ms": {
+        "p50": 0.6290269993769471,
+        "p99": 1.4854209985060152,
+        "mean": 0.6936708404148718
+      }
+    }
+  ]
+}

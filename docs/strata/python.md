@@ -79,6 +79,7 @@ Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for
 | `delete(keys)` | deletes the rows with a key or keys; returns how many there were |
 | `sql("UPDATE ...")` | `INSERT`, `UPDATE` and `DELETE` statements; returns the rows written. It also runs `CREATE TABLE` and `DROP TABLE` ([tables](query-language.md#tables)) and `CREATE` and `DROP RANK PROFILE` ([rank profiles](query-language.md#rank-profiles-a-ranking-kept-with-its-table)), which return 0, and writes any table |
 | `import_file(path, format=None)` | loads a JSON Lines, JSON, CSV or TSV file ([how files are read](server.md#loading-rows)); returns `{rows, bulk, skipped_fields}` |
+| `write(ops)` | applies write operations in one transaction, as the server's `/v1/write` takes them: `insert`, `upsert` and `delete`, and `set` or `add` of a numeric field in place (`{"op": "add", "key": k, "field": "n", "value": 1}`; with a `doc` instead of a `key`, an `add` inserts the row when no row has its key); each names its `table` or writes the first; returns the rows written |
 | `import_sqlite(path, tables=None, schemas=None)` | imports a SQLite database's tables, each into the table of its name, created when missing ([SQLite in and out](sqlite.md)); returns what it did and what did not carry over |
 | `export_sqlite(path, tables=None, fts=True, indexes=True)` | writes the tables to a new SQLite file, with indexes, an FTS5 index over the text and the Strata schemas |
 
@@ -202,6 +203,18 @@ items.query("SELECT id FROM items WHERE sid = '12.7'")
 ```
 
 It returns the SHA-256 of the file, which the table records. The options are `levels` (1 to 4, default 3), `k` centroids a level (up to 256), `iterations` of k-means a level (25), `sample`, the vectors it trains on (100 a centroid by default, drawn at random), `seed` (the same vectors and options give the same codebook), `table` (a database's first by default) and `models` (the default models directory, as for `Database.create`). Pass the same `models=` to `Database.create` and `Database.open`: a codebook that does not open is listed in `db.embed_errors`, and writes that need a code then fail.
+
+## Next items
+
+`strata.ngrams` keeps counts of what came after the last one or two items in a table, and `strata.next_items(db, history, k=10)` reads them with backoff ([Next items](next-items.md)):
+
+```python
+from strata import ngrams
+
+db = strata.open("next.strata", ngrams.schema())
+db.write(ngrams.ops(["a", "b"], "c"))       # after each event: "c" after [..., "a", "b"]
+strata.next_items(db, ["a", "b"], k=10)     # [("c", 1.0), ...]
+```
 
 ## A server from Python
 
