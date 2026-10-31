@@ -92,7 +92,7 @@ export function profileFigures(p) {
   return { cpu, segs: segs.size, threads: threads.size, wall, shards: steps.filter((x) => x.op === "shard").length };
 }
 
-function kpi(label, value, sub, title) {
+export function kpi(label, value, sub, title) {
   return h("div", { class: "card kpi", title }, h("div", { class: "lbl" }, label), h("div", { class: "val", style: { fontSize: "21px" } }, value), sub ? h("div", { class: "delta", style: { maxWidth: "100%" } }, sub) : null);
 }
 

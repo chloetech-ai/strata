@@ -76,9 +76,12 @@ pub struct QueryReq {
     pub release: bool,
     /// The writes the query must see ([`After`]).
     pub after: After,
-    /// Measure each step's CPU time ([`ExecOptions::profile`]); a
-    /// coordinator asks its shards to.
+    /// Measure each step's CPU time ([`ExecOptions::profile`]).
     pub profile: bool,
+    /// Not kept among the latest queries, nor in the statements'
+    /// statistics: a run of a CPU profile's query ([`crate::profiler`]),
+    /// which runs it thousands of times. Still counted in the metrics.
+    pub quiet: bool,
 }
 
 /// The writes a read must see, so that a client reads its own writes
@@ -1381,7 +1384,7 @@ impl Service {
         };
         drop(live);
         // A shard's answer to a coordinator is not a client's.
-        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, profiled, res);
+        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, (profiled, req.quiet), res);
         // A lease made for a query that failed holds nothing to fetch.
         let made = (lease != req.snapshot).then_some(lease).filter(|_| a.is_err());
         if let Some(l) = (req.release && req.snapshot != 0).then_some(req.snapshot).or(made) {
@@ -1394,7 +1397,7 @@ impl Service {
     /// answer. One with more rows than `window` (a compound query's, or a
     /// coordinator's without a LIMIT) fails.
     #[allow(clippy::too_many_arguments)]
-    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, profiled: bool, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
+    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, (profiled, quiet): (bool, bool), res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
         let mut res = match (res, window) {
             (Ok((rs, _)), Some(m)) if rs.rows.len() > m => Err(ApiError::bad(format!("query error: the query matches more than {m} rows, the most a query returns; add a LIMIT"))),
             (r, _) => r,
@@ -1422,7 +1425,9 @@ impl Service {
             self.metrics.slow("query");
             tracing::warn!(kind, outcome, secs, rows, sql = %obs::truncate(sql, 2000), "slow query");
         }
-        self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow, res.as_ref().ok().map(|(rs, _)| &rs.stats), profiled);
+        if !quiet {
+            self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow, res.as_ref().ok().map(|(rs, _)| &rs.stats), profiled);
+        }
         res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing, lease: 0 })
     }
 
@@ -1432,7 +1437,7 @@ impl Service {
     async fn compound(self: &Arc<Self>, mut req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
         req.profile |= self.profiling.cpu_all.load(Ordering::Relaxed);
-        let profiled = req.profile;
+        let (profiled, quiet) = (req.profile, req.quiet);
         let catalog = self.catalog();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
@@ -1443,7 +1448,7 @@ impl Service {
             Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
             r => r,
         };
-        self.done(&req_sql, kind, t0, self.max_rows, false, profiled, res)
+        self.done(&req_sql, kind, t0, self.max_rows, false, (profiled, quiet), res)
     }
 
     /// The work of [`Self::compound`]; [`Self::done`] counts it.

@@ -30,6 +30,7 @@ pub mod media;
 pub mod metrics;
 pub mod obs;
 pub mod plan_pb;
+pub mod profiler;
 pub mod replication;
 pub mod server;
 pub mod service;
