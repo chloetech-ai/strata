@@ -398,10 +398,15 @@ pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Result<V
     };
     rows.sort_by(|(ka, aa), (kb, ab)| {
         let o = match &primary {
-            Some((p, desc)) => {
-                let o = cmp(&value_of(ka, aa, p), &value_of(kb, ab, p));
-                if *desc { o.reverse() } else { o }
-            }
+            // NULL (the group of rows without a value, an aggregate of no
+            // values) last in either direction, as rows are.
+            Some((p, desc)) => match (value_of(ka, aa, p), value_of(kb, ab, p)) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => Ordering::Greater,
+                (_, Value::Null) => Ordering::Less,
+                (x, y) if *desc => cmp(&x, &y).reverse(),
+                (x, y) => cmp(&x, &y),
+            },
             None => Ordering::Equal,
         };
         o.then_with(|| by_key(ka, kb))

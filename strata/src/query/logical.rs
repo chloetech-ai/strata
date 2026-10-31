@@ -188,8 +188,12 @@ impl Pred {
     /// its negation holds when none does, also for an empty list, as
     /// `NOT (x = ANY(list))` does. `NOT AT_LEAST(n, ..)` of y conditions
     /// holds where at least y - n + 1 of them are FALSE, so a row that
-    /// UNKNOWNs could lift to n is left out. Apply it once, to a predicate
-    /// as written.
+    /// UNKNOWNs could lift to n is left out. `x IN (.., NULL)` (a NULL in
+    /// [`Pred::In`]'s values) is TRUE where `x` is one of the other values
+    /// and else UNKNOWN, so its negation is never TRUE; a multi-valued
+/// field's is never UNKNOWN (one of its values is among the others, or
+/// none is, as on rows in memory). Apply it once, to a
+    /// predicate as written, then [`Pred::simplify`].
     pub fn three_valued(self, multi: &dyn Fn(usize) -> bool) -> Pred {
         self.nnf(false, multi)
     }
@@ -211,6 +215,14 @@ impl Pred {
                 let need = if negated { (items.len() + 1).saturating_sub(need) } else { need };
                 Pred::AtLeast { need, items: items.into_iter().map(|p| p.nnf(negated, multi)).collect() }
             }
+            Pred::In { field, values } if negated && values.contains(&Value::Null) => match multi(field) {
+                false => Pred::False,
+                // A multi-valued field's membership is never UNKNOWN.
+                true => match values.into_iter().filter(|v| *v != Value::Null).collect::<Vec<_>>() {
+                    values if values.is_empty() => Pred::True,
+                    values => Pred::Not(Box::new(Pred::In { field, values })),
+                },
+            },
             p if !negated => p,
             Pred::True => Pred::False,
             Pred::False => Pred::True,
@@ -221,9 +233,18 @@ impl Pred {
         }
     }
 
-    /// Flattens nested AND/OR and folds constants.
+    /// Flattens nested AND/OR and folds constants. A NULL among
+    /// [`Pred::In`]'s values matches no row ([`Pred::three_valued`] reads
+    /// it first), and the empty prefix (`LIKE '%'`) is any value.
     pub fn simplify(self) -> Pred {
         match self {
+            Pred::In { field, values } if values.contains(&Value::Null) => {
+                let values: Vec<Value> = values.into_iter().filter(|v| *v != Value::Null).collect();
+                if values.is_empty() { Pred::False } else { Pred::In { field, values } }
+            }
+            Pred::Prefix { field, prefix, edits: 0 } if prefix.is_empty() => Pred::Present { field },
+            // `NOT (x IN (.., NULL))` as written, outside three_valued.
+            Pred::Not(p) if matches!(&*p, Pred::In { values, .. } if values.contains(&Value::Null)) => Pred::False,
             Pred::And(ps) => {
                 let mut out = Vec::new();
                 for p in ps.into_iter().map(Pred::simplify) {

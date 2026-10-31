@@ -238,6 +238,9 @@ impl<'a> Ops<'a, '_> {
         let schema = self.table(n)?;
         let mut leaf = n.clone();
         leaf.leaf_exprs_mut(&mut |e| e.visit_mut(&mut |x| self.resolve(x, Some(schema))))?;
+        // A subquery's NULL (no row, or a NULL among IN's values) compares
+        // as SQL reads it, not as an error.
+        unknown(&mut leaf, &self.catalog);
         let mut restricted = 0;
         if !restrict.is_empty() {
             let s = leaf.search_mut().expect("a leaf");
@@ -518,7 +521,7 @@ impl<'a> Ops<'a, '_> {
                 }
                 Ok(())
             })?;
-            unknown(&mut q);
+            unknown(&mut q, &self.catalog);
             *runs += 1;
             let v = number(&self.scalar(&q, None, None)?)?;
             match &mut grouped {
@@ -572,15 +575,25 @@ impl<'a> Ops<'a, '_> {
             _ => None,
         };
         match e {
-            // A value of the list each, as the binder makes an IN list.
+            // A value of the list each, as the binder makes an IN list, and
+            // NULL once if the subquery returned one: `x NOT IN (SELECT ..)`
+            // holds for no row then.
             Expr::In { expr, list } if list.iter().any(|x| matches!(x, Expr::Values(_) | Expr::Keys(_))) => {
                 let f = field(expr);
                 let mut out = Vec::with_capacity(list.len());
+                let mut null = false;
                 for x in std::mem::take(list) {
                     match x {
-                        x @ (Expr::Values(_) | Expr::Keys(_)) => out.extend(self.values(&x, schema, f)?.into_iter().map(Expr::Lit)),
+                        x @ (Expr::Values(_) | Expr::Keys(_)) => {
+                            let (vals, nulls) = self.values_and_null(&x, schema, f)?;
+                            out.extend(vals.into_iter().map(Expr::Lit));
+                            null |= nulls;
+                        }
                         x => out.push(x),
                     }
+                }
+                if null {
+                    out.push(Expr::Lit(Value::Null));
                 }
                 *list = out;
             }
@@ -639,7 +652,13 @@ impl<'a> Ops<'a, '_> {
     /// The values of [`Expr::Values`] (each once, a list's each, no NULL)
     /// or [`Expr::Keys`], as the values of field `f` of `schema`'s table.
     fn values(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<Vec<Value>> {
+        Ok(self.values_and_null(e, schema, f)?.0)
+    }
+
+    /// [`Ops::values`], and whether a row's value was NULL.
+    fn values_and_null(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<(Vec<Value>, bool)> {
         let (Expr::Values(n) | Expr::Keys(n)) = e else { unreachable!("a subquery") };
+        let mut null = false;
         let rows = self.node(n, "subquery")?;
         let vals = match e {
             Expr::Keys(_) => rows.keys.ok_or_else(|| err("the subquery's rows are not rows of the table, which have keys"))?,
@@ -652,7 +671,11 @@ impl<'a> Ops<'a, '_> {
                 for r in rows.rows {
                     let vs = match r.into_iter().next() {
                         Some(Value::List(xs)) => xs,
-                        Some(Value::Null) | None => Vec::new(),
+                        Some(Value::Null) => {
+                            null = true;
+                            Vec::new()
+                        }
+                        None => Vec::new(),
                         Some(v) => vec![v],
                     };
                     out.extend(vs.into_iter().filter(|v| seen.insert(part(v))));
@@ -660,8 +683,8 @@ impl<'a> Ops<'a, '_> {
                 out
             }
         };
-        self.plan.push(format!("subquery: {} {}", vals.len(), if matches!(e, Expr::Keys(_)) { "keys" } else { "values" }));
-        equal_to(schema, f, vals)
+        self.plan.push(format!("subquery: {} {}{}", vals.len(), if matches!(e, Expr::Keys(_)) { "keys" } else { "values" }, if null { " and NULL" } else { "" }));
+        Ok((equal_to(schema, f, vals)?, null))
     }
 
     /// The vectors of [`Expr::Values`] for `maxsim`: each row's, in order,
@@ -1207,24 +1230,37 @@ fn compare(a: &Value, b: &Value, k: &SortKey) -> Ordering {
 }
 
 /// The searches of `n` with each comparison with NULL (an outer row's
-/// value) read as SQL reads it: UNKNOWN, which keeps no row, and neither
-/// does its negation. Indexes answer a comparison with a value only.
-fn unknown(n: &mut Node) {
-    fn fold(e: &mut Expr, positive: bool) {
+/// value, a subquery's) read as SQL reads it: UNKNOWN, which keeps no
+/// row, and neither does its negation. `x IN (1, NULL)` is TRUE where x is
+/// 1 and else UNKNOWN; a multi-valued field's `IN` is never UNKNOWN (one
+/// of its values is in the list, or none is, as on rows in memory), so the
+/// NULL matches none of them. Indexes answer a comparison with a value
+/// only.
+fn unknown(n: &mut Node, catalog: &[&Schema]) {
+    fn fold(e: &mut Expr, positive: bool, schema: Option<&Schema>) {
         let null = |x: &Expr| matches!(x, Expr::Lit(Value::Null));
+        let multi = |x: &Expr| matches!(x, Expr::Field(f) if schema.and_then(|s| s.fields.get(*f as usize)).is_some_and(|f| f.multi));
         match e {
-            Expr::Not(x) => fold(x, !positive),
-            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| fold(x, positive)),
+            Expr::Not(x) => fold(x, !positive, schema),
+            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| fold(x, positive, schema)),
             Expr::Cmp { left, right, .. } if null(left) || null(right) => *e = Expr::Lit(Value::Bool(!positive)),
             Expr::Between { expr, lo, hi } if null(expr) || lo.iter().chain(hi.iter()).any(|b| null(b)) => *e = Expr::Lit(Value::Bool(!positive)),
             Expr::In { expr, .. } if null(expr) => *e = Expr::Lit(Value::Bool(!positive)),
+            Expr::In { expr, list } if list.iter().any(null) && !positive && !multi(expr) => *e = Expr::Lit(Value::Bool(true)),
+            Expr::In { list, .. } if list.iter().any(null) => {
+                list.retain(|x| !null(x));
+                if list.is_empty() {
+                    *e = Expr::Lit(Value::Bool(false));
+                }
+            }
             _ => {}
         }
     }
     if let Node::Search(s) = n {
-        fold(&mut s.filter, true);
+        let schema = catalog.iter().find(|t| t.table.eq_ignore_ascii_case(&s.table)).copied();
+        fold(&mut s.filter, true, schema);
     }
-    n.inputs_mut().into_iter().for_each(unknown);
+    n.inputs_mut().into_iter().for_each(|n| unknown(n, catalog));
 }
 
 /// A subquery's value as a ranking reads it.

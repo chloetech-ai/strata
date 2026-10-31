@@ -2756,9 +2756,11 @@ impl<'a> Executor<'a> {
     // ---- facets ----------------------------------------------------------
 
     /// The groups of one keyword field and their counts, from the field's
-    /// facet counters (no per-document work).
+    /// facet counters (no per-document work). Rows without a value are the
+    /// NULL group, as [`Self::aggregate`] makes it.
     fn facets(&mut self, q: &Select, g: usize, needed: &[Projection]) -> Result<agg::Groups> {
         let mut counts: HashMap<String, u64> = HashMap::new();
+        let mut missing = 0u64;
         let segs = self.segs.clone();
         for s in segs.iter() {
             self.check_deadline()?;
@@ -2766,10 +2768,16 @@ impl<'a> Executor<'a> {
             let kw = self.keyword(s, g)?;
             let strategy = kw.choose_facet_strategy(&set);
             self.stats.plan.push(format!("seg {}: facet {strategy:?} over {} docs", s.ord, set.len()));
+            let code_counts = kw.facet_code_counts(&set, strategy);
+            // A row of a single-valued field has one code at most.
+            missing += match kw.is_multi() {
+                true => set.difference(&kw.present()).len() as u64,
+                false => (set.len() as u64).saturating_sub(code_counts.iter().sum()),
+            };
             if kw.is_multi() {
                 self.stats.plan.push(format!("seg {}: multi-valued, each value of a document counts", s.ord));
             }
-            for (code, c) in kw.facet_code_counts(&set, strategy).into_iter().enumerate() {
+            for (code, c) in code_counts.into_iter().enumerate() {
                 if c > 0 {
                     let n = counts.len();
                     let v = kw.value(code as u32);
@@ -2790,6 +2798,11 @@ impl<'a> Executor<'a> {
             let key = if ints { forward::int_of_key(&v).map_or(agg::Part::Null, agg::Part::Int) } else { agg::Part::Str(v) };
             for a in groups.entry(vec![key], needed)? {
                 *a = agg::Acc::Count(c as i64);
+            }
+        }
+        if missing > 0 {
+            for a in groups.entry(vec![agg::Part::Null], needed)? {
+                *a = agg::Acc::Count(missing as i64);
             }
         }
         Ok(groups)

@@ -138,11 +138,16 @@ fn cond(rng: &mut StdRng, depth: u32, rows: bool) -> String {
             1 => format!("b {op} {}", ["0.5", "-1.5", "2.0"][rng.gen_range(0..3)]),
             2 => format!("c {} '{w}'", ["=", "!="][rng.gen_range(0..2)]),
             3 => ["a IS NULL", "b IS NOT NULL", "c IS NULL", "tags IS NULL"][rng.gen_range(0..4)].to_string(),
-            4 => format!("a {}IN (1, -2, {})", ["", "NOT "][rng.gen_range(0..2)], rng.gen_range(-5..=5)),
-            5 => format!("c {}IN ('{w}', 'q')", ["", "NOT "][rng.gen_range(0..2)]),
+            // A NULL among IN's values: TRUE or UNKNOWN, its NOT never TRUE.
+            4 => {
+                let last = if rng.gen_ratio(1, 3) { "NULL".to_string() } else { rng.gen_range(-5..=5).to_string() };
+                format!("a {}IN (1, -2, {last})", ["", "NOT "][rng.gen_range(0..2)])
+            }
+            5 => format!("c {}IN ('{w}', {})", ["", "NOT "][rng.gen_range(0..2)], ["'q'", "NULL"][rng.gen_range(0..2)]),
             6 => format!("a {}BETWEEN -1 AND {}", ["", "NOT "][rng.gen_range(0..2)], rng.gen_range(-1..=3)),
-            7 => format!("tags {} '{w}'", ["=", "!="][rng.gen_range(0..2)]),
-            8 => format!("c LIKE '{w}%'"),
+            7 => format!("tags {}", ["= 'w'", "!= 'w'", "IN ('w', NULL)", "NOT IN ('w', NULL)"][rng.gen_range(0..4)].replace('w', w)),
+            // The empty prefix is any value, and UNKNOWN for none.
+            8 => ["c LIKE 'w%'", "c LIKE '%'", "PREFIX(c, '')", "PREFIX(tags, '')"][rng.gen_range(0..4)].replace('w', w),
             9 => format!("a {op} b"),
             _ => format!("a * 2 {op} {}", rng.gen_range(-6..=6)),
         };
