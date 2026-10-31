@@ -52,7 +52,7 @@ pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions
 
 /// [`run`] of a plan whose leaves read any tables of `catalog`.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new(), encoded: Vec::new() };
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, per: None, plan: Vec::new(), encoded: Vec::new() };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -102,6 +102,9 @@ struct Ops<'a, 'r> {
     /// The scan a LIMIT over joins grows: the leaf, the rows it may read,
     /// and how many it read.
     driver: Option<(*const Node, u64, usize)>,
+    /// The cap a `MAX k PER` right above the driven scan puts on its rows,
+    /// which the scan may keep itself ([`super::ir::Search::per`]).
+    per: Option<(*const Node, super::ir::PerCap)>,
     plan: Vec<String>,
     /// The vectors of the `encode(..)`s run so far, with the `WITH`
     /// results in scope then: a column and the ORDER BY that names it
@@ -265,6 +268,11 @@ impl<'a> Ops<'a, '_> {
                     let below = std::mem::replace(inner, Node::Ref { name: String::new() });
                     *inner = Node::Limit { input: Box::new(below), offset: 0, limit: Some(cap) };
                 }
+            }
+        }
+        if let Some(cap) = self.per.filter(|(p, _)| std::ptr::eq(*p, n)).map(|(_, c)| c) {
+            if let Some(s) = leaf.search_mut() {
+                s.per = Some(cap);
             }
         }
         let mut correlated = false;
@@ -748,6 +756,7 @@ impl<'a> Ops<'a, '_> {
                     phases: Vec::new(),
                     profile: None,
                     guard: None,
+                    per: None,
                 })),
                 columns: vec![crate::query::ir::Column { name: "key".into(), expr: Expr::Field(pk as u32) }, crate::query::ir::Column { name: "vector".into(), expr: Expr::Field(field as u32) }],
             };
@@ -871,8 +880,17 @@ impl<'a> Ops<'a, '_> {
         let (Some(l), Some(scan)) = (limit, driver_of(input)) else { return Ok(cut(self.node(input, what)?)) };
         let want = l.saturating_add(offset);
         let first = if matches!(input, Node::DistinctOn { .. }) { 4 } else { 2 };
-        let mut lim = want.saturating_mul(first).clamp(32, MAX_ROWS);
+        // A scan that keeps the cap itself returns the first rows of each
+        // value, so the rows wanted are all it needs to read; one that does
+        // not (a shard over the typed protocol) returns them uncapped, and
+        // the slices grow from there.
+        let per = per_cap(input, scan);
+        let mut lim = match per {
+            Some(_) => want.clamp(1, MAX_ROWS),
+            None => want.saturating_mul(first).clamp(32, MAX_ROWS),
+        };
         let saved = self.driver.take();
+        let saved_per = std::mem::replace(&mut self.per, per.map(|c| (scan as *const Node, c)));
         let r = loop {
             self.driver = Some((scan as *const Node, lim as u64, 0));
             let rows = match self.node(input, what) {
@@ -886,6 +904,7 @@ impl<'a> Ops<'a, '_> {
             lim = (lim * 4).min(MAX_ROWS);
         };
         self.driver = saved;
+        self.per = saved_per;
         r
     }
 
@@ -1142,6 +1161,27 @@ fn trained_for(e: &Expr, schema: Option<&Schema>, f: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The cap of a `MAX k PER` (or a `DISTINCT ON` of one column) whose
+/// input is the scan `scan` itself, by one of its fields: the scan may keep
+/// it ([`super::ir::Search::per`]). None when a filter, a join or an
+/// expression stands between them, since the scan's rows are then not the
+/// rows the cap counts.
+fn per_cap(n: &Node, scan: &Node) -> Option<super::ir::PerCap> {
+    match n {
+        Node::DistinctOn { input, keys, per } if std::ptr::eq(input.as_ref(), scan) => {
+            let [Expr::Output(i)] = &keys[..] else { return None };
+            let Node::Project { columns, .. } = scan else { return None };
+            match columns.get(*i as usize)?.expr {
+                Expr::Field(field) => Some(super::ir::PerCap { field, k: *per }),
+                _ => None,
+            }
+        }
+        Node::DistinctOn { input, .. } | Node::Filter { input, .. } => per_cap(input, scan),
+        Node::Project { input, .. } if !n.is_leaf() => per_cap(input, scan),
+        _ => None,
+    }
 }
 
 /// The first table's scan of the joins under a LIMIT, or the scan whose

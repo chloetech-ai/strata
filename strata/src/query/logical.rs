@@ -837,6 +837,17 @@ pub struct Select {
     /// The query's guard ([`Guard`]), which the executor and a coordinator
     /// settle on a level before the query runs ([`Select::at_level`]).
     pub guard: Option<Guard>,
+    /// At most `k` rows of each value of field `field` (its index), the
+    /// first in the query's order ([`crate::query::ir::Search::per`]):
+    /// the executor may cap the rows it ranks, keeping ties at each cut.
+    pub per: Option<Per>,
+}
+
+/// [`Select::per`]: at most `k` rows of each value of `field`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Per {
+    pub field: usize,
+    pub k: usize,
 }
 
 impl Select {
