@@ -146,6 +146,11 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/shards", post(add_shard))
         .route("/v1/admin/shards/:i", axum::routing::delete(remove_shard))
         .route("/v1/admin/shards/:i/replicas", post(add_replica).merge(axum::routing::delete(remove_replica)))
+        .route("/v1/admin/shards/:i/drain", post(drain_shard))
+        .route("/v1/admin/rebalance", post(rebalance))
+        .route("/v1/admin/moves", get(moves).merge(post(move_slots)))
+        .route("/v1/admin/moves/stop", post(stop_moves))
+        .route("/v1/admin/moves/finish", post(finish_move))
         .route("/v1/agent", post(agent_run))
         .route("/v1/queries", get(live_queries))
         .route("/v1/queries/:id", axum::routing::delete(cancel_query))
@@ -1088,6 +1093,68 @@ async fn remove_replica(State(app): State<App>, axum::extract::Path(i): axum::ex
     let url = q.get("url").filter(|u| !u.is_empty()).ok_or_else(|| ApiError::bad("url is the gRPC URL of the server to remove (?url=http://host:port)"))?;
     let j = app.svc.coordinator()?.remove_replica(i, url).await?;
     Ok(audited(j, format!("removed {url} from shard {i}")))
+}
+
+/// The most slots each move of a rebalance or drain takes: the body's
+/// `"chunk"`, or [`crate::coord::MOVE_SLOTS`].
+fn chunk(b: &Option<AxJson<Json>>) -> Result<usize, ApiError> {
+    match b.as_ref().and_then(|b| b.get("chunk")) {
+        None | Some(Json::Null) => Ok(crate::coord::MOVE_SLOTS),
+        Some(v) => v.as_u64().filter(|&c| (1..=crate::slots::SLOTS as u64).contains(&c)).map(|c| c as usize).ok_or_else(|| ApiError::bad(format!("chunk is the most slots one move takes: 1 to {}", crate::slots::SLOTS))),
+    }
+}
+
+/// `POST /v1/admin/rebalance {"chunk"?}`: evens out the slots over the
+/// shards, in the background (`GET /v1/admin/moves` follows it).
+async fn rebalance(State(app): State<App>, body: Option<AxJson<Json>>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.rebalance(chunk(&body)?)?;
+    let detail = format!("rebalancing: {} moves", j["job"]["of"]);
+    Ok(audited(j, detail))
+}
+
+/// `POST /v1/admin/shards/:i/drain {"chunk"?}`: moves every slot of shard
+/// `i` to the others, in the background, so that it can be removed.
+async fn drain_shard(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, body: Option<AxJson<Json>>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.drain(i, chunk(&body)?)?;
+    let detail = format!("draining shard {i}: {} moves", j["job"]["of"]);
+    Ok(audited(j, detail))
+}
+
+/// `GET /v1/admin/moves`: the job of moves running or last run here, and
+/// the move under way in the cluster map.
+async fn moves(State(app): State<App>) -> Res {
+    Ok(AxJson(app.svc.coordinator()?.moves()))
+}
+
+/// `POST /v1/admin/moves {"slots": [[start, end], ...], "to": shard}`:
+/// moves slots of one shard to another, in the background.
+async fn move_slots(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let bad = || ApiError::bad("slots is a list of slots or of [start, end) ranges of them, all held by one shard");
+    let mut slots = Vec::new();
+    for v in b.get("slots").and_then(Json::as_array).ok_or_else(bad)? {
+        match (v.as_u64(), v.as_array().map(|r| r.iter().map(Json::as_u64).collect::<Vec<_>>())) {
+            (Some(s), _) => slots.push(s as usize),
+            (_, Some(r)) if matches!(r[..], [Some(a), Some(b)] if a < b && b <= crate::slots::SLOTS as u64) => slots.extend(r[0].unwrap_or(0) as usize..r[1].unwrap_or(0) as usize),
+            _ => return Err(bad()),
+        }
+    }
+    let to = b.get("to").and_then(Json::as_u64).ok_or_else(|| ApiError::bad("to is the shard the slots move to"))? as usize;
+    let j = app.svc.coordinator()?.start_move(slots.clone(), to)?;
+    Ok(audited(j, format!("moving {} slots to shard {to}", slots.len())))
+}
+
+/// `POST /v1/admin/moves/stop`: the job running here stops once its move
+/// under way ends.
+async fn stop_moves(State(app): State<App>) -> Result<Response, ApiError> {
+    Ok(audited(app.svc.coordinator()?.stop_moves(), "stopping the job of moves".into()))
+}
+
+/// `POST /v1/admin/moves/finish`: ends the move a stopped coordinator
+/// left in the cluster map (completed if it had flipped, given up if not).
+async fn finish_move(State(app): State<App>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.finish_move().await?;
+    let detail = format!("finished the move left in the cluster map: {}", j["finished"]);
+    Ok(audited(j, detail))
 }
 
 /// How long `POST /v1/admin/verify` waits for the replicas' digests by

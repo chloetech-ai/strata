@@ -71,6 +71,7 @@ pub(crate) struct SnapInner {
 }
 
 /// One table as a snapshot sees it.
+#[derive(Clone)]
 struct TableView {
     id: u32,
     schema: Arc<Schema>,
@@ -129,11 +130,7 @@ impl Snapshot {
                 if seg.live.as_ref().is_some_and(|l| !l.contains(d)) {
                     continue;
                 }
-                let seq = match seg.updates.as_ref().and_then(|u| u.get(SEQ, d)) {
-                    Some(x) => x.as_i64().unwrap_or(0) as u64,
-                    None => built.as_ref().map_or(0, |s| s.get(d)),
-                };
-                f(pk.map(|pk| pk.key(d)).as_ref(), seq);
+                f(pk.map(|pk| pk.key(d)).as_ref(), row_seq(seg, built.as_ref(), d));
             }
         }
         Ok(())
@@ -221,6 +218,134 @@ impl Snapshot {
         Some(self.pk(seg)?.key(doc))
     }
 
+    /// The same version, with the rows `mask` hides left out of every
+    /// table: queries, counts and lookups through it do not see them. The
+    /// rows stay in the database (a write by key still replaces one), and
+    /// what is hidden in each segment is worked out once per mask and
+    /// kept ([`Mask`]). Statistics read from the indexes themselves, such
+    /// as a term's document frequency, still count them, as they count
+    /// deleted rows until a merge drops them.
+    pub fn masked(&self, mask: &Mask) -> Result<Snapshot> {
+        let mut tables = Vec::with_capacity(self.inner.tables.len());
+        let mut present = std::collections::HashSet::new();
+        for t in &self.inner.tables {
+            let mut t = t.clone();
+            let place = t.schema.shard_by_field().or(t.schema.primary_key);
+            if let Some(place) = place {
+                for (seg, pk) in t.segments.iter_mut().zip(&t.pks) {
+                    present.insert((t.id, seg.id));
+                    let Some(hidden) = mask.hidden(t.id, &t.schema, place, seg, pk.as_ref())? else { continue };
+                    let n_hidden = match &seg.live {
+                        None => hidden.len(),
+                        Some(l) => hidden.iter().filter(|&d| l.contains(d)).count(),
+                    } as u32;
+                    if n_hidden == 0 {
+                        continue;
+                    }
+                    let n_live = seg.n_live.saturating_sub(n_hidden);
+                    seg.live = Some(Arc::new(Unhidden { live: seg.live.take(), hidden, n: n_live as usize }));
+                    seg.n_live = n_live;
+                }
+                t.n_live = t.segments.iter().map(|s| s.n_live as u64).sum();
+            }
+            tables.push(t);
+        }
+        mask.forget_except(&present);
+        let i = &self.inner;
+        let inner = SnapInner { txn: i.txn, numbered: i.numbered, seq: i.seq, tables, maps: i.maps.clone(), path: i.path.clone(), _pin: i._pin.pins.pin(i._pin.txn) };
+        Ok(Snapshot { inner: Arc::new(inner), table: self.table })
+    }
+
+    /// The live rows of the table this snapshot looks at that `mask`
+    /// hides, as (segment ordinal, docID), in that order; with `after`,
+    /// only those a write numbered above `after` last changed (refused
+    /// unless the database numbers its writes). A shard moving rows to
+    /// another picks them so, by a mask of the slots that move, and reads
+    /// them with [`crate::db::Db::documents_of`]. A table placed by neither
+    /// a primary key nor shard_by has none.
+    pub fn covered(&self, mask: &Mask, after: Option<u64>) -> Result<Vec<(usize, DocId)>> {
+        if after.is_some() && !self.numbers_writes() {
+            return Err(Error::Schema("the database does not number its writes".into()));
+        }
+        let v = self.view();
+        let Some(place) = v.schema.shard_by_field().or(v.schema.primary_key) else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for (i, (seg, pk)) in v.segments.iter().zip(&v.pks).enumerate() {
+            let Some(hidden) = mask.hidden(v.id, &v.schema, place, seg, pk.as_ref())? else { continue };
+            let built = match after {
+                Some(_) => rowseq::Seqs::of(&seg.file)?,
+                None => None,
+            };
+            for d in hidden.iter() {
+                if seg.live.as_ref().is_some_and(|l| !l.contains(d)) {
+                    continue;
+                }
+                if after.is_some_and(|a| row_seq(seg, built.as_ref(), d) <= a) {
+                    continue;
+                }
+                out.push((i, d));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The rows `mask` hides in `prev`, an earlier snapshot of the same
+    /// table, that this one no longer holds where `mask` hides them:
+    /// deleted since, or replaced by a row of the same key that `mask`
+    /// does not hide (another shard_by value). Each as its primary key and
+    /// the value that placed it in `prev`; none in a table without a
+    /// primary key. In a database that numbers its writes, a row this
+    /// snapshot holds unchanged since `prev` is passed over by its number.
+    pub fn covered_gone(&self, prev: &Snapshot, mask: &Mask) -> Result<Vec<(Value, Value)>> {
+        let (pv, nv) = (prev.view(), self.view());
+        if pv.schema.table != nv.schema.table {
+            return Err(Error::Query(format!("rows of {} compared with rows of {}", pv.schema.table, nv.schema.table)));
+        }
+        if pv.schema.primary_key.is_none() {
+            return Ok(Vec::new());
+        }
+        let by = pv.schema.shard_by_field();
+        let numbered = self.numbers_writes() && prev.numbers_writes();
+        let mut seqs: std::collections::HashMap<usize, Option<rowseq::Seqs>> = Default::default();
+        let mut stores: std::collections::HashMap<(bool, usize), crate::forward::DocStore> = Default::default();
+        let mut field_of = |now: bool, s: usize, d: DocId, f: usize| -> Result<Value> {
+            let (view, s) = (if now { nv } else { pv }, s);
+            let store = match stores.entry((now, s)) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(crate::forward::DocStore::open(&view.segments[s].file, &view.schema)?),
+            };
+            Ok(store.get_fields(d, &[f]).pop().unwrap_or(Value::Null))
+        };
+        let mut out = Vec::new();
+        for (s, d) in prev.covered(mask, None)? {
+            let key = pv.pks[s].as_ref().ok_or_else(|| Error::Corrupt(format!("table {}: segment {} has no primary-key index", pv.schema.table, pv.segments[s].id)))?.key(d);
+            let gone = match (self.lookup(&key), by) {
+                (None, _) => true,
+                // Placed by its key, which it keeps.
+                (Some(_), None) => false,
+                (Some((ns, nd)), Some(f)) => {
+                    let seg = &nv.segments[ns];
+                    let unchanged = numbered && {
+                        let built = match seqs.entry(ns) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(e) => e.insert(rowseq::Seqs::of(&seg.file)?),
+                        };
+                        row_seq(seg, built.as_ref(), nd) <= prev.inner.seq
+                    };
+                    !unchanged && !(mask.hide)(&nv.schema, &field_of(true, ns, nd, f)?)
+                }
+            };
+            if gone {
+                let place = match by {
+                    None => key.clone(),
+                    Some(f) => field_of(false, s, d, f)?,
+                };
+                out.push((key, place));
+            }
+        }
+        Ok(out)
+    }
+
     /// Drops this snapshot's file pages from memory and the page cache, so
     /// the next access reads from the device (cold-cache experiments).
     pub fn evict_from_cache(&self) -> Result<()> {
@@ -276,6 +401,83 @@ impl Drop for Pin {
                 m.remove(&self.txn);
             }
         }
+    }
+}
+
+/// Rows to leave out of what a snapshot shows ([`Snapshot::masked`]): those
+/// whose placement, a table's `shard_by` value or else its primary key,
+/// `hide` names. A sharded server hides the rows of slots it does not hold
+/// while rows move between shards. Each segment's hidden rows are worked
+/// out once and kept, by table and segment id; a new mask starts again.
+pub struct Mask {
+    hide: Box<dyn Fn(&Schema, &Value) -> bool + Send + Sync>,
+    built: Mutex<std::collections::HashMap<(u32, u64), Option<Arc<crate::segment::DocSet>>>>,
+}
+
+impl Mask {
+    pub fn new(hide: impl Fn(&Schema, &Value) -> bool + Send + Sync + 'static) -> Mask {
+        Mask { hide: Box::new(hide), built: Mutex::new(Default::default()) }
+    }
+
+    /// The rows of `seg` (of table `table`) to hide, placed by field
+    /// `place`; `None` when there are none.
+    fn hidden(&self, table: u32, schema: &Schema, place: usize, seg: &SegmentView, pk: Option<&PkIndex>) -> Result<Option<Arc<crate::segment::DocSet>>> {
+        if let Some(h) = lock(&self.built).get(&(table, seg.id)) {
+            return Ok(h.clone());
+        }
+        let n = seg.file.n_docs() as DocId;
+        let mut docs = Vec::new();
+        if Some(place) == schema.primary_key && schema.shard_by_field().is_none() {
+            let pk = pk.ok_or_else(|| Error::Corrupt(format!("table {}: segment {} has no primary-key index", schema.table, seg.id)))?;
+            docs.extend((0..n).filter(|&d| (self.hide)(schema, &pk.key(d))));
+        } else {
+            let values = crate::forward::DocStore::open(&seg.file, schema)?.field_values(place);
+            docs.extend((0..n).filter(|&d| (self.hide)(schema, &values[d as usize])));
+        }
+        let h = (!docs.is_empty()).then(|| Arc::new(crate::segment::DocSet::from_sorted(docs, n)));
+        lock(&self.built).insert((table, seg.id), h.clone());
+        Ok(h)
+    }
+
+    /// Drops what it kept of segments other than `present`, once it holds
+    /// more than twice as many.
+    fn forget_except(&self, present: &std::collections::HashSet<(u32, u64)>) {
+        let mut b = lock(&self.built);
+        if b.len() > 2 * present.len() + 16 {
+            b.retain(|k, _| present.contains(k));
+        }
+    }
+}
+
+/// The number of the write that last changed document `d` of `seg`
+/// ([`rowseq`]; 0 for rows from before numbering): an update's, else the
+/// segment's as built (`built`).
+fn row_seq(seg: &SegmentView, built: Option<&rowseq::Seqs>, d: DocId) -> u64 {
+    match seg.updates.as_ref().and_then(|u| u.get(SEQ, d)) {
+        Some(x) => x.as_i64().unwrap_or(0) as u64,
+        None => built.map_or(0, |s| s.get(d)),
+    }
+}
+
+impl std::fmt::Debug for Mask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mask").field("segments", &lock(&self.built).len()).finish()
+    }
+}
+
+/// A segment's live rows less those a [`Mask`] hides.
+struct Unhidden {
+    live: Option<Arc<dyn DocFilter>>,
+    hidden: Arc<crate::segment::DocSet>,
+    n: usize,
+}
+
+impl DocFilter for Unhidden {
+    fn contains(&self, doc: DocId) -> bool {
+        !self.hidden.contains(doc) && self.live.as_ref().is_none_or(|l| l.contains(doc))
+    }
+    fn cardinality(&self) -> usize {
+        self.n
     }
 }
 
