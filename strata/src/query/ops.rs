@@ -29,6 +29,7 @@ use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::{Agg, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, Plan, SortKey};
 use crate::query::logical::Direction;
 use crate::query::memory::Charge;
+use crate::query::steps::{self, Clock, Step};
 use crate::query::Projection;
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -52,7 +53,7 @@ pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions
 
 /// [`run`] of a plan whose leaves read any tables of `catalog`.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new(), encoded: Vec::new() };
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, per: None, plan: Vec::new(), encoded: Vec::new(), clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -61,7 +62,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
         keys: keys.unwrap_or_default(),
         scores: rows.scores.unwrap_or_default(),
         parts: None,
-        stats: ExecStats { plan: ops.plan, filter_docs: 0, scored: 0, reranked: 0 },
+        stats: ExecStats { plan: ops.plan, steps: ops.prof, steps_dropped: ops.dropped, ..ExecStats::default() },
     })
 }
 
@@ -102,11 +103,39 @@ struct Ops<'a, 'r> {
     /// The scan a LIMIT over joins grows: the leaf, the rows it may read,
     /// and how many it read.
     driver: Option<(*const Node, u64, usize)>,
+    /// The cap a `MAX k PER` right above the driven scan puts on its rows,
+    /// which the scan may keep itself ([`super::ir::Search::per`]).
+    per: Option<(*const Node, super::ir::PerCap)>,
     plan: Vec<String>,
     /// The vectors of the `encode(..)`s run so far, with the `WITH`
     /// results in scope then: a column and the ORDER BY that names it
     /// run it once.
     encoded: Vec<(Expr, usize, Option<std::sync::Arc<[f32]>>)>,
+    /// The operators' steps, each leaf's executor steps inside its own
+    /// ([`steps`]), and those the cap dropped.
+    clock: Clock,
+    prof: Vec<Step>,
+    dropped: u64,
+}
+
+/// What an operator's step is called, and what it works on.
+fn label(n: &Node) -> (&'static str, String) {
+    match n {
+        Node::Join { kind, keys, .. } => ("join", format!("{} on {} key{}", if *kind == JoinKind::Left { "left" } else { "inner" }, keys.len(), if keys.len() == 1 { "" } else { "s" })),
+        Node::With { ctes, .. } => ("with", ctes.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")),
+        Node::Limit { offset, limit, .. } => ("limit", match limit {
+            Some(l) => format!("{l} after {offset}"),
+            None => format!("after {offset}"),
+        }),
+        Node::Sort { keys, .. } => ("sort", format!("{} key{}", keys.len(), if keys.len() == 1 { "" } else { "s" })),
+        Node::Filter { .. } => ("filter", String::new()),
+        Node::Project { columns, .. } => ("project", format!("{} column{}", columns.len(), if columns.len() == 1 { "" } else { "s" })),
+        Node::Distinct { .. } => ("distinct", String::new()),
+        Node::DistinctOn { per, .. } => ("distinct on", format!("{per} per value")),
+        Node::KeyOrder { .. } => ("key order", String::new()),
+        Node::Aggregate { keys, aggs, .. } => ("aggregate", format!("{} key{}, {} aggregate{}", keys.len(), if keys.len() == 1 { "" } else { "s" }, aggs.len(), if aggs.len() == 1 { "" } else { "s" })),
+        _ => ("node", String::new()),
+    }
 }
 
 impl<'a> Ops<'a, '_> {
@@ -126,10 +155,24 @@ impl<'a> Ops<'a, '_> {
         self.opts.check()
     }
 
+    /// The rows of `n`, its run a step ([`steps`]).
     fn node(&mut self, n: &Node, what: &str) -> Result<Rows> {
         if n.is_leaf() {
             return self.leaf(n, what, Vec::new());
         }
+        if matches!(n, Node::Ref { .. }) {
+            return self.node_untimed(n, what);
+        }
+        let m = self.clock.mark(&self.prof);
+        let rows = self.node_untimed(n, what)?;
+        let (op, detail) = label(n);
+        if self.clock.wrap(&mut self.prof, m, op, detail, Some(rows.rows.len() as u64)).is_none() {
+            self.dropped += 1;
+        }
+        Ok(rows)
+    }
+
+    fn node_untimed(&mut self, n: &Node, what: &str) -> Result<Rows> {
         match n {
             Node::Join { .. } => self.join(n),
             Node::With { ctes, input } => {
@@ -234,10 +277,23 @@ impl<'a> Ops<'a, '_> {
     /// Runs a leaf with the executor, once its subqueries ran, with
     /// `restrict` added to its Search's filter.
     fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<(Expr, usize)>) -> Result<Rows> {
+        let m = self.clock.mark(&self.prof);
+        let rows = self.leaf_untimed(n, what, restrict)?;
+        let table = n.search().map(|s| s.table.as_str()).unwrap_or_default();
+        if self.clock.wrap(&mut self.prof, m, "leaf", format!("{what}: {table}"), Some(rows.rows.len() as u64)).is_none() {
+            self.dropped += 1;
+        }
+        Ok(rows)
+    }
+
+    fn leaf_untimed(&mut self, n: &Node, what: &str, restrict: Vec<(Expr, usize)>) -> Result<Rows> {
         self.opts.check()?;
         let schema = self.table(n)?;
         let mut leaf = n.clone();
         leaf.leaf_exprs_mut(&mut |e| e.visit_mut(&mut |x| self.resolve(x, Some(schema))))?;
+        // A subquery's NULL (no row, or a NULL among IN's values) compares
+        // as SQL reads it, not as an error.
+        unknown(&mut leaf, &self.catalog);
         let mut restricted = 0;
         if !restrict.is_empty() {
             let s = leaf.search_mut().expect("a leaf");
@@ -264,6 +320,11 @@ impl<'a> Ops<'a, '_> {
                 }
             }
         }
+        if let Some(cap) = self.per.filter(|(p, _)| std::ptr::eq(*p, n)).map(|(_, c)| c) {
+            if let Some(s) = leaf.search_mut() {
+                s.per = Some(cap);
+            }
+        }
         let mut correlated = false;
         leaf.leaf_exprs(&mut |e| correlated |= e.has_correlated());
         let rs = match correlated {
@@ -282,6 +343,7 @@ impl<'a> Ops<'a, '_> {
         }
         self.plan.push(line);
         self.plan.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
+        self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
         for r in &rs.rows {
             self.charge.row(r)?;
         }
@@ -518,7 +580,8 @@ impl<'a> Ops<'a, '_> {
                 }
                 Ok(())
             })?;
-            unknown(&mut q);
+            outer_lists(&mut q)?;
+            unknown(&mut q, &self.catalog);
             *runs += 1;
             let v = number(&self.scalar(&q, None, None)?)?;
             match &mut grouped {
@@ -572,15 +635,25 @@ impl<'a> Ops<'a, '_> {
             _ => None,
         };
         match e {
-            // A value of the list each, as the binder makes an IN list.
+            // A value of the list each, as the binder makes an IN list, and
+            // NULL once if the subquery returned one: `x NOT IN (SELECT ..)`
+            // holds for no row then.
             Expr::In { expr, list } if list.iter().any(|x| matches!(x, Expr::Values(_) | Expr::Keys(_))) => {
                 let f = field(expr);
                 let mut out = Vec::with_capacity(list.len());
+                let mut null = false;
                 for x in std::mem::take(list) {
                     match x {
-                        x @ (Expr::Values(_) | Expr::Keys(_)) => out.extend(self.values(&x, schema, f)?.into_iter().map(Expr::Lit)),
+                        x @ (Expr::Values(_) | Expr::Keys(_)) => {
+                            let (vals, nulls) = self.values_and_null(&x, schema, f)?;
+                            out.extend(vals.into_iter().map(Expr::Lit));
+                            null |= nulls;
+                        }
                         x => out.push(x),
                     }
+                }
+                if null {
+                    out.push(Expr::Lit(Value::Null));
                 }
                 *list = out;
             }
@@ -639,7 +712,13 @@ impl<'a> Ops<'a, '_> {
     /// The values of [`Expr::Values`] (each once, a list's each, no NULL)
     /// or [`Expr::Keys`], as the values of field `f` of `schema`'s table.
     fn values(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<Vec<Value>> {
+        Ok(self.values_and_null(e, schema, f)?.0)
+    }
+
+    /// [`Ops::values`], and whether a row's value was NULL.
+    fn values_and_null(&mut self, e: &Expr, schema: Option<&Schema>, f: Option<usize>) -> Result<(Vec<Value>, bool)> {
         let (Expr::Values(n) | Expr::Keys(n)) = e else { unreachable!("a subquery") };
+        let mut null = false;
         let rows = self.node(n, "subquery")?;
         let vals = match e {
             Expr::Keys(_) => rows.keys.ok_or_else(|| err("the subquery's rows are not rows of the table, which have keys"))?,
@@ -652,7 +731,11 @@ impl<'a> Ops<'a, '_> {
                 for r in rows.rows {
                     let vs = match r.into_iter().next() {
                         Some(Value::List(xs)) => xs,
-                        Some(Value::Null) | None => Vec::new(),
+                        Some(Value::Null) => {
+                            null = true;
+                            Vec::new()
+                        }
+                        None => Vec::new(),
                         Some(v) => vec![v],
                     };
                     out.extend(vs.into_iter().filter(|v| seen.insert(part(v))));
@@ -660,8 +743,8 @@ impl<'a> Ops<'a, '_> {
                 out
             }
         };
-        self.plan.push(format!("subquery: {} {}", vals.len(), if matches!(e, Expr::Keys(_)) { "keys" } else { "values" }));
-        equal_to(schema, f, vals)
+        self.plan.push(format!("subquery: {} {}{}", vals.len(), if matches!(e, Expr::Keys(_)) { "keys" } else { "values" }, if null { " and NULL" } else { "" }));
+        Ok((equal_to(schema, f, vals)?, null))
     }
 
     /// The vectors of [`Expr::Values`] for `maxsim`: each row's, in order,
@@ -725,6 +808,7 @@ impl<'a> Ops<'a, '_> {
                     phases: Vec::new(),
                     profile: None,
                     guard: None,
+                    per: None,
                 })),
                 columns: vec![crate::query::ir::Column { name: "key".into(), expr: Expr::Field(pk as u32) }, crate::query::ir::Column { name: "vector".into(), expr: Expr::Field(field as u32) }],
             };
@@ -848,8 +932,17 @@ impl<'a> Ops<'a, '_> {
         let (Some(l), Some(scan)) = (limit, driver_of(input)) else { return Ok(cut(self.node(input, what)?)) };
         let want = l.saturating_add(offset);
         let first = if matches!(input, Node::DistinctOn { .. }) { 4 } else { 2 };
-        let mut lim = want.saturating_mul(first).clamp(32, MAX_ROWS);
+        // A scan that keeps the cap itself returns the first rows of each
+        // value, so the rows wanted are all it needs to read; one that does
+        // not (a shard over the typed protocol) returns them uncapped, and
+        // the slices grow from there.
+        let per = per_cap(input, scan);
+        let mut lim = match per {
+            Some(_) => want.clamp(1, MAX_ROWS),
+            None => want.saturating_mul(first).clamp(32, MAX_ROWS),
+        };
         let saved = self.driver.take();
+        let saved_per = std::mem::replace(&mut self.per, per.map(|c| (scan as *const Node, c)));
         let r = loop {
             self.driver = Some((scan as *const Node, lim as u64, 0));
             let rows = match self.node(input, what) {
@@ -863,6 +956,7 @@ impl<'a> Ops<'a, '_> {
             lim = (lim * 4).min(MAX_ROWS);
         };
         self.driver = saved;
+        self.per = saved_per;
         r
     }
 
@@ -1121,6 +1215,27 @@ fn trained_for(e: &Expr, schema: Option<&Schema>, f: u32) -> Result<()> {
     Ok(())
 }
 
+/// The cap of a `MAX k PER` (or a `DISTINCT ON` of one column) whose
+/// input is the scan `scan` itself, by one of its fields: the scan may keep
+/// it ([`super::ir::Search::per`]). None when a filter, a join or an
+/// expression stands between them, since the scan's rows are then not the
+/// rows the cap counts.
+fn per_cap(n: &Node, scan: &Node) -> Option<super::ir::PerCap> {
+    match n {
+        Node::DistinctOn { input, keys, per } if std::ptr::eq(input.as_ref(), scan) => {
+            let [Expr::Output(i)] = &keys[..] else { return None };
+            let Node::Project { columns, .. } = scan else { return None };
+            match columns.get(*i as usize)?.expr {
+                Expr::Field(field) => Some(super::ir::PerCap { field, k: *per }),
+                _ => None,
+            }
+        }
+        Node::DistinctOn { input, .. } | Node::Filter { input, .. } => per_cap(input, scan),
+        Node::Project { input, .. } if !n.is_leaf() => per_cap(input, scan),
+        _ => None,
+    }
+}
+
 /// The first table's scan of the joins under a LIMIT, or the scan whose
 /// rows' first of each group a `DISTINCT ON` keeps, through the nodes that
 /// keep its rows' order (Project, Filter, DistinctOn): a leaf.
@@ -1207,24 +1322,70 @@ fn compare(a: &Value, b: &Value, k: &SortKey) -> Ordering {
 }
 
 /// The searches of `n` with each comparison with NULL (an outer row's
-/// value) read as SQL reads it: UNKNOWN, which keeps no row, and neither
-/// does its negation. Indexes answer a comparison with a value only.
-fn unknown(n: &mut Node) {
-    fn fold(e: &mut Expr, positive: bool) {
+/// value, a subquery's) read as SQL reads it: UNKNOWN, which keeps no
+/// row, and neither does its negation. `x IN (1, NULL)` is TRUE where x is
+/// 1 and else UNKNOWN; a multi-valued field's `IN` is never UNKNOWN (one
+/// of its values is in the list, or none is, as on rows in memory), so the
+/// NULL matches none of them. Indexes answer a comparison with a value
+/// only.
+fn unknown(n: &mut Node, catalog: &[&Schema]) {
+    fn fold(e: &mut Expr, positive: bool, schema: Option<&Schema>) {
         let null = |x: &Expr| matches!(x, Expr::Lit(Value::Null));
+        let multi = |x: &Expr| matches!(x, Expr::Field(f) if schema.and_then(|s| s.fields.get(*f as usize)).is_some_and(|f| f.multi));
         match e {
-            Expr::Not(x) => fold(x, !positive),
-            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| fold(x, positive)),
+            Expr::Not(x) => fold(x, !positive, schema),
+            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| fold(x, positive, schema)),
             Expr::Cmp { left, right, .. } if null(left) || null(right) => *e = Expr::Lit(Value::Bool(!positive)),
             Expr::Between { expr, lo, hi } if null(expr) || lo.iter().chain(hi.iter()).any(|b| null(b)) => *e = Expr::Lit(Value::Bool(!positive)),
             Expr::In { expr, .. } if null(expr) => *e = Expr::Lit(Value::Bool(!positive)),
+            Expr::In { expr, list } if list.iter().any(null) && !positive && !multi(expr) => *e = Expr::Lit(Value::Bool(true)),
+            Expr::In { list, .. } if list.iter().any(null) => {
+                list.retain(|x| !null(x));
+                if list.is_empty() {
+                    *e = Expr::Lit(Value::Bool(false));
+                }
+            }
             _ => {}
         }
     }
     if let Node::Search(s) = n {
-        fold(&mut s.filter, true);
+        let schema = catalog.iter().find(|t| t.table.eq_ignore_ascii_case(&s.table)).copied();
+        fold(&mut s.filter, true, schema);
     }
-    n.inputs_mut().into_iter().for_each(unknown);
+    n.inputs_mut().into_iter().for_each(|n| unknown(n, catalog));
+}
+
+/// The comparisons of `n` with a multi-valued column of the outer row,
+/// its values substituted (a list), as a filter on a multi-valued field
+/// reads them: `x = t.tags` holds when x is one of the values, `x !=
+/// t.tags` when it is none of them, and `x < t.sizes` when it is below
+/// one of them.
+fn outer_lists(n: &mut Node) -> Result<()> {
+    n.visit_exprs_mut(&mut |x| {
+        let Expr::Cmp { op, left, right } = x else { return Ok(()) };
+        // The list on the right: `x op list`.
+        let (op, other, values) = match (&**left, &**right) {
+            (o, Expr::Lit(Value::List(vs))) => (*op, o.clone(), vs.clone()),
+            (Expr::Lit(Value::List(vs)), o) => {
+                let flipped = match *op {
+                    CmpOp::Lt => CmpOp::Gt,
+                    CmpOp::Le => CmpOp::Ge,
+                    CmpOp::Gt => CmpOp::Lt,
+                    CmpOp::Ge => CmpOp::Le,
+                    op => op,
+                };
+                (flipped, o.clone(), vs.clone())
+            }
+            _ => return Ok(()),
+        };
+        let one_of = Expr::In { expr: Box::new(other.clone()), list: values.iter().cloned().map(Expr::Lit).collect() };
+        *x = match op {
+            CmpOp::Eq => one_of,
+            CmpOp::Ne => Expr::Not(Box::new(one_of)),
+            op => Expr::Or(values.into_iter().map(|v| Expr::Cmp { op, left: Box::new(other.clone()), right: Box::new(Expr::Lit(v)) }).collect()),
+        };
+        Ok(())
+    })
 }
 
 /// A subquery's value as a ranking reads it.

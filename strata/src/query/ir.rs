@@ -302,6 +302,23 @@ pub struct Search {
     /// a row needs ([`crate::query::logical::Guard`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<Box<Guard>>,
+    /// That a [`Node::DistinctOn`] above keeps at most `k` rows of each
+    /// value of a field, so the Search may return only those and stop
+    /// reading once it has them ([`PerCap`]). A hint, not a condition: a
+    /// reader that does not cap (one from before it, or a path that has no
+    /// capped scan) returns the rows uncapped, and the node above caps them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per: Option<PerCap>,
+}
+
+/// The cap of a [`Search::per`]: at most `k` rows of each value of the
+/// single-valued `field`, the first in the Search's order, NULL being one
+/// value; rows tied with a value's `k`-th, or with the LIMIT's last row,
+/// may be kept as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerCap {
+    pub field: u32,
+    pub k: u64,
 }
 
 /// A [`Search`]'s guard: what it relaxes, the loosest level and the row

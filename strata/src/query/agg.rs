@@ -69,7 +69,9 @@ pub enum Acc {
     /// cannot overflow), whether every value was an integer, and whether
     /// any was seen.
     Sum { sum: f64, isum: i128, int: bool, any: bool },
-    Avg { sum: f64, n: i64 },
+    /// The FLOAT values' sum, the INT values' exact sum, and the values
+    /// counted: an average of integers is their exact sum divided once.
+    Avg { sum: f64, isum: i128, n: i64 },
     Min(Option<Value>),
     Max(Option<Value>),
     Distinct(BTreeSet<Part>),
@@ -81,7 +83,7 @@ impl Acc {
             Projection::Agg { func, .. } => match func {
                 AggFn::Count => Acc::Count(0),
                 AggFn::Sum => Acc::Sum { sum: 0.0, isum: 0, int: true, any: false },
-                AggFn::Avg => Acc::Avg { sum: 0.0, n: 0 },
+                AggFn::Avg => Acc::Avg { sum: 0.0, isum: 0, n: 0 },
                 AggFn::Min => Acc::Min(None),
                 AggFn::Max => Acc::Max(None),
                 AggFn::CountDistinct => Acc::Distinct(BTreeSet::new()),
@@ -118,12 +120,18 @@ impl Acc {
                     }
                 }
             },
-            Acc::Avg { sum, n } => {
-                if let Some(x) = v.as_f64() {
-                    *sum += x;
+            Acc::Avg { sum, isum, n } => match v {
+                Value::Int(_) | Value::Bool(_) => {
+                    *isum += v.as_i64().unwrap_or(0) as i128;
                     *n += 1;
                 }
-            }
+                v => {
+                    if let Some(x) = v.as_f64() {
+                        *sum += x;
+                        *n += 1;
+                    }
+                }
+            },
             Acc::Min(m) => {
                 if m.as_ref().is_none_or(|m| cmp(v, m) == Ordering::Less) {
                     *m = Some(v.clone());
@@ -155,19 +163,20 @@ impl Acc {
             Acc::Sum { isum, int: true, .. } => i64::try_from(*isum).map_or(Value::Float(*isum as f64), Value::Int),
             Acc::Sum { sum, isum, .. } => Value::Float(sum + *isum as f64),
             Acc::Avg { n: 0, .. } => Value::Null,
-            Acc::Avg { sum, n } => Value::Float(sum / *n as f64),
+            Acc::Avg { sum, isum, n } => Value::Float((sum + *isum as f64) / *n as f64),
             Acc::Min(m) | Acc::Max(m) => m.clone().unwrap_or(Value::Null),
             Acc::Distinct(s) => Value::Int(s.len() as i64),
         }
     }
 
     /// The state as one value, for a shard's answer: an average is
-    /// `[sum, n]`, a distinct count the list of values, a sum `[sum, int,
-    /// any, integer sum]` (the last as decimal text: it can exceed 64 bits).
+    /// `[sum, n, integer sum]`, a distinct count the list of values, a sum
+    /// `[sum, int, any, integer sum]` (integer sums as decimal text: they
+    /// can exceed 64 bits).
     pub fn partial(&self) -> Value {
         match self {
             Acc::Sum { sum, isum, int, any } => Value::List(vec![Value::Float(*sum), Value::Int(*int as i64), Value::Int(*any as i64), Value::Str(isum.to_string())]),
-            Acc::Avg { sum, n } => Value::List(vec![Value::Float(*sum), Value::Int(*n)]),
+            Acc::Avg { sum, isum, n } => Value::List(vec![Value::Float(*sum), Value::Int(*n), Value::Str(isum.to_string())]),
             Acc::Distinct(s) => Value::List(s.iter().map(Part::value).collect()),
             a => a.value(),
         }
@@ -184,9 +193,13 @@ impl Acc {
                 *any |= xs[2].as_i64() == Some(1);
                 *isum += xs[3].as_str().and_then(|s| s.parse::<i128>().ok()).ok_or_else(bad)?;
             }
-            (Acc::Avg { sum, n }, Value::List(xs)) if xs.len() == 2 => {
+            // An older shard's average is `[sum, n]`, its integers in `sum`.
+            (Acc::Avg { sum, isum, n }, Value::List(xs)) if xs.len() == 2 || xs.len() == 3 => {
                 *sum += xs[0].as_f64().ok_or_else(bad)?;
                 *n += xs[1].as_i64().ok_or_else(bad)?;
+                if let Some(x) = xs.get(2) {
+                    *isum += x.as_str().and_then(|s| s.parse::<i128>().ok()).ok_or_else(bad)?;
+                }
             }
             (a @ (Acc::Min(_) | Acc::Max(_)), v) => {
                 a.add(v);
@@ -385,10 +398,15 @@ pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Result<V
     };
     rows.sort_by(|(ka, aa), (kb, ab)| {
         let o = match &primary {
-            Some((p, desc)) => {
-                let o = cmp(&value_of(ka, aa, p), &value_of(kb, ab, p));
-                if *desc { o.reverse() } else { o }
-            }
+            // NULL (the group of rows without a value, an aggregate of no
+            // values) last in either direction, as rows are.
+            Some((p, desc)) => match (value_of(ka, aa, p), value_of(kb, ab, p)) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => Ordering::Greater,
+                (_, Value::Null) => Ordering::Less,
+                (x, y) if *desc => cmp(&x, &y).reverse(),
+                (x, y) => cmp(&x, &y),
+            },
             None => Ordering::Equal,
         };
         o.then_with(|| by_key(ka, kb))
@@ -439,5 +457,32 @@ mod tests {
         c2.merge(&c.partial()).unwrap();
         assert_eq!(c2.value(), Value::Int(3));
         assert_eq!(Acc::new(&avg).value(), Value::Null);
+    }
+
+    /// Review BUG-10: AVG of INT summed in f64, so integers beyond 2^53
+    /// lost their low bits (`SUM(n) = 3` with `AVG(n) = 0.0`).
+    #[test]
+    fn avg_of_integers_sums_them_exactly() {
+        let avg = Projection::Agg { func: AggFn::Avg, field: 0 };
+        let big = (1i64 << 53) + 1;
+        let values = [Value::Int(big), Value::Int(big), Value::Int(-2 * big + 2), Value::Int(1)];
+        let mut a = Acc::new(&avg);
+        values.iter().for_each(|v| _ = a.add(v));
+        assert_eq!(a.value(), Value::Float(0.75));
+        // Over shards: the integer sum travels exactly, and an older
+        // shard's `[sum, n]` still merges.
+        let (mut s1, mut s2) = (Acc::new(&avg), Acc::new(&avg));
+        values[..2].iter().for_each(|v| _ = s1.add(v));
+        values[2..].iter().for_each(|v| _ = s2.add(v));
+        let mut m = Acc::new(&avg);
+        m.merge(&s1.partial()).unwrap();
+        m.merge(&s2.partial()).unwrap();
+        assert_eq!(m.value(), Value::Float(0.75));
+        m.merge(&Value::List(vec![Value::Float(1.0), Value::Int(4)])).unwrap();
+        assert_eq!(m.value(), Value::Float(4.0 / 8.0));
+        // FLOAT values and integers together.
+        let mut f = Acc::new(&avg);
+        [Value::Float(0.5), Value::Int(2), Value::Null].iter().for_each(|v| _ = f.add(v));
+        assert_eq!(f.value(), Value::Float(1.25));
     }
 }

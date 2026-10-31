@@ -23,8 +23,12 @@
 //! | no type | from the values: `INT`, `FLOAT`, or text as above |
 //! | other `BLOB` | skipped (Strata has no binary type), or base64 text with [`ImportOptions::blobs_base64`] |
 //!
-//! A column whose values do not fit its declared type (text in an
-//! `INTEGER` column, as SQLite allows) is read as text. A single-column
+//! A name that is already an identifier keeps it, and a respelled one
+//! that meets another takes a suffix (`x-y` beside `x_y` is `x_y_2`). A
+//! column whose values do not fit its declared type (text in an
+//! `INTEGER` column, as SQLite allows) is read as text. In a `FLOAT`
+//! column an infinite real is NULL, and integers past 2^53 round; the
+//! plan's notes say so. A single-column
 //! `INTEGER` or text primary key is the table's key; a composite one, or
 //! one holding NULLs, leaves the table without a key. A single-column
 //! foreign key to another imported table's key is a reference

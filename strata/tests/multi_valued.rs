@@ -88,11 +88,15 @@ fn check(db: &Db, docs: &[Document]) {
         s.dedup();
         s.into_iter().for_each(|s| *size_counts.entry(s).or_default() += 1);
     }
+    // A document without values is in the group NULL, last in the order.
+    let none = |f: usize| Value::Int(docs.iter().filter(|d| d[f].items().is_empty()).count() as i64);
     let got = db.query("SELECT tags, COUNT(*) FROM items GROUP BY tags ORDER BY tags", &Params::new()).unwrap();
-    let got: Vec<(String, i64)> = got.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap())).collect();
+    assert_eq!(got.rows.last().unwrap(), &vec![Value::Null, none(1)]);
+    let got: Vec<(String, i64)> = got.rows[..got.rows.len() - 1].iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap())).collect();
     assert_eq!(got, tag_counts.into_iter().collect::<Vec<_>>());
     let got = db.query("SELECT sizes, COUNT(*) FROM items GROUP BY sizes ORDER BY sizes", &Params::new()).unwrap();
-    let got: Vec<(i64, i64)> = got.rows.iter().map(|r| (r[0].as_i64().unwrap(), r[1].as_i64().unwrap())).collect();
+    assert_eq!(got.rows.last().unwrap(), &vec![Value::Null, none(2)]);
+    let got: Vec<(i64, i64)> = got.rows[..got.rows.len() - 1].iter().map(|r| (r[0].as_i64().unwrap(), r[1].as_i64().unwrap())).collect();
     assert_eq!(got, size_counts.into_iter().collect::<Vec<_>>(), "integer groups in numeric order");
 
     // Rows come back with their lists.

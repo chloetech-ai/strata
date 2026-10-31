@@ -46,6 +46,7 @@ use std::cmp::Ordering;
 use crate::error::{Error, Result};
 use crate::query::exec::{cmp_values, ExecOptions, ExecStats, RankParts, ResultSet, DEFAULT_K};
 use crate::query::agg;
+use crate::query::steps::Clock;
 use crate::query::logical::{OrderBy, Pred, Projection, Score, Select, Tiebreak};
 use crate::query::rank::Rank;
 use crate::schema::Schema;
@@ -69,6 +70,8 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         stats.scored += s.stats.scored;
         stats.reranked += s.stats.reranked;
         stats.plan.extend(s.stats.plan.iter().map(|l| format!("shard {i}: {l}")));
+        // Each shard's steps, which its caller put on one clock.
+        stats.nest(&s.stats, 0);
     }
     let empty = |rows, stats| ResultSet { columns: columns.clone(), rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
     // Groups and aggregates: each shard returns its groups with partial
@@ -221,6 +224,7 @@ pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
         graphs: Vec::new(),
         types: q.types.clone(),
         guard: None,
+        per: None,
     })
 }
 
@@ -238,7 +242,8 @@ pub fn fill(q: &Select, ranked: ResultSet, fetched: Vec<ResultSet>) -> Result<(R
         if f.keys.len() != f.rows.len() {
             return Err(err("a shard fetched rows without their keys (not in shard mode?)"));
         }
-        stats.plan.extend(f.stats.plan.into_iter().map(|l| format!("fetch: {l}")));
+        stats.plan.extend(f.stats.plan.iter().map(|l| format!("fetch: {l}")));
+        stats.nest(&f.stats, 0);
         rows.extend(f.keys.iter().map(agg::Part::of).zip(f.rows));
     }
     let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
@@ -332,10 +337,13 @@ pub fn rerank_models(q: &Select, rs: ResultSet, check: &mut dyn FnMut() -> Resul
                 .map(|r| crate::query::cross_encoder::text_of(read.iter().map(|f| fields.iter().position(|x| x == f).map_or(Value::Null, |i| r.values[own + i].clone()))))
                 .collect();
             let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let clock = Clock::new(false);
+            let mark = clock.mark(&stats.steps);
             for (r, s) in rows.iter_mut().zip(model.score(query, &texts, check)?) {
                 r.phases[j][l] = Some(s).filter(|x| x.is_finite());
             }
             stats.plan.push(format!("cross-encoder {}: scored {} rows", model.name, rows.len()));
+            stats.wrap(&clock, mark, "cross-encoder", format!("{} in phase {}", model.name, j + 1), Some(rows.len() as u64));
         }
         rows = rerank(q, rows, j..j + 1, &mut stats);
     }

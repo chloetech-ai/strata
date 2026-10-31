@@ -160,6 +160,13 @@ impl<'a> Raise<'a> {
         self.table(&search.table)?;
         let filter = self.filter(&search.filter)?;
         let guard = search.guard.as_deref().map(|g| self.guard(g)).transpose()?;
+        // A cap the executor can keep: a single-valued field of the table,
+        // under a ranked, ungrouped Search; any other is left to the node
+        // above.
+        let per = search.per.and_then(|c| {
+            let f = self.schema.fields.get(c.field as usize)?;
+            (!f.multi && c.k > 0).then(|| logical::Per { field: c.field as usize, k: usize::try_from(c.k).unwrap_or(usize::MAX) })
+        });
         let pk = self.schema.primary_key;
         let mut phases = Vec::new();
         let (projection, group_by, having, order, tiebreak) = match aggregate {
@@ -249,7 +256,8 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard })
+        let per = per.filter(|_| group_by.is_empty() && phases.is_empty() && order.is_some());
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard, per })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.
@@ -360,7 +368,14 @@ impl<'a> Raise<'a> {
             }
             Expr::In { expr, list } => {
                 let f = self.field_of(expr)?;
-                let values = list.iter().map(|v| self.stored(f, self.lit(v)?)).collect::<Result<Vec<_>>>()?;
+                // A NULL is kept for three_valued and simplify to read.
+                let values = list
+                    .iter()
+                    .map(|v| match self.lit(v)? {
+                        Value::Null => Ok(Value::Null),
+                        v => self.stored(f, v),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 if values.is_empty() {
                     Pred::False
                 } else {
@@ -387,6 +402,9 @@ impl<'a> Raise<'a> {
                     return Err(err(format!("PREFIX allows 0 to 2 edits, not {edits}")));
                 }
                 match self.lit(prefix)? {
+                    // The empty prefix (`IS NOT NULL` once simplified), so
+                    // that its negation leaves out rows without a value.
+                    Value::Str(p) if p.is_empty() && *edits == 0 => Pred::Prefix { field: f, prefix: p, edits: 0 },
                     Value::Str(p) if p.is_empty() => Pred::Present { field: f },
                     Value::Str(p) => Pred::Prefix { field: f, prefix: p, edits: *edits },
                     v => return Err(err(format!("PREFIX of {} takes text, not {v:?}", fld.name))),
@@ -517,6 +535,9 @@ impl<'a> Raise<'a> {
                 Some(p)
             }
         };
+        if g.max_nodes == 0 || g.k == 0 {
+            return Err(err("a traversal's max_nodes and k are 1 or more"));
+        }
         let g = GraphQuery {
             field,
             edges: g.edges.clone(),

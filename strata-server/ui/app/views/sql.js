@@ -1,7 +1,8 @@
 // The SQL workbench: tabs of queries in an editor that completes tables,
 // fields and functions, parameters filled in a form (a vector parameter
 // can be text the server embeds), the answer as a grid, a chart, the plan
-// as a tree with what ran on each segment, the trace and the JSON; a
+// as a tree with what ran on each segment, its profile (every step it
+// took, with the request's trace and CPU time when asked) and the JSON; a
 // sidebar of tables and fields to drag into the editor, snippets written
 // for the table's own fields, history and saved queries.
 
@@ -9,7 +10,7 @@ import { h, icon, clear, fmt, api, store, toast, copy, modal, drawer, empty, seg
 import { editor, quoteName } from "../sqledit.js";
 import { tables, cached, invalidate, typeBadge } from "../catalog.js";
 import { grid, resultChart, planTree, segments, answerStats, exportMenu } from "../results.js";
-import { waterfall } from "./queries.js";
+import { profileView } from "../profile.js";
 
 export default { id: "sql", title: "SQL workbench", icon: "sql", group: "Data", full: true, keywords: "query editor sql run explain plan results chart history saved snippets parameters", render, onParams };
 
@@ -114,8 +115,8 @@ function render(page, r) {
   const outBody = h("div", { class: "wb-res" });
   const status = h("div", { class: "wb-status" });
   const runBtn = h("button", { class: "btn primary", title: "Run the statement at the caret (Ctrl+Enter)", onclick: () => run() }, icon("play"), "Run");
-  const traceSw = h("label", { class: "row nw small dim", title: "Ask the server for the steps the query took", style: { gap: "6px", cursor: "pointer" } },
-    h("input", { type: "checkbox", checked: trace, onchange: (e) => { trace = e.target.checked; store.set("sql.trace", trace); } }), "trace");
+  const traceSw = h("label", { class: "row nw small dim", title: "Ask the server for the request's trace and the CPU time of every step the query took (its Profile tab)", style: { gap: "6px", cursor: "pointer" } },
+    h("input", { type: "checkbox", checked: trace, onchange: (e) => { trace = e.target.checked; store.set("sql.trace", trace); } }), "profile");
   const ed = editor({
     value: tab().sql,
     onChange: (v) => { tab().sql = v; save(); drawParams(); },
@@ -209,8 +210,8 @@ function render(page, r) {
     const t0 = performance.now();
     try {
       let j;
-      if (explain) j = await api("/v1/explain", { body: { sql, params, hits: 5 }, signal: running.signal });
-      else if (READ.test(stripStrings(sql))) j = await api("/v1/query", { body: { sql, params, trace }, signal: running.signal });
+      if (explain) j = await api("/v1/explain", { body: { sql, params, hits: 5, profile: trace }, signal: running.signal });
+      else if (READ.test(stripStrings(sql))) j = await api("/v1/query", { body: { sql, params, trace, profile: trace }, signal: running.signal });
       else j = await api("/v1/sql", { body: { sql, params }, signal: running.signal });
       j.roundtrip_ms = performance.now() - t0;
       last = { j, sql, explain };
@@ -253,7 +254,8 @@ function render(page, r) {
     lastKind = kind;
     if (!last) return;
     const { j, explain } = last;
-    const kinds = explain ? [["plan", "Plan"], ["json", "JSON"]] : j.written != null ? [["results", "Written"], ["json", "JSON"]] : [["results", `Results ${fmt.n(j.rows?.length || 0)}`], ["chart", "Chart"], ["plan", "Plan"], ["trace", "Trace"], ["json", "JSON"]];
+    const kinds = explain ? [["plan", "Plan"], ["profile", "Profile"], ["json", "JSON"]] : j.written != null ? [["results", "Written"], ["json", "JSON"]] : [["results", `Results ${fmt.n(j.rows?.length || 0)}`], ["chart", "Chart"], ["plan", "Plan"], ["profile", "Profile"], ["json", "JSON"]];
+    if (kind === "trace") kind = "profile";
     if (!kinds.some(([k]) => k === kind)) kind = kinds[0][0];
     clear(outTabs, kinds.map(([k, l]) => h("button", { role: "tab", "aria-selected": String(k === kind), onclick: () => show(k) }, l)));
     clear(status, explain ? h("span", { class: "small" }, h("b", {}, j.kind), " · ", fmt.ms(j.took_ms), " · ", fmt.plural(j.rows, "row")) : answerStats(j),
@@ -261,7 +263,14 @@ function render(page, r) {
     if (kind === "results" && j.written != null) clear(outBody, h("div", { class: "stack", style: { padding: "16px" } }, h("div", { class: "banner ok" }, icon("okc", "lg"), h("div", {}, h("div", { class: "big" }, `${fmt.plural(j.written, "row")} written`), h("div", { class: "small muted" }, `in ${fmt.ms(j.took_ms)}${j.seq_no != null ? ` · sequence number ${j.seq_no}` : ""}${j.skipped ? ` · ${fmt.n(j.skipped)} skipped` : ""}`)))));
     else if (kind === "results") clear(outBody, grid(j));
     else if (kind === "chart") clear(outBody, h("div", { style: { padding: "12px 14px" } }, resultChart(j)));
-    else if (kind === "trace") clear(outBody, h("div", { style: { padding: "12px 14px" } }, j.trace ? [waterfall(j.trace), h("div", { class: "small muted", style: { marginTop: "10px" } }, `${fmt.ms(j.took_ms)} on the server · ${fmt.ms(j.roundtrip_ms)} from this page and back`)] : empty("clock", "No trace", "Tick “trace” and run the query again.")));
+    else if (kind === "profile") {
+      const steps = explain ? j.steps : j.stats?.steps;
+      const cpu = steps?.some((x) => x.cpu_us != null);
+      clear(outBody, h("div", { style: { padding: "12px 14px" } },
+        h("div", { class: "row", style: { marginBottom: "10px" } }, h("span", { class: "small muted" }, cpu ? "Every step the query took, with its CPU time." : "Every step the query took. Tick “profile” and run it again for the CPU time of each and the request's trace."), h("span", { class: "sep" }),
+          h("a", { class: "btn sm", href: "#/profile?tab=query&sql=" + encodeURIComponent(last.sql), title: "Run it in the Profiler, as many times as you like" }, icon("flame"), "Open in the Profiler")),
+        profileView({ steps, trace: j.trace, took_ms: j.took_ms, roundtrip_ms: j.roundtrip_ms, plan: explain ? j.plan : j.stats?.plan, rows: explain ? j.rows : j.rows?.length, filter_docs: explain ? j.filter_docs : j.stats?.filter_docs, scored: explain ? j.scored : j.stats?.scored, profiled: cpu }, { compact: true })));
+    }
     else if (kind === "json") clear(outBody, h("pre", { class: "code", style: { margin: "12px 14px", maxHeight: "60vh" } }, JSON.stringify(j.rows && j.rows.length > 200 ? { ...j, rows: j.rows.slice(0, 200), note: `${j.rows.length - 200} more rows left out` } : j, null, 2)));
     else if (kind === "plan") explainView(explain ? j : null);
   }

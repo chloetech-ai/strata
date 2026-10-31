@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value as Json};
+use strata::query::exec::ExecStats;
+use strata::query::steps::Step;
 use tokio::sync::Notify;
 
 /// Milliseconds since the Unix epoch.
@@ -63,6 +65,12 @@ pub struct Span {
 impl Trace {
     pub fn new() -> Arc<Trace> {
         Arc::new(Trace { t0: Instant::now(), spans: Mutex::new(Vec::new()) })
+    }
+
+    /// When the request began: what its spans, and its query's steps
+    /// ([`strata::query::steps`]), count from.
+    pub fn t0(&self) -> Instant {
+        self.t0
     }
 
     /// The steps so far, at most [`MAX_SPANS`].
@@ -271,6 +279,9 @@ impl LiveQueries {
 /// A query that ended.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Finished {
+    /// Its number among the queries this server ran, for
+    /// `GET /v1/queries/finished/:id`.
+    pub id: u64,
     pub ts_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<Arc<str>>,
@@ -285,10 +296,97 @@ pub struct Finished {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trace: Vec<Span>,
+    /// Its profile: the timed steps of its execution, from the request's
+    /// start as the trace's spans are ([`strata::query::steps`]), with
+    /// CPU time when `profiled`; what ran, line by line; and its counters.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub profiled: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<String>,
+    pub filter_docs: u64,
+    pub scored: u64,
+}
+
+impl Finished {
+    /// As the lists of queries show it: without its steps and plan, which
+    /// `GET /v1/queries/finished/:id` gives, but their count and CPU time.
+    pub fn summary(&self) -> Json {
+        let mut j = serde_json::to_value(self).unwrap_or(Json::Null);
+        if let Some(o) = j.as_object_mut() {
+            o.remove("steps");
+            o.remove("plan");
+            o.insert("steps_n".into(), json!(self.steps.len()));
+            if let Some(cpu) = cpu_ms(&self.steps) {
+                o.insert("cpu_ms".into(), json!(cpu));
+            }
+            if let Some(b) = alloc_bytes(&self.steps) {
+                o.insert("alloc_bytes".into(), json!(b));
+            }
+        }
+        j
+    }
+}
+
+/// The CPU time of a query's steps, in milliseconds: each measured step's,
+/// the steps inside it counted in it (a coordinator measures none of its
+/// own steps, its shards their own); `None` unless any was measured.
+pub fn cpu_ms(steps: &[Step]) -> Option<f64> {
+    outermost(steps, |s| s.cpu_us).map(|us| us / 1e3)
+}
+
+/// The bytes a query's steps allocated, counted as [`cpu_ms`] counts CPU
+/// time; `None` unless any step counted them.
+pub fn alloc_bytes(steps: &[Step]) -> Option<u64> {
+    outermost(steps, |s| s.alloc_bytes.map(|b| b as f64)).map(|b| b as u64)
+}
+
+/// The sum of `f` over the outermost steps that have it.
+fn outermost(steps: &[Step], f: impl Fn(&Step) -> Option<f64>) -> Option<f64> {
+    let (mut total, mut inside) = (None, None);
+    for s in steps {
+        if inside.is_some_and(|d| s.depth > d) {
+            continue;
+        }
+        inside = None;
+        if let Some(c) = f(s) {
+            *total.get_or_insert(0.0) += c;
+            inside = Some(s.depth);
+        }
+    }
+    total
+}
+
+/// Profiling settings an operator changes while the server runs
+/// (`PUT /v1/profile/settings`).
+#[derive(Default)]
+pub struct Profiling {
+    /// The slow threshold in microseconds, plus one (0: as the server
+    /// started, `u64::MAX`: none).
+    slow: AtomicU64,
+    /// Measure every query's CPU time, as `"profile": true` does for one.
+    pub cpu_all: AtomicBool,
+}
+
+impl Profiling {
+    /// The slow threshold: as set at run time, else `started`.
+    pub fn slow(&self, started: Option<Duration>) -> Option<Duration> {
+        match self.slow.load(Ordering::Relaxed) {
+            0 => started,
+            u64::MAX => None,
+            us => Some(Duration::from_micros(us - 1)),
+        }
+    }
+
+    pub fn set_slow(&self, slow: Option<Duration>) {
+        self.slow.store(slow.map_or(u64::MAX, |d| (d.as_micros() as u64).min(u64::MAX - 2) + 1), Ordering::Relaxed);
+    }
 }
 
 /// The latest queries, the slow ones, and statistics per statement.
 pub struct QueryLog {
+    next: AtomicU64,
     recent: Mutex<VecDeque<Arc<Finished>>>,
     slow: Mutex<VecDeque<Arc<Finished>>>,
     pub statements: Statements,
@@ -298,19 +396,25 @@ pub struct QueryLog {
 pub const RECENT: usize = 500;
 pub const SLOW: usize = 200;
 
+/// Plan lines a kept query keeps.
+pub const PLAN_LINES: usize = 400;
+
 impl Default for QueryLog {
     fn default() -> QueryLog {
-        QueryLog { recent: Mutex::new(VecDeque::with_capacity(RECENT)), slow: Mutex::new(VecDeque::new()), statements: Statements::default() }
+        QueryLog { next: AtomicU64::new(0), recent: Mutex::new(VecDeque::with_capacity(RECENT)), slow: Mutex::new(VecDeque::new()), statements: Statements::default() }
     }
 }
 
 impl QueryLog {
-    /// Keeps a query that ended (in the slow ones too if `slow`).
+    /// Keeps a query that ended (in the slow ones too if `slow`), with
+    /// what it ran (`stats`, its steps from the request's start) and
+    /// whether its CPU time was measured (`profiled`).
     #[allow(clippy::too_many_arguments)]
-    pub fn add(&self, sql: &str, kind: &'static str, outcome: &'static str, secs: f64, rows: usize, shard: bool, error: Option<&str>, slow: bool) {
+    pub fn add(&self, sql: &str, kind: &'static str, outcome: &'static str, secs: f64, rows: usize, shard: bool, error: Option<&str>, slow: bool, stats: Option<&ExecStats>, profiled: bool) {
         let fingerprint = fingerprint(sql);
         self.statements.add(&fingerprint, sql, kind, outcome, secs, rows, shard);
         let f = Arc::new(Finished {
+            id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
             ts_ms: now_ms(),
             request_id: crate::obs::current(),
             sql: crate::obs::truncate(sql, 2000).into_owned(),
@@ -322,6 +426,11 @@ impl QueryLog {
             shard,
             error: error.map(|e| crate::obs::truncate(e, 500).into_owned()),
             trace: trace().map(|t| t.spans()).unwrap_or_default(),
+            steps: stats.map(|s| s.steps.clone()).unwrap_or_default(),
+            profiled,
+            plan: stats.map(|s| s.plan.iter().take(PLAN_LINES).cloned().collect()).unwrap_or_default(),
+            filter_docs: stats.map_or(0, |s| s.filter_docs),
+            scored: stats.map_or(0, |s| s.scored),
         });
         push(&self.recent, f.clone(), RECENT);
         if slow {
@@ -337,6 +446,13 @@ impl QueryLog {
 
     pub fn slow(&self, limit: usize) -> Vec<Arc<Finished>> {
         lock(&self.slow).iter().rev().take(limit).cloned().collect()
+    }
+
+    /// The query numbered `id` ([`Finished::id`]), if it is among the
+    /// latest or the slow ones still.
+    pub fn finished(&self, id: u64) -> Option<Arc<Finished>> {
+        let find = |q: &Mutex<VecDeque<Arc<Finished>>>| lock(q).iter().rev().find(|f| f.id == id).cloned();
+        find(&self.recent).or_else(|| find(&self.slow))
     }
 
     /// The query with request id `id`, as a coordinator asked or a client.
@@ -594,6 +710,10 @@ pub struct Sample {
     pub slow: u64,
     /// The process's CPU time, in seconds.
     pub cpu_s: f64,
+    /// Bytes allocated and allocations, since the process started (with
+    /// the counting allocator, [`crate::heap`]).
+    pub alloc_bytes: u64,
+    pub allocs: u64,
     /// Gauges, by name.
     pub gauges: BTreeMap<&'static str, f64>,
 }
@@ -672,6 +792,7 @@ fn point(a: &Sample, b: &Sample) -> Json {
         "write_p99_ms": ms(&wh, 0.99),
         "slow_s": rate(a.slow, b.slow),
         "cpu": ((b.cpu_s - a.cpu_s) / secs).max(0.0),
+        "alloc_bytes_s": rate(a.alloc_bytes, b.alloc_bytes), "allocs_s": rate(a.allocs, b.allocs),
         "by_kind": by_kind,
         "latency_hist": qh,
     });
@@ -721,6 +842,17 @@ fn rss() -> Option<u64> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rss() -> Option<u64> {
     None
+}
+
+/// The most resident memory the process has had, in bytes.
+pub fn peak_rss() -> Option<u64> {
+    // SAFETY: getrusage writes the struct it is given.
+    let max = unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        (libc::getrusage(libc::RUSAGE_SELF, &mut u) == 0).then_some(u.ru_maxrss as u64)?
+    };
+    // Linux counts ru_maxrss in KiB, macOS in bytes.
+    Some(if cfg!(target_os = "macos") { max } else { max * 1024 })
 }
 
 /// The space of the file system holding `path`: total, free, and

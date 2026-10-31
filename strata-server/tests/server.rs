@@ -1929,6 +1929,8 @@ async fn sqlite_files_over_http() {
         let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
         assert_eq!(status, 400, "{url}: {r}");
         assert!(r["error"].as_str().unwrap().contains(why), "{url}: {r}");
+        // Review BUG-N11: the server's temporary path is not the client's business.
+        assert!(!r["error"].as_str().unwrap().contains("import.sqlite"), "{url}: {r}");
     }
 
     // The export: a SQLite file of every table, which imports back as it was.
