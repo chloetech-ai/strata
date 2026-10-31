@@ -144,6 +144,9 @@ fn queries() -> Vec<(&'static str, Json)> {
         // statistics, and a rank-safe boost.
         ("SELECT id, score() FROM products ORDER BY ln(1 + bm25(body, 'waterproof hiking')) + 0.1 * coalesce(rating, 0) DESC LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products WHERE price < 200 ORDER BY bm25(body, 'leather boots') * (1 + 0.2 * coalesce(rating, 0)) DESC LIMIT 8", none.clone()),
+        // Some of the conditions, and a boost by how many hold.
+        ("SELECT id, price FROM products WHERE AT_LEAST(2, MATCH(body, 'waterproof'), price < 200, year >= 2020) ORDER BY price DESC, id LIMIT 10", none.clone()),
+        ("SELECT id, score() FROM products WHERE AT_LEAST('50%', rating >= 4, tags = 'sale', category = 'outdoor') ORDER BY bm25(body, 'leather boots') * (1 + count_true(rating >= 4, year >= 2020)) DESC LIMIT 8", none.clone()),
         // Autocomplete: a prefix's most rated, and a prefix counted.
         ("SELECT id, rating FROM products WHERE PREFIX(id, 'p00001') ORDER BY rating DESC, id LIMIT 10", none.clone()),
         ("SELECT COUNT(*) FROM products WHERE category LIKE 'k%' AND id NOT LIKE 'p0000%'", none.clone()),
@@ -647,6 +650,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no semantic IDs here"))
     }
+    async fn guard_counts(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no guards here"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -696,6 +702,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn sid_next(&self, _: tonic::Request<pb::SidNextRequest>) -> Result<tonic::Response<pb::SidNextResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no semantic IDs here"))
+    }
+    async fn guard_counts(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no guards here"))
     }
 }
 
@@ -966,6 +975,9 @@ impl pb::strata_server::Strata for Recording {
         self.up()?;
         self.inner.sid_next(r).await
     }
+    async fn guard_counts(&self, r: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::GuardCountsResponse>, tonic::Status> {
+        self.inner.guard_counts(self.read(r)?).await
+    }
 }
 
 async fn recording(db: Db, version: u32) -> (String, Arc<Recording>) {
@@ -1068,6 +1080,52 @@ async fn shards_speak_the_oldest_protocol_among_them() {
             assert!(log.iter().all(|s| s.epoch == (want_protocol >= 4) as u64), "{versions:?}: {log:?}");
         }
     }
+}
+
+/// Guarded queries (`min_rows`, `max_rows`) on the demo's products.
+const GUARDED: [&str; 3] = [
+    "SELECT id, price FROM products WHERE price < 400 AND AT_LEAST(1, MATCH(body, 'waterproof'), tags = 'sale', rating >= 4, year >= 2022, max_rows => 300) ORDER BY price DESC, id LIMIT 10",
+    "SELECT id, score() FROM products ORDER BY bm25(body, 'waterproof hiking boots leather', min => 1, min_rows => 40) DESC LIMIT 10",
+    "SELECT id, score() FROM products WHERE MATCH(body, 'lightweight waterproof jacket', min => 1, max_rows => 150) ORDER BY bm25(body, 'jacket') DESC LIMIT 10",
+];
+
+/// A guard's level is the cluster's: the shards' counts, summed, choose
+/// it as one database's would. A shard before protocol 8 cannot count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guard_counts_the_rows_of_every_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = create(dir.path(), "whole.strata", |_| true);
+    let local = service(create(dir.path(), "local.strata", |_| true), "http://unused");
+    let key = |i: usize| Value::Str(format!("p{i:07}"));
+    let mut urls = Vec::new();
+    for s in 0..3 {
+        let db = create(dir.path(), &format!("s{s}.strata"), |i| shard_of(&key(i), 3) == s);
+        urls.push(grpc(service(db, "http://unused")).await);
+    }
+    let coord = cluster(Coordinator::connect(urls).await.unwrap());
+    let guard = |rs: &strata::query::exec::ResultSet| rs.stats.plan.iter().find(|l| l.starts_with("guard: ")).cloned();
+    for sql in GUARDED {
+        let want = whole.query(sql, &Params::new()).unwrap();
+        assert!(!want.rows.is_empty(), "{sql}");
+        let got = coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        same(sql, &js::result(&want, 0.0), &js::result(&got.rs, 0.0));
+        assert!(guard(&want).is_some() && guard(&want) == guard(&got.rs), "{sql}: {:?} against {:?}", want.stats.plan, got.rs.stats.plan);
+        // The counts alone, as a coordinator in front of this one asks.
+        let counts = coord.guard_counts(sql, None, &Params::new(), &After::Any, 0).await.unwrap();
+        assert_eq!(counts, local.guard_counts(sql, None, &Params::new(), &After::Any, 0).await.unwrap(), "{sql}");
+        // A shard runs it at the level its coordinator chose, not its own.
+        let e = local.query(QueryReq { sql: sql.into(), shard: true, ..Default::default() }).await.err().unwrap();
+        assert!(e.message.contains("runs on shards at the level its coordinator chose"), "{sql}: {}", e.message);
+    }
+    let e = local.guard_counts("SELECT id FROM products WHERE price < 10", None, &Params::new(), &After::Any, 0).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("no guard"), "{}", e.message);
+    let (old, _) = recording(create(dir.path(), "old.strata", |i| shard_of(&key(i), 2) == 0), 7).await;
+    let (new, _) = recording(create(dir.path(), "new.strata", |i| shard_of(&key(i), 2) == 1), 8).await;
+    let coord = cluster(Coordinator::connect(vec![old, new]).await.unwrap());
+    let e = coord.query(QueryReq { sql: GUARDED[0].into(), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 400 && e.message.contains("needs 8: upgrade it"), "{}", e.message);
+    let sql = "SELECT id, price FROM products WHERE price < 400 AND AT_LEAST(1, MATCH(body, 'waterproof'), tags = 'sale') ORDER BY price DESC, id LIMIT 10";
+    coord.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 /// A replica that fails is asked its versions again before its next read,
@@ -1393,7 +1451,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
     let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 9 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 7, strata::query::ir::VERSION, 0));
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 8, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1419,9 +1477,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 8, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: 9, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 8"), "{}", e.message());
+    assert!(e.message().contains("protocol 9"), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);

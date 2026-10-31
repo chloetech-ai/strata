@@ -7,8 +7,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, NormKind, OnConflict, Phase, Plan, ProfileRef, Search, Set, SortKey, When};
+use strata::query::ir::{Agg, ArithOp, CmpOp, Column, Cte, Expr, Func, Graph, GraphKind, Guard, GuardSite, JoinKey, JoinKind, KeyValue, Node, NormKind, OnConflict, Phase, Plan, ProfileRef, Search, Set, SortKey, When};
 use strata::query::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy};
+use strata::text::query::Need;
 use strata::value::Value;
 
 use crate::grpc::{from_pb, to_pb};
@@ -56,6 +57,37 @@ fn set(s: &Set) -> pb::Set {
     pb::Set { field: s.field, value: Some(ex(&s.value)) }
 }
 
+fn match_pb(field: u32, query: &str, expand: &Expand) -> pb::Match {
+    pb::Match {
+        field,
+        query: query.to_string(),
+        expand: Some(pb::Expand {
+            synonyms: expand.synonyms,
+            fuzzy: expand.fuzzy.map(|f| match f {
+                Fuzzy::Auto => pb::expand::Fuzzy::Auto(pb::Empty {}),
+                Fuzzy::Edits(n) => pb::expand::Fuzzy::Edits(n as u32),
+            }),
+        }),
+    }
+}
+
+fn guard(g: &Guard) -> pb::Guard {
+    use pb::guard::{Need as PbNeed, Site};
+    pb::Guard {
+        site: Some(match &g.site {
+            GuardSite::AtLeast { conds } => Site::AtLeast(pb::GuardAtLeast { conds: conds.iter().map(ex).collect() }),
+            GuardSite::Match { field, text, expand } => Site::Match(match_pb(*field, text, expand)),
+            GuardSite::Bm25 { field, text } => Site::Bm25(pb::GuardBm25 { field: *field, text: text.clone() }),
+        }),
+        need: Some(match g.need {
+            Need::Count(n) => PbNeed::Count(n as u64),
+            Need::Percent(p) => PbNeed::Percent(p),
+        }),
+        min_rows: g.min_rows,
+        max_rows: g.max_rows,
+    }
+}
+
 fn opts(o: &BTreeMap<String, Value>) -> HashMap<String, pb::Value> {
     o.iter().map(|(k, v)| (k.clone(), to_pb(v))).collect()
 }
@@ -68,6 +100,7 @@ fn node(n: &Node) -> pb::Node {
             order: s.order.iter().map(sort_key).collect(),
             phases: s.phases.iter().map(|p| pb::Phase { count: p.count, expr: Some(ex(&p.expr)), global: p.global }).collect(),
             profile: s.profile.as_ref().map(|r| pb::RankProfileRef { name: r.name.clone(), hash: r.hash.clone() }),
+            guard: s.guard.as_deref().map(guard),
         })),
         Node::Aggregate { input, keys, aggs } => N::Aggregate(Box::new(pb::Aggregate {
             input: boxed(input),
@@ -104,7 +137,7 @@ fn node(n: &Node) -> pb::Node {
         Node::Ref { name } => N::Ref(name.clone()),
         Node::Distinct { input } => N::Distinct(Box::new(node(input))),
         Node::KeyOrder { input, by } => N::KeyOrder(Box::new(pb::KeyOrder { input: boxed(input), by: boxed(by) })),
-        Node::DistinctOn { input, keys } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect() })),
+        Node::DistinctOn { input, keys, per } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect(), per: *per })),
     };
     pb::Node { node: Some(n) }
 }
@@ -158,6 +191,7 @@ fn expr(e: &Expr) -> E {
         Expr::Not(x) => E::Not(Box::new(ex(x))),
         Expr::And(xs) => E::And(exprs(xs)),
         Expr::Or(xs) => E::Or(exprs(xs)),
+        Expr::AtLeast { need, conds } => E::AtLeast(pb::AtLeast { need: *need, conds: conds.iter().map(ex).collect() }),
         Expr::IsNull(x) => E::IsNull(Box::new(ex(x))),
         Expr::Cmp { op, left, right } => E::Cmp(Box::new(pb::Cmp {
             op: match op {
@@ -212,20 +246,11 @@ fn expr(e: &Expr) -> E {
                 Func::Clamp => pb::Func::Clamp,
                 Func::Dot => pb::Func::Dot,
                 Func::SidAt => pb::Func::SidAt,
+                Func::CountTrue => pb::Func::CountTrue,
             } as i32,
             args: args.iter().map(ex).collect(),
         }),
-        Expr::Match { field, query, expand } => E::Match(pb::Match {
-            field: *field,
-            query: query.clone(),
-            expand: Some(pb::Expand {
-                synonyms: expand.synonyms,
-                fuzzy: expand.fuzzy.map(|f| match f {
-                    Fuzzy::Auto => pb::expand::Fuzzy::Auto(pb::Empty {}),
-                    Fuzzy::Edits(n) => pb::expand::Fuzzy::Edits(n as u32),
-                }),
-            }),
-        }),
+        Expr::Match { field, query, expand } => E::Match(match_pb(*field, query, expand)),
         Expr::Graph(g) => E::Graph(Box::new(graph(g))),
         Expr::Bm25 { field, text, opts: o } => E::Bm25(pb::Bm25 { field: *field, text: text.clone(), opts: opts(o) }),
         Expr::Similarity { field, vector, opts: o } => E::Similarity(pb::Similarity { field: *field, vector: Some(pb::Floats { v: vector.to_vec() }), opts: opts(o) }),
@@ -322,6 +347,33 @@ fn from_opt_bex(e: Option<Box<pb::Expr>>) -> Result<Option<Box<Expr>>, ApiError>
     e.map(|e| from_bex(Some(e))).transpose()
 }
 
+fn from_match(m: pb::Match) -> Result<(u32, String, Expand), ApiError> {
+    let x = m.expand.unwrap_or_default();
+    let fuzzy = match x.fuzzy {
+        None => None,
+        Some(pb::expand::Fuzzy::Auto(_)) => Some(Fuzzy::Auto),
+        Some(pb::expand::Fuzzy::Edits(n)) => Some(Fuzzy::Edits(u8::try_from(n).map_err(|_| bad(format!("{n} edits is too many")))?)),
+    };
+    Ok((m.field, m.query, Expand { synonyms: x.synonyms, fuzzy }))
+}
+
+fn from_guard(g: pb::Guard) -> Result<Guard, ApiError> {
+    use pb::guard::{Need as PbNeed, Site};
+    let site = match need(g.site, "a guard's site")? {
+        Site::AtLeast(a) => GuardSite::AtLeast { conds: from_exprs(a.conds)? },
+        Site::Match(m) => {
+            let (field, text, expand) = from_match(m)?;
+            GuardSite::Match { field, text, expand }
+        }
+        Site::Bm25(b) => GuardSite::Bm25 { field: b.field, text: b.text },
+    };
+    let need = match need(g.need, "a guard's level")? {
+        PbNeed::Count(n) => Need::Count(usize::try_from(n).map_err(|_| bad(format!("a guard's level of {n}")))?),
+        PbNeed::Percent(p) => Need::Percent(p),
+    };
+    Ok(Guard { site, need, min_rows: g.min_rows, max_rows: g.max_rows })
+}
+
 fn from_exprs(es: Vec<pb::Expr>) -> Result<Vec<Expr>, ApiError> {
     es.into_iter().map(|e| from_ex(Some(e))).collect()
 }
@@ -349,7 +401,8 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
             };
             let phases = s.phases.into_iter().map(|p| Ok(Phase { count: p.count, expr: from_ex(p.expr)?, global: p.global })).collect::<Result<_, ApiError>>()?;
             let profile = s.profile.map(|r| ProfileRef { name: r.name, hash: r.hash });
-            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases, profile })
+            let guard = s.guard.map(from_guard).transpose()?.map(Box::new);
+            Node::Search(Search { table: s.table, filter, order: s.order.into_iter().map(from_sort_key).collect::<Result<_, _>>()?, phases, profile, guard })
         }
         N::Aggregate(a) => {
             let a = *a;
@@ -423,7 +476,7 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
         }
         N::DistinctOn(d) => {
             let d = *d;
-            Node::DistinctOn { input: from_bnode(d.input)?, keys: from_exprs(d.keys)? }
+            Node::DistinctOn { input: from_bnode(d.input)?, keys: from_exprs(d.keys)?, per: d.per.max(1) }
         }
     })
 }
@@ -470,6 +523,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         E::Not(x) => Expr::Not(Box::new(from_ex(Some(*x))?)),
         E::And(xs) => Expr::And(from_exprs(xs.v)?),
         E::Or(xs) => Expr::Or(from_exprs(xs.v)?),
+        E::AtLeast(a) => Expr::AtLeast { need: a.need, conds: from_exprs(a.conds)? },
         E::IsNull(x) => Expr::IsNull(Box::new(from_ex(Some(*x))?)),
         E::Cmp(c) => {
             let c = *c;
@@ -537,17 +591,13 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Clamp => Func::Clamp,
                 pb::Func::Dot => Func::Dot,
                 pb::Func::SidAt => Func::SidAt,
+                pb::Func::CountTrue => Func::CountTrue,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
         }
         E::Match(m) => {
-            let x = m.expand.unwrap_or_default();
-            let fuzzy = match x.fuzzy {
-                None => None,
-                Some(pb::expand::Fuzzy::Auto(_)) => Some(Fuzzy::Auto),
-                Some(pb::expand::Fuzzy::Edits(n)) => Some(Fuzzy::Edits(u8::try_from(n).map_err(|_| bad(format!("{n} edits is too many")))?)),
-            };
-            Expr::Match { field: m.field, query: m.query, expand: Expand { synonyms: x.synonyms, fuzzy } }
+            let (field, query, expand) = from_match(m)?;
+            Expr::Match { field, query, expand }
         }
         E::Graph(g) => Expr::Graph(Box::new(from_graph(*g)?)),
         E::Bm25(b) => Expr::Bm25 { field: b.field, text: b.text, opts: from_opts(b.opts)? },

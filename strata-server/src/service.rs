@@ -1508,6 +1508,39 @@ impl Service {
         }
     }
 
+    /// The loosest level of the guard of `sql` (`min_rows`, `max_rows`)
+    /// and how many rows each level from it up to the strictest matches,
+    /// summed over the shards of a coordinator, as the query would read
+    /// them seeing the writes `after` names.
+    pub async fn guard_counts(self: &Arc<Self>, sql: &str, plan: Option<&Plan>, params: &Params, after: &After, timeout_ms: u64) -> Result<(usize, Vec<u64>), ApiError> {
+        let t0 = Instant::now();
+        let bound = match plan {
+            Some(p) => p.clone(),
+            None => self.bound(|tables| compound::plan_read(sql, tables, params, &|t, n| self.rank_profile(t, n))).await?,
+        };
+        if bound.root.uses_operators() {
+            return Err(ApiError::bad("query error: a guard's levels are counted over one table's rows: a query without subqueries"));
+        }
+        let schema = self.table(bound.table()).await?;
+        let select = bound.to_select(&schema)?;
+        let timeout = self.timeout_of(timeout_ms);
+        let deadline = t0 + timeout;
+        match &self.backend {
+            Backend::Local(db) => {
+                let snap = self.read_snapshot(db, 0, after, deadline).await?;
+                let view = snap.table(&schema.table).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", schema.table)))?;
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected("guard_counts", t0)) };
+                let db = db.clone();
+                let synonyms = self.synonyms().or_else(|| db.exec.synonyms.clone());
+                let opts = ExecOptions { deadline: Some(deadline), memory: self.query_memory.clone(), synonyms, ..db.exec.clone() };
+                let r = tokio::task::spawn_blocking(move || db.guard_counts(&view, &select, &opts)).await.map_err(ApiError::internal)?;
+                drop(permit);
+                Ok(r?)
+            }
+            Backend::Cluster(c) => c.guard_counts(sql, &schema, plan, params, &select, after, deadline).await,
+        }
+    }
+
     /// The codes that can follow each of `prefixes` in semantic-ID field
     /// `field`, among the rows `sql` (`SELECT COUNT(*) FROM t WHERE ...`)
     /// or `plan` filters, seeing the writes `after` names: per prefix, each

@@ -195,6 +195,7 @@ pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
         offset: 0,
         graphs: Vec::new(),
         types: q.types.clone(),
+        guard: None,
     })
 }
 

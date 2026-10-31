@@ -159,6 +159,7 @@ impl<'a> Raise<'a> {
         let Node::Search(search) = n else { return Err(shape(n, "Search")) };
         self.table(&search.table)?;
         let filter = self.filter(&search.filter)?;
+        let guard = search.guard.as_deref().map(|g| self.guard(g)).transpose()?;
         let pk = self.schema.primary_key;
         let mut phases = Vec::new();
         let (projection, group_by, having, order, tiebreak) = match aggregate {
@@ -244,7 +245,7 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.
@@ -256,6 +257,30 @@ impl<'a> Raise<'a> {
     /// with NULL already accounted for ([`Pred::three_valued`]).
     fn filter(&mut self, e: &Expr) -> Result<Pred> {
         Ok(self.pred(e)?.simplify())
+    }
+
+    fn guard(&mut self, g: &super::Guard) -> Result<logical::Guard> {
+        let text_field = |me: &Self, f: u32| -> Result<usize> {
+            let i = me.field(f)?;
+            match me.schema.fields[i].ty {
+                FieldType::Text { .. } if me.schema.fields[i].indexed => Ok(i),
+                _ => Err(err(format!("a guard's MATCH or bm25 reads an indexed TEXT field, not {}", me.schema.fields[i].name))),
+            }
+        };
+        let site = match &g.site {
+            super::GuardSite::AtLeast { conds } if conds.is_empty() => return Err(err("a guard's AT_LEAST has conditions")),
+            super::GuardSite::AtLeast { conds } => logical::GuardSite::AtLeast(conds.iter().map(|c| self.filter(c)).collect::<Result<_>>()?),
+            super::GuardSite::Match { field, text, expand } => {
+                let field = text_field(self, *field)?;
+                crate::text::query::parse_match_with(text, self.schema.fields[field].text_analyzer())?;
+                logical::GuardSite::Match { field, text: text.clone(), expand: *expand }
+            }
+            super::GuardSite::Bm25 { field, text } => logical::GuardSite::Bm25 { field: text_field(self, *field)?, text: text.clone() },
+        };
+        if g.min_rows.is_none() && g.max_rows.is_none() {
+            return Err(err("a guard has min_rows, max_rows or both"));
+        }
+        Ok(logical::Guard { site, need: g.need, min_rows: g.min_rows, max_rows: g.max_rows })
     }
 
     fn pred(&mut self, e: &Expr) -> Result<Pred> {
@@ -291,6 +316,7 @@ impl<'a> Raise<'a> {
                 Pred::And(ps)
             }
             Expr::Or(xs) => Pred::Or(xs.iter().map(|x| self.pred(x)).collect::<Result<_>>()?),
+            Expr::AtLeast { need, conds } => Pred::AtLeast { need: *need as usize, items: conds.iter().map(|x| self.pred(x)).collect::<Result<_>>()? },
             Expr::IsNull(x) => Pred::Not(Box::new(Pred::Present { field: self.present_field(x)? })),
             Expr::Not(x) => match &**x {
                 Expr::IsNull(y) => Pred::Present { field: self.present_field(y)? },
@@ -566,6 +592,10 @@ impl<'a> Raise<'a> {
             Expr::SeqNo => Score::SeqNo,
             Expr::Arith { op, left, right } => Score::Arith { op: *op, left: sub(self, left)?, right: sub(self, right)? },
             Expr::Neg(x) => Score::Neg(sub(self, x)?),
+            // Each condition 1 where it holds, as WHERE would keep the row.
+            Expr::Call { func: Func::CountTrue, args } if !args.is_empty() => {
+                Score::Call { func: Func::CountTrue, args: args.iter().map(|a| Ok(Score::Cond(Box::new(self.filter(a)?)))).collect::<Result<_>>()? }
+            }
             Expr::Call { func, args } => {
                 if Func::numeric(func.name()).is_none() {
                     return Err(err(format!("{}() takes text: a ranking expression is numeric", func.name())));
@@ -730,7 +760,7 @@ impl<'a> Raise<'a> {
             Expr::Excluded(f) => Err(err(format!("excluded.{} is the row an INSERT proposed, in ON CONFLICT DO UPDATE", self.schema.fields[self.field(*f)?].name))),
             Expr::Lit(_) => Ok(()),
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => go(x),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) => all(xs),
+            Expr::And(xs) | Expr::Or(xs) | Expr::AtLeast { conds: xs, .. } | Expr::Concat(xs) => all(xs),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => go(left).and_then(|_| go(right)),
             Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern, .. } => go(expr).and_then(|_| go(pattern)),
             Expr::Between { expr, lo, hi } => [Some(expr), lo.as_ref(), hi.as_ref()].into_iter().flatten().try_for_each(|x| go(x)),

@@ -131,7 +131,7 @@ async fn query(svc: &Arc<Service>, s: &str) -> Json {
 
 /// Queries of every table, and across them: those whose order is total
 /// (`true`) answer in the same order, the others with the same rows.
-const QUERIES: [(&str, bool); 15] = [
+const QUERIES: [(&str, bool); 19] = [
     ("SELECT item, action, ts FROM events WHERE usr = 'u3' ORDER BY ts DESC, id LIMIT 50", true),
     ("SELECT COUNT(*) FROM events", true),
     ("SELECT usr, COUNT(*) FROM events GROUP BY usr LIMIT 100", false),
@@ -149,6 +149,11 @@ const QUERIES: [(&str, bool); 15] = [
     ("SELECT DISTINCT ON (item) item, id, ts FROM events WHERE action = 'buy' ORDER BY ts DESC LIMIT 15", true),
     ("SELECT DISTINCT ON (cat) id, cat, score() FROM items WHERE MATCH(title, 'kettle rope') ORDER BY bm25(title, 'kettle rope') DESC LIMIT 5", true),
     ("SELECT DISTINCT ON (action) action, usr, COUNT(*) AS n FROM events GROUP BY action, usr ORDER BY action, n DESC, usr", true),
+    // At most k rows of each group (MAX k PER).
+    ("SELECT usr, id, ts FROM events ORDER BY ts DESC, id MAX 2 PER usr LIMIT 20", true),
+    ("SELECT item, id, ts FROM events WHERE action = 'buy' ORDER BY ts DESC, id MAX 3 PER item LIMIT 15 OFFSET 2", true),
+    ("SELECT id, cat, score() FROM items WHERE MATCH(title, 'kettle rope') ORDER BY bm25(title, 'kettle rope') DESC MAX 2 PER cat LIMIT 8", true),
+    ("SELECT e.id, e.ts, i.cat FROM events e JOIN items i ON e.item = i.id ORDER BY e.ts DESC, e.id MAX 2 PER i.cat LIMIT 12", true),
 ];
 
 /// The same rows: in the same order when `ordered`, but for rows tied on

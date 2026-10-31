@@ -30,7 +30,14 @@
 //! not a stopword weighing 2, `require_first` with that word required
 //! (`+word`) and `exclude_last` with its last such word excluded
 //! (`-word`): what weights and the filters they make cost against
-//! `words`. `--features DIR` makes their training
+//! `words`. `min2` and `min50` rank the rows with at least 2, or half, of
+//! the query's words (`min => 2`, `min => '50%'`). The `_r100` variants
+//! take 100 rows, with their recall@100 beside nDCG@10: `plain_r100` any
+//! of the words, `all_r100` all of them (`min => '100%'`), and
+//! `guard_r100` all of them while 100 rows have them, else as many as do
+//! (`min => 1, min_rows => 100`); with `all_r100`, the recalls are given
+//! again over the queries fewer than 100 rows match all the words of.
+//! `--features DIR` makes their training
 //! data instead of timing anything: each query's BM25 top 100 with
 //! `features()` and its grades, in `<DIR>/<collection>.jsonl`, which
 //! `scripts/train_ltr.py` trains the models on. `--reps N` runs the
@@ -94,6 +101,7 @@ struct Args {
 /// A variant's query on collection `coll` and whether it ranks rank-safe.
 fn query(variant: &str, coll: &str) -> (String, bool) {
     let top10 = |rank: &str| format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 10");
+    let top100 = |rank: &str| format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 100");
     // A rerank phase over BM25's top 100.
     let rerank = |rank: &str| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT 100) SELECT id FROM top ORDER BY {rank} DESC LIMIT 10");
     let model = format!("gbdt('ltr_{coll}', bm25(body, :q, syntax => 'plain'), importance)");
@@ -110,7 +118,12 @@ fn query(variant: &str, coll: &str) -> (String, bool) {
         "gbdt_top100" => (top10(&model), false),
         "gbdt_rerank100" => (rerank(&model), true),
         "words" | "weight_first" | "require_first" | "exclude_last" => (top10("bm25(body, :q)"), true),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, words, weight_first, require_first or exclude_last"),
+        "min2" => (top10("bm25(body, :q, syntax => 'plain', min => 2)"), true),
+        "min50" => (top10("bm25(body, :q, syntax => 'plain', min => '50%')"), true),
+        "plain_r100" => (top100("bm25(body, :q, syntax => 'plain')"), true),
+        "all_r100" => (top100("bm25(body, :q, syntax => 'plain', min => '100%')"), true),
+        "guard_r100" => (top100("bm25(body, :q, syntax => 'plain', min => 1, min_rows => 100)"), true),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
     }
 }
 
@@ -272,6 +285,25 @@ fn main() {
                 doc["exact_top10_share"] = json!(mean(&share));
                 doc["queries_with_the_exact_top10"] = json!(whole);
                 line += &format!(", {:.4} of the exact top 10, all of it for {whole} queries", mean(&share));
+            }
+            // Recall@100, over every query and over those with few rows
+            // holding all their words.
+            if v.ends_with("_r100") {
+                let recall = |q: usize| {
+                    let relevant: Vec<&String> = coll.qrels[&coll.queries[q].0].iter().filter(|(_, &g)| g > 0).map(|(d, _)| d).collect();
+                    let found = relevant.iter().filter(|d| ids[j][q].contains(d)).count();
+                    if relevant.is_empty() { 0.0 } else { found as f64 / relevant.len() as f64 }
+                };
+                let all: Vec<f64> = (0..ids[j].len()).map(recall).collect();
+                doc["recall100"] = json!(mean(&all));
+                line += &format!(", recall@100 {:.4}", mean(&all));
+                if let Some(a) = args.variants.iter().position(|w| w == "all_r100") {
+                    let few: Vec<usize> = (0..ids[a].len()).filter(|&q| ids[a][q].len() < 100).collect();
+                    let r: Vec<f64> = few.iter().map(|&q| recall(q)).collect();
+                    let n: Vec<f64> = few.iter().map(|&q| ndcg_at_k(&ids[j][q], &coll.qrels[&coll.queries[q].0], 10)).collect();
+                    doc["few_all_words"] = json!({ "queries": few.len(), "recall100": mean(&r), "ndcg10": mean(&n) });
+                    line += &format!("; over the {} queries with under 100 rows of all their words: recall@100 {:.4}, nDCG@10 {:.4}", few.len(), mean(&r), mean(&n));
+                }
             }
             eprintln!("{line}");
             variants.insert(v.clone(), doc);

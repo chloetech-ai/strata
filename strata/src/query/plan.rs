@@ -25,6 +25,12 @@ pub trait Estimator {
     fn match_count(&self, field: usize, query: &str, expand: &Expand) -> f64;
     /// Total postings read to materialise `MATCH(field, query)`.
     fn match_postings(&self, field: usize, query: &str, expand: &Expand) -> f64;
+    /// Whether `MATCH(field, query)` is cheap to test one document at a
+    /// time: words and quoted single words, with no longer phrase, prefix,
+    /// typo or synonym.
+    fn match_probeable(&self, _field: usize, query: &str, expand: &Expand) -> bool {
+        !query.contains('"') && !query.contains('*') && !query.contains('~') && expand.is_none()
+    }
     /// Documents with `lo <= field <= hi` (histogram estimate).
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64;
     /// Documents whose keyword field equals one of `values` (exact).
@@ -146,8 +152,8 @@ impl<E: Estimator> Planner<'_, E> {
             Pred::Match { field, query, expand } => {
                 let card = self.est.match_count(*field, query, expand).min(n);
                 let postings = self.est.match_postings(*field, query, expand);
-                let simple = !query.contains('"') && !query.contains('*') && !query.contains('~') && expand.is_none();
-                PredEstimate { card, mat_cost: c.leaf + postings * c.posting + card * c.emit, probe_cost: c.probe_match, probeable: simple }
+                let probeable = self.est.match_probeable(*field, query, expand);
+                PredEstimate { card, mat_cost: c.leaf + postings * c.posting + card * c.emit, probe_cost: c.probe_match, probeable }
             }
             Pred::Range { field, lo, hi } => {
                 let card = self.est.range_count(*field, *lo, *hi).min(n);
@@ -198,6 +204,33 @@ impl<E: Estimator> Planner<'_, E> {
                 }
                 let mat_cost = es.iter().map(|e| e.mat_cost).sum::<f64>() + es.iter().skip(1).map(|e| e.card.min(es[0].card)).sum::<f64>() * c.emit;
                 PredEstimate { card, mat_cost, probe_cost, probeable: es.iter().all(|e| e.probeable) }
+            }
+            Pred::AtLeast { need, items } => {
+                // Independent items: the chance of at least `need`, from
+                // the distribution of how many hold (each item's chance
+                // its share of rows).
+                let es: Vec<PredEstimate> = items.iter().map(|q| self.estimate(q)).collect();
+                let mut dist = vec![1.0];
+                for e in &es {
+                    let p = (e.card / n).clamp(0.0, 1.0);
+                    let mut next = vec![0.0; dist.len() + 1];
+                    for (k, &q) in dist.iter().enumerate() {
+                        next[k] += q * (1.0 - p);
+                        next[k + 1] += q * p;
+                    }
+                    dist = next;
+                }
+                let card = n * dist.iter().skip(*need).sum::<f64>().min(1.0);
+                // Counting: each item's word of 64 rows rippled through the
+                // counter's ⌈log2(y + 1)⌉ words, then one comparison.
+                let planes = (usize::BITS - es.len().leading_zeros()) as f64;
+                let count = n / 64.0 * planes * (es.len() + 1) as f64 * c.emit;
+                PredEstimate {
+                    card,
+                    mat_cost: es.iter().map(|e| e.mat_cost).sum::<f64>() + count + card * c.emit,
+                    probe_cost: es.iter().map(|e| e.probe_cost).sum(),
+                    probeable: es.iter().all(|e| e.probeable),
+                }
             }
             Pred::Or(ps) => {
                 let es: Vec<PredEstimate> = ps.iter().map(|q| self.estimate(q)).collect();
