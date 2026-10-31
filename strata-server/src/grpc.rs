@@ -196,13 +196,15 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 
 /// The least a method's credential needs ([`crate::keys`]): the internal
 /// methods the root (the token the servers of a cluster share), writes a
-/// write key, the rest any key. What a call then does (a `Write` of a
+/// write key, the log store an admin key (it shows every client's SQL),
+/// the rest any key. What a call then does (a `Write` of a
 /// table's statement needs an admin key) the service checks, as for HTTP.
 /// Every method is named, so that a new one must say what it needs.
 fn method_scope(method: &str) -> Option<Scope> {
     match method {
         "Replicate" | "Restore" | "Verify" | "Slots" => None,
         "Write" | "WriteStream" => Some(Scope::Write),
+        "Logs" => Some(Scope::Admin),
         "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
         // An unknown method is the root's.
         _ => None,
@@ -265,7 +267,11 @@ impl Grpc {
         let _in = span.enter();
         let (code, r) = match r {
             Ok(x) => {
-                tracing::debug!(secs, "answered");
+                // A coordinator's query of the logs, as the viewer's own
+                // requests over HTTP, is not logged ([`crate::logstore`]).
+                if method != "Logs" {
+                    tracing::debug!(secs, "answered");
+                }
                 ("Ok", Ok(Response::new(x)))
             }
             Err(e) => {
@@ -299,6 +305,15 @@ impl pb::strata_server::Strata for Grpc {
             svc.check_epoch(r.epoch)?;
             let a = svc.query(query_req(r)?).await?;
             Ok(pb::QueryResponse { snapshot: a.lease, ..result_to_pb(&a.rs, a.took_ms) })
+        })
+        .await
+    }
+
+    async fn logs(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::QueryResponse>, Status> {
+        self.serve("Logs", req, |svc, _who, r| async move {
+            let store = svc.log_store.clone().ok_or_else(crate::logstore::none_here)?;
+            let (rs, took_ms) = store.query(&r.sql, &params_from_pb(r.params), r.shard, svc.timeout_of(r.timeout_ms as u64)).await?;
+            Ok(result_to_pb(&rs, took_ms))
         })
         .await
     }

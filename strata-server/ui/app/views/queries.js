@@ -33,6 +33,9 @@ export function waterfall(spans) {
 
 /** The details of one ended query. */
 export function queryDrawer(q) {
+  // Its profile came with it (the log store keeps the steps), or the
+  // server's list of the latest and the slow has it by its number.
+  const kept = q.steps?.length > 0, fetch = !kept && q.id != null && q.steps_n;
   const logs = h("div");
   const same = h("div");
   const prof = h("div", { class: "small muted" }, "Reading its profile…");
@@ -44,12 +47,13 @@ export function queryDrawer(q) {
       q.error ? h("div", { class: "error" }, q.error) : null,
       h("dl", { class: "kv" }, [["shape", h("span", { class: "mono small" }, q.fingerprint)], ["request id", q.request_id ? h("span", { class: "row nw" }, h("span", { class: "mono" }, q.request_id), h("button", { class: "btn ghost icon sm", title: "Copy", onclick: () => copy(q.request_id) }, icon("copy")), h("a", { class: "btn ghost sm", href: "#/logs?request=" + encodeURIComponent(q.request_id) }, "Its logs", icon("right"))) : "–"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])),
       card({ title: "Trace", sub: "where the time went", body: waterfall(q.trace) }),
-      q.id != null && q.steps_n ? card({ title: "Profile", sub: q.cpu_ms != null ? `every step it took, with its CPU time (${fmt.ms(q.cpu_ms)})` : "every step it took", tools: h("a", { class: "btn sm", href: `#/profile?tab=${q.ms >= (state.system?.limits?.slow_ms ?? Infinity) ? "slow" : "recent"}&id=${q.id}`, onclick: () => d.close() }, icon("flame"), "Open in the Profiler"), body: prof }) : null,
+      kept || fetch ? card({ title: "Profile", sub: q.cpu_ms != null ? `every step it took, with its CPU time (${fmt.ms(q.cpu_ms)})` : "every step it took", tools: fetch ? h("a", { class: "btn sm", href: `#/profile?tab=${q.ms >= (state.system?.limits?.slow_ms ?? Infinity) ? "slow" : "recent"}&id=${q.id}`, onclick: () => d.close() }, icon("flame"), "Open in the Profiler") : null, body: prof }) : null,
       q.request_id ? card({ title: "Everything this request ran", body: same }) : null,
       q.request_id ? card({ title: "Its log lines", body: logs }) : null,
     ],
   });
-  if (q.id != null && q.steps_n) api("/v1/queries/finished/" + q.id).then((f) => clear(prof, profileView({ ...f, took_ms: f.ms }, { compact: true }))).catch((e) => clear(prof, e.status === 404 ? "Its profile is gone: the server keeps the latest 500 queries and the slowest." : e.message));
+  if (kept) clear(prof, profileView({ ...q, took_ms: q.ms }, { compact: true }));
+  else if (fetch) api("/v1/queries/finished/" + q.id).then((f) => clear(prof, profileView({ ...f, took_ms: f.ms }, { compact: true }))).catch((e) => clear(prof, e.status === 404 ? "Its profile is gone: the server keeps the latest 500 queries and the slowest." : e.message));
   if (q.request_id) {
     api("/v1/queries/request/" + encodeURIComponent(q.request_id)).then((j) => clear(same, j.queries.length > 1 ? j.queries.map((x) => h("div", { class: "row nw small", style: { padding: "3px 0" } }, pill(OUTCOMES[x.outcome] || "info", x.outcome), h("span", { class: "mono ellipsis grow" }, x.sql), h("b", { class: "num" }, fmt.ms(x.ms)))) : h("div", { class: "small muted" }, "Just this query."))).catch((e) => clear(same, h("div", { class: "small muted" }, e.message)));
     api("/v1/logs?limit=50&request=" + encodeURIComponent(q.request_id)).then((j) => clear(logs, j.lines.length ? h("div", { class: "logs", style: { height: "auto", maxHeight: "240px", minHeight: 0 } }, j.lines.map((l) => h("div", { class: "ln" }, h("span", { class: "muted" }, fmt.time(l.ts_ms)), h("span", { class: "lv " + l.level }, l.level), h("span", { class: "tg" }, l.target), h("span", { class: "msg" }, l.message)))) : h("div", { class: "small muted" }, "No lines at the current log level. Set it to debug in Logs to see every request."))).catch((e) => clear(logs, h("div", { class: "small muted" }, e.message)));
