@@ -414,6 +414,11 @@ pub fn build_missing(schema: &Schema, fields: &[usize], n_docs: usize, opts: &Bu
             FieldType::Text { .. } if f.indexed => crate::text::field_builder(f, opts)?,
             FieldType::Sparse if f.indexed => crate::text::sparse::field_builder(f, opts)?,
             FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => crate::forward::field_builder(f, opts)?,
+            // One-vector rows are arrays of every row: a header stands in.
+            FieldType::Vector { .. } if !f.multi => {
+                out.put(crate::vector::section(&f.key(), "meta"), crate::vector::absent_meta(f, n_docs)?);
+                continue;
+            }
             FieldType::Vector { .. } => crate::vector::field_builder(f, opts)?,
             // A field added to a table is not EDGES (Schema::altered).
             _ => continue,

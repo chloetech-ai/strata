@@ -191,10 +191,32 @@ fn an_added_vector_is_missing_in_older_rows() {
     ];
     assert_eq!(stored(&db), want);
     assert_eq!(ids(&db, "SELECT id FROM items WHERE labels = 'l2'"), ["d"]);
+    // Binary codes, searched by HNSW, and flat.
+    run(&db, "ALTER TABLE items ADD COLUMN b VECTOR(64) OPTIONS(codes = 'binary'), ADD COLUMN f VECTOR(3) OPTIONS(index = 'flat')");
+    let mut v64 = vec![0.0f32; 64];
+    v64[3] = 1.0;
+    let p = Params::new().set("b", Value::Vector(v64.clone().into())).set("f", Value::Vector(vec![0.0, 1.0, 0.0].into()));
+    db.sql("INSERT INTO items (id, b, f) VALUES ('g', :b, :f)", &p).unwrap();
+    let qb = Params::new().set("q", Value::Vector(v64.into()));
+    let qf = Params::new().set("q", Value::Vector(vec![0.1, 0.9, 0.0].into()));
+    let by = |db: &Db, sql: &str, p: &Params| rows_with(db, sql, p).into_iter().map(|r| r[0].clone()).collect::<Vec<_>>();
+    {
+        let db = &db;
+        assert_eq!(by(db, "SELECT id FROM items ORDER BY similarity(b, :q) DESC LIMIT 3", &qb)[0], s("g"));
+        assert_eq!(by(db, "SELECT id FROM items ORDER BY similarity(f, :q) DESC LIMIT 3", &qf)[0], s("g"));
+        // Older rows are not ranked, as no row without a vector is.
+        run(db, "INSERT INTO items (id) VALUES ('h')");
+        for id in ["a", "h"] {
+            assert_eq!(by(db, &format!("SELECT id FROM items WHERE id = '{id}' ORDER BY similarity(f, :q) DESC"), &qf), Vec::<Value>::new());
+        }
+    }
     db.storage().flush().unwrap();
     merge(&db);
     assert_eq!(near(&db)[0], [s("d")]);
     assert_eq!(stored(&db), want);
+    assert_eq!(by(&db, "SELECT id FROM items ORDER BY similarity(b, :q) DESC LIMIT 3", &qb)[0], s("g"));
+    assert_eq!(rows(&db, "SELECT f FROM items WHERE id = 'a'"), [[Value::Null]]);
+    db.storage().check().unwrap();
 }
 
 #[test]
