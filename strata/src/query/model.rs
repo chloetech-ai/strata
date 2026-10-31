@@ -491,6 +491,10 @@ fn fnv(bytes: &[u8]) -> u64 {
 pub struct Models {
     open: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<Gbdt>)>>,
     cross: Mutex<HashMap<PathBuf, (Vec<(SystemTime, u64)>, Arc<CrossEncoder>)>>,
+    /// One lock per cross-encoder directory, held while it is opened, so
+    /// that queries arriving together open it once (a large model takes
+    /// seconds and up to a gigabyte) and the others wait for that copy.
+    opening: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// Sequence models (`encode()`), from the same directories.
     sequences: crate::query::sequence::SequenceModels,
 }
@@ -535,11 +539,20 @@ impl Models {
             .iter()
             .map(|f| std::fs::metadata(path.join(f)).map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len())).unwrap_or((SystemTime::UNIX_EPOCH, 0)))
             .collect();
-        // Opened outside the lock: hashing a large model takes seconds.
-        if let Some((t, m)) = self.cross.lock().unwrap_or_else(|e| e.into_inner()).get(&path) {
-            if *t == stamp {
-                return Ok(m.clone());
-            }
+        let cached = || -> Option<Arc<CrossEncoder>> {
+            let cross = self.cross.lock().unwrap_or_else(|e| e.into_inner());
+            cross.get(&path).filter(|(t, _)| *t == stamp).map(|(_, m)| m.clone())
+        };
+        if let Some(m) = cached() {
+            return Ok(m);
+        }
+        // Opened outside the cache's lock, since hashing a large model
+        // takes seconds, but under this directory's: one query opens it,
+        // and those that came meanwhile find its copy.
+        let gate = self.opening.lock().unwrap_or_else(|e| e.into_inner()).entry(path.clone()).or_default().clone();
+        let _opening = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = cached() {
+            return Ok(m);
         }
         let m = Arc::new(CrossEncoder::open(name, &path)?);
         self.cross.lock().unwrap_or_else(|e| e.into_inner()).insert(path, (stamp, m.clone()));

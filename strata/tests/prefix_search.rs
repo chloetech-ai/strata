@@ -86,6 +86,16 @@ fn near(v: &Value, p: &str, k: u8) -> bool {
     }
 }
 
+/// The fewest edits from `p` to a prefix of `v` with `p`'s first letter,
+/// if one is within `k`.
+fn fewest(v: &Value, p: &str, k: u8) -> Option<u8> {
+    let (v, q) = (v.as_str()?.chars().collect::<Vec<char>>(), p.chars().collect::<Vec<char>>());
+    if v.first() != q.first() {
+        return None;
+    }
+    (1..=v.len()).filter_map(|j| strata::text::fuzzy::within(&q, &v[..j].iter().collect::<String>(), k)).min()
+}
+
 /// A literal for SQL: quotes doubled.
 fn q(s: &str) -> String {
     s.replace('\'', "''")
@@ -169,6 +179,17 @@ fn check(db: &Db, docs: &[Document]) {
             let top: Vec<String> = top.into_iter().take(10).map(|(_, id)| id).collect();
             assert_eq!(r.rows.iter().map(|r| r[0].as_str().unwrap().to_string()).collect::<Vec<_>>(), top, "top fuzzy {fz} {p:?}");
         }
+        // Completions ranked by their edits, exact ones first, each tier
+        // by its count (IR-N1 of the review of 31 October).
+        let sql = format!(
+            "SELECT id, n FROM queries WHERE PREFIX(id, '{p}', fuzzy => 2) ORDER BY CASE WHEN PREFIX(id, '{p}') THEN 2 WHEN PREFIX(id, '{p}', fuzzy => 1) THEN 1 ELSE 0 END * 1000000 + n DESC LIMIT 10",
+            p = q(p)
+        );
+        let r = db.query(&sql, &Params::new()).unwrap();
+        let mut top: Vec<(u8, i64, String)> = docs.iter().filter_map(|d| fewest(&d[0], p, 2).map(|e| (e, -d[3].as_i64().unwrap(), d[0].as_str().unwrap().to_string()))).collect();
+        top.sort();
+        let top: Vec<String> = top.into_iter().take(10).map(|(_, _, id)| id).collect();
+        assert_eq!(r.rows.iter().map(|r| r[0].as_str().unwrap().to_string()).collect::<Vec<_>>(), top, "exact first {p:?}");
     }
     // A nullable field: NOT holds only where there is a value.
     assert_eq!(ids(db, &format!("{all} WHERE lang LIKE 'en%'")), want(docs, |d| starts(&d[1], "en")));

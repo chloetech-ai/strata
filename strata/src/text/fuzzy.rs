@@ -117,7 +117,9 @@ pub enum Match {
 /// against `q` within `k` edits, in order: each matching term for
 /// [`Match::Whole`] (`terms` still on it, `positions` its own), each run
 /// of terms starting with a prefix within `k` edits for [`Match::Prefix`]
-/// (`terms` past it; the edits are that prefix's).
+/// (`terms` past it), with the fewest edits of any prefix of those terms:
+/// a term starting with `q` itself has 0, whatever shorter prefix is also
+/// within `k`, so exact completions can be told from typo ones.
 ///
 /// The dictionary is walked as a trie: one row of the edit-distance table
 /// per letter of the path from the root, kept while the next term shares
@@ -125,7 +127,10 @@ pub enum Match {
 /// it shares with the previous term. A path whose row has no cell within
 /// `k` cannot lead to a match, so the walk jumps past every term starting
 /// with it, and a prefix match jumps past its run: the cost follows the
-/// trie's nodes within `k` edits of `q`, not the dictionary's size.
+/// trie's nodes within `k` edits of `q`, not the dictionary's size. A
+/// prefix match goes on down while a longer prefix could have fewer
+/// edits (the row's least cell is below the best edits so far), and jumps
+/// past the run once none can.
 pub fn walk<S: Sorted>(q: &[char], k: u8, m: Match, terms: &mut S, mut hit: impl FnMut(&S, std::ops::Range<usize>, u8)) {
     let (n, k) = (q.len(), k as usize);
     // The path's letters, their ends in bytes, and per depth j a row of
@@ -137,6 +142,9 @@ pub fn walk<S: Sorted>(q: &[char], k: u8, m: Match, terms: &mut S, mut hit: impl
     let mut bytes: Vec<u8> = Vec::new();
     let mut ends: Vec<usize> = vec![0];
     let mut rows: Vec<u8> = (0..=n).map(cap).collect();
+    // Per depth j, the fewest edits from a prefix of the path's first j
+    // letters to `q` (k + 1: none within k), for a prefix match.
+    let mut bests: Vec<u8> = vec![cap(n)];
     let first = match (m, q.first()) {
         (Match::Whole, _) => None,
         (Match::Prefix, None) => {
@@ -163,6 +171,7 @@ pub fn walk<S: Sorted>(q: &[char], k: u8, m: Match, terms: &mut S, mut hit: impl
         let j = ends.partition_point(|&e| e <= shared) - 1;
         path.truncate(j);
         ends.truncate(j + 1);
+        bests.truncate(j + 1);
         rows.truncate((j + 1) * w);
         bytes.truncate(ends[j]);
         let Ok(rest) = std::str::from_utf8(&t[ends[j]..]) else {
@@ -188,25 +197,32 @@ pub fn walk<S: Sorted>(q: &[char], k: u8, m: Match, terms: &mut S, mut hit: impl
                 rows.push(x);
                 min = min.min(x);
             }
-            let (min, last) = (min as usize, rows[at + n] as usize);
+            let best = bests[d].min(rows[at + n]);
+            let min = min as usize;
             path.push(c);
             bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
             ends.push(bytes.len());
+            bests.push(best);
+            if m == Match::Prefix && best as usize <= k && min >= best as usize {
+                // No longer prefix has fewer edits: every term starting
+                // with the path matches with these.
+                run = Some(best);
+                break;
+            }
             if min > k {
                 past = true;
                 break;
             }
-            if m == Match::Prefix && last <= k {
-                run = Some(last as u8);
-                break;
-            }
         }
         if !past && run.is_none() {
-            // The whole term was read; a prefix match would have stopped.
-            let d = rows[path.len() * w + n] as usize;
-            if m == Match::Whole && d <= k {
+            // The whole term was read.
+            let d = match m {
+                Match::Whole => rows[path.len() * w + n],
+                Match::Prefix => bests[path.len()],
+            };
+            if d as usize <= k {
                 let p = terms.pos();
-                hit(terms, p..p + 1, d as u8);
+                hit(terms, p..p + 1, d);
             }
             terms.next();
             continue;
@@ -284,21 +300,35 @@ mod tests {
                     let mut got = Vec::new();
                     walk(&q, k, Match::Whole, &mut SliceTerms::new(&terms), |_, r, d| got.push((r.start, d)));
                     assert_eq!(got, want, "{q:?} within {k}");
-                    let want: Vec<usize> = (0..terms.len())
-                        .filter(|&i| {
+                    // Each term with a prefix within k, and the fewest
+                    // edits of its prefixes.
+                    let want: Vec<(usize, u8)> = (0..terms.len())
+                        .filter_map(|i| {
                             let t: Vec<char> = terms[i].chars().collect();
-                            t.first() == q.first() && (1..=t.len()).any(|j| within(&q, &t[..j].iter().collect::<String>(), k).is_some())
+                            if t.first() != q.first() {
+                                return None;
+                            }
+                            (1..=t.len()).filter_map(|j| within(&q, &t[..j].iter().collect::<String>(), k)).min().map(|d| (i, d))
                         })
                         .collect();
                     let mut got = Vec::new();
-                    walk(&q, k, Match::Prefix, &mut SliceTerms::new(&terms), |_, r, _| got.extend(r));
-                    let want = if q.is_empty() { (0..terms.len()).collect() } else { want };
+                    walk(&q, k, Match::Prefix, &mut SliceTerms::new(&terms), |_, r, d| got.extend(r.map(|i| (i, d))));
+                    let want = if q.is_empty() { (0..terms.len()).map(|i| (i, 0)).collect() } else { want };
                     assert_eq!(got, want, "{q:?} prefix within {k}");
                 }
             }
         }
         assert!(prefix_within(&"hwo to ins".chars().collect::<Vec<_>>(), "how to install engram", 2));
         assert!(!prefix_within(&"wo to".chars().collect::<Vec<_>>(), "how to install", 2));
+        // A completion of the prefix itself has no edits, though a shorter
+        // prefix is within 2 too (IR-N1 of the review of 31 October).
+        let terms = ["keyb", "keyboard", "keyboards", "keybx", "keybxyz", "keyborad"];
+        let mut terms = terms.to_vec();
+        terms.sort();
+        let mut got = Vec::new();
+        walk(&"keyboa".chars().collect::<Vec<_>>(), 2, Match::Prefix, &mut SliceTerms::new(&terms), |_, r, d| got.extend(r.map(|i| (terms[i], d))));
+        got.sort();
+        assert_eq!(got, [("keyb", 2), ("keyboard", 0), ("keyboards", 0), ("keyborad", 1), ("keybx", 2), ("keybxyz", 2)]);
         assert_eq!(past_prefix(b"ab"), Some(b"ac".to_vec()));
         assert_eq!(past_prefix(&[0x61, 0xff]), Some(b"b".to_vec()));
         assert_eq!(past_prefix(&[0xff]), None);
