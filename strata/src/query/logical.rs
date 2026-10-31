@@ -320,8 +320,10 @@ pub enum Score {
     Decay { field: usize, decay: Decay, opts: Opts },
     /// The product of scores (`bm25(..) * decay(..)`): candidates are the
     /// top `depth` rows of each relevance factor (BM25, similarity, graph;
-    /// of every factor when there is none), scored exactly by every factor.
-    /// A factor below 0, or missing, counts as 0.
+    /// of every factor when there is none, in a plan that says so), scored
+    /// exactly by every factor. A factor below 0, or missing, counts as 0.
+    /// SQL writes one only with a relevance factor: a product of a row's
+    /// own values (`f * n`) is arithmetic ([`Score::fused_shapes`]).
     Product(Vec<Score>),
     /// The sequence number of the write that last changed the row
     /// (`seq_no()`), in a ranking expression.
@@ -557,9 +559,12 @@ impl Score {
                 factors(self.clone(), &mut fs);
                 let (scores, rest): (Vec<Score>, Vec<Score>) = fs.into_iter().partition(Score::is_fusable);
                 // A product counts a factor below 0 as 0, and `ranked()` is
-                // below 0 for every row: it multiplies as arithmetic.
+                // below 0 for every row: it multiplies as arithmetic. So
+                // does a product with no relevance factor (`f * n`, of a
+                // row's own values), which ranks as the numbers multiply.
                 let ranked = scores.iter().any(|f| matches!(f, Score::Ranked { .. }));
-                if scores.len() > 1 && !ranked && rest.iter().all(|f| matches!(f, Score::Num(_))) {
+                let relevance = scores.iter().any(Score::is_relevance);
+                if scores.len() > 1 && relevance && !ranked && rest.iter().all(|f| matches!(f, Score::Num(_))) {
                     // Constant factors scale the product of scores.
                     let c: f64 = rest.iter().map(|f| if let Score::Num(c) = f { *c } else { 1.0 }).product();
                     let product = Score::Product(scores);
