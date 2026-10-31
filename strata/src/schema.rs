@@ -149,9 +149,24 @@ pub struct Field {
     /// A KEYWORD or INT field holding any number of values per document
     /// (`Value::List`); a predicate matches when any value matches. Indexed
     /// as a keyword column (INT values in an order-preserving encoding, so
-    /// ranges are runs of codes), and stored.
+    /// ranges are runs of codes), and stored. A multi-valued VECTOR field
+    /// (`VECTOR(d)[]`, manifest feature `multi_vector`) holds a list of
+    /// vectors per row, such as a page's patches, which `maxsim` scores
+    /// ([`crate::vector::multi`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multi: bool,
+    /// A multi-vector field keeps its float32 vectors too, besides the
+    /// codes it searches and scores with (four times the bytes of SQ8
+    /// codes); without them, rows read back and merges use the SQ8 codes'
+    /// values.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_f32: bool,
+    /// A multi-vector field merges a row's vectors whose cosine similarity
+    /// is at least this into their mean when the row is written (token
+    /// pooling), until no two are that similar
+    /// ([`crate::vector::multi::pool`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<f32>,
     /// A VECTOR field's compressed codes (default SQ8).
     #[serde(default, skip_serializing_if = "VectorCodes::is_sq8")]
     pub codes: VectorCodes,
@@ -262,6 +277,8 @@ impl Field {
             indexed: true,
             generated_from: Vec::new(),
             multi: false,
+            keep_f32: false,
+            pool: None,
             codes: VectorCodes::Sq8,
             embed: None,
             references: None,
@@ -382,10 +399,30 @@ impl Field {
         self.codes = codes;
         self
     }
-    /// Makes a KEYWORD or INT field multi-valued.
+    /// Makes a KEYWORD or INT field multi-valued, or a VECTOR field a
+    /// multi-vector field, which searches binary codes unless
+    /// [`Field::codes`] says otherwise after this.
     pub fn multi(mut self) -> Self {
         self.multi = true;
+        if matches!(self.ty, FieldType::Vector { .. }) {
+            self.codes = VectorCodes::Binary;
+        }
         self
+    }
+    /// Keeps a multi-vector field's float32 vectors ([`Field::keep_f32`]).
+    pub fn keep_f32(mut self) -> Self {
+        self.keep_f32 = true;
+        self
+    }
+    /// Pools a multi-vector field's similar vectors at write
+    /// ([`Field::pool`]).
+    pub fn pooled(mut self, min_cosine: f32) -> Self {
+        self.pool = Some(min_cosine);
+        self
+    }
+    /// Whether this is a multi-vector field (`VECTOR(d)[]`).
+    pub fn is_multi_vector(&self) -> bool {
+        self.multi && matches!(self.ty, FieldType::Vector { .. })
     }
     pub fn generated(mut self, sources: &[&str]) -> Self {
         self.generated_from = sources.iter().map(|s| s.to_string()).collect();
@@ -531,8 +568,20 @@ impl Schema {
             )));
         }
         for (i, f) in s.fields.iter().enumerate() {
+            if f.is_multi_vector() {
+                if f.embed.is_some() || f.references.is_some() || f.not_null || f.default.is_some() {
+                    return Err(Error::Schema(format!("multi-vector field {} takes its vectors from writes: no embed, references, NOT NULL or default", f.name)));
+                }
+                if f.pool.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
+                    return Err(Error::Schema(format!("field {}: pool is a cosine similarity above 0 and at most 1", f.name)));
+                }
+                continue;
+            }
+            if f.keep_f32 || f.pool.is_some() {
+                return Err(Error::Schema(format!("field {}: keep_f32 and pool are options of a multi-vector field (VECTOR(d)[])", f.name)));
+            }
             if f.multi && (!matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored || s.primary_key == Some(i)) {
-                return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, not the primary key", f.name)));
+                return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, or a VECTOR, and not the primary key", f.name)));
             }
         }
         for f in s.fields.iter() {
@@ -548,15 +597,15 @@ impl Schema {
                 if e.from.len() > 1 {
                     return bad(format!("an embedded field embeds one MEDIA field ({}), or text fields, not both", m.name));
                 }
-                if m.media != Some(MediaKind::Image) {
-                    return bad(format!("source {}: the MEDIA field an embedded field embeds is of kind image", m.name));
+                if !matches!(m.media, Some(MediaKind::Image | MediaKind::Audio)) {
+                    return bad(format!("source {}: the MEDIA field an embedded field embeds is of kind image or audio", m.name));
                 }
                 continue;
             }
             for src in &e.from {
                 let ok = s.field(src).is_some_and(|g| (g.stored || !g.generated_from.is_empty()) && matches!(g.ty, FieldType::Text { .. } | FieldType::Keyword) && !g.multi);
                 if !ok {
-                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field, or a MEDIA field of images"));
+                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field, or a MEDIA field of images or sound"));
                 }
             }
         }
@@ -811,6 +860,9 @@ impl Schema {
             if !self.field(&sid.from).is_some_and(|v| matches!(v.ty, FieldType::Vector { .. })) {
                 return bad(&format!("semantic_id names {}, which is not a VECTOR field", sid.from));
             }
+            if self.field(&sid.from).is_some_and(Field::is_multi_vector) {
+                return bad(&format!("semantic_id codes one vector a row: {} is a multi-vector field", sid.from));
+            }
         }
         Ok(())
     }
@@ -849,14 +901,22 @@ impl Schema {
 
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
-    /// `semantic_id`, [`Analyzer::feature`], `media` ([`Field::media`]) and
-    /// `derive` ([`Field::derive`]), and its options `shard_by`, `cluster_by`,
-    /// `retain` and `edge_table` ([`Schema::with_shard_by`],
-    /// [`Schema::with_cluster_by`], [`Schema::with_retain`],
-    /// [`Schema::with_edges`]).
+    /// `multi_vector`, `semantic_id`, [`Analyzer::feature`], `media`
+    /// ([`Field::media`]) and `derive` ([`Field::derive`]), and its options
+    /// `shard_by`, `cluster_by`, `retain` and `edge_table`
+    /// ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
+    /// [`Schema::with_retain`], [`Schema::with_edges`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
         let fields = self.fields.iter().flat_map(|f| {
-            let named = [f.logical.map(Logical::feature), f.not_null.then_some("not_null"), f.default.as_ref().map(|_| "default"), f.semantic_id.as_ref().map(|_| "semantic_id"), f.media.map(|_| "media"), f.derive.as_ref().map(|_| "derive")];
+            let named = [
+                f.logical.map(Logical::feature),
+                f.not_null.then_some("not_null"),
+                f.default.as_ref().map(|_| "default"),
+                f.is_multi_vector().then_some("multi_vector"),
+                f.semantic_id.as_ref().map(|_| "semantic_id"),
+                f.media.map(|_| "media"),
+                f.derive.as_ref().map(|_| "derive"),
+            ];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
         let options = [self.shard_by.as_ref().map(|_| "shard_by"), self.cluster_by.as_ref().map(|_| "cluster_by"), self.retain.as_ref().map(|_| "retain"), self.edges.as_ref().map(|_| "edge_table")];
@@ -911,7 +971,7 @@ impl Schema {
     }
 
     /// The MEDIA field that field `f` is the embedding of, if it embeds
-    /// one (images) rather than text.
+    /// one (images or sound) rather than text.
     pub fn embeds_media(&self, f: usize) -> Option<usize> {
         let e = self.fields[f].embed.as_ref()?;
         let i = self.field_index(e.from.first()?)?;
@@ -1123,8 +1183,15 @@ impl Schema {
                                 },
                             );
                         }
-                        if !f.codes.is_sq8() {
+                        // A multi-vector field's codes are binary unless it says.
+                        if f.codes != if f.multi { VectorCodes::Binary } else { VectorCodes::Sq8 } {
                             m.insert("codes".into(), json!(f.codes.as_str()));
+                        }
+                        if f.keep_f32 {
+                            m.insert("keep_f32".into(), json!(true));
+                        }
+                        if let Some(p) = f.pool {
+                            m.insert("pool".into(), json!(p));
                         }
                         if let Some(e) = &f.embed {
                             m.insert("embed".into(), json!({"from": e.from, "model": e.model}));
@@ -1203,7 +1270,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "keep_f32", "pool", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -1283,7 +1350,14 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     f.generated_from = from;
     f.stored = flag("stored")?.unwrap_or(!is_vector && f.generated_from.is_empty());
     f.indexed = flag("indexed")?.unwrap_or(true);
-    f.multi = flag("multi")?.unwrap_or(false);
+    if flag("multi")?.unwrap_or(false) {
+        f = f.multi();
+    }
+    f.keep_f32 = flag("keep_f32")?.unwrap_or(false);
+    f.pool = match j.get("pool") {
+        None | Some(J::Null) => None,
+        Some(p) => Some(p.as_f64().ok_or_else(|| bad("pool is a cosine similarity, such as 0.9"))? as f32),
+    };
     if let Some(c) = j.get("codes").filter(|c| !c.is_null()) {
         f.codes = c.as_str().and_then(VectorCodes::parse).ok_or_else(|| bad("codes is \"sq8\" or \"binary\""))?;
     }

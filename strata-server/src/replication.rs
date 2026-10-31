@@ -1423,6 +1423,12 @@ impl Follow {
         Ok(pb::ReplicateResponse { matched: true, seq: at.seq, term: at.term, replica_term })
     }
 
+    /// Whether it serves reads now: its primary's last call reached the
+    /// primary's last transaction.
+    pub fn serves_reads(&self) -> bool {
+        self.serves_reads.load(Ordering::Relaxed)
+    }
+
     /// What `/v1/health` shows of replication.
     pub async fn health(&self) -> Json {
         let kept = self.kept.lock().await.clone();

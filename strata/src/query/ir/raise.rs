@@ -373,6 +373,18 @@ impl<'a> Raise<'a> {
                 crate::text::query::parse_match_with(query, fld.text_analyzer())?;
                 Pred::Match { field: f, query: query.clone(), expand: *expand }
             }
+            Expr::Prefix { expr, prefix } => {
+                let f = self.field_of(expr)?;
+                let fld = &self.schema.fields[f];
+                if fld.ty != FieldType::Keyword || !fld.indexed {
+                    return Err(err(format!("a Search's PREFIX needs an indexed KEYWORD field, not {}", fld.name)));
+                }
+                match self.lit(prefix)? {
+                    Value::Str(p) if p.is_empty() => Pred::Present { field: f },
+                    Value::Str(p) => Pred::Prefix { field: f, prefix: p },
+                    v => return Err(err(format!("PREFIX of {} takes text, not {v:?}", fld.name))),
+                }
+            }
             Expr::Graph(g) if !matches!(g.kind, GraphKind::Ppr { .. }) => Pred::Graph { id: self.graph(g)? },
             e => return Err(err(format!("a Search cannot filter by {e:?}"))),
         })
@@ -474,6 +486,9 @@ impl<'a> Raise<'a> {
             }
             None => {}
         }
+        if self.schema.fields[field].is_multi_vector() {
+            return Err(err(format!("a traversal follows one vector per row: {} is a multi-vector field", self.schema.fields[field].name)));
+        }
         let seeds = match (self.seeds(&g.seeds)?, g.weights.as_slice()) {
             (s, []) => s,
             (Seeds::Keys(keys), ws) if keys.len() == ws.len() && ws.iter().all(|w| w.is_finite()) => Seeds::Weighted(keys.into_iter().zip(ws.iter().copied()).collect()),
@@ -565,6 +580,8 @@ impl<'a> Raise<'a> {
     fn rank(&mut self, e: &Expr, in_expr: bool) -> Result<Score> {
         let sub = |this: &mut Self, x: &Expr| this.rank(x, true).map(Box::new);
         Ok(match e {
+            // NULL, as a scalar subquery of no row is.
+            Expr::Lit(Value::Null) => Score::Num(f64::NAN),
             Expr::Lit(v) => match v.as_f64() {
                 Some(x) if x.is_finite() && !matches!(v, Value::Str(_)) => Score::Num(x),
                 _ => return Err(err(format!("a number in a ranking expression is finite, not {v:?}"))),
@@ -609,6 +626,9 @@ impl<'a> Raise<'a> {
             Expr::Bm25 { field, text, opts } => Score::Bm25 { field: self.typed(*field, |t| matches!(t, FieldType::Text { .. }), "bm25", "TEXT")?, text: text.clone(), opts: opts.clone() },
             Expr::Similarity { field, vector, opts } => {
                 let f = self.typed(*field, |t| matches!(t, FieldType::Vector { .. }), "similarity", "VECTOR")?;
+                if self.schema.fields[f].multi {
+                    return Err(err(crate::query::sql::multi_similarity(&self.schema.fields[f].name)));
+                }
                 if let FieldType::Vector { dim, .. } = self.schema.fields[f].ty {
                     if vector.len() != dim {
                         return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
@@ -637,6 +657,12 @@ impl<'a> Raise<'a> {
             Expr::Product(factors) => Score::Product(factors.iter().map(|s| self.score(s)).collect::<Result<_>>()?),
             Expr::Ppr(g) if matches!(g.kind, GraphKind::Ppr { .. }) => Score::Ppr { graph: self.graph(g)? },
             Expr::Hops => Score::Hops { graph: self.hops_graph()?, far_first: false },
+            Expr::ByKey(values) => {
+                let pk = self.schema.primary_key.ok_or_else(|| err("values by key rank the rows of a table with a primary key"))?;
+                let values = values.iter().map(|kv| Ok(super::KeyValue { key: self.stored(pk, kv.key.clone())?, value: kv.value })).collect::<Result<_>>()?;
+                Score::ByKey(std::sync::Arc::new(crate::query::logical::ByKey::new(values)))
+            }
+            Expr::Outer(_) => return Err(err("a correlated subquery runs before the Search it ranks, with each row's values in place")),
             Expr::Ranked { keys } => {
                 let pk = self.schema.primary_key.ok_or_else(|| err(format!("ranked(keys) ranks rows by their primary keys, and {} has none", self.schema.table)))?;
                 Score::Ranked { keys: keys.iter().map(|k| crate::query::sql::coerced(&self.schema.fields[pk], k.clone())).collect::<Result<_>>()? }
@@ -733,7 +759,7 @@ impl<'a> Raise<'a> {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => go(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::AtLeast { conds: xs, .. } | Expr::Concat(xs) => all(xs),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => go(left).and_then(|_| go(right)),
-            Expr::Like { expr, pattern, .. } => go(expr).and_then(|_| go(pattern)),
+            Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern } => go(expr).and_then(|_| go(pattern)),
             Expr::Between { expr, lo, hi } => [Some(expr), lo.as_ref(), hi.as_ref()].into_iter().flatten().try_for_each(|x| go(x)),
             Expr::In { expr, list } => go(expr).and_then(|_| all(list)),
             Expr::Case { operand, whens, otherwise } => {

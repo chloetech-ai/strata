@@ -21,8 +21,10 @@ use strata::query::ir::Plan;
 use strata::query::sql::{ident, quoted};
 use strata::query::Params;
 use strata::query::exec::ResultSet;
+use strata::rank_log::{Export, Log};
 use strata::schema::Schema;
 use strata::sid::{Codebook, TrainOptions};
+use strata::sqlite;
 use strata::storage::{DbOptions, Layout, MergePolicy};
 use strata::{FieldType, Value};
 
@@ -111,7 +113,8 @@ fn result_py<'py>(py: Python<'py>, rs: &ResultSet) -> PyResult<Bound<'py, PyDict
 /// A query parameter, as the HTTP API reads one: a number, string, None,
 /// a list of numbers (a vector), a list, a dict of term weights (SPARSE),
 /// `{"embed": text, "field": f}` (the text's vector by `f`'s model, or an
-/// image file's for `{"embed": {"image": "<base64>"}}`) or
+/// image or sound file's for `{"embed": {"image": "<base64>"}}` or
+/// `{"embed": {"audio": "<base64>"}}`) or
 /// `{"vector_of": key, "field": f}` (a stored row's vector), each with
 /// `"table"` for a field of another table than the first.
 fn param(db: &Db, j: &Json) -> strata::Result<Value> {
@@ -129,7 +132,7 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_i64()) => Value::List(xs.iter().map(|x| Value::Int(x.as_i64().unwrap_or(0))).collect()),
         Json::Array(xs) if !xs.is_empty() && xs.iter().all(|x| x.is_number()) => Value::Vector(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect::<Vec<_>>().into()),
         Json::Array(xs) => Value::List(xs.iter().map(|x| param(db, x)).collect::<strata::Result<_>>()?),
-        Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some()) && o.keys().all(|k| k == "embed" || k == "field" || k == "table") => {
+        Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some() || e.get("audio").is_some()) && o.keys().all(|k| k == "embed" || k == "field" || k == "table") => {
             let s = table_of(db, o.get("table").and_then(|t| t.as_str()))?;
             let field = match o.get("field").and_then(|f| f.as_str()) {
                 Some(f) => f.to_string(),
@@ -138,11 +141,12 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
             let e = db.embedder_in(&s.table, &field).ok_or_else(|| bad(format!("{field} has no embedding model open (see Database.open's models)")))?;
             match &o["embed"] {
                 Json::String(t) => Value::Vector(e.embed_query(t).into()),
-                Json::Object(i) if i.len() == 1 && i["image"].is_string() => {
-                    let data = strata::media::base64_bytes(i["image"].as_str().unwrap_or_default()).map_err(|m| bad(format!("{{\"embed\": {{\"image\": ...}}}} is an image file in base64: {m}")))?;
-                    Value::Vector(strata::embed::embed_image_file(e.as_ref(), &data)?.into())
+                Json::Object(i) if i.len() == 1 && i.values().all(|v| v.is_string()) => {
+                    let (kind, b64) = i.iter().next().expect("one key");
+                    let (_, data) = strata::embed::query_file(kind, b64.as_str().unwrap_or_default())?;
+                    Value::Vector(strata::embed::embed_file(e.as_ref(), &data)?.into())
                 }
-                _ => return Err(bad("\"embed\" is a text or {\"image\": \"<base64>\"}".into())),
+                _ => return Err(bad("\"embed\" is a text, {\"image\": \"<base64>\"} or {\"audio\": \"<base64>\"}".into())),
             }
         }
         Json::Object(o) if o.contains_key("vector_of") && o.keys().all(|k| k == "vector_of" || k == "field" || k == "table") => {
@@ -205,6 +209,11 @@ impl Database {
 
     fn get(&self) -> PyResult<Arc<Db>> {
         self.db.read().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| StrataError::new_err("the database is closed"))
+    }
+
+    fn sqlite_options(tables: Option<Vec<String>>, schemas: Option<&str>, blobs_base64: bool) -> PyResult<sqlite::ImportOptions> {
+        let schemas = schemas.map(sqlite::schemas_from_json).transpose().map_err(err)?.unwrap_or_default();
+        Ok(sqlite::ImportOptions { tables: tables.unwrap_or_default(), schemas, blobs_base64 })
     }
 
     fn documents(db: &Db, schema: &Schema, rows: &[Json]) -> strata::Result<Vec<strata::Document>> {
@@ -279,6 +288,34 @@ impl Database {
             SqlResult::Rows(rs) => Ok(result_py(py, &rs)?.into_any()),
             SqlResult::Written(n) => Ok(n.into_pyobject(py)?.into_any()),
         }
+    }
+
+    /// Runs a SELECT and logs what it served (`log`: the options as JSON
+    /// text, as strata-server's `"log"` takes them); returns its answer as
+    /// `query` does, with the request's id.
+    fn query_logged<'py>(&self, py: Python<'py>, sql: &str, params: Option<&Bound<'py, PyDict>>, log: &str) -> PyResult<Bound<'py, PyDict>> {
+        let db = self.get()?;
+        let p = params_json(params)?;
+        let log: Json = serde_json::from_str(log).map_err(|e| StrataError::new_err(format!("log options are JSON: {e}")))?;
+        let l = py.detach(|| Log::from_json(&log).and_then(|log| self::params(&db, &p).and_then(|p| db.query_logged(sql, &p, &log)))).map_err(err)?;
+        let d = result_py(py, &l.rs)?;
+        d.set_item("request", l.request)?;
+        Ok(d)
+    }
+
+    /// The records of a log table (`export`: the options as JSON text, as
+    /// strata-server's `/v1/rank_log/export` takes them), as JSON text of a
+    /// list.
+    fn export_rank_log(&self, py: Python<'_>, export: &str) -> PyResult<String> {
+        let db = self.get()?;
+        let x: Json = serde_json::from_str(export).map_err(|e| StrataError::new_err(format!("export options are JSON: {e}")))?;
+        py.detach(|| {
+            let x = Export::from_json(&x)?;
+            let mut out = Vec::new();
+            db.export_rank_log(&x, |r| Ok(out.push(r)))?;
+            Ok(Json::Array(out).to_string())
+        })
+        .map_err(err)
     }
 
     /// The plan of a SELECT, INSERT, UPDATE or DELETE as JSON text, without
@@ -380,21 +417,93 @@ impl Database {
         Ok((r.rows, r.bulk, r.unknown))
     }
 
-    /// The vector `field`'s model gives `text` as a query, or `image`, the
-    /// bytes of an image file, for a model of images.
-    #[pyo3(signature = (text = None, field = None, table = None, image = None))]
-    fn embed(&self, py: Python<'_>, text: Option<&str>, field: Option<&str>, table: Option<&str>, image: Option<Vec<u8>>) -> PyResult<Vec<f32>> {
+    /// Imports the tables of the SQLite file `path` ([`sqlite::import`]);
+    /// returns what it did as JSON.
+    #[pyo3(signature = (path, tables = None, schemas = None, blobs_base64 = false))]
+    fn import_sqlite(&self, py: Python<'_>, path: PathBuf, tables: Option<Vec<String>>, schemas: Option<&str>, blobs_base64: bool) -> PyResult<String> {
         let db = self.get()?;
-        if let Some(data) = image {
+        let opts = Database::sqlite_options(tables, schemas, blobs_base64)?;
+        let r = py.detach(|| sqlite::import(&db, &path, &opts)).map_err(err)?;
+        Ok(r.to_json().to_string())
+    }
+
+    /// Writes the tables to a new SQLite file ([`sqlite::export`]); returns
+    /// what it wrote as JSON.
+    #[pyo3(signature = (path, tables = None, fts = true, indexes = true, schemas = true))]
+    fn export_sqlite(&self, py: Python<'_>, path: PathBuf, tables: Option<Vec<String>>, fts: bool, indexes: bool, schemas: bool) -> PyResult<String> {
+        let db = self.get()?;
+        let opts = sqlite::ExportOptions { tables: tables.unwrap_or_default(), fts, indexes, meta: schemas };
+        let r = py.detach(|| sqlite::export(&db, &path, &opts)).map_err(err)?;
+        Ok(r.to_json().to_string())
+    }
+
+    /// Creates a database at `path` from the tables of the SQLite file
+    /// `sqlite_path`; returns it and what the import did as JSON.
+    #[staticmethod]
+    #[pyo3(signature = (sqlite_path, path, tables = None, schemas = None, blobs_base64 = false, directory = false, models = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_sqlite(
+        py: Python<'_>,
+        sqlite_path: PathBuf,
+        path: PathBuf,
+        tables: Option<Vec<String>>,
+        schemas: Option<&str>,
+        blobs_base64: bool,
+        directory: bool,
+        models: Option<PathBuf>,
+    ) -> PyResult<(Self, String)> {
+        let opts = Database::sqlite_options(tables, schemas, blobs_base64)?;
+        let db_opts = DbOptions { layout: if directory { Layout::Directory } else { Layout::SingleFile }, ..DbOptions::default() };
+        let models = models.unwrap_or_else(strata::embed::models_dir);
+        let (db, embed_errors, report) = py
+            .detach(|| -> strata::Result<_> {
+                let src = sqlite::Source::open(&sqlite_path)?;
+                let plan = src.plan(None, &opts)?;
+                let first = plan.tables.first().ok_or_else(|| strata::Error::Schema(format!("{}: no table to import", sqlite_path.display())))?;
+                let db = Db::create_in(&path, first.schema.clone(), db_opts, &models)?;
+                // Before the rows, so that they get their embeddings.
+                let embed_errors: Vec<(String, String)> = db.open_embedders(&models).into_iter().map(|(f, e)| (f, e.to_string())).collect();
+                let r = src.load(&db, &plan)?;
+                Ok((db, embed_errors, r.to_json().to_string()))
+            })
+            .map_err(err)?;
+        Ok((Database { db: RwLock::new(Some(Arc::new(db))), embed_errors }, report))
+    }
+
+    /// What an import of the SQLite file `sqlite_path` into a new database
+    /// would do ([`sqlite::Plan::to_json`]).
+    #[staticmethod]
+    #[pyo3(signature = (sqlite_path, tables = None, schemas = None, blobs_base64 = false))]
+    fn plan_sqlite(py: Python<'_>, sqlite_path: PathBuf, tables: Option<Vec<String>>, schemas: Option<&str>, blobs_base64: bool) -> PyResult<String> {
+        let opts = Database::sqlite_options(tables, schemas, blobs_base64)?;
+        let plan = py.detach(|| sqlite::plan(&sqlite_path, None, &opts)).map_err(err)?;
+        Ok(plan.to_json().to_string())
+    }
+
+    /// The vector `field`'s model gives `text` as a query, or `image` or
+    /// `audio`, the bytes of an image or sound file, for a model of that.
+    #[pyo3(signature = (text = None, field = None, table = None, image = None, audio = None))]
+    fn embed(&self, py: Python<'_>, text: Option<&str>, field: Option<&str>, table: Option<&str>, image: Option<Vec<u8>>, audio: Option<Vec<u8>>) -> PyResult<Vec<f32>> {
+        use strata::embed::Modality;
+        let db = self.get()?;
+        let file = match (image, audio) {
+            (Some(_), Some(_)) => return Err(PyValueError::new_err("embed takes a text, an image or a sound, one of them")),
+            (Some(d), None) => Some((Modality::Image, d)),
+            (None, Some(d)) => Some((Modality::Audio, d)),
+            (None, None) => None,
+        };
+        if let Some((m, data)) = file {
             let s = table_of(&db, table).map_err(err)?;
+            let what = strata::embed::modality_name(m);
             let field = match field {
                 Some(f) => f.to_string(),
-                None => s.fields.iter().find(|f| db.embedder_in(&s.table, &f.name).is_some_and(|e| e.modalities().contains(&strata::embed::Modality::Image))).map(|f| f.name.clone()).ok_or_else(|| PyValueError::new_err("no embedded field has a model of images open"))?,
+                None => s.fields.iter().find(|f| db.embedder_in(&s.table, &f.name).is_some_and(|e| e.modalities().contains(&m))).map(|f| f.name.clone()).ok_or_else(|| PyValueError::new_err(format!("no embedded field has a model of {what} open")))?,
             };
             let e = db.embedder_in(&s.table, &field).ok_or_else(|| PyValueError::new_err(format!("{field} has no embedding model open (see Database.open's models)")))?;
-            return py.detach(|| strata::embed::embed_image_file(e.as_ref(), &data)).map_err(err);
+            strata::embed::file_is(m, &data).map_err(err)?;
+            return py.detach(|| strata::embed::embed_file(e.as_ref(), &data)).map_err(err);
         }
-        let text = text.ok_or_else(|| PyValueError::new_err("embed takes a text or an image"))?;
+        let text = text.ok_or_else(|| PyValueError::new_err("embed takes a text, an image or a sound"))?;
         let mut o = Map::new();
         o.insert("embed".into(), Json::String(text.into()));
         if let Some(f) = field {

@@ -761,11 +761,20 @@ impl Coordinator {
         let mut asked = Vec::new();
         // Asked, but passed over without being sent the read.
         let mut passed = Vec::new();
-        let launch = |r: usize| {
+        let name = crate::telemetry::rpc_name::<T>();
+        let launch = |r: usize, again: bool| {
             let fut = f(r, self.replicas[i][r].client.clone());
-            async move { (r, fut.await) }
+            // Timed in the request's trace, a hedge that lost as "outrun".
+            let span = crate::telemetry::CallSpan { name: name.clone(), shard: i, replica: self.replicas[i][r].url.clone(), t0: Instant::now(), again, outcome: None };
+            async move {
+                // The whole span, not only the field set below, moves in.
+                let mut span = span;
+                let res = fut.await;
+                span.outcome = Some(if res.is_ok() { "ok" } else { "error" });
+                (r, res)
+            }
         };
-        pending.push(launch(order[0]));
+        pending.push(launch(order[0], false));
         asked.push(order[0]);
         self.hedge_budget.earn();
         let mut hedge_at = Instant::now() + self.opts.hedge;
@@ -795,7 +804,7 @@ impl Coordinator {
                         // The primary holds every write: asked next.
                         if let Some(next) = self.next(i, &order, &asked, true) {
                             self.retries.fetch_add(1, Ordering::Relaxed);
-                            pending.push(launch(next));
+                            pending.push(launch(next, true));
                             asked.push(next);
                             hedge_at = Instant::now() + self.opts.hedge;
                         } else if pending.is_empty() {
@@ -819,7 +828,7 @@ impl Coordinator {
                     }
                     self.hedges.fetch_add(1, Ordering::Relaxed);
                     if let Some(next) = self.next(i, &order, &asked, false) {
-                        pending.push(launch(next));
+                        pending.push(launch(next, true));
                         asked.push(next);
                     }
                     hedge_at = Instant::now() + self.opts.hedge;
@@ -1508,6 +1517,60 @@ impl Coordinator {
     /// "ok" when every replica answers, "degraded" when every shard still
     /// has one, "down" when a shard has none. Documents and segments are
     /// counted once per shard.
+    /// Every replica of every shard: its role, health, latest point of
+    /// rates and gauges (each server's own, from `Health`'s detail), and
+    /// how long it took to answer; and the slots each shard holds.
+    pub async fn cluster(&self) -> Json {
+        let calls = self.replicas.iter().map(|rs| {
+            join_all(rs.iter().map(|r| {
+                let mut c = r.client.clone();
+                async move {
+                    let t0 = Instant::now();
+                    let a = tokio::time::timeout(Duration::from_secs(2), c.health(pb::Empty {})).await;
+                    (a, t0.elapsed().as_secs_f64() * 1e3)
+                }
+            }))
+        });
+        let now = self.now_ms();
+        let mut shards = Vec::new();
+        for (i, answers) in join_all(calls).await.into_iter().enumerate() {
+            let replicas: Vec<Json> = self.replicas[i]
+                .iter()
+                .zip(answers)
+                .map(|(r, (a, ms))| {
+                    let mut j = match a {
+                        Ok(Ok(h)) => {
+                            let h = h.into_inner();
+                            let detail: Json = serde_json::from_str(&h.detail).unwrap_or(Json::Null);
+                            json!({"url": r.url, "status": h.status, "docs": h.docs, "segments": h.segments, "txn": h.txn, "rtt_ms": ms, "detail": detail})
+                        }
+                        Ok(Err(e)) => json!({"url": r.url, "status": "down", "error": e.message(), "rtt_ms": ms}),
+                        Err(_) => json!({"url": r.url, "status": "down", "error": "no answer within 2 s", "rtt_ms": ms}),
+                    };
+                    j["role"] = json!(r.role().as_str_name().to_lowercase());
+                    j["takes_writes"] = json!(r.takes_writes());
+                    j["protocol"] = json!(r.protocol.load(Ordering::Relaxed));
+                    if r.avoid_until.load(Ordering::Relaxed) > now {
+                        j["avoided"] = json!(true);
+                    }
+                    j
+                })
+                .collect();
+            let calls: Vec<u64> = self.outcomes[i].iter().map(|n| n.load(Ordering::Relaxed)).collect();
+            let slots = self.slots.as_ref().map(|m| m.ranges(i));
+            let up = replicas.iter().filter(|r| r["status"] != "down").count();
+            let status = if up == replicas.len() { "ok" } else if up > 0 { "degraded" } else { "down" };
+            shards.push(json!({"shard": i, "url": self.shards[i], "status": status, "replicas": replicas, "slots": slots, "calls": {"ok": calls[0], "error": calls[1], "timeout": calls[2]}}));
+        }
+        let up = shards.iter().filter(|s| s["status"] == "ok").count();
+        let status = if up == shards.len() { "ok" } else if shards.iter().all(|s| s["status"] != "down") { "degraded" } else { "down" };
+        json!({
+            "role": "coordinator", "status": status, "shards": shards, "slot_epoch": self.epoch(), "slot_count": crate::slots::SLOTS,
+            "protocol": self.protocol(), "retries": self.retries.load(Ordering::Relaxed), "hedges": self.hedges.load(Ordering::Relaxed),
+            "hedge_ms": self.opts.hedge.as_millis() as u64,
+        })
+    }
+
     pub async fn health(&self) -> Json {
         let calls = self.replicas.iter().map(|rs| {
             join_all(rs.iter().map(|r| {

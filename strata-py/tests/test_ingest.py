@@ -193,10 +193,15 @@ def test_a_bad_event_stops_the_consumer_after_the_events_before_it(server):
 
 KAFKA = os.environ.get("STRATA_KAFKA")
 CONSUMER = """
-import json, sys, strata
+import json, sys, time, strata
 from strata import ingest
 url, topic, group, idle = sys.argv[1:5]
+# At most 5,000 events a second, so that a consumer is still writing when it
+# or the server is killed: unpaced, a fast machine wrote all the second
+# consumer's events in two streams of a quarter second, before the server's
+# kill, and the consumer never retried.
 def to_ops(e):
+    time.sleep(0.0002)
     c = json.loads(e.value)
     return [{"op": "insert", "table": "events", "doc": c}, {"op": "add", "table": "users", "key": c["usr"], "field": "n", "value": 1}]
 # A killed consumer's partitions move once its session times out.

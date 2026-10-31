@@ -1,0 +1,104 @@
+{
+  "data": {
+    "cats": 200,
+    "dim": 32,
+    "events": 400000,
+    "items": 100000,
+    "synthetic": true,
+    "users": 2000
+  },
+  "load_s": 6.128765803,
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "memory_gb": 16.9,
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "params": {
+    "candidates": 1000,
+    "history": 50,
+    "limit": 20,
+    "requests": 300,
+    "threads_query": 1
+  },
+  "runs": [
+    {
+      "added_mean_ms": 0.0,
+      "distinct_values": 0.0,
+      "mean_ms": 1.2850763699999992,
+      "p50_ms": 1.23916,
+      "p99_ms": 2.7629859999999997,
+      "rows_ranked": 0.0,
+      "shape": "no subquery",
+      "sql": "WITH first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + 0.001 * price DESC LIMIT 20",
+      "subquery_runs": 0.0
+    },
+    {
+      "added_mean_ms": 1.6465859666666693,
+      "distinct_values": 0.0,
+      "mean_ms": 2.9316623366666685,
+      "p50_ms": 2.827125,
+      "p99_ms": 5.066461,
+      "rows_ranked": 0.0,
+      "shape": "history read, no subquery",
+      "sql": "WITH h AS (SELECT e.item AS item, i.cat AS cat, i.emb AS emb, e.action AS action, e.ts AS ts FROM events e JOIN items i ON e.item = i.id WHERE e.usr = :u ORDER BY e.ts DESC LIMIT 50), first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + 0.001 * price DESC LIMIT 20",
+      "subquery_runs": 0.0
+    },
+    {
+      "added_mean_ms": 4.809986770000002,
+      "distinct_values": 198.60666666666665,
+      "mean_ms": 6.0950631400000015,
+      "p50_ms": 5.941921,
+      "p99_ms": 9.643862,
+      "rows_ranked": 992.41,
+      "shape": "1 subquery by category, over h",
+      "sql": "WITH h AS (SELECT e.item AS item, i.cat AS cat, i.emb AS emb, e.action AS action, e.ts AS ts FROM events e JOIN items i ON e.item = i.id WHERE e.usr = :u ORDER BY e.ts DESC LIMIT 50), first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + 0.5 * (SELECT COUNT(*) FROM h WHERE h.cat = first.cat) DESC LIMIT 20",
+      "subquery_runs": 2.0
+    },
+    {
+      "added_mean_ms": 8.049592076666675,
+      "distinct_values": 595.82,
+      "mean_ms": 9.334668446666674,
+      "p50_ms": 9.143801,
+      "p99_ms": 14.186121,
+      "rows_ranked": 992.41,
+      "shape": "3 subqueries by category, over h",
+      "sql": "WITH h AS (SELECT e.item AS item, i.cat AS cat, i.emb AS emb, e.action AS action, e.ts AS ts FROM events e JOIN items i ON e.item = i.id WHERE e.usr = :u ORDER BY e.ts DESC LIMIT 50), first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + 0.5 * (SELECT COUNT(*) FROM h WHERE h.cat = first.cat) - 0.0001 * coalesce((SELECT MIN(:now - h.ts) FROM h WHERE h.cat = first.cat), 100000) + (SELECT COUNT(*) FROM h WHERE h.cat = first.cat AND h.action = 'buy') DESC LIMIT 20",
+      "subquery_runs": 6.0
+    },
+    {
+      "added_mean_ms": 4.077475739999999,
+      "distinct_values": 198.60666666666665,
+      "mean_ms": 5.3625521099999975,
+      "p50_ms": 5.213589,
+      "p99_ms": 8.239248,
+      "rows_ranked": 992.41,
+      "shape": "1 subquery by category, events table",
+      "sql": "WITH first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + 0.1 * (SELECT COUNT(*) FROM events e WHERE e.usr = :u AND e.cat = first.cat) DESC LIMIT 20",
+      "subquery_runs": 2.0
+    },
+    {
+      "added_mean_ms": 21.288443020000013,
+      "distinct_values": 992.41,
+      "mean_ms": 22.573519390000012,
+      "p50_ms": 22.245946999999997,
+      "p99_ms": 29.831102,
+      "rows_ranked": 992.41,
+      "shape": "1 subquery by item, events table",
+      "sql": "WITH first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + coalesce((SELECT COUNT(*) FROM events e WHERE e.usr = :u AND e.item = first.id), 0) DESC LIMIT 20",
+      "subquery_runs": 2.0
+    },
+    {
+      "added_mean_ms": 10.186903153333333,
+      "distinct_values": 992.41,
+      "mean_ms": 11.471979523333331,
+      "p50_ms": 11.289169999999999,
+      "p99_ms": 18.462093999999997,
+      "rows_ranked": 992.41,
+      "shape": "1 subquery by embedding, over h",
+      "sql": "WITH h AS (SELECT e.item AS item, i.cat AS cat, i.emb AS emb, e.action AS action, e.ts AS ts FROM events e JOIN items i ON e.item = i.id WHERE e.usr = :u ORDER BY e.ts DESC LIMIT 50), first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000) SELECT id FROM first ORDER BY bm25(title, :q) + coalesce((SELECT MAX(dot(h.emb, first.emb)) FROM h WHERE h.action = 'buy'), 0) DESC LIMIT 20",
+      "subquery_runs": 992.41
+    }
+  ]
+}

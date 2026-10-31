@@ -3,7 +3,8 @@
 //! NULLs, lists and text, nested in AND, OR, NOT and each other, keep
 //! exactly the rows a hand-written three-valued evaluation keeps: in a
 //! Search's filter (sets and probes), under a ranking, over rows in memory
-//! (`WITH`), and as `count_true` in ORDER BY and SELECT.
+//! (`WITH`), ordered by a column, and as `count_true` in ORDER BY and
+//! SELECT.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -260,6 +261,14 @@ fn at_least_keeps_the_rows_a_row_by_row_count_keeps() {
         let ranked: Vec<String> = want.iter().filter(|id| rows.iter().any(|r| &r.id == *id && (r.body.contains(&"x") || r.body.contains(&"y")))).cloned().collect();
         let q = format!("SELECT id FROM t WHERE {} ORDER BY bm25(body, 'x y') DESC LIMIT 2000", c.sql);
         assert_eq!(ids(sql(&db, &q)), ranked, "case {i}: {q}");
+        // Ordered by a column, whose blocks are read best first and
+        // skipped when too few of the conditions can hold in them.
+        let mut by_a: Vec<&Row> = rows.iter().filter(|r| r.a.is_some() && want.contains(&r.id)).collect();
+        by_a.sort_by(|x, y| y.a.cmp(&x.a).then_with(|| x.id.cmp(&y.id)));
+        let top: Vec<String> = by_a.iter().take(25).map(|r| r.id.clone()).collect();
+        let q = format!("SELECT id FROM t WHERE ({}) AND a IS NOT NULL ORDER BY a DESC, id LIMIT 25", c.sql);
+        let got: Vec<String> = sql(&db, &q).into_iter().map(|r| r[0].as_str().unwrap().to_string()).collect();
+        assert_eq!(got, top, "case {i}: {q}");
         if !c.text {
             // The plan the binder made, evaluated row by row.
             let q = format!("SELECT id FROM t WHERE {}", c.sql);

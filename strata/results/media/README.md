@@ -109,3 +109,119 @@ STRATA_MACHINE="..." ./target/release/strata-media-eval --models ~/models \
     --captioner blip-image-captioning-base --limit 1000 --captions-out coco1k-blip-captions.json \
     --out results/media/coco1k-siglip-blip.json
 ```
+
+## Transcripts of speech
+
+`strata-asr-eval` (`strata/src/bin/strata-asr-eval.rs`, feature `audio`)
+loads LibriSpeech utterances into a table whose `transcript` is a `TEXT`
+field the database makes from the `MEDIA` field of each FLAC file as the rows
+load (`"derive": {"from": "audio", "model": "whisper-small"}`), reads the
+transcripts back through SQL and scores them against what was said. Then it
+searches for each utterance by what was said (`ORDER BY bm25(transcript, :t)
+DESC LIMIT 10`) among the others.
+
+Model: `whisper-small` (`openai/whisper-small`, 244M parameters), in candle:
+each 30 seconds of a file (these utterances are all shorter) decoded greedily
+without timestamps, in the language Whisper detects, as the `transformers`
+library generates by default. Split: 200 utterances of LibriSpeech's
+`test-clean`, every 13th by ID, so that all 40 of its speakers are in (25
+minutes of speech). Words are compared lower case and without punctuation
+(apostrophes inside words kept), which counts `St.` against `saint` and `10`
+against `ten` as errors: Whisper's own English normalizer spells those out,
+so the 3.4% its authors report for `whisper-small` on all of `test-clean` is
+not comparable with the numbers here.
+
+| transcripts | word error rate | utterances with every word right |
+|---|---|---|
+| Strata | 3.81% | 120 of 200 |
+| `transformers` 4.46.3 | 3.81% | 120 of 200 |
+
+The two wrote the same 200 transcripts, character for character.
+`whisper_reference.py` writes the `transformers` ones (`python
+whisper_reference.py MODEL_DIR SPLIT_DIR 200 OUT.json`), cutting each file as
+Strata does. The transcripts are `librispeech200-whisper-small-transcripts.json`
+and `librispeech200-transformers-transcripts.json` here.
+
+Found by what was said, `bm25(transcript, :t)`: R@1 99.0, R@5 99.5, R@10
+99.5. The two that miss are made of stopwords, which the `english` analyzer
+drops: "why should he not be as other men" is second, and "ham to be or not
+to be" (transcribed "Him to be or not to be.") is not in the first ten.
+
+Time: 1,077 s for the 200 (1,503 s of speech), 5.4 s an utterance, against
+583 s, 2.9 s an utterance, through `transformers` with PyTorch 2.5.1 on the
+same machine, both with nothing else running. Each utterance is one window,
+and the encoder reads all 30 seconds of a window however short the speech in
+it. The encoder takes most of the time (about 3.7 s a window, in batches of
+four), and attention 60% of that: candle writes each layer's 1500 by 1500
+attention scores to memory, takes their softmax and reads them back, where
+`transformers` calls PyTorch's fused `scaled_dot_product_attention`.
+
+```text
+cargo build --release --features audio --bin strata-asr-eval
+STRATA_MACHINE="..." ./target/release/strata-asr-eval --models ~/models \
+    --librispeech ~/data/LibriSpeech/test-clean --limit 200 \
+    --reference librispeech200-transformers-transcripts.json \
+    --transcripts-out librispeech200-whisper-small-transcripts.json \
+    --out results/media/librispeech200-whisper-small.json
+```
+
+## Vectors of sound
+
+`strata-clap-eval` (`strata/src/bin/strata-clap-eval.rs`, feature `audio`)
+loads Clotho's evaluation split into two tables: the recordings, as a
+`MEDIA` field of kind audio with a `VECTOR` field the database computes from
+it as the rows load (`"embed": {"from": ["audio"], "model":
+"clap-htsat-unfused"}`), and their captions, five each, with their text
+vectors from the same model. Text to audio ranks the recordings by each
+caption's vector (`ORDER BY similarity(emb, :q) DESC LIMIT 10`, exact
+search); audio to text ranks the captions by each recording's, and counts
+the first of its five.
+
+Model: `clap-htsat-unfused` (`laion/clap-htsat-unfused`, Apache-2.0), CLAP's
+HTSAT audio tower and RoBERTa text tower, in candle. A recording is
+resampled to 48 kHz and cut into 10-second windows (a shorter last window is
+repeated to fill 10 seconds); its vector is the normalized mean of its
+windows' vectors. Split: Clotho's evaluation split, 1,045 recordings of 15 to
+30 seconds (6.5 hours, 2,767 windows) with 5,225 captions. Clotho is by the
+Audio Research Group of Tampere University (Drossos, Lipping and Virtanen,
+"Clotho: an Audio Captioning Dataset", ICASSP 2020); its captions are for
+experimental and non-commercial use, and neither they nor the recordings
+are in this repository.
+
+| vectors of the recordings | text to audio R@1 | R@5 | R@10 | audio to text R@1 | R@5 | R@10 |
+|---|---|---|---|---|---|---|
+| Strata, the mean of 10-second windows | 15.9 | 40.1 | 53.6 | 23.2 | 48.6 | 61.7 |
+| `transformers` 4.46.3, the same windows | 15.9 | 40.0 | 53.5 | 23.3 | 48.3 | 61.9 |
+| `transformers`' default, one 10 seconds at random | 15.8 | 37.8 | 51.2 | 21.7 | 46.4 | 59.8 |
+
+The vectors are `transformers`' own: `strata-clap-eval --wav-out` wrote the
+first 20 recordings as Strata hears them (one channel at 48 kHz), and
+`clap_reference.py` embedded those samples and the 100 captions through
+`ClapModel`; every one of the 120 vectors had a cosine of 1.000000 with
+Strata's. On the whole split `transformers` read the 44.1 kHz files
+resampled by `scipy.signal.resample_poly`, so its recall differs from
+Strata's in the third digit. Its default (`truncation="rand_trunc"`, seeded)
+reads one 10 seconds of each recording at random; the mean over all of it is
+0.1 to 1.5 points better at R@1 and 1.9 to 2.4 at R@5 and R@10.
+
+Time, on the same machine with nothing else running: Strata read, decoded,
+resampled and embedded the 1,045 recordings in 743 s (0.27 s a window) and
+the captions in 108 s; `transformers` with PyTorch 2.5.1 took 386 s and 58 s
+for the same windows and captions. The 6,270 searches took 0.6 s.
+
+`clotho-clap.json` is Strata's run and `clotho-transformers.json` the two
+`transformers` runs (numbers only).
+
+```text
+cargo build --release --features audio --bin strata-clap-eval
+STRATA_MACHINE="..." ./target/release/strata-clap-eval --models ~/models \
+    --audio ~/data/clotho/audio/evaluation --captions ~/data/clotho/clotho_captions_evaluation.csv \
+    --out results/media/clotho-clap.json
+# The check against transformers, on the first 20 recordings:
+./target/release/strata-clap-eval --models ~/models --audio ... --captions ... --limit 20 --wav-out /tmp/clap-wav
+python clap_reference.py ~/models/clap-htsat-unfused /tmp/clap-wav ~/data/clotho/clotho_captions_evaluation.csv windows ref20.json 20
+./target/release/strata-clap-eval --models ~/models --audio ... --captions ... --limit 20 --reference ref20.json
+# transformers on the whole split:
+python clap_reference.py ~/models/clap-htsat-unfused ~/data/clotho/audio/evaluation ~/data/clotho/clotho_captions_evaluation.csv windows hf-windows.json
+python clap_reference.py ~/models/clap-htsat-unfused ~/data/clotho/audio/evaluation ~/data/clotho/clotho_captions_evaluation.csv crop hf-crop.json
+```

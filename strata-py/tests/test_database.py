@@ -7,7 +7,7 @@ import pytest
 
 import strata
 from strata import bm25, col, gbdt, score
-from conftest import BOOKS, book
+from conftest import BOOKS, book, tone_wav
 
 
 def test_create_open_and_schema(tmp_path):
@@ -85,6 +85,28 @@ def test_queries_and_results(db):
         db.query("SELECT nope FROM books")
 
 
+def test_a_query_by_sound_needs_a_model_of_sound(db):
+    """`embed(audio=...)` and `{"embed": {"audio": ...}}` go to a model of
+    sound; the books' model reads text only, and a file given as audio has
+    to be sound."""
+    import base64
+
+    wav = tone_wav()
+    with pytest.raises(ValueError, match="no embedded field has a model of sound open"):
+        db.embed(audio=wav)
+    with pytest.raises(ValueError, match="one of them"):
+        db.embed(image=b"x", audio=wav)
+    with pytest.raises(strata.StrataError, match="does not embed sound"):
+        db.embed(audio=wav, field="emb")
+    with pytest.raises(strata.StrataError, match="not a sound file"):
+        db.embed(audio=b"not a sound", field="emb")
+    q = "SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 1"
+    with pytest.raises(strata.StrataError, match="not a sound file"):
+        db.query(q, v={"embed": {"audio": base64.b64encode(b"not a sound").decode()}})
+    with pytest.raises(strata.StrataError, match="is a sound file"):
+        db.query(q, v={"embed": {"image": base64.b64encode(wav).decode()}})
+
+
 def test_vector_of_any_field_name(tmp_path):
     # The SQL it ran did not quote the names, so a space broke it.
     schema = {"table": "t", "primary_key": "doc id", "fields": [{"name": "doc id", "type": "keyword"}, {"name": "my vec", "type": "vector", "dim": 2}]}
@@ -93,6 +115,19 @@ def test_vector_of_any_field_name(tmp_path):
         near = db.query('SELECT "doc id" FROM t ORDER BY similarity("my vec", :v) DESC LIMIT 1', v={"vector_of": "n3", "field": "my vec"}).keys
         assert near == ["n3"]
 
+
+
+def test_multi_vector_field(tmp_path):
+    # A row holds several vectors; maxsim sums each query vector's best match.
+    schema = {"table": "pages", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "patches", "type": "vector", "dim": 3, "multi": True, "index": "flat", "keep_f32": True}]}
+    with strata.open(tmp_path / "m.strata", schema) as db:
+        db.insert([{"id": "a", "patches": [[1, 0, 0], [0, 1, 0]]}, {"id": "b", "patches": [[0, 0, 1]]}, {"id": "c", "patches": [0.5, 0.5, 0]}, {"id": "d"}])
+        r = db.query("SELECT id, patches FROM pages ORDER BY maxsim(patches, :qs) DESC LIMIT 5", qs=[[1, 0, 0], [0, 1, 0]])
+        assert r.keys == ["a", "c", "b"] and r.scores == [2.0, 1.0, 0.0]
+        assert r.rows[0][1] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        assert db.query("SELECT patches FROM pages WHERE id = 'd'").scalar() is None
+        with pytest.raises(strata.StrataError, match="maxsim"):
+            db.query("SELECT id FROM pages ORDER BY similarity(patches, :q) DESC LIMIT 1", q=[1, 0, 0])
 
 def test_numpy_values(db):
     np = pytest.importorskip("numpy")
@@ -375,3 +410,36 @@ def test_gbdt(tmp_path):
             db.query("SELECT id FROM books ORDER BY gbdt('m', rating, year) DESC LIMIT 5")
         with pytest.raises(strata.StrataError, match="no ranking model named nope"):
             db.query("SELECT id FROM books ORDER BY gbdt('nope', rating, year, year) DESC LIMIT 5")
+
+
+def test_the_rank_log(db):
+    import datetime as dt
+
+    db.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, action KEYWORD, ts TIMESTAMP)")
+    t0 = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+    sql = "SELECT id, title FROM books ORDER BY bm25(title, :q) * (1 + 0.1 * rating) DESC LIMIT 5"
+    served = db.query("SELECT id, score(), features() FROM books ORDER BY bm25(title, :q) * (1 + 0.1 * rating) DESC LIMIT 8", q="dragon")
+    r = db.query_logged(sql, {"q": "dragon"}, context="u1", variant="a", candidates=8, ts=t0)
+    assert r.columns == ["id", "title"] and r.keys == served.keys[:5] and len(r.request) == 32
+    db.insert([
+        {"id": 1, "usr": "u1", "item": "b0002", "action": "view", "ts": t0 - dt.timedelta(minutes=5)},
+        {"id": 2, "usr": "u1", "item": r.keys[0], "action": "buy", "ts": t0 + dt.timedelta(minutes=1)},
+    ], table="events")
+    # The ratings change after: the export keeps what was served.
+    db.sql("UPDATE books SET rating = 5.0 WHERE year > 0")
+    db.sql("UPDATE rank_log SET label = 2 WHERE request = :r AND row_key = :k", r=r.request, k=r.keys[1])
+    records = db.export_rank_log(
+        events={"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+        history=5, window="10 minutes", grades={"buy": 3},
+    )
+    assert [x["row_key"] for x in records] == served.keys
+    assert [x["shown"] for x in records] == [True] * 5 + [False] * 3
+    want = [dict(zip(served.columns[2:], row[2:])) for row in served.rows]
+    assert [x["features"] for x in records] == want
+    assert [x["score"] for x in records] == served.scores
+    assert [x["label"] for x in records] == [3, 2] + [0] * 6
+    assert records[0]["history_items"] == ["b0002"] and records[0]["history_actions"] == ["view"]
+    assert records[0]["context"] == "u1" and records[0]["variant"] == "a"
+    assert len(db.export_rank_log(since=t0 + dt.timedelta(seconds=1))) == 0
+    with pytest.raises(strata.StrataError, match="ORDER BY"):
+        db.query_logged("SELECT id FROM books WHERE year > 2000")

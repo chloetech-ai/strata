@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,7 +52,9 @@ class Client(Search):
         self.timeout = timeout
         self._schema: dict | None = None
 
-    def _call(self, method: str, path: str, body: Any = None, *, data: Any = None, headers: Mapping[str, str] | None = None) -> Any:
+    def _call(self, method: str, path: str, body: Any = None, *, data: Any = None, headers: Mapping[str, str] | None = None, text: bool = False, out: Any = None) -> Any:
+        """The answer's JSON, or its text with `text`; with `out`, a binary
+        file, the answer is copied into it and its headers returned."""
         h = dict(headers or {})
         if body is not None:
             data = json.dumps(body, default=_default).encode()
@@ -61,7 +64,10 @@ class Client(Search):
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=h)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read() or b"null")
+                if out is not None:
+                    shutil.copyfileobj(r, out)
+                    return r.headers
+                return r.read().decode() if text else json.loads(r.read() or b"null")
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
@@ -120,6 +126,18 @@ class Client(Search):
         r = self._call("POST", "/v1/sql", {"sql": sql, "params": _params(params, kw)})
         return Result._of(r) if "rows" in r else int(r["written"])
 
+    def _query_logged(self, sql: str, params: Mapping[str, Any] | None, log: dict) -> Result:
+        return Result._of(self._call("POST", "/v1/query", {"sql": sql, "params": _params(params, {}), "log": log}))
+
+    def _export_rank_log(self, opts: dict) -> list[dict]:
+        # NDJSON, a record a line; a failure partway is the last line.
+        out = [json.loads(line) for line in self._call("POST", "/v1/rank_log/export", opts, text=True).splitlines() if line.strip()]
+        if out and "error" in out[-1] and "request" not in out[-1]:
+            err = StrataError(f"{out[-1]['error']} (HTTP {out[-1].get('status', 500)})")
+            err.status, err.answer = out[-1].get("status", 500), out[-1]
+            raise err
+        return out
+
     def explain(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> dict:
         """Runs the query and returns its plan: the plan IR as JSON ("ir")
         and as lines ("tree"), the executor's plan lines ("plan") and the
@@ -134,12 +152,12 @@ class Client(Search):
         r = self._call("POST", "/v1/plan", {"plan": plan})
         return Result._of(r) if "rows" in r else int(r["written"])
 
-    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None, audio: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
-        first table, or of `table`), or of `image`, the bytes of an image
-        file, by a model of images, on the server."""
-        data = None if image is None else base64.b64encode(image).decode()
-        body = {k: v for k, v in {"text": text, "image": data, "field": field, "table": table}.items() if v is not None}
+        first table, or of `table`), or of `image` or `audio`, the bytes of
+        an image or sound file, by a model of that, on the server."""
+        b64 = lambda d: None if d is None else base64.b64encode(d).decode()
+        body = {k: v for k, v in {"text": text, "image": b64(image), "audio": b64(audio), "field": field, "table": table}.items() if v is not None}
         return self._call("POST", "/v1/embed", body)["vector"]
 
     def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
@@ -258,6 +276,55 @@ class Client(Search):
             query = {"format": format} if table is None else {"format": format, "table": table}
             r = self._call("POST", "/v1/import?" + urllib.parse.urlencode(query), data=f, headers={"content-length": str(size), "content-type": ct})
         return {"rows": r["written"], "bulk": False, "skipped_fields": r.get("skipped_fields", [])}
+
+    def _sqlite(self, path: str | os.PathLike, query: dict) -> dict:
+        with open(os.fspath(path), "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            return self._call("POST", "/v1/import?" + urllib.parse.urlencode(query), data=f, headers={"content-length": str(size), "content-type": "application/vnd.sqlite3"})
+
+    @staticmethod
+    def _sqlite_query(tables: str | Iterable[str] | None, **flags: bool) -> dict:
+        q: dict = {"format": "sqlite"}
+        if tables is not None:
+            q["tables"] = tables if isinstance(tables, str) else ",".join(tables)
+        q.update({k: "true" if v else "false" for k, v in flags.items()})
+        return q
+
+    def import_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, blobs_base64: bool = False) -> dict:
+        """Uploads a SQLite database file (up to the server's 256 MB) and
+        imports its tables (all, or `tables`), each into the table of its
+        name: one the server has keeps its schema, and a missing one is
+        created from the SQLite table's declarations and values; rows are
+        upserted by key. BLOB columns are left out unless `blobs_base64`.
+        Returns {tables: [{source, table, rows, created, notes}], skipped:
+        {name: why}, written}."""
+        return self._sqlite(path, self._sqlite_query(tables, blobs_base64=blobs_base64))
+
+    def plan_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, blobs_base64: bool = False) -> dict:
+        """What `import_sqlite` would do, writing nothing: each table's
+        schema, the columns read and what does not carry over."""
+        return self._sqlite(path, self._sqlite_query(tables, blobs_base64=blobs_base64, plan=True))
+
+    def export_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, fts: bool = True, indexes: bool = True, schemas: bool = True) -> list[str]:
+        """Downloads the server's tables (all, or `tables`) as a new SQLite
+        file at `path`, which must not exist: the rows, keys, references,
+        B-tree indexes (`indexes`), an FTS5 index over each table's text
+        (`fts`) and the Strata schemas (`schemas`). Returns the tables."""
+        path = os.fspath(path)
+        q: dict = {k: "false" for k, v in {"fts": fts, "indexes": indexes, "schemas": schemas}.items() if not v}
+        if tables is not None:
+            q["tables"] = tables if isinstance(tables, str) else ",".join(tables)
+        part = path + ".part"
+        try:
+            with open(part, "xb") as f:
+                headers = self._call("GET", "/v1/export?" + urllib.parse.urlencode(q), out=f)
+            if os.path.exists(path):
+                raise FileExistsError(path)
+            os.replace(part, path)
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
+        return [t for t in (headers.get("x-strata-tables") or "").split(",") if t]
 
     def ask(self, question: str, *, model: str | None = None, effort: str | None = None, api_key: str | None = None, max_steps: int | None = None) -> dict:
         """Asks the server's agent a question about the data: {answer,

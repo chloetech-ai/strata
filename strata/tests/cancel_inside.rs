@@ -48,10 +48,10 @@ fn alone() -> MutexGuard<'static, ()> {
     ONE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `sql` stops with a timeout, well before it would have finished, when
-/// its deadline passes a tenth of the way into its loops, and when another
-/// thread cancels it then.
-fn stops_midway(db: &Db, sql: &str) {
+/// `sql`, run with `base`, stops with a timeout, well before it would
+/// have finished, when its deadline passes a tenth of the way into its
+/// loops, and when another thread cancels it then.
+fn stops_midway(db: &Db, sql: &str, base: &ExecOptions) {
     let run = |opts: &ExecOptions| {
         let t0 = Instant::now();
         let r = db.query_with(sql, &Params::new(), opts);
@@ -61,7 +61,7 @@ fn stops_midway(db: &Db, sql: &str) {
     // tens of milliseconds (and the first full run may still read pages).
     let faster = |f: &dyn Fn() -> Duration| f().min(f());
     let full = faster(&|| {
-        let (r, took) = run(&ExecOptions::default());
+        let (r, took) = run(base);
         r.unwrap();
         took
     });
@@ -69,14 +69,14 @@ fn stops_midway(db: &Db, sql: &str) {
     // macOS runner tens of milliseconds more): the time it takes to stop
     // when its deadline has already passed. The rest is the loops.
     let first = faster(&|| {
-        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now()), ..ExecOptions::default() });
+        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now()), ..base.clone() });
         assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
         took
     });
     let loops = full.saturating_sub(first);
     assert!(loops >= Duration::from_millis(25), "{sql} took {full:?}, {first:?} before its first check: too short to stop in the middle");
     let took = faster(&|| {
-        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + first + loops / 10), ..ExecOptions::default() });
+        let (r, took) = run(&ExecOptions { deadline: Some(Instant::now() + first + loops / 10), ..base.clone() });
         assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("deadline")), "{sql}: {r:?}");
         took
     });
@@ -95,7 +95,7 @@ fn stops_midway(db: &Db, sql: &str) {
             flag.store(true, Ordering::Relaxed);
             Instant::now()
         });
-        let (r, _) = run(&ExecOptions { cancel: Some(cancel), ..ExecOptions::default() });
+        let (r, _) = run(&ExecOptions { cancel: Some(cancel), ..base.clone() });
         let stopped = Instant::now();
         let set = canceller.join().unwrap();
         assert!(matches!(r, Err(Error::Timeout(ref m)) if m.contains("cancelled")), "{sql}: {r:?}");
@@ -111,10 +111,11 @@ fn aggregation_and_ordering_stop_inside_a_segment() {
     let db = db(dir.path(), 3_000_000);
     // Grouped document by document, 500,000 groups.
     let grouped = "SELECT a, b, COUNT(*), SUM(c) FROM t GROUP BY a, b";
-    stops_midway(&db, grouped);
-    // Ordered by a column over every row.
+    stops_midway(&db, grouped, &ExecOptions::default());
+    // Ordered by a column over every row (its blocks best first read only
+    // a few).
     let ordered = "SELECT id FROM t WHERE c >= 0 ORDER BY b DESC LIMIT 10";
-    stops_midway(&db, ordered);
+    stops_midway(&db, ordered, &ExecOptions { column_blocks: false, ..ExecOptions::default() });
 }
 
 #[test]
@@ -124,7 +125,7 @@ fn graph_walks_stop_inside_a_segment() {
     let db = db(dir.path(), 1_000_000);
     // A chain: each hop reaches one more row.
     let walk = "SELECT COUNT(*) FROM t WHERE REACHABLE(next, 0, hops => 1000000, max_nodes => 1000000)";
-    stops_midway(&db, walk);
+    stops_midway(&db, walk, &ExecOptions::default());
 }
 
 #[test]
@@ -135,5 +136,5 @@ fn joins_stop_inside_a_segment() {
     // Every row meets every row of its `c` (800 each), and none passes
     // the rest of the join condition.
     let join = "SELECT x.id, y.id FROM t x JOIN t y ON x.c = y.c AND x.a < y.a - 2000";
-    stops_midway(&db, join);
+    stops_midway(&db, join, &ExecOptions::default());
 }

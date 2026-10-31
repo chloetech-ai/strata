@@ -147,6 +147,9 @@ fn queries() -> Vec<(&'static str, Json)> {
         // Some of the conditions, and a boost by how many hold.
         ("SELECT id, price FROM products WHERE AT_LEAST(2, MATCH(body, 'waterproof'), price < 200, year >= 2020) ORDER BY price DESC, id LIMIT 10", none.clone()),
         ("SELECT id, score() FROM products WHERE AT_LEAST('50%', rating >= 4, tags = 'sale', category = 'outdoor') ORDER BY bm25(body, 'leather boots') * (1 + count_true(rating >= 4, year >= 2020)) DESC LIMIT 8", none.clone()),
+        // Autocomplete: a prefix's most rated, and a prefix counted.
+        ("SELECT id, rating FROM products WHERE PREFIX(id, 'p00001') ORDER BY rating DESC, id LIMIT 10", none.clone()),
+        ("SELECT COUNT(*) FROM products WHERE category LIKE 'k%' AND id NOT LIKE 'p0000%'", none.clone()),
     ]
 }
 
@@ -1692,6 +1695,37 @@ async fn sparse_and_binary_vector_fields_over_http() {
     assert!(metrics.contains(r#"kind="sparse",outcome="ok"} 1"#), "{metrics}");
 }
 
+/// A multi-vector field over HTTP: rows written as arrays of vectors, ranked
+/// by `maxsim` with an array of query vectors, and read back as arrays.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_vector_fields_over_http() {
+    use strata::{Field, FieldType, Schema, VectorIndexKind};
+    let patches = Field::new("patches", FieldType::Vector { dim: 3, index: VectorIndexKind::Flat }).multi().keep_f32();
+    let schema = Schema::new("pages", vec![Field::new("id", FieldType::Keyword), patches], Some("id")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("m.strata"), schema, DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let base = http(service(db, "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let docs = [
+        json!({"id": "a", "patches": [[1, 0, 0], [0, 1, 0]]}),
+        json!({"id": "b", "patches": [[0.0, 0.0, 1.0]]}),
+        json!({"id": "c", "patches": [0.5, 0.5, 0.0]}),
+        json!({"id": "d"}),
+    ];
+    let ops: Vec<Json> = docs.into_iter().map(|d| json!({"op": "insert", "doc": d})).collect();
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({ "ops": ops })).await;
+    assert_eq!((status, r["written"].clone()), (200, json!(4)), "{r}");
+    let sql = "SELECT id, patches FROM pages ORDER BY maxsim(patches, :qs) DESC LIMIT 5";
+    let (status, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": sql, "params": {"qs": [[1, 0, 0], [0, 1, 0]]}})).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["keys"], json!(["a", "c", "b"]), "{r}");
+    assert_eq!(r["scores"], json!([2.0, 1.0, 0.0]), "{r}");
+    assert_eq!(r["rows"][0][1], json!([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]), "{r}");
+    assert_eq!(r["rows"][1][1], json!([[0.5, 0.5, 0.0]]), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/write"), json!({"ops": [{"op": "insert", "doc": {"id": "bad", "patches": [[1, 0]]}}]})).await;
+    assert_eq!(status, 400, "{r}");
+}
+
 /// `{"vector_of": key}` reads a row's vector whatever the fields are named:
 /// the SQL it ran did not quote them, so a space broke it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1819,6 +1853,98 @@ async fn imports_files_over_http() {
     assert_eq!(r["schema"]["primary_key"], json!(0), "{r}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_files_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = strata::Schema::from_json(ITEMS).unwrap();
+    let db = Db::create(&dir.path().join("i.strata"), schema.clone(), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema.clone(), agent_config("http://unused"), 16, Duration::from_secs(10));
+    svc.open_models(dir.path());
+    let base = http(Arc::new(svc), None).await;
+    let c = reqwest::Client::new();
+
+    // A SQLite file with rows for the server's table and a table it lacks,
+    // made by an export without the Strata schemas, so that the server
+    // makes the new table's from SQLite's declarations.
+    let src = Db::create(&dir.path().join("src.strata"), schema, DbOptions::default()).unwrap();
+    src.sql("INSERT INTO items (id, title, tags, price) VALUES ('a', 'red umbrella', ['rain'], 12.5), ('b', 'blue kettle', [], 30), ('c', 'green lamp', ['home', 'light'], 18)", &Params::new()).unwrap();
+    src.sql("CREATE TABLE notes (id INT PRIMARY KEY, item KEYWORD REFERENCES items, body TEXT, at TIMESTAMP)", &Params::new()).unwrap();
+    src.sql("INSERT INTO notes (id, item, body, at) VALUES (1, 'a', 'keeps the rain off on the walk to the station', '2026-10-01T12:00:00Z'), (2, 'c', 'a warm light for reading in the evening', '2026-10-02T08:30:00Z')", &Params::new()).unwrap();
+    let file = dir.path().join("src.sqlite");
+    strata::sqlite::export(&src, &file, &strata::sqlite::ExportOptions { meta: false, ..Default::default() }).unwrap();
+    let bytes = std::fs::read(&file).unwrap();
+    let tables = |c: reqwest::Client| {
+        let base = base.clone();
+        async move { c.get(format!("{base}/v1/tables")).send().await.unwrap().json::<Json>().await.unwrap()["tables"].as_array().unwrap().len() }
+    };
+
+    // The plan writes nothing.
+    let r = c.post(format!("{base}/v1/import?format=sqlite&plan=true")).header("content-type", "application/vnd.sqlite3").body(bytes.clone()).send().await.unwrap();
+    let (status, plan): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
+    assert_eq!(status, 200, "{plan}");
+    let summary: Vec<(String, bool)> = plan["tables"].as_array().unwrap().iter().map(|t| (t["table"].as_str().unwrap().to_string(), t["exists"].as_bool().unwrap())).collect();
+    assert_eq!(summary, [("items".to_string(), true), ("notes".to_string(), false)], "{plan}");
+    let notes = &plan["tables"][1]["fields"];
+    assert_eq!(notes[1], json!({"name": "item", "type": "keyword", "references": "items"}), "{plan}");
+    assert_eq!(notes[2]["type"], json!("text"), "{plan}");
+    assert_eq!(notes[3]["type"], json!("timestamp"), "{plan}");
+    assert_eq!(tables(c.clone()).await, 1);
+
+    // Recognised by its first bytes; the new table is created, the rows
+    // written through the writer, and the model embeds the titles.
+    let r = c.post(format!("{base}/v1/import")).header("content-type", "application/octet-stream").body(bytes.clone()).send().await.unwrap();
+    let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
+    assert_eq!((status, &r["written"]), (200, &json!(5)), "{r}");
+    assert_eq!(r["tables"][1], json!({"source": "notes", "table": "notes", "rows": 2, "created": true, "bulk": false, "notes": []}), "{r}");
+    assert_eq!(r["skipped"]["notes_fts"], json!("the fts5 index of notes (the columns it indexes are TEXT fields)"), "{r}");
+    assert_eq!(tables(c.clone()).await, 2);
+    let (_, q) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT n.id, i.title FROM notes n JOIN items i ON n.item = i.id WHERE MATCH(n.body, 'reading') "})).await;
+    assert_eq!(q["rows"], json!([[2, "green lamp"]]), "{q}");
+    let (_, q) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT id FROM items ORDER BY similarity(emb, :q) DESC LIMIT 1", "params": {"q": {"embed": "blue kettle", "field": "emb"}}})).await;
+    assert_eq!(q["rows"][0][0], json!("b"), "{q}");
+    // Again: the rows are upserted by key, into tables that now exist.
+    let r = c.post(format!("{base}/v1/import?format=sqlite&tables=notes")).header("content-type", "application/octet-stream").body(bytes.clone()).send().await.unwrap();
+    let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
+    assert_eq!((status, &r["written"], &r["tables"][0]["created"]), (200, &json!(2), &json!(false)), "{r}");
+    let (_, q) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT COUNT(*) FROM notes"})).await;
+    assert_eq!(q["rows"][0][0], json!(2), "{q}");
+
+    // What is refused: ?table= (for rows), a file that is not SQLite, a table it lacks.
+    for (url, body, why) in [
+        ("format=sqlite&table=items", bytes.clone(), "?tables="),
+        ("format=sqlite", b"id,title\nx,y\n".to_vec(), "not a SQLite database"),
+        ("format=sqlite&tables=nope", bytes.clone(), "no table nope"),
+    ] {
+        let r = c.post(format!("{base}/v1/import?{url}")).header("content-type", "application/octet-stream").body(body).send().await.unwrap();
+        let (status, r): (u16, Json) = (r.status().as_u16(), r.json().await.unwrap());
+        assert_eq!(status, 400, "{url}: {r}");
+        assert!(r["error"].as_str().unwrap().contains(why), "{url}: {r}");
+    }
+
+    // The export: a SQLite file of every table, which imports back as it was.
+    let r = c.get(format!("{base}/v1/export")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.headers()["content-type"], "application/vnd.sqlite3");
+    assert_eq!(r.headers()["content-disposition"], "attachment; filename=\"items.sqlite\"");
+    assert_eq!(r.headers()["x-strata-tables"], "items,notes");
+    let out = dir.path().join("out.sqlite");
+    std::fs::write(&out, r.bytes().await.unwrap()).unwrap();
+    let (back, done) = strata::sqlite::import_new(&out, &dir.path().join("back.strata"), DbOptions::default(), &Default::default()).unwrap();
+    assert_eq!(done.tables.iter().map(|t| (t.table.as_str(), t.rows)).collect::<Vec<_>>(), [("items", 3), ("notes", 2)]);
+    assert_eq!(back.storage().table("notes").unwrap().to_short_json()["fields"][1]["references"], json!("items"));
+    // Some tables, bare; and only SQLite.
+    let r = c.get(format!("{base}/v1/export?tables=notes&fts=false&indexes=0&schemas=no")).send().await.unwrap();
+    assert_eq!(r.headers()["x-strata-tables"], "notes");
+    let bare = dir.path().join("bare.sqlite");
+    std::fs::write(&bare, r.bytes().await.unwrap()).unwrap();
+    let (names, _) = strata::sqlite::Source::open(&bare).unwrap().tables().unwrap();
+    assert_eq!(names, ["notes"]);
+    let r = c.get(format!("{base}/v1/export?format=csv")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    let r = c.get(format!("{base}/v1/export?fts=maybe")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+}
+
 #[test]
 fn imports_files_from_the_command_line() {
     let dir = tempfile::tempdir().unwrap();
@@ -1827,7 +1953,7 @@ fn imports_files_from_the_command_line() {
     std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
     std::fs::write(&more, "id\ttitle\tprice\nb\tsecond again\t3\nc\tthird\t\n").unwrap();
     let db = dir.path().join("items.strata");
-    server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows.clone(), more]).unwrap();
+    server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows.clone(), more], Default::default()).unwrap();
     let opened = Db::open(&db, DbOptions::default()).unwrap();
     let r = opened.query("SELECT id, title, price FROM items", &Params::new()).unwrap();
     let mut got: Vec<String> = r.rows.iter().map(|r| format!("{:?}", r)).collect();
@@ -1836,7 +1962,34 @@ fn imports_files_from_the_command_line() {
     assert!(got[1].contains("second again") && got[1].contains("3.0"), "{got:?}");
     drop(opened);
     // An existing database takes no schema.
-    assert!(server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows]).unwrap_err().contains("exists"));
+    assert!(server::import_files(&db, Some(&schema), None, dir.path(), None, false, &[rows], Default::default()).unwrap_err().contains("exists"));
+}
+
+#[test]
+fn sqlite_files_from_and_to_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (schema, rows) = (dir.path().join("items.json"), dir.path().join("rows.jsonl"));
+    std::fs::write(&schema, ITEMS).unwrap();
+    std::fs::write(&rows, "{\"id\": \"a\", \"title\": \"first\"}\n{\"id\": \"b\", \"title\": \"second\", \"price\": 2}\n").unwrap();
+    let db = dir.path().join("items.strata");
+    server::import_files(&db, Some(&schema), None, dir.path(), None, false, std::slice::from_ref(&rows), Default::default()).unwrap();
+    let out = dir.path().join("items.sqlite");
+    server::export_sqlite(&db, &out, &Default::default()).unwrap();
+    assert!(strata::sqlite::is_sqlite_file(&out));
+    assert!(server::export_sqlite(&db, &out, &Default::default()).unwrap_err().contains("exists"));
+    // --plan writes nothing, and is for SQLite files.
+    let back = dir.path().join("back.strata");
+    let plan = || server::SqliteImport { plan: true, ..Default::default() };
+    server::import_files(&back, None, None, dir.path(), None, false, std::slice::from_ref(&out), plan()).unwrap();
+    assert!(!back.exists());
+    assert!(server::import_files(&back, None, None, dir.path(), None, false, std::slice::from_ref(&rows), plan()).unwrap_err().contains("--plan"));
+    // A new database from the SQLite file: the schema it kept, and the rows.
+    server::import_files(&back, None, None, dir.path(), None, false, &[out], Default::default()).unwrap();
+    let (a, b) = (Db::open(&db, DbOptions::default()).unwrap(), Db::open(&back, DbOptions::default()).unwrap());
+    assert_eq!(a.schema().to_short_json(), b.schema().to_short_json());
+    assert_eq!(b.snapshot().n_live_docs(), 2);
+    let r = b.query("SELECT price FROM items WHERE id = 'b'", &Params::new()).unwrap();
+    assert_eq!(r.rows[0][0], Value::Float(2.0));
 }
 
 // OPS-3: a replica that refused a query because too many were running was

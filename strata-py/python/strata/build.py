@@ -188,6 +188,14 @@ class Expr:
         """`lo <= expr <= hi`; a bound of None is open."""
         return _Between(self, lo, hi)
 
+    def startswith(self, prefix: str) -> Expr:
+        """The text starts with `prefix` (a multi-valued field: one of its
+        values does); on a KEYWORD field, one run of its index, as SQL's
+        `LIKE 'p%'` and `PREFIX(field, 'p')` are."""
+        if not isinstance(prefix, str):
+            raise TypeError("startswith takes a str")
+        return _Prefix(self, prefix)
+
     def is_null(self) -> Expr:
         """The expression has no value (a multi-valued field: holds none)."""
         return _IsNull(self)
@@ -387,6 +395,14 @@ class _IsNull(Expr):
 
     def _ir(self, ctx: _Ctx) -> Any:
         return {"is_null": self.e._ir(ctx)}
+
+
+class _Prefix(Expr):
+    def __init__(self, e: Expr, prefix: str):
+        self.e, self.prefix = e, prefix
+
+    def _ir(self, ctx: _Ctx) -> Any:
+        return {"prefix": {"expr": self.e._ir(ctx), "prefix": _operand(self.prefix, ctx, _field_of(self.e, ctx))}}
 
 
 class _In(Expr):
@@ -735,7 +751,9 @@ def similarity(field: str, query: Sequence[float] | Mapping[str, float]) -> Expr
 def maxsim(field: str, vectors: Iterable[Sequence[float]], *, max_vectors: int | None = None) -> Expr:
     """The best similarity of a VECTOR field to any of `vectors` (a
     user's recent items, a query's phrasings), as a score: one search
-    per vector, at most 64 of them unless `max_vectors` says more."""
+    per vector, at most 64 of them unless `max_vectors` says more. Over
+    a multi-vector field (VECTOR(d)[]), the sum over `vectors` of each
+    one's best match among a row's vectors."""
     vs = [[float(x) for x in v] for v in vectors]
 
     def build(ctx: _Ctx) -> Any:

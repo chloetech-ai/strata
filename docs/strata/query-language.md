@@ -77,11 +77,12 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | type | indexed as | filters |
 |---|---|---|
 | `INT`, `FLOAT` (finite: no NaN or infinity) | frame-of-reference column with zone maps, range histogram | `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL` |
-| `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`, `IS [NOT] NULL`; `GROUP BY` |
+| `KEYWORD` | dictionary codes and one docID list per value | `=`, `!=`, `IN`, `NOT IN`, `IS [NOT] NULL`, [prefixes](#prefixes-and-autocomplete) (`LIKE 'p%'`, `PREFIX`); `GROUP BY` |
 | `BOOL` | an `INT` column of 1 and 0 | the field alone (`WHERE done`, `NOT done`), `=`, `!=`, `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] NULL`; `GROUP BY` |
 | `TIMESTAMP` | an `INT` column of microseconds since 1970-01-01 UTC | as `INT`, with times written as text: `at >= '2026-10-01'` |
 | `TEXT` | inverted index (optionally with positions); may be generated from other text fields | `MATCH` |
 | `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`), with HNSW, IVF or flat search; may be declared as a model's embedding of other fields ([embedded vector fields](server.md#embedded-vector-fields)) | ordering by `similarity` / `distance`; a similarity graph |
+| `VECTOR(d)[]` | several vectors per row (a page's patches, a song's frames): 1-bit codes searched, 8-bit codes to score (float32 too with `keep_f32`), and maps from rows to their vectors and back | ordering by `maxsim` |
 | `SPARSE` | inverted index of learned term weights (SPLADE and similar) | ordering by `similarity` |
 | `MEDIA` | a file by reference: URI, SHA-256, type, size; a `KEYWORD` index of the hashes | `=`, `IN` on the hash; `GROUP BY` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
@@ -102,7 +103,7 @@ A `KEYWORD[]` field may hold the [semantic ID](server.md#semantic-ids) of a vect
 
 A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
-A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), and whose captions a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')` ([text from media](server.md#text-from-media)).
+A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), `sound_emb VECTOR OPTIONS(embed = 'recording', model = 'clap-htsat-unfused')` ([vectors of sound](server.md#vectors-of-sound)), and whose captions or transcripts a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')`, `transcript TEXT OPTIONS(derive = 'recording', model = 'whisper-small')` ([text from media](server.md#text-from-media)).
 
 ## Some of the conditions: `AT_LEAST`
 
@@ -173,6 +174,45 @@ primary := "(" query ")" ["@" n | "@" p "%"] | ("\"phrase\"" | word | word* | wo
 Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it. A weight (`vaccine^2`, `"messenger rna"^0.5`) is read and ignored, since `MATCH` only says whether a row matches: `vaccine^2 mrna` matches what `vaccine mrna` does, so one text can go to both `MATCH` and [`bm25`](#weights-required-and-excluded-words).
 
 A group with `@n` matches a row with at least `n` of its items: its operands, whether juxtaposed, joined by `AND` or by `OR`, each a word, a phrase, a prefix, a typo-tolerant word or a parenthesised query (`vaccine AND (mrna "messenger rna" trial~ (phase OR stage))@2`). A negated item (`-animal`) is not counted: the row must not have it. A stopword is not an item, and a word's synonyms and typo neighbours count as it does. `@p%` asks for p percent of the items, rounded down; either count is clamped to between 1 and the number of items, as Lucene's `minimum_should_match` is, so `@1` is any of them and a count past the end is all of them. `MATCH(body, 'a b c d', min => 2)` (or `min => '75%'`) treats the whole query as one group. A group nests anywhere a parenthesised query does. A group reads each item's matches once, so it costs about what an `OR` of its items does.
+
+## Prefixes and autocomplete
+
+`kw LIKE 'p%'` and `PREFIX(kw, 'p')` select the rows of a `KEYWORD` field whose value starts with `p`, byte for byte (no case folding). A field's values are sorted in its dictionary, so the values with a prefix are one run of it, found by two binary searches per segment: a short run unions its values' lists, and one of more than 1,024 values of a single-valued field scans the code column, as a range of numbers does. A multi-valued field matches a row when one of its values starts with the prefix, and `NOT` when none does.
+
+```sql
+-- autocomplete: the ten most asked queries that start with what was typed
+SELECT id, n FROM queries WHERE PREFIX(id, :typed) ORDER BY n DESC, id LIMIT 10;
+
+-- a user's own history first: keys of the form '<user>|<query>'
+SELECT id, n FROM user_queries WHERE PREFIX(id, 'u42|how to') ORDER BY n DESC LIMIT 3;
+
+SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/ir/%';
+```
+
+- `LIKE` on a table's own `KEYWORD` field takes a value (no wildcard: `=`) or text followed by `%`. `_` anywhere, or `%` before the end, is refused there, since the index cannot answer it; over joined or derived rows, `LIKE` takes any pattern.
+- `ESCAPE 'c'` makes the character after `c` literal: `LIKE 'snake!_%' ESCAPE '!'` is the prefix `snake_`. `PREFIX` needs no escaping.
+- `ILIKE` is refused on a table's own field: store the value lowercased (and a display form beside it) and use `LIKE`.
+- `PREFIX(x, p)` also works over joined or derived rows, as a test of each value; `PREFIX(kw, '')` and `LIKE '%'` are `IS NOT NULL`.
+- Counts kept with `UPDATE ... SET n = n + 1` or a write's `add` change in place, so a query log's popularity stays current without rewriting rows.
+
+A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
+
+**Cluster a completion table by its key.** `ORDER BY n DESC LIMIT 10` reads the count column's blocks best first ([ordering by a column](#a-column)), and with `OPTIONS(cluster_by = 'id')` a prefix's rows sit together in each segment, so the ten most asked queries under a prefix read about ten blocks whatever the prefix's length:
+
+```sql
+CREATE TABLE queries (id KEYWORD PRIMARY KEY, n INT) OPTIONS(cluster_by = 'id');
+```
+
+Over ORCAS's 10.4 million queries, loaded in no particular order and merged by the default policy (11 segments), 2,000 typed queries drawn by clicks, one thread on a 4-core cloud VM (Intel Xeon @ 2.10GHz), p99 in ms:
+
+| characters typed | 1 | 2 | 3 | 4 | 6 | 8 | 12 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rows matching (median) | 560,354 | 64,887 | 9,461 | 2,418 | 415 | 68 | 6 |
+| every match read | 46.7 | 25.4 | 18.2 | 17.1 | 9.9 | 9.1 | 2.6 |
+| blocks best first | 9.5 | 13.0 | 8.8 | 9.7 | 6.3 | 6.5 | 2.6 |
+| blocks, clustered by `id` | 0.27 | 0.53 | 0.48 | 0.38 | 0.35 | 0.33 | 0.28 |
+
+The full runs, with medians and the 105 segments straight after the load, are [`results/text/complete-orcas.json` and `complete-orcas-clustered.json`](https://github.com/rkonow/strata/tree/main/strata/results/text) (`strata-complete-bench`).
 
 ## Scores
 
@@ -256,6 +296,13 @@ ORDER BY rrf(bm25(title, :t), maxsim(emb, :recent)) * (1 + 0.1 * coalesce(rating
 ```
 
 It runs one search per query vector, with the filter and the options of `similarity` (`strategy`, `ef`, `nprobe`, `rerank`), and scores the union of their top *k* exactly against every query vector. The union holds the exact top *k*: a row among them is among the top *k* of the query vector it is closest to. Each added query vector costs one more search ([what that costs](results.md#maxsim)). A row without a vector scores `NULL`, a subquery with no rows ranks nothing, and more than 64 vectors is an error unless `max_vectors => n` raises the limit. It is a score wherever `similarity` is one: in `rrf`, `minmax()` sums and ranking expressions, on one database or over shards.
+
+On a **multi-vector field** (`VECTOR(d)[]`), `maxsim` is late interaction as ColBERT and ColPali score it: the sum over the query vectors of each one's best match among the row's vectors, $\sum_i \max_j q_i \cdot v_j$. Each query vector's search returns its best `depth` vectors (64), which name candidate rows; the `candidates` rows (200, at least the `LIMIT`) with the largest sum of the matches found are scored over all their vectors, with their 8-bit codes, or float32 when the field keeps them. A row without vectors ranks nowhere. `depth => n` and `candidates => n` trade time for recall; with both at least the number of vectors, the answer is exact. `similarity` refuses a multi-vector field, and so do graph functions.
+
+```sql
+-- pages by their patches' best matches with the query's token vectors
+SELECT id, score() FROM pages ORDER BY maxsim(patches, :tokens) DESC LIMIT 5;
+```
 
 `dot(a, b)` is the dot product of two vectors as a value, for rows in memory: `SELECT id, dot(emb, :q) FROM h` over a `WITH` result, a join, or a table's own rows. It equals `similarity` to the bit.
 
@@ -353,11 +400,56 @@ WITH a AS (SELECT * FROM products ORDER BY similarity(emb, :q) DESC LIMIT 500),
 SELECT id, score() FROM b ORDER BY minmax(bm25(body, :t)) + minmax(similarity(emb, :q)) DESC LIMIT 10;
 ```
 
-The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE`, grouping or subquery, ranks by one expression `DESC`, and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
+The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE` or grouping, ranks by one expression `DESC` (which may hold [correlated subqueries](#correlated-subqueries-a-ranking-that-reads-other-rows)), and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. `WITH` results before the first phase, a user's history say, are computed first, for the phases' subqueries to read. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
 
 A phase whose expression is row-local is a second phase: over shards, each shard scores it on its own top rows by the first phase. A phase with `minmax()`, `rank()`, `rrf` or a weighted sum reads every row it reranks, so it is a global phase: it runs once over the merged rows (on the coordinator over shards), and so does every phase after it. The coordinator keeps the top rows of the whole collection by the first phase before it ranks them by the next, so a split collection answers exactly as the whole one does. `EXPLAIN` shows each phase and which kind it is, and a query's plan lines say how many rows each reranked. The first phase's `LIMIT` counts against the rows a query may reach (`max_rows`), and the phases against its deadline.
 
 From Python, `rerank(expr, count)` adds a phase: `t.select("id", score()).order_by(bm25("body", q)).rerank(col("rating"), 100).limit(10)`. A plan with phases needs the plan feature `rank_phases`.
+
+#### Correlated subqueries: a ranking that reads other rows
+
+A scalar subquery in a ranking may name a column of the row it ranks (`first.cat`). It is then correlated, and gives a number for each row: how often the user met the row's category, how long ago, how close the row is to what they bought.
+
+```sql
+-- the user's last 50 events with their items' categories and embeddings, then
+-- BM25's top 1,000 reranked by what the user did with each one's category
+WITH h AS (SELECT e.item AS item, i.cat AS cat, i.emb AS emb, e.action AS action, e.ts AS ts
+           FROM events e JOIN items i ON e.item = i.id WHERE e.usr = :u ORDER BY e.ts DESC LIMIT 50),
+     first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000)
+SELECT id, title, score() FROM first
+ORDER BY bm25(title, :q)
+       + 0.5 * (SELECT COUNT(*) FROM h WHERE h.cat = first.cat)
+       - 0.0001 * coalesce((SELECT MIN(:now - h.ts) FROM h WHERE h.cat = first.cat), 100000)
+       + coalesce((SELECT MAX(dot(h.emb, first.emb)) FROM h WHERE h.action = 'buy'), 0) DESC
+LIMIT 20;
+
+-- a table read through its indexes: the user's events in the row's category that cost less
+SELECT id FROM items WHERE MATCH(title, :q)
+ORDER BY bm25(title, :q) + 0.1 * (SELECT COUNT(*) FROM events e WHERE e.usr = :u AND e.cat = items.cat AND e.price < items.price) DESC
+LIMIT 20;
+
+-- as a column of the rows ranked
+WITH first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 100)
+SELECT id, (SELECT COUNT(*) FROM events e WHERE e.usr = :u AND e.item = first.id) AS seen FROM first
+ORDER BY bm25(title, :q) DESC LIMIT 20;
+```
+
+- **Where.** The rows ranked must be a bounded set: a [rerank phase](#rerank-phases), whose rows are the phase before's top rows; an `ORDER BY` over a table, or over a `WITH` result, of at most 10,000 rows (more is an error that suggests a phase); or the columns of a ranked query, alone or in an expression (`coalesce(price, 0) + (SELECT ...)`). A subquery naming the outer row in `WHERE`, `IN` or `EXISTS` is an error.
+- **What it names.** `name.column`, where `name` is the outer query's table or `WITH` result (or its alias) and the column one of its columns. The subquery reads a `WITH` result in memory, compared any way an expression over rows in memory can be, or a table through its indexes, whose conditions compare one of its columns with the outer row's (`e.cat = items.cat`, `e.price < items.price`) as they would a value.
+- **Its value** is a number (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG` of numbers, or a boolean as 0 or 1). One of no rows is `NULL` (`COUNT` gives 0), which ranks last unless `coalesce`d. A `NULL` of the outer row is compared as SQL compares it: `e.price < first.price` holds for no event when the row has no price.
+- **How it runs.** First the rows ranked (the phases before, or the rows a bounded `ORDER BY` reads), with the columns the subqueries name. The parts of a subquery that do not read the outer row run once (`h` above, and its rows where `h.action = 'buy'`). A subquery whose outer columns meet only equalities ANDed into its `WHERE` (`h.cat = first.cat`) then runs once, grouped by them over the values the rows hold (`h.cat IN (...)`), and a value no group has takes the subquery's value over no rows; any other runs once for each distinct value of the columns it names. Then the ranking sorts the rows, with each row's values, and the plan lines say how much ran: `correlated: 3 subqueries over 1000 rows, 597 values, 3 runs`.
+- **Over shards** a coordinator runs the steps before, and the subqueries over the shards' rows, and sends each row's values to the shards inside the plan, by key, so that every shard ranks with the same ones. A plan with them needs the plan feature `correlated`.
+- **Cost** at 1,000 candidates, measured with `strata-correlated-bench` on a cloud VM (4-core Intel Xeon @ 2.10GHz, 16.9 GB, Linux 6.18): 100,000 items in 200 categories, 400,000 events of 2,000 users, a history of 50 events, one thread, 300 requests of each shape. BM25's top 1,000 reranked to 20 took 1.29 ms (mean) without subqueries, and reading the history added 1.67 ms. A subquery added, over the rerank alone (with the history's read):
+
+  | subquery | values | runs | added, mean |
+  |---|---|---|---|
+  | by category, over `h` | 199 | 2 | 4.90 ms |
+  | three by category, over `h` | 596 | 6 | 8.14 ms |
+  | by category, over the events table | 199 | 2 | 4.09 ms |
+  | by item, over the events table | 992 | 2 | 21.6 ms |
+  | by embedding (`dot(h.emb, first.emb)`), over `h` | 992 | 992 | 10.5 ms |
+
+  A grouped run costs about what reading the candidates' values does. A subquery that runs once per value costs about 10 µs a run over rows in memory, and one grouped by a key reads an `IN` list as long as the candidates (`e.item IN (...)`), which is most of its cost. A second run gave the same numbers within 0.4 ms (`strata/results/correlated/`).
 
 #### Features: the values a ranking read
 
@@ -419,6 +511,55 @@ SELECT id, score() FROM top ORDER BY sigmoid(gbdt('clicks', bm25(title, :t), bm2
 - **A plan names the model and the hash of its file** (`EXPLAIN` shows `ranking model: docs_ltr (hash …)`) and needs the plan feature `rank_models`. A database or shard whose file of that name is another refuses the plan rather than rank with another model; a plan without a hash runs with the file there. A coordinator scores the shards' rows with the model too, so it needs the same file in its own models directory.
 - `features()` lists a model's inputs' leaves and then the model's score, and from Python `gbdt("docs_ltr", bm25("title", t), col("rating"))` builds the same ranking.
 
+#### The rank log: what each query served
+
+A ranking is trained on what it served. A query run with a log writes one row per row it answered to a log table, with the values its ranking read as it computed them, so a model trained later sees what serving saw, however the tables change in between: new rows that move BM25's statistics, counters that grow, rows deleted.
+
+```sql
+-- what the first query logged to it makes (rank_log unless the log names another)
+CREATE TABLE IF NOT EXISTS rank_log (
+  id KEYWORD PRIMARY KEY,                 -- '<request>#<position>'
+  request KEYWORD NOT NULL, ts TIMESTAMP NOT NULL, context KEYWORD,
+  row_key KEYWORD NOT NULL, position INT NOT NULL, shown BOOL NOT NULL,
+  score FLOAT, features KEYWORD OPTIONS(indexed = false),
+  variant KEYWORD, label FLOAT
+) OPTIONS(cluster_by = 'context');
+
+-- a label written later: a judge's grade, an agent citing the row
+UPDATE rank_log SET label = 3 WHERE request = :r AND row_key = :k;
+```
+
+```sh
+curl -s localhost:7700/v1/query -d '{"sql": "SELECT id, title FROM docs ORDER BY bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0)) DESC LIMIT 10",
+  "params": {"t": "mrna vaccine"}, "log": {"context": "u42", "variant": "b", "candidates": 50}}'
+# {"columns": ["id", "title"], "rows": [...], ..., "request": "9f0c...", "logged": {"rows": 50, "seq_no": 812}}
+```
+
+- **A logged query** is one `SELECT` ranked by an `ORDER BY` ([rerank phases](#rerank-phases) and [rank profiles](#rank-profiles-a-ranking-kept-with-its-table) included) of a table with a primary key: `"log"` in the body of `POST /v1/query` or `/v1/sql` (`true`, or an object of options), `db.query_logged(sql, params, context=...)` in [Python](python.md#the-rank-log), `Db::query_logged` in Rust. It runs with `score()` and [`features()`](#features-the-values-a-ranking-read) added to its columns, answers with the columns it asked for and the request's id (`request`), and writes its rows to the log in one transaction once it has answered: a logged query costs a write.
+- **Options**: `context`, whom the request served (a user, a session, a query class), which the export reads events by; `request`, the request's id (a random one when left out; logging a request's id again overwrites its rows at the same positions); `variant`, the client's name for the ranking that served (an A/B arm); `candidates`, a number of rows from the query's `OFFSET` to log, more than its `LIMIT` returns, those past the `LIMIT` logged as not shown (unshown negatives); `ts`, when it was served (ISO 8601 text or microseconds; now when left out), for replaying past traffic; `table`, another log table.
+- **A row** holds its request, time and context, the key of the row served (`row_key`, as text), its `position` from 0 (the `OFFSET` included), whether it was `shown`, its `score()`, and `features`: a JSON object of each `features()` column, named by its SQL text, whose numbers read back to the bits the ranking computed. A table made by hand serves as a log if it has these columns, of these types (with `retain = '90 days'`, say).
+- **Through a coordinator** the query is the coordinator's, so the values are one database's ([features over shards](#features-the-values-a-ranking-read)), and the rows go to the shards their keys place them on; the first logged query makes the table on every shard. A replica refuses a logged query, the log being a write, and so does a primary until its copies have the table (`CREATE TABLE` does not reach replicas yet). A shard's query (`"shard": true`) is not logged.
+- **Cost.** Computing the values is nearly free, since the ranking computes them anyway; the write is the cost. On a 4-core cloud VM over HTTP, with 100,000 documents and one client, a query took 1.87 ms at the median plain, 1.85 ms with its values added and 4.33 ms logged (7.81 ms logging 100 candidates); writing the same ten rows alone through `/v1/write` took 1.97 ms. Without the disk's flush (`--no-sync`) the logged query took 3.50 ms: the sync is a third of the log's cost here, and the rest is the write itself. Four clients got 1,620 plain and 670 logged queries a second. A row took 152 bytes in the segments (an Intel Xeon @ 2.10GHz, 16.9 GB, Linux 6.18; `strata-server/results/rank_log/vm.json` and `vm-no-sync.json`, from `strata-rank-log-bench`). The export read 70,000 records a second, each with a history of 20 events and a label.
+
+#### Exporting the log for training
+
+The export reads a log table back from one snapshot, one record per logged row, with what happened around it as of its time, from a table of events (a user's views, clicks, purchases): the context's last events before the row (its history, for a sequence model), and a label from the events on the row's key after it, within a window.
+
+```sh
+curl -s localhost:7700/v1/rank_log/export -d '{"events": {"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+  "history": 20, "window": "30 minutes", "grades": {"click": 1, "buy": 3}, "since": "2026-10-01"}'
+# {"id": "9f0c...#0", "request": "9f0c...", "ts": 1793338200000000, "context": "u42", "row_key": "d17", "position": 0, "shown": true,
+#  "score": 7.31, "variant": "b", "label": 3.0,
+#  "features": {"bm25(body, :t)": 6.09, "bm25(body, :t) * (1 + 0.1 * coalesce(rating, 0))": 7.31, "rating": 2.0},
+#  "history_items": ["d3", "d9", ...], "history_times": [...], "history_actions": ["view", "click", ...]}
+```
+
+- **Records** come as NDJSON from `POST /v1/rank_log/export`, as a list of dicts from `db.export_rank_log(...)` in Python, and from `Db::export_rank_log` in Rust, context by context, each context's rows in the order they were served. Times are microseconds since the epoch. `since` and `until` keep the rows served in `[since, until)`, and `table` names another log.
+- **`events`** names a table, its column of contexts (`user`, `KEYWORD` or `INT`), of the rows the events were about (`item`), of when they happened (`time`, a `TIMESTAMP` or an `INT` of microseconds), and optionally of what they were (`action`). `OPTIONS(shard_by = 'usr', cluster_by = 'usr')` keeps each user's events together, on one shard and in few pages.
+- **History**: with `history` set to n, the context's last n events before the row's time, oldest first. **Label**: with `window`, a period (`'30 minutes'`) or seconds, the best grade among the context's events on the row's key in the window after the row's time, `grades` giving each action's (an event whose action has none is not a label; without `grades` every event grades 1), and 0 when there is none. A label written on the row wins. A row without a context has no history and no label but its own.
+- **As of the row's time**, by the events' own times: an event timed before a row is in its history even when it arrived after the row was served, which a query at the time could not have seen. The features are the values served, never recomputed.
+- **A coordinator does not export**: export from each shard's server. Logs placed by context (a hand-made log with `context KEYWORD NOT NULL` and `shard_by = 'context'`) and events placed by user then give each shard every row and event of its contexts.
+
 ### `decay(field, origin, scale, …)`: closeness to a value
 
 A numeric column's closeness to `origin`, as in Elasticsearch's decay functions. With `d = max(0, |x − origin| − offset)`, the score is 1 at `d = 0` and `decay` at `d = scale`:
@@ -448,6 +589,8 @@ A product's factors are scores (`bm25`, `similarity`, `ppr`, `decay`) and numeri
 ### A column
 
 `ORDER BY year DESC` orders by a numeric column. Rows without a value come last in either direction (as in Elasticsearch); `ORDER BY year DESC NULLS FIRST` puts them first. Their `score()` is `NULL`. With no `ORDER BY`, rows come in storage order.
+
+With a `LIMIT`, the rows can come from the column's blocks of 128 rows, best block first by its zone map (its largest value for `DESC`, smallest for `ASC`), stopping at the first block whose best value is worse than the k-th row found. A row's filter is checked only when its value can still make the cut, and blocks the filter's own zone maps rule out are never read. So the ten most clicked of the 560,000 ORCAS queries starting with `a` read about 150 of 81,000 blocks, and about 10 when the table is clustered by query (`OPTIONS(cluster_by = 'id')`), where each prefix's rows sit together. The planner keeps the plain scan of the matches when they are a few thousand rows, or under 1 in 64 of the rows the zone maps admit (a rare prefix of an unclustered table, whose k-th best value is low enough that most blocks could hold a better one), and switches to it when the blocks have cost half of what it would (a filter that rejects the best values, `WHERE n < 3 ORDER BY n DESC`); `NULLS FIRST` always scans. Values written in place are read first, so counters kept with `UPDATE ... SET n = n + 1` rank by their current value.
 
 ## Typos and synonyms
 
@@ -519,7 +662,7 @@ SELECT a.id, b.id FROM papers a JOIN papers b ON a.category = b.category AND b.i
 
 Each plans into operators over the single-table queries above ([`EXPLAIN`](#explain) shows them), all run on one snapshot, so every single-table query uses the indexes. Each is bound as it is built, never printed as SQL and parsed again:
 
-- **`IN (SELECT ...)`** and **`NOT IN`** run the subquery first and filter with its values (a multi-valued column contributes each value). **`EXISTS`** is true or false, and a **scalar subquery** must return one column and at most one row. A subquery's values reach the outer query's filter as values, so its indexes serve it: `year > (SELECT AVG(year) ...)` is a range of `year`.
+- **`IN (SELECT ...)`** and **`NOT IN`** run the subquery first and filter with its values (a multi-valued column contributes each value). **`EXISTS`** is true or false, and a **scalar subquery** must return one column and at most one row. A subquery's values reach the outer query's filter as values, so its indexes serve it: `year > (SELECT AVG(year) ...)` is a range of `year`. A scalar subquery that names a column of the outer row is [correlated](#correlated-subqueries-a-ranking-that-reads-other-rows): it ranks, and is not a condition.
 - **`WITH`** results and **`FROM (SELECT ...)`** are read like a table. A `WITH` whose rows are rows of the table (no aggregates) keeps their keys, so an outer query over it reads the table restricted to those rows, in the `WITH`'s order unless it orders them itself, and `(SELECT id FROM top)` can seed a graph. `WITH RECURSIVE` is not supported: `REACHABLE` and `PATH` walk links.
 - **Joins** are `JOIN` (inner) and `LEFT JOIN`, of a table with another, with itself or with a `WITH` result; name each side (`papers a JOIN papers b`). `ON` needs an equality between the sides, of two columns of one kind: `KEYWORD`, or `INT` and `FLOAT` compared as numbers (`p.venue = a.id`, an `INT` with a `KEYWORD`, is an error). A multi-valued column joins each of its values. Comparing an `EDGES` field with the key follows its links (`a.cites = b.id`: *b* is a row *a* links to; `b.cites = a.id`: *b* links to *a*); links name keys of their own table, so they join a table with itself. Each `WHERE` or `ON` condition on one side filters that side's scan, and the second side reads only the rows whose join values the first side holds (`b.id IN (...)`, or for links the rows linking to them), before a hash join in memory. Text, vector and graph functions name one side (`MATCH(a.body, ...)`); `ORDER BY` a score ranks by that side's scan, and when the order is the first side's, scans of a growing number of its rows stop once `LIMIT` rows join. Joined columns are named by their expression (`b.title`) unless aliased.
 - Over joined or derived rows, `WHERE`, `GROUP BY`, aggregates, `HAVING`, `ORDER BY`, `DISTINCT` and `LIMIT` also take arithmetic, `||`, `LIKE`, `ILIKE`, `CASE`, `COALESCE`, `LOWER`, `UPPER`, `LENGTH`, `ABS`, `ROUND` and `DOT`. So does the `SELECT` list over one table (`SELECT id, rating * 2, dot(emb, :q) FROM papers WHERE ...`): the table's query finds the rows and the columns are computed in memory. Their conditions follow the same three-valued logic as a single table's, multi-valued columns included (`NOT (b.tags = 'red')` keeps rows without tags). Integer arithmetic is exact, and a result too big for an integer is a `FLOAT`; `/` gives a `FLOAT`, and dividing by zero gives `NULL`. `||` skips `NULL`s, and `LIKE` with a `NULL` side is `NULL`. `ORDER BY` puts rows without a value last in either direction unless `NULLS FIRST`, as over a single table.
@@ -705,8 +848,8 @@ CREATE TABLE events (
 DROP TABLE IF EXISTS wrote, authors;
 ```
 
-- **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (or `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, `DATETIME`; a `DATE` is a `TIMESTAMP` at midnight UTC), `VECTOR(dimensions)`, `SPARSE`, `MEDIA` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists. A `BOOL` or `TIMESTAMP` column holds one value and is neither the primary key nor a reference.
-- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`), `kind` of a `MEDIA` field, `derive` (a `MEDIA` field) with `model` for [text made from media](server.md#text-from-media), `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
+- **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (or `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, `DATETIME`; a `DATE` is a `TIMESTAMP` at midnight UTC), `VECTOR(dimensions)`, `SPARSE`, `MEDIA` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists, and `VECTOR(dimensions)[]` several vectors per row ([multi-vector fields](#maxsimfield-vectors-several-query-vectors)). A `BOOL` or `TIMESTAMP` column holds one value and is neither the primary key nor a reference.
+- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`; a multi-vector field searches `'binary'` by default), `keep_f32` (a multi-vector field keeps its float32 vectors to score with, four times the bytes of its 8-bit codes), `pool` (a multi-vector field merges a row's vectors whose cosine similarity is at least this, such as `0.9`, into their mean when it is written), `kind` of a `MEDIA` field, `derive` (a `MEDIA` field) with `model` for [text made from media](server.md#text-from-media), `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there, and an inner join along the reference leaves that row out (`LEFT JOIN` keeps it). Joins along them are [ordinary joins](#subqueries-with-and-joins) (`FROM wrote w JOIN authors a ON w.author = a.id`).
 - **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`. The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).
@@ -737,7 +880,7 @@ DELETE FROM products WHERE stock = 0 ORDER BY price LIMIT 100;
 ```
 
 - A write names its table, any table of the database.
-- **`INSERT`** fails on a primary key that already exists. **`INSERT OR REPLACE`** (or `REPLACE INTO`) replaces that row, an upsert. **`ON CONFLICT (key) DO NOTHING`** (or `INSERT OR IGNORE`) writes only the rows whose key is new, and the first of a key the statement repeats. **`ON CONFLICT (key) DO UPDATE SET ...`** inserts the new keys and sets fields of the rows already there, where `excluded.column` is the value the statement gave; a key that comes twice in one such statement is an error. Lists are `ARRAY[…]`; a vector is a parameter, `ARRAY[…]` or a JSON array string; a `SPARSE` value is a JSON object string, and a `MEDIA` value a URI or a JSON object string.
+- **`INSERT`** fails on a primary key that already exists. **`INSERT OR REPLACE`** (or `REPLACE INTO`) replaces that row, an upsert. **`ON CONFLICT (key) DO NOTHING`** (or `INSERT OR IGNORE`) writes only the rows whose key is new, and the first of a key the statement repeats. **`ON CONFLICT (key) DO UPDATE SET ...`** inserts the new keys and sets fields of the rows already there, where `excluded.column` is the value the statement gave; a key that comes twice in one such statement is an error. Lists are `ARRAY[…]`; a vector is a parameter, `ARRAY[…]` or a JSON array string; a multi-vector value is a list of vectors (`ARRAY[ARRAY[…], ARRAY[…]]`, a parameter holding a list of vectors, or `'[[…], […]]'`), and one vector given to it is a list of one; a `SPARSE` value is a JSON object string, and a `MEDIA` value a URI or a JSON object string.
 - **`UPDATE`** takes any `WHERE`, and a `LIMIT`. Setting only single-valued `INT` and `FLOAT` fields (`SET clicks = clicks + 1`) changes them in place, without rewriting the row, which suits counters and prices that change often. Setting any other field rewrites the row, which needs every text field stored or generated.
 - **`SET`** takes a value or any expression of the row: arithmetic, `||`, `CASE`, `NOT`, comparisons, `lower`, `upper`, `length`, `abs`, `round` and `coalesce` over the row's columns, and in `ON CONFLICT DO UPDATE` over `excluded.column` too. Every expression reads the row as it was, so `SET a = b, b = a` swaps two fields. The result is stored as the field's type: a whole number fits an `INT` (`clicks = price * 2`), but `7 / 2` is 3.5 and an error there (`round(clicks / 2)` fits); one value set to a multi-valued field becomes a list of it. NULL in gives NULL out, as in SQL, except `field + number` and `field - number`, which count a NULL as zero, as a counter does; `coalesce(field, 0) + other` does the same elsewhere. A multi-valued field without values is NULL to `coalesce` and `IS NULL`. Searches, scores and aggregates (`MATCH`, `bm25`, `score()`, `COUNT`) are errors in `SET`. A statement that cannot set one of its rows sets none.
 - **`DELETE`** takes any `WHERE`, and `ORDER BY` with `LIMIT` to delete the first rows in that order.

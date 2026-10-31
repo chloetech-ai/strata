@@ -26,7 +26,7 @@ use crate::query::agg::{self, Acc, Part};
 use crate::query::compound::MAX_ROWS;
 use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
 use crate::query::ir::eval::{self, Ref};
-use crate::query::ir::{Agg, Expr, Graph, GraphKind, JoinKey, JoinKind, Node, Plan, SortKey};
+use crate::query::ir::{Agg, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, Plan, SortKey};
 use crate::query::logical::Direction;
 use crate::query::memory::Charge;
 use crate::query::Projection;
@@ -35,6 +35,10 @@ use crate::value::Value;
 
 /// Runs one leaf of a plan.
 pub type Runner<'r> = dyn FnMut(&Plan) -> Result<ResultSet> + 'r;
+
+/// Rows an ORDER BY with a correlated subquery ranks at most: each row may
+/// run the subquery once.
+pub const CORRELATED_ROWS: usize = 10_000;
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
@@ -256,7 +260,12 @@ impl<'a> Ops<'a, '_> {
                 }
             }
         }
-        let rs = (self.runner)(&Plan::new(leaf))?;
+        let mut correlated = false;
+        leaf.leaf_exprs(&mut |e| correlated |= e.has_correlated());
+        let rs = match correlated {
+            true => self.correlated(leaf, schema)?,
+            false => (self.runner)(&Plan::new(leaf))?,
+        };
         if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, n)) {
             *read = rs.rows.len();
         }
@@ -279,6 +288,268 @@ impl<'a> Ops<'a, '_> {
             columns: rs.columns,
             rows: rs.rows,
         })
+    }
+
+    /// Runs a leaf whose ranking holds correlated subqueries
+    /// ([`Expr::is_correlated`]), each once for each distinct value of the
+    /// outer fields it names among the rows it is computed for:
+    ///
+    /// 1. **Rows.** The rows the first phase that holds one reranks (the
+    ///    phases before it run as the leaf has them); every row that passes
+    ///    the filter, at most [`CORRELATED_ROWS`], when the ORDER BY holds
+    ///    one; or, when only columns do, the leaf's own rows.
+    /// 2. **Values.** Each subquery's value for each distinct value of
+    ///    the fields it names among those rows, a number or NULL.
+    /// 3. **Ranking.** The leaf again over those rows, each subquery as
+    ///    its value for each row by key ([`Expr::ByKey`]), from that phase
+    ///    on (the rows ranked by where step 1 left them), or from the
+    ///    start; with columns only, step 1's rows take the values.
+    ///
+    /// A coordinator's shards answer steps 1 and 3 as any leaf, and the
+    /// subqueries run here, so they may read any table.
+    fn correlated(&mut self, leaf: Node, schema: &Schema) -> Result<ResultSet> {
+        let pk = schema.primary_key.ok_or_else(|| err("a correlated subquery takes a value for each row of a table with a primary key"))?;
+        let s = leaf.search().expect("a leaf").clone();
+        let Node::Project { columns, input } = &leaf else { unreachable!("a leaf") };
+        let mut elsewhere = s.filter.has_correlated();
+        input.leaf_exprs(&mut |e| elsewhere |= e.has_correlated());
+        let in_order = s.order.iter().any(|k| k.expr.has_correlated());
+        let phase = s.phases.iter().position(|p| p.expr.has_correlated());
+        let in_columns: Vec<bool> = columns.iter().map(|c| c.expr.has_correlated()).collect();
+        if elsewhere && !(in_order || phase.is_some()) || s.filter.has_correlated() {
+            return Err(err("a subquery that names the outer row computes a number of each row it ranks: it works in ORDER BY, rerank phases and the columns of ranked rows, not in WHERE"));
+        }
+        // The subqueries, each once, and the outer fields each names.
+        let mut subs: Vec<(Expr, Vec<u32>)> = Vec::new();
+        leaf.leaf_exprs(&mut |e| {
+            e.visit(&mut |x| {
+                if x.is_correlated() && !subs.iter().any(|(y, _)| y == x) {
+                    let Expr::Scalar(n) = x else { unreachable!("a subquery") };
+                    let mut fields = Vec::new();
+                    n.visit_exprs(&mut |o| {
+                        if let Expr::Outer(f) = o {
+                            if !fields.contains(f) {
+                                fields.push(*f);
+                            }
+                        }
+                    });
+                    subs.push((x.clone(), fields));
+                }
+            })
+        });
+        let mut outer: Vec<u32> = subs.iter().flat_map(|(_, fs)| fs.iter().copied()).collect();
+        if !in_order && phase.is_none() {
+            // A column computed from a subquery's value reads its row's
+            // fields too.
+            for c in columns.iter().filter(|c| c.expr.has_correlated()) {
+                c.expr.visit(&mut |x| {
+                    if let Expr::Field(f) = x {
+                        outer.push(*f);
+                    }
+                });
+            }
+        }
+        outer.sort_unstable();
+        outer.dedup();
+        let outer_columns = |c: &mut Vec<super::ir::Column>| c.extend(outer.iter().map(|f| super::ir::Column { name: format!("__outer{f}"), expr: Expr::Field(*f) }));
+
+        // 1. The rows.
+        let search_of = |order: Vec<SortKey>, phases: Vec<super::ir::Phase>| Node::Search(super::ir::Search { order, phases, profile: None, ..s.clone() });
+        let (first, cut) = match (in_order, phase) {
+            (true, _) => (search_of(Vec::new(), Vec::new()), CORRELATED_ROWS as u64 + 1),
+            (false, Some(j)) => (search_of(s.order.clone(), s.phases[..j].to_vec()), s.phases[j].count),
+            (false, None) => (Node::Ref { name: String::new() }, 0),
+        };
+        let (rows_of, only_columns) = match (in_order, phase) {
+            (false, None) => {
+                // The leaf itself, each such column the key until it has its values.
+                let mut l = leaf.clone();
+                let Node::Project { columns, .. } = &mut l else { unreachable!("a leaf") };
+                for (c, &sub) in columns.iter_mut().zip(&in_columns) {
+                    if sub {
+                        c.expr = Expr::Field(pk as u32);
+                    }
+                }
+                outer_columns(columns);
+                let rs = (self.runner)(&Plan::new(l))?;
+                (rs, true)
+            }
+            _ => {
+                let mut cols = Vec::new();
+                outer_columns(&mut cols);
+                let l = Node::Project { input: Box::new(Node::Limit { input: Box::new(first), offset: 0, limit: Some(cut) }), columns: cols };
+                ((self.runner)(&Plan::new(l))?, false)
+            }
+        };
+        let n = rows_of.rows.len();
+        if in_order && n > CORRELATED_ROWS {
+            return Err(err(format!(
+                "an ORDER BY with a subquery that names the outer row ranks at most {CORRELATED_ROWS} rows, and this one reaches more: rank its top rows in a rerank phase (WITH top AS (... LIMIT n) SELECT ... FROM top ORDER BY ...)"
+            )));
+        }
+        if rows_of.keys.len() != n {
+            return Err(err("a correlated subquery takes a value for each row by its key, and the rows came without keys"));
+        }
+        let at = rows_of.columns.len() - outer.len();
+
+        // 2. Each subquery's values.
+        let mark = self.ctes.len();
+        let (mut distinct, mut runs) = (0, 0);
+        let values = subs
+            .iter()
+            .map(|(sub, fields)| {
+                let tuples: Vec<Vec<Value>> = rows_of.rows.iter().map(|row| fields.iter().map(|f| row[at + outer.binary_search(f).expect("an outer field")].clone()).collect()).collect();
+                self.sub_values(sub, fields, &tuples, &mut distinct, &mut runs)
+            })
+            .collect::<Result<Vec<_>>>();
+        self.ctes.truncate(mark);
+        let values: Vec<Vec<KeyValue>> = values?.into_iter().map(|vs| vs.into_iter().zip(&rows_of.keys).map(|(value, key)| KeyValue { key: key.clone(), value }).collect()).collect();
+        self.plan.push(format!("correlated: {} subqueries over {n} rows, {distinct} values, {runs} runs", subs.len()));
+        let by_key = |e: &mut Expr| {
+            e.visit_mut(&mut |x| {
+                if let Some(i) = subs.iter().position(|(y, _)| y == x) {
+                    *x = Expr::ByKey(values[i].clone());
+                }
+                Ok(())
+            })
+        };
+
+        // 3. The ranking, or step 1's rows with their values.
+        if only_columns {
+            let mut rs = rows_of;
+            for (i, c) in columns.iter().enumerate().filter(|(i, _)| in_columns[*i]) {
+                for (r, row) in rs.rows.iter_mut().enumerate() {
+                    let mut e = c.expr.clone();
+                    e.visit_mut(&mut |x| {
+                        if let Some(j) = subs.iter().position(|(y, _)| y == x) {
+                            *x = Expr::Lit(values[j][r].value.map_or(Value::Null, Value::Float));
+                        }
+                        Ok(())
+                    })?;
+                    let fields = |f: u32| outer.binary_search(&f).map(|o| row[at + o].clone());
+                    row[i] = eval::eval(&e, &|x| match x {
+                        Ref::Field(f) => fields(f).map_err(|_| err("a field the column reads")),
+                        _ => Err(err("a column computed from a subquery that names the outer row reads the row's fields and the subqueries' values: rank by scores in ORDER BY")),
+                    })?;
+                }
+            }
+            for row in rs.rows.iter_mut() {
+                row.truncate(at);
+            }
+            rs.columns.truncate(at);
+            return Ok(rs);
+        }
+        let keys = Expr::In { expr: Box::new(Expr::Field(pk as u32)), list: rows_of.keys.iter().cloned().map(Expr::Lit).collect() };
+        let mut l = leaf;
+        l.leaf_exprs_mut(&mut |e| by_key(e))?;
+        let search = l.search_mut().expect("a leaf");
+        search.filter = match std::mem::replace(&mut search.filter, Expr::Lit(Value::Bool(true))) {
+            Expr::Lit(Value::Bool(true)) => keys,
+            Expr::And(mut xs) => {
+                xs.push(keys);
+                Expr::And(xs)
+            }
+            f => Expr::And(vec![f, keys]),
+        };
+        search.profile = None;
+        if let (false, Some(j)) = (in_order, phase) {
+            // From that phase on, the rows in the order step 1 gave them.
+            let order = rows_of.keys.iter().enumerate().map(|(i, k)| KeyValue { key: k.clone(), value: Some((n - i) as f64) }).collect();
+            search.order = vec![SortKey { expr: Expr::ByKey(order), desc: true, nulls_first: false }];
+            search.phases.drain(..j);
+        }
+        (self.runner)(&Plan::new(l))
+    }
+
+    /// The values of correlated subquery `sub` for each of `tuples`, the
+    /// values of the outer `fields` it names: one grouped run when the
+    /// outer values meet only equalities ([`decorrelated`]), else a run for
+    /// each distinct tuple. Counts the distinct tuples and the runs.
+    fn sub_values(&mut self, sub: &Expr, fields: &[u32], tuples: &[Vec<Value>], distinct: &mut usize, runs: &mut usize) -> Result<Vec<Option<f64>>> {
+        let Expr::Scalar(node) = sub else { unreachable!("a subquery") };
+        // What does not read the outer row, once.
+        let mut node = (**node).clone();
+        self.hoist(&mut node)?;
+        let id = |t: &mut dyn Iterator<Item = &Value>| t.map(canonical).collect::<Vec<_>>().join("\u{0}");
+        let ids: Vec<String> = tuples.iter().map(|t| id(&mut t.iter())).collect();
+        let mut seen = HashSet::new();
+        let unique: Vec<&[Value]> = tuples.iter().zip(&ids).filter(|(_, i)| seen.insert(i.as_str())).map(|(t, _)| t.as_slice()).collect();
+        *distinct += unique.len();
+        let mut memo: HashMap<String, Option<f64>> = HashMap::new();
+        // With a grouped run, the value of each tuple of no group: the
+        // subquery's over no rows.
+        let mut grouped: Option<(Vec<usize>, Option<Option<f64>>)> = None;
+        let one = decorrelated(&node, fields, &unique, self.catalog);
+        if let Some((q, outs)) = one {
+            self.opts.check()?;
+            *runs += 1;
+            let rows = self.node(&q, "subquery")?;
+            let k = outs.len();
+            if rows.rows.iter().all(|r| r[..k].iter().all(|v| matches!(v, Value::Str(_) | Value::Int(_) | Value::Float(_)))) {
+                for r in &rows.rows {
+                    memo.insert(id(&mut r[..k].iter()), number(&r[k])?);
+                }
+                grouped = Some((outs, None));
+            }
+        }
+        let mut out = Vec::with_capacity(tuples.len());
+        for (t, tid) in tuples.iter().zip(&ids) {
+            let key = match &grouped {
+                Some((outs, _)) => id(&mut outs.iter().map(|&i| &t[i])),
+                None => tid.clone(),
+            };
+            if let Some(v) = memo.get(&key) {
+                out.push(*v);
+                continue;
+            }
+            if let Some((_, Some(v))) = &grouped {
+                out.push(*v);
+                continue;
+            }
+            self.opts.check()?;
+            let mut q = node.clone();
+            q.visit_exprs_mut(&mut |x| {
+                if let Expr::Outer(f) = x {
+                    *x = Expr::Lit(t[fields.iter().position(|g| g == f).expect("a field it names")].clone());
+                }
+                Ok(())
+            })?;
+            unknown(&mut q);
+            *runs += 1;
+            let v = number(&self.scalar(&q, None, None)?)?;
+            match &mut grouped {
+                Some((_, empty)) => *empty = Some(v),
+                None => {
+                    memo.insert(key, v);
+                }
+            }
+            out.push(v);
+        }
+        Ok(out)
+    }
+
+    /// Runs each input of `n` that does not read the outer row (an
+    /// [`Expr::Outer`]) and is more than a `WITH` result's rows, and puts
+    /// its rows in its place: a correlated subquery then reads them for
+    /// each of the outer row's values without computing them again. The
+    /// rows are `WITH` results in scope until the caller truncates them.
+    fn hoist(&mut self, n: &mut Node) -> Result<()> {
+        fn outer(n: &Node) -> bool {
+            let mut found = false;
+            n.visit_exprs(&mut |e| found |= matches!(e, Expr::Outer(_)));
+            found
+        }
+        for i in n.inputs_mut() {
+            if outer(i) {
+                self.hoist(i)?;
+            } else if !matches!(i, Node::Ref { .. }) {
+                let rows = self.node(i, "subquery")?;
+                let name = format!("#{}", self.ctes.len());
+                self.ctes.push((name.clone(), Rc::new(rows)));
+                *i = Node::Ref { name };
+            }
+        }
+        Ok(())
     }
 
     /// `e`, over rows in memory, with its subqueries run.
@@ -347,6 +618,8 @@ impl<'a> Ops<'a, '_> {
             Expr::MaxSim { vectors, .. } if matches!(vectors.as_ref(), Expr::Values(_)) => **vectors = Expr::Lit(Value::List(self.vectors(vectors)?)),
             Expr::Values(_) | Expr::Keys(_) => *e = Expr::Lit(Value::List(self.values(e, None, None)?)),
             Expr::Exists(n) => *e = Expr::Lit(Value::Bool(!self.node(n, "subquery")?.rows.is_empty())),
+            // Runs for each row, once the rows are known.
+            Expr::Scalar(_) if e.is_correlated() => {}
             Expr::Scalar(n) => *e = Expr::Lit(self.scalar(n, None, None)?),
             _ => {}
         }
@@ -826,4 +1099,156 @@ fn compare(a: &Value, b: &Value, k: &SortKey) -> Ordering {
             if k.desc { c.reverse() } else { c }
         }
     }
+}
+
+/// The searches of `n` with each comparison with NULL (an outer row's
+/// value) read as SQL reads it: UNKNOWN, which keeps no row, and neither
+/// does its negation. Indexes answer a comparison with a value only.
+fn unknown(n: &mut Node) {
+    fn fold(e: &mut Expr, positive: bool) {
+        let null = |x: &Expr| matches!(x, Expr::Lit(Value::Null));
+        match e {
+            Expr::Not(x) => fold(x, !positive),
+            Expr::And(xs) | Expr::Or(xs) => xs.iter_mut().for_each(|x| fold(x, positive)),
+            Expr::Cmp { left, right, .. } if null(left) || null(right) => *e = Expr::Lit(Value::Bool(!positive)),
+            Expr::Between { expr, lo, hi } if null(expr) || lo.iter().chain(hi.iter()).any(|b| null(b)) => *e = Expr::Lit(Value::Bool(!positive)),
+            Expr::In { expr, .. } if null(expr) => *e = Expr::Lit(Value::Bool(!positive)),
+            _ => {}
+        }
+    }
+    if let Node::Search(s) = n {
+        fold(&mut s.filter, true);
+    }
+    n.inputs_mut().into_iter().for_each(unknown);
+}
+
+/// A subquery's value as a ranking reads it.
+fn number(v: &Value) -> Result<Option<f64>> {
+    Ok(match v {
+        Value::Null => None,
+        Value::Int(x) => Some(*x as f64),
+        Value::Float(x) => Some(*x).filter(|x| x.is_finite()),
+        Value::Bool(b) => Some(*b as u8 as f64),
+        v => return Err(err(format!("a subquery in a ranking expression gives a number, not {v:?}"))),
+    })
+}
+
+/// A value as a key of a correlated subquery's memo: numbers equal as
+/// numbers (`2` and `2.0`), and a value of another kind never equal to one.
+fn canonical(v: &Value) -> String {
+    match v {
+        Value::Int(x) => format!("n{}", *x as f64),
+        Value::Float(x) => format!("n{x}"),
+        Value::Str(s) => format!("s{s}"),
+        // Bit for bit, which is cheaper to write than the numbers.
+        Value::Vector(xs) => {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(1 + 8 * xs.len());
+            s.push('v');
+            for x in xs.iter() {
+                let _ = write!(s, "{:08x}", x.to_bits());
+            }
+            s
+        }
+        v => format!("{v:?}"),
+    }
+}
+
+/// A correlated subquery `SELECT agg(..) FROM t WHERE c AND t.a = o.b`,
+/// whose outer values meet only equalities ANDed into its filter, as one
+/// query grouped by their other sides over the values the outer rows give
+/// them (`t.a IN (...)`): a group's row is the subquery's value for outer
+/// values equal to its keys, and outer values of no group take its value
+/// over no rows. The query gives the keys, then the subquery's column;
+/// with it, the index in `fields` of each key's outer field. A key of a
+/// table's Search is a KEYWORD, INT or FLOAT column whose outer values are
+/// of its kind; one over rows in memory, values compared as eval does.
+fn decorrelated(n: &Node, fields: &[u32], tuples: &[&[Value]], catalog: &[&Schema]) -> Option<(Node, Vec<usize>)> {
+    fn outer(e: &Expr) -> bool {
+        let mut found = false;
+        e.visit(&mut |x| found |= matches!(x, Expr::Outer(_)));
+        found
+    }
+    fn node_outer(n: &Node) -> bool {
+        let mut found = false;
+        n.visit_exprs(&mut |x| found |= matches!(x, Expr::Outer(_)));
+        found
+    }
+    let Node::Project { input, columns } = n else { return None };
+    let below = match &**input {
+        Node::Sort { input, .. } => input,
+        n => n,
+    };
+    let Node::Aggregate { input: base, keys, aggs } = below else { return None };
+    if !keys.is_empty() || columns.len() != 1 || outer(&columns[0].expr) || aggs.iter().any(|a| a.arg.as_ref().is_some_and(outer)) {
+        return None;
+    }
+    let (filter, schema) = match &**base {
+        Node::Search(s) => (&s.filter, Some(*catalog.iter().find(|t| t.table.eq_ignore_ascii_case(&s.table))?)),
+        Node::Filter { input, cond } if !node_outer(input) => (cond, None),
+        _ => return None,
+    };
+    let conjuncts: Vec<&Expr> = match filter {
+        Expr::And(xs) => xs.iter().collect(),
+        x => vec![x],
+    };
+    let (mut keys, mut outs, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+    for c in conjuncts {
+        match c {
+            Expr::Cmp { op: CmpOp::Eq, left, right } if matches!((&**left, &**right), (a, Expr::Outer(_)) | (Expr::Outer(_), a) if !outer(a)) => {
+                let (a, o) = match (&**left, &**right) {
+                    (a, Expr::Outer(o)) | (Expr::Outer(o), a) => (a, *o),
+                    _ => unreachable!("an equality with the outer row"),
+                };
+                keys.push(a.clone());
+                outs.push(fields.iter().position(|f| *f == o)?);
+            }
+            c if outer(c) => return None,
+            c => rest.push(c.clone()),
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    for (key, &o) in keys.iter().zip(&outs) {
+        let mut seen = HashSet::new();
+        let values: Vec<&Value> = tuples.iter().map(|t| &t[o]).filter(|v| **v != Value::Null && seen.insert(canonical(v))).collect();
+        let fits = |v: &Value| match schema.map(|s| (key, s)) {
+            Some((Expr::Field(f), s)) => {
+                let fld = s.fields.get(*f as usize);
+                match fld.map(|f| (&f.ty, f.logical.is_some())) {
+                    Some((FieldType::Keyword, _)) => matches!(v, Value::Str(_)),
+                    Some((FieldType::Int, false)) => matches!(v, Value::Int(_)),
+                    Some((FieldType::Float, false)) => matches!(v, Value::Int(_) | Value::Float(_)),
+                    _ => false,
+                }
+            }
+            Some(_) => false,
+            None => matches!(v, Value::Str(_) | Value::Int(_) | Value::Float(_)),
+        };
+        if values.is_empty() || !values.iter().all(|v| fits(v)) {
+            return None;
+        }
+        rest.push(Expr::In { expr: Box::new(key.clone()), list: values.into_iter().cloned().map(Expr::Lit).collect() });
+    }
+    let filter = if rest.len() == 1 { rest.pop().expect("a condition") } else { Expr::And(rest) };
+    let base = match &**base {
+        Node::Search(s) => Node::Search(super::ir::Search { filter, ..s.clone() }),
+        Node::Filter { input, .. } => Node::Filter { input: input.clone(), cond: filter },
+        _ => unreachable!("a Search or a Filter"),
+    };
+    let k = keys.len() as u32;
+    let mut value = columns[0].clone();
+    value
+        .expr
+        .visit_mut(&mut |x| {
+            if let Expr::Output(i) = x {
+                *i += k;
+            }
+            Ok(())
+        })
+        .ok()?;
+    let mut cols: Vec<super::ir::Column> = (0..k).map(|i| super::ir::Column { name: format!("#{i}"), expr: Expr::Output(i) }).collect();
+    cols.push(value);
+    Some((Node::Project { input: Box::new(Node::Aggregate { input: Box::new(base), keys, aggs: aggs.clone() }), columns: cols }, outs))
 }

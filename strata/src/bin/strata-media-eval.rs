@@ -174,7 +174,7 @@ fn main() {
     }
     // A query by an image file gives the vector its row holds.
     let (id, stored) = (image_rows[0][0].as_str().unwrap(), image_rows[0][1].as_vector().unwrap());
-    let fresh = strata::embed::embed_image_file(model.as_ref(), &std::fs::read(root.join(id)).unwrap()).expect("embed an image file");
+    let fresh = strata::embed::embed_file(model.as_ref(), &std::fs::read(root.join(id)).unwrap()).expect("embed an image file");
     let cos: f32 = fresh.iter().zip(stored).map(|(x, y)| x * y).sum();
     assert!(cos > 0.999, "a query by {id} gives its row's vector (cosine {cos})");
 

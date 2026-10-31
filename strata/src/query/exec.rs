@@ -26,7 +26,7 @@ use crate::segment::{DocFilter, DocId, DocSet, SegmentFile};
 use crate::storage::{rowseq, KeyRef, SegmentView, Snapshot, Updates};
 use crate::text::{self, Bm25Params, Boost, BoolQuery, CollectionStats, FilterStrategy, Synonyms, TextFieldReader, TopKAlgo};
 use crate::value::Value;
-use crate::vector::{self, SearchParams, VectorReader};
+use crate::vector::{self, multi, ExactQuery, SearchParams, VectorReader};
 
 /// Rows returned by ranked queries without a LIMIT.
 pub const DEFAULT_K: usize = 100;
@@ -189,6 +189,11 @@ pub struct ExecOptions {
     /// the text score's top `depth` rows as candidates, as other
     /// expressions do (for comparisons).
     pub rank_safe: bool,
+    /// Find a LIMIT's rows by a numeric column (`ORDER BY clicks DESC
+    /// LIMIT 10`) by reading the column's blocks best first and stopping
+    /// at the first that cannot reach them. False reads every matching
+    /// row (for comparisons).
+    pub column_blocks: bool,
     /// Collection statistics to score BM25 with instead of this database's
     /// own, so that a shard of a larger collection scores like the whole
     /// of it ([`crate::query::stats`]). Terms missing from it use local
@@ -243,6 +248,7 @@ impl Default for ExecOptions {
             bm25_algo: TopKAlgo::MaxScore,
             fusion_depth: 100,
             rank_safe: true,
+            column_blocks: true,
             stats: None,
             shard: false,
             threads: 1,
@@ -427,6 +433,18 @@ impl ProbeNode {
             ProbeNode::Not(c) => !c.contains(d),
         }
     }
+
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        match self {
+            ProbeNode::Const(b) => *b,
+            ProbeNode::Leaf(f) => f.may_have(docs),
+            ProbeNode::And(cs) => cs.iter().all(|c| c.may_have(docs.clone())),
+            ProbeNode::Or(cs) => cs.iter().any(|c| c.may_have(docs.clone())),
+            // A row needs `need` of them, so `need` must each have some.
+            ProbeNode::AtLeast(need, cs) => cs.iter().filter(|c| c.may_have(docs.clone())).take(*need).count() >= *need,
+            ProbeNode::Not(_) => true,
+        }
+    }
 }
 
 impl DocFilter for ProbeFilter {
@@ -435,6 +453,9 @@ impl DocFilter for ProbeFilter {
     }
     fn cardinality(&self) -> usize {
         self.card
+    }
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        self.root.may_have(docs)
     }
 }
 
@@ -502,6 +523,65 @@ fn keep_best<T: Copy>(v: &mut Vec<T>, k: usize, better: impl Fn(&T, &T) -> std::
         v.retain(|c| better(c, &cut) != std::cmp::Ordering::Greater);
     }
 }
+
+/// A row's place in an order by a column, better rows greater: its value
+/// and, for INT columns, its exact integer (both negated, order-wise, for
+/// an ascending order).
+#[derive(Clone, Copy, Debug)]
+struct Place(f64, i64);
+
+impl Place {
+    fn new(v: f64, exact: i64, desc: bool) -> Place {
+        if desc {
+            Place(v, exact)
+        } else {
+            Place(-v, !exact)
+        }
+    }
+}
+
+impl PartialEq for Place {
+    fn eq(&self, o: &Place) -> bool {
+        self.cmp(o).is_eq()
+    }
+}
+impl Eq for Place {}
+impl PartialOrd for Place {
+    fn partial_cmp(&self, o: &Place) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Place {
+    fn cmp(&self, o: &Place) -> std::cmp::Ordering {
+        self.0.total_cmp(&o.0).then(self.1.cmp(&o.1))
+    }
+}
+
+/// A unit of a column [`Executor::top_blocks`] reads, by the best place a
+/// row of it can have: superblock `i` of segment `seg` (`list` is
+/// `usize::MAX`), or block `i`, entry `pos` of the superblock's list of
+/// blocks still to read.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Unit {
+    best: Place,
+    seg: usize,
+    i: usize,
+    list: usize,
+    pos: usize,
+}
+
+/// What [`Executor::top_blocks`] costs per block it reads, in the
+/// planner's nanoseconds (its keys decoded and the rows that can make the
+/// cut probed, a few cache misses each in a column of ten million rows),
+/// and what a scan of the matches costs per row (its value read twice and
+/// kept).
+const BLOCK_NS: f64 = 2000.0;
+const ROW_NS: f64 = 30.0;
+/// The share of the rows its zone maps admit that a filter must match for
+/// [`Executor::top_blocks`] to read blocks: a rarer match leaves the
+/// k-th best value low, under the best of most blocks, and they would
+/// all be read.
+const TOP_BLOCKS_SHARE: f64 = 1.0 / 64.0;
 
 impl<'a> Executor<'a> {
     /// `readers[i]` must belong to `snap.segments()[i]`.
@@ -1107,6 +1187,7 @@ impl<'a> Executor<'a> {
                 _ => self.keyword(s, *field)?.present(),
             },
             Pred::In { field, values } => self.materialize_in(s, *field, values)?,
+            Pred::Prefix { field, prefix } => self.keyword(s, *field)?.docs_prefix(prefix),
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
@@ -1181,6 +1262,8 @@ impl<'a> Executor<'a> {
                 ProbeNode::Leaf(Box::new(self.materialize(s, p)?))
             }
             Pred::Present { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            Pred::Prefix { field, .. } if self.schema.fields[*field].multi => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            Pred::Prefix { field, prefix } => ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_prefix(prefix))),
             Pred::Range { field, lo, hi } => ProbeNode::Leaf(Box::new(self.numeric(s, *field)?.col().filter(*lo, *hi))),
             Pred::IntRange { field, lo, hi } => {
                 let col = self.numeric(s, *field)?.col();
@@ -1271,31 +1354,18 @@ impl<'a> Executor<'a> {
             let o = a.0.score.total_cmp(&b.0.score).then(a.1.cmp(&b.1));
             if desc { o.reverse() } else { o }
         };
-        let mut cands: Vec<(Hit, i64)> = Vec::new();
-        // With a LIMIT, the candidates are cut to the best and their ties
-        // as they pile up, so they hold about twice the LIMIT, not every
-        // match.
-        let mut cut_at = want.map_or(usize::MAX, |k| (2 * k).max(4096));
-        let segs = self.segs.clone();
-        let mut tick = self.ticker();
-        for s in segs.iter() {
-            self.check_deadline()?;
-            let col = self.numeric(s, field)?.col();
-            let set = self.filter_set(s, p)?;
-            for d in set.iter() {
-                tick.tick()?;
-                if let Some(v) = self.num_value(s, field, col, d).or(null_score) {
-                    let exact = if int { self.int_value(s, field, col, d).unwrap_or(0) } else { 0 };
-                    self.charge.room(&mut cands)?;
-                    cands.push((Hit { seg: s.ord, doc: d, score: v }, exact));
-                    self.stats.scored += 1;
-                    if cands.len() >= cut_at {
-                        keep_best(&mut cands, want.unwrap_or(0), better);
-                        cut_at = cut_at.max(2 * cands.len());
-                    }
-                }
+        // Rows without a value first (`NULLS FIRST`) leave nothing for
+        // the column's blocks to bound.
+        let blocks = match want {
+            Some(k) if k > 0 && self.opts.column_blocks && nulls != Some(true) && !self.schema.fields[field].multi => {
+                self.top_blocks(field, desc, nulls.is_some(), p, k, int)?
             }
-        }
+            _ => None,
+        };
+        let mut cands = match blocks {
+            Some(cands) => cands,
+            None => self.column_scan(field, null_score, p, want, int, better)?,
+        };
         if let Some(k) = want {
             keep_best(&mut cands, k, better);
         }
@@ -1319,6 +1389,247 @@ impl<'a> Executor<'a> {
             keyed.truncate(k);
         }
         Ok(keyed.into_iter().map(|(h, _, _)| h).collect())
+    }
+
+    /// Every row of the filter with its value of `field` (`null_score`
+    /// for rows without one, which are left out without it), and its exact
+    /// integer for an INT column; with a LIMIT, cut to about twice the best
+    /// `want` and their ties as they pile up.
+    fn column_scan(&mut self, field: usize, null_score: Option<f64>, p: &Pred, want: Option<usize>, int: bool, better: impl Fn(&(Hit, i64), &(Hit, i64)) -> std::cmp::Ordering + Copy) -> Result<Vec<(Hit, i64)>> {
+        let mut cands: Vec<(Hit, i64)> = Vec::new();
+        let mut cut_at = want.map_or(usize::MAX, |k| (2 * k).max(4096));
+        let segs = self.segs.clone();
+        let mut tick = self.ticker();
+        for s in segs.iter() {
+            self.check_deadline()?;
+            let col = self.numeric(s, field)?.col();
+            let set = self.filter_set(s, p)?;
+            for d in set.iter() {
+                tick.tick()?;
+                if let Some(v) = self.num_value(s, field, col, d).or(null_score) {
+                    let exact = if int { self.int_value(s, field, col, d).unwrap_or(0) } else { 0 };
+                    self.charge.room(&mut cands)?;
+                    cands.push((Hit { seg: s.ord, doc: d, score: v }, exact));
+                    self.stats.scored += 1;
+                    if cands.len() >= cut_at {
+                        keep_best(&mut cands, want.unwrap_or(0), better);
+                        cut_at = cut_at.max(2 * cands.len());
+                    }
+                }
+            }
+        }
+        Ok(cands)
+    }
+
+    /// The rows [`Self::by_column`] keeps for its best `k` and their ties,
+    /// found by reading the column's blocks of [`forward::BLOCK`] rows best
+    /// first, by their zone maps, until the next block's best value is
+    /// worse than the `k`-th row found. A superblock is opened when it is
+    /// the best unit left, and its blocks that can reach the `k`-th join
+    /// one at a time, best first. Units the filter's zone maps exclude are
+    /// never read (a prefix of a table clustered by its key, a time range
+    /// of one clustered by time), and a row's filter is checked only when
+    /// its value can still make the cut. Values written in place are read
+    /// first and skipped in their blocks, whose zone maps do not know them.
+    /// The ten most clicked of half a million queries starting with `a`
+    /// read about 150 blocks of 81,000; clustered by query, about 10.
+    ///
+    /// `None` when the scan of the matches is the better plan: when they
+    /// are few, or under [`TOP_BLOCKS_SHARE`] of the rows the zone maps
+    /// admit, or once the blocks have cost half of what the scan would (a
+    /// filter that rejects the best values); and when rows without a value
+    /// (`with_nulls`, sorted last) may be needed to fill the `k`.
+    fn top_blocks(&mut self, field: usize, desc: bool, with_nulls: bool, p: &Pred, k: usize, int: bool) -> Result<Option<Vec<(Hit, i64)>>> {
+        use forward::{BLOCK, SUPER};
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let segs = self.segs.clone();
+        // What reading every match costs.
+        let (mut scan, mut matches) = (0.0, 0.0);
+        for s in segs.iter() {
+            let est = SegEst { ex: self, s, params: None, local_sel: None };
+            let e = self.planner(&est).estimate(p);
+            scan += if *p == Pred::True { 0.0 } else { e.mat_cost } + e.card * ROW_NS;
+            matches += e.card;
+        }
+        // So few matches that a scan costs what a few blocks per row of the
+        // LIMIT would.
+        if scan < 4.0 * k as f64 * BLOCK_NS {
+            return Ok(None);
+        }
+        // A key's value, exact integer (as `int_value` reads it) and place.
+        let value = |kind: forward::NumericKind, key: i64| {
+            let v = kind.decode(key);
+            let exact = match (int, kind) {
+                (false, _) => 0,
+                (true, forward::NumericKind::Int) => key,
+                (true, _) => v as i64,
+            };
+            (v, exact, Place::new(v, exact, desc))
+        };
+        let block_docs = |b: usize, n: usize| (b * BLOCK) as DocId..((b + 1) * BLOCK).min(n) as DocId;
+        let null_score = if desc { f64::NEG_INFINITY } else { f64::INFINITY };
+        let null_place = Place::new(null_score, 0, desc);
+        let mut units = BinaryHeap::new();
+        // The blocks of each opened superblock that could reach the k-th
+        // when it was opened, best first.
+        let mut lists: Vec<Vec<(Place, usize)>> = Vec::new();
+        let mut filters: Vec<SegFilter> = Vec::with_capacity(segs.len());
+        // Each segment's documents with a value written in place, by docID.
+        let mut written: Vec<Vec<DocId>> = vec![Vec::new(); segs.len()];
+        let mut cands: Vec<(Hit, i64)> = Vec::new();
+        // The best `k` places found, worst on top.
+        let mut top: BinaryHeap<Reverse<Place>> = BinaryHeap::new();
+        // Blocks, and rows in the superblocks the filter's zone maps admit.
+        let (mut total, mut admitted) = (0usize, 0usize);
+        for (i, s) in segs.iter().enumerate() {
+            let col = self.numeric(s, field)?.col();
+            total += col.n_blocks();
+            let f = self.top_filter(s, p, k)?;
+            for u in 0..col.n_blocks().div_ceil(SUPER) {
+                let Some((lo, hi)) = col.super_keys(u) else { continue };
+                let docs = (u * SUPER * BLOCK) as DocId..((u + 1) * SUPER * BLOCK).min(col.len()) as DocId;
+                if f.as_dyn().is_none_or(|f| f.may_have(docs.clone())) {
+                    admitted += docs.len();
+                    units.push(Unit { best: value(col.kind(), if desc { hi } else { lo }).2, seg: i, i: u, list: usize::MAX, pos: 0 });
+                }
+            }
+            if let Some(upd) = self.updates(s, field) {
+                for (d, v) in upd.field(field) {
+                    written[i].push(d);
+                    let (score, exact, pl) = match v.as_f64() {
+                        Some(x) => {
+                            let exact = if int { v.as_i64().unwrap_or(0) } else { 0 };
+                            (x, exact, Place::new(x, exact, desc))
+                        }
+                        None if with_nulls => (null_score, 0, null_place),
+                        None => continue,
+                    };
+                    if f.as_dyn().is_some_and(|f| !f.contains(d)) {
+                        continue;
+                    }
+                    self.charge.room(&mut cands)?;
+                    cands.push((Hit { seg: s.ord, doc: d, score }, exact));
+                    self.stats.scored += 1;
+                    top.push(Reverse(pl));
+                    if top.len() > k {
+                        top.pop();
+                    }
+                }
+            }
+            filters.push(f);
+        }
+        if matches < admitted as f64 * TOP_BLOCKS_SHARE {
+            return Ok(None);
+        }
+        let mut cut_at = (2 * k).max(4096);
+        let mut tick = Ticker::new(self.opts, 64);
+        let name = &self.schema.fields[field].name;
+        let mut read = 0;
+        while let Some(u) = units.pop() {
+            tick.tick()?;
+            let bar = (top.len() == k).then(|| top.peek().unwrap().0);
+            if bar.is_some_and(|bar| u.best < bar) {
+                break;
+            }
+            let s = &segs[u.seg];
+            let col = self.numeric(s, field)?.col();
+            let f = filters[u.seg].as_dyn();
+            if u.list == usize::MAX {
+                let mut blocks: Vec<(Place, usize)> = (u.i * SUPER..((u.i + 1) * SUPER).min(col.n_blocks()))
+                    .filter_map(|b| col.block_keys(b).map(|(lo, hi)| (value(col.kind(), if desc { hi } else { lo }).2, b)))
+                    .filter(|&(best, b)| bar.is_none_or(|bar| best >= bar) && f.is_none_or(|f| f.may_have(block_docs(b, col.len()))))
+                    .collect();
+                blocks.sort_unstable_by(|a, b| b.cmp(a));
+                if let Some(&(best, b)) = blocks.first() {
+                    units.push(Unit { best, seg: u.seg, i: b, list: lists.len(), pos: 0 });
+                    lists.push(blocks);
+                }
+                continue;
+            }
+            if let Some(&(best, b)) = lists[u.list].get(u.pos + 1) {
+                units.push(Unit { best, seg: u.seg, i: b, list: u.list, pos: u.pos + 1 });
+            }
+            read += 1;
+            if read as f64 * BLOCK_NS > scan / 2.0 {
+                self.stats.plan.push(format!("top {k} by {name}: {read} blocks cost more than a scan of the matches"));
+                return Ok(None);
+            }
+            self.block_rows(s, col, f, u.i, &written[u.seg], k, &value, &mut top, &mut cands)?;
+            if cands.len() >= cut_at {
+                let bar = top.peek().unwrap().0;
+                cands.retain(|(h, x)| Place::new(h.score, *x, desc) >= bar);
+                cut_at = cut_at.max(2 * cands.len());
+            }
+        }
+        // Rows without a value come after every value, so the blocks do
+        // not know whether they reach the k-th.
+        if with_nulls && top.peek().is_none_or(|bar| top.len() < k || bar.0 <= null_place) {
+            return Ok(None);
+        }
+        self.stats.plan.push(format!("top {k} by {name}: {read} of {total} blocks read, best first"));
+        Ok(Some(cands))
+    }
+
+    /// Reads block `b` of segment `s`'s column for [`Self::top_blocks`]:
+    /// each row not written in place whose value can still make the best
+    /// `k` and that passes `f` joins `cands`, and its place `top`.
+    #[allow(clippy::too_many_arguments)]
+    fn block_rows(
+        &mut self,
+        s: &Seg<'a>,
+        col: &NumericColumn,
+        f: Option<&dyn DocFilter>,
+        b: usize,
+        written: &[DocId],
+        k: usize,
+        value: &impl Fn(forward::NumericKind, i64) -> (f64, i64, Place),
+        top: &mut std::collections::BinaryHeap<std::cmp::Reverse<Place>>,
+        cands: &mut Vec<(Hit, i64)>,
+    ) -> Result<()> {
+        let mut keys = [0i64; forward::BLOCK];
+        let mut mask = col.block_keys_of(b, &mut keys);
+        let first = (b * forward::BLOCK) as DocId;
+        for &d in &written[written.partition_point(|&d| d < first)..written.partition_point(|&d| d < first + forward::BLOCK as DocId)] {
+            let j = (d - first) as usize;
+            mask[j / 64] &= !(1 << (j % 64));
+        }
+        for (wi, mut m) in mask.into_iter().enumerate() {
+            while m != 0 {
+                let j = wi * 64 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                let (score, exact, pl) = value(col.kind(), keys[j]);
+                if top.len() == k && pl < top.peek().unwrap().0 {
+                    continue;
+                }
+                let d = first + j as DocId;
+                if f.is_some_and(|f| !f.contains(d)) {
+                    continue;
+                }
+                self.charge.room(cands)?;
+                cands.push((Hit { seg: s.ord, doc: d, score }, exact));
+                self.stats.scored += 1;
+                top.push(std::cmp::Reverse(pl));
+                if top.len() > k {
+                    top.pop();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The filter [`Self::top_blocks`] checks rows against: probed when that
+    /// is cheaper than materialising it for the rows a LIMIT of `k` reads.
+    fn top_filter(&mut self, s: &Seg<'a>, p: &Pred, k: usize) -> Result<SegFilter> {
+        let mode = {
+            let est = SegEst { ex: self, s, params: None, local_sel: None };
+            let planner = self.planner(&est);
+            let n = est.n_docs().max(1.0);
+            let card = planner.estimate(p).card.max(1.0);
+            planner.filter_mode(p, (4.0 * k as f64 * n / card).min(n))
+        };
+        let mode = self.opts.filter_mode.filter(|m| *m != FilterMode::None).unwrap_or(mode);
+        self.seg_filter(s, p, mode)
     }
 
     /// The `k` rows of the filter with the largest decay of `field` (rows
@@ -1893,6 +2204,9 @@ impl<'a> Executor<'a> {
     }
 
     fn vector_top(&mut self, field: usize, q: &[f32], opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        if self.schema.fields[field].multi {
+            return Err(err(crate::query::sql::multi_similarity(&self.schema.fields[field].name)));
+        }
         let base = self.search_params(opts);
         let forced = match opts.get("strategy").and_then(|v| v.as_str()) {
             Some("prefilter") => Some(VectorStrategy::PreFilter),
@@ -1949,6 +2263,9 @@ impl<'a> Executor<'a> {
     /// similar to (else `k` rows beat it there, and so overall), so the
     /// union holds every row an exact search ranks first.
     fn maxsim_top(&mut self, field: usize, vectors: &Vectors, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        if self.schema.fields[field].multi {
+            return self.multi_top(field, vectors, opts, p, k);
+        }
         let qs = query_vectors(vectors, opts)?;
         let mut cands: Vec<(usize, DocId)> = Vec::new();
         let mut lines = None;
@@ -1977,6 +2294,13 @@ impl<'a> Executor<'a> {
             self.check_deadline()?;
             let s = &self.seg_by_ord(seg);
             let vr = self.vector(s, field)?;
+            if let Some(rows) = vr.rows() {
+                let eqs: Vec<ExactQuery> = qs.iter().map(|q| vr.prepare_exact(q)).collect();
+                for i in range {
+                    out[i] = multi_score(vr, rows, &eqs, cands[i].1);
+                }
+                continue;
+            }
             for i in range {
                 let d = cands[i].1;
                 if vr.has_vector(d) {
@@ -1985,6 +2309,62 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Top-`k` rows of a multi-vector field by `maxsim`, the sum over the
+    /// query vectors of each one's best match in the row: per segment, each
+    /// query vector's best `depth` vectors name the candidate rows, the
+    /// `candidates` of them with the largest sum of the best matches found
+    /// are kept, and those are scored over all their vectors
+    /// ([`crate::vector::multi`]).
+    fn multi_top(&mut self, field: usize, vectors: &Vectors, opts: &Opts, p: &Pred, k: usize) -> Result<Vec<Hit>> {
+        let qs = query_vectors(vectors, opts)?;
+        let size = |key: &str, d: usize| opts.get(key).and_then(|v| v.as_f64()).map_or(d, |x| x as usize);
+        let (depth, cap) = (size("depth", multi::DEPTH), size("candidates", multi::CANDIDATES).max(k));
+        let base = self.search_params(opts);
+        // The searches only pick candidate rows: the index unless the query
+        // asks for an exact scan.
+        let strategy = match opts.get("strategy").and_then(|v| v.as_str()) {
+            Some("flat") | Some("prefilter") => vector::Strategy::Flat,
+            Some("auto") | Some("index") | Some("ivf") | Some("hnsw") | Some("postfilter") | None => vector::Strategy::Auto,
+            Some(other) => return Err(err(format!("unknown vector strategy {other}"))),
+        };
+        let name = self.schema.fields[field].name.clone();
+        let per = self.per_segment(|ex, s, l| {
+            let vr = ex.vector(s, field)?;
+            let Some(rows) = vr.rows() else { return Err(err(format!("{name} has one vector per row in segment {}", s.ord))) };
+            let f = ex.seg_filter_l(s, p, if *p == Pred::True { FilterMode::None } else { FilterMode::Materialize }, l)?;
+            let owners = f.as_dyn().map(|f| multi::OwnerFilter { rows, filter: f, n: vr.n_docs() as usize });
+            // Each candidate row's best match per query vector so far.
+            let mut found: HashMap<DocId, Vec<f32>> = HashMap::new();
+            let mut floor = vec![0f32; qs.len()];
+            let mut sp = base.clone();
+            sp.strategy = strategy;
+            for (i, q) in qs.iter().enumerate() {
+                let out = vr.search(q, depth, &sp, owners.as_ref().map(|o| o as &dyn DocFilter));
+                l.scored += out.stats.candidates as u64;
+                floor[i] = out.hits.last().map_or(0.0, |h| h.score);
+                for h in out.hits {
+                    let Some(r) = rows.owner(h.doc) else { continue };
+                    let best = found.entry(r).or_insert_with(|| vec![f32::NEG_INFINITY; qs.len()]);
+                    best[i] = best[i].max(h.score);
+                }
+            }
+            // A query vector that found nothing in a row scores it at most
+            // its search's last hit.
+            let mut cands: Vec<(f32, DocId)> = found.into_iter().map(|(r, b)| (b.iter().zip(&floor).map(|(&x, &f)| if x.is_finite() { x } else { f }).sum(), r)).collect();
+            let found = cands.len();
+            cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            cands.truncate(cap);
+            let eqs: Vec<ExactQuery> = qs.iter().map(|q| vr.prepare_exact(q)).collect();
+            let mut hits: Vec<Hit> = cands.iter().map(|&(_, r)| Hit { seg: s.ord, doc: r, score: multi_score(vr, rows, &eqs, r) as f64 }).collect();
+            let scored: usize = cands.iter().map(|&(_, r)| rows.vectors(r).len()).sum();
+            l.scored += (scored * qs.len()) as u64;
+            l.plan.push(format!("seg {}: maxsim({name}) over {} rows: {found} candidate rows from {} searches of {depth}, {} scored exactly", s.ord, rows.n_rows(), qs.len(), cands.len()));
+            hits.retain(|h| h.score.is_finite());
+            Ok(merge_top(hits, k))
+        })?;
+        Ok(merge_top(per.concat(), k))
     }
 
     /// The fraction of the query's nearest neighbours that pass the filter,
@@ -2289,6 +2669,11 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            Score::ByKey(b) => {
+                for (i, c) in cands.iter().enumerate() {
+                    out[i] = self.snap.key(c.0, c.1).map_or(f64::NAN, |k| b.get(&k));
+                }
+            }
             // NULL for a row whose key is not listed.
             Score::Ranked { keys } => {
                 let at = self.ranked_rows(keys)?;
@@ -2389,11 +2774,14 @@ impl<'a> Executor<'a> {
             .projection
             .iter()
             .filter_map(|(_, p)| match p {
-                // Vectors live in their index, not the doc store.
+                // Vectors live in their index, not the doc store, and a
+                // single-valued KEYWORD's index reads a row's value without
+                // decompressing its stored fields.
                 Projection::Field(i)
                     if self.schema.fields[*i].stored
                         && Some(*i) != self.schema.primary_key
-                        && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. }) =>
+                        && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. })
+                        && !self.keyword_column(*i) =>
                 {
                     Some(*i)
                 }
@@ -2462,15 +2850,34 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
+    /// Whether the field's values are read from its keyword column: one
+    /// value a row, the value itself (a MEDIA field's column holds its
+    /// `sha256`).
+    fn keyword_column(&self, field: usize) -> bool {
+        let f = &self.schema.fields[field];
+        matches!(f.ty, FieldType::Keyword) && f.indexed && !f.multi && f.media.is_none()
+    }
+
     fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
         match self.schema.fields[field].ty {
-            FieldType::Vector { .. } => s.r.vector(field).ok().flatten().filter(|v| v.has_vector(d)).map_or(Value::Null, |v| Value::Vector(v.vector(d).into())),
+            FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| v.row_value(d)),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
             FieldType::Text { .. } | FieldType::Sparse => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
         }
     }
+}
+
+/// `maxsim` of row `r` of a multi-vector field: the sum over the query
+/// vectors of each one's best match among the row's vectors (`-inf` for a
+/// row without vectors).
+fn multi_score(vr: &VectorReader, rows: &multi::Rows, eqs: &[ExactQuery], r: DocId) -> f32 {
+    let vs = rows.vectors(r);
+    if vs.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+    eqs.iter().map(|q| vs.clone().map(|v| vr.exact_score(q, v)).fold(f32::NEG_INFINITY, f32::max)).sum()
 }
 
 /// The query vectors of `maxsim`, at most `max_vectors` of them.
@@ -2831,6 +3238,16 @@ impl Estimator for SegEst<'_, '_> {
             return kw.n_present() as f64;
         }
         self.s.r.numeric(field).ok().flatten().map_or(self.n_docs(), |n| n.col().n_present() as f64)
+    }
+    fn prefix_count(&self, field: usize, prefix: &str) -> f64 {
+        self.s.r.keyword(field).ok().flatten().map_or(0.0, |kw| kw.count_prefix(prefix) as f64)
+    }
+    fn prefix_cost(&self, field: usize, prefix: &str) -> Option<f64> {
+        // A long run of a single-valued field scans the code column.
+        let kw = self.s.r.keyword(field).ok().flatten()?;
+        let c = &self.ex.opts.costs;
+        (!self.ex.schema.fields[field].multi && kw.prefix_codes(prefix).len() > forward::PREFIX_LISTS)
+            .then(|| self.n_docs() * c.column_scan + kw.count_prefix(prefix) as f64 * c.emit)
     }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {

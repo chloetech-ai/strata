@@ -28,7 +28,8 @@ clap = { version = "4", features = ["derive"] }
 rust-stemmers = "1.2"
 # MEDIA values (`media`): bytes given as base64.
 base64 = "0.22"
-# Baselines (feature `baselines`): SQLite with FTS5, and Tantivy.
+# SQLite (bundled, with FTS5): importing and exporting SQLite databases
+# (feature `sqlite`, `strata::sqlite`) and the SQLite baseline (`baselines`).
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
 tantivy = { version = "0.26", optional = true }
 # Embedding models for VECTOR fields declared with `embed` (`embed`):
@@ -39,6 +40,8 @@ candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 # Images decoded for SigLIP (`vision`).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
+# Audio decoded for Whisper (`audio`): WAV, FLAC, MP3, Ogg Vorbis, AAC in MP4.
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "adpcm", "flac", "mp3", "ogg", "vorbis", "aac", "isomp4"], optional = true }
 
 [features]
 default = ["embed"]
@@ -46,8 +49,13 @@ embed = ["dep:tokenizers"]
 bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 # Images: decoded with the `image` crate, embedded by SigLIP.
 vision = ["bert", "dep:image"]
+# Audio: decoded with symphonia, transcribed by Whisper.
+audio = ["bert", "dep:symphonia"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["bert", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+# Importing SQLite databases into Strata and exporting Strata to SQLite
+# (`strata::sqlite`).
+sqlite = ["dep:rusqlite"]
 # SQLite and Tantivy baselines and the `strata-baselines` experiment binary.
 baselines = ["dep:rusqlite", "dep:tantivy"]
 # Power losses, full disks and failing syncs for tests (`storage::io`).
@@ -62,6 +70,16 @@ required-features = ["baselines"]
 name = "strata-media-eval"
 path = "src/bin/strata-media-eval.rs"
 required-features = ["vision"]
+
+[[bin]]
+name = "strata-asr-eval"
+path = "src/bin/strata-asr-eval.rs"
+required-features = ["audio"]
+
+[[bin]]
+name = "strata-clap-eval"
+path = "src/bin/strata-clap-eval.rs"
+required-features = ["audio"]
 
 [dev-dependencies]
 tempfile = "3"
