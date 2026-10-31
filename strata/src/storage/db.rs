@@ -1162,6 +1162,7 @@ impl Database {
         if t.id == SOURCES_ID {
             return Err(Error::Schema(format!("{SOURCES} is a system table, which takes no rank profile")));
         }
+        crate::query::profile::check_columns(&profile, &t.schema)?;
         let exists = lock(&self.state).tables[t.pos].profiles.iter().any(|p| p.name.eq_ignore_ascii_case(&profile.name));
         if exists && !replace {
             return Err(Error::Schema(format!("{} has a rank profile named {} already; CREATE OR REPLACE RANK PROFILE replaces it", t.schema.table, profile.name)));
