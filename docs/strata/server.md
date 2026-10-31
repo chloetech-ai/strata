@@ -171,7 +171,7 @@ A `VECTOR` field can say what its vectors are: a model's embedding of other fiel
 {"name": "emb_both", "type": "vector", "embed": {"from": ["title", "description"], "model": "potion-retrieval-32M"}}
 ```
 
-The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field; or one [`media` field](#media-fields) of kind `image`, whose images a model of images and text embeds ([vectors of images](#vectors-of-images)). The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
+The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text embedded is their non-empty values joined by newlines, as for a generated field; or one [`media` field](#media-fields) of kind `image` or `audio`, whose files a model of images and text, or of sound and text, embeds ([vectors of images](#vectors-of-images), [of sound](#vectors-of-sound)). The declaration is kept in the database, returned by `/v1/schema` and shown by the UI ("emb_title ← title") and the agent. When the server starts it opens each field's model from `--models` and logs what each field is. With the model open:
 
 - writes that leave the vector out get it computed: `/v1/write` documents and SQL `INSERT`, and an `UPDATE` that changes a source recomputes it, all before the write queues for the writer (on as many writes at once as there are cores), so the writer never waits for a model (with bge-small on 4 cores, an in-place `UPDATE` beside two clients inserting rows went from 4.7 to 500 a second, and four inserting clients from 10 to 23 rows a second: [results](https://github.com/rkonow/strata/tree/main/strata-server/results/sql-writes)); a vector a write supplies is kept as given;
 - an `UPDATE` that changes a source recomputes the vector; merges do not (they keep the stored vectors);
@@ -188,13 +188,14 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 | `bge-small-en-v1.5` | BERT encoder, 384 dimensions | build with `--features bert`; milliseconds a row |
 | `snowflake-arctic-embed-m-v1.5` | BERT encoder, 768 dimensions | build with `--features bert`; slower, better |
 | `siglip-base-patch16-224` | SigLIP base: images and text in one space, 768 dimensions | build with `--features vision`; about 0.5 s an image and 80 ms a text on a 4-vCPU cloud VM |
+| `clap-htsat-unfused` | CLAP (HTSAT and RoBERTa): sound and text in one space, 512 dimensions | build with `--features audio`; about 0.27 s for each 10 seconds of sound and 20 ms a text on a 4-vCPU cloud VM |
 | `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
 | `ms-marco-MiniLM-L-6-v2` | a [cross-encoder](query-language.md#cross-encoders-cross_encodermodel-fields-query) (BERT, 22M parameters, English), not an embedding model | build with `--features bert` |
 | `bge-reranker-base` | a cross-encoder (XLM-RoBERTa, 278M parameters, English and Chinese) | build with `--features bert`; larger and slower |
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
-`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
+`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`; CLAP's `pytorch_model.bin`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
 
@@ -277,6 +278,26 @@ Through Strata, `siglip-base-patch16-224` retrieves as well as [open_clip's publ
 | COCO, 5,000 images | 47.8 / 72.4 / 80.9 | 65.7 / 85.6 / 91.4 |
 | *published* | *47.8 / 72.4 / 81.0* | *65.7 / 85.4 / 91.3* |
 
+### Vectors of sound
+
+An embedded vector field can also be the embedding of a `media` field of kind `audio`, by a model of sound and text (`clap-htsat-unfused`, LAION's CLAP, built with `--features audio`):
+
+```json
+{"name": "recording", "type": "media", "kind": "audio"},
+{"name": "emb", "type": "vector", "embed": {"from": ["recording"], "model": "clap-htsat-unfused"}}
+```
+
+Sound is decoded as for [transcripts](#text-from-media), resampled to CLAP's 48 kHz and cut into 10-second windows; a window shorter than 10 seconds is repeated to fill them. A recording's vector is the normalized mean of its windows' vectors, so all of it counts: the `transformers` library's default takes one 10 seconds at random from a longer recording. Writes, logs, replicas and the errors of a file that cannot be read are as for [vectors of images](#vectors-of-images). A query embeds a sound file with the model's audio tower, `{"embed": {"audio": "<base64>"}, "field": "emb"}`, and a text with its text tower, `{"embed": "rain on a tin roof", "field": "emb"}`; either finds recordings.
+
+Strata's vectors are the `transformers` library's: on the first 20 recordings of Clotho's evaluation split and their 100 captions, every vector Strata made had a cosine of 1.000000 with the one `transformers` 4.46.3 made from the same samples. On the whole split, 1,045 recordings of 15 to 30 seconds with five captions each, exact search (`strata-clap-eval`, cloud container with 4 vCPUs, [results](https://github.com/rkonow/strata/tree/main/strata/results/media#vectors-of-sound)):
+
+| vectors of the recordings | text to audio R@1 / R@5 / R@10 | audio to text R@1 / R@5 / R@10 |
+|---|---|---|
+| Strata, the mean of 10-second windows | 15.9 / 40.1 / 53.6 | 23.2 / 48.6 / 61.7 |
+| `transformers`' default, one 10 seconds at random | 15.8 / 37.8 / 51.2 | 21.7 / 46.4 / 59.8 |
+
+A recording of 22 seconds takes about 0.7 s to read and embed, and a caption 20 ms, on a 4-vCPU cloud VM.
+
 ### Text from media
 
 A `text` field can be a model's text of a `media` field's file: a caption of each row's image, made by BLIP's captioner (`blip-image-captioning-base`, built with `--features vision`), or a transcript of each row's recording, made by Whisper (`whisper-small`, built with `--features audio`).
@@ -344,7 +365,7 @@ A database with a semantic-ID field needs the manifest feature `semantic_id`, an
 
 ## HTTP API
 
-Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model (`{"embed": {"image": "<base64>"}, ...}` for an image file's, by a [model of images](#vectors-of-images)); both take `"table"` for a field of another table than the first.
+Every request and answer is JSON. Every answer carries the request's id in an `x-request-id` header: the one the client sent, if it is 1 to 64 letters, digits, `-`, `_`, `.` or `:`, or a new one. The [logs](#logs) name it, and a coordinator passes it on to its shards (as gRPC metadata of the same name), so one id finds a request in every server it reached. Parameters bind `:name` placeholders: a number, a string, an array for a vector, an object of term weights for a `SPARSE` field, `{"vector_of": "key", "field": "emb"}` for a stored row's vector (more like this), or `{"embed": "text", "field": "emb"}` for the text's vector by an [embedded field](#embedded-vector-fields)'s model (`{"embed": {"image": "<base64>"}, ...}` for an image file's, by a [model of images](#vectors-of-images), and `{"embed": {"audio": "<base64>"}, ...}` for a sound file's, by a [model of sound](#vectors-of-sound)); both take `"table"` for a field of another table than the first.
 
 | route | body | answer |
 |---|---|---|
@@ -360,7 +381,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `GET /v1/export?tables=A,B&fts=false&indexes=false&schemas=false` | | the database (or those tables) as a new SQLite file, `application/vnd.sqlite3`; `x-strata-tables` names the tables |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short}`, or the error |
 | `POST /v1/explain` | `{sql, params?, hits?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the bound query (`logical`) and counts; with `hits: n`, a ranked query's top `n` rows as objects with their `score()` and [`features()`](query-language.md#features-the-values-a-ranking-read), the values each was ranked by |
-| `POST /v1/embed` | `{text or image, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image file (`image`, base64, for a model of images), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `POST /v1/embed` | `{text, image or audio, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image or sound file (`image` or `audio`, base64, for a model of images or of sound), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/sid/next` | `{field, prefixes, where?, params?, table?, timeout_ms?, min_seq_no?, min_seq_nos?}` | the codes that can follow each prefix of a [semantic-ID field](#semantic-ids) among the rows `where` matches: `{next: [{prefix, next: [{code, count}]}], took_ms}` |
 | `POST /v1/snapshot` | | a snapshot lease for 60 s: `{snapshot, txn, ttl_s}` (at most 10,000 are held at once; more get 429) |

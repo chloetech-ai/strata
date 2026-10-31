@@ -7,7 +7,7 @@ import pytest
 
 import strata
 from strata import bm25, col, cross_encoder, gbdt, score
-from conftest import BOOKS, book
+from conftest import BOOKS, book, tone_wav
 
 
 def test_create_open_and_schema(tmp_path):
@@ -83,6 +83,28 @@ def test_queries_and_results(db):
     assert near == ["b0007"]
     with pytest.raises(strata.StrataError):
         db.query("SELECT nope FROM books")
+
+
+def test_a_query_by_sound_needs_a_model_of_sound(db):
+    """`embed(audio=...)` and `{"embed": {"audio": ...}}` go to a model of
+    sound; the books' model reads text only, and a file given as audio has
+    to be sound."""
+    import base64
+
+    wav = tone_wav()
+    with pytest.raises(ValueError, match="no embedded field has a model of sound open"):
+        db.embed(audio=wav)
+    with pytest.raises(ValueError, match="one of them"):
+        db.embed(image=b"x", audio=wav)
+    with pytest.raises(strata.StrataError, match="does not embed sound"):
+        db.embed(audio=wav, field="emb")
+    with pytest.raises(strata.StrataError, match="not a sound file"):
+        db.embed(audio=b"not a sound", field="emb")
+    q = "SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 1"
+    with pytest.raises(strata.StrataError, match="not a sound file"):
+        db.query(q, v={"embed": {"audio": base64.b64encode(b"not a sound").decode()}})
+    with pytest.raises(strata.StrataError, match="is a sound file"):
+        db.query(q, v={"embed": {"image": base64.b64encode(wav).decode()}})
 
 
 def test_vector_of_any_field_name(tmp_path):

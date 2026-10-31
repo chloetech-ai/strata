@@ -103,7 +103,7 @@ A `KEYWORD[]` field may hold the [semantic ID](server.md#semantic-ids) of a vect
 
 A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
-A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), and whose captions or transcripts a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')`, `transcript TEXT OPTIONS(derive = 'recording', model = 'whisper-small')` ([text from media](server.md#text-from-media)).
+A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), `sound_emb VECTOR OPTIONS(embed = 'recording', model = 'clap-htsat-unfused')` ([vectors of sound](server.md#vectors-of-sound)), and whose captions or transcripts a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')`, `transcript TEXT OPTIONS(derive = 'recording', model = 'whisper-small')` ([text from media](server.md#text-from-media)).
 
 ## Full text: `MATCH`
 
@@ -349,11 +349,56 @@ WITH a AS (SELECT * FROM products ORDER BY similarity(emb, :q) DESC LIMIT 500),
 SELECT id, score() FROM b ORDER BY minmax(bm25(body, :t)) + minmax(similarity(emb, :q)) DESC LIMIT 10;
 ```
 
-The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE`, grouping or subquery, ranks by one expression `DESC`, and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
+The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE` or grouping, ranks by one expression `DESC` (which may hold [correlated subqueries](#correlated-subqueries-a-ranking-that-reads-other-rows)), and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. `WITH` results before the first phase, a user's history say, are computed first, for the phases' subqueries to read. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
 
 A phase whose expression is row-local is a second phase: over shards, each shard scores it on its own top rows by the first phase. A phase with `minmax()`, `rank()`, `rrf` or a weighted sum reads every row it reranks, so it is a global phase: it runs once over the merged rows (on the coordinator over shards), and so does every phase after it. The coordinator keeps the top rows of the whole collection by the first phase before it ranks them by the next, so a split collection answers exactly as the whole one does. `EXPLAIN` shows each phase and which kind it is, and a query's plan lines say how many rows each reranked. The first phase's `LIMIT` counts against the rows a query may reach (`max_rows`), and the phases against its deadline.
 
 From Python, `rerank(expr, count)` adds a phase: `t.select("id", score()).order_by(bm25("body", q)).rerank(col("rating"), 100).limit(10)`. A plan with phases needs the plan feature `rank_phases`.
+
+#### Correlated subqueries: a ranking that reads other rows
+
+A scalar subquery in a ranking may name a column of the row it ranks (`first.cat`). It is then correlated, and gives a number for each row: how often the user met the row's category, how long ago, how close the row is to what they bought.
+
+```sql
+-- the user's last 50 events with their items' categories and embeddings, then
+-- BM25's top 1,000 reranked by what the user did with each one's category
+WITH h AS (SELECT e.item AS item, i.cat AS cat, i.emb AS emb, e.action AS action, e.ts AS ts
+           FROM events e JOIN items i ON e.item = i.id WHERE e.usr = :u ORDER BY e.ts DESC LIMIT 50),
+     first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 1000)
+SELECT id, title, score() FROM first
+ORDER BY bm25(title, :q)
+       + 0.5 * (SELECT COUNT(*) FROM h WHERE h.cat = first.cat)
+       - 0.0001 * coalesce((SELECT MIN(:now - h.ts) FROM h WHERE h.cat = first.cat), 100000)
+       + coalesce((SELECT MAX(dot(h.emb, first.emb)) FROM h WHERE h.action = 'buy'), 0) DESC
+LIMIT 20;
+
+-- a table read through its indexes: the user's events in the row's category that cost less
+SELECT id FROM items WHERE MATCH(title, :q)
+ORDER BY bm25(title, :q) + 0.1 * (SELECT COUNT(*) FROM events e WHERE e.usr = :u AND e.cat = items.cat AND e.price < items.price) DESC
+LIMIT 20;
+
+-- as a column of the rows ranked
+WITH first AS (SELECT * FROM items ORDER BY bm25(title, :q) DESC LIMIT 100)
+SELECT id, (SELECT COUNT(*) FROM events e WHERE e.usr = :u AND e.item = first.id) AS seen FROM first
+ORDER BY bm25(title, :q) DESC LIMIT 20;
+```
+
+- **Where.** The rows ranked must be a bounded set: a [rerank phase](#rerank-phases), whose rows are the phase before's top rows; an `ORDER BY` over a table, or over a `WITH` result, of at most 10,000 rows (more is an error that suggests a phase); or the columns of a ranked query, alone or in an expression (`coalesce(price, 0) + (SELECT ...)`). A subquery naming the outer row in `WHERE`, `IN` or `EXISTS` is an error.
+- **What it names.** `name.column`, where `name` is the outer query's table or `WITH` result (or its alias) and the column one of its columns. The subquery reads a `WITH` result in memory, compared any way an expression over rows in memory can be, or a table through its indexes, whose conditions compare one of its columns with the outer row's (`e.cat = items.cat`, `e.price < items.price`) as they would a value.
+- **Its value** is a number (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG` of numbers, or a boolean as 0 or 1). One of no rows is `NULL` (`COUNT` gives 0), which ranks last unless `coalesce`d. A `NULL` of the outer row is compared as SQL compares it: `e.price < first.price` holds for no event when the row has no price.
+- **How it runs.** First the rows ranked (the phases before, or the rows a bounded `ORDER BY` reads), with the columns the subqueries name. The parts of a subquery that do not read the outer row run once (`h` above, and its rows where `h.action = 'buy'`). A subquery whose outer columns meet only equalities ANDed into its `WHERE` (`h.cat = first.cat`) then runs once, grouped by them over the values the rows hold (`h.cat IN (...)`), and a value no group has takes the subquery's value over no rows; any other runs once for each distinct value of the columns it names. Then the ranking sorts the rows, with each row's values, and the plan lines say how much ran: `correlated: 3 subqueries over 1000 rows, 597 values, 3 runs`.
+- **Over shards** a coordinator runs the steps before, and the subqueries over the shards' rows, and sends each row's values to the shards inside the plan, by key, so that every shard ranks with the same ones. A plan with them needs the plan feature `correlated`.
+- **Cost** at 1,000 candidates, measured with `strata-correlated-bench` on a cloud VM (4-core Intel Xeon @ 2.10GHz, 16.9 GB, Linux 6.18): 100,000 items in 200 categories, 400,000 events of 2,000 users, a history of 50 events, one thread, 300 requests of each shape. BM25's top 1,000 reranked to 20 took 1.29 ms (mean) without subqueries, and reading the history added 1.67 ms. A subquery added, over the rerank alone (with the history's read):
+
+  | subquery | values | runs | added, mean |
+  |---|---|---|---|
+  | by category, over `h` | 199 | 2 | 4.90 ms |
+  | three by category, over `h` | 596 | 6 | 8.14 ms |
+  | by category, over the events table | 199 | 2 | 4.09 ms |
+  | by item, over the events table | 992 | 2 | 21.6 ms |
+  | by embedding (`dot(h.emb, first.emb)`), over `h` | 992 | 992 | 10.5 ms |
+
+  A grouped run costs about what reading the candidates' values does. A subquery that runs once per value costs about 10 µs a run over rows in memory, and one grouped by a key reads an `IN` list as long as the candidates (`e.item IN (...)`), which is most of its cost. A second run gave the same numbers within 0.4 ms (`strata/results/correlated/`).
 
 #### Features: the values a ranking read
 
@@ -589,7 +634,7 @@ SELECT a.id, b.id FROM papers a JOIN papers b ON a.category = b.category AND b.i
 
 Each plans into operators over the single-table queries above ([`EXPLAIN`](#explain) shows them), all run on one snapshot, so every single-table query uses the indexes. Each is bound as it is built, never printed as SQL and parsed again:
 
-- **`IN (SELECT ...)`** and **`NOT IN`** run the subquery first and filter with its values (a multi-valued column contributes each value). **`EXISTS`** is true or false, and a **scalar subquery** must return one column and at most one row. A subquery's values reach the outer query's filter as values, so its indexes serve it: `year > (SELECT AVG(year) ...)` is a range of `year`.
+- **`IN (SELECT ...)`** and **`NOT IN`** run the subquery first and filter with its values (a multi-valued column contributes each value). **`EXISTS`** is true or false, and a **scalar subquery** must return one column and at most one row. A subquery's values reach the outer query's filter as values, so its indexes serve it: `year > (SELECT AVG(year) ...)` is a range of `year`. A scalar subquery that names a column of the outer row is [correlated](#correlated-subqueries-a-ranking-that-reads-other-rows): it ranks, and is not a condition.
 - **`WITH`** results and **`FROM (SELECT ...)`** are read like a table. A `WITH` whose rows are rows of the table (no aggregates) keeps their keys, so an outer query over it reads the table restricted to those rows, in the `WITH`'s order unless it orders them itself, and `(SELECT id FROM top)` can seed a graph. `WITH RECURSIVE` is not supported: `REACHABLE` and `PATH` walk links.
 - **Joins** are `JOIN` (inner) and `LEFT JOIN`, of a table with another, with itself or with a `WITH` result; name each side (`papers a JOIN papers b`). `ON` needs an equality between the sides, of two columns of one kind: `KEYWORD`, or `INT` and `FLOAT` compared as numbers (`p.venue = a.id`, an `INT` with a `KEYWORD`, is an error). A multi-valued column joins each of its values. Comparing an `EDGES` field with the key follows its links (`a.cites = b.id`: *b* is a row *a* links to; `b.cites = a.id`: *b* links to *a*); links name keys of their own table, so they join a table with itself. Each `WHERE` or `ON` condition on one side filters that side's scan, and the second side reads only the rows whose join values the first side holds (`b.id IN (...)`, or for links the rows linking to them), before a hash join in memory. Text, vector and graph functions name one side (`MATCH(a.body, ...)`); `ORDER BY` a score ranks by that side's scan, and when the order is the first side's, scans of a growing number of its rows stop once `LIMIT` rows join. Joined columns are named by their expression (`b.title`) unless aliased.
 - Over joined or derived rows, `WHERE`, `GROUP BY`, aggregates, `HAVING`, `ORDER BY`, `DISTINCT` and `LIMIT` also take arithmetic, `||`, `LIKE`, `ILIKE`, `CASE`, `COALESCE`, `LOWER`, `UPPER`, `LENGTH`, `ABS`, `ROUND` and `DOT`. So does the `SELECT` list over one table (`SELECT id, rating * 2, dot(emb, :q) FROM papers WHERE ...`): the table's query finds the rows and the columns are computed in memory. Their conditions follow the same three-valued logic as a single table's, multi-valued columns included (`NOT (b.tags = 'red')` keeps rows without tags). Integer arithmetic is exact, and a result too big for an integer is a `FLOAT`; `/` gives a `FLOAT`, and dividing by zero gives `NULL`. `||` skips `NULL`s, and `LIKE` with a `NULL` side is `NULL`. `ORDER BY` puts rows without a value last in either direction unless `NULLS FIRST`, as over a single table.

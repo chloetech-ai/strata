@@ -1011,8 +1011,8 @@ impl Service {
     /// `{"embed": "text", "field": "emb"}`, the vector of the text by the
     /// model of that embedded field (the first one with a model if left
     /// out), so that the text and the rows are embedded alike, or
-    /// `{"embed": {"image": "<base64>"}, "field": "emb"}`, the vector of an
-    /// image file by a model of images and text.
+    /// `{"embed": {"image": "<base64>"}, "field": "emb"}` (or `"audio"`),
+    /// the vector of an image or sound file by a model of that and text.
     pub async fn params(self: &Arc<Self>, j: Option<&Json>) -> Result<Params, ApiError> {
         let mut p = Params::new();
         let Some(j) = j.filter(|j| !j.is_null()) else { return Ok(p) };
@@ -1024,18 +1024,19 @@ impl Service {
                     let (table, field) = self.vector_field(table, o.get("field").and_then(|f| f.as_str()))?;
                     self.vector_of(&table, &o["vector_of"], &field).await?
                 }
-                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
+                Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some() || e.get("audio").is_some()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
                     let (_, field, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
-                    let image = match &o["embed"] {
+                    let file = match &o["embed"] {
                         Json::String(_) => None,
                         Json::Object(i) if i.len() == 1 => {
-                            let b64 = i["image"].as_str().ok_or_else(|| ApiError::bad("{\"embed\": {\"image\": ...}} is an image file in base64"))?;
-                            Some(strata::media::base64_bytes(b64).map_err(|m| ApiError::bad(format!("{{\"embed\": {{\"image\": ...}}}} is an image file in base64: {m}")))?)
+                            let (kind, b64) = i.iter().next().expect("one key");
+                            let b64 = b64.as_str().ok_or_else(|| ApiError::bad(format!("{{\"embed\": {{\"{kind}\": ...}}}} is a file in base64")))?;
+                            Some(strata::embed::query_file(kind, b64)?)
                         }
-                        _ => return Err(ApiError::bad("\"embed\" is a text or {\"image\": \"<base64>\"}")),
+                        _ => return Err(ApiError::bad("\"embed\" is a text, {\"image\": \"<base64>\"} or {\"audio\": \"<base64>\"}")),
                     };
-                    if image.is_some() && !e.modalities().contains(&strata::embed::Modality::Image) {
-                        return Err(ApiError::bad(format!("the model of {field} ({}) does not embed images", e.name())));
+                    if let Some((m, _)) = file.as_ref().filter(|(m, _)| !e.modalities().contains(m)) {
+                        return Err(ApiError::bad(format!("the model of {field} ({}) does not embed {}", e.name(), strata::embed::modality_name(*m))));
                     }
                     let text = o["embed"].as_str().unwrap_or_default().to_string();
                     let t0 = Instant::now();
@@ -1045,8 +1046,8 @@ impl Service {
                     };
                     let v = tokio::task::spawn_blocking(move || {
                         let _core = core;
-                        match image {
-                            Some(data) => strata::embed::embed_image_file(e.as_ref(), &data),
+                        match file {
+                            Some((_, data)) => strata::embed::embed_file(e.as_ref(), &data),
                             None => Ok(e.embed_query(&text)),
                         }
                     })

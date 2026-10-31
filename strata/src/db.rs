@@ -453,8 +453,14 @@ impl Db {
         if e.dim() != *dim {
             return Err(Error::Schema(format!("model {} makes {}-dimension vectors; field {field} holds {dim}", spec.model, e.dim())));
         }
-        if let Some(m) = schema.embeds_media(i).filter(|_| !e.modalities().contains(&Modality::Image)) {
-            return Err(Error::Schema(format!("model {} does not embed images, and field {field} is the embedding of the images of {}", spec.model, schema.fields[m].name)));
+        if let Some(m) = schema.embeds_media(i) {
+            let (wants, what) = match schema.fields[m].media {
+                Some(crate::media::MediaKind::Audio) => (Modality::Audio, "sound"),
+                _ => (Modality::Image, "images"),
+            };
+            if !e.modalities().contains(&wants) {
+                return Err(Error::Schema(format!("model {} does not embed {what}, and field {field} is the embedding of the {what} of {}", spec.model, schema.fields[m].name)));
+            }
         }
         let mut all = self.embedders.write().unwrap_or_else(|e| e.into_inner());
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
@@ -1359,10 +1365,13 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
 }
 
 /// The vectors of field `f` of `schema` for `sources` (as
-/// [`Schema::embed_text`] gives them): of the texts, or of the images
-/// that the MEDIA values name, decoded a batch at a time.
+/// [`Schema::embed_text`] gives them): of the texts, or of the images or
+/// sounds that the MEDIA values name, decoded a batch at a time.
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
     let Some(m) = schema.embeds_media(f) else { return Ok(embed_all(e, sources)) };
+    if schema.fields[m].media == Some(crate::media::MediaKind::Audio) {
+        return in_sound_batches(&schema.fields[m].name, sources, files, |inputs| e.embed_inputs(inputs));
+    }
     let mut out = Vec::with_capacity(sources.len());
     for batch in sources.chunks(16) {
         let images = images_of(&schema.fields[m].name, batch, files)?;
@@ -1440,24 +1449,32 @@ fn derived_of(derivers: &[Option<Arc<dyn Deriver>>], schema: &Schema, docs: &[Do
 /// decoded a batch at a time: 16 images, or up to 4 sounds of 2 minutes
 /// together (a sound can be an hour long).
 fn derive_sources(d: &dyn Deriver, schema: &Schema, m: usize, values: &[String], files: &Files) -> Result<Vec<String>> {
-    let mut out = Vec::with_capacity(values.len());
     let field = &schema.fields[m].name;
     if d.modality() == Modality::Audio {
-        let mut batch: Vec<crate::embed::Audio> = Vec::new();
-        for (i, v) in values.iter().enumerate() {
-            batch.extend(sounds_of(field, std::slice::from_ref(v), files)?);
-            let seconds: f64 = batch.iter().map(|a| a.samples.len() as f64 / a.rate as f64).sum();
-            if batch.len() == 4 || seconds >= 120.0 || i + 1 == values.len() {
-                out.extend(d.derive(&batch.iter().map(Input::Audio).collect::<Vec<_>>())?);
-                batch.clear();
-            }
-        }
-        return Ok(out);
+        return in_sound_batches(field, values, files, |inputs| d.derive(inputs));
     }
+    let mut out = Vec::with_capacity(values.len());
     for batch in values.chunks(16) {
         let images = images_of(field, batch, files)?;
         let inputs: Vec<Input> = images.iter().map(Input::Image).collect();
         out.extend(d.derive(&inputs)?);
+    }
+    Ok(out)
+}
+
+/// What `f` makes of the sounds that MEDIA values of field `field` name,
+/// decoded and given to it up to 4 at a time, or 2 minutes of sound
+/// together (a sound can be an hour long).
+fn in_sound_batches<T>(field: &str, values: &[String], files: &Files, mut f: impl FnMut(&[Input<'_>]) -> Result<Vec<T>>) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(values.len());
+    let mut batch: Vec<crate::embed::Audio> = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        batch.extend(sounds_of(field, std::slice::from_ref(v), files)?);
+        let seconds: f64 = batch.iter().map(|a| a.samples.len() as f64 / a.rate.max(1) as f64).sum();
+        if batch.len() == 4 || seconds >= 120.0 || i + 1 == values.len() {
+            out.extend(f(&batch.iter().map(Input::Audio).collect::<Vec<_>>())?);
+            batch.clear();
+        }
     }
     Ok(out)
 }

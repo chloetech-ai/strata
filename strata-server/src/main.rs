@@ -256,7 +256,8 @@ enum Command {
     FetchModel {
         /// A known name (potion-retrieval-32M, potion-base-8M, bge-small-en-v1.5,
         /// snowflake-arctic-embed-m-v1.5, siglip-base-patch16-224,
-        /// blip-image-captioning-base) or a repository, owner/name.
+        /// blip-image-captioning-base, whisper-small, clap-htsat-unfused) or a
+        /// repository, owner/name.
         name: String,
         /// Where to put it (default: --models, $STRATA_MODELS, or
         /// ~/.local/share/strata/models).

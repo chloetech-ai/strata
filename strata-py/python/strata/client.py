@@ -152,12 +152,12 @@ class Client(Search):
         r = self._call("POST", "/v1/plan", {"plan": plan})
         return Result._of(r) if "rows" in r else int(r["written"])
 
-    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None, audio: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
-        first table, or of `table`), or of `image`, the bytes of an image
-        file, by a model of images, on the server."""
-        data = None if image is None else base64.b64encode(image).decode()
-        body = {k: v for k, v in {"text": text, "image": data, "field": field, "table": table}.items() if v is not None}
+        first table, or of `table`), or of `image` or `audio`, the bytes of
+        an image or sound file, by a model of that, on the server."""
+        b64 = lambda d: None if d is None else base64.b64encode(d).decode()
+        body = {k: v for k, v in {"text": text, "image": b64(image), "audio": b64(audio), "field": field, "table": table}.items() if v is not None}
         return self._call("POST", "/v1/embed", body)["vector"]
 
     def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:

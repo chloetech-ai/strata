@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 import strata
-from conftest import BOOKS, book
+from conftest import BOOKS, book, tone_wav
 
 
 @pytest.fixture
@@ -103,6 +103,9 @@ def test_client_builder_and_embed(client, tmp_path):
     assert near.rows == client.query("SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 3", v={"embed": "dragon ship"}).rows
     with pytest.raises(strata.StrataError, match="HTTP 400"):
         client.embed("x", "title")
+    # A sound file's vector is a model of sound's: the books' reads text.
+    with pytest.raises(strata.StrataError, match="does not embed sound"):
+        client.embed(audio=tone_wav())
     a = client.search("dragon", limit=5, where=col("year") >= 1950)
     b = client.search("dragon", limit=5, where="year >= 1950")
     assert a.keys == b.keys and len(a) == 5
