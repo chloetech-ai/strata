@@ -5,7 +5,8 @@
 //! started again when its `--shards` list changes. A cluster is made,
 //! grows and shrinks in shards and in copies, hands a primary over before
 //! its copy goes, and takes back a copy that lost its volume, answering
-//! every row throughout.
+//! every row throughout: open, and with a cluster token of its own, the
+//! admin token held by the coordinator alone.
 
 #![cfg(unix)]
 
@@ -61,14 +62,19 @@ struct Procs {
     schema: PathBuf,
     coordinator_port: u16,
     failover_after_ms: u64,
+    /// The admin token and the cluster token, as `tokenSecret` and
+    /// `clusterTokenSecret` give them: the servers take the cluster token,
+    /// the coordinator both.
+    tokens: Option<(String, String)>,
     state: Mutex<State>,
 }
 
 impl Procs {
-    fn new(dir: &Path, failover_after_ms: u64) -> Procs {
+    fn new(dir: &Path, failover_after_ms: u64, tokens: Option<(&str, &str)>) -> Procs {
         let schema = dir.join("schema.json");
         std::fs::write(&schema, serde_json::to_string(&strata_server::demo::schema(ROWS)).unwrap()).unwrap();
-        Procs { dir: dir.to_path_buf(), schema, coordinator_port: port(), failover_after_ms, state: Mutex::new(State::default()) }
+        let tokens = tokens.map(|(a, c)| (a.to_string(), c.to_string()));
+        Procs { dir: dir.to_path_buf(), schema, coordinator_port: port(), failover_after_ms, tokens, state: Mutex::new(State::default()) }
     }
 
     fn ports(&self, id: u32, k: usize) -> (u16, u16) {
@@ -92,6 +98,9 @@ impl Procs {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_strata-server"));
         cmd.arg("--db").arg(&db).args(["--seq-no", "--listen", &format!("127.0.0.1:{http}"), "--grpc", &format!("127.0.0.1:{grpc}")]);
         cmd.args(["--failover-after-ms", &self.failover_after_ms.to_string(), "--log", "info"]);
+        if let Some((_, cluster)) = &self.tokens {
+            cmd.args(["--cluster-token", cluster]);
+        }
         if !db.exists() {
             match demo {
                 Some((i, n)) if k == 0 => cmd.args(["--demo", &ROWS.to_string(), "--demo-shard", &format!("{i}/{n}")]),
@@ -193,8 +202,12 @@ impl Platform for Procs {
         drop(self.state.lock().unwrap().coordinator.take());
         let list = shards.iter().map(|s| s.join("|")).collect::<Vec<_>>().join(",");
         let http = self.coordinator_port;
-        let child = Command::new(env!("CARGO_BIN_EXE_strata-server"))
-            .args(["--shards", &list, "--listen", &format!("127.0.0.1:{http}"), "--grpc", "off", "--log", "info"])
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_strata-server"));
+        cmd.args(["--shards", &list, "--listen", &format!("127.0.0.1:{http}"), "--grpc", "off", "--log", "info"]);
+        if let Some((admin, cluster)) = &self.tokens {
+            cmd.args(["--token", admin, "--cluster-token", cluster]);
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(self.log("coordinator"))
             .spawn()
@@ -270,10 +283,42 @@ impl Run {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_is_made_grown_shrunk_and_healed() {
     let dir = tempfile::tempdir().unwrap();
-    let procs = Procs::new(dir.path(), 1000);
+    let procs = Procs::new(dir.path(), 1000, None);
     let admin = Admin::new(&format!("http://127.0.0.1:{}", procs.coordinator_port), None);
     let spec = Spec { shards: 2, replicas: 2, demo: Some(ROWS), failover_after_ms: 1000, ..Spec::default() };
+    every_step(&mut Run { procs, admin, spec }).await;
+}
+
+/// The same steps with a cluster token: the operator holds the admin
+/// token, which the servers do not take, and every step the coordinator
+/// passes on to them goes with the cluster's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cluster_with_its_own_token_is_made_grown_shrunk_and_healed() {
+    let dir = tempfile::tempdir().unwrap();
+    let procs = Procs::new(dir.path(), 1000, Some(("admin-token", "cluster-token")));
+    let admin = Admin::new(&format!("http://127.0.0.1:{}", procs.coordinator_port), Some("admin-token".into()));
+    let spec = Spec {
+        shards: 2,
+        replicas: 2,
+        demo: Some(ROWS),
+        failover_after_ms: 1000,
+        token_secret: Some("admin".into()),
+        cluster_token_secret: Some("inner".into()),
+        ..Spec::default()
+    };
     let mut run = Run { procs, admin, spec };
+    every_step(&mut run).await;
+    // A server takes the cluster's token, not the admin's.
+    let server = run.procs.state.lock().unwrap().sets[&0].1[&0].http;
+    let ask = |token: &'static str| reqwest::Client::new().get(format!("http://127.0.0.1:{server}/v1/stats")).bearer_auth(token).send();
+    assert_eq!(ask("admin-token").await.unwrap().status(), 401);
+    assert_eq!(ask("cluster-token").await.unwrap().status(), 200);
+}
+
+/// Makes the cluster, grows it in shards and copies, heals a copy that
+/// lost its volume, hands a primary over, shrinks it back and starts the
+/// coordinator again, every row and write kept.
+async fn every_step(run: &mut Run) {
 
     // Made: two shards of two copies, the demo products split over them.
     let said = run.settle("made").await;

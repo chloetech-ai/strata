@@ -48,6 +48,7 @@ kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
 | `failoverAfterMs` | 3000 | every server's `--failover-after-ms`: a shard elects a new primary on its own when its primary's pod dies |
 | `writeAcks` | `all` | every primary's `--write-acks` |
 | `tokenSecret` | | a Secret whose key `token` every server and coordinator requires; without it they run with `--no-token`, open to whatever reaches them |
+| `clusterTokenSecret` | | a Secret whose key `token` is the cluster's own token (`--cluster-token`), which the servers and coordinators send each other and clients never hold; with it, the `tokenSecret` token goes to the coordinators alone, as the admin token (the operator's too), and may not make the calls between servers. Needs `tokenSecret` |
 | `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args` | `strata-server:dev` | the servers' image, containers and further arguments |
 
 What a change does:
@@ -164,7 +165,9 @@ put a cluster token in a Secret and give it to every server, coordinators
 included (they send it to each other, and only it makes the calls between
 servers), give the coordinators an admin token of their own, drop
 `--no-token`, and serve TLS. Clients get API keys made on a coordinator,
-which every server then holds:
+which every server then holds. The operator does this for a
+`StrataCluster` that names both Secrets (`tokenSecret` and
+`clusterTokenSecret`, above):
 
 ```bash
 kubectl -n strata create secret generic strata-cluster-token --from-literal=token="$(openssl rand -hex 32)"

@@ -140,6 +140,7 @@ without a filter is the plain index search.
 | `vector.ivf.sample` | 64 | training points per list |
 | `vector.hnsw.m` | schema's `m` (16) | layer 0 has 2·M |
 | `vector.hnsw.ef_construction` | schema's (200) | |
+| `vector.hnsw.build` | `sq8` with SQ8 codes | `sq8`: construction scores with the codes, as search does; `f32`: with float32 rows |
 | `vector.threads` | 1 | k-means and graph construction |
 | `vector.seed` | fixed | sample, HNSW levels |
 
@@ -348,12 +349,42 @@ for every index strategy on segments without that index.
 
 * **Construction**: hnswlib's algorithm (heuristic neighbour selection,
   2·M links on layer 0, per-node locks, levels from a seeded hash so the
-  layer structure does not depend on the thread count), float32 distances.
-  Inserts are memory-latency bound (4 KiB per vector, random): prefetching
+  layer structure does not depend on the thread count). Inserts are
+  memory-latency bound (4 KiB per float32 vector, random): prefetching
   the next neighbour's vector cut FiQA's build from 50.5 s to 33.5 s
   (prefetching in the selection heuristic and link shrinking was neutral).
-  Build with 2 threads under load: FiQA 54 s, TREC-COVID 113 s, Quora
-  593 s.
+  Build with 2 threads under load, float32 distances: FiQA 54 s,
+  TREC-COVID 113 s, Quora 593 s.
+* **Construction on SQ8 codes** (`vector.hnsw.build`, default `sq8`): the
+  inserted vector is prepared as a query (int8 weights, as searches are)
+  and scored against the others' codes, a byte per dimension; the
+  selection heuristic prepares each neighbour it keeps the same way.
+  TREC-COVID, 4 threads, idle container: 36.6 s against 82.0 s on float32
+  rows, recall@10 within 0.014 at every ef from 10 to 256 (one run each).
+  At 64 dimensions it saves nothing (a float32 row is 256 bytes, and
+  preparing a query per kept neighbour costs about what it saves).
+* **Merges** start from the inputs' graphs (`GraphStart`). The largest
+  input that lost no documents keeps its levels and links (Lucene 9.9);
+  every other whole input is joined to it (Lucene 10.2's
+  `MergingHnswGraphBuilder`): a join set covering its graph (greedy, each
+  node needing `max(2, ⌈degree/4⌉)` neighbours in the set, Lucene's
+  `UpdateGraphsUtils.computeJoinSet`) is inserted as usual, then every
+  other node searches layer 0 from its old neighbours already inserted
+  (the join set, and the nodes before it) and their new neighbours. Four
+  TREC-COVID segments of 25,000 (1,024 dimensions, 4 threads, 50 queries
+  and 500 held-out documents, `examples/graph_start.rs`):
+
+  | layer-0 beam of the other nodes | seeds | seconds | recall@10 ef 64 | ef 100 |
+  |---|---|---|---|---|
+  | `min(ef/2, 3M)` = 48 (Lucene) | join set | 10.3 | 0.984 | 0.991 |
+  | `min(ef/2, 3M)` = 48 | join set and nodes before | 10.1 | 0.983 | 0.991 |
+  | `ef/2` = 100 | join set | 12.1 | 0.988 | 0.992 |
+  | `ef/2` = 100 (kept) | join set and nodes before | 12.0 | 0.990 | 0.995 |
+  | largest input's graph only | | 15.9 | 0.991 | 0.995 |
+  | from scratch | | 20.4 | 0.989 | 0.993 |
+
+  One run each on codes; float32 rows: 20.9 to 21.1 s joined, 29.6 to
+  30.0 s from the largest, 37.9 s from scratch.
 * **Search on SQ8 codes** (1 KiB per hop instead of 4 KiB), four neighbours
   per VNNI call, then float32 re-ranking; `ef = max(ef, rerank)`. Default
   ef 64: recall 0.984 (FiQA), 0.988 (TREC-COVID), 0.991 (Quora) at 90–175
@@ -429,7 +460,11 @@ well with plain read-around.
   `ef`, IVF `nprobe` scaled by the same factor, flat: the whole scan), then
   the filter, retried with 4× the candidates if fewer than k members
   survive. Filters correlated *away* from the query need retries (TREC-COVID
-  topic 1%: 9.6 ms vs 1.8 ms for a random 1% filter).
+  topic 1%: 9.6 ms vs 1.8 ms for a random 1% filter). On HNSW a retry goes on
+  with the walk it widens (`hnsw::Walk`, pgvector's iterative scan): the
+  candidates the narrower walk cut, the nodes it scored below its floor and
+  the results it pushed out come back, and the visited set stays, so no node
+  is scored twice. Measured below (post-filter rows).
 * **Auto** asks the cost model for the cheapest applicable strategy: Flat or
   the native index without a filter; PreFilter, the native in-filter
   strategy or PostFilter with one.
@@ -464,6 +499,34 @@ the embedding) Auto makes the same choices; the IVF choice at 3–10% costs
 recall there (TREC-COVID 0.904 / 0.884, Quora 0.918 / 0.936, against 1.000
 for the pre-filter at 1.0–7× the time), because the model cannot see
 correlation.
+
+Resuming the walk, against starting each retry over (TREC-COVID, HNSW at
+ef 64 and rerank 40, 50 queries per cell, the same segment; SQ8 distances
+per query, which do not depend on the machine's load, and mean µs of two
+runs before and two after, on the 4-core cloud container, Intel Xeon @
+2.10 GHz, with nothing else running):
+
+| filter | recall@10 | retries | distances before → after | µs before → after |
+|---|---|---|---|---|
+| topic 1% | 0.984 = | 0.66 = | 52,263 → 37,523 (−28%) | 14,403 / 16,247 → 10,862 / 11,285 |
+| topic 3% | 0.966 = | 0.82 = | 32,631 → 22,646 (−31%) | 9,275 / 8,802 → 7,237 / 7,208 |
+| topic 10% | 0.966 = | 0.66 = | 8,654 → 6,630 (−23%) | 1,647 / 1,635 → 1,398 / 1,438 |
+| topic 30% | 0.996 = | 0.06 = | 1,047 → 993 (−5%) | 187 / 162 → 193 / 180 |
+| random 1–30% | 0.986–0.998 = | ≤ 0.02 = | equal (10%: 2,251 → 2,196) | within noise |
+
+Recall and the number of retries are the same in every cell; only the work
+a retry repeats goes. Growing the walk 2× instead of 4× per retry cuts the
+distances further (topic 3%: 18,106) but loses recall (0.948), because the
+last walk is narrower; 4× stays.
+
+**Lucene's guards on two-hop** (10.2: in-filter two-hop only when the filter
+leaves out at least 40% of the vectors, and from a node look two hops out
+only when more than a tenth of its neighbours fail) were measured on the
+same cells and left out: they give two-hop's recall exactly (topic 1%:
+0.512, 3%: 0.630, 10%: 0.884; random 1%: 0.584), because with filters of
+30% or less nearly every node has more than a tenth of its neighbours
+failing, so the guard always looks two hops out. The planner's choice is
+unchanged: pre-filter below ~3%, post-filter above.
 
 ### Cost model
 
@@ -529,11 +592,14 @@ copy; the segment is streamed to the file with `write_to`).
 
 ## Open issues
 
-* **HNSW construction** is the slowest build step (TREC-COVID 113 s with 2
-  threads, Quora 593 s). It uses float32 distances on 4 KiB
-  vectors and is memory-latency bound; building on SQ8 codes or BF16
-  (AVX512-BF16 is present) would cut the traffic 2–4×, at some graph
-  quality. The 4-thread final run will roughly halve it.
+* **HNSW construction** is still the slowest build step. On SQ8 codes it
+  reads a quarter of the bytes (2.2× faster on TREC-COVID); preparing a
+  query per kept neighbour in the selection heuristic is now a large part
+  of an insert, and caching those, or comparing neighbours code to code,
+  would cut it further. Joining a merge's inputs' graphs is 1.3× faster
+  than starting from the largest alone (1.4× on float32 rows; with the
+  codes, 2.4× faster than float32 from the largest), but the nodes of
+  inputs that lost documents are still inserted from scratch.
 * **IVF centroid scan.** Every IVF query scores all `nlist` centroids:
   Quora's 2893 SQ8 centroids (2.9 MB, past L2) cost ~170 µs, most of a
   query at nprobe ≤ 8 (nprobe 1: 205 µs). A small HNSW over the centroids,

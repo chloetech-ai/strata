@@ -54,6 +54,14 @@ struct Args {
     /// Where embedded fields' models are (see `fetch-model`).
     #[arg(long, env = "STRATA_MODELS")]
     models: Option<PathBuf>,
+    /// Leave rows stored while their embedded field had no model open
+    /// without vectors. By default they get them once the model opens.
+    #[arg(long)]
+    no_backfill: bool,
+    /// Do not download the models Strata knows (see `fetch-model`) that an
+    /// embedded field names and --models lacks.
+    #[arg(long)]
+    no_fetch_models: bool,
     /// Create a new database as a directory of segment files.
     #[arg(long)]
     directory: bool,
@@ -611,6 +619,8 @@ async fn main() {
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
         models: a.models.unwrap_or_else(strata::embed::models_dir),
+        backfill: !a.no_backfill,
+        fetch_models: !a.no_fetch_models,
         synonyms: a.synonyms,
         backup_dir: a.backup_dir,
         media_fetch: a.media_fetch,

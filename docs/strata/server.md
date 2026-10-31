@@ -59,6 +59,8 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--max-body-mb N` | 256 | the largest body of a write or an import, and of a gRPC message; other requests take up to 16 MiB |
 | `--model ID` | `claude-haiku-5-5` | the agent's default model |
 | `--models DIR` | `$STRATA_MODELS`, else `~/.local/share/strata/models` | where the models of [embedded vector fields](#embedded-vector-fields), [ranking models](query-language.md#ranking-models-gbdtmodel-features) (`<name>/gbdt.json`) and [cross-encoders](query-language.md#cross-encoders-cross_encodermodel-fields-query) (`<name>/config.json`, `tokenizer.json`, `model.safetensors`) are |
+| `--no-backfill` | off | leave the rows stored while their embedded field had no model open without vectors; by default they [get them](#embedded-vector-fields) once the model opens |
+| `--no-fetch-models` | off | do not download the [models Strata knows](#embedded-vector-fields) that an embedded field names and `--models` lacks |
 | `--copy-from PATH` | | fill the new database (`--db` with `--schema`) with this database's rows, re-embedding the vector fields whose embedding changed |
 | `--synonyms FILE` | | the synonym list for `synonyms => 1` searches ([format](query-language.md#typos-and-synonyms)): read at start if it exists, written by `PUT /v1/synonyms` |
 | `--backup-dir DIR` | | where `POST /v1/admin/checkpoint` writes checkpoints ([backups](#backups)); created if missing |
@@ -187,7 +189,11 @@ The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text e
 
 Several fields can embed different sources side by side, and a query picks one: `ORDER BY similarity(emb_title, :q)`, or both fused, `rrf(similarity(emb_title, :q), similarity(emb_both, :p))`. Each 512-dimension field costs about 0.5 KB a row as 8-bit codes, plus its HNSW graph.
 
-A field may also name a model the server cannot run, such as `cohere/embed-english-v3.0` for vectors computed elsewhere: that documents what the vectors are, writes must supply them, and text cannot be searched against them (only rows, with `vector_of`). The BEIR collections of the evaluation declare their Cohere vectors this way.
+The model can be computed here (the table below) or sit behind an API, such as `openai/text-embedding-3-small` ([hosted models](#hosted-models)). A field may also name a model the server cannot open (its API key not set, a model directory not there yet): rows written meanwhile are stored without the vector, and text cannot be searched against the field (only rows, with `vector_of`). `/v1/schema` says, for each embedded field, whether its model is open here and why not; `GET /v1/models` lists the models a schema can name and whether each would open on this server.
+
+**Rows stored without vectors get them later.** When a field's model opens (the server started again with the key set, a table created or altered, a model fetched), the server finds the rows of the field that have no vector and fills them in through the writer, 256 rows a write, as any write goes: replicas get them from the primary, and in a cluster each shard fills in its own. A row given a vector meanwhile keeps it, and a row whose text changed meanwhile gets the vector of its new text. A row whose sources are all empty stays without one. `/v1/schema` shows the progress under each embedded field's `backfill` (`{"state": "done", "missing": 600, "embedded": 599}`; `running`; `failed`, with the error, tried again five minutes later when the model failed), and the log says when it starts and ends. `--no-backfill` turns it off. From Rust: `Db::missing_vectors` and `Db::embed_backfill`.
+
+**Models are fetched when a field names them.** A field naming one of the models below that the models directory lacks gets it from Hugging Face when the server starts (or when a table naming it is created), then its rows are filled in as above. `--no-fetch-models` turns that off, for a server without access to huggingface.co; `strata-server fetch-model` fetches a model by hand.
 
 | model | what it is | |
 |---|---|---|
@@ -204,6 +210,45 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
 `strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`; CLAP's `pytorch_model.bin`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
+
+### Hosted models
+
+A field can name a model behind an API as `<provider>/<model>`, and Strata calls the provider itself: on every write that leaves the vector out (in batches, before the write queues for the writer, as for a model computed here) and for every `{"embed": "text"}` parameter. Rows go in as plain text and come back by meaning, with no embedding pipeline of your own:
+
+```json
+{"name": "emb", "type": "vector", "embed": {"from": ["title", "description"], "model": "openai/text-embedding-3-small"}}
+```
+
+| provider | names, for example | the key, in the server's environment | base URL (to point at another server of the API) |
+|---|---|---|---|
+| OpenAI | `openai/text-embedding-3-small` (1536), `openai/text-embedding-3-large` (3072) | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
+| Cohere | `cohere/embed-v4.0` (1536), `cohere/embed-english-v3.0` (1024), `cohere/embed-multilingual-v3.0` | `COHERE_API_KEY` or `CO_API_KEY` | `COHERE_BASE_URL` |
+| Voyage AI | `voyage/voyage-3.5` (1024), `voyage/voyage-3-large`, `voyage/voyage-code-3` | `VOYAGE_API_KEY` | `VOYAGE_BASE_URL` |
+| Google Gemini | `gemini/gemini-embedding-001` (3072), `gemini/text-embedding-004` (768) | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `GEMINI_BASE_URL` |
+| Mistral | `mistral/mistral-embed` (1024), `mistral/codestral-embed` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` |
+| Jina AI | `jina/jina-embeddings-v3` (1024), `jina/jina-embeddings-v4` | `JINA_API_KEY` | `JINA_BASE_URL` |
+| Ollama (local) | `ollama/nomic-embed-text` (768), `ollama/mxbai-embed-large` (1024), `ollama/bge-m3` | none | `OLLAMA_HOST` (default `localhost:11434`) |
+
+Any model name after the prefix is sent as it is, so a provider's newer models need no new Strata; a field naming one Strata does not know gives `dim`. Keys are read from the environment when the server opens the model, and never stored in the database or shown in errors: a schema names its model, not its key. Without its key a model does not open, `/v1/schema` says which variable to set, and writes must bring their vectors until it is set. In a cluster, each shard embeds the rows it takes and the coordinator embeds queries, so each needs the key.
+
+What Strata does for each request:
+
+- **Batches** of texts (OpenAI 256 a request, Cohere 96, Gemini 100, Voyage 128, Ollama 32, and by characters too), with up to 4 requests of a model in flight at once across every write and query (2 for Ollama), so a large import runs at the provider's speed and a burst of writes does not trip its rate limit.
+- **Retries** on a rate limit (429, waiting as long as `Retry-After` says), a server error (5xx), a timeout or a dropped connection: six times, waiting half a second and doubling. A refused key (401, 403), a wrong answer (vectors of another size, too few) or a request the API calls bad fails at once. A write whose vectors cannot be had fails whole with 503 (`unavailable: model openai/...: ... answered 429 ...`), and nothing of it is written; a query fails alike.
+- **Long texts** are cut to what the model takes (about 24,000 characters for OpenAI, 8,000 for Gemini; Cohere, Voyage, Jina and Ollama cut them themselves), and a text the API still calls too long is cut by half and sent again.
+- **Documents and queries** are embedded as the API asks: Cohere's `search_document` and `search_query`, Voyage's `document` and `query`, Gemini's `RETRIEVAL_DOCUMENT` and `RETRIEVAL_QUERY`, Jina's `retrieval.passage` and `retrieval.query`, and the prefixes nomic-embed-text, mxbai-embed-large and snowflake-arctic-embed were trained with.
+- **Fewer dimensions.** A field of fewer dimensions than the model makes asks for them, from a model that can shorten its vectors (OpenAI's text-embedding-3, Cohere's embed-v4.0, Voyage 3 and 3.5, Gemini, Jina v3 and v4): `{"type": "vector", "dim": 512, "embed": {"model": "openai/text-embedding-3-large", ...}}` keeps 512 numbers a row. A model that cannot is refused for a field of another size.
+- **Unit vectors and a query cache.** Every vector is normalized, as Strata's dot product needs; the last 4,096 query texts' vectors are kept, so a repeated search sends nothing.
+- **Usage.** `/metrics` counts each field's requests, retries, failures and the tokens the provider says it counted (`strata_embed_requests_total`, `strata_embed_retries_total`, `strata_embed_failures_total`, `strata_embed_tokens_total`), and `/v1/schema` shows them under each embedded field's `usage`.
+
+**Other servers of these APIs.** vLLM, Hugging Face Text Embeddings Inference, LM Studio, LiteLLM, Azure OpenAI, Together and Fireworks speak OpenAI's API. Point `openai/<model>` at one with `OPENAI_BASE_URL` (a server named by URL may need no key), or give it a name of its own: a directory under `--models` holding an `endpoint.json`, which the schema then names like any model.
+
+```json
+{"api": "openai", "base_url": "http://gpu-box:8080/v1", "model": "BAAI/bge-m3", "dim": 1024,
+ "key_env": "GPU_BOX_KEY", "query_prefix": "", "batch": 64, "concurrency": 8}
+```
+
+`api` is `openai`, `cohere`, `voyage`, `gemini`, `jina` or `ollama`. `base_url` gets the API's path added (`/embeddings`); `url` is used as given instead (Azure's `.../deployments/NAME/embeddings?api-version=2024-02-01`, with `"key_header": "api-key"`). The rest are optional: `model` (the API's name; default the directory's), `dim`, `key_env`, `key_header`, `headers` (an object), `document_prefix`, `query_prefix`, `dimensions` (whether the model takes a number of dimensions), `batch`, `batch_chars`, `max_chars`, `concurrency`, `retries` and `timeout_s` (60). An `endpoint.json` in `models/openai/text-embedding-3-small/` changes these for that name only. Strata's builds have hosted models on (feature `hosted`, a default).
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
 
@@ -369,6 +414,8 @@ curl -s localhost:7700/v1/sid/next -H 'content-type: application/json' -d '{
 
 Each prefix's next codes come in the order of their last numbers, with the rows under each that `where` matches (every row without it), and a code no matching row has is left out. The filter is worked out once per segment; the codes below a prefix are found by jumping through the field's sorted dictionary, where every prefix is a value, and each is counted against the filter. `Db::sid_next` answers the same from Rust. A coordinator asks every shard (gRPC `SidNext`, protocol 7) and adds their counts. Each shard numbers the ties of its own rows, so on a coordinator a full code can name one row on each shard: the counts of the levels are the table's, and a tie's are those of every row with that code.
 
+**With a decoder.** A TIGER-style decoder over these codes, each step's numbers from `sid_next` among the items a user does not have, comes within 0.0023 Recall@10 of published TIGER on Amazon Beauty and Sports (0.0085 below it on Toys). Alone it ranks no better than a sequence model's [`encode()`](query-language.md#sequence-models-encodemodel-history), at 30 to 40 times its time, most of it the decoder's own; its answer, given to a query as `ranked(:gen)` and fused with `rrf`, adds to that model's and to a walk's ([results](https://github.com/rkonow/strata/tree/main/strata/results/generative)).
+
 A database with a semantic-ID field needs the manifest feature `semantic_id`, and a plan that uses `sid_at` the plan feature of the same name, which versions of Strata before them refuse by name.
 
 ## HTTP API
@@ -390,6 +437,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short, sql}` (`sql` the `CREATE TABLE` that makes it), or the error |
 | `POST /v1/explain` | `{sql, params?, hits?, profile?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the timed steps of the run (`steps`, its [profile](#what-the-server-is-doing-now)), the bound query (`logical`) and counts; with `hits: n`, a ranked query's top `n` rows as objects with their `score()` and [`features()`](query-language.md#features-the-values-a-ranking-read), the values each was ranked by |
 | `POST /v1/embed` | `{text, image or audio, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image or sound file (`image` or `audio`, base64, for a model of images or of sound), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name (those Strata fetches, the hosted ones it knows, and the directories of `--models`), and whether each would open here: fetched, its key set, its feature built; nothing is loaded or sent |
 | `GET /v1/media/<sha256>` | | the bytes of the file a row's `media` value names, by the file's SHA-256, read as writes read files (the media store, or a place `--media-fetch` lists) and checked against the hash, so a UI can show it; only files that rows name, 404 otherwise; a coordinator refuses (400): ask a shard server |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/sid/next` | `{field, prefixes, where?, params?, table?, timeout_ms?, min_seq_no?, min_seq_nos?}` | the codes that can follow each prefix of a [semantic-ID field](#semantic-ids) among the rows `where` matches: `{next: [{prefix, next: [{code, count}]}], took_ms}` |
@@ -699,7 +747,7 @@ Through a coordinator, a write answers `seq_nos`, each shard's number (0 where i
 
 ## On Kubernetes
 
-`strata-server operator` runs Strata clusters on Kubernetes. A `StrataCluster` resource names the shards, the copies of each shard, the first table's schema and what each server needs (image, volume size, failover delay, write acks, a token's Secret); the operator makes a StatefulSet of copies per shard, each copy a pod with its own volume, and the coordinators behind a Service named as the cluster, and changes the cluster through a coordinator's admin calls, one step every few seconds, until it is as the resource says. More shards join the cluster and [slots move](#moving-slots) to them; fewer are drained first. More copies join their shards as replicas and are sent a copy of the primary; fewer leave their shards first, a primary being [handed over](#failover) before its pod goes. A pod that comes back without its volume joins its shard again. The copies elect their primaries themselves, so a dead pod costs a few seconds of its shard's writes whether the operator runs or not. The resource's status says what it found and does (`kubectl get strata -o wide`).
+`strata-server operator` runs Strata clusters on Kubernetes. A `StrataCluster` resource names the shards, the copies of each shard, the first table's schema and what each server needs (image, volume size, failover delay, write acks, the Secrets of its admin token and of its [cluster token](#security)); the operator makes a StatefulSet of copies per shard, each copy a pod with its own volume, and the coordinators behind a Service named as the cluster, and changes the cluster through a coordinator's admin calls, one step every few seconds, until it is as the resource says. More shards join the cluster and [slots move](#moving-slots) to them; fewer are drained first. More copies join their shards as replicas and are sent a copy of the primary; fewer leave their shards first, a primary being [handed over](#failover) before its pod goes. A pod that comes back without its volume joins its shard again. The copies elect their primaries themselves, so a dead pod costs a few seconds of its shard's writes whether the operator runs or not. The resource's status says what it found and does (`kubectl get strata -o wide`).
 
 ```sh
 kubectl apply -f strata-server/deploy/k8s/operator/operator.yaml    # the operator, in strata-system
@@ -757,7 +805,8 @@ It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only 
 | `strata_write_queue_requests`, `strata_write_batches_total` | | write requests held ([limits](#limits)): embedding, waiting for the writer or being applied; and the groups the writer applied in one transaction each |
 | `strata_idempotent_replays_total` | | writes answered from their idempotency key instead of being applied again |
 | `strata_slow_requests_total` | `what` | queries and writes the slow log wrote down |
-| `strata_embedded_texts_total`, `strata_embed_duration_seconds` | `for` | texts the server's models embedded for writes and for query parameters, and how long each took |
+| `strata_embedded_texts_total`, `strata_embed_duration_seconds` | `for` | texts the server's models embedded for writes (`write`), for query parameters (`query`) and for rows stored without vectors (`backfill`), and how long each took |
+| `strata_embed_requests_total`, `strata_embed_retries_total`, `strata_embed_failures_total`, `strata_embed_tokens_total` | `table`, `field`, `model` | requests a [hosted model](#hosted-models) sent, sent again after a rate limit or failure, and failed for good, and the tokens its provider counted |
 | `strata_agent_runs_total` | | questions the agent was asked |
 | `strata_docs`, `strata_segments`, `strata_deleted_docs`, `strata_memtable_docs` | | a database's rows, segments, deleted rows merges have not dropped yet, and rows not yet flushed |
 | `strata_file_bytes`, `strata_free_bytes`, `strata_wal_bytes` | | its size on disk, the free space in its file, and its write-ahead log |

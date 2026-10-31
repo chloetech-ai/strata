@@ -102,7 +102,7 @@ function render(page) {
     kubeForm = h("div", { class: "stack" }, kubeStatus,
       h("div", { class: "row", style: { gap: "14px", alignItems: "flex-end", flexWrap: "wrap" } },
         h("label", { class: "f" }, "Shards", shards), h("label", { class: "f" }, "Copies per shard", replicas), h("label", { class: "f" }, "Coordinators", coords), apply),
-      h("dl", { class: "kv" }, [["image", sp.image || "strata-server:dev"], ["volume", sp.storage?.size || "10Gi"], ["failover after", sp.failoverAfterMs === 0 ? "by hand" : fmt.ms(sp.failoverAfterMs ?? 3000)], ["write acks", sp.writeAcks || "all"], ["token", sp.tokenSecret ? "Secret " + sp.tokenSecret : "none (open to the cluster's network)"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])));
+      h("dl", { class: "kv" }, [["image", sp.image || "strata-server:dev"], ["volume", sp.storage?.size || "10Gi"], ["failover after", sp.failoverAfterMs === 0 ? "by hand" : fmt.ms(sp.failoverAfterMs ?? 3000)], ["write acks", sp.writeAcks || "all"], ["token", sp.tokenSecret ? "Secret " + sp.tokenSecret : "none (open to the cluster's network)"], ["cluster token", sp.clusterTokenSecret ? "Secret " + sp.clusterTokenSecret : "the token"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])));
     clear(kubeBox, card({ title: "Kubernetes", sub: `StrataCluster ${kube.namespace}/${kube.name}: the operator makes what you change here, one step at a time`, attrs: { style: { marginBottom: "14px" } }, body: kubeForm }));
   }
 
@@ -289,20 +289,21 @@ function render(page) {
       return [
         "# 1. The operator (once per Kubernetes cluster), from the Strata repository:",
         "#    kubectl apply -f strata-server/deploy/k8s/operator/operator.yaml",
-        t ? `# 2. A token every server and coordinator requires:\n#    kubectl create namespace ${nsv}\n#    kubectl -n ${nsv} create secret generic ${nm}-token --from-literal=token="$(openssl rand -hex 32)"` : "# 2. (No token: anything that reaches the pods may read and write.)",
+        t ? `# 2. Two tokens: the one clients and admins send to the coordinators, and the one the servers take only from each other:\n#    kubectl create namespace ${nsv}\n#    kubectl -n ${nsv} create secret generic ${nm}-token --from-literal=token="$(openssl rand -hex 32)"\n#    kubectl -n ${nsv} create secret generic ${nm}-cluster-token --from-literal=token="$(openssl rand -hex 32)"` : "# 2. (No token: anything that reaches the pods may read and write.)",
         "# 3. This file: kubectl apply -f cluster.yaml",
         "apiVersion: v1", "kind: Namespace", "metadata:", `  name: ${nsv}`, "---",
         "apiVersion: strata.chloetech.ai/v1alpha1", "kind: StrataCluster", "metadata:", `  name: ${nm}`, `  namespace: ${nsv}`, "spec:",
         `  shards: ${+shards.value || 1}`, `  replicas: ${+copies.value || 1}`, "  coordinators: 1", "  storage:", `    size: ${size.value.trim() || "10Gi"}`,
         first === "schema" && schema ? `  schema: ${JSON.stringify(schema)}` : "  demo: 10000",
-        "  failoverAfterMs: 3000", "  writeAcks: all", t ? `  tokenSecret: ${nm}-token` : null,
+        "  failoverAfterMs: 3000", "  writeAcks: all", t ? `  tokenSecret: ${nm}-token` : null, t ? `  clusterTokenSecret: ${nm}-cluster-token` : null,
         "# Then: kubectl -n " + nsv + " get strata " + nm + " -o wide; kubectl -n " + nsv + " port-forward svc/" + nm + " 7700",
       ].filter((x) => x != null).join("\n");
     };
     const script = () => {
       const k = +shards.value || 1, r = +copies.value || 1;
-      const auth = token.checked ? " --token \"$STRATA_TOKEN\"" : " --no-token";
-      const serve = "strata-server --db /data/s.strata --seq-no --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701 --failover-after-ms 3000" + auth;
+      const auth = token.checked ? " --token \"$STRATA_TOKEN\" --cluster-token \"$STRATA_CLUSTER_TOKEN\"" : " --no-token";
+      const serverAuth = token.checked ? " --cluster-token \"$STRATA_CLUSTER_TOKEN\"" : " --no-token";
+      const serve = "strata-server --db /data/s.strata --seq-no --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701 --failover-after-ms 3000" + serverAuth;
       const lines = first === "demo" && k > 0
         ? [`# On the machine of shard I's first copy (shardI-0), demo products split over ${k}:`, `#   ${serve} --demo 10000 --demo-shard I/${k}`, "# and on each other copy's machine (shardI-K), the demo's schema (GET /v1/schema of a first copy, its \"schema\"):", `#   ${serve} --schema schema.json`]
         : ["# On each machine of shard I, copy K (shardI-K: a database each, the same schema file):", `#   ${serve} --schema schema.json`];

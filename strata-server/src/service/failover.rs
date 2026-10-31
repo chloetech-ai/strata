@@ -142,6 +142,7 @@ impl Service {
         match f.take_over(Some(won.term), opts).await {
             Ok((p, _)) => {
                 *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::Primary(p);
+                self.models_changed.send_modify(|n| *n += 1);
                 tracing::warn!(term = won.term, replicas = %won.others.join(", "), "elected: this server is its shard's primary");
             }
             Err(e) => tracing::warn!(error = %e.message, "elected, but could not begin the term"),
