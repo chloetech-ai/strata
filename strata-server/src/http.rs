@@ -19,6 +19,7 @@
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
 //! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
+//! | `GET /v1/media/<sha256>` | | the bytes of the file a row's MEDIA value names, by its hash, read as writes read files (`--media-store`, `--media-fetch`); 404 when no row names it, 400 from a coordinator |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
@@ -123,6 +124,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/embed", post(embed))
+        .route("/v1/media/:sha256", get(media_file))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/sid/next", post(sid_next))
@@ -856,6 +858,15 @@ async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let p = app.svc.params(Some(&json!({ "v": { "embed": what, "field": field, "table": table } }))).await?;
     let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
     Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
+}
+
+/// The file a MEDIA value names, by its SHA-256, for showing it: only a
+/// file some row names, read from where the row says and checked against
+/// the hash ([`Service::media_file`]). Its bytes never change, so clients
+/// may keep it.
+async fn media_file(State(app): State<App>, axum::extract::Path(sha256): axum::extract::Path<String>) -> Result<Response, ApiError> {
+    let (mime, bytes) = app.svc.media_file(&sha256).await?;
+    Ok(([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=31536000, immutable".to_string())], bytes).into_response())
 }
 
 async fn explain(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
