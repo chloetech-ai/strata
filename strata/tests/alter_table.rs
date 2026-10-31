@@ -330,10 +330,19 @@ fn an_added_embedding_embeds_new_rows_and_follows_renames() {
     let vector = |text: &str| Value::Vector(strata::embed::Embedder::embed(&h, &[text]).unwrap().remove(0).into());
     run(&db, "INSERT INTO items (id, title) VALUES ('d', 'ripe mango')");
     assert_eq!(rows(&db, "SELECT emb FROM items WHERE id = 'd'"), [[vector("ripe mango")]]);
-    // Older rows have no vector until their source is written again.
+    // Older rows have no vector until the backfill gives them theirs (a
+    // server runs it once the field's model opens), or their source is
+    // written again.
     assert_eq!(rows(&db, "SELECT emb FROM items WHERE id = 'a'"), [[Value::Null]]);
+    let mut missing = db.missing_vectors("items", "emb").unwrap();
+    missing.sort_by_key(|k| k.as_str().map(String::from));
+    assert_eq!(missing, [s("a"), s("b"), s("c"), s("e")]);
     run(&db, "UPDATE items SET title = title WHERE id = 'a'");
     assert_eq!(rows(&db, "SELECT emb FROM items WHERE id = 'a'"), [[vector("red apple")]]);
+    assert_eq!(db.embed_backfill("items", "emb", 2).unwrap(), 3);
+    assert!(db.missing_vectors("items", "emb").unwrap().is_empty());
+    assert_eq!(rows(&db, "SELECT emb FROM items WHERE id = 'c'"), [[vector("yellow pear")]]);
+    assert_eq!(rows(&db, "SELECT emb FROM items WHERE id = 'e'"), [[vector("blue plum")]]);
 
     // The embedding follows its source's new name, and keeps it from a drop.
     run(&db, "ALTER TABLE items RENAME COLUMN title TO headline");
