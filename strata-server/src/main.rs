@@ -235,6 +235,25 @@ struct Args {
     /// with their SQL (0: none).
     #[arg(long, default_value_t = 1000)]
     slow_ms: u64,
+    /// The API keys' file (default: DB.keys.json beside --db; a
+    /// coordinator keeps its keys in memory without it). Keys have scopes
+    /// (read, write, admin) and are made in the UI or with POST
+    /// /v1/admin/keys; --token stays the root credential.
+    #[arg(long)]
+    keys: Option<PathBuf>,
+    /// Append the requests that need the admin scope, and refused ones, to
+    /// this file as JSON lines (the latest are kept in memory either way:
+    /// GET /v1/admin/audit).
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
+    /// The alert rules' file, JSON (created when the rules are first
+    /// edited; default rules in memory without it).
+    #[arg(long)]
+    alerts: Option<PathBuf>,
+    /// Post each alert that fires or resolves to this URL, as
+    /// {"text": ..., "alert": {...}} (a Slack incoming webhook takes it).
+    #[arg(long)]
+    alert_webhook: Option<String>,
     /// What to log: a level (error, warn, info, debug, trace), or levels
     /// per module ("info,strata=debug"). debug logs every request.
     #[arg(long, env = "STRATA_LOG", default_value = "info")]
@@ -464,6 +483,10 @@ async fn main() {
         media_store: a.media_store,
         media_timeout_s: a.media_timeout_s,
         slow_ms: a.slow_ms,
+        keys: a.keys,
+        audit_log: a.audit_log,
+        alerts: a.alerts,
+        alert_webhook: a.alert_webhook.filter(|u| !u.is_empty()),
         merger: {
             let d = strata::storage::MergerOptions::default();
             strata::storage::MergerOptions {
@@ -478,12 +501,13 @@ async fn main() {
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
     let bind = |addr: &str| {
         let addr = addr.to_string();
-        let open = token.is_none() && !a.no_token;
+        // API keys close a server as a token does.
+        let open = token.is_none() && svc.keys.is_empty() && !a.no_token;
         async move {
             let l = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
             let ip = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}"))).ip();
             if open && !ip.is_loopback() {
-                fail(&format!("{addr} is reachable beyond this machine: set --token (or $STRATA_TOKEN), or pass --no-token to serve it open"));
+                fail(&format!("{addr} is reachable beyond this machine: set --token (or $STRATA_TOKEN), make an API key, or pass --no-token to serve it open"));
             }
             (l, ip)
         }

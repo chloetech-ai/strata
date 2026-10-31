@@ -15,6 +15,8 @@ use crate::auth::{self, Access};
 use crate::coord::{CoordOptions, Coordinator};
 use crate::replication::{self, Acks, Follow, Primary, PrimaryOptions};
 use crate::service::{shard_of, AgentConfig, Backend, Replication, Service};
+use crate::alerts::Alerts;
+use crate::keys::{Audit, Keys};
 use crate::{demo, grpc, http, pb};
 
 #[derive(Clone, Debug, Default)]
@@ -107,6 +109,15 @@ pub struct Options {
     /// Log queries and writes that take this many milliseconds or more
     /// (0: none).
     pub slow_ms: u64,
+    /// The API keys' file (default: `<db>.keys.json` beside a database; a
+    /// coordinator's keys are in memory without it).
+    pub keys: Option<PathBuf>,
+    /// Append every audited request here, as JSON lines.
+    pub audit_log: Option<PathBuf>,
+    /// The alert rules' file (default rules, in memory, without it).
+    pub alerts: Option<PathBuf>,
+    /// Post alerts that fire or resolve to this URL.
+    pub alert_webhook: Option<String>,
 }
 
 /// How writes resolve MEDIA values, from `--media-fetch`,
@@ -256,6 +267,12 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if o.max_body_mb > 0 {
         svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
     }
+    let keys = o.keys.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(Keys::file_of));
+    if let Some(file) = keys {
+        svc.keys = Arc::new(Keys::open(file)?);
+    }
+    svc.audit = Audit::new(o.audit_log.clone())?;
+    svc.alerts = Alerts::new(o.alerts.clone(), o.alert_webhook.clone())?;
     svc.open_models(&o.models);
     for m in svc.models().iter() {
         match &m.model {
@@ -529,7 +546,13 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
             tick.tick().await;
             let Some(svc) = svc.upgrade() else { return };
             let s = svc.sample();
-            svc.series.add(s);
+            if let Some(point) = svc.series.add(s) {
+                let changes = svc.alerts.check(&point);
+                if !changes.is_empty() {
+                    let svc = svc.clone();
+                    tokio::spawn(async move { svc.alerts.notify(&changes).await });
+                }
+            }
         }
     });
 }
@@ -569,8 +592,8 @@ pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, access: Access
     }
 }
 
-/// Serves gRPC: every call needs `access.token`, over TLS with
-/// `access.tls`.
+/// Serves gRPC: every call needs `access.token` or a key of the scope
+/// its method needs ([`crate::keys`]), over TLS with `access.tls`.
 pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access) -> Result<(), tonic::transport::Error> {
     use tokio_stream::StreamExt;
     // A gRPC answer is several small writes (headers, data, trailers); with
@@ -584,12 +607,16 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access
     });
     let token = access.token.clone();
     let counted = svc.clone();
-    let check = move |req: tonic::Request<()>| match &token {
-        Some(t) if !t.admits(req.metadata().get("authorization").and_then(|v| v.to_str().ok())) => {
+    // Who the call is from, for each method to check its scope.
+    let check = move |mut req: tonic::Request<()>| match counted.keys.resolve(token.as_ref(), req.metadata().get("authorization").and_then(|v| v.to_str().ok())) {
+        Some(who) => {
+            req.extensions_mut().insert(who);
+            Ok(req)
+        }
+        None => {
             counted.metrics.grpc("any", "Unauthenticated", 0.0);
             Err(tonic::Status::unauthenticated("missing or wrong token"))
         }
-        _ => Ok(req),
     };
     // A Write message carries rows, as an HTTP write's body does.
     let max_body = svc.max_body;
