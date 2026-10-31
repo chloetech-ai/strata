@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
 use crate::service::{After, QueryReq, Service, Stream};
-use crate::keys::{self, Principal, Scope};
+use crate::keys::{self, KeySet, Principal, Scope};
 use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
@@ -202,15 +202,16 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 }
 
 /// The least a method's credential needs ([`crate::keys`]): the internal
-/// methods the root (the token the servers of a cluster share), writes a
-/// write key, the log store and a profile an admin key (the log store
-/// shows every client's SQL; a profile as `/v1/profile` over HTTP),
+/// methods the root (the cluster's token, or the token of a server
+/// without one), writes a write key, the log store and a profile an admin
+/// key (the log store shows every client's SQL; a profile as
+/// `/v1/profile` over HTTP),
 /// the rest any key. What a call then does (a `Write` of a
 /// table's statement needs an admin key) the service checks, as for HTTP.
 /// Every method is named, so that a new one must say what it needs.
 fn method_scope(method: &str) -> Option<Scope> {
     match method {
-        "Replicate" | "Restore" | "Verify" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" => None,
+        "Replicate" | "Restore" | "Verify" | "Vote" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" | "Keys" => None,
         "Write" | "WriteStream" => Some(Scope::Write),
         "Logs" | "Profile" => Some(Scope::Admin),
         "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
@@ -223,7 +224,7 @@ fn method_scope(method: &str) -> Option<Scope> {
 fn may_call<T>(req: &Request<T>, method: &str) -> (Principal, Result<(), ApiError>) {
     let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
     let r = match method_scope(method) {
-        None if !who.root => Err(ApiError { status: 403, message: format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name) }),
+        None if !who.root => Err(ApiError { status: 403, message: format!("{method} is a call between the servers of a cluster: it needs the cluster's token ({:?} may not make it)", who.name) }),
         None => Ok(()),
         Some(need) => who.may(need, method),
     };
@@ -481,7 +482,7 @@ impl pb::strata_server::Strata for Grpc {
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
         self.serve("Hello", req, |svc, _who, _| async move {
             let n = svc.local_db().and_then(|db| db.storage().numbering()).unwrap_or_default();
-            Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), role: svc.role() as i32, term: n.term, seq_no: n.seq, replaced_by_term: svc.replaced_by(), ..hello() })
+            Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), role: svc.role() as i32, term: n.term, seq_no: n.seq, last_term: n.last().term, replaced_by_term: svc.replaced_by(), ..hello() })
         })
         .await
     }
@@ -496,6 +497,10 @@ impl pb::strata_server::Strata for Grpc {
 
     async fn verify(&self, req: Request<pb::VerifyRequest>) -> Result<Response<pb::VerifyResponse>, Status> {
         self.serve("Verify", req, |svc, _who, r| async move { svc.verify_for(r).await }).await
+    }
+
+    async fn vote(&self, req: Request<pb::VoteRequest>) -> Result<Response<pb::VoteResponse>, Status> {
+        self.serve("Vote", req, |svc, _who, r| async move { svc.vote(r).await }).await
     }
 
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
@@ -514,11 +519,16 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn configure(&self, req: Request<pb::ConfigureRequest>) -> Result<Response<pb::ConfigureResponse>, Status> {
-        self.serve("Configure", req, |svc, _who, r| async move {
+        self.serve("Configure", req, |svc, who, r| async move {
             let acks = match r.write_acks.as_str() {
                 "" => None,
                 a => Some(crate::replication::Acks::parse(a).ok_or_else(|| ApiError::bad(format!("write_acks is all, majority or primary, not {a:?}")))?),
             };
+            if r.promote && r.role() == pb::Role::Primary {
+                let acks = acks.unwrap_or_default();
+                svc.promote(&who, r.replicas, acks, r.force).await?;
+                return Ok(svc.configured());
+            }
             svc.configure(r.role(), r.replicas, acks, r.force).await
         })
         .await
@@ -553,6 +563,27 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("CleanupSlots", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
             Ok(pb::CleanupResponse { deleted: svc.cleanup_slots().await? })
+        })
+        .await
+    }
+
+    async fn keys(&self, req: Request<pb::KeysRequest>) -> Result<Response<pb::KeysResponse>, Status> {
+        self.serve("Keys", req, |svc, who, r| async move {
+            if who.is_open() {
+                return Err(ApiError {
+                    status: 409,
+                    message: "this server has no token: keys would close it to the servers that gave them, which send it none. Give the cluster's servers a --cluster-token to share keys".into(),
+                });
+            }
+            if !r.keys_json.is_empty() {
+                let given = KeySet::from_json(&r.keys_json).map_err(|e| ApiError::bad(format!("keys_json: {e}")))?;
+                let before = svc.keys.set();
+                if svc.keys.merge(&given)? {
+                    let after = svc.keys.set();
+                    keys::note(format!("merged keys from the cluster: {} keys, {} revoked (were {} and {})", after.keys.len(), after.revoked.len(), before.keys.len(), before.revoked.len()));
+                }
+            }
+            Ok(pb::KeysResponse { keys_json: serde_json::to_vec(&svc.keys.set()).map_err(ApiError::internal)? })
         })
         .await
     }

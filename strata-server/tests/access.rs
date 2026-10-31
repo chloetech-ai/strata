@@ -327,7 +327,7 @@ async fn an_open_server_s_first_key_closes_it() {
     assert_eq!(call(&base, "DELETE", &format!("/v1/admin/keys/{id}"), Some(&admin), None).await.0, 409);
     // The keys file keeps it.
     let again = Keys::open(dir.path().join("a.strata.keys.json")).unwrap();
-    assert!(again.resolve(None, Some(&format!("Bearer {admin}"))).is_some());
+    assert!(again.resolve(None, None, Some(&format!("Bearer {admin}"))).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,0 +1,154 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "strataclusters.strata.chloetech.ai"
+  },
+  "spec": {
+    "group": "strata.chloetech.ai",
+    "names": {
+      "kind": "StrataCluster",
+      "listKind": "StrataClusterList",
+      "plural": "strataclusters",
+      "shortNames": [
+        "strata"
+      ],
+      "singular": "stratacluster"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.shards",
+            "name": "Shards",
+            "type": "integer"
+          },
+          {
+            "jsonPath": ".spec.replicas",
+            "name": "Copies",
+            "type": "integer"
+          },
+          {
+            "jsonPath": ".status.phase",
+            "name": "Phase",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.message",
+            "name": "Message",
+            "priority": 1,
+            "type": "string"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "properties": {
+              "spec": {
+                "properties": {
+                  "args": {
+                    "description": "More arguments for every server.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "coordinatorResources": {
+                    "description": "Resources of each coordinator's container.",
+                    "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true
+                  },
+                  "coordinators": {
+                    "description": "Coordinators behind the cluster's Service (default 1).",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "demo": {
+                    "description": "Instead of a schema: this many demo products, split over the shards the cluster starts with.",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "failoverAfterMs": {
+                    "description": "--failover-after-ms of every server (default 3000; 0: failover by hand).",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "image": {
+                    "description": "The strata-server image of every server (default strata-server:dev).",
+                    "type": "string"
+                  },
+                  "imagePullPolicy": {
+                    "type": "string"
+                  },
+                  "replicas": {
+                    "description": "Copies of each shard: a primary and its replicas (default 3).",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "resources": {
+                    "description": "Resources of each server's container.",
+                    "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true
+                  },
+                  "schema": {
+                    "description": "The first table's schema, as strata-server --schema takes it.",
+                    "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true
+                  },
+                  "shards": {
+                    "description": "Shards, each holding a part of the 4,096 slots (default 1).",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "storage": {
+                    "properties": {
+                      "size": {
+                        "description": "Each copy's volume (default 10Gi).",
+                        "type": "string"
+                      },
+                      "storageClassName": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "tokenSecret": {
+                    "description": "A Secret whose key token every server and coordinator requires.",
+                    "type": "string"
+                  },
+                  "writeAcks": {
+                    "description": "--write-acks of every primary (default all).",
+                    "enum": [
+                      "all",
+                      "majority",
+                      "primary"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "status": {
+                "description": "What the operator found and does.",
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": true
+              }
+            },
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}
