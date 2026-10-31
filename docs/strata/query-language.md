@@ -612,7 +612,7 @@ curl -s localhost:7700/v1/query -d '{"sql": "SELECT id, title FROM docs ORDER BY
 # {"columns": ["id", "title"], "rows": [...], "request": "9f0c...", "teams": ["rated", "bm25", "bm25", "rated", ...], "logged": {"rows": 10, ...}}
 
 curl -s localhost:7700/v1/rank_log/interleaving -d '{"events": {"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"}, "window": "30 minutes"}'
-# {"pairs": [{"variants": ["bm25", "rated"], "requests": 4120, "acted": 1630, "wins": [690, 820], "ties": 120, "delta": -0.043, "p": 0.00089}], "took_ms": 61.3}
+# {"pairs": [{"variants": ["bm25", "rated"], "requests": 4120, "acted": 1630, "wins": [690, 820], "ties": 120, "delta": -0.040, "p": 0.00089}], "took_ms": 61.3}
 ```
 
 - **The list** is team draft (Radlinski, Kurup and Joachims, CIKM 2008): both queries run, on one snapshot, and in each round the ranking with fewer rows in the list, or a coin's choice when they have as many, adds its best row not yet in it, up to the logged query's `LIMIT`. A row both rankings hold goes to the one that took it. The coin is seeded by the request's id, so the same request draws the same list. When one ranking runs out, the other's rows fill the list for neither team. `teams` in the answer names each row's ranking; show the rows, not the teams.
