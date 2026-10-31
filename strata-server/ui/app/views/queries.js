@@ -37,7 +37,7 @@ export function queryDrawer(q) {
   const d = drawer({
     title: h("span", { class: "row nw" }, pill(OUTCOMES[q.outcome] || "info", q.outcome), `${fmt.ms(q.ms)} · ${q.kind}`), sub: `${fmt.datetime(q.ts_ms)} · ${fmt.plural(q.rows, "row")}${q.shard ? " · for a coordinator" : ""}`, wide: true,
     body: [
-      h("div", { class: "row between" }, h("b", {}, "SQL"), h("div", { class: "row" }, h("button", { class: "btn sm", onclick: () => copy(q.sql, "SQL copied") }, icon("copy"), "Copy"), h("a", { class: "btn sm", href: "#/classic", title: "Run it in the console" }, icon("play"), "Open the console"))),
+      h("div", { class: "row between" }, h("b", {}, "SQL"), h("div", { class: "row" }, h("button", { class: "btn sm", onclick: () => copy(q.sql, "SQL copied") }, icon("copy"), "Copy"), h("a", { class: "btn sm", href: "#/sql?q=" + encodeURIComponent(q.sql), title: "Open it in the SQL workbench", onclick: () => d.close() }, icon("play"), "Open in the workbench"))),
       sqlBlock(q.sql),
       q.error ? h("div", { class: "error" }, q.error) : null,
       h("dl", { class: "kv" }, [["shape", h("span", { class: "mono small" }, q.fingerprint)], ["request id", q.request_id ? h("span", { class: "row nw" }, h("span", { class: "mono" }, q.request_id), h("button", { class: "btn ghost icon sm", title: "Copy", onclick: () => copy(q.request_id) }, icon("copy")), h("a", { class: "btn ghost sm", href: "#/logs?request=" + encodeURIComponent(q.request_id) }, "Its logs", icon("right"))) : "–"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])),

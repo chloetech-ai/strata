@@ -26,7 +26,7 @@ function setAttrs(e, attrs) {
     if (v == null || v === false) continue;
     if (k === "class") e.setAttribute("class", v);
     else if (k === "text") e.textContent = v;
-    else if (k === "style" && typeof v === "object") Object.assign(e.style, v);
+    else if (k === "style" && typeof v === "object") for (const [p, x] of Object.entries(v)) { if (p.startsWith("--")) e.style.setProperty(p, x); else e.style[p] = x; }
     else if (k === "dataset") Object.assign(e.dataset, v);
     else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v);
     else if (k === "value" && "value" in e) e.value = v;
@@ -155,6 +155,8 @@ if (token) { try { sessionStorage.setItem("strata.token", token); } catch { /* p
 if (new URLSearchParams(location.search).has("token")) { try { history.replaceState(null, "", location.pathname + location.hash); } catch { /* old browser */ } }
 export function setToken(t) { token = t || null; try { if (t) sessionStorage.setItem("strata.token", t); else sessionStorage.removeItem("strata.token"); } catch { /* private mode */ } bus.emit("token"); }
 export const hasToken = () => !!token;
+/** The Authorization header, for requests `api` cannot make (an upload with progress). */
+export const authHeader = () => (token ? { authorization: "Bearer " + token } : {});
 
 export class ApiError extends Error {
   constructor(status, message, body) { super(message); this.status = status; this.body = body; }
