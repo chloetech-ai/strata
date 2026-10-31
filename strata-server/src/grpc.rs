@@ -146,8 +146,9 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         hold: r.hold,
         release: r.release,
         after: After::of(r.min_seq_no, r.min_seq_nos)?,
-        // A shard measures CPU time when set to for every query.
-        profile: false,
+        // A coordinator's query that asked for its steps' CPU time; a shard
+        // also measures it when set to for every query.
+        profile: r.profile,
         quiet: false,
     })
 }
@@ -202,7 +203,8 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 
 /// The least a method's credential needs ([`crate::keys`]): the internal
 /// methods the root (the token the servers of a cluster share), writes a
-/// write key, the log store an admin key (it shows every client's SQL),
+/// write key, the log store and a profile an admin key (the log store
+/// shows every client's SQL; a profile as `/v1/profile` over HTTP),
 /// the rest any key. What a call then does (a `Write` of a
 /// table's statement needs an admin key) the service checks, as for HTTP.
 /// Every method is named, so that a new one must say what it needs.
@@ -210,7 +212,7 @@ fn method_scope(method: &str) -> Option<Scope> {
     match method {
         "Replicate" | "Restore" | "Verify" | "Vote" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" => None,
         "Write" | "WriteStream" => Some(Scope::Write),
-        "Logs" => Some(Scope::Admin),
+        "Logs" | "Profile" => Some(Scope::Admin),
         "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
         // An unknown method is the root's.
         _ => None,
@@ -568,6 +570,17 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("Release", req, |svc, _who, r| async move {
             svc.release(&r.snapshots);
             Ok(pb::Empty {})
+        })
+        .await
+    }
+
+    async fn profile(&self, req: Request<pb::ProfileRequest>) -> Result<Response<pb::ProfileResponse>, Status> {
+        self.serve("Profile", req, |svc, _, r| async move {
+            let body: serde_json::Value = if r.body_json.is_empty() { serde_json::Value::Null } else { serde_json::from_slice(&r.body_json).map_err(|e| ApiError::bad(format!("bad profile body: {e}")))? };
+            let asked = crate::profiling::Asked { kind: crate::profiling::Kind::of(&r.kind)?, body, folded: r.folded, in_use: r.in_use };
+            // Audited as an admin's request over HTTP is.
+            keys::note(format!("a {} profile", asked.kind.name()));
+            Ok(pb::ProfileResponse { body: crate::profiling::take(&svc, asked).await?.bytes() })
         })
         .await
     }

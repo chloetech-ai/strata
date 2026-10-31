@@ -33,7 +33,7 @@ fn build(f: &Fixture, opts: BuildOptions) -> VectorReader {
     let schema = Schema::new("t", vec![Field::new("emb", FieldType::Vector { dim: 1024, index: VectorIndexKind::Flat }).not_stored()], None).unwrap();
     let docs: Vec<Vec<Value>> = f.docs.iter().map(|v| vec![Value::Vector(v.clone())]).collect();
     let seg = SegmentFile::from_vec(build_segment(&schema, &docs, &opts).unwrap()).unwrap();
-    VectorReader::open(&seg, "emb").unwrap()
+    VectorReader::open(&seg, &schema.key_of("emb").unwrap()).unwrap()
 }
 
 /// Mean recall@10 of `strategy` against exact search (optionally filtered).

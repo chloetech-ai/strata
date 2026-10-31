@@ -139,6 +139,12 @@ pub struct DbOptions {
     /// none. A replica further behind than this needs a copy of the
     /// segments first.
     pub ship_log_bytes: usize,
+    /// Open a database written before field ids
+    /// ([`crate::storage::manifest::FIELD_IDS`]), which opening refuses
+    /// otherwise: to copy it into a new database ([`crate::upgrade`]). It
+    /// stays in its format: what is written to it meanwhile is written as
+    /// the versions of Strata before field ids wrote it.
+    pub open_old: bool,
 }
 
 /// How a database is laid out on disk.
@@ -182,6 +188,7 @@ impl Default for DbOptions {
             verify_checksums: false,
             check_sections: true,
             ship_log_bytes: 0,
+            open_old: false,
         }
     }
 }
@@ -526,7 +533,7 @@ impl<'a> ClusterKey<'a> {
 /// cluster_by field `f`, read from the inputs' columns: a keyword's is its
 /// rank among every input's values, so that keys compare as the values do.
 fn cluster_keys(schema: &Schema, f: usize, views: &[&SegmentView], order: &[(u32, DocId)]) -> Result<Vec<Option<i64>>> {
-    let name = &schema.fields[f].name;
+    let name = &schema.fields[f].key();
     match schema.fields[f].ty {
         FieldType::Keyword => {
             let cols = views.iter().map(|v| crate::forward::KeywordColumn::open(&v.file, name)).collect::<Result<Vec<_>>>()?;
@@ -766,6 +773,9 @@ impl Database {
     /// nothing (and a hidden `.<name>.creating-…` beside it, which can be
     /// deleted): `path` can be created again.
     pub fn create(path: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
+        // A table read from a database written before field ids gets them.
+        let schema = if schema.is_legacy() { schema.with_new_ids()? } else { schema };
+        schema.check_ids()?;
         if let Some(f) = schema.fields.iter().find(|f| f.references.as_ref().is_some_and(|r| !r.eq_ignore_ascii_case(&schema.table))) {
             let r = f.references.as_deref().unwrap_or_default();
             return Err(Error::Schema(format!("field {}: references {r}, and a new database has no table but {}", f.name, schema.table)));
@@ -870,7 +880,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open_in(path, m, &t.schema, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         let meta = dir_meta(&cur);
         Database::assemble(path, path.join(dir::WAL), Some(path.to_path_buf()), lockf, opts, manifest, meta, 0, FreeList::new(META_PAGES), OwnedBytes::empty(), handles)
@@ -928,7 +938,7 @@ impl Database {
         let handles = manifest
             .tables
             .iter()
-            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
+            .map(|t| t.segments.iter().map(|m| SegHandle::open(&map, m, &t.schema, opts.read_ahead, opts.read_ahead && opts.random_hints, opts.check_at_open()).map(Arc::new)).collect())
             .collect::<Result<_>>()?;
         Ok((manifest, freelist, map, handles))
     }
@@ -949,6 +959,12 @@ impl Database {
         map: OwnedBytes,
         handles: Vec<Vec<Arc<SegHandle>>>,
     ) -> Result<Database> {
+        if manifest.is_legacy() && !opts.open_old {
+            return Err(Error::Schema(format!(
+                "{} was written by a version of Strata from before field ids, which this one opens only to copy it into a new database: run strata::upgrade on it (strata-server upgrade, or strata.upgrade in Python; engram upgrades its stores itself)",
+                path.display()
+            )));
+        }
         let fits = |table: u32, op: &Op| manifest.table(table).is_none_or(|t| op_fits(&t.schema, op));
         let numbered = manifest.seq_no.is_some();
         let (sealed, mut txns, cut) = read_sealed_wals(&wal_path, &manifest, meta.db_id, opts.wal_drop_damaged, &fits)?;
@@ -1137,6 +1153,14 @@ impl Database {
             f.references = Some(t.table.clone());
         }
         let mut vw = VersionWriter::begin(self);
+        if vw.manifest.is_legacy() {
+            // Opened to be copied: it stays as it was written.
+            schema = schema.without_ids();
+        } else if schema.is_legacy() {
+            // A table read from a database written before field ids.
+            schema = schema.with_new_ids()?;
+        }
+        schema.check_ids()?;
         let id = vw.manifest.next_table_id;
         vw.manifest.next_table_id += 1;
         vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new(), profiles: Vec::new() });
@@ -1233,7 +1257,8 @@ impl Database {
             return Ok(());
         }
         let mut vw = VersionWriter::begin(self);
-        vw.manifest.tables.push(TableMeta { id: SOURCES_ID, schema: sources_schema(), segments: Vec::new(), profiles: Vec::new() });
+        let schema = if vw.manifest.is_legacy() { sources_schema().without_ids() } else { sources_schema() };
+        vw.manifest.tables.push(TableMeta { id: SOURCES_ID, schema, segments: Vec::new(), profiles: Vec::new() });
         let c = vw.commit(wal)?;
         self.publish(c, |_| {})
     }
@@ -2166,6 +2191,11 @@ impl Database {
             let file = SegmentFile::open(OwnedBytes::new(bytes.clone()))
                 .and_then(|f| f.verify_sections().map(|()| f))
                 .map_err(|e| Error::Schema(format!("{}: {e}", path.display())))?;
+            // Written for the table as it is: its fields, by the same ids.
+            let ids = (!self.schema.is_legacy()).then(|| self.schema.fields.iter().map(|f| f.id).collect::<Vec<_>>());
+            if file.field_ids()? != ids {
+                return Err(Error::Schema(format!("{}: was written for other fields than table {}'s (the field ids differ)", path.display(), self.schema.table)));
+            }
             let keys = crate::storage::pk::PkIndex::open(&file)?;
             if pk.is_some() != keys.is_some() {
                 return Err(Error::Schema(format!("{}: primary key index does not match the table", path.display())));
@@ -2317,7 +2347,7 @@ impl Database {
             .segments()
             .iter()
             .map(|v| {
-                let expired = retention.map_or(0, |(f, cutoff)| self.expired_in(v, &snap.schema().fields[f].name, cutoff));
+                let expired = retention.map_or(0, |(f, cutoff)| self.expired_in(v, &snap.schema().fields[f].key(), cutoff));
                 SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0) }
             })
             .collect();
@@ -2394,7 +2424,7 @@ impl Database {
             // Rows past the table's retention are dropped as deleted ones
             // are (their time is not changed in place).
             if let Some((f, cutoff)) = claim.retention {
-                let times = crate::forward::NumericColumn::open(&v.file, &schema.fields[f].name)?;
+                let times = crate::forward::NumericColumn::open(&v.file, &schema.fields[f].key())?;
                 let before = live.len();
                 live.retain(|&d| times.get_i64(d).is_none_or(|t| t >= cutoff));
                 stats.docs_expired += (before - live.len()) as u64;
@@ -2956,6 +2986,7 @@ impl Database {
         if meta != st_meta || manifest.encode() != st_manifest.encode() {
             return Err(corrupt("on-disk version differs from the open one"));
         }
+        check_field_lists(&manifest, &handles)?;
         let mut used = vec![false; meta.page_count as usize];
         let mut claim = |what: &str, page: u64, pages: u64| -> Result<()> {
             for p in page..page + pages {
@@ -3030,6 +3061,7 @@ impl Database {
         if on_disk.encode() != manifest.encode() || cur.txn != meta.txn {
             return Err(corrupt("on-disk version differs from the open one"));
         }
+        check_field_lists(&manifest, &handles)?;
         for (s, h) in manifest.segments().zip(&handles) {
             let name = s.file.as_deref().ok_or_else(|| corrupt(format!("segment {} has no file", s.id)))?;
             if crc32fast::hash(&std::fs::read(d.join(name))?) != s.crc {
@@ -3121,8 +3153,8 @@ impl Database {
                     .iter()
                     .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
                         (Some(h), _) => Ok(h.clone()),
-                        (None, Some(d)) => SegHandle::open_in(d, m, self.opts.read_ahead, hints, check).map(Arc::new),
-                        (None, None) => SegHandle::open(&map, m, self.opts.read_ahead, hints, check).map(Arc::new),
+                        (None, Some(d)) => SegHandle::open_in(d, m, &t.schema, self.opts.read_ahead, hints, check).map(Arc::new),
+                        (None, None) => SegHandle::open(&map, m, &t.schema, self.opts.read_ahead, hints, check).map(Arc::new),
                     })
                     .collect::<Result<Vec<_>>>()
             })
@@ -3346,7 +3378,7 @@ impl Database {
         drop(st);
         let field = &t.schema.fields[f];
         Ok(if field.indexed && matches!(field.ty, FieldType::Int | FieldType::Float) {
-            crate::forward::NumericColumn::open(&h.file, &field.name)?.get(d)
+            crate::forward::NumericColumn::open(&h.file, &field.key())?.get(d)
         } else {
             crate::forward::DocStore::open(&h.file, &t.schema)?.get_fields(d, &[f]).pop().unwrap_or(Value::Null)
         })
@@ -4092,7 +4124,7 @@ impl<'a> VersionWriter<'a> {
         }
         let (mut upd, mut updates_crc, mut updates_file) = (None, 0, None);
         if let Some(u) = updates {
-            let b = u.encode();
+            let b = u.encode(&self.manifest.table(table).expect("table of a new segment").schema);
             let (e, f) = self.write_as(&b, dir::updates_name(id, self.txn))?;
             (upd, updates_file, updates_crc) = (Some(e), f, crc32fast::hash(&b));
         }
@@ -4152,7 +4184,8 @@ impl<'a> VersionWriter<'a> {
     /// `newer`.
     fn add_updates(&mut self, id: u64, newer: &Updates) -> Result<()> {
         let h = lock(&self.db.state).handle(id).cloned().expect("segment of a pending update");
-        let b = Updates::merged(h.updates.as_deref(), newer).encode();
+        let schema = &self.manifest.tables.iter().find(|t| t.segments.iter().any(|s| s.id == id)).expect("table of a segment").schema;
+        let b = Updates::merged(h.updates.as_deref(), newer).encode(schema);
         let (e, file) = self.write_as(&b, dir::updates_name(id, self.txn))?;
         let s = self.manifest.segment_mut(id).expect("segment in manifest");
         match (s.updates, s.updates_file.take()) {
@@ -4359,6 +4392,31 @@ pub struct DropOptions {
     pub cascade: bool,
     /// Skip names that are not tables (SQL `IF EXISTS`), instead of failing.
     pub if_exists: bool,
+}
+
+/// Checks that each segment lists the fields it was written with
+/// ([`crate::segment::FIELDS`]: ids, none twice, each one its table has
+/// given), or, in a database written before field ids, lists none.
+/// `handles` are the version's segments in the manifest's order.
+fn check_field_lists(manifest: &Manifest, handles: &[Arc<SegHandle>]) -> Result<()> {
+    let mut hs = handles.iter();
+    for t in &manifest.tables {
+        for s in &t.segments {
+            let h = hs.next().ok_or_else(|| corrupt("the open version has fewer segments than its manifest"))?;
+            match (t.schema.is_legacy(), h.file.field_ids()?) {
+                (true, None) => {}
+                (false, Some(mut ids)) => {
+                    ids.sort_unstable();
+                    if ids.windows(2).any(|w| w[0] == w[1]) || ids.last().is_some_and(|&id| id >= t.schema.next_field_id) {
+                        return Err(corrupt(format!("segment {} lists fields its table {} never had, or one twice", s.id, t.schema.table)));
+                    }
+                }
+                (true, Some(_)) => return Err(corrupt(format!("segment {} lists field ids, and its table {} has none", s.id, t.schema.table))),
+                (false, None) => return Err(corrupt(format!("segment {} does not list the fields it was written with", s.id))),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Table names are plain identifiers, so SQL can name them unquoted.

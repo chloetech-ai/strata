@@ -225,6 +225,9 @@ impl<'a> SegmentBuild<'a> {
         for s in built.into_iter().flatten() {
             out.append(s);
         }
+        if !self.schema.is_legacy() {
+            out.put(super::FIELDS, super::encode_field_ids(self.schema));
+        }
         Ok(out)
     }
 

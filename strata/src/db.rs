@@ -447,7 +447,13 @@ impl Db {
     /// a derived TEXT field, by its model ([`crate::schema::Derive`]).
     /// Returns the rows loaded.
     pub fn load_from(&self, other: &Db) -> Result<u64> {
-        let (old, new) = (other.schema(), self.schema());
+        self.load_table_from(&self.schema().table, other, &other.schema().table)
+    }
+
+    /// [`Db::load_from`] of the rows of table `from` of `other` into this
+    /// database's table `table`.
+    pub fn load_table_from(&self, table: &str, other: &Db, from: &str) -> Result<u64> {
+        let (old, new) = (&*other.table(from)?, &*self.table(table)?);
         if let Some(f) = old.unrebuildable() {
             return Err(crate::Error::Schema(format!("{} is not stored, so its values cannot be copied", f.name)));
         }
@@ -468,7 +474,7 @@ impl Db {
                 keep.then_some(j)
             })
             .collect();
-        let snap = other.snapshot();
+        let snap = other.snapshot().table(from).ok_or_else(|| Error::Query(format!("no such table: {from}")))?;
         let mut failed = None;
         let mut n = 0u64;
         let docs = other.documents(&snap).map_while(|d| match d {
@@ -481,7 +487,7 @@ impl Db {
                 None
             }
         });
-        self.load(docs)?;
+        self.load_into(table, docs)?;
         match failed {
             Some(e) => Err(e),
             None => Ok(n),
@@ -691,7 +697,7 @@ impl Db {
         let FieldType::Vector { dim, .. } = f.ty else { return Err(Error::Schema(format!("field {field} is not a VECTOR field"))) };
         let mut vectors = Vec::new();
         for v in snap.segments() {
-            let r = VectorReader::open(&v.file, &f.name)?;
+            let r = VectorReader::open(&v.file, &f.key())?;
             for d in 0..v.file.n_docs() as DocId {
                 if v.live.as_ref().is_none_or(|l| l.contains(d)) && r.has_vector(d) {
                     vectors.extend_from_slice(r.vector(d));
@@ -1778,13 +1784,13 @@ impl DocumentSource for StoredSource {
         for (i, f) in schema.fields.iter().enumerate() {
             match f.ty {
                 FieldType::Edges if !f.stored && f.indexed => {
-                    if let Some(g) = crate::graph::GraphReader::open(seg, &f.name)? {
+                    if let Some(g) = crate::graph::GraphReader::open(seg, &f.key())? {
                         edges.push((i, g));
                     }
                 }
-                FieldType::Vector { .. } => vectors.push((i, VectorReader::open(seg, &f.name)?)),
-                FieldType::Int | FieldType::Float if !f.stored && f.indexed => numeric.push((i, NumericColumn::open(seg, &f.name)?)),
-                FieldType::Keyword if !f.stored && f.indexed => keyword.push((i, KeywordColumn::open(seg, &f.name)?)),
+                FieldType::Vector { .. } => vectors.push((i, VectorReader::open(seg, &f.key())?)),
+                FieldType::Int | FieldType::Float if !f.stored && f.indexed => numeric.push((i, NumericColumn::open(seg, &f.key())?)),
+                FieldType::Keyword if !f.stored && f.indexed => keyword.push((i, KeywordColumn::open(seg, &f.key())?)),
                 _ => {}
             }
         }

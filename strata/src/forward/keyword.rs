@@ -88,6 +88,8 @@ pub enum FacetStrategy {
 /// Builds the three sections of a KEYWORD field.
 pub(crate) struct KeywordBuilder {
     name: String,
+    /// Names its sections ([`Field::key`]).
+    key: String,
     rare: usize,
     ids: HashMap<String, u32>,
     /// Provisional id (first-seen order) per document.
@@ -102,7 +104,7 @@ pub(crate) struct KeywordBuilder {
 impl KeywordBuilder {
     pub fn new(field: &Field, opts: &BuildOptions) -> Result<Self> {
         let rare = super::usize_option(opts, "forward.kw_rare", DEFAULT_RARE)?;
-        Ok(KeywordBuilder { name: field.name.clone(), rare, ids: HashMap::new(), docs: Vec::new(), multi: field.multi, media: field.media.is_some(), extra: Vec::new() })
+        Ok(KeywordBuilder { name: field.name.clone(), key: field.key(), rare, ids: HashMap::new(), docs: Vec::new(), multi: field.multi, media: field.media.is_some(), extra: Vec::new() })
     }
 
     fn id(&mut self, v: &Value) -> Result<u32> {
@@ -162,13 +164,13 @@ impl FieldIndexBuilder for KeywordBuilder {
         w.u64(VERSION);
         w.array(&offs);
         w.array(&bytes);
-        out.put(format!("kw.{}.dict", self.name), w.finish());
+        out.put(format!("kw.{}.dict", self.key), w.finish());
 
         // Codes.
         let mut w = ByteWriter::new();
         w.u64(VERSION);
         write_blocks(&codes.iter().map(|c| c.map(|c| c as i64)).collect::<Vec<_>>(), &mut w);
-        out.put(format!("kw.{}.codes", self.name), w.finish());
+        out.put(format!("kw.{}.codes", self.key), w.finish());
 
         // Postings: documents grouped by code (counting sort keeps them
         // sorted), rare values in one array, the others as Pyramids. A
@@ -220,11 +222,11 @@ impl FieldIndexBuilder for KeywordBuilder {
         w.array(&rare);
         w.array(&pyr_codes);
         write_lists(&mut w, &lists);
-        out.put(format!("kw.{}.post", self.name), w.finish());
+        out.put(format!("kw.{}.post", self.key), w.finish());
         if self.multi {
             let mut w = ByteWriter::new();
             w.u64(VERSION);
-            out.put(format!("kw.{}.multi", self.name), w.finish());
+            out.put(format!("kw.{}.multi", self.key), w.finish());
         }
         Ok(())
     }

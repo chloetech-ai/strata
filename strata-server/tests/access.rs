@@ -152,6 +152,19 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     let mut rd = client(read2).await;
     assert_eq!(rd.write(pb::WriteRequest::default()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     assert!(rd.health(pb::Empty {}).await.is_ok());
+    // A profile, as over HTTP, needs an admin key (or the token).
+    let threads = || pb::ProfileRequest { kind: "threads".into(), ..Default::default() };
+    assert_eq!(rd.profile(threads()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(wr.profile(threads()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    let j: Json = serde_json::from_slice(&ops.profile(threads()).await.unwrap().into_inner().body).unwrap();
+    assert!(j["threads"].is_array(), "{j}");
+    assert!(rootc.profile(pb::ProfileRequest { kind: "memory".into(), ..Default::default() }).await.is_ok());
+    assert_eq!(ops.profile(pb::ProfileRequest { kind: "disk".into(), ..Default::default() }).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+    // An admin's profile is audited, as over HTTP, and so is a refused one.
+    let (_, audit) = call(&base, "GET", "/v1/admin/audit", root, None).await;
+    let entries = audit["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|e| e["method"] == "gRPC" && e["route"] == "Profile" && e["who"] == "ops" && e["status"] == 200 && e["detail"] == "a threads profile"), "{audit}");
+    assert!(entries.iter().any(|e| e["method"] == "gRPC" && e["route"] == "Profile" && e["status"] == 403), "{audit}");
     let mut nobody = client("sk_00000000_ff".into()).await;
     assert_eq!(nobody.health(pb::Empty {}).await.unwrap_err().code(), tonic::Code::Unauthenticated);
 }

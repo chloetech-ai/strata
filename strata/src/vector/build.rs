@@ -122,7 +122,7 @@ impl VectorBuilder {
             other => return Err(Error::Schema(format!("unknown vector index {other:?}"))),
         };
         Ok(VectorBuilder {
-            field: field.name.clone(),
+            field: field.key(),
             dim: *dim,
             stride: strides(*dim).0,
             kind,

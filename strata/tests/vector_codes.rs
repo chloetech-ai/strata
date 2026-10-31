@@ -15,6 +15,9 @@ use strata::vector::codes::BINARY_RERANK;
 use strata::vector::{Hit, SearchParams, Strategy, VectorReader};
 use strata::{Field, FieldType, Schema, Value, VectorCodes, VectorIndexKind};
 
+/// The sections of field `emb`, the table's only field (id 0).
+const EMB: &str = "f0";
+
 fn gaussian(rng: &mut impl Rng) -> f32 {
     let (u, v): (f64, f64) = (rng.gen_range(1e-12..1.0), rng.gen());
     ((-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()) as f32
@@ -86,8 +89,8 @@ fn binary_codes_are_a_32nd_of_the_vectors_and_rescore_exactly() {
     let (dim, n) = (384, 3000);
     let vecs: Vec<Option<Vec<f32>>> = embeddings(n, dim, 40, 1).into_iter().map(Some).collect();
     let queries = embeddings(40, dim, 40, 2);
-    let bin = VectorReader::open(&segment(&vecs, dim, VectorCodes::Binary, &opts("flat")), "emb").unwrap();
-    let sq8 = VectorReader::open(&segment(&vecs, dim, VectorCodes::Sq8, &opts("flat")), "emb").unwrap();
+    let bin = VectorReader::open(&segment(&vecs, dim, VectorCodes::Binary, &opts("flat")), EMB).unwrap();
+    let sq8 = VectorReader::open(&segment(&vecs, dim, VectorCodes::Sq8, &opts("flat")), EMB).unwrap();
     assert_eq!(bin.info().codes, VectorCodes::Binary);
     assert_eq!(bin.code_bytes(), n * dim / 8);
     assert_eq!(sq8.code_bytes(), n * dim);
@@ -123,7 +126,7 @@ fn every_index_and_filter_strategy_searches_binary_codes() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(5);
     let filters: Vec<DocSet> = [0.01, 0.2].iter().map(|&p| DocSet::from_sorted((0..n as u32).filter(|_| rng.gen_bool(p)).collect(), n as u32)).collect();
     for kind in ["flat", "ivf", "hnsw"] {
-        let r = VectorReader::open(&segment(&vecs, dim, VectorCodes::Binary, &opts(kind)), "emb").unwrap();
+        let r = VectorReader::open(&segment(&vecs, dim, VectorCodes::Binary, &opts(kind)), EMB).unwrap();
         assert_eq!(r.index_kind(), kind);
         let p = SearchParams { nprobe: 8, ef: 64, ..Default::default() };
         let got = recall(&r, &vecs, &queries, &p, None);
@@ -144,9 +147,9 @@ fn every_index_and_filter_strategy_searches_binary_codes() {
 fn build_option_overrides_the_schema() {
     let dim = 64;
     let vecs: Vec<Option<Vec<f32>>> = embeddings(500, dim, 8, 6).into_iter().map(Some).collect();
-    let r = VectorReader::open(&segment(&vecs, dim, VectorCodes::Sq8, &opts("flat").set("vector.codes", "binary")), "emb").unwrap();
+    let r = VectorReader::open(&segment(&vecs, dim, VectorCodes::Sq8, &opts("flat").set("vector.codes", "binary")), EMB).unwrap();
     assert_eq!(r.info().codes, VectorCodes::Binary);
-    let r = VectorReader::open(&segment(&vecs, dim, VectorCodes::Binary, &opts("hnsw").set("vector.codes", "sq8")), "emb").unwrap();
+    let r = VectorReader::open(&segment(&vecs, dim, VectorCodes::Binary, &opts("hnsw").set("vector.codes", "sq8")), EMB).unwrap();
     assert_eq!(r.info().codes, VectorCodes::Sq8);
     let schema = Schema::new("t", vec![Field::new("emb", FieldType::Vector { dim, index: VectorIndexKind::Flat })], None).unwrap();
     let docs = vec![vec![Value::Vector(Arc::from(vecs[0].as_deref().unwrap()))]];
