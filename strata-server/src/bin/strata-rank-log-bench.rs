@@ -173,7 +173,7 @@ async fn main() {
     db.spawn_flusher();
     db.spawn_merger(Default::default());
     let db = Arc::new(db);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = Arc::new(Service::new(Backend::Local(db.clone()), schema, agent(), 64, Duration::from_secs(60)));
     let url = http(svc).await;
     eprintln!("loaded {} docs and {} events in {:.1} s", a.docs, a.events, t0.elapsed().as_secs_f64());

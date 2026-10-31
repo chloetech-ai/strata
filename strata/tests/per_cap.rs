@@ -162,7 +162,7 @@ fn a_capped_subquery_and_the_plan() {
     let q = "SELECT id FROM clips ORDER BY bm25(transcript, 'dog') DESC MAX 3 PER video LIMIT 10";
     let plan = db.explain(q, &Params::new()).unwrap();
     assert!(plan.features.iter().any(|f| f == "per_cap") && plan.features.iter().any(|f| f == "distinct_on"), "{:?}", plan.features);
-    let text = plan.explain(&[db.schema()]).join("\n");
+    let text = plan.explain(&[&db.schema()]).join("\n");
     assert!(text.contains("At most 3 per: video"), "{text}");
     // The plan as JSON runs alike.
     let json = plan.to_json_text().unwrap();

@@ -26,7 +26,7 @@ use crate::query::model::Models;
 use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
 use crate::rank_log::{self, Export, Log, Logged};
-use crate::schema::{Derive, Embed, FieldType, Schema};
+use crate::schema::{Alter, Derive, Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Mask, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
@@ -142,7 +142,7 @@ pub struct Db {
     /// On-disk segments keep their id for life (deletes travel with the
     /// snapshot, not the readers), but a vacuum can move their bytes;
     /// in-memory ones get a fresh id per rebuild.
-    readers: RwLock<HashMap<u64, (usize, Arc<SegmentReaders>)>>,
+    readers: RwLock<HashMap<u64, (usize, Arc<Schema>, Arc<SegmentReaders>)>>,
     pub exec: ExecOptions,
     /// Models of embedded VECTOR fields ([`Db::set_embedder_in`]).
     embedders: RwLock<Vec<Model>>,
@@ -232,7 +232,7 @@ impl Db {
 
     /// The schema of the database's first table, which the methods here
     /// that name no table write.
-    pub fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> Arc<Schema> {
         self.storage.schema()
     }
 
@@ -293,6 +293,53 @@ impl Db {
             self.open_embedders_of(&name, &dir);
         }
         self.open_codebooks_of(&name, &models);
+        Ok(())
+    }
+
+    /// Changes the columns of the table named `table`
+    /// ([`Database::alter_table`], SQL `ALTER TABLE`). The models of its
+    /// embedded and derived columns follow them: a renamed column keeps
+    /// its, and so does one whose sources are renamed; an added one gets
+    /// its as a new table's columns do, after [`Db::open_embedders`].
+    pub fn alter_table(&self, table: &str, alters: &[Alter]) -> Result<()> {
+        let before = self.table(table)?;
+        self.storage.alter_table(table, alters)?;
+        let after = self.table(table)?;
+        // A model serves a field by its table's and its own name, and the
+        // spec it was given; the field it served, by id, now.
+        let now = |field: &str| before.field(field).and_then(|b| after.fields.iter().find(|a| a.id == b.id).map(|a| (b, a)));
+        let ours = |t: &str| t.eq_ignore_ascii_case(&before.table);
+        self.embedders.write().unwrap_or_else(|e| e.into_inner()).retain_mut(|m| {
+            if !ours(&m.table) {
+                return true;
+            }
+            let Some((b, a)) = now(&m.field) else { return false };
+            if let (Some(was), Some(is)) = (&b.embed, &a.embed) {
+                if *was == m.embed {
+                    m.embed = is.clone();
+                }
+            }
+            m.field = a.name.clone();
+            true
+        });
+        self.derivers.write().unwrap_or_else(|e| e.into_inner()).retain_mut(|m| {
+            if !ours(&m.table) {
+                return true;
+            }
+            let Some((b, a)) = now(&m.field) else { return false };
+            if let (Some(was), Some(is)) = (&b.derive, &a.derive) {
+                if *was == m.derive {
+                    m.derive = is.clone();
+                }
+            }
+            m.field = a.name.clone();
+            true
+        });
+        let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(dir) = dir {
+            let added = |f: &crate::schema::Field| before.fields.iter().all(|b| b.id != f.id);
+            self.open_models_of(&after.table, &dir, added);
+        }
         Ok(())
     }
 
@@ -659,9 +706,14 @@ impl Db {
     }
 
     fn open_embedders_of(&self, table: &str, models: &Path) -> Vec<(String, Error)> {
+        self.open_models_of(table, models, |_| true)
+    }
+
+    /// [`Db::open_embedders_of`], for the fields `which` picks.
+    fn open_models_of(&self, table: &str, models: &Path, which: impl Fn(&crate::schema::Field) -> bool) -> Vec<(String, Error)> {
         let Some(schema) = self.storage.table(table) else { return Vec::new() };
         let mut failed = Vec::new();
-        for f in &schema.fields {
+        for f in schema.fields.iter().filter(|f| which(f)) {
             let opened = match (&f.embed, &f.derive) {
                 (Some(spec), _) => crate::embed::open_for(&spec.model, match f.ty { FieldType::Vector { dim, .. } => Some(dim), _ => None }, models).and_then(|m| self.set_embedder_in(table, &f.name, m)),
                 (_, Some(spec)) => crate::derive::open(&spec.model, models).and_then(|m| self.set_deriver_in(table, &f.name, m)),
@@ -996,6 +1048,12 @@ impl Db {
                 self.drop_tables(&names, opts)?;
                 Ok(SqlResult::Written(0))
             }
+            Command::AlterTable { table, alters } => {
+                if let Some(t) = table.filter(|_| !alters.is_empty()) {
+                    self.alter_table(&t, &alters)?;
+                }
+                Ok(SqlResult::Written(0))
+            }
             Command::CreateRankProfile { table, profile, replace } => {
                 self.storage.set_rank_profile(&table, profile, replace)?;
                 Ok(SqlResult::Written(0))
@@ -1156,7 +1214,7 @@ impl Db {
         let mut t = self.storage.begin()?;
         let mut tt = t.table(&schema.table)?;
         if tt.schema() != schema {
-            return Err(Error::Query(format!("table {} was dropped and created again while the statement ran; run it again", schema.table)));
+            return Err(Error::Query(format!("table {} was altered, or dropped and created again, while the statement ran; run it again", schema.table)));
         }
         let models = self.models_of(schema);
         let derivers = self.derivers_of(schema);
@@ -1364,9 +1422,14 @@ impl Db {
     /// Readers for every segment of `snap`, opened on first use.
     pub fn readers(&self, snap: &Snapshot) -> Result<Vec<Arc<SegmentReaders>>> {
         let at = |v: &crate::storage::SegmentView| v.file.image().as_ptr() as usize;
+        // Readers are opened for one schema: an ALTER TABLE gives the
+        // table's segments new ones. The cache holds the schema it opened
+        // them with, so its address is not reused while an entry names it.
+        let schema = snap.shared_schema();
+        let fits = |(p, s, _): &&(usize, Arc<Schema>, Arc<SegmentReaders>), v: &crate::storage::SegmentView| *p == at(v) && Arc::ptr_eq(s, schema);
         {
             let cache = self.readers.read().unwrap_or_else(|e| e.into_inner());
-            let hit = |v: &crate::storage::SegmentView| cache.get(&v.id).filter(|(p, _)| *p == at(v)).map(|(_, r)| r.clone());
+            let hit = |v: &crate::storage::SegmentView| cache.get(&v.id).filter(|e| fits(e, v)).map(|(_, _, r)| r.clone());
             if let Some(all) = snap.segments().iter().map(hit).collect() {
                 return Ok(all);
             }
@@ -1374,11 +1437,11 @@ impl Db {
         let mut cache = self.readers.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(snap.segments().len());
         for v in snap.segments() {
-            let r = match cache.get(&v.id).filter(|(p, _)| *p == at(v)) {
-                Some((_, r)) => r.clone(),
+            let r = match cache.get(&v.id).filter(|e| fits(e, v)) {
+                Some((_, _, r)) => r.clone(),
                 None => {
-                    let r = Arc::new(SegmentReaders::open(&v.file, snap.schema())?);
-                    cache.insert(v.id, (at(v), r.clone()));
+                    let r = Arc::new(SegmentReaders::open(&v.file, schema)?);
+                    cache.insert(v.id, (at(v), schema.clone(), r.clone()));
                     r
                 }
             };

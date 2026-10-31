@@ -49,7 +49,7 @@ fn create(dir: &Path, name: &str) -> Arc<Db> {
 }
 
 fn service(db: Arc<Db>, timeout: Duration) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Service::new(Backend::Local(db), schema, agent(), 16, timeout)
 }
 
@@ -767,7 +767,7 @@ async fn a_replica_serves_reads_once_caught_up_and_waits_for_a_write() {
     let dir = tempfile::tempdir().unwrap();
     let (pdb, rdb) = (create(dir.path(), "p.strata"), create(dir.path(), "r.strata"));
     // One query slot, which a read waiting for a write does not hold.
-    let mut r = Service::new(Backend::Local(rdb.clone()), rdb.schema().clone(), agent(), 1, Duration::from_secs(10));
+    let mut r = Service::new(Backend::Local(rdb.clone()), (*rdb.schema()).clone(), agent(), 1, Duration::from_secs(10));
     r.set_replication(Replication::Replica(Arc::new(Follow::open(rdb.clone(), None).unwrap())));
     let r = Arc::new(r);
     let ur = grpc(r.clone()).await;

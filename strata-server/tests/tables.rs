@@ -45,7 +45,7 @@ fn agent() -> AgentConfig {
 
 fn local(dir: &std::path::Path, name: &str) -> Arc<Service> {
     let db = Db::create(&dir.join(name), items(), DbOptions { segment_max_docs: 500, publish_snapshots: true, ..DbOptions::default() }).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent(), 16, Duration::from_secs(20)))
 }
 

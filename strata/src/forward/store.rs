@@ -246,6 +246,10 @@ pub struct DocStore {
     /// Each column of a row: the schema position of its field
     /// ([`GONE`] for a field the schema no longer has), and its kind.
     fields: Vec<(usize, Kind)>,
+    /// The stored fields of the schema that the segment lacks, added to its
+    /// table after it was written, and the value its rows hold
+    /// ([`crate::schema::Field::fill_value`]).
+    fills: Vec<(usize, Value)>,
     first: Slice<u32>,
     offs: Slice<u64>,
     raw_len: Slice<u32>,
@@ -282,9 +286,14 @@ impl DocStore {
         if seen.windows(2).any(|w| w[0] == w[1]) {
             return Err(corrupt("doc store index names a field twice"));
         }
+        // A stored field the segment was written without (added to its
+        // table since) reads the value its rows hold then.
+        let written = seg.field_ids()?;
+        let mut fills = Vec::new();
         for (i, k) in stored_fields(schema) {
             match fields.iter().find(|&&(j, _)| j == i) {
                 Some(&(_, kj)) if kj == k => {}
+                None if written.as_ref().is_some_and(|ids| !ids.contains(&schema.fields[i].id)) => fills.push((i, schema.fields[i].fill_value()?)),
                 _ => return Err(mismatch()),
             }
         }
@@ -301,7 +310,7 @@ impl DocStore {
         {
             return Err(corrupt("bad doc store index"));
         }
-        Ok(DocStore { n, n_fields: schema.fields.len(), fields, first, offs, raw_len, data })
+        Ok(DocStore { n, n_fields: schema.fields.len(), fields, fills, first, offs, raw_len, data })
     }
 
     /// Number of documents.
@@ -333,6 +342,9 @@ impl DocStore {
         let want: Vec<usize> = self.fields.iter().map(|&(i, _)| i).filter(|&i| i != GONE).collect();
         for (i, v) in want.iter().zip(self.get_fields(d, &want)) {
             doc[*i] = v;
+        }
+        for (i, v) in &self.fills {
+            doc[*i] = v.clone();
         }
         doc
     }
@@ -465,6 +477,11 @@ impl DocStore {
                         out[k2] = out[k].clone();
                     }
                 }
+            }
+        }
+        for (k, f) in fields.iter().enumerate() {
+            if let Some((_, v)) = self.fills.iter().find(|(i, _)| i == f) {
+                out[k] = v.clone();
             }
         }
         Some(out)
