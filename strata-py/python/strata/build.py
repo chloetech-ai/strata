@@ -621,25 +621,43 @@ class _Features(Expr):
         return "features()"
 
 
-def match(field: str, query: str) -> Expr:
+def _need(min: int | str) -> str:
+    """A count or a percentage (`2`, `"75%"`), as MATCH's `@` writes it."""
+    if isinstance(min, bool) or not isinstance(min, (int, str)):
+        raise StrataError(f"min is a count or a percentage ('75%'), not {min!r}")
+    return str(min)
+
+
+def match(field: str, query: str, *, min: int | str | None = None) -> Expr:
     """`field` (an indexed TEXT field) matches the full-text `query`, in
-    MATCH's syntax (`a b` both words, `a | b` either, `"a b"` the phrase,
-    `-a` not, `a~` with typos)."""
-    return _Fn(lambda ctx: {"match": {"field": ctx.field(field)[0], "query": query}}, f"match({field!r}, {query!r})", score=False)
+    MATCH's syntax (`a b` both words, `a OR b` either, `"a b"` the phrase,
+    `-a` not, `a~` with typos, `(a b c)@2` two of them). `min=2` or
+    `min="75%"` asks for that many of the query's items."""
+    q = query if min is None else f"({query})@{_need(min)}"
+    return _Fn(lambda ctx: {"match": {"field": ctx.field(field)[0], "query": q}}, f"match({field!r}, {q!r})", score=False)
 
 
-def bm25(field: str, text: str, *, syntax: str | None = None) -> Expr:
+def bm25(field: str, text: str, *, syntax: str | None = None, min: int | str | None = None) -> Expr:
     """BM25 of a TEXT field for `text`, as a score. `text` may weigh a
     word (`word^2`), require one (`+word`, `+"a phrase"`) or exclude one
-    (`-word`); `syntax="plain"` reads it as plain words."""
+    (`-word`); `syntax="plain"` reads it as plain words. `min=2` or
+    `min="75%"` ranks only the rows with that many of its optional words."""
+    if min is not None:
+        _need(min)
 
     def build(ctx: _Ctx) -> Any:
         m: dict[str, Any] = {"field": ctx.field(field)[0], "text": text}
+        opts: dict[str, Any] = {}
         if syntax is not None:
-            m["opts"] = {"syntax": {"text": syntax}}
+            opts["syntax"] = {"text": syntax}
+        if min is not None:
+            opts["min"] = {"text": min} if isinstance(min, str) else {"int": min}
+        if opts:
+            m["opts"] = opts
         return {"bm25": m}
 
-    return _Fn(build, f"bm25({field!r}, {text!r}" + ("" if syntax is None else f", syntax={syntax!r}") + ")")
+    extra = "".join(f", {k}={v!r}" for k, v in (("syntax", syntax), ("min", min)) if v is not None)
+    return _Fn(build, f"bm25({field!r}, {text!r}{extra})")
 
 
 def similarity(field: str, query: Sequence[float] | Mapping[str, float]) -> Expr:

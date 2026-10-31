@@ -30,7 +30,8 @@
 //! not a stopword weighing 2, `require_first` with that word required
 //! (`+word`) and `exclude_last` with its last such word excluded
 //! (`-word`): what weights and the filters they make cost against
-//! `words`. `--features DIR` makes their training
+//! `words`. `min2` and `min50` rank the rows with at least 2, or half, of
+//! the query's words (`min => 2`, `min => '50%'`). `--features DIR` makes their training
 //! data instead of timing anything: each query's BM25 top 100 with
 //! `features()` and its grades, in `<DIR>/<collection>.jsonl`, which
 //! `scripts/train_ltr.py` trains the models on. `--reps N` runs the
@@ -110,7 +111,9 @@ fn query(variant: &str, coll: &str) -> (String, bool) {
         "gbdt_top100" => (top10(&model), false),
         "gbdt_rerank100" => (rerank(&model), true),
         "words" | "weight_first" | "require_first" | "exclude_last" => (top10("bm25(body, :q)"), true),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, words, weight_first, require_first or exclude_last"),
+        "min2" => (top10("bm25(body, :q, syntax => 'plain', min => 2)"), true),
+        "min50" => (top10("bm25(body, :q, syntax => 'plain', min => '50%')"), true),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, words, weight_first, require_first, exclude_last, min2 or min50"),
     }
 }
 

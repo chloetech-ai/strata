@@ -60,6 +60,22 @@ def test_bm25_weighs_requires_and_excludes_words(db):
         db.run(t.select("id").order_by(bm25("description", q, syntax="lucene")).limit(5))
 
 
+def test_min_asks_for_some_of_the_words(db):
+    t = db.table()
+    q = "dragon ship river secret"
+    r = same(db, t.select("id", score()).order_by(bm25("description", q, min=3)).limit(20),
+             f"SELECT id, score() FROM books ORDER BY bm25(description, '{q}', min => 3) DESC LIMIT 20")
+    assert len(r) > 0 and all(sum(w in d for w in q.split()) >= 3 for d in (book(int(i[1:]))["description"] for i, _ in r.rows))
+    same(db, t.select("id").order_by(bm25("description", q, min="50%", syntax="plain")).limit(20),
+         f"SELECT id FROM books ORDER BY bm25(description, '{q}', min => '50%', syntax => 'plain') DESC LIMIT 20")
+    same(db, t.select("id").where(match("description", q, min=3)).order_by(col("year")).limit(100),
+         f"SELECT id FROM books WHERE MATCH(description, '{q}', min => 3) ORDER BY year LIMIT 100")
+    same(db, t.select("id").where(match("description", "(dragon ship river)@2 -secret")).order_by(col("year")).limit(100),
+         "SELECT id FROM books WHERE MATCH(description, '(dragon ship river)@2 -secret') ORDER BY year LIMIT 100")
+    with pytest.raises(strata.StrataError, match="count or a percentage"):
+        bm25("description", q, min=1.5)
+
+
 def test_a_ranking_given_by_keys_runs_as_its_sql(db):
     t = db.table()
     keys = ["b0007", "b0003", "none", "b0011", "b0003"]
