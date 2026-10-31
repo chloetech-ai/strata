@@ -534,8 +534,9 @@ fn row_versions_list_each_table_s_live_rows() {
             out.sort_by_key(|x| x.1);
             out
         };
-        assert_eq!(row_versions(&db), Seqs::from([(key(0), 1), (key(2), 5)]), "flushed {flushed}");
-        assert_eq!(keyless(&db.snapshot().table("log").unwrap()), [(None, 2), (None, 4), (None, 6)], "flushed {flushed}");
+        // The table took number 1.
+        assert_eq!(row_versions(&db), Seqs::from([(key(0), 2), (key(2), 6)]), "flushed {flushed}");
+        assert_eq!(keyless(&db.snapshot().table("log").unwrap()), [(None, 3), (None, 5), (None, 7)], "flushed {flushed}");
         db.storage().flush().unwrap();
     }
 }

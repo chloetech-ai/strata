@@ -1122,6 +1122,10 @@ impl Database {
     /// A field that references another table ([`crate::schema::Field::references`])
     /// must name a table of this database whose primary key has the field's
     /// type; the reference is spelled as that table's name.
+    ///
+    /// In a database that numbers its writes it takes the next number, and
+    /// its replicas make the same table ([`Database::apply_shipped`]); the
+    /// memtables are flushed first ([`Database::change_tables`]).
     pub fn create_table(&self, mut schema: Schema) -> Result<()> {
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
@@ -1152,8 +1156,11 @@ impl Database {
             }
             f.references = Some(t.table.clone());
         }
-        let mut vw = VersionWriter::begin(self);
-        if vw.manifest.is_legacy() {
+        let (id, legacy) = {
+            let st = lock(&self.state);
+            (st.manifest.next_table_id, st.manifest.is_legacy())
+        };
+        if legacy {
             // Opened to be copied: it stays as it was written.
             schema = schema.without_ids();
         } else if schema.is_legacy() {
@@ -1161,11 +1168,89 @@ impl Database {
             schema = schema.with_new_ids()?;
         }
         schema.check_ids()?;
-        let id = vw.manifest.next_table_id;
-        vw.manifest.next_table_id += 1;
-        vw.manifest.tables.push(TableMeta { id, schema, segments: Vec::new(), profiles: Vec::new() });
-        let c = vw.commit(&mut wal)?;
-        self.publish(c, |_| {})
+        self.change_tables(&mut wal, vec![(id, Op::Table { def: Some(Arc::new(schema)) })], None)
+    }
+
+    /// Makes the change of tables `ops` (each an [`Op::Table`]: a schema
+    /// for the table to create with that id, `None` to drop the table with
+    /// that id) in one version, under the writer lock. A drop removes the
+    /// references the tables left standing hold to the dropped ones, and
+    /// the memtables are flushed first, so that no logged write outlives
+    /// its table.
+    ///
+    /// In a database that numbers its writes, the change is a numbered
+    /// transaction too, of the next number (`seq`, which a replica passes
+    /// as its primary's, must be it): the version records the number, and
+    /// the ship log keeps the change as table def records, so that replicas
+    /// make the same change, with the same ids ([`Database::apply_shipped`]).
+    /// The change is not logged, so the memtables are flushed and the log
+    /// emptied before a create as well: the ship log, which opening rebuilds
+    /// from the log, then starts after the change rather than skip its
+    /// number.
+    fn change_tables(&self, wal: &mut Wal, ops: Vec<(u32, Op)>, seq: Option<SeqNo>) -> Result<()> {
+        let next = {
+            let st = lock(&self.state);
+            st.manifest.seq_no.as_ref().map(|n| SeqNo { term: n.term, seq: st.seq + 1 })
+        };
+        if seq.is_some() && seq != next {
+            return Err(corrupt(format!("a change of tables numbered {seq:?} here, whose next number is {next:?}")));
+        }
+        let dropped: Vec<u32> = ops.iter().filter(|(_, op)| matches!(op, Op::Table { def: None })).map(|(id, _)| *id).collect();
+        if next.is_some() || !dropped.is_empty() {
+            self.flush_locked(wal)?;
+            if !wal.is_empty() {
+                // Only transactions the segments already hold can be left.
+                wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+            }
+        }
+        let mut vw = VersionWriter::begin(self);
+        let names: Vec<String> = dropped.iter().filter_map(|&id| vw.manifest.table(id).map(|t| t.schema.table.clone())).collect();
+        for (id, op) in &ops {
+            match op {
+                Op::Table { def: Some(schema) } => {
+                    // A shipped table comes with its fields' ids.
+                    schema.check_ids()?;
+                    vw.manifest.next_table_id = vw.manifest.next_table_id.max(id + 1);
+                    vw.manifest.tables.push(TableMeta { id: *id, schema: (**schema).clone(), segments: Vec::new(), profiles: Vec::new() });
+                }
+                Op::Table { def: None } => vw.drop_table(*id),
+                _ => return Err(Error::Schema("a change of tables holds only table defs".into())),
+            }
+        }
+        for t in vw.manifest.tables.iter_mut() {
+            for f in t.schema.fields.iter_mut() {
+                if f.references.as_ref().is_some_and(|r| names.iter().any(|d| d.eq_ignore_ascii_case(r))) {
+                    f.references = None;
+                }
+            }
+        }
+        if let (Some(s), Some(n)) = (next, vw.manifest.seq_no.as_mut()) {
+            n.seq = n.seq.max(s.seq);
+        }
+        let txn = vw.txn;
+        let before = lock(&self.state).manifest.format();
+        let c = vw.commit(wal)?;
+        self.publish(c, |st| {
+            if !dropped.is_empty() {
+                st.live_cache.clear();
+                st.updates_cache.clear();
+            }
+            if let Some(s) = next {
+                st.seq = s.seq;
+                st.ship.push(Shipped { seq: s, bytes: wal::encode_txn(txn, Some(s), &ops).into() });
+            }
+        })?;
+        if self.dir.is_none() && lock(&self.state).manifest.format() < before {
+            // The other meta slot still names a version of the newer
+            // format (several tables, or a format 3 feature), and versions
+            // of Strata that do not read it refuse a file with such a slot
+            // even when it is the older one. Commit again so that both
+            // slots hold the older format.
+            let c = VersionWriter::begin(self).commit(wal)?;
+            self.publish(c, |_| {})?;
+        }
+        self.committed(next);
+        Ok(())
     }
 
     /// Gives table `table` (any case) the rank profile `profile`, in place
@@ -1378,6 +1463,12 @@ impl Database {
     /// set of a row that is not live, an insert of one that is), which
     /// means that the two databases were not copies of each other: it is
     /// not applied, and those before it are.
+    ///
+    /// A change of tables the primary made ([`Database::create_table`],
+    /// [`Database::drop_tables`]) is made here too, with the primary's
+    /// table ids, so that the writes after it find their tables; one that
+    /// creates a table this database has (by id or name) or drops one it
+    /// lacks is refused with the rest of the batch.
     pub fn apply_shipped(&self, prev: SeqNo, txns: &[&[u8]]) -> Result<Applied> {
         let now = || self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()));
         // None: a primary asks the last transaction, which needs no writer
@@ -1395,11 +1486,16 @@ impl Database {
         if !schemas.iter().any(|(id, _)| *id == SOURCES_ID) {
             schemas.push((SOURCES_ID, Arc::new(sources_schema())));
         }
-        let fits = |table: u32, op: &Op| schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op));
+        // Writes fit the tables as the changes of tables before them in the
+        // batch leave them; those changes are checked below.
+        let fits = |schemas: &[(u32, Arc<Schema>)], table: u32, op: &Op| match op {
+            Op::Table { .. } => true,
+            _ => schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op)),
+        };
         let mut shipped = Vec::with_capacity(txns.len());
         let mut at = now.last();
         for bytes in txns {
-            let t = wal::decode_shipped(bytes, &fits)?;
+            let t = wal::decode_shipped(bytes, &|table, op| fits(&schemas, table, op))?;
             let s = t.seq.expect("a shipped transaction is numbered");
             if s.seq != at.seq + 1 {
                 return Err(corrupt(format!("shipped transaction {} does not follow {}", s.seq, at.seq)));
@@ -1413,6 +1509,27 @@ impl Database {
                 )));
             }
             at = s;
+            if t.ops.iter().any(|(_, op)| matches!(op, Op::Table { .. })) {
+                let differs = |what: String| Error::Schema(format!("shipped transaction {} {what}: this database is not a copy of its primary's", s.seq));
+                for (id, op) in &t.ops {
+                    let system = *id == 0 || *id == SOURCES_ID;
+                    match op {
+                        Op::Table { def: Some(def) } => {
+                            if system || check_table_name(&def.table).is_err() || schemas.iter().any(|(i, x)| i == id || x.table.eq_ignore_ascii_case(&def.table)) {
+                                return Err(differs(format!("creates table {} with id {id}, which this database has or cannot have", def.table)));
+                            }
+                            schemas.push((*id, def.clone()));
+                        }
+                        Op::Table { def: None } => {
+                            if system || !schemas.iter().any(|(i, _)| i == id) {
+                                return Err(differs(format!("drops the table with id {id}, which this database lacks or cannot drop")));
+                            }
+                            schemas.retain(|(i, _)| i != id);
+                        }
+                        _ => return Err(corrupt(format!("shipped transaction {} changes tables along with rows", s.seq))),
+                    }
+                }
+            }
             shipped.push((s, t.ops));
         }
         if shipped.iter().any(|(_, ops)| ops.iter().any(|(id, _)| *id == SOURCES_ID)) {
@@ -1426,6 +1543,14 @@ impl Database {
                     failed = Some(e);
                     break;
                 }
+            }
+            if ops.iter().any(|(_, op)| matches!(op, Op::Table { .. })) {
+                if let Err(e) = self.change_tables(&mut wal, ops, Some(s)) {
+                    failed = Some(e);
+                    break;
+                }
+                at = s;
+                continue;
             }
             let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() };
             let replayed = txn.replay(ops);
@@ -1491,10 +1616,13 @@ impl Database {
     /// ([`Database::apply_shipped`]). Every row, row number and term here
     /// is replaced, the WAL and the ship log are emptied, and snapshots
     /// taken before go on reading what they read; a merge running here
-    /// installs nothing. Both must number their writes and hold the same
-    /// tables (names and schemas, in order), and the copy's term must not
-    /// be older than this database's: a copy of a replaced primary is
-    /// refused. Durable on return. Returns the copy's last transaction.
+    /// installs nothing. The copy's tables replace this database's, with
+    /// the copy's ids, so that the transactions shipped after it find
+    /// theirs: tables only this database has are dropped. Both must number
+    /// their writes and have the same first table (name and schema), and
+    /// the copy's term must not be older than this database's: a copy of a
+    /// replaced primary is refused. Durable on return. Returns the copy's
+    /// last transaction.
     pub fn install_copy(&self, copy: &Database) -> Result<SeqNo> {
         if std::ptr::eq(self, copy) {
             return Err(Error::Schema("a database is not a copy of itself".into()));
@@ -1513,30 +1641,24 @@ impl Database {
                     false => {
                         // Logged since its last version, maybe.
                         let profiles = st.tables.iter().find(|ts| ts.id == t.id).map_or_else(Vec::new, |ts| ts.profiles.to_vec());
-                        tables.push((t.schema.clone(), segs, profiles));
+                        tables.push((t.id, t.schema.clone(), segs, profiles));
                     }
                 }
             }
-            (Numbering { seq: st.seq, ..n }, (tables, sources))
+            (Numbering { seq: st.seq, ..n }, (tables, sources, st.manifest.next_table_id))
         };
-        let (tables, sources) = tables;
+        let (tables, sources, next_table_id) = tables;
         // No background flush may seal the log in between.
         let _one = lock(&self.background);
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         let ours = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
-        {
-            // Sources aside, which either may have made first.
-            let st = lock(&self.state);
-            let mine: Vec<&Schema> = st.manifest.tables.iter().filter(|t| t.id != SOURCES_ID).map(|t| &t.schema).collect();
-            let names = |ts: &mut dyn Iterator<Item = &Schema>| ts.map(|s| s.table.clone()).collect::<Vec<_>>().join(", ");
-            if mine.len() != tables.len() || mine.iter().zip(&tables).any(|(t, (s, _, _))| **t != *s) {
-                return Err(Error::Schema(format!(
-                    "the copy's tables ({}) are not this database's ({}), or their schemas differ",
-                    names(&mut tables.iter().map(|t| &t.0)),
-                    names(&mut mine.into_iter())
-                )));
-            }
+        if tables.first().is_none_or(|(id, s, _, _)| *id != 0 || *s != *self.schema) {
+            return Err(Error::Schema(format!(
+                "the copy's first table ({}) is not this database's ({}), or their schemas differ",
+                tables.first().map_or("none", |t| t.1.table.as_str()),
+                self.schema.table
+            )));
         }
         if sources.is_some() {
             self.add_sources(&mut wal)?;
@@ -1553,11 +1675,24 @@ impl Database {
             wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
         }
         let mut vw = VersionWriter::begin(self);
-        let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).filter(|&id| id != SOURCES_ID).collect();
         for id in vw.manifest.tables.iter().flat_map(|t| &t.segments).map(|s| s.id).collect::<Vec<_>>() {
             vw.remove_segment(id);
         }
-        let mut into: Vec<_> = ids.into_iter().zip(tables.iter().map(|(_, segs, profiles)| (segs, profiles.clone()))).collect();
+        // The copy's tables, in its order, then the sources: a table of the
+        // same id takes the copy's schema, and one the copy lacks goes (its
+        // segments went above).
+        let mut old = std::mem::take(&mut vw.manifest.tables);
+        let kept_sources = old.iter().position(|t| t.id == SOURCES_ID).map(|i| old.remove(i));
+        for (id, schema, _, _) in &tables {
+            let t = match old.iter().position(|t| t.id == *id) {
+                Some(i) => TableMeta { schema: schema.clone(), ..old.remove(i) },
+                None => TableMeta { id: *id, schema: schema.clone(), segments: Vec::new(), profiles: Vec::new() },
+            };
+            vw.manifest.tables.push(t);
+        }
+        vw.manifest.tables.extend(kept_sources);
+        vw.manifest.next_table_id = vw.manifest.next_table_id.max(next_table_id);
+        let mut into: Vec<_> = tables.iter().map(|(id, _, segs, profiles)| (*id, (segs, profiles.clone()))).collect();
         if let Some(segs) = &sources {
             into.push((SOURCES_ID, (segs, Vec::new())));
         }
@@ -1613,10 +1748,12 @@ impl Database {
     /// left standing references ([`crate::schema::Field::references`]) is
     /// dropped only with `opts.cascade`, which removes those references in
     /// the same commit; a name that is not a table is an error unless
-    /// `opts.if_exists`.
+    /// `opts.if_exists`. In a database that numbers its writes the drop
+    /// takes the next number, and its replicas drop the same tables
+    /// ([`Database::apply_shipped`]).
     pub fn drop_tables(&self, names: &[&str], opts: DropOptions) -> Result<()> {
         let mut wal = self.try_writer()?;
-        let (ids, dropped) = {
+        let ids = {
             let st = lock(&self.state);
             let mut ids = Vec::new();
             let mut dropped: Vec<String> = Vec::new();
@@ -1642,43 +1779,12 @@ impl Database {
                     }
                 }
             }
-            (ids, dropped)
+            ids
         };
         if ids.is_empty() {
             return Ok(());
         }
-        self.flush_locked(&mut wal)?;
-        if !wal.is_empty() {
-            // Only transactions the segments already hold can be left.
-            wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
-        }
-        let mut vw = VersionWriter::begin(self);
-        for &id in &ids {
-            vw.drop_table(id);
-        }
-        for t in vw.manifest.tables.iter_mut() {
-            for f in t.schema.fields.iter_mut() {
-                if f.references.as_ref().is_some_and(|r| dropped.iter().any(|d| d.eq_ignore_ascii_case(r))) {
-                    f.references = None;
-                }
-            }
-        }
-        let before = lock(&self.state).manifest.format();
-        let c = vw.commit(&mut wal)?;
-        self.publish(c, |st| {
-            st.live_cache.clear();
-            st.updates_cache.clear();
-        })?;
-        if self.dir.is_none() && lock(&self.state).manifest.format() < before {
-            // The other meta slot still names a version of the newer
-            // format (several tables, or a format 3 feature), and versions
-            // of Strata that do not read it refuse a file with such a slot
-            // even when it is the older one. Commit again so that both
-            // slots hold the older format.
-            let c = VersionWriter::begin(self).commit(&mut wal)?;
-            self.publish(c, |_| {})?;
-        }
-        Ok(())
+        self.change_tables(&mut wal, ids.into_iter().map(|id| (id, Op::Table { def: None })).collect(), None)
     }
 
     pub fn path(&self) -> &Path {
@@ -2854,10 +2960,15 @@ impl Database {
             // two checkpoints' files then share a name only if they hold
             // the same bytes, and can be synced into one place.
             vw.txn = vw.txn.max(manifest.txn);
-            // The copy's tables were created in the same order; their ids
-            // may differ (dropped tables leave gaps in the source's).
-            let ids: Vec<u32> = vw.manifest.tables.iter().map(|t| t.id).collect();
-            for (t, &to) in manifest.tables.iter().zip(&ids) {
+            // The copy's tables were created in the same order, and take
+            // the source's ids (dropped tables leave gaps in them), which
+            // the transactions a primary ships after a copy of it name.
+            for (m, t) in vw.manifest.tables.iter_mut().zip(&manifest.tables) {
+                m.id = t.id;
+            }
+            vw.manifest.next_table_id = manifest.next_table_id;
+            for t in &manifest.tables {
+                let to = t.id;
                 vw.table_mut(to).profiles = t.profiles.clone();
                 for m in &t.segments {
                     let h = handles.iter().find(|h| h.meta.id == m.id).ok_or_else(|| corrupt(format!("segment {} is in the manifest but not open", m.id)))?;
@@ -3904,6 +4015,7 @@ impl<'a> WriteTxn<'a> {
                     }
                 }
                 op @ Op::Profile { .. } => self.ops.push((t.id, op)),
+                Op::Table { .. } => return Err(differs("changes tables along with rows".into())),
             }
         }
         Ok(())
@@ -4495,6 +4607,8 @@ fn op_fits(schema: &Schema, op: &Op) -> bool {
         Op::Insert(doc) => validate(schema, doc).is_ok(),
         Op::Delete(k) => is_key(k),
         Op::Profile { name, def } => check_name("rank profile", name).is_ok() && def.as_ref().is_none_or(|p| p.name == *name),
+        // A change of tables, which writes no table's rows.
+        Op::Table { .. } => false,
         Op::Set { key, field, value } => {
             let i = *field as usize;
             is_key(key)

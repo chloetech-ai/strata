@@ -28,7 +28,7 @@ use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Co
 use crate::rank_log::{self, Export, Log, Logged};
 use crate::schema::{Derive, Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
-use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Mask, Snapshot, TableTxn, SOURCES};
+use crate::storage::{Applied, Database, DbOptions, DocumentSource, DropOptions, Mask, SeqNo, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
 use crate::vector::VectorReader;
 
@@ -307,6 +307,45 @@ impl Db {
         let tables = self.catalog();
         self.embedders.write().unwrap_or_else(|e| e.into_inner()).retain(|m| tables.iter().any(|t| t.table.eq_ignore_ascii_case(&m.table)));
         r
+    }
+
+    /// Applies transactions a primary shipped ([`Database::apply_shipped`]).
+    /// A table they create gets its models as [`Db::create_table`] gives
+    /// them, and a table they drop loses its own.
+    pub fn apply_shipped(&self, prev: SeqNo, txns: &[&[u8]]) -> Result<Applied> {
+        let before = self.catalog();
+        let r = self.storage.apply_shipped(prev, txns);
+        self.tables_changed(&before);
+        r
+    }
+
+    /// Puts a copy of its primary in place of this database's rows and
+    /// tables ([`Database::install_copy`]); the tables that come with it get
+    /// their models as [`Db::apply_shipped`] gives them.
+    pub fn install_copy(&self, copy: &Database) -> Result<SeqNo> {
+        let before = self.catalog();
+        let r = self.storage.install_copy(copy);
+        self.tables_changed(&before);
+        r
+    }
+
+    /// Opens the models of the tables made since the catalog was `before`
+    /// (or whose schema changed), as [`Db::create_table`] does, and forgets
+    /// those of the tables gone.
+    fn tables_changed(&self, before: &[Arc<Schema>]) {
+        let now = self.catalog();
+        if now.len() == before.len() && now.iter().zip(before).all(|(a, b)| a == b) {
+            return;
+        }
+        self.embedders.write().unwrap_or_else(|e| e.into_inner()).retain(|m| now.iter().any(|t| t.table.eq_ignore_ascii_case(&m.table)));
+        let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let models = dir.clone().unwrap_or_else(crate::embed::models_dir);
+        for t in now.iter().filter(|t| !before.contains(t)) {
+            if let Some(dir) = &dir {
+                self.open_embedders_of(&t.table, dir);
+            }
+            self.open_codebooks_of(&t.table, &models);
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
