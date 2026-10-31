@@ -122,13 +122,72 @@ pub struct SlotMap {
     shards: usize,
     /// Each shard's servers (empty: not named).
     replicas: Vec<Vec<String>>,
+    /// The slots moving between two shards, if any.
+    moving: Option<Move>,
+}
+
+/// Slots moving from one shard to another, one move at a time: the
+/// coordinator copies their rows while `from` serves them (`copying`),
+/// gives them to `to` (`cleaning`, while `from` deletes its copies), or
+/// gives up (`aborting`, while `to` deletes what it was sent). In JSON,
+/// `"moving": {"from": 0, "to": 2, "slots": [[0, 256]], "state":
+/// "copying"}`. A shard holding rows of moving slots that it does not
+/// serve hides them ([`SlotMap::residue`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Move {
+    pub from: usize,
+    pub to: usize,
+    /// The slots, in increasing order.
+    pub slots: Vec<usize>,
+    pub state: MoveState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveState {
+    Copying,
+    Cleaning,
+    Aborting,
+}
+
+impl MoveState {
+    pub fn name(self) -> &'static str {
+        match self {
+            MoveState::Copying => "copying",
+            MoveState::Cleaning => "cleaning",
+            MoveState::Aborting => "aborting",
+        }
+    }
+}
+
+impl Move {
+    /// Whether `slot` is one of those moving.
+    pub fn has(&self, slot: usize) -> bool {
+        self.slots.binary_search(&slot).is_ok()
+    }
+
+    /// The slots as runs `[start, end)`.
+    pub fn ranges(&self) -> Vec<(usize, usize)> {
+        runs(self.slots.iter().copied())
+    }
+}
+
+/// `slots`, in increasing order, as runs `[start, end)`.
+pub fn runs(slots: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for s in slots {
+        match out.last_mut() {
+            Some(r) if r.1 == s => r.1 = s + 1,
+            _ => out.push((s, s + 1)),
+        }
+    }
+    out
 }
 
 impl SlotMap {
     /// `n` shards holding equal runs of slots, shard 0 the first.
     pub fn even(n: usize, epoch: u64) -> SlotMap {
         assert!((1..=SLOTS).contains(&n), "1 to {SLOTS} shards");
-        SlotMap { epoch, owner: (0..SLOTS).map(|s| even_owner(s, n) as u16).collect(), shards: n, replicas: Vec::new() }
+        SlotMap { epoch, owner: (0..SLOTS).map(|s| even_owner(s, n) as u16).collect(), shards: n, replicas: Vec::new(), moving: None }
     }
 
     pub fn shards(&self) -> usize {
@@ -182,7 +241,7 @@ impl SlotMap {
         }
         let mut replicas = self.replicas.clone();
         replicas.push(servers);
-        SlotMap { epoch: self.epoch + 1, shards: self.shards + 1, owner: self.owner.clone(), replicas: Vec::new() }.with_replicas(replicas)
+        SlotMap { epoch: self.epoch + 1, shards: self.shards + 1, owner: self.owner.clone(), replicas: Vec::new(), moving: self.moving.clone() }.with_replicas(replicas)
     }
 
     /// The next map without shard `i`, which must hold no slot: the shards
@@ -194,12 +253,15 @@ impl SlotMap {
         if self.count(i) > 0 {
             return Err(format!("shard {i} holds {} slots: move them to other shards first (drain it)", self.count(i)));
         }
+        if self.moving.is_some() {
+            return Err("slots are moving: remove a shard once the move ends".into());
+        }
         let owner = self.owner.iter().map(|&o| if o as usize > i { o - 1 } else { o }).collect();
         let mut replicas = self.replicas.clone();
         if !replicas.is_empty() {
             replicas.remove(i);
         }
-        Ok(SlotMap { epoch: self.epoch + 1, owner, shards: self.shards - 1, replicas })
+        Ok(SlotMap { epoch: self.epoch + 1, owner, shards: self.shards - 1, replicas, moving: None })
     }
 
     /// The next map, shard `i` served by `servers`.
@@ -212,10 +274,15 @@ impl SlotMap {
         SlotMap { epoch: self.epoch + 1, ..self.clone() }.with_replicas(replicas)
     }
 
-    /// The next map, the slots `slots` held by shard `to`.
+    /// The next map, the slots `slots` held by shard `to` (rows and all
+    /// at once: for a map given to shards that hold no rows yet; a
+    /// serving cluster moves slots with [`Self::start_move`]).
     pub fn move_slots(&self, slots: &[usize], to: usize) -> Result<SlotMap, String> {
         if to >= self.shards {
             return Err(format!("there is no shard {to} of {}", self.shards));
+        }
+        if self.moving.is_some() {
+            return Err("slots are moving already".into());
         }
         let mut owner = self.owner.clone();
         for &s in slots {
@@ -225,6 +292,108 @@ impl SlotMap {
             owner[s] = to as u16;
         }
         Ok(SlotMap { epoch: self.epoch + 1, owner, ..self.clone() })
+    }
+
+    /// The move under way, if any.
+    pub fn moving(&self) -> Option<&Move> {
+        self.moving.as_ref()
+    }
+
+    /// The next map, `slots` (all held by one shard) starting to move to
+    /// shard `to`, copying.
+    pub fn start_move(&self, slots: &[usize], to: usize) -> Result<SlotMap, String> {
+        if let Some(m) = &self.moving {
+            return Err(format!("slots are moving already, from shard {} to {} ({})", m.from, m.to, m.state.name()));
+        }
+        if to >= self.shards {
+            return Err(format!("there is no shard {to} of {}", self.shards));
+        }
+        let mut slots = slots.to_vec();
+        slots.sort_unstable();
+        slots.dedup();
+        let Some(&first) = slots.first() else { return Err("a move needs a slot".into()) };
+        if let Some(&s) = slots.iter().find(|&&s| s >= SLOTS) {
+            return Err(format!("there is no slot {s}"));
+        }
+        let from = self.owner(first);
+        if let Some(&s) = slots.iter().find(|&&s| self.owner(s) != from) {
+            return Err(format!("slots {first} and {s} are held by shards {from} and {}: a move takes slots of one shard", self.owner(s)));
+        }
+        if from == to {
+            return Err(format!("shard {to} holds those slots already"));
+        }
+        Ok(SlotMap { epoch: self.epoch + 1, moving: Some(Move { from, to, slots, state: MoveState::Copying }), ..self.clone() })
+    }
+
+    /// The next map, the moving slots held by the shard they move to,
+    /// while the one they left deletes its rows of them.
+    pub fn flip_move(&self) -> Result<SlotMap, String> {
+        let m = match &self.moving {
+            Some(m) if m.state == MoveState::Copying => m,
+            Some(m) => return Err(format!("the move is {}, not copying", m.state.name())),
+            None => return Err("no slots are moving".into()),
+        };
+        let mut owner = self.owner.clone();
+        for &s in &m.slots {
+            owner[s] = m.to as u16;
+        }
+        Ok(SlotMap { epoch: self.epoch + 1, owner, moving: Some(Move { state: MoveState::Cleaning, ..m.clone() }), ..self.clone() })
+    }
+
+    /// The next map, the move given up while the shard the slots were to
+    /// move to deletes what it was sent of them.
+    pub fn abort_move(&self) -> Result<SlotMap, String> {
+        match &self.moving {
+            Some(m) if m.state == MoveState::Copying => Ok(SlotMap { epoch: self.epoch + 1, moving: Some(Move { state: MoveState::Aborting, ..m.clone() }), ..self.clone() }),
+            Some(m) => Err(format!("the move is {}: it can no longer be given up", m.state.name())),
+            None => Err("no slots are moving".into()),
+        }
+    }
+
+    /// The next map, the move ended (cleaning or aborting, once the rows
+    /// left behind are deleted).
+    pub fn end_move(&self) -> Result<SlotMap, String> {
+        match &self.moving {
+            Some(m) if m.state != MoveState::Copying => Ok(SlotMap { epoch: self.epoch + 1, moving: None, ..self.clone() }),
+            Some(_) => Err("the move is copying: flip it or give it up first".into()),
+            None => Err("no slots are moving".into()),
+        }
+    }
+
+    /// The moving slots whose rows shard `shard` holds without serving
+    /// them, and hides: the shard they move to while copying or aborting,
+    /// the one they left while cleaning.
+    pub fn residue(&self, shard: usize) -> Option<&[usize]> {
+        let m = self.moving.as_ref()?;
+        let holder = match m.state {
+            MoveState::Copying | MoveState::Aborting => m.to,
+            MoveState::Cleaning => m.from,
+        };
+        (holder == shard).then_some(&m.slots[..])
+    }
+
+    /// Whether shard `shard` takes the rows of `slot` the coordinator
+    /// moves (writes marked moved): a moving slot, and the shard one of
+    /// the move's two.
+    pub fn takes_moved(&self, shard: usize, slot: usize) -> bool {
+        self.moving.as_ref().is_some_and(|m| (m.from == shard || m.to == shard) && m.has(slot))
+    }
+
+    /// Whether `next` is the step of a move after this map's (started,
+    /// flipped, given up or ended), changing nothing else of the slots.
+    pub fn moves_to(&self, next: &SlotMap) -> bool {
+        let same_owners = self.owner == next.owner;
+        match (&self.moving, &next.moving) {
+            (None, Some(n)) => same_owners && n.state == MoveState::Copying,
+            (Some(a), Some(b)) if a.slots == b.slots && a.from == b.from && a.to == b.to => match (a.state, b.state) {
+                (MoveState::Copying, MoveState::Aborting) => same_owners,
+                (MoveState::Copying, MoveState::Cleaning) => (0..SLOTS).all(|s| next.owner(s) == if a.has(s) { a.to } else { self.owner(s) }),
+                (x, y) => x == y && same_owners,
+            },
+            (Some(a), None) => same_owners && a.state != MoveState::Copying,
+            (None, None) => same_owners,
+            _ => false,
+        }
     }
 
     /// The same assignment and servers under epoch `epoch`.
@@ -249,20 +418,16 @@ impl SlotMap {
 
     /// Shard `shard`'s slots, as runs `[start, end)`.
     pub fn ranges(&self, shard: usize) -> Vec<(usize, usize)> {
-        let mut out: Vec<(usize, usize)> = Vec::new();
-        for s in (0..SLOTS).filter(|&s| self.owner(s) == shard) {
-            match out.last_mut() {
-                Some(r) if r.1 == s => r.1 = s + 1,
-                _ => out.push((s, s + 1)),
-            }
-        }
-        out
+        runs((0..SLOTS).filter(|&s| self.owner(s) == shard))
     }
 
     pub fn to_json(&self) -> Json {
         let mut j = json!({"epoch": self.epoch, "shards": (0..self.shards).map(|i| self.ranges(i)).collect::<Vec<_>>()});
         if !self.replicas.is_empty() {
             j["replicas"] = json!(self.replicas);
+        }
+        if let Some(m) = &self.moving {
+            j["moving"] = json!({"from": m.from, "to": m.to, "slots": m.ranges(), "state": m.state.name()});
         }
         j
     }
@@ -297,16 +462,49 @@ impl SlotMap {
         if let Some(s) = owner.iter().position(|&o| o == u16::MAX) {
             return Err(format!("slot {s} is given to no shard"));
         }
-        let map = SlotMap { epoch, owner, shards: shards.len(), replicas: Vec::new() };
-        match j.get("replicas") {
-            None | Some(Json::Null) => Ok(map),
+        let mut map = SlotMap { epoch, owner, shards: shards.len(), replicas: Vec::new(), moving: None };
+        map = match j.get("replicas") {
+            None | Some(Json::Null) => map,
             Some(r) => {
                 let lists: Vec<Vec<String>> = serde_json::from_value(r.clone()).map_err(|_| "\"replicas\" lists each shard's servers, as lists of gRPC URLs".to_string())?;
-                map.with_replicas(lists)
+                map.with_replicas(lists)?
             }
+        };
+        if let Some(m) = j.get("moving").filter(|m| !m.is_null()) {
+            map.moving = Some(move_of_json(m, &map)?);
         }
+        Ok(map)
     }
 }
+
+/// A move from JSON (`"moving"` of a map): two shards of `map`, slots of
+/// one shard there (the one they come from while copying or aborting, the
+/// one they went to while cleaning).
+fn move_of_json(j: &Json, map: &SlotMap) -> Result<Move, String> {
+    let shard = |k: &str| j.get(k).and_then(Json::as_u64).map(|s| s as usize).filter(|&s| s < map.shards).ok_or_else(|| format!("\"moving\" needs \"{k}\", a shard of the map"));
+    let (from, to) = (shard("from")?, shard("to")?);
+    let state = match j.get("state").and_then(Json::as_str) {
+        Some("copying") => MoveState::Copying,
+        Some("cleaning") => MoveState::Cleaning,
+        Some("aborting") => MoveState::Aborting,
+        _ => return Err("\"moving\" needs a \"state\": copying, cleaning or aborting".into()),
+    };
+    let mut slots = Vec::new();
+    for r in j.get("slots").and_then(Json::as_array).ok_or("\"moving\" needs \"slots\", as [start, end) ranges")? {
+        match r.as_array().map(|r| r.iter().map(Json::as_u64).collect::<Vec<_>>()).as_deref() {
+            Some([Some(a), Some(b)]) if a < b && *b as usize <= SLOTS => slots.extend(*a as usize..*b as usize),
+            _ => return Err(format!("\"moving\": {r} is not a [start, end) range of slots")),
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    let holder = if state == MoveState::Cleaning { to } else { from };
+    if from == to || slots.is_empty() || slots.iter().any(|&s| map.owner(s) != holder) {
+        return Err(format!("\"moving\": slots of shard {holder}, from shard {from} to another, {to}"));
+    }
+    Ok(Move { from, to, slots, state })
+}
+
 
 #[cfg(test)]
 mod tests {
