@@ -317,7 +317,7 @@ async fn main() {
 
     // One server.
     let db = database(&work.join("one.strata"));
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let url = http(Arc::new(Service::new(Backend::Local(db.clone()), schema, agent(), 64, Duration::from_secs(30)))).await;
     add_users(&url, a.users).await;
     let mut sent = 0;
@@ -342,7 +342,7 @@ async fn main() {
     let mut urls = Vec::new();
     for i in 0..a.shards {
         let db = database(&work.join(format!("shard{i}.strata")));
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         urls.push(grpc(Arc::new(Service::new(Backend::Local(db), schema, agent(), 64, Duration::from_secs(30)))).await);
     }
     let c = Coordinator::connect(urls).await.unwrap();

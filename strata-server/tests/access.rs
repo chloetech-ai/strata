@@ -20,7 +20,7 @@ fn service(dir: &std::path::Path) -> Service {
     let db = Db::create(&dir.join("a.strata"), demo::schema(N), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
     db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     db.load((0..N).map(|i| demo::product(i, 7))).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let agent = AgentConfig { api_key: None, model: String::new(), base_url: String::new() };
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(10));
     svc.keys = Arc::new(Keys::open(dir.join("a.strata.keys.json")).unwrap());

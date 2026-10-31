@@ -58,7 +58,7 @@ fn local(dir: &std::path::Path, name: &str, keep: impl Fn(usize) -> bool) -> Arc
     let db = Db::create(&dir.join(name), demo::schema(N), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
     db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     db.load((0..N).filter(|&i| keep(i)).map(|i| demo::product(i, 7))).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let agent = AgentConfig { api_key: None, model: String::new(), base_url: String::new() };
     Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(10)))
 }

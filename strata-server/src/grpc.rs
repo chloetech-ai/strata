@@ -473,7 +473,7 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("Schema", req, |svc, _who, _| async move {
             let tables = svc.catalog().iter().map(|t| serde_json::to_string(&**t).unwrap_or_default()).collect();
             let profiles = svc.rank_profiles().iter().map(|(t, p)| crate::coord::profile_json(t, p)).collect();
-            Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&svc.schema).unwrap_or_default(), tables_json: tables, profiles_json: profiles })
+            Ok(pb::SchemaResponse { schema_json: serde_json::to_string(&*svc.first_table()).unwrap_or_default(), tables_json: tables, profiles_json: profiles })
         })
         .await
     }

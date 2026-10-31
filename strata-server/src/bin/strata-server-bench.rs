@@ -688,10 +688,10 @@ async fn run(args: Args) -> Result<(), String> {
     // 3. Reads over HTTP from one database.
     let client = reqwest::Client::builder().pool_max_idle_per_host(1024).build().map_err(|x| x.to_string())?;
     let kinds = bodies(&queries, &keys);
-    let one = serve_http(service(Backend::Local(sq8.db.clone()), sq8.db.schema().clone())).await;
+    let one = serve_http(service(Backend::Local(sq8.db.clone()), (*sq8.db.schema()).clone())).await;
     let mut http = Vec::new();
     read_mix(&args, &client, &one, "one database", &kinds, &mut http).await;
-    let bin_url = serve_http(service(Backend::Local(bin.db.clone()), bin.db.schema().clone())).await;
+    let bin_url = serve_http(service(Backend::Local(bin.db.clone()), (*bin.db.schema()).clone())).await;
     let vector_kinds: Vec<(&'static str, Vec<Json>)> = kinds.iter().filter(|(k, _)| k.starts_with("vector") || k.starts_with("hybrid")).cloned().collect();
     read_mix(&args, &client, &bin_url, "1-bit codes", &vector_kinds, &mut http).await;
 
@@ -709,7 +709,7 @@ async fn run(args: Args) -> Result<(), String> {
         }
     }
     let wdb = Arc::new(Db::open(&wpath, serve_opts()).map_err(e)?);
-    let wone = serve_http(service(Backend::Local(wdb.clone()), wdb.schema().clone())).await;
+    let wone = serve_http(service(Backend::Local(wdb.clone()), (*wdb.schema()).clone())).await;
     let write_url = format!("{wone}/v1/write");
     let sql_url = format!("{wone}/v1/sql");
     let sets: Vec<Json> = (0..2000).map(|i| json!({"ops": [{"op": "set", "key": keys[(i * 104729) % n], "field": "rating", "value": (i % 50) as f64 / 10.0}]})).collect();
@@ -751,7 +751,7 @@ async fn run(args: Args) -> Result<(), String> {
     } else {
         let mut urls = Vec::new();
         for s in &shards {
-            urls.push(serve_grpc(service(Backend::Local(s.db.clone()), s.db.schema().clone())).await);
+            urls.push(serve_grpc(service(Backend::Local(s.db.clone()), (*s.db.schema()).clone())).await);
         }
         let c = Coordinator::connect(urls).await.map_err(|x| x.message)?;
         let schema = c.schema.clone();

@@ -106,7 +106,7 @@ async fn cancels_the_join(base: &str) {
 async fn a_server_lists_times_and_cancels_its_queries() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "one.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = service(Backend::Local(db), schema);
     let base = http(svc.clone()).await;
     svc.series.add(svc.sample());
@@ -169,7 +169,7 @@ async fn a_coordinator_traces_its_shard_calls_and_shows_its_copies() {
     let mut locals = Vec::new();
     for s in 0..2 {
         let db = open(dir.path(), &format!("s{s}.strata"), shard(s));
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         let svc = service(Backend::Local(db), schema);
         // Each shard has a point to show.
         svc.series.add(svc.sample());

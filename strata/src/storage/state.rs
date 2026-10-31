@@ -64,6 +64,19 @@ fn verify_segment(meta: &SegmentMeta, image: Option<&[u8]>, deletes: Option<&[u8
     Ok(())
 }
 
+/// `file`, a segment of a table of `schema`, with the sections of the
+/// fields it was written without (added to the table since) built in
+/// memory over its rows ([`crate::segment::build::build_missing`]), until
+/// a merge writes them.
+pub(crate) fn with_missing(file: SegmentFile, schema: &Schema) -> Result<SegmentFile> {
+    let missing = crate::segment::build::missing_fields(&file, schema)?;
+    if missing.is_empty() {
+        return Ok(file);
+    }
+    let overlay = crate::segment::build::build_missing(schema, &missing, file.n_docs(), &Default::default())?;
+    file.with_overlay(overlay)
+}
+
 /// When an opened segment's image is checked against its checksums.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Check {
@@ -133,6 +146,7 @@ impl SegHandle {
         if random_hints {
             file.advise_random_sections();
         }
+        file = with_missing(file, schema)?;
         let pk = PkIndex::open(&file)?;
         if file.n_docs() != meta.n_docs as usize || pk.as_ref().is_some_and(|p| p.len() != file.n_docs()) {
             return Err(corrupt(format!("segment {} document count disagrees with manifest", meta.id)));

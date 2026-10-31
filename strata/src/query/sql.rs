@@ -119,6 +119,11 @@ pub enum Command {
     CreateTable { schema: Schema, if_not_exists: bool },
     /// `DROP TABLE [IF EXISTS] a, b [CASCADE | RESTRICT]`.
     DropTable { tables: Vec<String>, opts: DropOptions },
+    /// `ALTER TABLE [IF EXISTS] name ADD [COLUMN] ..., DROP [COLUMN] ...,
+    /// RENAME COLUMN a TO b`: the changes of table `table`, in order, less
+    /// those `IF [NOT] EXISTS` skips ([`crate::query::ddl`]); none, and no
+    /// table, for `IF EXISTS` of a table that is not there.
+    AlterTable { table: Option<String>, alters: Vec<crate::schema::Alter> },
     /// `CREATE [OR REPLACE] RANK PROFILE` ([`crate::query::profile`]).
     CreateRankProfile { table: String, profile: crate::storage::RankProfile, replace: bool },
     /// `DROP RANK PROFILE [IF EXISTS] name [ON table]`.
@@ -254,7 +259,11 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
             let (tables, opts) = ddl::drop_table(stmt)?;
             Command::DropTable { tables, opts }
         }
-        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE RANK PROFILE, DROP RANK PROFILE and EXPLAIN are supported")),
+        stmt @ sql::Statement::AlterTable { .. } => match ddl::alter_table(stmt, tables)? {
+            Some((table, alters)) => Command::AlterTable { table: Some(table), alters },
+            None => Command::AlterTable { table: None, alters: Vec::new() },
+        },
+        _ => return Err(err("only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE RANK PROFILE, DROP RANK PROFILE and EXPLAIN are supported")),
     })
 }
 

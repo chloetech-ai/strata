@@ -272,7 +272,7 @@ fn a_table_records_its_codebook() {
     assert!(db.schema().features().any(|f| f == "semantic_id"));
     // The short JSON form keeps it.
     let back = Schema::from_json_value(&db.schema().to_short_json()).unwrap();
-    assert_eq!(&back, db.schema());
+    assert_eq!(back, *db.schema());
 
     // SQL: a table made with a codebook in the database's models directory.
     assert!(db.open_embedders(&models).is_empty());

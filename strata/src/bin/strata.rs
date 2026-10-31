@@ -81,7 +81,7 @@ fn run(db: &Db, sql: &str, params: &Params, args: &Args, out: &mut impl Write) -
         return Ok(());
     }
     match trimmed {
-        ".schema" => return writeln!(out, "{}", serde_json::to_string_pretty(db.schema()).unwrap_or_default()),
+        ".schema" => return writeln!(out, "{}", serde_json::to_string_pretty(&*db.schema()).unwrap_or_default()),
         ".check" => {
             return match db.storage().check() {
                 Ok(()) => writeln!(out, "ok"),

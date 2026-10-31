@@ -389,3 +389,41 @@ impl<'a> SegmentBuild<'a> {
         built.into_iter().map(|b| b.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every task ran")).collect()
     }
 }
+
+/// The positions of `schema`'s fields that segment `seg` was written
+/// without: fields added to its table since
+/// ([`crate::schema::Field::added`]). None for a segment written before
+/// field ids, whose table cannot change.
+pub fn missing_fields(seg: &SegmentFile, schema: &Schema) -> Result<Vec<usize>> {
+    let Some(ids) = seg.field_ids()? else { return Ok(Vec::new()) };
+    Ok((0..schema.fields.len()).filter(|&i| !ids.contains(&schema.fields[i].id)).collect())
+}
+
+/// The index sections of `schema`'s fields `fields` over `n_docs` rows
+/// that each hold the field's [`crate::schema::Field::fill_value`], as a
+/// segment image in memory: what a segment written before the fields were
+/// added reads them from ([`SegmentFile::with_overlay`]), so that its
+/// rows match a filter, a sort or a search on them as they read in a
+/// `SELECT`. Stored values come from the doc store
+/// ([`crate::forward::DocStore`]), which reads the same value.
+pub fn build_missing(schema: &Schema, fields: &[usize], n_docs: usize, opts: &BuildOptions) -> Result<SegmentFile> {
+    let mut out = SegmentWriter::new(n_docs);
+    for &i in fields {
+        let f = &schema.fields[i];
+        let builder = match &f.ty {
+            FieldType::Text { .. } if f.indexed => crate::text::field_builder(f, opts)?,
+            FieldType::Sparse if f.indexed => crate::text::sparse::field_builder(f, opts)?,
+            FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => crate::forward::field_builder(f, opts)?,
+            FieldType::Vector { .. } => crate::vector::field_builder(f, opts)?,
+            // A field added to a table is not EDGES (Schema::altered).
+            _ => continue,
+        };
+        let fill = f.fill_value()?;
+        let mut b = builder;
+        for d in 0..n_docs {
+            b.add(d as DocId, &fill)?;
+        }
+        b.finish(&mut out)?;
+    }
+    SegmentFile::open(crate::storage::page_aligned(&out.finish()))
+}

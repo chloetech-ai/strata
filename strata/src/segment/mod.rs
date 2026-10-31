@@ -221,6 +221,10 @@ pub struct SegmentFile {
     /// each section's checksum, by [`Section::slot`].
     checked: Option<Arc<[AtomicU8]>>,
     random: Random,
+    /// Sections built in memory for the fields the segment lacks (added
+    /// to its table after it was written), read where the segment has
+    /// none of that name ([`SegmentFile::with_overlay`]).
+    overlay: Option<Arc<SegmentFile>>,
 }
 
 /// Which sections of a mapped segment the kernel was advised to read
@@ -268,7 +272,7 @@ impl SegmentFile {
             }
             sections.insert(e.name, Section { offset, len, crc: e.crc32, slot });
         }
-        Ok(SegmentFile { n_docs, bytes, sections, checked: None, random: Random::None })
+        Ok(SegmentFile { n_docs, bytes, sections, checked: None, random: Random::None, overlay: None })
     }
 
     /// Builds a segment in memory (tests, memtable snapshots).
@@ -289,10 +293,36 @@ impl SegmentFile {
         self.n_docs
     }
 
+    /// The segment with the sections of `overlay`, an image of as many
+    /// documents built in memory, read where it has none of their names:
+    /// the sections of the fields added to its table after it was written,
+    /// as their values in its rows make them
+    /// ([`crate::segment::build::missing_fields`]). They are not part of
+    /// the image: [`SegmentFile::image`], [`SegmentFile::verify_sections`],
+    /// [`SegmentFile::section_sizes`] and [`SegmentFile::field_ids`] are
+    /// the segment's own.
+    pub fn with_overlay(mut self, overlay: SegmentFile) -> Result<Self> {
+        if overlay.n_docs != self.n_docs || overlay.sections.contains_key(FIELDS) {
+            return Err(corrupt("an overlay of other documents than its segment's"));
+        }
+        self.overlay = Some(Arc::new(overlay));
+        Ok(self)
+    }
+
+    /// The overlay's sections ([`SegmentFile::with_overlay`]), with sizes.
+    pub fn overlay_sizes(&self) -> Vec<(String, usize)> {
+        self.overlay.as_ref().map_or_else(Vec::new, |o| o.section_sizes())
+    }
+
     /// The bytes of section `name`, if the segment has one; an error if it
     /// fails its checksum ([`checked_on_read`](Self::checked_on_read)).
     pub fn section(&self, name: &str) -> Result<Option<OwnedBytes>> {
-        let Some(s) = self.sections.get(name) else { return Ok(None) };
+        let Some(s) = self.sections.get(name) else {
+            return match &self.overlay {
+                Some(o) => o.section(name),
+                None => Ok(None),
+            };
+        };
         if let (Some(checked), Some(_)) = (&self.checked, s.crc) {
             let state = &checked[s.slot];
             let known = match state.load(Ordering::Acquire) {
@@ -316,7 +346,7 @@ impl SegmentFile {
 
     /// Whether the segment has section `name` (without reading it).
     pub fn has(&self, name: &str) -> bool {
-        self.sections.contains_key(name)
+        self.sections.contains_key(name) || self.overlay.as_ref().is_some_and(|o| o.has(name))
     }
 
     /// Checks every section that has a crc32 against it, reading the whole

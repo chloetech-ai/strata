@@ -51,7 +51,7 @@ fn create(dir: &std::path::Path, name: &str) -> Arc<Db> {
 
 /// A service of `db` that embeds `emb` with its model.
 fn service(db: Arc<Db>) -> Service {
-    let mut svc = Service::new(Backend::Local(db.clone()), db.schema().clone(), agent(), 16, Duration::from_secs(10));
+    let mut svc = Service::new(Backend::Local(db.clone()), (*db.schema()).clone(), agent(), 16, Duration::from_secs(10));
     svc.open_models(std::path::Path::new("/nonexistent"));
     svc
 }

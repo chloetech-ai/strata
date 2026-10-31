@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::error::{corrupt, Error, Result};
-use crate::schema::{FieldType, Schema};
+use crate::schema::{Alter, FieldType, Schema};
 use crate::sid::{Codebook, Ties};
 use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
 use crate::segment::{DocId, SegmentFile, SegmentWriter};
@@ -255,8 +255,6 @@ pub struct Database {
     path: PathBuf,
     wal_path: PathBuf,
     opts: DbOptions,
-    /// The first table's schema (that table cannot be dropped).
-    schema: Arc<Schema>,
     /// The database file, or the directory layout's `LOCK` file.
     file: File,
     /// The directory, in the directory layout.
@@ -993,7 +991,6 @@ impl Database {
                 ts
             })
             .collect();
-        let schema = tables[0].schema.clone();
         let seq = manifest.seq_no.as_ref().map_or(0, |n| n.seq);
         let mut st = State {
             manifest,
@@ -1063,7 +1060,6 @@ impl Database {
             path: path.to_path_buf(),
             wal_path,
             opts,
-            schema,
             file,
             dir,
             writer: Mutex::new(wal),
@@ -1093,9 +1089,10 @@ impl Database {
         Ok(db)
     }
 
-    /// The schema of the database's first table.
-    pub fn schema(&self) -> &Schema {
-        &self.schema
+    /// The schema of the database's first table, as it is now
+    /// ([`Database::alter_table`] changes it).
+    pub fn schema(&self) -> Arc<Schema> {
+        lock(&self.state).tables[0].schema.clone()
     }
 
     /// The schemas of the database's tables, in creation order (the first
@@ -1133,24 +1130,9 @@ impl Database {
             return Err(Error::Schema(format!("table {} already exists", schema.table)));
         }
         let tables = self.tables();
+        let own = schema.table.clone();
         for f in schema.fields.iter_mut() {
-            let Some(r) = &f.references else { continue };
-            if r.eq_ignore_ascii_case(&schema.table) {
-                continue;
-            }
-            let t = tables.iter().find(|t| t.table.eq_ignore_ascii_case(r)).ok_or_else(|| Error::Schema(format!("field {}: references {r}, which is not a table", f.name)))?;
-            let pk = t.primary_key.map(|k| &t.fields[k]).ok_or_else(|| Error::Schema(format!("field {}: references {}, which has no primary key", f.name, t.table)))?;
-            if pk.ty != f.ty {
-                return Err(Error::Schema(format!(
-                    "field {}: references {}, whose primary key {} is {}, not {}",
-                    f.name,
-                    t.table,
-                    pk.name,
-                    crate::schema::type_name(&pk.ty),
-                    crate::schema::type_name(&f.ty)
-                )));
-            }
-            f.references = Some(t.table.clone());
+            resolve_reference(&tables, &own, f)?;
         }
         let mut vw = VersionWriter::begin(self);
         if vw.manifest.is_legacy() {
@@ -1681,6 +1663,85 @@ impl Database {
         Ok(())
     }
 
+    /// Changes the columns of the table named `table` (any case): each of
+    /// `alters` in turn ([`Schema::altered`]), in one commit. A column
+    /// added to a table that holds rows is read in them as its default
+    /// (NULL without one), in a `SELECT` and in every filter, sort and
+    /// search: the segments written before it hold no sections of it, so
+    /// each builds them in memory when it opens, until a merge rewrites it
+    /// with the column ([`crate::schema::Added`]). A dropped column's data
+    /// stays in those segments, unread, until then.
+    ///
+    /// The memtables are flushed and the log emptied first, as for
+    /// [`Database::drop_tables`], since the log names columns by position.
+    /// A merge that started before the change is not installed; the merger
+    /// starts it again. A rank profile of the table must still bind to its
+    /// columns, and a NOT NULL column added to a table with rows needs a
+    /// default.
+    ///
+    /// The change is not shipped to replicas yet: a primary's replicas take
+    /// it with a copy.
+    pub fn alter_table(&self, table: &str, alters: &[Alter]) -> Result<()> {
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        let (id, before, profiles) = {
+            let st = lock(&self.state);
+            let t = st.tables.iter().find(|t| t.schema.table.eq_ignore_ascii_case(table)).ok_or_else(|| Error::Schema(format!("no table {table}")))?;
+            if t.id == SOURCES_ID {
+                return Err(Error::Schema(format!("{SOURCES} is a system table, whose columns do not change")));
+            }
+            (t.id, t.schema.clone(), t.profiles.clone())
+        };
+        let mut schema = (*before).clone();
+        for a in alters {
+            schema = schema.altered(a)?;
+        }
+        if schema == *before {
+            return Ok(());
+        }
+        let tables = self.tables();
+        let mut rows = None;
+        for f in schema.fields.iter_mut().filter(|f| before.fields.iter().all(|b| b.id != f.id)) {
+            resolve_reference(&tables, &before.table, f)?;
+            if f.not_null && f.fill_value()? == crate::value::Value::Null {
+                let n = *rows.get_or_insert_with(|| self.snapshot_inner(true).table(&before.table).map_or(0, |t| t.n_live_docs()));
+                if n > 0 {
+                    return Err(Error::Schema(format!("column {} is NOT NULL, and the {n} rows {} holds would have none: give it a DEFAULT", f.name, before.table)));
+                }
+            }
+        }
+        for p in profiles.iter() {
+            crate::query::profile::check_columns(p, &schema).map_err(|e| Error::Schema(format!("rank profile {} of {} would no longer bind ({e}): drop or replace it first", p.name, before.table)))?;
+        }
+        self.flush_locked(&mut wal)?;
+        if !wal.is_empty() {
+            // Only transactions the segments already hold can be left.
+            wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
+        }
+        let mut vw = VersionWriter::begin(self);
+        vw.table_mut(id).schema = schema.clone();
+        let c = vw.commit(&mut wal)?;
+        self.publish(c, |st| {
+            st.live_cache.clear();
+            st.updates_cache.clear();
+        })?;
+        // Codebooks are kept by the position of their field.
+        let mut coded = self.codebooks.write().unwrap_or_else(|e| e.into_inner());
+        coded.retain_mut(|c| {
+            if c.table != id {
+                return true;
+            }
+            match before.fields.get(c.field).and_then(|f| schema.position_of(f.id)) {
+                Some(p) => {
+                    c.field = p;
+                    true
+                }
+                None => false,
+            }
+        });
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -2183,7 +2244,8 @@ impl Database {
         // As for bulk loads: WAL deletes are replayed against the on-disk
         // version, so segments added behind the WAL's back must follow it.
         self.flush_locked(&mut wal)?;
-        let pk = self.schema.primary_key;
+        let schema = self.schema();
+        let pk = schema.primary_key;
         let mut seen = HashSet::new();
         let mut loaded = Vec::with_capacity(images.len());
         for path in images {
@@ -2192,9 +2254,9 @@ impl Database {
                 .and_then(|f| f.verify_sections().map(|()| f))
                 .map_err(|e| Error::Schema(format!("{}: {e}", path.display())))?;
             // Written for the table as it is: its fields, by the same ids.
-            let ids = (!self.schema.is_legacy()).then(|| self.schema.fields.iter().map(|f| f.id).collect::<Vec<_>>());
+            let ids = (!schema.is_legacy()).then(|| schema.fields.iter().map(|f| f.id).collect::<Vec<_>>());
             if file.field_ids()? != ids {
-                return Err(Error::Schema(format!("{}: was written for other fields than table {}'s (the field ids differ)", path.display(), self.schema.table)));
+                return Err(Error::Schema(format!("{}: was written for other fields than table {}'s (the field ids differ)", path.display(), schema.table)));
             }
             let keys = crate::storage::pk::PkIndex::open(&file)?;
             if pk.is_some() != keys.is_some() {
@@ -2610,16 +2672,18 @@ impl Database {
     /// Replaces a merge's inputs with the merged segment (`written`, of
     /// `n_new` documents; none when every input document was deleted) in
     /// one commit. Returns whether it did: not when the table was dropped
-    /// meanwhile.
+    /// or altered meanwhile.
     #[allow(clippy::too_many_arguments)]
     fn install_merge(&self, wal: &mut Wal, claim: &MergeClaim, written: Option<&(Reserved, u32)>, inputs: &[(u64, Vec<DocId>)], slots: Option<&[Vec<u32>]>, n_new: u32, stats: &mut MergeStats) -> Result<bool> {
         let (table, snap, ids) = (claim.table, &claim.snap, &claim.ids[..]);
         self.check_poisoned()?;
         {
             let st = lock(&self.state);
-            if st.table_index(table).is_none() || inputs.iter().any(|(id, _)| st.handle(*id).is_none()) {
-                // Dropped while the merge was building, or replaced by a
-                // copy of the primary ([`Database::install_copy`]).
+            if st.table_index(table).is_none_or(|i| *st.tables[i].schema != *snap.schema()) || inputs.iter().any(|(id, _)| st.handle(*id).is_none()) {
+                // Dropped while the merge was building, replaced by a copy
+                // of the primary ([`Database::install_copy`]), or altered
+                // ([`Database::alter_table`]): the values written in place
+                // since are kept by the positions of the new columns.
                 return Ok(false);
             }
         }
@@ -3136,9 +3200,12 @@ impl Database {
 
     /// Makes a committed version the current one.
     fn publish(&self, c: Committed, update: impl FnOnce(&mut State)) -> Result<()> {
-        let (old, map) = {
+        let (old, map, altered) = {
             let st = lock(&self.state);
-            (st.handles().cloned().collect::<Vec<_>>(), st.map.clone())
+            // The segments of a table whose columns changed open again: what
+            // they read by position, and the fields they lack, follow it.
+            let altered: Vec<u32> = c.manifest.tables.iter().filter(|t| st.tables.iter().any(|o| o.id == t.id && *o.schema != t.schema)).map(|t| t.id).collect();
+            (st.handles().cloned().collect::<Vec<_>>(), st.map.clone(), altered)
         };
         let grown = self.dir.is_none() && c.meta.page_count * PAGE > map.len() as u64;
         let map = if grown { pager::map_file(&self.file, self.opts.read_ahead).map_err(|e| self.poison(e))? } else { map };
@@ -3151,7 +3218,7 @@ impl Database {
             .map(|t| {
                 t.segments
                     .iter()
-                    .map(|m| match (old.iter().find(|h| h.meta == *m), &self.dir) {
+                    .map(|m| match (old.iter().find(|h| h.meta == *m).filter(|_| !altered.contains(&t.id)), &self.dir) {
                         (Some(h), _) => Ok(h.clone()),
                         (None, Some(d)) => SegHandle::open_in(d, m, &t.schema, self.opts.read_ahead, hints, check).map(Arc::new),
                         (None, None) => SegHandle::open(&map, m, &t.schema, self.opts.read_ahead, hints, check).map(Arc::new),
@@ -3175,12 +3242,11 @@ impl Database {
                     Some(i) => {
                         let mut o = old_tables.swap_remove(i);
                         o.handles = h;
-                        // A drop with CASCADE removes references; nothing
-                        // else changes a table's schema, and never the
-                        // first table's (whose references are its own).
+                        // ALTER TABLE changes a table's columns, and a
+                        // drop with CASCADE its references.
                         if *o.schema != t.schema {
-                            debug_assert!(t.id != 0, "the first table's schema changed");
                             o.schema = Arc::new(t.schema.clone());
+                            o.ties = None;
                         }
                         // The version took them from here, unless it
                         // installs others (a copy's).
@@ -3233,7 +3299,7 @@ impl Database {
 
     /// The first table: id 0, always first since it cannot be dropped.
     fn first_table(&self) -> TableRef {
-        TableRef { id: 0, pos: 0, schema: self.schema.clone() }
+        TableRef { id: 0, pos: 0, schema: self.schema() }
     }
 
     /// Gives semantic-ID field `field` of the table named `table` its
@@ -4416,6 +4482,30 @@ fn check_field_lists(manifest: &Manifest, handles: &[Arc<SegHandle>]) -> Result<
             }
         }
     }
+    Ok(())
+}
+
+/// Checks that the table field `f` of table `own` references, if another,
+/// is one of `tables` whose primary key has the field's type, and spells
+/// the reference as that table's name.
+fn resolve_reference(tables: &[Arc<Schema>], own: &str, f: &mut crate::schema::Field) -> Result<()> {
+    let Some(r) = &f.references else { return Ok(()) };
+    if r.eq_ignore_ascii_case(own) {
+        return Ok(());
+    }
+    let t = tables.iter().find(|t| t.table.eq_ignore_ascii_case(r)).ok_or_else(|| Error::Schema(format!("field {}: references {r}, which is not a table", f.name)))?;
+    let pk = t.primary_key.map(|k| &t.fields[k]).ok_or_else(|| Error::Schema(format!("field {}: references {}, which has no primary key", f.name, t.table)))?;
+    if pk.ty != f.ty {
+        return Err(Error::Schema(format!(
+            "field {}: references {}, whose primary key {} is {}, not {}",
+            f.name,
+            t.table,
+            pk.name,
+            crate::schema::type_name(&pk.ty),
+            crate::schema::type_name(&f.ty)
+        )));
+    }
+    f.references = Some(t.table.clone());
     Ok(())
 }
 

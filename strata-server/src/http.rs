@@ -363,7 +363,7 @@ async fn stats(State(app): State<App>) -> AxJson<Json> {
 async fn schema(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Res {
     let s = match q.get("table") {
         Some(t) => app.svc.table(t).await?,
-        None => Arc::new(app.svc.schema.clone()),
+        None => app.svc.first_table(),
     };
     Ok(AxJson(table_json(&app.svc, &s)))
 }

@@ -42,13 +42,13 @@ fn vector_42(db: &Db) -> Value {
 }
 
 fn service(db: Db, base_url: &str) -> Arc<Service> {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent_config(base_url), 16, Duration::from_secs(10)))
 }
 
 /// A server of `db`, set up by `f` (its replication).
 fn service_with(db: Arc<Db>, f: impl FnOnce(&mut Service)) -> Arc<Service> {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(db), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
     f(&mut svc);
     Arc::new(svc)
@@ -245,7 +245,7 @@ async fn writes_over_http() {
 async fn concurrent_writes_wait_for_the_writer() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(create(dir.path(), "c.strata", |i| i < 500));
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = Arc::new(Service::new(Backend::Local(db.clone()), schema, agent_config("http://unused"), 16, Duration::from_secs(30)));
     let base = http(svc, None).await;
     let c = reqwest::Client::new();
@@ -293,7 +293,7 @@ async fn concurrent_writes_wait_for_the_writer() {
 async fn grouped_writes_fail_alone() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(create(dir.path(), "g.strata", |i| i < 200));
-    let svc = Arc::new(Service::new(Backend::Local(db.clone()), db.schema().clone(), agent_config("http://unused"), 16, Duration::from_secs(30)));
+    let svc = Arc::new(Service::new(Backend::Local(db.clone()), (*db.schema()).clone(), agent_config("http://unused"), 16, Duration::from_secs(30)));
     let base = http(svc, None).await;
     let c = reqwest::Client::new();
     let sold = |r: &Json| r["rows"][0][0].as_i64().unwrap();
@@ -781,7 +781,7 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
         good.push(replicas);
     }
     let dead = "http://127.0.0.1:1".to_string();
-    let hung = stuck(whole.schema()).await;
+    let hung = stuck(&whole.schema()).await;
 
     // Shard 0's first replica refuses connections; shard 1's never answers.
     let opts = CoordOptions { hedge: Duration::from_millis(50), ..Default::default() };
@@ -1509,7 +1509,7 @@ async fn a_page_is_fetched_from_the_snapshot_it_was_ranked_on() {
 async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "db.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = service(db, "http://unused");
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
@@ -1551,7 +1551,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
 
 /// A shard serving `db`, keeping the slot map it is given beside `path`.
 fn holding_slots(db: Db, path: &std::path::Path) -> Arc<Service> {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
     svc.keep_slots_in(slots::file_of(path)).unwrap();
     Arc::new(svc)
@@ -1818,7 +1818,7 @@ async fn vector_of_any_field_name() {
 async fn embedded_fields_over_http() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::create(&dir.path().join("e.strata"), demo::schema(500), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
     svc.open_models(dir.path());
     let base = http(Arc::new(svc), None).await;
@@ -2078,7 +2078,7 @@ async fn an_overloaded_replica_is_not_relieved_by_its_sibling() {
     let db = create(dir.path(), "db.strata", |_| true);
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let over = format!("http://{}", l.local_addr().unwrap());
-    let fake = pb::strata_server::StrataServer::new(Overloaded(serde_json::to_string(db.schema()).unwrap()));
+    let fake = pb::strata_server::StrataServer::new(Overloaded(serde_json::to_string(&*db.schema()).unwrap()));
     tokio::spawn(tonic::transport::Server::builder().add_service(fake).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
     let good = grpc(service(db, "http://unused")).await;
     let coord = cluster(Coordinator::connect(vec![format!("{over}|{good}")]).await.unwrap());
@@ -2213,7 +2213,7 @@ async fn health_reports_a_database_that_cannot_write() {
 async fn admin_routes_checkpoint_check_and_vacuum() {
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "db.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://127.0.0.1:9"), 16, Duration::from_secs(10));
     let backups = dir.path().join("backups");
     svc.set_backup_dir(&backups).unwrap();
@@ -2464,7 +2464,7 @@ async fn explain_gives_the_plan_ir() {
     use strata::query::{bind_command, Command};
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "e.strata", |i| i < 300);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let base = http(service(db, "http://unused"), None).await;
     let c = reqwest::Client::new();
     let sql = "SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY bm25(body, 'quiet kettle') DESC LIMIT 5";
