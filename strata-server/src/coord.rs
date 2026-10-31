@@ -2023,13 +2023,18 @@ impl Coordinator {
     /// how long it took to answer; and the slots each shard holds.
     pub async fn cluster(&self) -> Json {
         let t = &self.topo();
+        // Its part in replication said again too, as for `health`.
         let calls = t.replicas.iter().map(|rs| {
             join_all(rs.iter().map(|r| {
-                let mut c = r.client.clone();
+                let (mut c, mut h) = (r.client.clone(), r.client.clone());
                 async move {
                     let t0 = Instant::now();
-                    let a = tokio::time::timeout(Duration::from_secs(2), c.health(pb::Empty {})).await;
-                    (a, t0.elapsed().as_secs_f64() * 1e3)
+                    let (a, said) = tokio::join!(tokio::time::timeout(Duration::from_secs(2), c.health(pb::Empty {})), tokio::time::timeout(Duration::from_secs(2), hello(&mut h)));
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    if let Ok(Ok(said)) = said {
+                        r.heard(&said);
+                    }
+                    (a, ms)
                 }
             }))
         });
@@ -2050,6 +2055,7 @@ impl Coordinator {
                         Err(_) => json!({"url": r.url, "status": "down", "error": "no answer within 2 s", "rtt_ms": ms}),
                     };
                     j["role"] = json!(r.role().as_str_name().to_lowercase());
+                    j["term"] = json!(r.term.load(Ordering::Relaxed));
                     j["takes_writes"] = json!(r.takes_writes());
                     j["protocol"] = json!(r.protocol.load(Ordering::Relaxed));
                     if r.avoid_until.load(Ordering::Relaxed) > now {

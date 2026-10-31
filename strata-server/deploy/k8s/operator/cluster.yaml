@@ -1,0 +1,46 @@
+# A Strata cluster the operator makes and keeps: 2 shards of 3 copies
+# each (a primary and two replicas, on different nodes when there are),
+# behind one coordinator, holding 10,000 demo products split over the two
+# shards. Edit and apply again to change it:
+#
+#   kubectl -n strata patch strata demo --type merge -p '{"spec": {"shards": 3}}'     # add a shard: slots move to it
+#   kubectl -n strata patch strata demo --type merge -p '{"spec": {"replicas": 2}}'   # one copy fewer per shard
+#   kubectl -n strata get strata demo -o wide                                         # phase and what it is doing
+#   kubectl -n strata port-forward svc/demo 7700                                      # the API and the command center
+#
+# Deleting it deletes its pods and keeps their volumes (PVCs data-demo-s*).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: strata
+---
+apiVersion: strata.chloetech.ai/v1alpha1
+kind: StrataCluster
+metadata:
+  name: demo
+  namespace: strata
+spec:
+  image: strata-server:dev
+  imagePullPolicy: IfNotPresent
+  shards: 2
+  replicas: 3
+  coordinators: 1
+  storage:
+    size: 1Gi
+    # storageClassName: standard
+  # The first table: demo products here; or `schema:` with a table's
+  # schema as strata-server --schema takes it, for example
+  #   schema: {table: notes, key: id, fields: [{name: id, type: keyword}, {name: body, type: text}]}
+  demo: 10000
+  # A replica takes over when its primary has not answered for this long
+  # and a majority of the shard's copies agree (0: failover by hand).
+  failoverAfterMs: 3000
+  # A write is answered once every in-sync copy has it (all), a majority
+  # (majority), or the primary alone (primary).
+  writeAcks: all
+  # Servers and coordinators require the token in this Secret's key
+  # `token` (without it they run with --no-token: open to the cluster):
+  #   kubectl -n strata create secret generic demo-token --from-literal=token="$(openssl rand -hex 32)"
+  # tokenSecret: demo-token
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}

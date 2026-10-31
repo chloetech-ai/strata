@@ -592,9 +592,13 @@ impl Follower {
     }
 
     /// Puts it in sync: it holds the primary's last transaction. A replica
-    /// that joined counts among the copies from then.
-    fn caught_up(&self) {
-        self.member.store(true, Ordering::Relaxed);
+    /// that joined counts among the copies from then, once a call it
+    /// answered says so (`shipped`): not on installing a copy, whose call
+    /// started too long ago to count toward the primary's lease on reads.
+    fn caught_up(&self, shipped: bool) {
+        if shipped {
+            self.member.store(true, Ordering::Relaxed);
+        }
         if !self.in_sync.swap(true, Ordering::Relaxed) {
             tracing::info!(replica = %self.url, seq_no = self.acked(), "a replica is in sync");
         }
@@ -1217,7 +1221,7 @@ async fn ship(p: Weak<Primary>, k: usize) {
                         None => p.db.storage().numbering().map_or(last, |n| n.seq),
                     };
                     if r.seq >= last {
-                        f.caught_up();
+                        f.caught_up(end.is_some());
                         // Shipped up to the last, and not just copied: what
                         // followed the copy is no longer needed.
                         if end.is_some() {
@@ -1669,13 +1673,24 @@ impl Follow {
                 Err(_) => Err(ApiError::bad(format!("no answer within {} s", opts.call_timeout.as_secs()))),
             }
         });
+        // This replica's last transaction; when it holds none (its rows
+        // came in a copy), its term, as a copy that holds none is taken.
+        let last = match mine.seq {
+            0 => (mine.term, 0),
+            seq => (mine.last().term, seq),
+        };
         let mut copies = Vec::new();
         let mut ahead = Vec::new();
         for (url, a) in checked.iter().zip(futures::future::join_all(asks).await) {
             copies.push(match a {
                 Ok(h) => {
-                    if h.seq_no > mine.seq || h.term > mine.term {
-                        ahead.push(format!("{url} holds transactions up to {} (term {})", h.seq_no, h.term));
+                    // By its last transaction: a copy that began or follows a
+                    // newer term but holds nothing of it holds nothing more.
+                    // (A server that does not say its last term, or holds no
+                    // transaction, is taken at its term.)
+                    let last_term = if h.last_term > 0 { h.last_term } else { h.term };
+                    if (last_term, h.seq_no) > last {
+                        ahead.push(format!("{url} holds transactions up to {} (term {last_term})", h.seq_no));
                     }
                     json!({"url": url, "role": h.role().as_str_name().to_lowercase(), "term": h.term, "seq_no": h.seq_no})
                 }
@@ -1689,8 +1704,8 @@ impl Follow {
             return Err(conflict(format!(
                 "{}, past this replica's last ({} of term {}): the new primary would not hold those transactions, and a copy of it would drop them. Promote the copy with the latest transaction, or pass force",
                 ahead.join("; "),
-                mine.seq,
-                mine.last().term
+                last.1,
+                last.0
             )));
         }
         let elected = match force {
