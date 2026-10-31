@@ -77,7 +77,8 @@ pub struct Reach {
     pub edges: u64,
 }
 
-/// Breadth-first search to `max_hops`, meeting at most `max_nodes` nodes.
+/// Breadth-first search to `max_hops`, meeting at most `max_nodes` nodes
+/// besides the seeds; [`Reach::truncated`] if there were more.
 pub fn bfs(adj: &mut dyn Adjacency, seeds: &[Node], max_hops: u32, max_nodes: usize) -> Result<Reach> {
     let mut out = Reach { dist: node_map(), ..Default::default() };
     let mut frontier: Vec<Node> = Vec::new();
@@ -86,6 +87,7 @@ pub fn bfs(adj: &mut dyn Adjacency, seeds: &[Node], max_hops: u32, max_nodes: us
             frontier.push(s);
         }
     }
+    let max_nodes = max_nodes.saturating_add(frontier.len());
     let mut buf = Vec::new();
     for depth in 1..=max_hops {
         let mut next = Vec::new();
@@ -116,18 +118,30 @@ pub fn bfs(adj: &mut dyn Adjacency, seeds: &[Node], max_hops: u32, max_nodes: us
     Ok(out)
 }
 
+/// The answer of [`shortest_path`].
+#[derive(Debug, Default, PartialEq)]
+pub struct Path {
+    /// The path's nodes in order, if one was found.
+    pub nodes: Option<Vec<Node>>,
+    /// Edges followed.
+    pub edges: u64,
+    /// Stopped at the node limit before finding a path, so one may exist.
+    pub truncated: bool,
+}
+
 /// A shortest path from any of `from` to any of `to` (unweighted), by
 /// bidirectional breadth-first search: each round expands the smaller
-/// frontier, forward along the edges or backward against them. Returns the
-/// path's nodes in order, and the edges followed.
-pub fn shortest_path(adj: &mut dyn Adjacency, from: &[Node], to: &[Node], max_hops: u32, max_nodes: usize) -> Result<(Option<Vec<Node>>, u64)> {
+/// frontier, forward along the edges or backward against them, meeting at
+/// most `max_nodes` nodes besides the ends.
+pub fn shortest_path(adj: &mut dyn Adjacency, from: &[Node], to: &[Node], max_hops: u32, max_nodes: usize) -> Result<Path> {
     let mut edges = 0u64;
     if let Some(&n) = from.iter().find(|n| to.contains(n)) {
-        return Ok((Some(vec![n]), 0));
+        return Ok(Path { nodes: Some(vec![n]), ..Path::default() });
     }
     // Parent pointers on each side; u64::MAX marks a seed.
     let mut fwd: NodeMap<Node> = from.iter().map(|&n| (n, u64::MAX)).collect();
     let mut bwd: NodeMap<Node> = to.iter().map(|&n| (n, u64::MAX)).collect();
+    let max_nodes = max_nodes.saturating_add(fwd.len() + bwd.len());
     let mut ff: Vec<Node> = fwd.keys().copied().collect();
     let mut bf: Vec<Node> = bwd.keys().copied().collect();
     let mut buf = Vec::new();
@@ -155,7 +169,7 @@ pub fn shortest_path(adj: &mut dyn Adjacency, from: &[Node], to: &[Node], max_ho
                     next.push(v);
                 }
                 if mine.len() + other.len() > max_nodes {
-                    return Ok((None, edges));
+                    return Ok(Path { nodes: None, edges, truncated: true });
                 }
             }
         }
@@ -173,11 +187,11 @@ pub fn shortest_path(adj: &mut dyn Adjacency, from: &[Node], to: &[Node], max_ho
                 path.push(x);
                 x = bwd[&x];
             }
-            return Ok((Some(path), edges));
+            return Ok(Path { nodes: Some(path), edges, truncated: false });
         }
         *frontier = next;
     }
-    Ok((None, edges))
+    Ok(Path { nodes: None, edges, truncated: false })
 }
 
 /// Personalized PageRank by forward push (Andersen, Chung and Lang, 2006).
@@ -291,6 +305,10 @@ mod tests {
         d.sort();
         assert_eq!(d, vec![(0, 0), (1, 1), (2, 2), (4, 2), (5, 1)]);
         assert!(bfs(&mut chain(), &[0], 9, 3).unwrap().truncated);
+        // The limit counts the nodes met besides the seeds: 4 within 2 hops.
+        assert!(!bfs(&mut chain(), &[0], 2, 4).unwrap().truncated);
+        assert!(bfs(&mut chain(), &[0], 2, 3).unwrap().truncated);
+        assert!(bfs(&mut chain(), &[0], 1, 1).unwrap().truncated);
         // Not through 5: 4 is reached only along the long chain.
         let mut g = chain();
         g.1 = Some(5);
@@ -299,14 +317,18 @@ mod tests {
 
     #[test]
     fn shortest_paths_both_ways() {
-        assert_eq!(shortest_path(&mut chain(), &[0], &[4], 10, 100).unwrap().0, Some(vec![0, 5, 4]));
-        assert_eq!(shortest_path(&mut chain(), &[1], &[4], 10, 100).unwrap().0, Some(vec![1, 2, 3, 4]));
-        assert_eq!(shortest_path(&mut chain(), &[4], &[0], 10, 100).unwrap().0, None);
-        assert_eq!(shortest_path(&mut chain(), &[1], &[4], 2, 100).unwrap().0, None);
-        assert_eq!(shortest_path(&mut chain(), &[3], &[3], 2, 100).unwrap().0, Some(vec![3]));
+        assert_eq!(shortest_path(&mut chain(), &[0], &[4], 10, 100).unwrap().nodes, Some(vec![0, 5, 4]));
+        assert_eq!(shortest_path(&mut chain(), &[1], &[4], 10, 100).unwrap().nodes, Some(vec![1, 2, 3, 4]));
+        assert_eq!(shortest_path(&mut chain(), &[4], &[0], 10, 100).unwrap().nodes, None);
+        assert_eq!(shortest_path(&mut chain(), &[1], &[4], 2, 100).unwrap().nodes, None);
+        assert_eq!(shortest_path(&mut chain(), &[3], &[3], 2, 100).unwrap().nodes, Some(vec![3]));
+        // Out of nodes before a path: no path, and truncated.
+        let p = shortest_path(&mut chain(), &[1], &[4], 10, 1).unwrap();
+        assert_eq!((p.nodes, p.truncated), (None, true));
+        assert!(!shortest_path(&mut chain(), &[1], &[4], 2, 100).unwrap().truncated);
         let mut g = chain();
         g.1 = Some(5);
-        assert_eq!(shortest_path(&mut g, &[0], &[4], 10, 100).unwrap().0, Some(vec![0, 1, 2, 3, 4]));
+        assert_eq!(shortest_path(&mut g, &[0], &[4], 10, 100).unwrap().nodes, Some(vec![0, 1, 2, 3, 4]));
     }
 
     /// Power iteration on a small graph matches forward push.

@@ -110,7 +110,8 @@ pub struct Reach {
     pub hops: usize,
     /// Kinds a walk may pass through (seeds and end points are exempt).
     pub through: Vec<Kind>,
-    /// Stop after meeting this many records.
+    /// The most records a walk may meet; past it, the walk takes fewer
+    /// hops ([`Store::reach`]).
     pub max_nodes: usize,
 }
 
@@ -372,7 +373,9 @@ impl Store {
 
     /// The records reachable from `seeds` over links within `r.hops`, both
     /// ways, passing only through the kinds `r.through` allows, best
-    /// `n` by cosine similarity to `v`. Seeds are left out.
+    /// `n` by cosine similarity to `v`. Seeds are left out. A walk that
+    /// would meet more than `r.max_nodes` records takes a hop fewer (Strata
+    /// refuses to cut it), and none at all if one hop meets too many.
     pub fn reach(&self, seeds: &[String], v: &[f32], n: usize, filter: &Filter, r: &Reach) -> Result<Vec<(Record, f64)>> {
         if seeds.is_empty() || r.hops == 0 {
             return Ok(Vec::new());
@@ -383,12 +386,19 @@ impl Store {
             let ks: Vec<String> = r.through.iter().map(|k| format!("'{}'", k.as_str())).collect();
             format!(", through => kind IN ({})", ks.join(", "))
         };
-        let mut conds = filter.conds();
-        conds.push(format!("REACHABLE(links, :seeds, hops => {}, dir => 'both', max_nodes => {}{through})", r.hops, r.max_nodes));
-        let sql = format!("SELECT {COLUMNS}, score() FROM memory WHERE {} ORDER BY similarity(emb, :v) DESC LIMIT {n}", conds.join(" AND "));
-        let rs = self.query_with(&sql, &filter.params().set("v", Value::Vector(v.to_vec().into())).set("seeds", strs(seeds)))?;
-        let seeds: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
-        Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).filter(|(r, _)| !seeds.contains(r.id.as_str())).collect())
+        let params = filter.params().set("v", Value::Vector(v.to_vec().into())).set("seeds", strs(seeds));
+        for hops in (1..=r.hops).rev() {
+            let mut conds = filter.conds();
+            conds.push(format!("REACHABLE(links, :seeds, hops => {hops}, dir => 'both', max_nodes => {}{through})", r.max_nodes));
+            let sql = format!("SELECT {COLUMNS}, score() FROM memory WHERE {} ORDER BY similarity(emb, :v) DESC LIMIT {n}", conds.join(" AND "));
+            let rs = match self.query_with(&sql, &params) {
+                Err(e) if e.to_string().contains("max_nodes") => continue,
+                rs => rs?,
+            };
+            let seeds: std::collections::HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
+            return Ok(rs.rows.iter().filter_map(|r| Some((row_record(r)?, r.last()?.as_f64()?))).filter(|(r, _)| !seeds.contains(r.id.as_str())).collect());
+        }
+        Ok(Vec::new())
     }
 
     /// The top `n` by cosine similarity to `v`.
@@ -819,6 +829,12 @@ mod tests {
         let got: Vec<String> = s.reach(&[todo.clone()], &v, 10, &Filter::default(), &r).unwrap().into_iter().map(|(r, _)| r.id).collect();
         assert!(got.contains(&prompt) && got.contains(&fact_b), "{got:?}");
         assert!(!got.iter().any(|i| i.starts_with("e:") || *i == fact_c || *i == todo), "{got:?}");
+        // Two hops meet more than 3 records, one hop 3 (the prompt and two
+        // entities): the walk takes one; with 2, none.
+        let one = Reach { max_nodes: 3, ..r.clone() };
+        let got: Vec<String> = s.reach(&[todo.clone()], &v, 10, &Filter::default(), &one).unwrap().into_iter().map(|(r, _)| r.id).collect();
+        assert_eq!(got, vec![prompt.clone()]);
+        assert!(s.reach(&[todo.clone()], &v, 10, &Filter::default(), &Reach { max_nodes: 2, ..r }).unwrap().is_empty());
         // A retag keeps the links.
         s.retag(&todo, "done").unwrap();
         assert_eq!(s.get(&[todo]).unwrap()[0].links.len(), 3);
