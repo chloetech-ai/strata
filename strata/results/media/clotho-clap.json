@@ -1,0 +1,24 @@
+{
+  "audio_seconds": 23415.77800000001,
+  "audio_to_text": {
+    "R@1": 0.23157894736842105,
+    "R@10": 0.6172248803827751,
+    "R@5": 0.4861244019138756,
+    "mAP@10": 0.3372514619883041
+  },
+  "captions": 5225,
+  "captions_load_seconds": 107.981163976,
+  "dimensions": 512,
+  "machine": "cloud container, 4 vCPU Xeon 2.10 GHz, 15 GB",
+  "model": "clap-htsat-unfused",
+  "recordings": 1045,
+  "recordings_load_seconds": 742.965739018,
+  "search_seconds": 0.586802766,
+  "split": "clotho_captions_evaluation.csv",
+  "text_to_audio": {
+    "R@1": 0.15885167464114833,
+    "R@10": 0.5360765550239235,
+    "R@5": 0.40057416267942586,
+    "mAP@10": 0.2648958001063262
+  }
+}

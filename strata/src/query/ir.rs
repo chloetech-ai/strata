@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 15] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, MIN_MATCH];
+pub const FEATURES: [&str; 16] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, MIN_MATCH];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -124,6 +124,10 @@ pub const TEXT_OPERATORS: &str = "text_operators";
 /// The feature of a plan that tests whether text starts with a prefix
 /// ([`Expr::Prefix`]).
 pub const PREFIX: &str = "prefix";
+
+/// The feature of a plan with a correlated subquery ([`Expr::Outer`]), or
+/// the values one took for a Search's rows ([`Expr::ByKey`]).
+pub const CORRELATED: &str = "correlated";
 
 /// The feature of a plan whose text a row must match some of: a `MATCH`
 /// group `(a b c)@2`, or `bm25`'s `min` option. A Strata from before them
@@ -706,6 +710,26 @@ pub enum Expr {
     Exists(Box<Node>),
     /// The value of a plan's one row and one column; NULL without a row.
     Scalar(Box<Node>),
+    /// In the plan of a correlated subquery, a column of the row the
+    /// query around it is on: a field of a Search's row by id, or a column
+    /// of rows in memory. An [`Expr::Scalar`] whose plan names the row so
+    /// runs once for each distinct value of what it names among the rows
+    /// it is computed for, those values in their place (feature
+    /// [`CORRELATED`]).
+    Outer(u32),
+    /// A number for each row of a Search by its primary key, NULL for a
+    /// row it does not list: the values a correlated subquery took for the
+    /// Search's rows, once it ran (feature [`CORRELATED`]).
+    ByKey(Vec<KeyValue>),
+}
+
+/// A row's primary key and a number for it ([`Expr::ByKey`]); `None` is
+/// NULL.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeyValue {
+    #[serde(with = "lit")]
+    pub key: Value,
+    pub value: Option<f64>,
 }
 
 /// A traversal over an EDGES field, over an edge table, or over a VECTOR
@@ -776,6 +800,24 @@ impl Node {
             | Node::DistinctOn { input, .. } => vec![input],
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
             Node::With { ctes, input } => ctes.iter().map(|c| &c.input).chain([&**input]).collect(),
+        }
+    }
+
+    /// [`Node::inputs`], to change.
+    pub(crate) fn inputs_mut(&mut self) -> Vec<&mut Node> {
+        match self {
+            Node::Search(_) | Node::Insert { .. } | Node::Ref { .. } => Vec::new(),
+            Node::Aggregate { input, .. }
+            | Node::Filter { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Limit { input, .. }
+            | Node::Project { input, .. }
+            | Node::Update { input, .. }
+            | Node::Delete { input, .. }
+            | Node::Distinct { input }
+            | Node::DistinctOn { input, .. } => vec![input],
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
+            Node::With { ctes, input } => ctes.iter_mut().map(|c| &mut c.input).chain([&mut **input]).collect(),
         }
     }
 
@@ -1248,7 +1290,8 @@ impl Node {
         }
     }
 
-    pub(crate) fn search_mut(&mut self) -> Option<&mut Search> {
+    /// A leaf's Search, to change.
+    pub fn search_mut(&mut self) -> Option<&mut Search> {
         match self {
             Node::Search(s) => Some(s),
             Node::Project { input, .. } | Node::Limit { input, .. } | Node::Sort { input, .. } | Node::Filter { input, .. } | Node::Aggregate { input, .. } | Node::DistinctOn { input, .. } => input.search_mut(),
@@ -1308,6 +1351,24 @@ impl Expr {
     pub fn has_operators(&self) -> bool {
         let mut found = false;
         self.visit(&mut |e| found |= matches!(e, Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_)));
+        found
+    }
+
+    /// Whether the expression is a correlated subquery: an
+    /// [`Expr::Scalar`] whose plan names the row around it
+    /// ([`Expr::Outer`]).
+    pub fn is_correlated(&self) -> bool {
+        let Expr::Scalar(n) = self else { return false };
+        let mut found = false;
+        n.visit_exprs(&mut |e| found |= matches!(e, Expr::Outer(_)));
+        found
+    }
+
+    /// Whether the expression holds a correlated subquery
+    /// ([`Expr::is_correlated`]).
+    pub fn has_correlated(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |e| found |= e.is_correlated());
         found
     }
 
@@ -1476,6 +1537,11 @@ impl Plan {
         }
         if root.has_text_operators() {
             features.push(TEXT_OPERATORS.to_string());
+        }
+        let mut correlated = false;
+        root.visit_exprs(&mut |e| correlated |= matches!(e, Expr::Outer(_) | Expr::ByKey(_)));
+        if correlated {
+            features.push(CORRELATED.to_string());
         }
         if root.has_min_match() {
             features.push(MIN_MATCH.to_string());

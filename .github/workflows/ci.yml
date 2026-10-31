@@ -133,10 +133,11 @@ jobs:
         working-directory: strata-server
         run: cargo test --profile ci --features vision --test media_vectors --test media
 
-  # Sound (feature `audio`: symphonia's decoders and Whisper through
-  # candle): decoding, resampling and mel features, and text derived from
-  # sound with a test model (Whisper's weights are not fetched here), and
-  # clippy over the feature's code in Strata and the server.
+  # Sound (feature `audio`: symphonia's decoders, and Whisper and CLAP
+  # through candle): decoding, resampling and mel features, text derived
+  # from sound and vectors of it with test models (the real models' weights
+  # are not fetched here), and clippy over the feature's code in Strata and
+  # the server.
   audio:
     name: sound (feature audio)
     runs-on: ubuntu-latest
@@ -158,8 +159,8 @@ jobs:
       - name: Strata
         working-directory: strata
         run: |
-          cargo test --profile ci --features audio --test derived_audio
-          cargo test --profile ci --features audio --lib -- audio::
+          cargo test --profile ci --features audio --test derived_audio --test audio_vectors
+          cargo test --profile ci --features audio --lib -- audio:: clap::
           cargo clippy --profile ci --features audio --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
       - name: strata-server
         working-directory: strata-server

@@ -87,3 +87,16 @@ def serve(tmp_path):
     for p in procs:
         p.terminate()
         p.wait(timeout=10)
+
+
+def tone_wav():
+    """A WAV file of a tenth of a second of a 440 Hz tone, 16 kHz."""
+    import io, math, struct, wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / 16000))) for i in range(1600)))
+    return buf.getvalue()

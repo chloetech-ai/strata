@@ -554,6 +554,8 @@ impl<'a> Raise<'a> {
     fn rank(&mut self, e: &Expr, in_expr: bool) -> Result<Score> {
         let sub = |this: &mut Self, x: &Expr| this.rank(x, true).map(Box::new);
         Ok(match e {
+            // NULL, as a scalar subquery of no row is.
+            Expr::Lit(Value::Null) => Score::Num(f64::NAN),
             Expr::Lit(v) => match v.as_f64() {
                 Some(x) if x.is_finite() && !matches!(v, Value::Str(_)) => Score::Num(x),
                 _ => return Err(err(format!("a number in a ranking expression is finite, not {v:?}"))),
@@ -625,6 +627,12 @@ impl<'a> Raise<'a> {
             Expr::Product(factors) => Score::Product(factors.iter().map(|s| self.score(s)).collect::<Result<_>>()?),
             Expr::Ppr(g) if matches!(g.kind, GraphKind::Ppr { .. }) => Score::Ppr { graph: self.graph(g)? },
             Expr::Hops => Score::Hops { graph: self.hops_graph()?, far_first: false },
+            Expr::ByKey(values) => {
+                let pk = self.schema.primary_key.ok_or_else(|| err("values by key rank the rows of a table with a primary key"))?;
+                let values = values.iter().map(|kv| Ok(super::KeyValue { key: self.stored(pk, kv.key.clone())?, value: kv.value })).collect::<Result<_>>()?;
+                Score::ByKey(std::sync::Arc::new(crate::query::logical::ByKey::new(values)))
+            }
+            Expr::Outer(_) => return Err(err("a correlated subquery runs before the Search it ranks, with each row's values in place")),
             Expr::Ranked { keys } => {
                 let pk = self.schema.primary_key.ok_or_else(|| err(format!("ranked(keys) ranks rows by their primary keys, and {} has none", self.schema.table)))?;
                 Score::Ranked { keys: keys.iter().map(|k| crate::query::sql::coerced(&self.schema.fields[pk], k.clone())).collect::<Result<_>>()? }
