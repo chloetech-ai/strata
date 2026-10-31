@@ -1,0 +1,206 @@
+{
+ "scenario": "stockroom",
+ "lanes": {
+  "engram": {
+   "runs": 40,
+   "solved": 40,
+   "solved_rate": 1.0,
+   "score": 1.0,
+   "cost_usd": 0.00575003425,
+   "memory_cost_usd": 0.001826755,
+   "steps": 6.425,
+   "wall_s": 18.0075,
+   "memory_tool_calls": 0.2,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.05661423,
+    "memory_cost_usd": 0.030313999999999994,
+    "wall_s": 226.7,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 24,
+     "solved": 24,
+     "score": 1.0
+    },
+    "repo": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {}
+  },
+  "engram+next": {
+   "runs": 40,
+   "solved": 40,
+   "solved_rate": 1.0,
+   "score": 1.0,
+   "cost_usd": 0.0058132835,
+   "memory_cost_usd": 0.0017865175,
+   "steps": 6.475,
+   "wall_s": 17.8275,
+   "memory_tool_calls": 0.275,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.05661423,
+    "memory_cost_usd": 0.030313999999999994,
+    "wall_s": 226.7,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 24,
+     "solved": 24,
+     "score": 1.0
+    },
+    "repo": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "engram": {
+     "all": {
+      "tasks": 10,
+      "runs": [
+       40,
+       40
+      ],
+      "solved": [
+       40,
+       40
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 6,
+      "runs": [
+       24,
+       24
+      ],
+      "solved": [
+       24,
+       24
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "repo": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  }
+ },
+ "tasks": {
+  "count_sheet": {
+   "kind": "conversation",
+   "needs": "count sheet requirements stated only in conversation (walking order by bin, blind count)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "stock_value": {
+   "kind": "conversation",
+   "needs": "valuation method (FIFO, auditor) stated only in conversation",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "purchase_suggestions": {
+   "kind": "conversation",
+   "needs": "the client's order-quantity rule (up to 3x reorder point, whole cases) stated only in conversation",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "scanner_import": {
+   "kind": "conversation",
+   "needs": "the scanner file format (semicolons, no header, bin;sku;qty, sum duplicates) stated only in conversation",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "negative_stock_advice": {
+   "kind": "conversation",
+   "needs": "a failed approach and its reason (till posts after payment) stated only in conversation",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "config_advice": {
+   "kind": "conversation",
+   "needs": "an environment fact (client PC on Python 3.8) said once in passing",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "last_receipt": {
+   "kind": "repo",
+   "needs": "the SKU normalization convention, applied in the code during the history",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "write_off": {
+   "kind": "repo",
+   "needs": "the reason codes, added to the code during the history",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "abc_classes": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "parse_location": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  }
+ }
+}

@@ -1,0 +1,39 @@
+{
+ "tasks": 52,
+ "runs": [
+  208,
+  208
+ ],
+ "solved": {
+  "engram+next": 197,
+  "engram": 199
+ },
+ "fisher_solved_p": 0.8194138127694447,
+ "score_diff": -0.011618589743589869,
+ "perm_score_p": 0.054894510548945105,
+ "solved_diff": -0.009615384615384692,
+ "perm_solved_p": 0.48725127487251274,
+ "runs_shown_next_files": 65,
+ "next_files_shown": 130,
+ "tasks_shown_next_files": 18,
+ "solved_in_those_tasks": {
+  "engram+next": "65/72",
+  "engram": "67/72"
+ },
+ "cost_usd_per_run": {
+  "engram+next": 0.006729652403846154,
+  "engram": 0.00679633125
+ },
+ "memory_cost_usd_per_run": {
+  "engram+next": 0.0019295620192307692,
+  "engram": 0.0019568360576923075
+ },
+ "edit_hook_chars_per_run": {
+  "engram+next": 754.75,
+  "engram": 524.8798076923077
+ },
+ "prompt_hook_chars_per_run": {
+  "engram+next": 3330.716346153846,
+  "engram": 3330.7596153846152
+ }
+}

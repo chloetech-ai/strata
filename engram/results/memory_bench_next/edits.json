@@ -1,0 +1,39 @@
+{
+ "named": 207,
+ "edited": 59,
+ "without_named": 720,
+ "without_edited": 210,
+ "note_kinds": {
+  "fact": 16,
+  "error": 33,
+  "decision": 8
+ },
+ "by_project": {
+  "bakehouse": {
+   "named": 68,
+   "edited": 22,
+   "without_named": 254,
+   "without_edited": 82
+  },
+  "kestrel": {
+   "named": 34,
+   "edited": 12,
+   "without_named": 130,
+   "without_edited": 48
+  },
+  "slotwise": {
+   "named": 53,
+   "edited": 13,
+   "without_named": 128,
+   "without_edited": 32
+  },
+  "stockroom": {
+   "named": 52,
+   "edited": 12,
+   "without_named": 208,
+   "without_edited": 48
+  }
+ },
+ "edited_share": 0.28502415458937197,
+ "without_edited_share": 0.2916666666666667
+}
