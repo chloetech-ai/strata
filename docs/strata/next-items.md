@@ -71,6 +71,8 @@ SASRec's published numbers on the same split are 0.0605 and 0.0318 (as [TIGER](h
 
 A sequence model ([`encode()`](query-language.md#sequence-models-encodemodel-history)) trained on the same split, reading items only, has 0.0662 and 0.0406 ([results](https://github.com/rkonow/strata/tree/main/strata/results/sequence)), at 0.6 ms a query.
 
+On Beauty, Sports and Toys, the walk of the next section ranks above both that model and a generative decoder over [semantic IDs](server.md#semantic-ids), and `rrf` of the model's scores and the walk's ranks above the walk: on Beauty, Recall@10 0.0834 and NDCG@10 0.0511, and Recall@10 0.0855 with the decoder's answer added ([results](https://github.com/rkonow/strata/tree/main/strata/results/generative)).
+
 ## Several steps ahead
 
 Counts predict the next item. For items further ahead, or for "seen together", the same events can feed an [edge table](query-language.md#edge-tables), whose edges are directed: adding 1/*g* to the edge from the item *g* steps back to the new one records what comes after what, and `ppr(cooc, :x, dir => 'out')` walks forward from the last items. `dir => 'both'`, `ppr`'s default, reads the same edges as seen together.
