@@ -314,6 +314,10 @@ fn ranking_expressions_are_columns() {
     assert!(nulls > 10 && zeros > 100, "{nulls} {zeros}");
     let years = column(&r, "y");
     assert!(years.iter().all(|y| num(y).is_some_and(|y| y.fract() == 0.0)), "{years:?}");
+    // Without a ranking's value, the row evaluator computes the columns,
+    // typed: text functions too.
+    let r = db.query("SELECT id, lower(title), (year - 2000) * 2 AS y FROM docs ORDER BY rating DESC LIMIT 5", &params).unwrap();
+    assert!(r.rows.iter().all(|row| matches!(row[1], Value::Str(_)) && matches!(row[2], Value::Int(_))), "{:?}", r.rows);
 
     // Ordered by a selected expression, by position.
     let r = db.query("SELECT id, score(), bm25(body, :t) * 2 + 1 FROM docs ORDER BY 3 DESC LIMIT 10", &params).unwrap();
@@ -330,7 +334,6 @@ fn ranking_expressions_are_columns() {
         ("SELECT id, features() FROM docs ORDER BY 2 DESC LIMIT 5", "is not one column"),
         ("SELECT category, COUNT(*), features() FROM docs GROUP BY category ORDER BY COUNT(*) DESC", "not of groups"),
         ("SELECT category, bm25(body, :t) FROM docs GROUP BY category", "scores rows, not groups"),
-        ("SELECT id, lower(title) FROM docs LIMIT 5", "lower"),
         ("SELECT id, bm25(year, :t) FROM docs LIMIT 5", "TEXT"),
     ] {
         let e = db.query(sql, &params).map(|r| r.columns).unwrap_err().to_string();
