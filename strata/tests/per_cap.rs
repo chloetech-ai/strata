@@ -196,3 +196,62 @@ fn what_a_cap_refuses() {
         assert!(e.contains(want), "{q}: {e}");
     }
 }
+
+/// Posts of a few topics, most of them one topic's, with three texts only:
+/// BM25 ties thousands of rows, at a group's `k`-th row and at the cut.
+fn load_ties(dir: &std::path::Path) -> Db {
+    let schema = Schema::new(
+        "posts",
+        vec![
+            Field::new("id", FieldType::Keyword),
+            Field::new("topic", FieldType::Keyword),
+            Field::new("rank", FieldType::Int),
+            Field::new("body", FieldType::Text { positions: false }),
+        ],
+        Some("id"),
+    )
+    .unwrap();
+    let db = Db::create(&dir.join("p.strata"), schema, DbOptions { sync: false, segment_max_docs: 100, ..DbOptions::default() }).unwrap();
+    let mut g = rand::rngs::StdRng::seed_from_u64(11);
+    db.load((0..900).map(|i| {
+        let topic = if g.gen_bool(0.6) { "t0".to_string() } else { format!("t{}", g.gen_range(1..10)) };
+        let rank = if g.gen_bool(0.2) { Value::Null } else { Value::Int(g.gen_range(-2..4)) };
+        let body = ["dog", "dog dog", "dog cat"][g.gen_range(0..3)];
+        vec![Value::Str(format!("p{i:03}")), Value::Str(topic), rank, Value::Str(body.into())]
+    }))
+    .unwrap();
+    db
+}
+
+#[test]
+fn ties_at_each_cut_by_a_keyword_or_an_int_with_nulls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = load_ties(dir.path());
+    let mut checked = 0;
+    for field in ["topic", "rank"] {
+        for then in ["", ", id DESC"] {
+            let all = rows(&db, &format!("SELECT id, {field}, score() FROM posts ORDER BY bm25(body, 'dog') DESC{then} LIMIT 100000"));
+            assert_eq!(all.len(), 900);
+            for k in [1, 2, 5] {
+                for limit in [1, 3, 10, 25, 200] {
+                    let q = format!("SELECT id, {field}, score() FROM posts ORDER BY bm25(body, 'dog') DESC{then} MAX {k} PER {field} LIMIT {limit}");
+                    let got = db.query(&q, &Params::new()).unwrap();
+                    assert_eq!(got.rows, capped(&all, k, 0, Some(limit)), "{q}");
+                    // A descending key tie-break is a sort above the scan,
+                    // which reads every row.
+                    if then.is_empty() {
+                        assert!(got.stats.plan.iter().any(|l| l.contains("kept as bm25 scores each segment")), "{q}: {:?}", got.stats.plan);
+                    }
+                    checked += got.rows.len();
+                }
+            }
+        }
+    }
+    assert!(checked > 500, "{checked}");
+    // Other rankings read rows until enough are left.
+    let q = "SELECT id, topic, score() FROM posts ORDER BY bm25(body, 'dog') * 2 DESC MAX 2 PER topic LIMIT 15";
+    let got = db.query(q, &Params::new()).unwrap();
+    let all = rows(&db, "SELECT id, topic, score() FROM posts ORDER BY bm25(body, 'dog') * 2 DESC LIMIT 100000");
+    assert_eq!(got.rows, capped(&all, 2, 0, Some(15)), "{q}");
+    assert!(got.stats.plan.iter().any(|l| l.contains("read until enough rows are left")), "{:?}", got.stats.plan);
+}

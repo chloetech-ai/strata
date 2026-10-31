@@ -25,7 +25,7 @@ struct Args {
 fn main() {
     let a = Args::parse();
     let read = |f: &str| std::fs::read(a.model.join(f)).unwrap_or_else(|e| panic!("{}: {e}", a.model.join(f).display()));
-    let m = SequenceModel::parse("bench", &read(CONFIG_FILE), &read(WEIGHTS_FILE)).unwrap();
+    let m = SequenceModel::parse("bench", &read(CONFIG_FILE), &read(WEIGHTS_FILE), None).unwrap();
     println!("{m:?}");
     let mut rng = rand::rngs::StdRng::seed_from_u64(7);
     let items: Vec<Vec<f32>> = (0..1000).map(|_| (0..m.dim).map(|_| rng.gen_range(-0.2f32..0.2)).collect()).collect();

@@ -86,13 +86,15 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     assert_eq!(status, 403, "{j}");
     assert!(j["error"].as_str().unwrap().contains("write scope"), "{j}");
     assert_eq!(call(&base, "POST", "/v1/write", r, Some(json!({"ops": []}))).await.0, 403);
-    for (m, path) in [("POST", "/v1/admin/vacuum"), ("GET", "/v1/queries"), ("GET", "/v1/logs"), ("GET", "/v1/admin/keys"), ("GET", "/v1/export")] {
+    for (m, path) in [("POST", "/v1/admin/vacuum"), ("GET", "/v1/queries"), ("GET", "/v1/logs"), ("GET", "/v1/admin/keys"), ("GET", "/v1/export"), ("GET", "/v1/profile/settings"), ("POST", "/v1/profile/cpu"), ("GET", "/v1/profile/memory"), ("POST", "/v1/profile/heap"), ("GET", "/v1/profile/threads")] {
         assert_eq!(call(&base, m, path, r, None).await.0, 403, "{path}");
     }
     // write: rows, not tables.
     assert_eq!(call(&base, "POST", "/v1/sql", w, Some(insert)).await.0, 200);
     assert_eq!(call(&base, "POST", "/v1/sql", w, Some(create.clone())).await.0, 403);
     assert_eq!(call(&base, "POST", "/v1/admin/keys", w, Some(json!({"name": "x", "scope": "admin"}))).await.0, 403);
+    assert_eq!(call(&base, "POST", "/v1/profile/cpu", w, Some(json!({"seconds": 0.1}))).await.0, 403);
+    assert_eq!(call(&base, "POST", "/v1/profile/heap", w, Some(json!({"seconds": 0.1}))).await.0, 403);
     // The token may do it all; a table's statement is audited.
     assert_eq!(call(&base, "POST", "/v1/sql", root, Some(create)).await.0, 200);
 
@@ -151,6 +153,141 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     assert!(rd.health(pb::Empty {}).await.is_ok());
     let mut nobody = client("sk_00000000_ff".into()).await;
     assert_eq!(nobody.health(pb::Empty {}).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+}
+
+/// What a request does needs its scope, over HTTP and gRPC alike: the
+/// three ways past the key scopes the review of 31 October found (OPS-N1:
+/// BUG-N1, BUG-N2, BUG-N3) are closed, and each refusal is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_s_statements_and_options_need_their_scope_over_http_and_grpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = Arc::new(service(dir.path()));
+    let (l, base) = listen().await;
+    let access = Access { token: Some(Secret::new("root-token")), ..Default::default() };
+    tokio::spawn(server::serve_http(svc.clone(), l, access.clone()));
+    let (gl, gurl) = listen().await;
+    tokio::spawn(server::serve_grpc(svc.clone(), gl, access));
+    let root = Some("root-token");
+    let reader = new_key(&base, root, "dashboards", "read").await;
+    let writer = new_key(&base, root, "ingest", "write").await;
+    let admin = new_key(&base, root, "ops", "admin").await;
+    let (r, w, a) = (Some(reader.as_str()), Some(writer.as_str()), Some(admin.as_str()));
+    let client = |auth: String| {
+        let url = gurl.clone();
+        async move {
+            let ch = tonic::transport::Channel::from_shared(url).unwrap().connect().await.unwrap();
+            pb::strata_client::StrataClient::with_interceptor(ch, move |mut req: tonic::Request<()>| {
+                req.metadata_mut().insert("authorization", format!("Bearer {auth}").parse().unwrap());
+                Ok(req)
+            })
+        }
+    };
+    let tables = || svc.catalog().iter().map(|t| t.table.clone()).collect::<Vec<_>>();
+
+    // BUG-N1: a write key's table and rank-profile statements over gRPC
+    // Write are refused, as over HTTP; an admin key's are run and audited.
+    let sql = |s: &str| pb::WriteRequest { sql: s.into(), ..Default::default() };
+    let mut wr = client(writer.clone()).await;
+    for s in [
+        "CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT)",
+        "DROP TABLE products",
+        "CREATE RANK PROFILE cheap ON products AS SELECT * FROM products ORDER BY price ASC",
+    ] {
+        let e = wr.write(sql(s)).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "{s}: {e}");
+        assert!(e.message().contains("admin scope"), "{s}: {e}");
+    }
+    assert_eq!(tables(), vec!["products".to_string()]);
+    assert!(wr.write(sql("INSERT INTO products (id, title, category, price, sold) VALUES ('g-1', 'A lamp', 'home', 9.0, 1)")).await.is_ok());
+    let mut ops = client(admin.clone()).await;
+    ops.write(sql("CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT)")).await.unwrap();
+    assert!(tables().contains(&"notes".to_string()));
+
+    // BUG-N2: a read key does not write the rank log, through /v1/sql nor
+    // /v1/query; a write key logs to a log table that exists, and only an
+    // admin key's first logged query creates it.
+    let logged = json!({"sql": "SELECT id FROM products ORDER BY bm25(body, 'tent') DESC LIMIT 3", "log": true});
+    for route in ["/v1/sql", "/v1/query"] {
+        let (status, j) = call(&base, "POST", route, r, Some(logged.clone())).await;
+        assert_eq!(status, 403, "{route}: {j}");
+        assert!(j["error"].as_str().unwrap().contains("write scope"), "{j}");
+    }
+    let (status, j) = call(&base, "POST", "/v1/sql", w, Some(logged.clone())).await;
+    assert_eq!(status, 403, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("creates the table"), "{j}");
+    assert!(!tables().contains(&"rank_log".to_string()));
+    let (status, j) = call(&base, "POST", "/v1/query", a, Some(logged.clone())).await;
+    assert_eq!(status, 200, "{j}");
+    let (status, j) = call(&base, "POST", "/v1/sql", w, Some(logged.clone())).await;
+    assert_eq!(status, 200, "{j}");
+    assert_eq!(j["logged"]["rows"], 3, "{j}");
+
+    // BUG-N3: a write key's SQLite import that creates a table is refused
+    // before anything is written; into tables that exist, it imports.
+    let src = Db::create(&dir.path().join("src.strata"), demo::schema(N), DbOptions::default()).unwrap();
+    src.load((0..3).map(|i| demo::product(i, 7))).unwrap();
+    src.sql("CREATE TABLE extra (id INT PRIMARY KEY, body TEXT)", &strata::query::Params::new()).unwrap();
+    src.sql("INSERT INTO extra (id, body) VALUES (1, 'one')", &strata::query::Params::new()).unwrap();
+    let file = dir.path().join("src.sqlite");
+    strata::sqlite::export(&src, &file, &Default::default()).unwrap();
+    let bytes = std::fs::read(&file).unwrap();
+    let import = |auth: &str, q: &str| {
+        let (base, bytes, auth, q) = (base.clone(), bytes.clone(), auth.to_string(), q.to_string());
+        async move {
+            let r = reqwest::Client::new().post(format!("{base}/v1/import?format=sqlite{q}")).bearer_auth(auth).header("content-type", "application/vnd.sqlite3").body(bytes).send().await.unwrap();
+            (r.status().as_u16(), r.json::<Json>().await.unwrap())
+        }
+    };
+    let docs = || svc.local_db().unwrap().snapshot().n_live_docs();
+    let before = docs();
+    let (status, j) = import(&writer, "").await;
+    assert_eq!(status, 403, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("creates tables (extra)"), "{j}");
+    assert!(!tables().contains(&"extra".to_string()));
+    assert_eq!(docs(), before, "nothing was written");
+    // Its plan writes nothing, so a write key may ask for it.
+    assert_eq!(import(&writer, "&plan=true").await.0, 200);
+    let (status, j) = import(&writer, "&tables=products").await;
+    assert_eq!(status, 200, "{j}");
+    let (status, j) = import(&admin, "").await;
+    assert_eq!(status, 200, "{j}");
+    assert!(tables().contains(&"extra".to_string()));
+
+    // Each refusal and each admin statement is in the audit log, for gRPC
+    // as for HTTP.
+    let (_, audit) = call(&base, "GET", "/v1/admin/audit?limit=2000", root, None).await;
+    let entries = audit["entries"].as_array().unwrap();
+    let find = |who: &str, method: &str, route: &str, status: u64| entries.iter().any(|e| e["who"] == who && e["method"] == method && e["route"] == route && e["status"] == status);
+    assert!(find("ingest", "gRPC", "Write", 403), "{audit}");
+    assert!(find("ops", "gRPC", "Write", 200), "{audit}");
+    assert!(entries.iter().any(|e| e["method"] == "gRPC" && e["detail"].as_str().is_some_and(|d| d.starts_with("CREATE TABLE notes"))), "{audit}");
+    assert!(find("dashboards", "POST", "/v1/sql", 403) && find("dashboards", "POST", "/v1/query", 403), "{audit}");
+    assert!(entries.iter().any(|e| e["who"] == "ops" && e["route"] == "/v1/query" && e["detail"].as_str().is_some_and(|d| d.starts_with("CREATE TABLE IF NOT EXISTS rank_log"))), "{audit}");
+    assert!(find("ingest", "POST", "/v1/import", 403), "{audit}");
+    assert!(entries.iter().any(|e| e["who"] == "ops" && e["detail"] == "SQLite import created tables extra"), "{audit}");
+    // Plain reads and writes are not.
+    assert!(!entries.iter().any(|e| e["route"] == "Write" && e["who"] == "ingest" && e["status"] == 200), "{audit}");
+    let mut nobody = client("sk_00000000_ff".into()).await;
+    assert_eq!(nobody.health(pb::Empty {}).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+    let (_, audit) = call(&base, "GET", "/v1/admin/audit", root, None).await;
+    assert!(audit["entries"].as_array().unwrap().iter().any(|e| e["method"] == "gRPC" && e["status"] == 401), "{audit}");
+}
+
+/// A server without a token keeps an admin key that never expires, so the
+/// last one expiring cannot lock everyone out (BUG-N5).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_without_a_token_keeps_an_admin_key_that_never_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = Arc::new(service(dir.path()));
+    let (l, base) = listen().await;
+    tokio::spawn(server::serve_http(svc.clone(), l, Default::default()));
+    let (status, j) = call(&base, "POST", "/v1/admin/keys", None, Some(json!({"name": "me", "scope": "admin", "expires_days": 1}))).await;
+    assert_eq!(status, 400, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("never expire"), "{j}");
+    assert_eq!(call(&base, "GET", "/v1/whoami", None, None).await.1["name"], "open", "still open");
+    let admin = new_key(&base, None, "me", "admin").await;
+    let (status, j) = call(&base, "POST", "/v1/admin/keys", Some(&admin), Some(json!({"name": "brief", "scope": "admin", "expires_days": 1}))).await;
+    assert_eq!(status, 200, "{j}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

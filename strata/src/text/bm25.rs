@@ -214,11 +214,85 @@ impl Key for f64 {
 
 /// The best `k` (score, doc) pairs; ties keep the earlier document, or,
 /// with `ties`, every document tied with the `k`-th stays as well.
-struct TopK<S = f32> {
+struct TopK<'g, S = f32> {
     k: usize,
     heap: BinaryHeap<Entry<S>>,
     /// Pairs left out of the heap with the score of its worst, when kept.
     ties: Option<Vec<Entry<S>>>,
+    /// With a cap on each group's rows, the rows kept instead of the heap
+    /// ([`TopK::capped`]).
+    cap: Option<Cap<'g, S>>,
+}
+
+/// Rows a capped top-k compacts at the least ([`Cap::limit`]).
+const CAP_MIN: usize = 1024;
+
+/// The rows of a top-k that keeps at most `per` rows of each group: every
+/// row that can be among the best `k` once each group keeps its best `per`,
+/// ties at either cut broken later (by key, which a segment does not
+/// order by). Rows come in as scored; [`Cap::compact`] drops the rest.
+struct Cap<'g, S> {
+    per: usize,
+    /// A row's group; None for rows without a value, which are one group.
+    group: &'g dyn Fn(DocId) -> Option<u64>,
+    rows: Vec<(S, DocId, Option<u64>)>,
+    /// `rows` is compacted when it reaches this many.
+    limit: usize,
+    /// The score of the `k`-th row counted (each group's best `per`) at the
+    /// last compaction: rows below it cannot be among the best `k`.
+    theta: S,
+    /// The groups with `per` rows at the last compaction, and the score of
+    /// each one's `per`-th: rows of the group below it are out.
+    full: HashMap<Option<u64>, S>,
+}
+
+impl<S: Key> Cap<'_, S> {
+    #[inline]
+    fn insert(&mut self, doc: DocId, score: S, k: usize) {
+        if score.total_cmp(&self.theta).is_lt() {
+            return;
+        }
+        let g = (self.group)(doc);
+        if self.full.get(&g).is_some_and(|w| score.total_cmp(w).is_lt()) {
+            return;
+        }
+        self.rows.push((score, doc, g));
+        if self.rows.len() >= self.limit {
+            self.compact(k);
+            self.limit = self.rows.len().saturating_mul(2).max(k.saturating_mul(2)).max(CAP_MIN);
+        }
+    }
+
+    /// Keeps, best first, each group's best `per` rows and the rows tied
+    /// with its `per`-th, down to the `k`-th row counted (each group's
+    /// first `per`) and the rows tied with it.
+    fn compact(&mut self, k: usize) {
+        self.rows.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let per = self.per;
+        let mut seen: HashMap<Option<u64>, (usize, S)> = HashMap::new();
+        let (mut counted, mut theta) = (0usize, S::NEG_INFINITY);
+        self.rows.retain(|&(s, _, g)| {
+            if counted >= k && s.total_cmp(&theta).is_lt() {
+                return false;
+            }
+            let e = seen.entry(g).or_insert((0, s));
+            if e.0 < per {
+                e.0 += 1;
+                e.1 = s;
+                counted += 1;
+                if counted == k {
+                    theta = s;
+                }
+                true
+            } else {
+                s.total_cmp(&e.1).is_eq()
+            }
+        });
+        if counted >= k {
+            self.theta = theta;
+        }
+        self.full = seen.into_iter().filter(|(_, (n, _))| *n >= per).map(|(g, (_, s))| (g, s)).collect();
+    }
 }
 
 /// Heap order: the greatest entry is the worst (lowest score, then highest
@@ -240,18 +314,29 @@ impl<S: Key> PartialOrd for Entry<S> {
     }
 }
 
-impl<S: Key> TopK<S> {
+impl<'g, S: Key> TopK<'g, S> {
     fn new(k: usize) -> Self {
-        TopK { k, heap: BinaryHeap::with_capacity(k.saturating_add(1).min(HEAP_RESERVE)), ties: None }
+        TopK { k, heap: BinaryHeap::with_capacity(k.saturating_add(1).min(HEAP_RESERVE)), ties: None, cap: None }
     }
 
     fn with_ties(k: usize) -> Self {
         TopK { ties: Some(Vec::new()), ..TopK::new(k) }
     }
 
+    /// The rows that can be among the best `k` once each group (`group` of
+    /// a document) keeps only its best `per` ([`Cap`]).
+    fn capped(k: usize, per: usize, group: &'g dyn Fn(DocId) -> Option<u64>) -> Self {
+        let cap = Cap { per: per.max(1), group, rows: Vec::new(), limit: k.saturating_mul(2).max(CAP_MIN), theta: S::NEG_INFINITY, full: HashMap::new() };
+        TopK { k, heap: BinaryHeap::new(), ties: None, cap: Some(cap) }
+    }
+
     /// Scores must exceed this to enter (to be kept, with ties).
     #[inline]
     fn threshold(&self) -> S {
+        if let Some(c) = &self.cap {
+            // Rows tied with the cut are kept.
+            return c.theta.next_down();
+        }
         if self.heap.len() < self.k {
             return S::NEG_INFINITY;
         }
@@ -263,6 +348,10 @@ impl<S: Key> TopK<S> {
 
     #[inline]
     fn insert(&mut self, doc: DocId, score: S) {
+        if let Some(c) = &mut self.cap {
+            c.insert(doc, score, self.k);
+            return;
+        }
         if self.heap.len() < self.k {
             self.heap.push(Entry(score, doc));
             return;
@@ -285,8 +374,13 @@ impl<S: Key> TopK<S> {
         }
     }
 
-    /// By decreasing score, the kept ties last.
+    /// By decreasing score, the kept ties last (capped: by decreasing
+    /// score, then document).
     fn into_sorted(self) -> Vec<(DocId, S)> {
+        if let Some(mut c) = self.cap {
+            c.compact(self.k);
+            return c.rows.into_iter().map(|(s, d, _)| (d, s)).collect();
+        }
         let mut v = self.heap.into_sorted_vec();
         v.extend(self.ties.unwrap_or_default());
         v.into_iter().map(|e| (e.1, e.0)).collect()
@@ -563,6 +657,31 @@ impl TextFieldReader {
         self.run(self.query_weighted(&w, stats, params), top, &mut Text, filter, algo, FilterStrategy::Auto)
     }
 
+    /// The documents that can be among the best `k` by weighted BM25
+    /// ([`top_k_weighted`](Self::top_k_weighted)) once each group (`group`
+    /// of a document, None for the documents without a value) keeps only
+    /// its best `per`: each group's best `per`
+    /// and the documents tied with its `per`-th, down to the score of the
+    /// `k`-th so counted, documents tied with it kept; by decreasing score,
+    /// then document. Whatever order breaks the ties, the best `k` capped
+    /// rows of one segment or of many (the union of each one's) are among
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn top_k_capped(
+        &self,
+        terms: &[(String, f32)],
+        stats: &CollectionStats,
+        params: Bm25Params,
+        k: usize,
+        per: usize,
+        group: &dyn Fn(DocId) -> Option<u64>,
+        filter: Option<&dyn DocFilter>,
+        algo: TopKAlgo,
+    ) -> Vec<(DocId, f32)> {
+        let w: Vec<(&str, f32)> = terms.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        self.run(self.query_weighted(&w, stats, params), TopK::capped(k, per, group), &mut Text, filter, algo, FilterStrategy::Auto)
+    }
+
     /// The top `k` documents, and every document tied with the `k`-th, by
     /// `boost` of their weighted BM25 ([`top_k_weighted`](Self::top_k_weighted)),
     /// best first, and the algorithm that ran: `algo` where the boost's
@@ -622,7 +741,7 @@ impl TextFieldReader {
         self.score_with(self.query_dot(terms), docs)
     }
 
-    fn run<F: Final>(&self, mut q: Query<'_>, mut top: TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, F::S)> {
+    fn run<F: Final>(&self, mut q: Query<'_>, mut top: TopK<'_, F::S>, f: &mut F, filter: Option<&dyn DocFilter>, algo: TopKAlgo, strategy: FilterStrategy) -> Vec<(DocId, F::S)> {
         if top.k == 0 || q.scorers.is_empty() {
             return Vec::new();
         }
@@ -689,7 +808,7 @@ impl Query<'_> {
         (s as f32, any, live)
     }
 
-    fn drive<F: Final>(&mut self, members: impl Iterator<Item = DocId>, top: &mut TopK<F::S>, f: &mut F) {
+    fn drive<F: Final>(&mut self, members: impl Iterator<Item = DocId>, top: &mut TopK<'_, F::S>, f: &mut F) {
         for d in members {
             let (s, any, live) = self.score_doc(d);
             if any {
@@ -701,7 +820,7 @@ impl Query<'_> {
         }
     }
 
-    fn exhaustive<F: Final>(&mut self, top: &mut TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
+    fn exhaustive<F: Final>(&mut self, top: &mut TopK<'_, F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
         let sc = &mut self.scorers;
         // Current docIDs, dense, so that finding the next candidate does not
         // touch the (large) cursors.
@@ -731,7 +850,7 @@ impl Query<'_> {
         }
     }
 
-    fn max_score<F: Final>(&mut self, top: &mut TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
+    fn max_score<F: Final>(&mut self, top: &mut TopK<'_, F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
         let sc = &mut self.scorers;
         sc.sort_by(|a, b| a.max.total_cmp(&b.max));
         let n = sc.len();
@@ -793,7 +912,7 @@ impl Query<'_> {
         }
     }
 
-    fn block_max_wand<F: Final>(&mut self, top: &mut TopK<F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
+    fn block_max_wand<F: Final>(&mut self, top: &mut TopK<'_, F::S>, f: &mut F, filter: Option<&dyn DocFilter>) {
         let sc = &mut self.scorers;
         let n = sc.len();
         let mut docs: Vec<DocId> = sc.iter().map(|s| s.cur.doc()).collect();
@@ -900,5 +1019,72 @@ fn bubble(order: &mut [usize], mut p: usize, doc: impl Fn(usize) -> DocId) {
     while p + 1 < order.len() && doc(order[p]) > doc(order[p + 1]) {
         order.swap(p, p + 1);
         p += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{Rng, SeedableRng};
+
+    /// The first `k` rows with at most `per` of each group, in the order
+    /// of decreasing score with ties broken by `rank` (any order a caller
+    /// breaks them by).
+    fn exact(rows: &[(f32, DocId, Option<u64>)], k: usize, per: usize, rank: &[u32]) -> Vec<DocId> {
+        let mut v = rows.to_vec();
+        v.sort_by(|a, b| b.0.total_cmp(&a.0).then(rank[a.1 as usize].cmp(&rank[b.1 as usize])));
+        let mut seen: HashMap<Option<u64>, usize> = HashMap::new();
+        v.iter()
+            .filter(|r| {
+                let n = seen.entry(r.2).or_default();
+                *n += 1;
+                *n <= per
+            })
+            .take(k)
+            .map(|r| r.1)
+            .collect()
+    }
+
+    #[test]
+    fn a_capped_top_k_keeps_every_row_a_tie_order_can_pick() {
+        let mut g = rand::rngs::StdRng::seed_from_u64(5);
+        for case in 0..60 {
+            let n = [50, 3000, 9000][case % 3];
+            let groups = [1u64, 3, 40, 2000][case % 4];
+            // Few distinct scores, so that many rows tie at either cut.
+            let scores = [4u32, 30, 1000][case % 3];
+            let rows: Vec<(f32, DocId, Option<u64>)> = (0..n as DocId)
+                .map(|d| {
+                    let skewed = (g.gen::<f64>().powi(3) * groups as f64) as u64;
+                    let group = if g.gen_bool(0.1) { None } else { Some(skewed) };
+                    (g.gen_range(0..scores) as f32 / 7.0, d, group)
+                })
+                .collect();
+            let group_of: HashMap<DocId, Option<u64>> = rows.iter().map(|r| (r.1, r.2)).collect();
+            let group = |d: DocId| group_of[&d];
+            let (k, per) = (g.gen_range(1..60), g.gen_range(1..4));
+            let mut top = TopK::capped(k, per, &group);
+            let mut order: Vec<usize> = (0..rows.len()).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, g.gen_range(0..=i));
+            }
+            for &i in &order {
+                if rows[i].0 > top.threshold() {
+                    top.insert(rows[i].1, rows[i].0);
+                }
+            }
+            let kept = top.into_sorted();
+            assert!(kept.windows(2).all(|w| w[0].1 >= w[1].1), "case {case}: best first");
+            let got: std::collections::HashSet<DocId> = kept.iter().map(|r| r.0).collect();
+            for _ in 0..8 {
+                let mut rank: Vec<u32> = (0..n as u32).collect();
+                for i in (1..rank.len()).rev() {
+                    rank.swap(i, g.gen_range(0..=i));
+                }
+                for d in exact(&rows, k, per, &rank) {
+                    assert!(got.contains(&d), "case {case} (k {k}, per {per}): row {d} missing");
+                }
+            }
+        }
     }
 }

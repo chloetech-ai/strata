@@ -313,9 +313,10 @@ fn line_row(schema: &Schema, node: &str, l: &LogLine, last: &mut i64) -> Documen
     )
 }
 
-/// The query log's fields that are columns of `queries`; the rest go to
+/// The query log's fields that are columns of `queries`, and its `id`
+/// (the query's number in this run of the server); the rest go to
 /// `detail`.
-const QUERY_COLUMNS: [&str; 10] = ["ts_ms", "request_id", "kind", "outcome", "shard", "sql", "fingerprint", "ms", "rows", "error"];
+const QUERY_COLUMNS: [&str; 11] = ["id", "ts_ms", "request_id", "kind", "outcome", "shard", "sql", "fingerprint", "ms", "rows", "error"];
 
 fn query_row(schema: &Schema, node: &str, q: &Finished, last: &mut i64) -> Document {
     let ts = q.ts_ms as i64 * 1000;
@@ -866,6 +867,7 @@ mod tests {
         let s = LogStore::open(LogOptions { capture: false, queries_per_sec: 1, ..LogOptions::new(dir.path().join("q.logs"), "n".into()) }).unwrap();
         let q = |outcome: &'static str, ms: f64| {
             Arc::new(Finished {
+                id: 7,
                 ts_ms: 1_793_400_000_000,
                 request_id: Some("rq".into()),
                 sql: "SELECT * FROM t WHERE x = 1".into(),
@@ -877,6 +879,11 @@ mod tests {
                 shard: false,
                 error: None,
                 trace: vec![crate::telemetry::Span { name: "execute".into(), shard: None, replica: None, start_us: 0, dur_us: 9, outcome: "ok", again: false }],
+                steps: vec![strata::query::steps::Step { op: "filter".into(), start_us: 1.0, us: 8.0, rows: Some(3), ..Default::default() }],
+                profiled: false,
+                plan: vec!["filter x = 1".into()],
+                filter_docs: 3,
+                scored: 0,
             })
         };
         for _ in 0..5 {
@@ -891,6 +898,9 @@ mod tests {
         assert_eq!(rs.rows[0][2], Value::Str("SELECT * FROM t WHERE x = ?".into()));
         let detail: Json = serde_json::from_str(rs.rows[0][3].as_str().unwrap()).unwrap();
         assert_eq!(detail["trace"][0]["name"], "execute");
+        assert_eq!(detail["steps"][0]["op"], "filter", "its profile is kept: {detail}");
+        assert_eq!(detail["plan"][0], "filter x = 1");
+        assert!(detail.get("id").is_none(), "its number in this run of the server is not: {detail}");
         assert_eq!(rs.rows[0][4], Value::Bool(false));
         assert_eq!(s.status()["sampled_out"], 4);
     }

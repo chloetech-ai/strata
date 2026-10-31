@@ -168,6 +168,8 @@ impl Fnv {
 #[cfg(feature = "bert")]
 mod bert {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use candle_core::{CpuStorage, DType, Device, InplaceOp1, InplaceOp2, Layout, Module, Tensor};
     use candle_nn::{embedding, layer_norm, Embedding, LayerNorm, VarBuilder};
@@ -393,14 +395,17 @@ mod bert {
                 let att = candle_nn::ops::softmax_last_dim(&q.matmul(&k.t()?)?)?;
                 att.matmul(&v)?.transpose(0, 1)?.reshape((rows, h))
             };
-            // Pairs attend on their own threads: candle's products of one
-            // pair's size barely use a second core.
+            // Pairs attend on the query pool's threads: candle's products of
+            // one pair's size barely use a second core.
             let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(seqs.len());
             let per = seqs.len().div_ceil(threads.max(1));
-            let ctx = std::thread::scope(|s| {
-                let parts: Vec<_> = seqs.chunks(per).map(|part| s.spawn(|| part.iter().map(attend).collect::<candle_core::Result<Vec<_>>>())).collect();
-                parts.into_iter().map(|p| p.join().expect("attention thread")).collect::<candle_core::Result<Vec<_>>>()
-            })?;
+            let parts: Vec<&[(usize, usize)]> = seqs.chunks(per).collect();
+            let outs: Vec<Mutex<Option<candle_core::Result<Vec<Tensor>>>>> = parts.iter().map(|_| Mutex::new(None)).collect();
+            on_pool(parts.len(), &|i| {
+                let r = parts[i].iter().map(attend).collect::<candle_core::Result<Vec<_>>>();
+                *outs[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            });
+            let ctx = outs.into_iter().map(|o| o.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every part ran")).collect::<candle_core::Result<Vec<_>>>()?;
             let x = match first {
                 Some(rows) => x.index_select(rows, 0)?,
                 None => x.clone(),
@@ -409,6 +414,22 @@ mod bert {
             let up = l.up.forward(&x, Some(self.act))?;
             l.down_norm.forward(&l.down.forward_add(&up, &x)?)
         }
+    }
+
+    /// Runs `task(i)` for each `i` below `n` on this thread and on the
+    /// process's query pool ([`crate::query::pool::Pool::global`]), so
+    /// that reranks running at once share its threads, one per core,
+    /// rather than each starting a thread per core for every layer.
+    fn on_pool(n: usize, task: &(dyn Fn(usize) + Sync)) {
+        let next = AtomicUsize::new(0);
+        let pool = crate::query::pool::Pool::global();
+        pool.run(n.saturating_sub(1).min(pool.threads()), &|| loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            task(i);
+        });
     }
 
     /// A dense layer's bias, then its activation or the residual, in
@@ -451,11 +472,10 @@ mod bert {
                     }
                 }
             };
-            std::thread::scope(|s| {
-                for (k, part) in v.chunks_mut(rows * width).enumerate() {
-                    let run = &run;
-                    s.spawn(move || run(k * rows, part));
-                }
+            let parts: Vec<Mutex<&mut [f32]>> = v.chunks_mut(rows * width).map(Mutex::new).collect();
+            on_pool(parts.len(), &|k| {
+                let mut part = parts[k].lock().unwrap_or_else(|e| e.into_inner());
+                run(k * rows, &mut **part);
             });
             Ok(())
         }

@@ -354,15 +354,22 @@ impl<'a> Executor<'a> {
         let (what, edges, extra) = match &g.kind {
             GraphKind::Reach { min_hops, max_hops } => {
                 let r = traverse::bfs(&mut adj, &seed_nodes, *max_hops, g.max_nodes)?;
+                // A cut answer would depend on the order of the edges.
+                if r.truncated {
+                    return Err(err(format!("REACHABLE meets more than max_nodes => {} rows within hops => {max_hops}: raise max_nodes or lower hops", g.max_nodes)));
+                }
                 for (n, d) in r.dist {
                     if d >= *min_hops && d <= *max_hops {
                         nodes.insert(n, (d, -(d as f64)));
                     }
                 }
-                ("reachable", r.edges, if r.truncated { format!(", stopped at {} rows", g.max_nodes) } else { String::new() })
+                ("reachable", r.edges, String::new())
             }
             GraphKind::Path { max_hops, .. } => {
-                let (path, edges) = traverse::shortest_path(&mut adj, &seed_nodes, &targets, *max_hops, g.max_nodes)?;
+                let traverse::Path { nodes: path, edges, truncated } = traverse::shortest_path(&mut adj, &seed_nodes, &targets, *max_hops, g.max_nodes)?;
+                if truncated {
+                    return Err(err(format!("PATH meets more than max_nodes => {} rows before finding a path: raise max_nodes", g.max_nodes)));
+                }
                 let len = path.as_ref().map_or(0, |p| p.len());
                 for (i, n) in path.into_iter().flatten().enumerate() {
                     nodes.insert(n, (i as u32, -(i as f64)));

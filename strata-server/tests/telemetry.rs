@@ -116,7 +116,7 @@ async fn a_server_lists_times_and_cancels_its_queries() {
         let (status, body) = query(&base, json!({"sql": sql, "trace": true})).await;
         assert_eq!(status, 200, "{body}");
         let steps = names(&body["trace"]);
-        assert_eq!(steps, ["admission", "execute"], "{t}: {body}");
+        assert_eq!(steps, ["plan", "admission", "execute"], "{t}: {body}");
     }
     let stats = get(&base, "/v1/queries/stats").await;
     let shapes = stats["statements"].as_array().unwrap();
@@ -127,7 +127,7 @@ async fn a_server_lists_times_and_cancels_its_queries() {
     let recent = get(&base, "/v1/queries/recent").await;
     assert_eq!(recent["queries"].as_array().unwrap().len(), 3);
     assert_eq!(recent["queries"][0]["sql"], "SELECT COUNT(*) FROM products");
-    assert_eq!(names(&recent["queries"][0]["trace"]), ["admission", "execute"]);
+    assert_eq!(names(&recent["queries"][0]["trace"]), ["plan", "admission", "execute"]);
     let id = recent["queries"][0]["request_id"].as_str().unwrap().to_string();
     assert_eq!(get(&base, &format!("/v1/queries/request/{id}")).await["queries"].as_array().unwrap().len(), 1);
     let r = reqwest::Client::new().post(format!("{base}/v1/queries/stats/reset")).send().await.unwrap();
@@ -193,7 +193,7 @@ async fn a_coordinator_traces_its_shard_calls_and_shows_its_copies() {
         assert_eq!(on, [0, 1]);
         assert!(calls.iter().all(|s| s["outcome"] == "ok" && shards.contains(&s["replica"].as_str().unwrap().to_string())), "{body}");
     }
-    assert_eq!(trace[0]["name"], "admission");
+    assert_eq!((trace[0]["name"].as_str(), trace[1]["name"].as_str()), (Some("plan"), Some("admission")));
     // Each shard kept the query it ran for the coordinator, under the same id.
     let id = get(&base, "/v1/queries/recent").await["queries"][0]["request_id"].as_str().unwrap().to_string();
     for svc in &locals {

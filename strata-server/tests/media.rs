@@ -18,6 +18,7 @@ use strata::schema::{Field, FieldType, Schema, VectorIndexKind};
 use strata::storage::DbOptions;
 use strata::value::Value;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::media::HttpFetcher;
 use strata_server::replication::{Acks, Follow, Primary, PrimaryOptions};
 use strata_server::service::{After, AgentConfig, Backend, Replication, Service};
@@ -120,7 +121,7 @@ async fn writes_fetch_what_the_list_allows() {
         .unwrap();
     assert_eq!(w.rows, 4);
     // SQL and imports resolve too.
-    svc.sql(&format!("INSERT INTO photos (id, title, image) VALUES ('q', 'from sql', '{cdn}/a.png')"), &Params::new(), After::Any, 0).await.unwrap();
+    svc.sql(&Principal::open(), &format!("INSERT INTO photos (id, title, image) VALUES ('q', 'from sql', '{cdn}/a.png')"), &Params::new(), After::Any, 0).await.unwrap();
     let csv = format!("id,title,image\ni,imported,{cdn}/a.png\n");
     assert_eq!(svc.import(None, axum::body::Bytes::from(csv), strata::ingest::Format::Csv).await.unwrap().0, 1);
     let got = rows(&db);

@@ -5,8 +5,9 @@
 
 import { h, s, icon, clear, fmt, card, api, every, drawer, toast, confirm, pill, empty, table, sqlBlock, copy, shareBar, failure, debounce, showTip, hideTip } from "../core.js";
 import { state } from "../data.js";
+import { profileView } from "../profile.js";
 
-export default { id: "queries", title: "Queries", icon: "queries", group: "Workload", keywords: "live running cancel recent slow statements trace profile waterfall pg_stat_statements", render, onParams };
+export default { id: "queries", title: "Queries", icon: "queries", group: "Workload", keywords: "live running cancel recent slow statements trace waterfall pg_stat_statements", render, onParams };
 
 const OUTCOMES = { ok: "ok", partial: "warn", error: "bad", timeout: "bad", rejected: "warn", cancelled: "info" };
 const OCOLOR = { ok: "var(--s1)", partial: "var(--s4)", error: "var(--crit)", timeout: "var(--s8)", rejected: "var(--s2)", cancelled: "var(--s7)" };
@@ -19,7 +20,7 @@ function onParams(r) { switchTab?.(r.params.get("tab") || "live"); }
 export function waterfall(spans) {
   if (!spans?.length) return h("div", { class: "small muted" }, "No trace was kept for this query.");
   const end = Math.max(...spans.map((x) => x.start_us + x.dur_us), 1);
-  const kind = (n) => n === "admission" ? "k-admission" : n === "execute" ? "k-execute" : n.startsWith("wait") ? "k-wait" : "k-rpc";
+  const kind = (n) => n === "admission" ? "k-admission" : n === "execute" ? "k-execute" : n === "plan" ? "k-plan" : n.startsWith("wait") ? "k-wait" : "k-rpc";
   const rows = spans.slice().sort((a, b) => a.start_us - b.start_us);
   return h("div", {},
     h("div", { class: "wf" }, rows.map((x) => [
@@ -32,8 +33,12 @@ export function waterfall(spans) {
 
 /** The details of one ended query. */
 export function queryDrawer(q) {
+  // Its profile came with it (the log store keeps the steps), or the
+  // server's list of the latest and the slow has it by its number.
+  const kept = q.steps?.length > 0, fetch = !kept && q.id != null && q.steps_n;
   const logs = h("div");
   const same = h("div");
+  const prof = h("div", { class: "small muted" }, "Reading its profile…");
   const d = drawer({
     title: h("span", { class: "row nw" }, pill(OUTCOMES[q.outcome] || "info", q.outcome), `${fmt.ms(q.ms)} · ${q.kind}`), sub: `${fmt.datetime(q.ts_ms)} · ${fmt.plural(q.rows, "row")}${q.shard ? " · for a coordinator" : ""}`, wide: true,
     body: [
@@ -42,10 +47,13 @@ export function queryDrawer(q) {
       q.error ? h("div", { class: "error" }, q.error) : null,
       h("dl", { class: "kv" }, [["shape", h("span", { class: "mono small" }, q.fingerprint)], ["request id", q.request_id ? h("span", { class: "row nw" }, h("span", { class: "mono" }, q.request_id), h("button", { class: "btn ghost icon sm", title: "Copy", onclick: () => copy(q.request_id) }, icon("copy")), h("a", { class: "btn ghost sm", href: "#/logs?request=" + encodeURIComponent(q.request_id) }, "Its logs", icon("right"))) : "–"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])),
       card({ title: "Trace", sub: "where the time went", body: waterfall(q.trace) }),
+      kept || fetch ? card({ title: "Profile", sub: q.cpu_ms != null ? `every step it took, with its CPU time (${fmt.ms(q.cpu_ms)})` : "every step it took", tools: fetch ? h("a", { class: "btn sm", href: `#/profile?tab=${q.ms >= (state.system?.limits?.slow_ms ?? Infinity) ? "slow" : "recent"}&id=${q.id}`, onclick: () => d.close() }, icon("flame"), "Open in the Profiler") : null, body: prof }) : null,
       q.request_id ? card({ title: "Everything this request ran", body: same }) : null,
       q.request_id ? card({ title: "Its log lines", body: logs }) : null,
     ],
   });
+  if (kept) clear(prof, profileView({ ...q, took_ms: q.ms }, { compact: true }));
+  else if (fetch) api("/v1/queries/finished/" + q.id).then((f) => clear(prof, profileView({ ...f, took_ms: f.ms }, { compact: true }))).catch((e) => clear(prof, e.status === 404 ? "Its profile is gone: the server keeps the latest 500 queries and the slowest." : e.message));
   if (q.request_id) {
     api("/v1/queries/request/" + encodeURIComponent(q.request_id)).then((j) => clear(same, j.queries.length > 1 ? j.queries.map((x) => h("div", { class: "row nw small", style: { padding: "3px 0" } }, pill(OUTCOMES[x.outcome] || "info", x.outcome), h("span", { class: "mono ellipsis grow" }, x.sql), h("b", { class: "num" }, fmt.ms(x.ms)))) : h("div", { class: "small muted" }, "Just this query."))).catch((e) => clear(same, h("div", { class: "small muted" }, e.message)));
     api("/v1/logs?limit=50&request=" + encodeURIComponent(q.request_id)).then((j) => clear(logs, j.lines.length ? h("div", { class: "logs", style: { height: "auto", maxHeight: "240px", minHeight: 0 } }, j.lines.map((l) => h("div", { class: "ln" }, h("span", { class: "muted" }, fmt.time(l.ts_ms)), h("span", { class: "lv " + l.level }, l.level), h("span", { class: "tg" }, l.target), h("span", { class: "msg" }, l.message)))) : h("div", { class: "small muted" }, "No lines at the current log level. Set it to debug in Logs to see every request."))).catch((e) => clear(logs, h("div", { class: "small muted" }, e.message)));
@@ -136,7 +144,7 @@ function ended(body, which) {
     { key: "rows", label: "rows", num: true, render: (q) => fmt.n(q.rows) },
     { key: "sql", label: "SQL", cls: "sql", render: (q) => h("span", { title: q.sql }, q.sql) },
     { key: "trace", label: "steps", num: true, sort: (q) => q.trace?.length || 0, render: (q) => q.trace?.length ? miniTrace(q.trace) : "–" },
-  ], { sortKey: "ts_ms", desc: true, onRow: queryDrawer, empty: empty("queries", which === "slow" ? "No slow queries" : "No queries yet", which === "slow" ? (state.system?.limits?.slow_ms ? `None took over ${state.system.limits.slow_ms} ms.` : "Start the server with --slow-ms to keep them.") : "Run a query and it shows here.") });
+  ], { sortKey: "ts_ms", desc: true, onRow: queryDrawer, empty: empty("queries", which === "slow" ? "No slow queries" : "No queries yet", which === "slow" ? (state.system?.limits?.slow_ms ? `None took over ${state.system.limits.slow_ms} ms.` : h("span", {}, "Set a threshold in the ", h("a", { href: "#/profile?tab=slow" }, "Profiler"), " (or start the server with --slow-ms) to keep them.")) : "Run a query and it shows here.") });
   body.append(
     h("div", { class: "row", style: { marginBottom: "12px", gap: "10px" } }, chips, kindSel, search, toggleShard(), h("span", { class: "sep" }), note),
     card({ title: "Latency of each query", sub: "log scale · click a dot for its trace", body: plot, attrs: { style: { marginBottom: "14px" } } }),
@@ -165,7 +173,7 @@ function ended(body, which) {
 function miniTrace(spans) {
   const end = Math.max(...spans.map((x) => x.start_us + x.dur_us), 1);
   const svgEl = s("svg", { viewBox: "0 0 80 14", width: 80, height: 14, "aria-hidden": "true" });
-  spans.slice(0, 12).forEach((x, i) => svgEl.append(s("rect", { x: x.start_us / end * 80, y: (i % 3) * 4.5, width: Math.max(1, x.dur_us / end * 80), height: 4, rx: 1, style: { fill: x.outcome !== "ok" && x.outcome !== "outrun" ? "var(--crit)" : x.name === "admission" ? "var(--s4)" : x.name === "execute" ? "var(--s1)" : "var(--s3)" } })));
+  spans.slice(0, 12).forEach((x, i) => svgEl.append(s("rect", { x: x.start_us / end * 80, y: (i % 3) * 4.5, width: Math.max(1, x.dur_us / end * 80), height: 4, rx: 1, style: { fill: x.outcome !== "ok" && x.outcome !== "outrun" ? "var(--crit)" : x.name === "admission" ? "var(--s4)" : x.name === "execute" ? "var(--s1)" : x.name === "plan" ? "var(--s5)" : "var(--s3)" } })));
   return svgEl;
 }
 

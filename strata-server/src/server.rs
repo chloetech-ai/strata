@@ -46,7 +46,9 @@ pub struct Options {
     /// Ship the database's writes to these replicas (gRPC URLs of servers
     /// started with `replica`), as their primary
     /// ([`crate::replication`]); the replicas' token and CA are
-    /// `coord.token` and `coord.ca`.
+    /// `coord.token` and `coord.ca`. With `replica`: the shard's other
+    /// copies, which it ships to once promoted, and the only ones a
+    /// promotion asked for with a key may name.
     pub replicas: Vec<String>,
     /// Apply the writes a primary ships, and take none from clients.
     pub replica: bool,
@@ -187,7 +189,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if replicating && !o.shards.is_empty() {
         return Err("--replicas, --replica and --promote are for the servers holding a shard's copies, not the coordinator".into());
     }
-    if (!o.replicas.is_empty() || o.promote) && o.replica {
+    if o.promote && o.replica {
         return Err("a server is a primary (--replicas, --promote) or a replica (--replica), not both".into());
     }
     let ship_log_bytes = match replicating {
@@ -327,15 +329,17 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
         // How it ships as a primary, but for its replicas and acks.
         let ships = PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() };
-        if !o.replicas.is_empty() || o.promote {
+        if (!o.replicas.is_empty() && !o.replica) || o.promote {
             let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
             svc.set_replication(Replication::Primary(p));
         } else if o.replica {
             svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
-            svc.promote_options = Some(ships);
-            tracing::info!("replica: applies the writes its primary ships, and takes none from clients");
+            // Its --replicas: the shard's other copies, the ones a
+            // promotion ships to (Service::known_copies).
+            svc.promote_options = Some(PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, ..ships });
+            tracing::info!(copies = %o.replicas.join(", "), "replica: applies the writes its primary ships, and takes none from clients");
         }
     }
     open_log_store(&mut svc, o)?;
@@ -672,6 +676,19 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access
         }
         None => {
             counted.metrics.grpc("any", "Unauthenticated", 0.0);
+            // The method is not known yet: the path is the service's.
+            counted.audit.add(crate::keys::Entry {
+                ts_ms: crate::telemetry::now_ms(),
+                who: "unknown".into(),
+                key: None,
+                scope: None,
+                method: "gRPC".into(),
+                route: "any".into(),
+                status: 401,
+                ms: 0.0,
+                request_id: None,
+                detail: None,
+            });
             Err(tonic::Status::unauthenticated("missing or wrong token"))
         }
     };

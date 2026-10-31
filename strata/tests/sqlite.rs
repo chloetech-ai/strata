@@ -432,3 +432,45 @@ fn export_some_tables_bare() {
     assert_eq!(field(s, "price").default, Some(json!(9.99)));
     assert_eq!(ids(&back, "SELECT isbn FROM books WHERE tags = 'fable'"), [Value::from("isbn-2")]);
 }
+
+/// Review BUG-N11 of 31 October: a table `x_y` was renamed `x_y_2` because
+/// a table `x-y` before it took the name; `9223372036854775807` in a column
+/// of integers and reals became a float with no note; and one infinite
+/// real refused the whole import.
+#[test]
+fn names_as_written_and_values_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("odd.sqlite");
+    let c = Connection::open(&src).unwrap();
+    c.execute_batch(
+        "CREATE TABLE \"x-y\" (id INTEGER PRIMARY KEY, v TEXT);
+         CREATE TABLE x_y (id INTEGER PRIMARY KEY, \"a-b\" TEXT, a_b TEXT, m, r REAL NOT NULL);
+         INSERT INTO \"x-y\" VALUES (1, 'dash');
+         INSERT INTO x_y VALUES (1, 'p', 'q', 9223372036854775807, 1.5), (2, 'p', 'q', 0.5, 9e999), (3, 'p', 'q', 2, -9e999);",
+    )
+    .unwrap();
+    drop(c);
+    let (db, done) = sqlite::import_new(&src, &dir.path().join("odd.strata"), DbOptions::default(), &ImportOptions::default()).unwrap();
+    let names: Vec<(&str, &str, u64)> = done.tables.iter().map(|t| (t.source.as_str(), t.table.as_str(), t.rows)).collect();
+    assert_eq!(names, [("x-y", "x_y_2", 1), ("x_y", "x_y", 3)], "a name Strata spells as SQLite does keeps it");
+    let s = db.catalog().into_iter().find(|s| s.table == "x_y").unwrap();
+    let fields: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(fields, ["id", "a_b_2", "a_b", "m", "r"]);
+    let notes = &done.tables[1].notes;
+    assert!(notes.iter().any(|n| n == "column \"a-b\" is field a_b_2"), "{notes:?}");
+    assert!(notes.iter().all(|n| !n.contains("table \"x_y\"")), "{notes:?}");
+    // The integers of a FLOAT column past 2^53 round, and the plan says so.
+    assert_eq!(field(&s, "m").ty, FieldType::Float);
+    assert!(notes.iter().any(|n| n.contains("\"m\"") && n.contains("2^53")), "{notes:?}");
+    assert_eq!(ids(&db, "SELECT m FROM x_y ORDER BY id"), [Value::Float(9223372036854775807i64 as f64), Value::Float(0.5), Value::Float(2.0)]);
+    // An infinite real is NULL, noted, and the column may hold NULL.
+    assert!(notes.iter().any(|n| n.contains("\"r\"") && n.contains("2 infinite values are NULL")), "{notes:?}");
+    assert!(!field(&s, "r").not_null);
+    assert_eq!(ids(&db, "SELECT r FROM x_y ORDER BY id"), [Value::Float(1.5), Value::Null, Value::Null]);
+    // A column of small integers beside reals needs no note.
+    let c = Connection::open(&src).unwrap();
+    c.execute_batch("UPDATE x_y SET m = 7 WHERE id = 1").unwrap();
+    drop(c);
+    let plan = sqlite::plan(&src, None, &ImportOptions::default()).unwrap();
+    assert!(plan.tables[1].notes.iter().all(|n| !n.contains("2^53")), "{:?}", plan.tables[1].notes);
+}

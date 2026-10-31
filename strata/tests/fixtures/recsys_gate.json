@@ -1,0 +1,66 @@
+{
+ "data": {
+  "name": "MovieLens-1M",
+  "users": 6040,
+  "items": 3706,
+  "ratings": 1000209
+ },
+ "protocol": "leave-one-out, full ranking without the user's own items, all users",
+ "model": "ml1m",
+ "tolerance": {
+  "recall@10": 0.002,
+  "recall@50": 0.002,
+  "recall@100": 0.002,
+  "ndcg@10": 0.002,
+  "coverage@10": 0.005
+ },
+ "beat_both_baselines": [
+  "encode",
+  "next_items",
+  "ppr"
+ ],
+ "sources": {
+  "popularity": {
+   "ndcg@10": 0.0179,
+   "recall@10": 0.0364,
+   "recall@100": 0.226,
+   "recall@50": 0.1397,
+   "coverage@10": 0.0537
+  },
+  "item_knn": {
+   "ndcg@10": 0.0354,
+   "recall@10": 0.0692,
+   "recall@100": 0.3118,
+   "recall@50": 0.1987,
+   "coverage@10": 0.1387
+  },
+  "encode": {
+   "ndcg@10": 0.1804,
+   "recall@10": 0.306,
+   "recall@100": 0.6677,
+   "recall@50": 0.5596,
+   "coverage@10": 0.6257
+  },
+  "maxsim": {
+   "ndcg@10": 0.0317,
+   "recall@10": 0.0641,
+   "recall@100": 0.3222,
+   "recall@50": 0.207,
+   "coverage@10": 0.4811
+  },
+  "next_items": {
+   "ndcg@10": 0.1211,
+   "recall@10": 0.2108,
+   "recall@100": 0.4788,
+   "recall@50": 0.3959,
+   "coverage@10": 0.7574
+  },
+  "ppr": {
+   "ndcg@10": 0.1383,
+   "recall@10": 0.2417,
+   "recall@100": 0.5684,
+   "recall@50": 0.4675,
+   "coverage@10": 0.5275
+  }
+ }
+}

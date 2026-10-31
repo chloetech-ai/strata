@@ -17,7 +17,7 @@ use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
 use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
-use strata::query::{bind_command, compound, ops, profile, Command, Params, Select};
+use strata::query::{bind_command, compound, ops, profile, steps, Command, Params, Select};
 use strata::rank_log::{self, Log};
 use strata::schema::Schema;
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
@@ -35,7 +35,7 @@ use crate::replication::{Acks, Follow, Primary, PrimaryOptions, READ_WAIT};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
 use crate::alerts::Alerts;
-use crate::keys::{Audit, Keys, Scope};
+use crate::keys::{self, Audit, Keys, Principal, Scope};
 use crate::telemetry::{self, LiveQueries, QueryLog, Sample, Series};
 use crate::{json as js, obs, pb, ApiError};
 
@@ -76,6 +76,12 @@ pub struct QueryReq {
     pub release: bool,
     /// The writes the query must see ([`After`]).
     pub after: After,
+    /// Measure each step's CPU time ([`ExecOptions::profile`]).
+    pub profile: bool,
+    /// Not kept among the latest queries, nor in the statements'
+    /// statistics: a run of a CPU profile's query ([`crate::profiler`]),
+    /// which runs it thousands of times. Still counted in the metrics.
+    pub quiet: bool,
 }
 
 /// The writes a read must see, so that a client reads its own writes
@@ -182,8 +188,12 @@ pub struct Service {
     /// The longest deadline a request may ask for (`timeout_ms`).
     pub max_timeout: Duration,
     /// Queries and writes that take this long or longer are logged as
-    /// slow (`None`: none are).
+    /// slow (`None`: none are), unless changed while the server runs
+    /// ([`Self::slow_after`]).
     pub slow: Option<Duration>,
+    /// Profiling settings changed at run time: the slow threshold, and
+    /// whether every query's CPU time is measured.
+    pub profiling: telemetry::Profiling,
     /// The most rows a query may reach, OFFSET included
     /// ([`ExecOptions::max_rows`]; `None`: no limit).
     pub max_rows: Option<usize>,
@@ -251,6 +261,15 @@ pub enum Replication {
 
 impl Service {
     pub fn new(backend: Backend, schema: Schema, agent: AgentConfig, max_concurrent: usize, timeout: Duration) -> Service {
+        // Steps count from this moment, which must come before any
+        // request's start for them to line up with its trace.
+        steps::epoch();
+        // With the counting allocator, a profiled query's steps carry the
+        // bytes they allocated, and the heap's peak is kept.
+        if crate::heap::installed() {
+            steps::count_allocations(crate::heap::thread_allocated);
+            crate::heap::watch();
+        }
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let idempotency = Arc::new(idem::Keys::default());
         let writer_state = Arc::new(WriterState::default());
@@ -282,6 +301,7 @@ impl Service {
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
+            profiling: telemetry::Profiling::default(),
             max_rows: None,
             max_rerank: None,
             max_groups: None,
@@ -410,10 +430,45 @@ impl Service {
         }
     }
 
+    /// The shard's other copies, as this replica knows them (its
+    /// `--replicas`): the only servers a promotion asked for with a key
+    /// calls, and so sends the cluster's token to.
+    pub fn known_copies(&self) -> Vec<String> {
+        self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default()
+    }
+
     /// Makes this replica the primary of a new term, shipping to
     /// `replicas` under `acks` ([`Follow::promote`]); with `force`, even
-    /// when one of them holds transactions this replica does not.
-    pub async fn promote(&self, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
+    /// when one of them holds transactions this replica does not. No
+    /// `replicas`: its [`Self::known_copies`]. Promotion calls each copy
+    /// with the cluster's token, so a key's promotion may name only known
+    /// copies; the token's holder, who could send the token anywhere
+    /// anyway, may name others.
+    pub async fn promote(&self, who: &Principal, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
+        who.may(Scope::Admin, "a promotion")?;
+        let known = self.known_copies();
+        let replicas = match replicas.is_empty() {
+            true => known,
+            false => {
+                let unknown: Vec<&String> = replicas.iter().filter(|u| !known.contains(u)).collect();
+                if !who.root && !unknown.is_empty() {
+                    let known = match known.is_empty() {
+                        true => "none: start the replica with --replicas naming them".to_string(),
+                        false => known.join(", "),
+                    };
+                    return Err(ApiError {
+                        status: 403,
+                        message: format!(
+                            "{} {} not among this shard's copies, which promotion calls with the cluster's token; known copies: {known}",
+                            unknown.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(", "),
+                            if unknown.len() == 1 { "is" } else { "are" }
+                        ),
+                    });
+                }
+                replicas
+            }
+        };
+        keys::note(format!("promote, shipping to {}", if replicas.is_empty() { "no replica".to_string() } else { replicas.join(", ") }));
         let _one = self.promoting.lock().await;
         let Replication::Replica(f) = self.replication() else {
             return Err(conflict("this server is not a replica (--replica): only a replica is promoted".into()));
@@ -1189,6 +1244,7 @@ impl Service {
         let timeout = self.timeout_of(req.timeout_ms);
         // Bound against every table: a query of one table is the
         // executor's, any other a compound plan.
+        let tp = Instant::now();
         let plan = match &req.plan {
             Some(p) => Ok(p.clone()),
             None => self.bound(|tables| compound::plan_read(&req.sql, tables, &req.params, &|t, n| self.rank_profile(t, n))).await.map(Arc::new),
@@ -1200,6 +1256,7 @@ impl Service {
             (p, _) => p,
         };
         let plan = plan.and_then(|p| self.open_ranking_models(p, req.shard));
+        telemetry::record("plan", tp, if plan.is_ok() { "ok" } else { "error" });
         let bound = match plan {
             Ok(plan) if plan.root.uses_operators() => {
                 // A compound query runs as its plan; a coordinator sends the
@@ -1227,7 +1284,7 @@ impl Service {
                 let secs = t0.elapsed().as_secs_f64();
                 self.metrics.query("invalid", "error", secs);
                 // Kept with its error, as a query that ran and failed is.
-                self.query_log.add(&req.sql, "invalid", "error", secs, 0, req.shard, Some(&e.message), false);
+                self.query_log.add(&req.sql, "invalid", "error", secs, 0, req.shard, Some(&e.message), false, None, false);
                 Err(e)
             }
         }
@@ -1239,12 +1296,17 @@ impl Service {
     /// their keys place them on. The first query logged to a table makes
     /// it, on every shard through a coordinator. A replica refuses it, the
     /// log being a write. Returns the request's id and the log's write.
-    pub async fn query_logged(self: &Arc<Self>, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+    /// A logged query needs a write key, and the first one to a table,
+    /// which creates it, an admin key.
+    pub async fn query_logged(self: &Arc<Self>, who: &Principal, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+        who.may(Scope::Write, "a logged query (it writes the rank log)")?;
         self.takes_writes()?;
         let schema = match self.table(&log.table).await {
             Ok(s) => s,
             Err(_) => {
-                self.sql(&rank_log::create_sql(&log.table)?, &Params::new(), After::Any, req.timeout_ms).await?;
+                let what = format!("the first query logged to {} (it creates the table; log once with an admin key, or create it with CREATE TABLE)", log.table);
+                who.may(Scope::Admin, &what)?;
+                self.sql(who, &rank_log::create_sql(&log.table)?, &Params::new(), After::Any, req.timeout_ms).await?;
                 self.table(&log.table).await?
             }
         };
@@ -1267,7 +1329,13 @@ impl Service {
     /// [`Service::query`] does, and a write as [`Service::sql`] does (on any
     /// table). A coordinator takes writes as SQL until its shards take write
     /// plans. A read sees the writes `after` names.
-    pub async fn run_plan(self: &Arc<Self>, plan: Plan, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+    pub async fn run_plan(self: &Arc<Self>, who: &Principal, plan: Plan, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        if plan.writes() {
+            who.may(Scope::Write, "a write plan")?;
+            if !plan.is_write() {
+                return Err(ApiError::bad("a plan writes at its root only: an INSERT, UPDATE or DELETE inside a read is not run"));
+            }
+        }
         let t0 = Instant::now();
         // What the slow-query log shows of the plan.
         let catalog = self.catalog();
@@ -1292,6 +1360,8 @@ impl Service {
     async fn select(self: &Arc<Self>, mut req: QueryReq, schema: Arc<Schema>, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = metrics::kind(&select);
         let mut lease = 0;
+        req.profile |= self.profiling.cpu_all.load(Ordering::Relaxed);
+        let profiled = req.profile;
         let live = self.live.start(&req.sql, kind, req.shard);
         let res = match &self.backend {
             Backend::Local(db) => {
@@ -1326,6 +1396,7 @@ impl Service {
                         max_rows: if req.shard { self.max_rows.map(|m| m.max(compound::MAX_ROWS + 1)) } else { self.max_rows },
                         max_groups: self.max_groups,
                         memory: self.query_memory.clone(),
+                        profile: req.profile,
                         ..db.exec.clone()
                     };
                     let db = db.clone();
@@ -1334,13 +1405,21 @@ impl Service {
                     let te = Instant::now();
                     let r = tokio::task::spawn_blocking(move || {
                         let _held = (permit, running);
-                        db.execute(&view, &select, &opts)
+                        let started = Instant::now();
+                        let r = db.execute(&view, &select, &opts);
+                        (r, started, Instant::now())
                     })
                     .await;
+                    let back = Instant::now();
                     drop(cancel);
-                    telemetry::record("execute", te, if matches!(r, Ok(Ok(_))) { "ok" } else { "error" });
+                    telemetry::record("execute", te, if matches!(r, Ok((Ok(_), ..))) { "ok" } else { "error" });
                     match r {
-                        Ok(r) => r.map(|rs| (rs, Vec::new())).map_err(ApiError::from),
+                        Ok((r, started, ended)) => r
+                            .map(|mut rs| {
+                                steps::around(&mut rs.stats.steps, te, started, ended, back);
+                                (rs, Vec::new())
+                            })
+                            .map_err(ApiError::from),
                         Err(e) => Err(ApiError::internal(e)),
                     }
                 })
@@ -1365,7 +1444,7 @@ impl Service {
         };
         drop(live);
         // A shard's answer to a coordinator is not a client's.
-        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, res);
+        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, (profiled, req.quiet), res);
         // A lease made for a query that failed holds nothing to fetch.
         let made = (lease != req.snapshot).then_some(lease).filter(|_| a.is_err());
         if let Some(l) = (req.release && req.snapshot != 0).then_some(req.snapshot).or(made) {
@@ -1377,11 +1456,18 @@ impl Service {
     /// Counts a query's outcome, logs it if it was slow, and makes its
     /// answer. One with more rows than `window` (a compound query's, or a
     /// coordinator's without a LIMIT) fails.
-    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
-        let res = match (res, window) {
+    #[allow(clippy::too_many_arguments)]
+    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, (profiled, quiet): (bool, bool), res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
+        let mut res = match (res, window) {
             (Ok((rs, _)), Some(m)) if rs.rows.len() > m => Err(ApiError::bad(format!("query error: the query matches more than {m} rows, the most a query returns; add a LIMIT"))),
             (r, _) => r,
         };
+        // The steps count from the request's start, as its trace does: a
+        // shard's, from the start of the call the coordinator made.
+        if let Ok((rs, _)) = &mut res {
+            let start = telemetry::trace().map_or(t0, |t| t.t0());
+            steps::rebase(&mut rs.stats.steps, steps::us_at(start));
+        }
         let secs = t0.elapsed().as_secs_f64();
         let outcome = match &res {
             Ok((_, missing)) if !missing.is_empty() => "partial",
@@ -1394,20 +1480,24 @@ impl Service {
         };
         self.metrics.query(kind, outcome, secs);
         let rows = res.as_ref().map_or(0, |(rs, _)| rs.rows.len());
-        let slow = self.slow.is_some_and(|s| t0.elapsed() >= s);
+        let slow = self.slow_after().is_some_and(|s| t0.elapsed() >= s);
         if slow {
             self.metrics.slow("query");
             tracing::warn!(kind, outcome, secs, rows, sql = %obs::truncate(sql, 2000), "slow query");
         }
-        self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow);
+        if !quiet {
+            self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow, res.as_ref().ok().map(|(rs, _)| &rs.stats), profiled);
+        }
         res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing, lease: 0 })
     }
 
     /// A compound query ([`compound`]): its plan's leaves run on one
     /// snapshot here, or each through the coordinator, and its operators
     /// here.
-    async fn compound(self: &Arc<Self>, req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
+    async fn compound(self: &Arc<Self>, mut req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
+        req.profile |= self.profiling.cpu_all.load(Ordering::Relaxed);
+        let (profiled, quiet) = (req.profile, req.quiet);
         let catalog = self.catalog();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
@@ -1418,7 +1508,7 @@ impl Service {
             Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
             r => r,
         };
-        self.done(&req_sql, kind, t0, self.max_rows, false, res)
+        self.done(&req_sql, kind, t0, self.max_rows, false, (profiled, quiet), res)
     }
 
     /// The work of [`Self::compound`]; [`Self::done`] counts it.
@@ -1442,13 +1532,16 @@ impl Service {
                     synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                     max_groups: self.max_groups,
                     memory: self.query_memory.clone(),
+                    profile: req.profile,
                     ..db.exec.clone()
                 };
                 let db = db.clone();
+                let te = Instant::now();
                 let r = tokio::task::spawn_blocking(move || {
                     let _held = (permit, running);
+                    let started = Instant::now();
                     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
-                    ops::run_in(
+                    let r = ops::run_in(
                         &plan,
                         &tables,
                         &mut |leaf| {
@@ -1456,10 +1549,17 @@ impl Service {
                             db.execute(&view, &leaf.to_select(view.schema())?, &opts)
                         },
                         &opts,
-                    )
+                    );
+                    (r, started, Instant::now())
                 })
                 .await;
-                r.map(|r| r.map(|rs| (rs, Vec::new())))
+                let back = Instant::now();
+                r.map(|(r, started, ended)| {
+                    r.map(|mut rs| {
+                        steps::around(&mut rs.stats.steps, te, started, ended, back);
+                        (rs, Vec::new())
+                    })
+                })
             }
             Backend::Cluster(c) => {
                 let Some(permit) = self.admit(timeout).await else { return Err(too_many()) };
@@ -1474,7 +1574,7 @@ impl Service {
                     let _held = permit;
                     // Shards any leaf was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
-                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, ..ExecOptions::default() };
+                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, profile: req.profile, ..ExecOptions::default() };
                     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
                     let rs = ops::run_in(&plan, &tables, &mut |leaf| {
                         checks.check()?;
@@ -1482,7 +1582,7 @@ impl Service {
                         let select = leaf.to_select(schema)?;
                         // The shards run the leaf's plan; its text names it in their logs.
                         let sql = leaf.explain(&tables).join(" / ");
-                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), ..Default::default() };
+                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), profile: req.profile, ..Default::default() };
                         let m = rt.block_on(telemetry::within(trace.clone(), obs::scope(id.clone(), c.query(&step, schema, &select, deadline)))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
@@ -1523,6 +1623,11 @@ impl Service {
                 None
             }
         }
+    }
+
+    /// The slow threshold now: as set while running, else as started.
+    pub fn slow_after(&self) -> Option<Duration> {
+        self.profiling.slow(self.slow)
     }
 
     /// Queries running now, including those whose callers stopped waiting
@@ -1641,8 +1746,16 @@ impl Service {
     /// writes `after` names; the documents an INSERT, UPDATE or DELETE
     /// wrote; none for `CREATE TABLE`, `DROP TABLE` and the `RANK PROFILE`
     /// statements ([`Self::ddl`]).
-    pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
-        let ddl = match self.bound(|tables| bind_command(sql, tables, params)).await? {
+    /// The statement needs the scope of its kind ([`command_scope`]), which
+    /// `who` must have; a table's or rank profile's statement is audited.
+    pub async fn sql(self: &Arc<Self>, who: &Principal, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        let command = self.bound(|tables| bind_command(sql, tables, params)).await?;
+        let need = command_scope(&command);
+        who.may(need, &format!("a {} statement", match need { Scope::Read => "query", Scope::Write => "write", Scope::Admin => "table or rank profile" }))?;
+        if need == Scope::Admin {
+            keys::note(obs::truncate(sql, 500).into_owned());
+        }
+        let ddl = match command {
             Command::Query => {
                 let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, after, ..Default::default() }).await?;
                 return Ok(SqlAnswer::Rows(a));
@@ -1666,16 +1779,6 @@ impl Service {
         };
         let w = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
-    }
-
-    /// The scope a SQL statement needs ([`crate::keys`]): a query read, a
-    /// write write, and a table's or rank profile's statement admin.
-    pub async fn statement_scope(&self, sql: &str, params: &Params) -> Result<Scope, ApiError> {
-        Ok(match self.bound(|tables| bind_command(sql, tables, params)).await? {
-            Command::Query | Command::Explain { .. } => Scope::Read,
-            Command::Write { .. } => Scope::Write,
-            Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
-        })
     }
 
     /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
@@ -1885,7 +1988,7 @@ impl Service {
             Ok(w) => self.metrics.write(w.rows, secs),
             Err(e) => self.metrics.write_error(e.status),
         }
-        if self.slow.is_some_and(|s| t0.elapsed() >= s) {
+        if self.slow_after().is_some_and(|s| t0.elapsed() >= s) {
             self.metrics.slow("write");
             let (rows, status) = (r.as_ref().map_or(0, |w| w.rows), r.as_ref().map_or_else(|e| e.status, |_| 200));
             match sql {
@@ -1953,13 +2056,18 @@ impl Service {
     /// `plan_only`, returns the plan ([`strata::sqlite::Plan::to_json`])
     /// and writes nothing; otherwise what was written
     /// ([`strata::sqlite::Imported::to_json`]).
-    pub async fn import_sqlite(self: &Arc<Self>, body: axum::body::Bytes, opts: strata::sqlite::ImportOptions, plan_only: bool, timeout_ms: u64) -> Result<Json, ApiError> {
+    /// Rows need a write key, and an import that creates tables an admin
+    /// key, refused before anything is written.
+    pub async fn import_sqlite(self: &Arc<Self>, who: &Principal, body: axum::body::Bytes, opts: strata::sqlite::ImportOptions, plan_only: bool, timeout_ms: u64) -> Result<Json, ApiError> {
+        who.may(Scope::Write, "an import")?;
         let catalog = self.catalog();
         let checked = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             let dir = tempfile::tempdir().map_err(ApiError::internal)?;
             let path = dir.path().join("import.sqlite");
             std::fs::write(&path, &body).map_err(ApiError::internal)?;
-            let src = strata::sqlite::Source::open(&path).map_err(|e| ApiError::bad(e.to_string()))?;
+            // The server's temporary path is no business of the client's.
+            let shown = path.display().to_string();
+            let src = strata::sqlite::Source::open(&path).map_err(|e| ApiError::bad(e.to_string().replace(&shown, "the uploaded file")))?;
             let plan = src.plan_over(&catalog, &opts)?;
             if !plan_only {
                 for t in &plan.tables {
@@ -1978,6 +2086,11 @@ impl Service {
         let (dir, src, plan) = checked;
         if plan_only {
             return Ok(plan.to_json());
+        }
+        let creates: Vec<&str> = plan.tables.iter().filter(|t| !t.exists).map(|t| t.schema.table.as_str()).collect();
+        if !creates.is_empty() {
+            who.may(Scope::Admin, &format!("an import that creates tables ({})", creates.join(", ")))?;
+            keys::note(format!("SQLite import created tables {}", creates.join(", ")));
         }
         enum Step {
             Table(usize),
@@ -2135,9 +2248,15 @@ impl Service {
         self.metrics.totals(&mut s);
         let (rss, cpu) = telemetry::process_usage();
         s.cpu_s = cpu;
+        let heap = crate::heap::stats();
+        (s.alloc_bytes, s.allocs) = (heap.allocated_bytes, heap.allocs);
         let g = &mut s.gauges;
         if let Some(r) = rss {
             g.insert("rss_bytes", r as f64);
+        }
+        if heap.installed {
+            g.insert("heap_bytes", heap.in_use_bytes as f64);
+            g.insert("heap_peak_bytes", heap.peak_bytes as f64);
         }
         g.insert("running", self.running() as f64);
         g.insert("live", self.live.len() as f64);
@@ -2226,7 +2345,7 @@ impl Service {
                 "timeout_ms": self.timeout.as_millis() as u64, "max_timeout_ms": self.max_timeout.as_millis() as u64,
                 "max_concurrent": self.max_concurrent, "max_rows": self.max_rows, "max_groups": self.max_groups,
                 "query_memory_bytes": self.query_memory.as_ref().map(|b| b.limit()), "max_queued_writes": self.max_queued_writes,
-                "max_body_bytes": self.max_body, "slow_ms": self.slow.map(|d| d.as_millis() as u64), "lease_ttl_s": self.lease_ttl.as_secs(),
+                "max_body_bytes": self.max_body, "slow_ms": self.slow_after().map(|d| d.as_millis() as u64), "lease_ttl_s": self.lease_ttl.as_secs(),
             },
             "features": {
                 "synonyms": self.synonyms().map_or(0, |s| s.rules()), "backup_dir": self.backup_dir.as_ref().map(|p| p.display().to_string()),
@@ -2773,6 +2892,17 @@ const SOURCE_NAME: usize = 256;
 
 pub fn has_source(op: &Json) -> bool {
     op.get("source").is_some_and(|s| !s.is_null())
+}
+
+/// The scope a SQL statement needs ([`crate::keys`]): a query read, a
+/// write write, and a table's or rank profile's statement admin. Every
+/// kind is named, so that a new one must say what it needs.
+pub fn command_scope(c: &Command) -> Scope {
+    match c {
+        Command::Query | Command::Explain { .. } => Scope::Read,
+        Command::Write { .. } => Scope::Write,
+        Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
+    }
 }
 
 /// Whether an operation only marks a source's offset (`"op": "source"`),

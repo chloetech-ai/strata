@@ -17,6 +17,11 @@
 
 use std::path::PathBuf;
 
+/// Every allocation counted: the heap's size, its rate and where it is
+/// allocated (`strata_server::heap`).
+#[global_allocator]
+static ALLOC: strata_server::heap::Counting = strata_server::heap::Counting;
+
 use clap::{Parser, Subcommand};
 use strata_server::auth::{self, Access, Secret, Tls};
 use strata_server::obs;
@@ -73,7 +78,9 @@ struct Args {
     /// Ship this database's writes to these replicas, as their primary
     /// (comma-separated gRPC URLs of servers started with --replica), so
     /// that each holds the same rows under the same sequence numbers.
-    /// Needs --seq-no.
+    /// Needs --seq-no. With --replica: the shard's other copies (its
+    /// primary and the other replicas), which it ships to once promoted;
+    /// a promotion asked for with an API key ships only to these.
     #[arg(long, value_delimiter = ',')]
     replicas: Vec<String>,
     /// Serve as a replica: apply the writes a primary ships here (its
@@ -178,9 +185,10 @@ struct Args {
     max_groups: usize,
     /// The most rows a cross-encoder's rerank phase may score, on a
     /// database or a coordinator: a query whose phase asks for more fails
-    /// (0: no limit). A hundred abstracts take ms-marco-MiniLM-L-6-v2
-    /// about the default deadline on four cores.
-    #[arg(long, default_value_t = 100)]
+    /// (0: no limit). Twenty abstracts take ms-marco-MiniLM-L-6-v2 about
+    /// 1 s at the median and at most 1.6 s at p99 on four cores, a third of
+    /// the default deadline; a hundred take all of it.
+    #[arg(long, default_value_t = 20)]
     max_rerank: usize,
     /// Memory the running queries may hold together, in MiB: their groups,
     /// candidate rows, answers and joins; a query that needs more fails
@@ -313,7 +321,10 @@ enum Command {
         url: String,
         /// The copies it is to ship to (comma-separated gRPC URLs): the
         /// shard's other replicas, and the old primary, which is sent a
-        /// copy once it starts again with --replica.
+        /// copy once it starts again with --replica. None: the copies the
+        /// replica was started with (its --replicas). Promotion calls each
+        /// with the cluster's token, so with an API key only those may be
+        /// named; with the token, any.
         #[arg(long, value_delimiter = ',')]
         replicas: Vec<String>,
         /// The copies that hold a write before it is answered, as
@@ -540,6 +551,9 @@ async fn main() {
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
+    if token.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
+        tracing::warn!("this server has no token and no admin key that never expires: once its admin keys expire, only starting it with --token manages it. Make an admin key without expires_days");
+    }
     let bind = |addr: &str| {
         let addr = addr.to_string();
         // API keys close a server as a token does.
