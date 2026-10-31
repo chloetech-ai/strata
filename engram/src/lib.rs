@@ -21,6 +21,7 @@ pub mod inspect;
 pub mod install;
 pub mod llm;
 pub mod mcp;
+pub mod next_files;
 pub mod paths;
 pub mod recall;
 pub mod record;

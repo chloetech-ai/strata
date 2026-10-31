@@ -144,6 +144,23 @@ Fisher's exact test gives p = 1.0 on solved runs, and a permutation test within 
 
 At a million records the tail adds 5.8 ms at the median, over the 2 ms it was allowed: almost all of it is `maxsim`'s four nearest-neighbour searches, one per vector, on the vector side of the search. LongMemEval turns name no files, so the digest's BM25 query does not run here and would add to that in a real session. Searching from the tail after each turn instead of on the prompt would take it off the hook's path, if the tail ever earns a place. The runs are in [`engram/results/memory_bench_tail/`](https://github.com/rkonow/strata/blob/main/engram/results/memory_bench_tail/README.md) and the timings in `engram/results/tail/tail_static.json` (`engram-bench tail`).
 
+## Next files
+
+Before an edit, the hook can also name the files that earlier sessions usually edited next (`ENGRAM_NEXT_FILES=1`, [how it works](index.md#when-to-load)), counted from the edits the store holds: B follows A when an edit of B came within three edits after one of A, weighted by one over the gap. It is off by default because it made no measurable difference.
+
+**Method.** The memory bench above, on its four projects, with one recorded history per project and two lanes on it, Engram as shipped and the same with next files on, so the lanes differ only in the variable. Four runs per task and lane, Haiku everywhere, in the cloud container on 2026-10-31.
+
+| | without next files | with next files |
+|---|---|---|
+| runs solved | 199 / 208 | 197 / 208 |
+| bakehouse / kestrel / slotwise / stockroom | 67/72, 52/56, 40/40, 40/40 | 65/72, 52/56, 40/40, 40/40 |
+| runs shown next files | | 65 of 208, in 18 of 52 tasks |
+| named files edited later in the run | 29% (210 of 720, had they been named) | 29% (59 of 207) |
+| $ per run, agent + memory | 0.0068 | 0.0067 |
+| characters the edit hook injected | 525 | 755 |
+
+Fisher's exact test gives p = 0.82 on solved runs, and a permutation test within tasks p = 0.055 on the mean score (−0.012 with next files), almost three quarters of it from two tasks whose runs were shown no next files. One task lost two runs (`bake_sheet`, 3 to 1 of 4) with next files shown in all four, a move the same code makes between lanes by chance. The counts guessed the next file right about a time in four, and the agent edited the files it was told about no more often than without being told. Fewer than half of the notes shown with them (24 of 57) were facts or decisions; the rest were errors that name the file, mostly shell output, because nothing else was written about it. These tasks say which files to change, or the agent reads the code first; a hint would matter more in a repository too large to read, where a change in one place needs one in another that nothing names. The runs are in [`engram/results/memory_bench_next/`](https://github.com/rkonow/strata/blob/main/engram/results/memory_bench_next/README.md).
+
 ## This repository's own 26-hour session
 
 The transcript of the session that built Strata and Engram is the most realistic test available: 26.5 hours, 43.6 MB, three projects, and two compactions whose summaries keep 14,202 and 17,998 characters. Replaying it through Engram's capture gives the records the hooks would have stored; questions are asked at the point just before Engram's own work began.

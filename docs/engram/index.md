@@ -54,7 +54,7 @@ One Strata table, `memory`. Each record is one key–value pair with attributes.
 | `kind` | KEYWORD | `prompt`, `answer`, `tool_call`, `tool_result`, `error`, `episode`, `summary`, `decision`, `preference`, `fact`, `todo`, `note` |
 | `tag` | KEYWORD | tool name, summary section, `distilled`, `planned`, `superseded`, … |
 | `turn`, `seq`, `ts` | INT | user turn, project-wide sequence number, Unix seconds |
-| `importance` | FLOAT | salience prior in [0, 1] |
+| `importance` | FLOAT | salience prior in [0, 1]; for an entity, how many records link to it |
 | `files` | TEXT | paths the record touches (path components are terms) |
 | `text` | TEXT, stored | the value: one chunk of at most 400 bytes, injected as is |
 | `ctx` | TEXT, stored | the turn's request (≤ 200 characters); for notes also the situations they matter in (`When:`) and the code they were written against (`Anchor:`); part of the lexical key, never shown |
@@ -181,7 +181,7 @@ sequenceDiagram
    $$
 
    Then the main search and a three-way gate: strong evidence injects the top records up to 4,000 characters; weak evidence injects three records up to 1,200, marked as a weak match; otherwise nothing.
-3. **`PreToolUse` on `Edit`/`Write`: file notes.** Up to two older errors, decisions or rules anchored to that path, once per file per window.
+3. **`PreToolUse` on `Edit`/`Write`: file notes.** Up to two older errors, decisions or rules anchored to that path, once per file per window. With `ENGRAM_NEXT_FILES=1` (an experiment, off by default) the hook also names the files earlier sessions usually edited next: B follows A when an edit of B came within three edits after one of A (consecutive edits of one file count once), weighted by one over the gap and summed over sessions, and files above 1 are shown, at most two, each with its newest note. The daemon counts these from the edits the store holds as tool calls, reading only what was stored since it last looked, so nothing new is written. On the memory bench it changed neither how many tasks were solved nor which files were edited ([results](results.md#next-files)), so it stays off.
 4. **Pull: MCP tools.** `memory_ask` (the query engine below), `memory_search`, `memory_timeline` (the neighbourhood of a hit), `memory_sql` (read-only SQL over `memory`), `memory_remember` and `memory_forget`.
 
 The briefing also ends with a one-line index of the notes it had no room for ("31 older notes are not shown here, about: …"), so the model knows what to ask for.
@@ -308,6 +308,7 @@ engram stats | briefing | stop
 | `ENGRAM_DEEP_PLAN`, `ENGRAM_DEEP_RANK` | `none` skips the planner; `local` ranks without a model call (defaults: `model`, `model`) |
 | `ENGRAM_CONSOLIDATE=0` | turns consolidation off |
 | `ENGRAM_SESSION_CONTEXT=1` | recall also searches with the session's last records ([session context](#ranking); or `"rank": {"tail": {"enabled": true}}` in the store's `config.json`) |
+| `ENGRAM_NEXT_FILES=1` | before an edit, also the files usually edited next, with a note on each ([when to load](#when-to-load); or `"next_files": true` in the store's `config.json`) |
 | `ENGRAM_EMBEDDER` | `static` (default), `bert`, or `hash:<dim>` for a model-free hash embedder |
 
 The full design, including the evaluation plan, is in [`engram/DESIGN.md`](https://github.com/rkonow/strata/blob/main/engram/DESIGN.md).

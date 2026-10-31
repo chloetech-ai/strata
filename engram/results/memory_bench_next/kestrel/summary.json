@@ -1,0 +1,230 @@
+{
+ "scenario": "kestrel",
+ "lanes": {
+  "engram": {
+   "runs": 56,
+   "solved": 52,
+   "solved_rate": 0.9285714285714286,
+   "score": 0.9571428571428572,
+   "cost_usd": 0.007693351964285715,
+   "memory_cost_usd": 0.0020353160714285715,
+   "steps": 7.214285714285714,
+   "wall_s": 25.448214285714283,
+   "memory_tool_calls": 0.23214285714285715,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.15299142,
+    "memory_cost_usd": 0.08424890000000003,
+    "wall_s": 572.6,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 44,
+     "solved": 40,
+     "score": 0.9454545454545454
+    },
+    "repo": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    }
+   },
+   "vs": {}
+  },
+  "engram+next": {
+   "runs": 56,
+   "solved": 52,
+   "solved_rate": 0.9285714285714286,
+   "score": 0.9392857142857143,
+   "cost_usd": 0.007746904464285715,
+   "memory_cost_usd": 0.0020467714285714285,
+   "steps": 7.303571428571429,
+   "wall_s": 25.583928571428572,
+   "memory_tool_calls": 0.10714285714285714,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.15299142,
+    "memory_cost_usd": 0.08424890000000003,
+    "wall_s": 572.6,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "conversation": {
+     "runs": 44,
+     "solved": 40,
+     "score": 0.9227272727272727
+    },
+    "repo": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "engram": {
+     "all": {
+      "tasks": 14,
+      "runs": [
+       56,
+       56
+      ],
+      "solved": [
+       52,
+       52
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": -0.017857142857142905,
+      "perm_score_p": 0.3114688531146885,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "conversation": {
+      "tasks": 11,
+      "runs": [
+       44,
+       44
+      ],
+      "solved": [
+       40,
+       40
+      ],
+      "fisher_solved_p": 0.9999999999999709,
+      "score_diff": -0.022727272727272707,
+      "perm_score_p": 0.3140685931406859,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "repo": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  }
+ },
+ "tasks": {
+  "free_slots": {
+   "kind": "conversation",
+   "needs": "opening hours (day 1), appointment lengths, quarter-hour starts and the assessment buffer (day 4)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "can_book": {
+   "kind": "conversation",
+   "needs": "opening hours, lengths, buffer and the 8-per-day cap (days 1 and 4)",
+   "engram": 0.4,
+   "engram+next": 0.15000000000000002
+  },
+  "cancellation_fee": {
+   "kind": "conversation",
+   "needs": "the cancellation policy (day 2) as revised to 48 hours (day 5)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "appointment_price": {
+   "kind": "conversation",
+   "needs": "the CSC discount (day 2) and the 1 April 2027 price rise (day 6)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "reminder_text": {
+   "kind": "conversation",
+   "needs": "the privacy rule for SMS (day 2); local time (day 1)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "send_reminders": {
+   "kind": "conversation",
+   "needs": "Bulkie's 50-per-call limit and the Python 3.9 constraint (day 3)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "invoice_number": {
+   "kind": "conversation",
+   "needs": "the accountant's numbering scheme (day 4)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "invoice_export": {
+   "kind": "conversation",
+   "needs": "the accountant's export format (day 4) and the privacy rule on names (day 2)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "waitlist_offer": {
+   "kind": "conversation",
+   "needs": "the waitlist order: urgent first, then by request time (day 6)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "overbooking_advice": {
+   "kind": "conversation",
+   "needs": "a failed approach and its reason (the board complaint, day 5)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "python_advice": {
+   "kind": "conversation",
+   "needs": "an environment fact said once (reception PCs on Python 3.9, day 3)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "upcoming": {
+   "kind": "repo",
+   "needs": "the patient ID normalization convention, applied in the code on day 1",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "merge_busy": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  },
+  "parse_duration": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+next": 1.0
+  }
+ }
+}

@@ -73,6 +73,10 @@ By the end, the three turns had become 42 records in three segments: prompts, to
 
 ## The panels
 
+### Finding an entity or a file
+
+The box at the top right completes the names of entities and the paths of files as you type (`count` finds `count sheet`, `src/` the files under `src`), most linked first: an entity row counts the records that link to it. It is a prefix query on the `id` column, `PREFIX(id, 'e:count')` for names and `PREFIX(id, 'f:src/')` for paths, ordered by that count. When the exact prefix leaves room in the list of ten, names one typo away (two from six letters) follow, marked as typos, so `cuont` still finds `count sheet`. Picking one opens it with the records that link to it. The graph's seed box completes the same way.
+
 ### Live
 
 ![Live: every record and daemon event as it happens](../assets/img/inspector-live.png)

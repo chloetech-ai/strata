@@ -41,6 +41,9 @@ pub struct Config {
     pub knowledge: recall::KnowledgeParams,
     /// Notes about a file before Edit/Write.
     pub file_notes: bool,
+    /// Before Edit/Write, also the files usually edited next, with a note
+    /// on each ([`crate::next_files`]; an experiment, `ENGRAM_NEXT_FILES=1`).
+    pub next_files: bool,
     pub sync: bool,
     /// Knowledge written down by a small model after each turn.
     pub distill: crate::distill::DistillConfig,
@@ -61,6 +64,7 @@ impl Default for Config {
             briefing_chars: 6000,
             knowledge: Default::default(),
             file_notes: true,
+            next_files: std::env::var("ENGRAM_NEXT_FILES").is_ok_and(|v| v == "1"),
             sync: true,
             distill: Default::default(),
             consolidate: Default::default(),
@@ -139,6 +143,8 @@ pub struct Daemon {
     distilled_since: std::sync::atomic::AtomicUsize,
     /// Query-understanding searches by session.
     deep_jobs: Mutex<HashMap<String, DeepJob>>,
+    /// Files edited after each file, counted from the stored edits.
+    next_files: Mutex<crate::next_files::NextFiles>,
     /// The settings Claude Code's hooks last ran with (their environment):
     /// they win over the daemon's own, which may have been started from a
     /// shell or the MCP server without them.
@@ -158,7 +164,7 @@ impl Daemon {
         let store = Arc::new(Store::open(&paths.db, embedder, StoreOptions { sync: cfg.sync, ..Default::default() })?);
         let state: State = std::fs::read_to_string(&paths.state).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         Ok(Daemon { paths, project: project.to_string(), store, cfg, state: Mutex::new(state), dirty: Default::default(), pending: Default::default(), saving: Mutex::new(()),
-            distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), from_hooks: Mutex::new((String::new(), None)), last_activity: AtomicI64::new(now()) })
+            distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), next_files: Default::default(), from_hooks: Mutex::new((String::new(), None)), last_activity: AtomicI64::new(now()) })
     }
 
     /// Writes the session state: copied under the session lock, written
@@ -375,7 +381,14 @@ impl Daemon {
                     return Ok((json!({"output": null}), None));
                 }
                 let rel = path.strip_prefix(&self.project).map(|x| x.trim_start_matches('/')).unwrap_or(path).to_string();
-                let text = self.file_notes(&sid, &rel)?;
+                let mut text = self.file_notes(&sid, &rel)?;
+                if self.cfg.next_files {
+                    let next = self.next_file_notes(&sid, &rel, &text)?;
+                    if !next.is_empty() {
+                        self.log(&json!({"ts": now(), "event": "next_files", "session": sid, "file": rel, "chars": next.len()}));
+                        text = if text.is_empty() { next } else { format!("{text}\n{next}") };
+                    }
+                }
                 Ok((ctx_out("PreToolUse", text), None))
             }
             "PostToolUse" | "PostToolUseFailure" => {
@@ -908,6 +921,50 @@ impl Daemon {
             let snip: String = r.text.chars().take(500).collect();
             let label = if r.kind.is_knowledge() { ck.check_record(&r).label() } else { String::new() };
             s += &format!("\n{}\n", recall::fmt_record_labeled(r, &snip, now(), &label));
+        }
+        Ok(s)
+    }
+
+    /// The files usually edited after `rel`, each with one note not in
+    /// `shown`: the newest decision, rule or fact about it, else its newest
+    /// error (episodes, which name every file of a turn, are left out).
+    /// Once per file and session.
+    fn next_file_notes(&self, sid: &str, rel: &str, shown: &str) -> Result<String> {
+        if !self.with_session(sid, |s| s.annotated.insert(format!("next:{rel}"))) {
+            return Ok(String::new());
+        }
+        let next = {
+            let mut nf = self.next_files.lock().unwrap();
+            nf.update(&self.store)?;
+            nf.after(rel, 2, 1.0)
+        };
+        let next: Vec<String> = next.into_iter().map(|(f, _)| f).filter(|f| Path::new(&self.project).join(f).exists()).collect();
+        if next.is_empty() {
+            return Ok(String::new());
+        }
+        let w = self.with_session(sid, |s| s.window_start);
+        let kinds = vec![Kind::Error, Kind::Decision, Kind::Preference, Kind::Fact, Kind::Note];
+        let filter = Filter { exclude_window: Some((sid.to_string(), w)), kinds, ..Default::default() };
+        let mut s = format!("In earlier work, edits of {rel} were usually followed by edits of: {}.\n", next.join(", "));
+        let mut shown = shown.to_string();
+        let mut ck = self.checker();
+        for f in &next {
+            let terms: Vec<String> = strata::text::analyze(f);
+            if terms.is_empty() {
+                continue;
+            }
+            let mut where_ = filter.conds();
+            where_.push("MATCH(files, :files)".into());
+            let params = filter.params().set("files", Value::Str(terms.join(" AND ")));
+            let rs = self.store.query_with(&format!("SELECT {} FROM memory WHERE {} ORDER BY seq DESC LIMIT 12", crate::record::COLUMNS, where_.join(" AND ")), &params)?;
+            let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).filter(|r| !shown.contains(&format!("[{}]", r.id))).collect();
+            if let Some(r) = recs.iter().find(|r| r.kind.is_knowledge()).or(recs.first()).cloned() {
+                let snip: String = r.text.chars().take(300).collect();
+                let label = if r.kind.is_knowledge() { ck.check_record(&r).label() } else { String::new() };
+                let one = format!("\nEngram note on {f}:\n{}\n", recall::fmt_record_labeled(&r, &snip, now(), &label));
+                shown += &one;
+                s += &one;
+            }
         }
         Ok(s)
     }
