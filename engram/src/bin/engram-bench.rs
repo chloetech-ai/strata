@@ -193,6 +193,29 @@ enum Cmd {
         #[arg(long, default_value_t = 0.01)]
         knowledge: f64,
     },
+    /// The session tail's cost on a prompt (`ENGRAM_SESSION_CONTEXT=1`):
+    /// knowledge and hybrid search side by side, then packing, as the prompt
+    /// hook runs them, without the tail and with it (the session's last
+    /// records read, a digest of their words searched by BM25 and their
+    /// vectors by maxsim), alternating, on one
+    /// warm store per size, one prompt at a time.
+    Tail {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "1000000")]
+        sizes: Vec<usize>,
+        #[arg(long, default_value = "static")]
+        embedder: String,
+        #[arg(long, default_value = "results/tail")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 94)]
+        queries: usize,
+        /// Passes over the queries.
+        #[arg(long, default_value_t = 5)]
+        rounds: usize,
+        #[arg(long, default_value_t = 0.01)]
+        knowledge: f64,
+    },
     /// Appends tool calls back to back from one or more clients, as tool
     /// hooks do, to an empty store, and reports how long each append took:
     /// any wait for a flush or a merge shows in the tail.
@@ -647,6 +670,7 @@ fn main() {
         }
         Cmd::Scale { data, sizes, embedder, out, queries, hooks, hook_gap_ms } => scale_cmd(&data, &sizes, &embedder, &out, queries, hooks, hook_gap_ms),
         Cmd::Latency { data, sizes, embedder, out, queries, rounds, hooks, knowledge } => latency_cmd(&data, &sizes, &embedder, &out, queries, rounds, hooks, knowledge),
+        Cmd::Tail { data, sizes, embedder, out, queries, rounds, knowledge } => tail_cmd(&data, &sizes, &embedder, &out, queries, rounds, knowledge),
         Cmd::Concurrency { data, sizes, embedder, out, queries, readers, secs, write_every_ms, knowledge } => {
             concurrency_cmd(&data, &sizes, &embedder, &out, queries, &readers, secs, write_every_ms, knowledge)
         }
@@ -1635,6 +1659,128 @@ fn prompt_searches(store: &Store, q: &str, filter: &Filter, rank: &RankParams, k
     known.unwrap();
     let (hits, _) = searched.unwrap();
     let _ = recall::pack(&hits, q, &skip, &PackParams::default());
+}
+
+/// The prompt's searches as the hook runs them with the session tail on:
+/// the session's last records read, then [`prompt_searches`] with them.
+/// Returns the time the read took.
+fn prompt_searches_tail(store: &Store, q: &str, session: &str, filter: &Filter, rank: &RankParams, kp: &recall::KnowledgeParams) -> f64 {
+    let t = Instant::now();
+    let tail = recall::Tail::of(&store.tail(session, rank.tail.records).unwrap(), &rank.tail);
+    let read = ms_since(t);
+    let skip = HashSet::new();
+    let (known, searched) = recall::both(|| recall::knowledge(store, q, filter, &skip, kp), || recall::search_with(store, q, Some(&tail), filter, rank));
+    known.unwrap();
+    let (hits, _) = searched.unwrap();
+    let _ = recall::pack(&hits, q, &skip, &PackParams::default());
+    read
+}
+
+fn tail_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queries: usize, rounds: usize, knowledge: f64) {
+    let e = open_embedder(embedder);
+    let units = engram::benchdata::read_units(data, 1, None).expect("data");
+    std::fs::create_dir_all(out).unwrap();
+    let mut results = Vec::new();
+    for &n in sizes {
+        eprintln!("== {n} records");
+        let (mut recs, qs, _) = haystack(&units, n, n_queries);
+        if knowledge > 0.0 {
+            let every = (1.0 / knowledge).round().max(1.0) as usize;
+            let kinds = [Kind::Decision, Kind::Preference, Kind::Fact];
+            for (i, r) in recs.iter_mut().enumerate().filter(|(i, _)| i % every == 0) {
+                r.kind = kinds[(i / every) % 3];
+                r.tag = "distilled".into();
+            }
+        }
+        // The prompts' sessions: sessions of at least 20 records, spread
+        // over the store, as a long session's tail would be.
+        let mut by: HashMap<&str, usize> = HashMap::new();
+        for r in &recs {
+            *by.entry(r.session.as_str()).or_default() += 1;
+        }
+        let mut long: Vec<String> = by.into_iter().filter(|(_, c)| *c >= 20).map(|(s, _)| s.to_string()).collect();
+        long.sort();
+        assert!(!long.is_empty(), "no session of 20 records");
+        let texts: Vec<String> = recs.iter().map(|r| r.embed_text()).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let chunks: Vec<&[&str]> = refs.chunks((refs.len() / 4).max(1)).collect();
+            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c)) }).collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        drop(texts);
+        let dir = std::env::temp_dir().join(format!("engram-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("memory.strata");
+        {
+            let store = Store::open(&db, e.clone(), StoreOptions { sync: false, flush_docs: usize::MAX / 8, ..Default::default() }).unwrap();
+            store.bulk_insert(&recs, embs).unwrap();
+        }
+        let n = recs.len();
+        drop(recs);
+        // The bulk store's merger can still hold the file for a while after
+        // a large load; wait for it.
+        let t0 = Instant::now();
+        let store = loop {
+            match Store::open(&db, e.clone(), StoreOptions::default()) {
+                Ok(s) => break s,
+                Err(err) if err.to_string().contains("busy") && t0.elapsed().as_secs() < 600 => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(err) => panic!("{err}"),
+            }
+        };
+        store.warm();
+        let off = RankParams::default();
+        let mut on = RankParams::default();
+        on.tail.enabled = true;
+        let kp = recall::KnowledgeParams::default();
+        let (mut t_off, mut t_on, mut t_read) = (Vec::new(), Vec::new(), Vec::new());
+        // One warm-up pass, then alternate the two.
+        for (i, (q, _)) in qs.iter().enumerate() {
+            let session = &long[i * 7919 % long.len()];
+            let filter = Filter { exclude_window: Some((session.clone(), i64::MAX)), ..Default::default() };
+            prompt_searches(&store, &q.question, &filter, &off, &kp);
+            prompt_searches_tail(&store, &q.question, session, &filter, &on, &kp);
+        }
+        for round in 0..rounds {
+            for (i, (q, _)) in qs.iter().enumerate() {
+                let session = &long[i * 7919 % long.len()];
+                let filter = Filter { exclude_window: Some((session.clone(), i64::MAX)), ..Default::default() };
+                let time_off = || {
+                    let t = Instant::now();
+                    prompt_searches(&store, &q.question, &filter, &off, &kp);
+                    ms_since(t)
+                };
+                let time_on = || {
+                    let t = Instant::now();
+                    let read = prompt_searches_tail(&store, &q.question, session, &filter, &on, &kp);
+                    (ms_since(t), read)
+                };
+                if (round + i) % 2 == 0 {
+                    t_off.push(time_off());
+                    let (a, r) = time_on();
+                    t_on.push(a);
+                    t_read.push(r);
+                } else {
+                    let (a, r) = time_on();
+                    t_on.push(a);
+                    t_read.push(r);
+                    t_off.push(time_off());
+                }
+            }
+        }
+        let (so, sn, sr) = (stats(&t_off), stats(&t_on), stats(&t_read));
+        eprintln!("  off: p50 {:.2} ms, mean {:.2}; on: p50 {:.2} ms, mean {:.2}; tail read p50 {:.2} ms", so["p50"].as_f64().unwrap(), so["mean"].as_f64().unwrap(), sn["p50"].as_f64().unwrap(), sn["mean"].as_f64().unwrap(), sr["p50"].as_f64().unwrap());
+        results.push(json!({"records": n, "sessions_used": long.len().min(qs.len()), "tail": on.tail, "off_ms": so, "on_ms": sn, "tail_read_ms": sr}));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let machine = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()))
+        .unwrap_or_default();
+    let report = json!({"machine": {"cpu": machine, "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)}, "embedder": embedder, "queries": n_queries, "rounds": rounds, "results": results});
+    std::fs::write(out.join(format!("tail_{}.json", embedder.split(':').next().unwrap_or("x"))), serde_json::to_string_pretty(&report).unwrap()).unwrap();
 }
 
 /// A tool call and its result, as a tool hook stores them.

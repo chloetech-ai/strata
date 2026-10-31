@@ -32,11 +32,14 @@ pub struct RankParams {
     /// Records linked to the best hits (see [`GraphParams`]).
     #[serde(default)]
     pub graph: GraphParams,
+    /// The session's last records as context (see [`TailParams`]).
+    #[serde(default)]
+    pub tail: TailParams,
 }
 
 impl Default for RankParams {
     fn default() -> Self {
-        RankParams { n: 50, w_bm25: 0.5, lambda_imp: 0.2, lambda_rec: 0.05, tau: 5000.0, use_bm25: true, use_vectors: true, graph: GraphParams::default() }
+        RankParams { n: 50, w_bm25: 0.5, lambda_imp: 0.2, lambda_rec: 0.05, tau: 5000.0, use_bm25: true, use_vectors: true, graph: GraphParams::default(), tail: TailParams::default() }
     }
 }
 
@@ -67,6 +70,97 @@ impl Default for GraphParams {
     /// evaluations in eval/graph_eval_plan.md show it helps.
     fn default() -> Self {
         GraphParams { enabled: std::env::var("ENGRAM_GRAPH").is_ok_and(|v| v == "1"), seeds: 5, entity_seeds: 3, min_entity_cos: 0.5, hops: 2, n: 20, k: 10.0, weight: 0.5, max_nodes: 5000 }
+    }
+}
+
+/// The session's last records as context for a prompt's recall: what the
+/// work in progress touches, which the prompt may not say ("add the
+/// endpoint" while editing the billing module). Their files and failures
+/// join the prompt on the BM25 side; their vectors rank records by `maxsim`
+/// (the best cosine to any of them), a third list fused beside BM25 and
+/// cosine; and records about their files get a boost. The gate's evidence
+/// stays the prompt's own. Off unless `ENGRAM_SESSION_CONTEXT=1` (or the
+/// config turns it on) until the A/B harness shows it helps.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TailParams {
+    pub enabled: bool,
+    /// The session's newest records read.
+    pub records: usize,
+    /// Of those, the newest with vectors (prompts, answers, tool calls and
+    /// errors; not tool output) that rank by `maxsim`.
+    pub vectors: usize,
+    /// Candidates of each of its lists (BM25 over the digest, `maxsim`).
+    pub n: usize,
+    /// Weight of a record's tail score (the better of its normalised scores
+    /// in the two lists), beside BM25's and cosine's (which sum to 1).
+    pub weight: f64,
+    /// Score × (1 + boost) for a record about one of the tail's files.
+    pub file_boost: f64,
+    /// Words of the digest searched with BM25, at most.
+    pub digest_words: usize,
+}
+
+impl Default for TailParams {
+    fn default() -> Self {
+        TailParams { enabled: std::env::var("ENGRAM_SESSION_CONTEXT").is_ok_and(|v| v == "1"), records: 20, vectors: 4, n: 20, weight: 0.5, file_boost: 0.15, digest_words: 24 }
+    }
+}
+
+/// What a session's last records say about the work in progress.
+#[derive(Clone, Debug, Default)]
+pub struct Tail {
+    /// The files they name.
+    pub files: HashSet<String>,
+    /// Their files and failures, as words for BM25.
+    pub digest: String,
+    /// The newest records' vectors, for `maxsim`.
+    pub vectors: Vec<Vec<f32>>,
+}
+
+impl Tail {
+    /// The tail of `records`, newest first (as [`Store::tail`] returns them).
+    pub fn of(records: &[(Record, Option<Vec<f32>>)], p: &TailParams) -> Tail {
+        let mut files = HashSet::new();
+        let mut words: Vec<String> = Vec::new();
+        let add = |w: &str, words: &mut Vec<String>| {
+            if !w.is_empty() && words.len() < p.digest_words && !words.iter().any(|x| x == w) {
+                words.push(w.to_string());
+            }
+        };
+        // A file by its name and its directory's: "billing money" for
+        // src/billing/money.rs, not the "src" and "rs" every path has.
+        for (r, _) in records {
+            for f in r.files.split_whitespace() {
+                if files.insert(f.to_string()) {
+                    let path = std::path::Path::new(f);
+                    let dir = path.parent().and_then(|d| d.file_name()).and_then(|d| d.to_str()).filter(|d| !matches!(*d, "src" | "lib" | "test" | "tests" | "." | ".."));
+                    for w in [dir, path.file_stem().and_then(|s| s.to_str())].into_iter().flatten() {
+                        add(w, &mut words);
+                    }
+                }
+            }
+        }
+        // A failure's first line names what failed: a test, a command.
+        for (r, _) in records.iter().filter(|(r, _)| r.kind == Kind::Error) {
+            for w in r.text.lines().next().unwrap_or("").split_whitespace().take(8) {
+                add(w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'), &mut words);
+            }
+        }
+        let vectors = records
+            .iter()
+            .filter(|(r, _)| matches!(r.kind, Kind::Prompt | Kind::Answer | Kind::ToolCall | Kind::Error))
+            .filter_map(|(_, v)| v.clone())
+            .take(p.vectors)
+            .collect();
+        Tail { files, digest: words.join(" "), vectors }
+    }
+
+    /// Whether `r` is about one of the tail's files: it names one, or
+    /// links to it.
+    fn touches(&self, r: &Record) -> bool {
+        !self.files.is_empty()
+            && (r.files.split_whitespace().any(|f| self.files.contains(f)) || r.links.iter().any(|l| l.to.strip_prefix("f:").is_some_and(|f| self.files.contains(f))))
     }
 }
 
@@ -271,17 +365,35 @@ pub fn both<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> 
 /// Hybrid search: BM25 and vector candidates, min-max fused, with priors.
 /// The two searches run on one snapshot, side by side when a core is free.
 pub fn search(store: &Store, query: &str, filter: &Filter, p: &RankParams) -> Result<(Vec<Hit>, Evidence)> {
+    search_with(store, query, None, filter, p)
+}
+
+/// [`search`] with the session's last records as context ([`TailParams`]),
+/// when `p.tail` is on.
+pub fn search_with(store: &Store, query: &str, tail: Option<&Tail>, filter: &Filter, p: &RankParams) -> Result<(Vec<Hit>, Evidence)> {
     let store = &store.pinned();
     let terms = strata::text::analyze_query(query);
-    let (bm, (vq, dv)) = both(
-        || if p.use_bm25 && !terms.is_empty() { store.bm25_top(query, p.n, filter) } else { Ok(Vec::new()) },
+    let tail = tail.filter(|_| p.tail.enabled);
+    let ((bm, td), (vq, dv, tv)) = both(
+        || {
+            let bm = if p.use_bm25 && !terms.is_empty() { store.bm25_top(query, p.n, filter) } else { Ok(Vec::new()) };
+            let td = match tail {
+                Some(t) if p.use_bm25 && !strata::text::analyze_query(&t.digest).is_empty() => store.bm25_top(&t.digest, p.tail.n, filter),
+                _ => Ok(Vec::new()),
+            };
+            (bm, td)
+        },
         || {
             let vq = p.use_vectors.then(|| store.embedder.embed_query(query));
             let dv = vq.as_ref().map_or(Ok(Vec::new()), |v| store.vector_top(v, p.n, filter));
-            (vq, dv)
+            let tv = match tail {
+                Some(t) if p.use_vectors => store.maxsim_top(&t.vectors, p.tail.n, filter),
+                _ => Ok(Vec::new()),
+            };
+            (vq, dv, tv)
         },
     );
-    let (mut bm, mut dv) = (bm?, dv?);
+    let (mut bm, mut dv, mut td, mut tv) = (bm?, dv?, td?, tv?);
     // Earlier copies of the same question and answers that admitted not
     // knowing match a repeated question best and carry nothing: they would
     // inflate the gate and repeat the failure.
@@ -289,7 +401,9 @@ pub fn search(store: &Store, query: &str, filter: &Filter, p: &RankParams) -> Re
     let useful = |r: &Record| r.tag != "uncertain" && r.tag != "superseded" && !same_question(r, &qterms);
     bm.retain(|(r, _)| useful(r));
     dv.retain(|(r, _)| useful(r));
-    let (hits, ev) = fuse(store, query, &terms, bm, dv, p);
+    td.retain(|(r, _)| useful(r));
+    tv.retain(|(r, _)| useful(r));
+    let (hits, ev) = fuse_with(store, query, &terms, bm, dv, [td, tv], tail, p);
     if !p.graph.enabled || hits.is_empty() {
         return Ok((hits, ev));
     }
@@ -302,6 +416,16 @@ pub fn search(store: &Store, query: &str, filter: &Filter, p: &RankParams) -> Re
 /// Fuses BM25 and vector candidate lists (exposed for benchmarks that run
 /// the two searches themselves).
 pub fn fuse(store: &Store, query: &str, terms: &[String], bm: Vec<(Record, f64)>, dv: Vec<(Record, f64)>, p: &RankParams) -> (Vec<Hit>, Evidence) {
+    fuse_with(store, query, terms, bm, dv, [Vec::new(), Vec::new()], None, p)
+}
+
+/// [`fuse`] with the session tail's two lists (BM25 over its digest and
+/// `maxsim` over its vectors) and its files. A record's tail score is the
+/// better of its two normalised scores. The evidence is the prompt's own:
+/// read from the order without the tail, so the tail reorders what the gate
+/// lets through but does not open or close it.
+#[allow(clippy::too_many_arguments)]
+fn fuse_with(store: &Store, query: &str, terms: &[String], bm: Vec<(Record, f64)>, dv: Vec<(Record, f64)>, tails: [Vec<(Record, f64)>; 2], tail: Option<&Tail>, p: &RankParams) -> (Vec<Hit>, Evidence) {
     let top_ids = |l: &[(Record, f64)]| l.iter().take(10).map(|(r, _)| r.id.clone()).collect::<HashSet<_>>();
     let (bm_top, dv_top) = (top_ids(&bm), top_ids(&dv));
     let max_cos = dv.iter().map(|x| x.1).fold(0.0, f64::max);
@@ -323,36 +447,56 @@ pub fn fuse(store: &Store, query: &str, terms: &[String], bm: Vec<(Record, f64)>
     for (r, s) in dv {
         by.entry(r.id.clone()).and_modify(|h| h.cos = Some(s)).or_insert(Hit { record: r, bm25: None, cos: Some(s), score: 0.0 });
     }
+    let mut near: HashMap<String, f64> = HashMap::new();
+    for l in tails {
+        let (lo, hi) = range(&l);
+        for (r, s) in l {
+            let t = near.entry(r.id.clone()).or_insert(0.0);
+            *t = t.max(norm(s, lo, hi));
+            by.entry(r.id.clone()).or_insert(Hit { record: r, bm25: None, cos: None, score: 0.0 });
+        }
+    }
+    let wt = if near.is_empty() { 0.0 } else { p.tail.weight };
     let max_seq = by.values().map(|h| h.record.seq).max().unwrap_or(0).max(store.last_seq());
     let (wb, wv) = match (bhi.is_finite(), vhi.is_finite()) {
         (true, true) => (p.w_bm25, 1.0 - p.w_bm25),
         (true, false) => (1.0, 0.0),
         _ => (0.0, 1.0),
     };
-    let mut hits: Vec<Hit> = by
+    // Each hit with its score without the tail, which orders the evidence.
+    let mut hits: Vec<(Hit, f64)> = by
         .into_values()
         .map(|mut h| {
             let b = h.bm25.map_or(0.0, |x| norm(x, blo, bhi));
             let c = h.cos.map_or(0.0, |x| norm(x, vlo, vhi));
-            let rel = wb * b + wv * c;
+            let t = near.get(&h.record.id).copied().unwrap_or(0.0);
             let age = (max_seq - h.record.seq).max(0) as f64;
-            h.score = rel * (1.0 + p.lambda_imp * h.record.importance) + p.lambda_rec * (-age / p.tau).exp();
-            h
+            let score = |rel: f64| rel * (1.0 + p.lambda_imp * h.record.importance) + p.lambda_rec * (-age / p.tau).exp();
+            let plain = score(wb * b + wv * c);
+            h.score = score(wb * b + wv * c + wt * t);
+            if tail.is_some_and(|t| t.touches(&h.record)) {
+                h.score *= 1.0 + p.tail.file_boost;
+            }
+            (h, plain)
         })
         .collect();
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(b.record.seq.cmp(&a.record.seq)));
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.record.seq.cmp(&a.0.record.seq)));
     let mut ev = Evidence { max_cos, cue: past_reference(query), cos_gap, bm_gap, ..Default::default() };
-    if let Some(top) = hits.first() {
+    if let Some((top, _)) = hits.first() {
         ev.agree = bm_top.contains(&top.record.id) && dv_top.contains(&top.record.id);
     }
     if !terms.is_empty() {
         let idf = store.idf(terms).unwrap_or_else(|_| vec![1.0; terms.len()]);
         let total: f64 = idf.iter().sum();
-        for h in hits.iter().take(5) {
+        for (h, _) in hits.iter().take(5) {
             let have = analyzed(&format!("{}\n{}", h.record.text, h.record.ctx));
             let got: f64 = terms.iter().zip(&idf).filter(|(t, _)| have.contains(*t)).map(|(_, w)| w).sum();
             ev.max_cov = ev.max_cov.max(if total > 0.0 { got / total } else { 0.0 });
         }
+    }
+    let mut hits: Vec<Hit> = hits.into_iter().map(|(h, _)| h).collect();
+    if tail.is_some() {
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(b.record.seq.cmp(&a.record.seq)));
     }
     (hits, ev)
 }
@@ -835,6 +979,68 @@ mod tests {
         assert_eq!(SHARE.get(), 0);
         assert!(std::panic::catch_unwind(|| both(|| panic!("a search failed"), || 1)).is_err());
         assert_eq!(SHARE.get(), 0);
+    }
+
+    /// The session's last records bring back what the prompt does not
+    /// say: a rule about the file being edited.
+    #[test]
+    fn the_session_tail_recalls_what_the_work_touches() {
+        use crate::embed::HashEmbedder;
+        use crate::record::Draft;
+        use crate::store::StoreOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("m.strata"), std::sync::Arc::new(HashEmbedder { dim: 64 }), StoreOptions { sync: false, ..Default::default() }).unwrap();
+        let money = "src/billing/money.rs".to_string();
+        store
+            .append(
+                "old",
+                1,
+                100,
+                vec![
+                    Draft::new(Kind::Decision, "Amounts in the billing module are integer cents, never floats").files(vec![money.clone()]),
+                    Draft::new(Kind::Decision, "A new endpoint goes in src/api/routes.rs and gets an integration test"),
+                    Draft::new(Kind::Decision, "Endpoints return JSON errors with a code and a message"),
+                    Draft::new(Kind::Preference, "Keep pull requests small, one endpoint each"),
+                ],
+            )
+            .unwrap();
+        let first = store
+            .append(
+                "now",
+                1,
+                200,
+                vec![
+                    Draft::new(Kind::Prompt, "Refactor how invoice totals are rounded"),
+                    Draft::new(Kind::ToolCall, "Edit src/billing/money.rs").tag("Edit").files(vec![money.clone()]),
+                    Draft::new(Kind::Error, "test billing::rounding_of_totals failed: left 10.01 right 10.00").tag("Bash").files(vec![money.clone()]),
+                ],
+            )
+            .unwrap()[0]
+            .seq;
+        let filter = Filter { exclude_window: Some(("now".into(), first)), ..Default::default() };
+        let mut p = RankParams::default();
+        p.tail = TailParams { enabled: true, ..TailParams::default() };
+        let tail = Tail::of(&store.tail("now", p.tail.records).unwrap(), &p.tail);
+        assert!(tail.files.contains(&money) && tail.digest.contains("rounding_of_totals"), "{tail:?}");
+        assert_eq!(tail.vectors.len(), 3);
+        let prompt = "now add a discount endpoint";
+        let rank = |hits: &[Hit]| hits.iter().position(|h| h.record.text.contains("integer cents"));
+        let (with, ev_with) = search_with(&store, prompt, Some(&tail), &filter, &p).unwrap();
+        let (without, ev) = search_with(&store, prompt, None, &filter, &p).unwrap();
+        // The gate reads the prompt's own evidence either way.
+        assert_eq!(format!("{ev_with:?}"), format!("{ev:?}"));
+        let show = |hits: &[Hit]| hits.iter().map(|h| format!("{:.3} {}", h.score, h.record.text)).collect::<Vec<_>>();
+        // The billing rule the work touches gains about the tail's weight
+        // (it heads the digest's list) and the file boost; an endpoint rule,
+        // which the prompt names, stays first.
+        let score = |hits: &[Hit]| hits.iter().find(|h| h.record.text.contains("integer cents")).map_or(0.0, |h| h.score);
+        assert_eq!(rank(&without), Some(3), "{:?}", show(&without));
+        assert!(score(&with) > score(&without) + p.tail.weight, "{:?} against {:?}", show(&with), show(&without));
+        assert!(with[0].record.text.to_lowercase().contains("endpoint"), "{:?}", show(&with));
+        // Off, the tail changes nothing.
+        p.tail.enabled = false;
+        let (off, _) = search_with(&store, prompt, Some(&tail), &filter, &p).unwrap();
+        assert_eq!(off.iter().map(|h| &h.record.id).collect::<Vec<_>>(), without.iter().map(|h| &h.record.id).collect::<Vec<_>>());
     }
 
     #[test]

@@ -192,6 +192,7 @@ impl Lower<'_> {
                 hi: (*hi != i64::MAX).then(|| Box::new(self.lit(*f, &Value::Int(*hi)))),
             },
             Pred::In { field: f, values } => Expr::In { expr: field(*f), list: values.iter().map(|v| self.lit(*f, v)).collect() },
+            Pred::Prefix { field: f, prefix } => Expr::Prefix { expr: field(*f), prefix: Box::new(Expr::Lit(Value::Str(prefix.clone()))) },
             Pred::Present { field: f } => Expr::Not(Box::new(Expr::IsNull(field(*f)))),
             Pred::Not(q) => match &**q {
                 Pred::Present { field: f } => Expr::IsNull(field(*f)),

@@ -11,6 +11,8 @@
 //! strata-server --db new.strata --schema new.json --copy-from my.strata   # re-embed into a new schema
 //! strata-server fetch-model potion-retrieval-32M       # download an embedding model
 //! strata-server import --db my.strata --schema my.json rows.jsonl more.csv   # load files
+//! strata-server import --db shop.strata shop.sqlite    # a SQLite database's tables
+//! strata-server export --db shop.strata shop-copy.sqlite   # and back to SQLite
 //! ```
 
 use std::path::PathBuf;
@@ -278,23 +280,41 @@ enum Command {
         #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
-    /// Load rows from JSON Lines, JSON, CSV or TSV files into a database,
-    /// created with --schema if it does not exist. A server must not have
-    /// the database open (import through `POST /v1/import` instead).
+    /// Load rows from JSON Lines, JSON, CSV or TSV files, and the tables of
+    /// SQLite databases, into a database. A database that does not exist
+    /// is created with --schema, or from the first SQLite file's tables. A
+    /// SQLite table goes into the table of its name, created from SQLite's
+    /// declarations and values when missing. A server must not have the
+    /// database open (import through `POST /v1/import` instead).
     Import {
         /// The database.
         #[arg(long)]
         db: PathBuf,
-        /// Schema of a new database, as JSON.
+        /// Schema of a new database, as JSON. With SQLite files, schemas
+        /// for the tables it creates, in place of the ones made from
+        /// SQLite's: one, an array, or the output of --plan, edited.
         #[arg(long)]
         schema: Option<PathBuf>,
-        /// The table the rows go to (default: the first).
+        /// The table the rows go to (default: the first). A SQLite file's
+        /// tables go to the tables of their names.
         #[arg(long)]
         table: Option<String>,
-        /// The files' format: jsonl, json, csv or tsv (default: from each
-        /// file's extension).
+        /// The files' format: jsonl, json, csv, tsv or sqlite (default:
+        /// SQLite for a SQLite database, else from each file's extension).
         #[arg(long)]
         format: Option<String>,
+        /// SQLite: import only these tables (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tables: Vec<String>,
+        /// SQLite: keep BLOB columns as base64 text, rather than leave
+        /// them out.
+        #[arg(long)]
+        blobs_base64: bool,
+        /// SQLite: print what the import would do as JSON (each table's
+        /// schema, its columns and what is left out), and write nothing.
+        /// Edit it and give it back with --schema.
+        #[arg(long)]
+        plan: bool,
         /// Where embedded fields' models are (see `fetch-model`).
         #[arg(long, env = "STRATA_MODELS")]
         models: Option<PathBuf>,
@@ -304,6 +324,31 @@ enum Command {
         /// The files, loaded in order.
         #[arg(required = true)]
         files: Vec<PathBuf>,
+    },
+    /// Write a database's tables to a new SQLite file, from one snapshot:
+    /// the rows, keys, references, NOT NULL and DEFAULT, a B-tree index on
+    /// each indexed KEYWORD, INT, FLOAT, BOOL and TIMESTAMP field, an FTS5
+    /// index over each table's TEXT fields, and the Strata schemas, which
+    /// `import` restores. A server must not have the database open.
+    Export {
+        /// The database.
+        #[arg(long)]
+        db: PathBuf,
+        /// Only these tables (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tables: Vec<String>,
+        /// No FTS5 indexes.
+        #[arg(long)]
+        no_fts: bool,
+        /// No B-tree indexes.
+        #[arg(long)]
+        no_indexes: bool,
+        /// Leave out the table that keeps the Strata schemas
+        /// (`_strata_tables`).
+        #[arg(long)]
+        no_schemas: bool,
+        /// The SQLite file to write; it must not exist.
+        out: PathBuf,
     },
 }
 
@@ -334,10 +379,18 @@ async fn main() {
             }
             return;
         }
-        Some(Command::Import { db, schema, table, format, models, directory, files }) => {
-            let format = format.as_deref().map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv or tsv"))));
+        Some(Command::Import { db, schema, table, format, models, directory, files, tables, blobs_base64, plan }) => {
+            let sqlite = server::SqliteImport { format: format.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("sqlite")), tables: tables.clone(), blobs_base64: *blobs_base64, plan: *plan };
+            let format = format.as_deref().filter(|_| !sqlite.format).map(|f| strata::ingest::Format::parse(f).unwrap_or_else(|| fail(&format!("unknown --format {f}: jsonl, json, csv, tsv or sqlite"))));
             let models = models.clone().unwrap_or_else(strata::embed::models_dir);
-            if let Err(e) = server::import_files(db, schema.as_deref(), table.as_deref(), &models, format, *directory, files) {
+            if let Err(e) = server::import_files(db, schema.as_deref(), table.as_deref(), &models, format, *directory, files, sqlite) {
+                fail(&e);
+            }
+            return;
+        }
+        Some(Command::Export { db, tables, no_fts, no_indexes, no_schemas, out }) => {
+            let opts = strata::sqlite::ExportOptions { tables: tables.clone(), fts: !no_fts, indexes: !no_indexes, meta: !no_schemas };
+            if let Err(e) = server::export_sqlite(db, out, &opts) {
                 fail(&e);
             }
             return;

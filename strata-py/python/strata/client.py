@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,7 +52,9 @@ class Client(Search):
         self.timeout = timeout
         self._schema: dict | None = None
 
-    def _call(self, method: str, path: str, body: Any = None, *, data: Any = None, headers: Mapping[str, str] | None = None, text: bool = False) -> Any:
+    def _call(self, method: str, path: str, body: Any = None, *, data: Any = None, headers: Mapping[str, str] | None = None, text: bool = False, out: Any = None) -> Any:
+        """The answer's JSON, or its text with `text`; with `out`, a binary
+        file, the answer is copied into it and its headers returned."""
         h = dict(headers or {})
         if body is not None:
             data = json.dumps(body, default=_default).encode()
@@ -61,6 +64,9 @@ class Client(Search):
         req = urllib.request.Request(self.url + path, data=data, method=method, headers=h)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                if out is not None:
+                    shutil.copyfileobj(r, out)
+                    return r.headers
                 return r.read().decode() if text else json.loads(r.read() or b"null")
         except urllib.error.HTTPError as e:
             raw = e.read()
@@ -270,6 +276,55 @@ class Client(Search):
             query = {"format": format} if table is None else {"format": format, "table": table}
             r = self._call("POST", "/v1/import?" + urllib.parse.urlencode(query), data=f, headers={"content-length": str(size), "content-type": ct})
         return {"rows": r["written"], "bulk": False, "skipped_fields": r.get("skipped_fields", [])}
+
+    def _sqlite(self, path: str | os.PathLike, query: dict) -> dict:
+        with open(os.fspath(path), "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            return self._call("POST", "/v1/import?" + urllib.parse.urlencode(query), data=f, headers={"content-length": str(size), "content-type": "application/vnd.sqlite3"})
+
+    @staticmethod
+    def _sqlite_query(tables: str | Iterable[str] | None, **flags: bool) -> dict:
+        q: dict = {"format": "sqlite"}
+        if tables is not None:
+            q["tables"] = tables if isinstance(tables, str) else ",".join(tables)
+        q.update({k: "true" if v else "false" for k, v in flags.items()})
+        return q
+
+    def import_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, blobs_base64: bool = False) -> dict:
+        """Uploads a SQLite database file (up to the server's 256 MB) and
+        imports its tables (all, or `tables`), each into the table of its
+        name: one the server has keeps its schema, and a missing one is
+        created from the SQLite table's declarations and values; rows are
+        upserted by key. BLOB columns are left out unless `blobs_base64`.
+        Returns {tables: [{source, table, rows, created, notes}], skipped:
+        {name: why}, written}."""
+        return self._sqlite(path, self._sqlite_query(tables, blobs_base64=blobs_base64))
+
+    def plan_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, blobs_base64: bool = False) -> dict:
+        """What `import_sqlite` would do, writing nothing: each table's
+        schema, the columns read and what does not carry over."""
+        return self._sqlite(path, self._sqlite_query(tables, blobs_base64=blobs_base64, plan=True))
+
+    def export_sqlite(self, path: str | os.PathLike, *, tables: str | Iterable[str] | None = None, fts: bool = True, indexes: bool = True, schemas: bool = True) -> list[str]:
+        """Downloads the server's tables (all, or `tables`) as a new SQLite
+        file at `path`, which must not exist: the rows, keys, references,
+        B-tree indexes (`indexes`), an FTS5 index over each table's text
+        (`fts`) and the Strata schemas (`schemas`). Returns the tables."""
+        path = os.fspath(path)
+        q: dict = {k: "false" for k, v in {"fts": fts, "indexes": indexes, "schemas": schemas}.items() if not v}
+        if tables is not None:
+            q["tables"] = tables if isinstance(tables, str) else ",".join(tables)
+        part = path + ".part"
+        try:
+            with open(part, "xb") as f:
+                headers = self._call("GET", "/v1/export?" + urllib.parse.urlencode(q), out=f)
+            if os.path.exists(path):
+                raise FileExistsError(path)
+            os.replace(part, path)
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
+        return [t for t in (headers.get("x-strata-tables") or "").split(",") if t]
 
     def ask(self, question: str, *, model: str | None = None, effort: str | None = None, api_key: str | None = None, max_steps: int | None = None) -> dict:
         """Asks the server's agent a question about the data: {answer,

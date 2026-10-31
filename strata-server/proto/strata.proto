@@ -523,6 +523,9 @@ message Expr {
     // range of the multi-vector work, so lanes building at once do not
     // collide.
     MaxSim maxsim = 80;
+    // PREFIX(x, p), and a table's kw LIKE 'p%'; plan feature "prefix".
+    // Numbered from 100, the range of the autocomplete work.
+    Prefix prefix = 100;
   }
 }
 
@@ -611,6 +614,11 @@ message Like {
   Expr expr = 1;
   Expr pattern = 2;
   bool case_insensitive = 3;
+}
+
+message Prefix {
+  Expr expr = 1;
+  Expr prefix = 2;
 }
 
 message Case {

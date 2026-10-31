@@ -1619,6 +1619,10 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             otherwise: else_result.as_deref().map(bx).transpose()?,
         },
         Expr::Function(_) if outer_field(e).is_some() => ir::Expr::Outer(outer_field(e).expect("a field")),
+        Expr::Function(f) if fname(f) == "prefix" => {
+            let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
+            ir::Expr::Prefix { expr: bx(x)?, prefix: bx(p)? }
+        }
         Expr::Function(f) => {
             let func = match fname(f).as_str() {
                 "lower" => Func::Lower,
