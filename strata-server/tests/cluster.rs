@@ -54,7 +54,7 @@ fn create_unnumbered(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Ar
 /// and ships quickly when it becomes a primary.
 async fn serve(db: Arc<Db>, dir: &Path, name: &str) -> (Arc<Service>, String) {
     let path = dir.join(name);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10));
     svc.keep_slots_in(slots::file_of(&path)).unwrap();
     svc.keep_replication_in(replication::file_of(&path));
@@ -189,6 +189,52 @@ async fn shards_join_and_leave_a_serving_cluster() {
     assert_eq!(cluster["slot_epoch"], removed.epoch);
     assert_eq!(cluster["changes"]["ok"], true);
     assert_eq!(cluster["shards"][0]["slots_held"].as_u64().unwrap() + cluster["shards"][1]["slots_held"].as_u64().unwrap(), slots::SLOTS as u64);
+}
+
+/// The rows `sql` reads through `svc`.
+async fn select(svc: &Arc<Service>, sql: &str) -> Vec<Vec<Value>> {
+    svc.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message)).rs.rows
+}
+
+/// ALTER TABLE through a coordinator runs on every shard, and the
+/// coordinator serves the columns it added or renamed, of the first table
+/// and of others; a shard added after is given the altered tables. DROP
+/// COLUMN is refused: the coordinator's plans name columns by place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tables_altered_through_a_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut urls = Vec::new();
+    for s in 0..2 {
+        let name = format!("s{s}.strata");
+        urls.push(serve(create(d, &name, |i| shard_of(&key(i), 2) == s), d, &name).await.1);
+    }
+    let (a, svc) = coordinator(&urls).await;
+    sql(&svc, "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)").await.unwrap();
+    sql(&svc, "INSERT INTO notes (id, body) VALUES (1, 'one'), (2, 'two'), (3, 'three')").await.unwrap();
+    sql(&svc, "ALTER TABLE notes ADD COLUMN pinned INT DEFAULT 0, RENAME COLUMN body TO text").await.unwrap();
+    sql(&svc, "ALTER TABLE products ADD COLUMN stock INT DEFAULT 5").await.unwrap();
+    sql(&svc, "INSERT INTO notes (id, text, pinned) VALUES (4, 'four', 1)").await.unwrap();
+    let notes = "SELECT id, text, pinned FROM notes ORDER BY id";
+    let want: Vec<Vec<Value>> = [(1, "one", 0), (2, "two", 0), (3, "three", 0), (4, "four", 1)].iter().map(|&(i, t, p)| vec![Value::Int(i), Value::Str(t.into()), Value::Int(p)]).collect();
+    assert_eq!(select(&svc, notes).await, want);
+    assert_eq!(select(&svc, "SELECT COUNT(*) FROM products WHERE stock = 5").await, [[Value::Int(N as i64)]]);
+    assert!(svc.first_table().field("stock").is_some(), "the coordinator serves the first table as altered");
+
+    let e = sql(&svc, "ALTER TABLE notes DROP COLUMN pinned").await.unwrap_err();
+    assert!(e.contains("does not run through a coordinator"), "{e}");
+
+    // A new shard holds the first table as the cluster does, and is given
+    // the others by CREATE TABLE.
+    let db2 = create(d, "s2.strata", |_| false);
+    let (svc2, u2) = serve(db2.clone(), d, "s2.strata").await;
+    let e = a.add_shard(vec![u2.clone()], Acks::All).await.unwrap_err();
+    assert!(e.message.contains("another schema"), "{}", e.message);
+    sql(&svc2, "ALTER TABLE products ADD COLUMN stock INT DEFAULT 5").await.unwrap();
+    a.add_shard(vec![u2], Acks::All).await.unwrap();
+    assert!(db2.catalog().iter().any(|t| t.table == "notes" && t.field("pinned").is_some()));
+    a.refresh(true).await;
+    assert_eq!(select(&svc, notes).await, want, "the coordinator serves the table its shards made differently");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

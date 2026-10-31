@@ -225,6 +225,22 @@ impl Database {
 }
 
 /// The schema of the table named `table` (any case), or of the first.
+/// One change of [`Database::alter_table_json`].
+fn alter_of(j: &serde_json::Value) -> PyResult<strata::schema::Alter> {
+    use strata::schema::{Alter, Field};
+    let bad = || PyValueError::new_err(format!("a change is {{\"add\": field}}, {{\"drop\": name}} or {{\"rename\": [from, to]}}, not {j}"));
+    let o = j.as_object().filter(|o| o.len() == 1).ok_or_else(bad)?;
+    match o.iter().next().ok_or_else(bad)? {
+        (k, f) if k == "add" => Ok(Alter::AddField(Field::from_short_json(f).map_err(err)?)),
+        (k, serde_json::Value::String(name)) if k == "drop" => Ok(Alter::DropField(name.clone())),
+        (k, serde_json::Value::Array(xs)) if k == "rename" => match xs.as_slice() {
+            [serde_json::Value::String(from), serde_json::Value::String(to)] => Ok(Alter::RenameField { from: from.clone(), to: to.clone() }),
+            _ => Err(bad()),
+        },
+        _ => Err(bad()),
+    }
+}
+
 fn table_of(db: &Db, table: Option<&str>) -> strata::Result<Arc<Schema>> {
     match table {
         None => Ok(db.catalog().swap_remove(0)),
@@ -257,6 +273,19 @@ impl Database {
     #[pyo3(signature = (table = None))]
     fn schema_json(&self, table: Option<&str>) -> PyResult<String> {
         Ok(table_of(&*self.get()?, table).map_err(err)?.to_short_json().to_string())
+    }
+
+    /// Changes the columns of the first table, or of `table`, in one
+    /// change: `alters` is a JSON list of `{"add": field}` (a field in its
+    /// short form), `{"drop": name}` and `{"rename": [from, to]}`, applied
+    /// in order, as `ALTER TABLE` takes them.
+    #[pyo3(signature = (alters, table = None))]
+    fn alter_table_json(&self, py: Python<'_>, alters: &str, table: Option<&str>) -> PyResult<()> {
+        let db = self.get()?;
+        let table = table_of(&db, table).map_err(err)?.table.clone();
+        let list: Vec<serde_json::Value> = serde_json::from_str(alters).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let alters = list.iter().map(alter_of).collect::<PyResult<Vec<_>>>()?;
+        py.detach(|| db.alter_table(&table, &alters)).map_err(err)
     }
 
     /// Every table's schema in its short JSON form, the first first.

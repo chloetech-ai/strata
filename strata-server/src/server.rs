@@ -281,7 +281,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         if let Some(b) = db.storage().merge_status().memory_budget {
             tracing::info!(threads = o.merger.threads.max(1), memory_mib = b >> 20, "merging in the background");
         }
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         (Backend::Local(db), schema)
     };
     let mut svc = Service::new(backend, schema, agent, o.max_concurrent.max(1), timeout);

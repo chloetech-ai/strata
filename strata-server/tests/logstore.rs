@@ -63,7 +63,7 @@ fn shard(dir: &std::path::Path, name: &str, node: &str, i: usize) -> Arc<Service
     let db = Db::create(&dir.join(name), demo::schema(N), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
     db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     db.load((0..N).filter(|&k| shard_of(&strata::Value::Str(format!("p{k:07}")), 2) == i).map(|k| demo::product(k, 7))).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let agent = AgentConfig { api_key: None, model: String::new(), base_url: String::new() };
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(10));
     svc.log_store = Some(LogStore::open(LogOptions { capture: false, ..LogOptions::new(dir.join(format!("{name}.logs")), node.into()) }).unwrap());

@@ -72,7 +72,7 @@ async fn stops_at_deadline(base: &str) {
 async fn a_server_stops_a_join_at_its_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "one.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let base = http(Arc::new(service(Backend::Local(db), schema))).await;
     stops_at_deadline(&base).await;
 }
@@ -84,7 +84,7 @@ async fn a_coordinator_stops_a_join_at_its_deadline() {
     let mut shards = Vec::new();
     for s in 0..2 {
         let db = open(dir.path(), &format!("s{s}.strata"), shard(s));
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         shards.push(grpc(Arc::new(service(Backend::Local(db), schema))).await);
     }
     let c = Coordinator::connect(shards).await.unwrap();

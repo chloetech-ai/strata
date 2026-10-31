@@ -28,7 +28,7 @@ fn service(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Service {
     let db = Db::create(&dir.join(name), demo::schema(N), DbOptions { publish_snapshots: true, segment_max_docs: 150, ..DbOptions::default() }).unwrap();
     db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     db.load((0..N).filter(|&i| keep(i)).map(|i| demo::product(i, 7))).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent(), 16, Duration::from_secs(10));
     svc.open_models(&dir.join("models"));
     svc

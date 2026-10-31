@@ -53,7 +53,7 @@ fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
         FieldType::Sparse => "SPARSE (learned term weights)".to_string(),
     };
     let mut notes = Vec::new();
-    if svc.schema.primary_key == Some(i) {
+    if svc.first_table().primary_key == Some(i) {
         notes.push("primary key".to_string());
     }
     if f.multi {
@@ -77,7 +77,8 @@ fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
 }
 
 fn system_prompt(svc: &Service, docs: u64) -> String {
-    let s = &svc.schema;
+    let first = svc.first_table();
+    let s = &*first;
     let fields: Vec<String> = s.fields.iter().enumerate().map(|(i, f)| field_line(svc, f, i)).collect();
     let vectors: Vec<String> = s
         .fields
@@ -178,7 +179,7 @@ async fn run_sql(svc: &Arc<Service>, input: &Json) -> (Result<Json, String>, Jso
     let sql = input.get("sql").and_then(|s| s.as_str()).unwrap_or("").to_string();
     let t0 = Instant::now();
     let r: Result<_, ApiError> = async {
-        if strata::query::bind_write(&sql, &svc.schema, &strata::query::Params::new()).ok().flatten().is_some() {
+        if strata::query::bind_write(&sql, &svc.first_table(), &strata::query::Params::new()).ok().flatten().is_some() {
             return Err(ApiError::bad("run_sql is read-only"));
         }
         let params = svc.params(input.get("params")).await?;

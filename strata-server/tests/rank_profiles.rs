@@ -40,7 +40,7 @@ fn create(dir: &Path, name: &str, ship: bool, keep: impl Fn(usize) -> bool) -> A
 }
 
 fn service(db: Arc<Db>) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10))
 }
 
@@ -238,4 +238,7 @@ async fn a_primary_ships_its_profiles_and_tables_to_its_replicas() {
     sql(&p, "DROP TABLE notes").await.unwrap();
     assert!(rdb.storage().table("notes").is_none());
     assert_eq!(rdb.storage().seq_no(), pdb.storage().seq_no());
+    // No replica applies an ALTER TABLE yet, so a primary refuses it.
+    let e = sql(&p, "ALTER TABLE products ADD COLUMN stock INT").await.err().unwrap();
+    assert!(e.contains("does not reach replicas yet"), "{e}");
 }

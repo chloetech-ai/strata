@@ -7,7 +7,7 @@ nav_order: 1
 # Strata's query language
 {: .no_toc }
 
-Strata speaks standard SQL over the tables of a database: `SELECT` with functions for full text, vectors, rank fusion and graphs, aggregates, typo-tolerant and synonym searches, and subqueries, `WITH` and joins of a table with itself; `INSERT`, `UPDATE` and `DELETE`; and `CREATE TABLE` and `DROP TABLE`. Text, structured and vector conditions mix freely in one statement, and the planner decides how to evaluate them together.
+Strata speaks standard SQL over the tables of a database: `SELECT` with functions for full text, vectors, rank fusion and graphs, aggregates, typo-tolerant and synonym searches, and subqueries, `WITH` and joins of a table with itself; `INSERT`, `UPDATE` and `DELETE`; and `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE`. Text, structured and vector conditions mix freely in one statement, and the planner decides how to evaluate them together.
 {: .fs-5 .fw-300 }
 
 1. TOC
@@ -938,9 +938,31 @@ DROP TABLE IF EXISTS wrote, authors;
 - **`OPTIONS(retain = '400 days')`** drops rows once their time is older than the period: a flush does not write them, and a merge leaves them out of the segment it writes, or drops a segment whose rows are all past it without rewriting anything; the merger looks for such segments on its own. Until then a query still finds them, so filter on the time where that matters (`WHERE ts > '2025-10-01'`). The time is the table's only `TIMESTAMP` column, or the one `retain_by = 'column'` names (indexed, single-valued, and not changed by `UPDATE`); a row without one is kept. A period is a whole number and a unit: seconds, minutes, hours, days or weeks (`'90 s'`, `'12h'`, `'2 weeks'`). In JSON it is `"retain": "400 days"` with `"retain_by"`.
 - **`OPTIONS(edges = 'src, dst, w')`** makes each row an edge of a graph over another table's rows, which walks over that table follow ([edge tables](#edge-tables)). In JSON it is `"edges": "src, dst, w"`.
 - **`DROP TABLE`** drops tables other than the first. A table that another table references goes with it (`DROP TABLE wrote, authors`) or with `CASCADE`, which removes those references.
-- Every other clause (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, a `DEFAULT` that is an expression, `CREATE TABLE ... AS SELECT`) is an error, and there is no `ALTER TABLE` yet.
+- Every other clause (`UNIQUE`, `CHECK`, `ON DELETE`, constraint names, a `DEFAULT` that is an expression, `CREATE TABLE ... AS SELECT`) is an error.
 
-`CREATE TABLE` and `DROP TABLE` run through `Db::sql`, Python's in-process [`strata.Database`](python.md), and [strata-server](server.md#schemas)'s `POST /v1/sql`, where a coordinator runs them on every shard.
+`CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` run through `Db::sql`, Python's in-process [`strata.Database`](python.md), and [strata-server](server.md#schemas)'s `POST /v1/sql`, where a coordinator runs them on every shard.
+
+### Changing a table's columns
+
+```sql
+ALTER TABLE products ADD COLUMN stock INT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS brand KEYWORD, ADD note TEXT;
+ALTER TABLE products ADD COLUMN emb2 VECTOR OPTIONS(embed = 'title', model = 'potion-retrieval-32M');
+ALTER TABLE products RENAME COLUMN note TO notes;
+ALTER TABLE products DROP COLUMN IF EXISTS notes;
+ALTER TABLE IF EXISTS drafts DROP COLUMN body, DROP COLUMN title;
+```
+
+`ALTER TABLE` changes the columns of any table, the first included, while it holds rows; the changes of one statement apply in order, as one change.
+
+- **`ADD COLUMN`** (or `ADD`) takes a column as `CREATE TABLE` does, with its type, `NOT NULL`, `DEFAULT`, `REFERENCES` and `OPTIONS`, and puts it last. Rows written before it read it as its default, or `NULL` without one (a `TIMESTAMP` with `DEFAULT CURRENT_TIMESTAMP` too: the default is the time of each later write): in `SELECT`, `WHERE`, `ORDER BY`, aggregates and searches alike. Writes from then on take it. A `NOT NULL` column without a default can only be added to a table without rows. A column added with `embed` gets its model and embeds the rows written from then on; the rows before get theirs from [the backfill](server.md#embedded-vector-fields), which a server runs once the model opens (from Rust, `Db::embed_backfill`), and until then have none. A generated `TEXT` column, a semantic-ID column, `EDGES` and a primary key cannot be added.
+- **`DROP COLUMN`** drops a column and its values; a column added again under the same name is a new column, `NULL` in the older rows. The primary key, a table's only column, a column another field names (as the source of a generated text, an embedding, a caption or semantic IDs) and one the table's options name (`shard_by`, `cluster_by`, `retain_by`, `edges`) stay, and the statement says what names it; so do columns a [rank profile](#rank-profiles-a-ranking-kept-with-its-table) of the table ranks by.
+- **`RENAME COLUMN a TO b`** keeps the column's values, and the fields and options that name it follow it; a rank profile does not, so a column a profile ranks by keeps its name until the profile is dropped or replaced.
+- **`IF EXISTS`** after `ALTER TABLE` skips a table that is not there; `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS` skip a column that is, or is not. Positions (`FIRST`, `AFTER`), `ALTER COLUMN`, `RENAME TO` (of the table) and `CASCADE` are errors.
+
+A change writes nothing but the table's schema: it waits for writes in flight, writes the memtable as segments (a write-ahead log names columns by position), and commits the new schema. A segment written before a column was added does not hold it; when it is opened, the column's index is built in memory over its rows' default, and the next merge that rewrites the segment writes the column for real. A dropped column's values stay in the older segments, unread, until merges rewrite them. The Rust API is `Db::alter_table(table, &[Alter::AddField(field), Alter::DropField(name), Alter::RenameField { from, to }])`; a database with a column added later needs the feature `added_fields`, so a version of Strata from before it refuses the database.
+
+On strata-server, a coordinator runs `ADD COLUMN` and `RENAME COLUMN` on every shard and then serves the table as altered; it refuses `DROP COLUMN`, since its plans name a table's columns by position and a query planned while some shards had dropped the column would read the next one. A primary refuses `ALTER TABLE` (409): it ships `CREATE TABLE` and `DROP TABLE` to its replicas, but no replica applies an `ALTER TABLE` yet.
 
 ## Writes
 

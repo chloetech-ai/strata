@@ -61,7 +61,7 @@ async fn a_coordinator_profiles_each_server_of_its_cluster() {
     let mut alone = None;
     for s in 0..2 {
         let db = open(dir.path(), &format!("s{s}.strata"), |i| shard_of(&strata::Value::Str(format!("p{i:07}")), 2) == s);
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         let svc = service(Backend::Local(db), schema);
         let (l, url) = listen().await;
         tokio::spawn(server::serve_grpc(svc.clone(), l, Default::default()));

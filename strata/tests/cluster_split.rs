@@ -157,23 +157,23 @@ fn split_collection_answers_like_the_whole() {
         "SELECT topic, COUNT(*) FROM docs GROUP BY topic",
         "SELECT id, title FROM docs WHERE year >= 2005",
     ] {
-        assert!(!cluster::fetches(&bind(sql, a.schema(), &params).unwrap(), a.schema()), "{sql}");
+        assert!(!cluster::fetches(&bind(sql, &a.schema(), &params).unwrap(), &a.schema()), "{sql}");
     }
     // A row that changed between the phases is left out, and counted.
     let sql = wide[0];
-    let select = bind(sql, a.schema(), &params).unwrap();
-    let ids = cluster::ids(&select, a.schema()).unwrap();
+    let select = bind(sql, &a.schema(), &params).unwrap();
+    let ids = cluster::ids(&select, &a.schema()).unwrap();
     let ranked = a.execute(&a.snapshot(), &ids, &ExecOptions { shard: true, ..ExecOptions::default() }).unwrap();
     let mut keys = ranked.keys.clone();
     let gone = keys.remove(0);
-    let one = a.execute(&a.snapshot(), &cluster::fetch(&select, a.schema(), keys).unwrap(), &ExecOptions { shard: true, ..ExecOptions::default() }).unwrap();
+    let one = a.execute(&a.snapshot(), &cluster::fetch(&select, &a.schema(), keys).unwrap(), &ExecOptions { shard: true, ..ExecOptions::default() }).unwrap();
     let (rs, lost) = cluster::fill(&select, cluster::merge(&ids, vec![ranked]).unwrap(), vec![one]).unwrap();
     assert_eq!((lost, rs.rows.len()), (1, 9));
     assert!(!rs.keys.contains(&gone));
 
     // Without the summed statistics, a shard's BM25 scores differ.
     let sql = &queries[0];
-    let select = bind(sql, a.schema(), &params).unwrap();
+    let select = bind(sql, &a.schema(), &params).unwrap();
     let local = a.execute(&a.snapshot(), &select, &ExecOptions { shard: true, ..ExecOptions::default() }).unwrap();
     let global = {
         let stats = TermStats::sum(&[a.term_stats(&a.snapshot(), &select).unwrap(), b.term_stats(&b.snapshot(), &select).unwrap()]);
@@ -256,7 +256,7 @@ fn shard_mode_refuses_graph_queries() {
     let a = open(dir.path(), "a.strata", &docs);
     // Vector neighbours count as edges, and they cross shards.
     let sql = "SELECT id FROM docs WHERE REACHABLE(emb, 'd0000001', hops => 2) LIMIT 10";
-    let select = bind(sql, a.schema(), &Params::new()).unwrap();
+    let select = bind(sql, &a.schema(), &Params::new()).unwrap();
     assert!(a.execute(&a.snapshot(), &select, &ExecOptions::default()).is_ok());
     let r = a.execute(&a.snapshot(), &select, &ExecOptions { shard: true, ..ExecOptions::default() });
     assert!(matches!(r, Err(strata::Error::Query(_))), "{r:?}");

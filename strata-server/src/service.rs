@@ -19,7 +19,7 @@ use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
 use strata::query::{bind_command, compound, ops, profile, steps, Command, Params, Select};
 use strata::rank_log::{self, Log};
-use strata::schema::Schema;
+use strata::schema::{Alter, Schema};
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
 use strata::text::Synonyms;
 use strata::value::Value;
@@ -1327,6 +1327,12 @@ impl Service {
         }
     }
 
+    /// The first table's schema as it is now: [`Self::schema`] is the one
+    /// the server started with, before any ALTER TABLE.
+    pub fn first_table(&self) -> Arc<Schema> {
+        self.catalog().into_iter().next().unwrap_or_else(|| Arc::new(self.schema.clone()))
+    }
+
     /// The table named `name` (any case). A coordinator that does not know
     /// it asks its shards again first.
     pub async fn table(&self, name: &str) -> Result<Arc<Schema>, ApiError> {
@@ -2194,6 +2200,20 @@ impl Service {
             }
             Command::Explain { .. } => return Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain")),
             Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => true,
+            Command::AlterTable { alters, .. } => {
+                // A coordinator's plans name a table's columns by their
+                // place, and its shards drop a column one by one: a query
+                // planned before a shard dropped one would read the next.
+                if matches!(self.backend, Backend::Cluster(_)) && alters.iter().any(|a| matches!(a, Alter::DropField(_))) {
+                    return Err(ApiError::bad("ALTER TABLE ... DROP COLUMN does not run through a coordinator yet (its plans name columns by place); ADD COLUMN and RENAME COLUMN do"));
+                }
+                // A primary ships CREATE TABLE and DROP TABLE, but no
+                // replica applies a shipped ALTER TABLE yet.
+                if let (Backend::Local(_), Replication::Primary(_)) = (&self.backend, self.replication()) {
+                    return Err(conflict("ALTER TABLE does not reach replicas yet: change a table's columns before its copies replicate".into()));
+                }
+                true
+            }
             Command::Write { .. } => false,
         };
         if after != After::Any {
@@ -2228,8 +2248,8 @@ impl Service {
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
-    /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
-    /// PROFILE`: on a local database, once no write holds the writer;
+    /// `CREATE TABLE`, `ALTER TABLE` or `DROP TABLE`, `CREATE RANK PROFILE`
+    /// or `DROP RANK PROFILE`: on a local database, once no write holds the writer;
     /// through a coordinator, on every shard ([`Coordinator::ddl`]). A
     /// replica refuses it, as it refuses every write. Each is a numbered
     /// transaction in a database that numbers its writes, so a primary
@@ -2459,7 +2479,7 @@ impl Service {
     pub async fn import(self: &Arc<Self>, table: Option<&str>, body: axum::body::Bytes, format: Format) -> Result<(u64, Vec<String>), ApiError> {
         let schema = match table {
             Some(t) => self.table(t).await?,
-            None => Arc::new(self.schema.clone()),
+            None => self.first_table(),
         };
         // Rows of the first table name none, as before there were tables.
         let named = table.map(|_| schema.table.clone());
@@ -3385,7 +3405,7 @@ pub fn command_scope(c: &Command) -> Scope {
     match c {
         Command::Query | Command::Explain { .. } => Scope::Read,
         Command::Write { .. } => Scope::Write,
-        Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
+        Command::CreateTable { .. } | Command::AlterTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
     }
 }
 

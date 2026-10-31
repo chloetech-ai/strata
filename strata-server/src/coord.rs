@@ -243,21 +243,24 @@ const ONE_REPLICA: &str = "seq_no() and if_seq_no need one replica per shard, or
 /// The tables every replica that answered `Schema` names alike, in the
 /// first one's order: each names them all (`tables_json`), or, from a
 /// server before tables, its first table alone. One that is not on every
-/// replica is left out, and logged.
+/// replica is left out, and logged. Alike is [`Schema::same_columns`]: a
+/// shard that joined after a table was altered was given it by one
+/// `CREATE TABLE`, which numbers its fields afresh.
 fn common_tables(answers: &[pb::SchemaResponse]) -> Result<Vec<Arc<Schema>>, ApiError> {
-    let lists: Vec<Vec<&str>> = answers
+    let lists: Vec<Vec<Schema>> = answers
         .iter()
         .map(|a| match a.tables_json.is_empty() {
             true => vec![a.schema_json.as_str()],
             false => a.tables_json.iter().map(String::as_str).collect(),
         })
-        .collect();
+        .map(|l| l.into_iter().map(serde_json::from_str).collect::<Result<_, _>>())
+        .collect::<Result<_, _>>()
+        .map_err(ApiError::internal)?;
     let Some(first) = lists.first() else { return Ok(Vec::new()) };
     let mut out = Vec::new();
-    for t in first {
-        let schema: Schema = serde_json::from_str(t).map_err(ApiError::internal)?;
-        match lists.iter().all(|l| l.contains(t)) {
-            true => out.push(Arc::new(schema)),
+    for schema in first {
+        match lists.iter().all(|l| l.iter().any(|s| s.same_columns(schema))) {
+            true => out.push(Arc::new(schema.clone())),
             false => tracing::warn!(table = %schema.table, "a table some shard replicas lack, or hold with another schema, is not served: create it on every shard (CREATE TABLE IF NOT EXISTS through the coordinator)"),
         }
     }
@@ -717,10 +720,11 @@ impl Coordinator {
             }
         }
         let Survey { schemas, tables, maps } = found;
-        if schemas.iter().any(|s| *s != schemas[0]) {
+        let parsed: Vec<Schema> = schemas.iter().map(|s| serde_json::from_str(s)).collect::<Result<_, _>>().map_err(ApiError::internal)?;
+        if parsed.iter().any(|s| !s.same_columns(&parsed[0])) {
             return Err(ApiError::bad("the shards serve different schemas"));
         }
-        let schema: Schema = serde_json::from_str(&schemas[0]).map_err(ApiError::internal)?;
+        let schema = parsed.into_iter().next().ok_or_else(|| ApiError::bad("no shard answered"))?;
         if schema.primary_key.is_none() {
             return Err(ApiError::bad("a sharded table needs a primary key to route writes"));
         }
@@ -847,7 +851,8 @@ impl Coordinator {
         });
         let answers: Vec<pb::SchemaResponse> = join_all(calls).await.into_iter().filter_map(|a| a.ok()?.ok()).map(|a| a.into_inner()).collect();
         let tables = match common_tables(&answers) {
-            Ok(t) if t.first().is_some_and(|f| **f == self.schema) => t,
+            // The first table, as ALTER TABLE left it.
+            Ok(t) if t.first().is_some_and(|f| f.table == self.schema.table) => t,
             _ => return false,
         };
         let profiles = common_profiles(&answers);
@@ -2390,7 +2395,8 @@ impl Coordinator {
             return Err(ApiError::bad(format!("{url} holds a cluster map already (epoch {}, as shard {i}): it belongs to a cluster; start it on a new database", m.epoch)));
         }
         let first: Schema = serde_json::from_str(&schema.schema_json).map_err(ApiError::internal)?;
-        if first != self.schema {
+        let ours = self.catalog().first().cloned().unwrap_or_else(|| Arc::new(self.schema.clone()));
+        if !first.same_columns(&ours) {
             return Err(ApiError::bad(format!("{url} serves table {} with another schema than the cluster's first table, {}: create its database with the same --schema", first.table, self.schema.table)));
         }
         if health.docs > 0 && !force {
