@@ -482,6 +482,6 @@ def test_two_rankings_interleaved(db):
         assert next(x for x in (ka if t == "plain" else kb) if x not in r.keys[:i]) == k
     # The same request draws the same list.
     assert db.query_logged(a, {"q": "dragon"}, request="r1", interleave=b, variants=["plain", "rated"]).keys == r.keys
-    records = [x for x in db.export_rank_log() if x["request"] == "r1"]
+    records = sorted((x for x in db.export_rank_log() if x["request"] == "r1"), key=lambda x: x["position"])
     assert [x["row_key"] for x in records] == r.keys and [x["variant"] for x in records] == r.teams
     assert db.query(a, q="dragon").teams is None
