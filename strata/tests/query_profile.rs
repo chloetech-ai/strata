@@ -102,5 +102,6 @@ fn a_query_s_steps_are_its_operators_and_segments() {
     let leaf = steps.iter().position(|s| s.op == "leaf").unwrap_or_else(|| panic!("no leaf step in {steps:#?}"));
     assert!(steps[leaf].depth > 0 && steps[leaf].detail.ends_with("docs"), "{:?}", steps[leaf]);
     assert!(children(steps, leaf).iter().any(|&i| steps[i].op == "rank"), "{steps:#?}");
-    assert!(steps.iter().any(|s| s.op == "distinct"), "{steps:#?}");
+    // DISTINCT runs as GROUP BY its columns.
+    assert!(steps.iter().any(|s| s.op == "aggregate" && s.detail == "1 key, 1 aggregate"), "{steps:#?}");
 }
