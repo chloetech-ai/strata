@@ -1,0 +1,33 @@
+# The one-way doors: changes here are hard or impossible to undo once
+# databases, replicas or clients depend on them (the on-disk format, the
+# shard protocol, replication and authentication). A pull request that
+# touches one names it in its description (.github/pull_request_template.md)
+# and waits for a human review.
+#
+# GitHub requests a review from the owners below; it enforces that review
+# only when the branch rule for main turns on "Require review from Code
+# Owners".
+
+# The on-disk format: manifest, write-ahead log, pages, directory layout,
+# segments, the fixtures that pin each format version, and the features a
+# file declares (query/ir.rs).
+/strata/src/storage/manifest.rs   @rkonow
+/strata/src/storage/wal.rs        @rkonow
+/strata/src/storage/pager.rs      @rkonow
+/strata/src/storage/dir.rs        @rkonow
+/strata/src/storage/ship.rs       @rkonow
+/strata/src/segment/              @rkonow
+/strata/src/query/ir.rs           @rkonow
+/strata/tests/fixtures/format*/   @rkonow
+
+# The shard protocol and replication between servers.
+/strata-server/proto/             @rkonow
+/strata-server/src/replication.rs @rkonow
+/strata-server/src/slots.rs       @rkonow
+
+# Authentication and authorization.
+/strata-server/src/auth.rs        @rkonow
+/strata-server/src/keys.rs        @rkonow
+
+# The merge gate itself.
+/.github/                         @rkonow
