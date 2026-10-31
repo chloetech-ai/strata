@@ -266,10 +266,20 @@ fn every_plan_round_trips() {
     // In the ranking, and as a column of features().
     assert_eq!(models, vec![("m".to_string(), "0123456789abcdef".to_string(), 3); 2]);
     seen.extend(kinds(&plan));
+    // Reranked by a cross-encoder, in a global phase.
+    let sql = "WITH top AS (SELECT * FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 20) SELECT id, score() FROM top ORDER BY cross_encoder('ce', title, body, 'graph search') DESC LIMIT 5";
+    let plan = compound::plan(sql, &schema, &params()).unwrap();
+    assert!(plan.features.iter().any(|f| f == ir::RANK_MODELS), "{:?}", plan.features);
+    let back = through_pb(&plan);
+    let mut found = Vec::new();
+    back.root.each_search(&mut |s| found.extend(s.phases.iter().map(|p| (p.count, p.global, p.expr.clone()))));
+    let [(20, true, Expr::CrossEncoder { model, fields, query, .. })] = &found[..] else { panic!("{found:?}") };
+    assert_eq!((model.as_str(), fields.len(), query.as_str()), ("ce", 2, "graph search"));
+    seen.extend(kinds(&plan));
     // Every kind of node and expression was among them.
     let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
     let exprs = [
-        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim", "prefix", "outer", "by_key", "at_least",
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "cross_encoder", "maxsim", "prefix", "outer", "by_key", "at_least",
     ];
     let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
     let missing: Vec<&String> = want.difference(&seen).collect();

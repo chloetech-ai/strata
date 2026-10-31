@@ -37,10 +37,15 @@
 //! `guard_r100` all of them while 100 rows have them, else as many as do
 //! (`min => 1, min_rows => 100`); with `all_r100`, the recalls are given
 //! again over the queries fewer than 100 rows match all the words of.
-//! `--features DIR` makes their training
+//! `--features DIR` makes the `gbdt` models' training
 //! data instead of timing anything: each query's BM25 top 100 with
 //! `features()` and its grades, in `<DIR>/<collection>.jsonl`, which
-//! `scripts/train_ltr.py` trains the models on. `--reps N` runs the
+//! `scripts/train_ltr.py` trains the models on. `ce_rerank<N>` ranks
+//! BM25's top `N` again by `cross_encoder('<--cross-encoder>', body, :q)`
+//! in a global phase, the model in `--models`. Each variant reports
+//! nDCG@10, recall@10 and, when `plain` runs too, the p-value of a paired
+//! randomization test of its nDCG@10 against plain BM25's (10,000
+//! rounds). `--queries N` evaluates the first `N` queries only. `--reps N` runs the
 //! variants N times in turn and keeps each query's median time. Writes
 //! `<out>/bm25_<tag>.json` (default `results/text/`). Tune on `--split dev` (or `train` where a collection
 //! has no dev split) and report `test`; `tests/relevance_gate.rs` holds the
@@ -56,7 +61,7 @@ use clap::Parser;
 use serde_json::{json, Value as Json};
 use strata::beir;
 use strata::db::Db;
-use strata::metrics::{mean, ndcg_at_k, percentile};
+use strata::metrics::{mean, ndcg_at_k, paired_randomization, percentile, recall_at_k};
 use strata::query::exec::ExecOptions;
 use strata::query::Params;
 use strata::schema::{Field, FieldType, Schema};
@@ -96,15 +101,25 @@ struct Args {
     /// `<DIR>/<collection>.jsonl` instead of timing the variants.
     #[arg(long)]
     features: Option<PathBuf>,
+    /// The `ce_rerank<N>` variants' cross-encoder, in `--models`.
+    #[arg(long, default_value = "ms-marco-MiniLM-L-6-v2")]
+    cross_encoder: String,
+    /// Evaluates the first N queries of each collection only.
+    #[arg(long)]
+    queries: Option<usize>,
 }
 
 /// A variant's query on collection `coll` and whether it ranks rank-safe.
-fn query(variant: &str, coll: &str) -> (String, bool) {
+fn query(variant: &str, coll: &str, cross_encoder: &str) -> (String, bool) {
     let top10 = |rank: &str| format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 10");
     let top100 = |rank: &str| format!("SELECT id FROM docs ORDER BY {rank} DESC LIMIT 100");
-    // A rerank phase over BM25's top 100.
-    let rerank = |rank: &str| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT 100) SELECT id FROM top ORDER BY {rank} DESC LIMIT 10");
+    // A rerank phase over BM25's top `n`.
+    let rerank_n = |rank: &str, n: usize| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT {n}) SELECT id FROM top ORDER BY {rank} DESC LIMIT 10");
+    let rerank = |rank: &str| rerank_n(rank, 100);
     let model = format!("gbdt('ltr_{coll}', bm25(body, :q, syntax => 'plain'), importance)");
+    if let Some(n) = variant.strip_prefix("ce_rerank").and_then(|n| n.parse().ok()) {
+        return (rerank_n(&format!("cross_encoder('{cross_encoder}', body, :q)"), n), true);
+    }
     match variant {
         "plain" => (top10("bm25(body, :q, syntax => 'plain')"), true),
         "fuzzy" => (top10("bm25(body, :q, syntax => 'plain', fuzzy => 'auto')"), true),
@@ -123,7 +138,7 @@ fn query(variant: &str, coll: &str) -> (String, bool) {
         "plain_r100" => (top100("bm25(body, :q, syntax => 'plain')"), true),
         "all_r100" => (top100("bm25(body, :q, syntax => 'plain', min => '100%')"), true),
         "guard_r100" => (top100("bm25(body, :q, syntax => 'plain', min => 1, min_rows => 100)"), true),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, ce_rerank<N>, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
     }
 }
 
@@ -211,7 +226,10 @@ fn main() {
     let mut report = serde_json::Map::new();
     for name in &args.collections {
         let t0 = Instant::now();
-        let coll = beir::load(&args.dir.join(name), &args.split).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut coll = beir::load(&args.dir.join(name), &args.split).unwrap_or_else(|e| panic!("{name}: {e}"));
+        if let Some(n) = args.queries {
+            coll.queries.truncate(n);
+        }
         let path = tmp.join(format!("strata-bm25-eval-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
@@ -240,14 +258,17 @@ fn main() {
         let mut failed = vec![0; args.variants.len()];
         for rep in 0..args.reps.max(1) {
             for (j, v) in args.variants.iter().enumerate() {
-                let (sql, safe) = query(v, name);
+                let (sql, safe) = query(v, name, &args.cross_encoder);
                 let opts = ExecOptions { rank_safe: safe, ..ExecOptions::default() };
                 for (q, (_, text)) in coll.queries.iter().enumerate() {
                     let text = text_of(v, text);
                     let t = Instant::now();
                     let got: Vec<String> = match db.query_with(&sql, &Params::new().set("q", Value::Str(text)), &opts) {
                         Ok(r) => r.keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect(),
-                        Err(_) => {
+                        Err(e) => {
+                            if failed[j] == 0 && rep == 0 {
+                                eprintln!("{name} {v}: {e}");
+                            }
                             failed[j] += (rep == 0) as usize;
                             Vec::new()
                         }
@@ -260,19 +281,28 @@ fn main() {
             }
         }
         let mut variants = serde_json::Map::new();
+        let ndcgs: Vec<Vec<f64>> = ids.iter().map(|ids| coll.queries.iter().zip(ids).map(|((qid, _), got)| ndcg_at_k(got, &coll.qrels[qid], 10)).collect()).collect();
+        let plain = args.variants.iter().position(|v| v == "plain");
         for (j, v) in args.variants.iter().enumerate() {
-            let ndcg: Vec<f64> = coll.queries.iter().zip(&ids[j]).map(|((qid, _), got)| ndcg_at_k(got, &coll.qrels[qid], 10)).collect();
+            let ndcg = &ndcgs[j];
+            let recall: Vec<f64> = coll.queries.iter().zip(&ids[j]).map(|((qid, _), got)| recall_at_k(got, &coll.qrels[qid], 10)).collect();
             let ms: Vec<f64> = times[j].iter().map(|t| percentile(t, 50.0)).collect();
-            let mut doc = json!({ "ndcg10": mean(&ndcg), "ms_mean": mean(&ms), "ms_p50": percentile(&ms, 50.0), "ms_p99": percentile(&ms, 99.0), "failed": failed[j] });
+            let mut doc = json!({ "ndcg10": mean(ndcg), "recall10": mean(&recall), "ms_mean": mean(&ms), "ms_p50": percentile(&ms, 50.0), "ms_p99": percentile(&ms, 99.0), "failed": failed[j] });
             let mut line = format!(
-                "{name} {v}: nDCG@10 {:.4} over {} queries ({} failed), {:.2} ms/query, p50 {:.2}, p99 {:.2}",
-                mean(&ndcg),
+                "{name} {v}: nDCG@10 {:.4}, recall@10 {:.4} over {} queries ({} failed), {:.2} ms/query, p50 {:.2}, p99 {:.2}",
+                mean(ndcg),
+                mean(&recall),
                 ndcg.len(),
                 failed[j],
                 mean(&ms),
                 percentile(&ms, 50.0),
                 percentile(&ms, 99.0)
             );
+            if let Some(p) = plain.filter(|&p| p != j) {
+                let pv = paired_randomization(ndcg, &ndcgs[p], 10_000, 7);
+                doc["p_vs_plain"] = json!(pv);
+                line += &format!(", p = {pv:.4} against plain");
+            }
             // The share of the exact top 10 that BM25's top 100 holds.
             if let Some(b) = v.strip_suffix("_top100").or_else(|| v.strip_suffix("_rerank100")).and_then(|base| args.variants.iter().position(|w| w == base)) {
                 let share: Vec<f64> = ids[j]

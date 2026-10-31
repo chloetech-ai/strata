@@ -12,9 +12,12 @@
 //! * [`memory`]: the memory breaker queries count what they hold against.
 //! * [`model`]: ranking models (`gbdt()`), read from LightGBM and XGBoost
 //!   files.
+//! * [`cross_encoder`]: cross-encoders (`cross_encoder()`), which a global
+//!   rerank phase scores rows' text with.
 
 pub mod agg;
 pub mod compound;
+pub mod cross_encoder;
 pub mod ddl;
 pub mod exec;
 pub mod fusion;

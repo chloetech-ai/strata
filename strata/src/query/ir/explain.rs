@@ -21,7 +21,7 @@ impl Plan {
     pub fn explain(&self, schemas: &[&Schema]) -> Vec<String> {
         let mut lines = Text { schemas, refs: RefCell::default() }.node(&self.root).0;
         self.root.visit_exprs(&mut |e| {
-            if let Expr::Gbdt { model, hash, .. } = e {
+            if let Expr::Gbdt { model, hash, .. } | Expr::CrossEncoder { model, hash, .. } = e {
                 let line = match hash.as_str() {
                     "" => format!("ranking model: {model}"),
                     h => format!("ranking model: {model} (hash {h})"),
@@ -337,6 +337,9 @@ impl<'a> Text<'a> {
             }
             Expr::Call { func, args } => format!("{}({})", func.name(), args.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
             Expr::Gbdt { model, args, .. } => format!("gbdt({})", std::iter::once(quote(model)).chain(args.iter().map(|x| self.expr(x, names))).collect::<Vec<_>>().join(", ")),
+            Expr::CrossEncoder { model, fields, query, .. } => {
+                format!("cross_encoder({})", std::iter::once(quote(model)).chain(fields.iter().map(|f| field(names, *f))).chain(std::iter::once(quote(query))).collect::<Vec<_>>().join(", "))
+            }
             Expr::Norm { kind, input } => {
                 let name = match kind {
                     NormKind::MinMax => "minmax",

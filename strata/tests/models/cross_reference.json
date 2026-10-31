@@ -1,0 +1,107 @@
+{
+ "max_tokens": 64,
+ "pairs": [
+  [
+   "graph neural networks",
+   "Graph neural networks learn representations of nodes from their neighbours."
+  ],
+  [
+   "graph neural networks",
+   "The capital of Chile is Santiago, in a valley between two mountain ranges."
+  ],
+  [
+   "what does a cross-encoder do",
+   "A cross-encoder reads the query and the passage together and scores them."
+  ],
+  [
+   "bm25 ranking",
+   "BM25 ranks documents by the frequency of query terms, saturated by length."
+  ],
+  [
+   "capital of chile",
+   "The capital of Chile is Santiago, in a valley between two mountain ranges."
+  ],
+  [
+   "capital of chile",
+   "The Atacama desert is one of the driest places on Earth."
+  ],
+  [
+   "how do vaccines work",
+   "Vaccines train the immune system to recognise a virus before an infection."
+  ],
+  [
+   "caffeine and the brain",
+   "Coffee contains caffeine, which blocks adenosine receptors in the brain."
+  ],
+  [
+   "inverted index",
+   "Inverted indexes map each term to the documents that contain it. BM25 ranks documents by the frequency of query terms, saturated by length."
+  ],
+  [
+   "rerank",
+   "Search engines rerank the top results of a cheap first stage with costly models."
+  ],
+  [
+   "",
+   "Transformers use attention to mix information across every token of a text."
+  ],
+  [
+   "glaciers",
+   ""
+  ],
+  [
+   "long passage about search and ranking",
+   "Graph neural networks learn representations of nodes from their neighbours. A cross-encoder reads the query and the passage together and scores them. BM25 ranks documents by the frequency of query terms, saturated by length. The capital of Chile is Santiago, in a valley between two mountain ranges. Vaccines train the immune system to recognise a virus before an infection. Coffee contains caffeine, which blocks adenosine receptors in the brain. Inverted indexes map each term to the documents that contain it. Transformers use attention to mix information across every token of a text. Glaciers in Patagonia have retreated quickly over the last century. A learning to rank model orders results by features such as text scores. Rust has no garbage collector; ownership decides when memory is freed. The Atacama desert is one of the driest places on Earth. Search engines rerank the top results of a cheap first stage with costly models. Protein folding predicts the shape of a protein from its amino acid sequence. Tokenizers split text into word pieces that a model has embeddings for. Ocean currents carry heat from the equator towards the poles."
+  ],
+  [
+   "Graph neural networks learn representations of nodes from their neighbours. A cross-encoder reads the query and the passage together and scores them. BM25 ranks documents by the frequency of query terms, saturated by length. The capital of Chile is Santiago, in a valley between two mountain ranges. Vaccines train the immune system to recognise a virus before an infection. Coffee contains caffeine, which blocks adenosine receptors in the brain.",
+   "a short text"
+  ],
+  [
+   "Graph neural networks learn representations of nodes from their neighbours. A cross-encoder reads the query and the passage together and scores them. BM25 ranks documents by the frequency of query terms, saturated by length. The capital of Chile is Santiago, in a valley between two mountain ranges. Vaccines train the immune system to recognise a virus before an infection.",
+   "Coffee contains caffeine, which blocks adenosine receptors in the brain. Inverted indexes map each term to the documents that contain it. Transformers use attention to mix information across every token of a text. Glaciers in Patagonia have retreated quickly over the last century. A learning to rank model orders results by features such as text scores. Rust has no garbage collector; ownership decides when memory is freed. The Atacama desert is one of the driest places on Earth. Search engines rerank the top results of a cheap first stage with costly models. Protein folding predicts the shape of a protein from its amino acid sequence. Tokenizers split text into word pieces that a model has embeddings for. Ocean currents carry heat from the equator towards the poles."
+  ],
+  [
+   "UNSEEN w\u00f6rds \u00fcnd \u00d1and\u00fa 42",
+   "\u00d1and\u00fa: a bird of Patagonia, 1,5 metres tall!"
+  ]
+ ],
+ "scores": {
+  "ce_bert": [
+   0.4036684036254883,
+   0.35182684659957886,
+   0.07330408692359924,
+   0.1990698277950287,
+   0.13847516477108002,
+   0.0811619907617569,
+   0.43731918931007385,
+   0.4042361080646515,
+   0.3075171113014221,
+   0.3123157322406769,
+   0.37680089473724365,
+   -0.560166597366333,
+   0.31066542863845825,
+   -0.02656031958758831,
+   0.24498607218265533,
+   0.29835405945777893
+  ],
+  "ce_xlmr": [
+   -0.4546864330768585,
+   -0.5768983960151672,
+   -0.5026071071624756,
+   -0.458177387714386,
+   -0.6340444684028625,
+   -0.5374086499214172,
+   -0.45027774572372437,
+   -0.4807877540588379,
+   -0.344154953956604,
+   -0.5204945206642151,
+   -0.4787483513355255,
+   -0.5855211615562439,
+   -0.404620885848999,
+   -0.38354191184043884,
+   -0.37438249588012695,
+   -0.5239609479904175
+  ]
+ }
+}

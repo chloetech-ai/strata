@@ -5,7 +5,7 @@
 
 use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan};
 use crate::error::Result;
-use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
+use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors, CROSS_ENCODER_FIRST};
 use crate::query::rank::Rank;
 use crate::query::sql::{self, Assign, Conflict, Write};
 use crate::schema::{FieldType, Schema};
@@ -181,6 +181,7 @@ impl<'a> Raise<'a> {
                                 // RANK_FEATURES), which scores each row by
                                 // itself.
                                 e => match self.rank(e, true).map(Score::fused_shapes) {
+                                    Ok(s) if s.has_cross_encoder() => return Err(err("a cross-encoder ranks in a rerank phase, not in a column: rank by it and select score()")),
                                     Ok(s) if Rank::is_global(&s) => {
                                         return Err(err(format!("a column of a Search scores each row by itself: minmax(), rank(), rrf() and weighted sums rank rows against each other, not {e:?}")))
                                     }
@@ -197,6 +198,9 @@ impl<'a> Raise<'a> {
                     Some(k) if k.expr == Expr::Hops => Some(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: k.desc }, desc: true, nulls_first: false }),
                     Some(k) => Some(OrderBy::Score { score: self.score(&k.expr)?, desc: k.desc, nulls_first: k.nulls_first }),
                 };
+                if matches!(&order, Some(OrderBy::Score { score, .. }) if score.has_cross_encoder()) {
+                    return Err(err(CROSS_ENCODER_FIRST));
+                }
                 let tiebreak = match &search.order[..] {
                     [] | [_] => None,
                     [_, k] if pk.is_some() && k.expr == Expr::Field(pk.unwrap() as u32) => Some(Tiebreak::Key { desc: k.desc }),
@@ -561,7 +565,7 @@ impl<'a> Raise<'a> {
                 return Err(err("a rerank phase after a global one is global"));
             }
             if !p.global && Rank::is_global(&score) {
-                return Err(err("a rerank phase with minmax(), rank(), rrf() or a weighted sum reads every row it reranks: it is global"));
+                return Err(err("a rerank phase with minmax(), rank(), rrf(), a weighted sum or a cross-encoder reads every row it reranks: it is global"));
             }
             after_global |= p.global;
             out.push(logical::Phase { score, count: usize::try_from(p.count).unwrap_or(usize::MAX), global: p.global });
@@ -612,6 +616,23 @@ impl<'a> Raise<'a> {
                     return Err(err(format!("ranking model {model} reads {} features, not {}", m.features, args.len())));
                 }
                 Score::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()?, open: open.clone() }
+            }
+            // Opened where it runs: a shard leaves it to its coordinator.
+            Expr::CrossEncoder { model, hash, fields, query, open } => {
+                if fields.is_empty() {
+                    return Err(err(format!("cross-encoder {model} reads the text of at least one field")));
+                }
+                let fields = fields
+                    .iter()
+                    .map(|&f| {
+                        let f = self.typed(f, |t| matches!(t, FieldType::Text { .. } | FieldType::Keyword), "cross_encoder", "TEXT or KEYWORD")?;
+                        match self.schema.fields[f].stored {
+                            true => Ok(f),
+                            false => Err(err(format!("cross_encoder reads a stored field's text, and {} is not stored", self.schema.fields[f].name))),
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+                Score::CrossEncoder { model: model.clone(), hash: hash.clone(), fields, query: query.clone(), open: open.clone() }
             }
             Expr::Case { operand: Some(_), .. } => return Err(err("CASE in a ranking expression takes WHEN conditions, not an operand")),
             Expr::Case { operand: None, whens, otherwise } => Score::Case {

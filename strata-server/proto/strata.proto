@@ -549,6 +549,8 @@ message Expr {
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
+    // A cross-encoder's score of a row's text; plan feature "rank_models".
+    CrossEncoder cross_encoder = 38;
     // AT_LEAST(need, conds...); plan feature "at_least".
     AtLeast at_least = 39;
     // The values a correlated subquery took, by the primary key of each
@@ -570,6 +572,16 @@ message Expr {
     // Numbered from 100, the range of the autocomplete work.
     Prefix prefix = 100;
   }
+}
+
+// cross_encoder('model', fields..., query): the model of that name in the
+// models directory, whose files have the hash `hash` (empty: not opened
+// yet), scoring the text of `fields` (joined by a space) for `query`.
+message CrossEncoder {
+  string model = 1;
+  string hash = 2;
+  repeated uint32 fields = 3;
+  string query = 4;
 }
 
 // Whether at least `need` of `conds` are TRUE.

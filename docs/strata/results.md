@@ -102,6 +102,29 @@ The engineering review's ranking fixes (query letters such as "d" and "t" kept, 
 
 Plain BM25 moves little except on ArguAna (+0.052), whose queries are whole arguments; every one of its 8,674 documents has text, so the gain comes from the query-side fixes (repeated words, kept letters), which this run does not separate. Typo tolerance gains on every collection, most on TREC-COVID (+0.414): before, a query word's rare typo neighbours scored with their own, higher IDF and could outrank the word itself.
 
+### Cross-encoder reranking
+
+BM25's top 100 ranked again by the cross-encoder `ms-marco-MiniLM-L-6-v2` in a second phase (`cross_encoder()`, ranking 7b), over every test query, with `strata-bm25-eval --variants plain,ce_rerank100`; p is the paired randomization test of nDCG@10 against BM25 over the queries (10,000 rounds). Results: `strata/results/text/bm25_ce_quality.json`; that run shared the cloud container with builds, so its query times are not latencies.
+
+| | SciFact | NFCorpus | ArguAna |
+|---|---|---|---|
+| nDCG@10, BM25 | 0.691 | 0.329 | 0.362 |
+| nDCG@10, reranked | 0.687 (p = 0.79) | 0.352 (p < 0.001) | 0.312 (p < 0.001) |
+| recall@10, BM25 | 0.827 | 0.156 | 0.758 |
+| recall@10, reranked | 0.803 | 0.162 | 0.666 |
+
+The model, trained on MS MARCO's web questions, helps on NFCorpus's medical questions, not on SciFact's scientific claims, and hurts on ArguAna, where each query is a whole argument and the document to find is its counterargument, a task unlike answering a question. The BEIR paper measured the same reranking at 0.311 on ArguAna. The relevance gate keeps a cheaper variant, BM25's top 20 reranked on SciFact and NFCorpus (`strata/tests/fixtures/relevance_gate_cross_encoder.json`).
+
+Latency, alone on the cloud container (Intel Xeon @ 2.30 GHz, 4 cores, Linux), the first 50 test queries of each collection (`bm25_ce_latency.json`), ms:
+
+| p50 / p99 | SciFact | NFCorpus | ArguAna |
+|---|---|---|---|
+| BM25 | 0.07 / 1.19 | 0.04 / 0.65 | 1.10 / 8.32 |
+| top 20 reranked | 997 / 1,320 | 872 / 1,151 | 1,000 / 1,645 |
+| top 100 reranked | 4,789 / 5,866 | 4,512 / 5,380 | 5,225 / 7,269 |
+
+About 50 ms a row on four cores. A server's `--max-rerank` defaults to 100 rows, about what fits its default 5 s deadline.
+
 ## Hybrid ranking
 
 ![Weighted hybrid ranking: nDCG@10 by BM25 weight on four collections, with RRF of the same two rankings as dashed lines](../assets/img/chart-strata-fusion.png)

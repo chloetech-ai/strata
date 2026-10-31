@@ -38,6 +38,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
+# candle's matrix products, here only to turn on their AVX-512 kernels,
+# which run where the CPU has AVX-512 (checked at run time).
+gemm = { version = "0.19", features = ["x86-v4"], optional = true }
 # Images decoded for SigLIP (`vision`).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
 # Audio decoded for Whisper (`audio`): WAV, FLAC, MP3, Ogg Vorbis, AAC in MP4.
@@ -46,7 +49,7 @@ symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm
 [features]
 default = ["embed"]
 embed = ["dep:tokenizers"]
-bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:gemm"]
 # Images: decoded with the `image` crate, embedded by SigLIP.
 vision = ["bert", "dep:image"]
 # Audio: decoded with symphonia, transcribed by Whisper.

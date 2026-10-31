@@ -53,6 +53,7 @@ __all__ = [
     "minmax",
     "rank",
     "gbdt",
+    "cross_encoder",
     "ln",
     "log",
     "exp",
@@ -834,6 +835,24 @@ def gbdt(model: str, *features: Any) -> Expr:
     return _Ranked("gbdt", parts, lambda ctx, a: {"gbdt": {"model": model, "args": a}}, f"gbdt({model!r}, {', '.join(map(repr, parts))})")
 
 
+def cross_encoder(model: str, fields: str | Sequence[str], query: str) -> Expr:
+    """A cross-encoder's score of how well a row's text answers `query`:
+    the model `<models>/<model>` (a BERT or XLM-RoBERTa sequence
+    classifier saved by Hugging Face, such as `ms-marco-MiniLM-L-6-v2`)
+    reads the query and the text of `fields` (stored TEXT or KEYWORD
+    fields, their values joined by a space) together. Milliseconds a row,
+    so it reranks the top rows of a cheaper ranking:
+    `.order_by(bm25(...)).rerank(cross_encoder(...), 100)`, a global
+    phase that runs once per query. A plan names the hash of the model's
+    files; `builtin:overlap` needs none (the share of the query's words a
+    text holds)."""
+    names = [fields] if isinstance(fields, str) else list(fields)
+    if not names:
+        raise StrataError("cross_encoder reads the text of at least one field")
+    build = lambda ctx: {"cross_encoder": {"model": model, "fields": [ctx.field(f)[0] for f in names], "query": str(query)}}
+    return _Fn(build, f"cross_encoder({model!r}, {', '.join(names)})")
+
+
 def ln(x: Any) -> Expr:
     """The natural logarithm; NULL for x <= 0."""
     return _call("ln", x)
@@ -1096,7 +1115,7 @@ class Query:
                 phases, after = [], False
                 for e, n in self._phases:
                     expr = e._ir(ctx)
-                    after = after or _reads_every_row(expr)
+                    after = after or _reads_every_row(expr) or _has_cross_encoder(expr)
                     phases.append({"count": n, "expr": expr, **({"global": True} if after else {})})
                 search["phases"] = phases
         else:
@@ -1180,7 +1199,7 @@ class Query:
             if isinstance(e, _Ranked) or (isinstance(e, _Fn) and e.inputs is not None):
                 for x in e.inputs:
                     leaves(x, out)
-            else:
+            elif not _has_cross_encoder(e._ir(ctx)):
                 out.append(e)
 
         items: list[Expr] = []
@@ -1189,7 +1208,7 @@ class Query:
         for e in ranks:
             b = _bare(e)
             inner = isinstance(b, _Ranked) or (isinstance(b, _Fn) and b.inputs is not None)
-            if inner and not _reads_every_row(b._ir(ctx)):
+            if inner and not _reads_every_row(b._ir(ctx)) and not _has_cross_encoder(b._ir(ctx)):
                 items.append(b)
         out, seen = [], set()
         for e in items:
@@ -1216,6 +1235,16 @@ def _reads_every_row(ir: Any) -> bool:
         return any(k in ("norm", "rrf", "weighted") or _reads_every_row(v) for k, v in ir.items())
     if isinstance(ir, list):
         return any(_reads_every_row(v) for v in ir)
+    return False
+
+
+def _has_cross_encoder(ir: Any) -> bool:
+    """Whether a ranking's plan holds a cross-encoder, which ranks in a
+    global phase and is no feature."""
+    if isinstance(ir, dict):
+        return any(k == "cross_encoder" or _has_cross_encoder(v) for k, v in ir.items())
+    if isinstance(ir, list):
+        return any(_has_cross_encoder(v) for v in ir)
     return False
 
 

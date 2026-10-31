@@ -100,7 +100,7 @@ async fn shards_rank_by_a_model_like_one_database() {
     let catalog = whole.catalog();
     let tables: Vec<&strata::Schema> = catalog.iter().map(|t| &**t).collect();
     let plan = compound::plan_read(&queries[0], &tables, &Params::new(), &|_, _| None).unwrap();
-    let opened = whole.open_ranking_models(Arc::new(plan.clone())).unwrap();
+    let opened = whole.open_ranking_models(Arc::new(plan.clone()), false).unwrap();
     let hash = strata::query::model::Gbdt::parse("m", &std::fs::read(lgb.join("m/gbdt.json")).unwrap()).unwrap().hash;
     assert!(opened.to_json_text().unwrap().contains(&format!(r#""hash":"{hash}""#)));
     assert!(opened.explain(&tables).contains(&format!("ranking model: m (hash {hash})")));

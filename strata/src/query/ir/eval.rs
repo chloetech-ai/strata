@@ -219,6 +219,7 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
         | Expr::Product(_)
         | Expr::Norm { .. }
         | Expr::Gbdt { .. }
+        | Expr::CrossEncoder { .. }
         | Expr::Ppr(_)
         | Expr::Ranked { .. }
         | Expr::Subquery(_) => return Err(err("full-text, graph and score expressions are answered by indexes in a Search, not row by row")),

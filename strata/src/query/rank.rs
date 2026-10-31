@@ -200,10 +200,11 @@ impl<'s> Rank<'s> {
     }
 
     /// Whether a rerank phase by `score` reads every row it reranks (a set
-    /// function, RRF or a weighted sum), so that it runs once over all of
-    /// them: a global phase ([`crate::query::logical::Phase::global`]).
+    /// function, RRF or a weighted sum), or scores with a cross-encoder, so
+    /// that it runs once over all of them: a global phase
+    /// ([`crate::query::logical::Phase::global`]).
     pub fn is_global(score: &Score) -> bool {
-        Rank::of(score, 0).is_some_and(|r| !r.is_row_local())
+        score.has_cross_encoder() || Rank::of(score, 0).is_some_and(|r| !r.is_row_local())
     }
 
     /// [`Rank::rerank`] of rows whose phase scores a shard computed:
@@ -826,6 +827,7 @@ fn leaf_name(s: &Score, schema: &Schema) -> String {
         Score::Ppr { .. } => "ppr()".into(),
         Score::Hops { .. } => "hops()".into(),
         Score::SeqNo => "seq_no()".into(),
+        Score::CrossEncoder { model, fields, .. } => format!("cross_encoder('{model}', {})", fields.iter().map(name).collect::<Vec<_>>().join(", ")),
         Score::Ranked { keys } => format!("ranked({} keys)", keys.len()),
         Score::Cond(p) => {
             fn fields(p: &Pred, out: &mut Vec<usize>) {
