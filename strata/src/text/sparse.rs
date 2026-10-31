@@ -66,7 +66,7 @@ pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn Field
         return Err(Error::Schema(format!("field {} is not SPARSE", field.name)));
     }
     let (format, loom_min_df) = super::builder::options(opts)?;
-    Ok(Box::new(SparseBuilder { field: field.name.clone(), n: 0, text: TextFieldBuilder::new(&field.name, false, format, loom_min_df) }))
+    Ok(Box::new(SparseBuilder { field: field.name.clone(), n: 0, text: TextFieldBuilder::new(&field.key(), false, format, loom_min_df) }))
 }
 
 struct SparseBuilder {

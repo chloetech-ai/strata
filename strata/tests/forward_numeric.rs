@@ -13,6 +13,11 @@ fn schema() -> Schema {
     Schema::new("t", vec![Field::new("i", FieldType::Int), Field::new("f", FieldType::Float)], None).unwrap()
 }
 
+/// The name of field `name`'s sections (by its id).
+fn key(name: &str) -> String {
+    schema().key_of(name).unwrap()
+}
+
 /// Column values of several shapes: negatives, nulls, duplicates, blocks
 /// of one value, keys spanning more than 32 bits within a block.
 fn int_values(rng: &mut StdRng, n: usize, shape: usize) -> Vec<Option<i64>> {
@@ -145,12 +150,12 @@ fn columns_and_ranges_match_naive() {
             for buckets in [64usize, 7, 0] {
                 let opts = BuildOptions::default().set("forward.range_buckets", buckets);
                 let seg = build(&schema(), &docs, &opts);
-                let ci = NumericColumn::open(&seg, "i").unwrap();
-                let cf = NumericColumn::open(&seg, "f").unwrap();
+                let ci = NumericColumn::open(&seg, &key("i")).unwrap();
+                let cf = NumericColumn::open(&seg, &key("f")).unwrap();
                 assert!(ci.is_view() && cf.is_view());
                 assert_eq!(ci.kind(), NumericKind::Int);
-                let ii = RangeIndex::open_if_present(&seg, "i").unwrap();
-                let fi = RangeIndex::open_if_present(&seg, "f").unwrap();
+                let ii = RangeIndex::open_if_present(&seg, &key("i")).unwrap();
+                let fi = RangeIndex::open_if_present(&seg, &key("f")).unwrap();
                 assert_eq!(ii.is_some(), buckets > 0);
                 for (d, v) in ints.iter().enumerate() {
                     assert_eq!(ci.get_i64(d as u32), *v);
@@ -184,19 +189,19 @@ fn float_encodings() {
     for (vals, kind) in cases {
         let docs: Vec<Document> = vals.iter().map(|v| vec![Value::Int(0), Value::Float(v.unwrap())]).collect();
         let seg = build(&schema(), &docs, &BuildOptions::default());
-        let col = NumericColumn::open(&seg, "f").unwrap();
+        let col = NumericColumn::open(&seg, &key("f")).unwrap();
         assert_eq!(col.kind(), kind);
-        check_column(&col, RangeIndex::open_if_present(&seg, "f").unwrap().as_ref(), &vals, &mut rng);
+        check_column(&col, RangeIndex::open_if_present(&seg, &key("f")).unwrap().as_ref(), &vals, &mut rng);
     }
     // Ratings pack in 9 bits per document (plus zone maps).
     let docs: Vec<Document> = (0..12_800).map(|_| vec![Value::Int(0), Value::Float(rng.gen_range(0..500) as f64 / 100.0)]).collect();
     let seg = build(&schema(), &docs, &BuildOptions::default());
-    let sizes = NumericColumn::open(&seg, "f").unwrap().byte_sizes();
+    let sizes = NumericColumn::open(&seg, &key("f")).unwrap().byte_sizes();
     assert_eq!(sizes[2], 12_800 * 9 / 8);
     // An integer stored in a FLOAT field reads back as a float.
     let docs = vec![vec![Value::Int(1), Value::Int(3)], vec![Value::Int(2), Value::Float(0.5)]];
     let seg = build(&schema(), &docs, &BuildOptions::default());
-    let col = NumericColumn::open(&seg, "f").unwrap();
+    let col = NumericColumn::open(&seg, &key("f")).unwrap();
     assert_eq!(col.get(0), Value::Float(3.0));
     assert_eq!(col.get_i64(1), Some(0));
 }
@@ -206,13 +211,13 @@ fn zone_maps_prune_sorted_columns() {
     let n = 100_000;
     let docs: Vec<Document> = (0..n).map(|d| vec![Value::Int(d as i64), Value::Float(0.0)]).collect();
     let seg = build(&schema(), &docs, &BuildOptions::default());
-    let col = NumericColumn::open(&seg, "i").unwrap();
+    let col = NumericColumn::open(&seg, &key("i")).unwrap();
     // A range inside one block decodes only that block; one aligned to
     // blocks decodes none.
     assert_eq!(col.blocks_to_decode(1000.0, 1010.0), 1);
     assert_eq!(col.blocks_to_decode(1280.0, 2559.0), 0);
     assert_eq!(col.scan_count(1280.0, 2559.0), 1280);
-    let idx = RangeIndex::open(&seg, "i").unwrap();
+    let idx = RangeIndex::open(&seg, &key("i")).unwrap();
     let p = idx.plan(0.0, 50_000.0).unwrap();
     assert_eq!(p.covered.len() + p.boundary.len(), 33);
     assert!(p.boundary.len() <= 1);

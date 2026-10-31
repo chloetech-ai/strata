@@ -13,6 +13,7 @@
 //! strata-server import --db my.strata --schema my.json rows.jsonl more.csv   # load files
 //! strata-server import --db shop.strata shop.sqlite    # a SQLite database's tables
 //! strata-server export --db shop.strata shop-copy.sqlite   # and back to SQLite
+//! strata-server upgrade my.strata                      # copy a database from before field ids into this version's format
 //! ```
 
 use std::path::PathBuf;
@@ -308,6 +309,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Copy a database written by a version of Strata from before field
+    /// ids, which no longer opens, into this version's format in its place;
+    /// the old one is kept as <db>.before-field-ids. The server must not
+    /// have it open.
+    Upgrade {
+        /// The database: a file, or a directory in the directory layout.
+        db: PathBuf,
+    },
     /// Download an embedding model from Hugging Face into the models directory.
     FetchModel {
         /// A known name (potion-retrieval-32M, potion-base-8M, bge-small-en-v1.5,
@@ -434,6 +443,14 @@ async fn main() {
         obs::sink().start();
     }
     match &a.command {
+        Some(Command::Upgrade { db }) => {
+            match strata::upgrade::upgrade(db) {
+                Ok(Some(u)) => println!("copied {} rows of {} tables of {} into this version's format; the old database is {}", u.rows, u.tables, db.display(), u.old.display()),
+                Ok(None) => println!("{} needs no upgrade", db.display()),
+                Err(e) => fail(&format!("upgrade {}: {e}", db.display())),
+            }
+            return;
+        }
         Some(Command::FetchModel { name, models }) => {
             let dir = models.clone().unwrap_or_else(strata::embed::models_dir);
             match server::fetch_model(name, &dir).await {

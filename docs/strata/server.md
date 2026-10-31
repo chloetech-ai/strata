@@ -76,6 +76,8 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 `strata-server import`, `strata-server fetch-model` and `strata-server promote` are subcommands: [loading rows](#loading-rows), [embedded vector fields](#embedded-vector-fields) and [promotion](#replication-a-primary-and-its-replicas).
 
+`strata-server upgrade PATH` copies a database written by a version of Strata from before field ids, which this one refuses to serve, into this version's format in its place, and keeps the old one as `PATH.before-field-ids` ([field ids](index.md#wal-memtable-and-snapshots)). Stop the server that has it open first. A database started with `--seq-no` is not copied: create a new one and fill it with `--copy-from`.
+
 ## Schemas
 
 A database starts with one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the query console's schema designer, or `strata.Database.create` in [Python](python.md)). [`CREATE TABLE`](query-language.md#tables) and `DROP TABLE` over `POST /v1/sql` add and drop more, and the server serves every table: SQL names its tables, write operations and imports name theirs (`"table"`, `?table=`; the first table when they name none), `GET /v1/tables` lists the schemas and `GET /v1/schema?table=` gives one. [`CREATE RANK PROFILE`](query-language.md#rank-profiles-a-ranking-kept-with-its-table) and `DROP RANK PROFILE` keep rankings with a table the same way; unlike tables, a primary takes them and ships them to its replicas as it ships writes, and answers once the copies its acks name hold them. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
@@ -208,7 +210,7 @@ On a Mac, build with `--features accelerate` instead of `bert`: the BERT models'
 strata-server --db products-v2.strata --schema v2.json --copy-from products.strata
 ```
 
-Rows are copied field by field by name; a vector field is copied when the old one has the same dimensions, sources and model, and embedded anew otherwise; fields the new schema drops are left out. `Db::load_from` does the same from Rust.
+Rows are copied field by field by name; a vector field is copied when the old one has the same dimensions, sources and model, and embedded anew otherwise; fields the new schema drops are left out. The old database may be one from before [field ids](index.md#wal-memtable-and-snapshots), which opens only to be copied. `Db::load_from` does the same from Rust.
 
 **Which fields to embed.** Embed the text that carries what people search for, usually title and description; keep brand, price, category and dates out of the vector and filter on them instead. Measured on four BEIR collections with titles (nDCG@10; Apple M2, 2026-10-27; [all tables, recall and times](https://github.com/rkonow/strata/tree/main/strata/results/embed-fields)):
 

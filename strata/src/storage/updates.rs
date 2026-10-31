@@ -19,12 +19,18 @@
 //!
 //! Encoding: `u32` entry count, then per entry `u16` field, `u32` docID, a
 //! tag (0 null, 1 integer, 2 float) and 8 bytes of value, little-endian,
-//! sorted by (field, docID).
+//! sorted by (field, docID). The field is its id
+//! ([`crate::schema::Field::id`], below [`SEQ`]); a database written
+//! before field ids wrote its position, which its schema reads as its id.
+//! In memory, entries are keyed by the field's position in the table's
+//! schema, which [`Updates::encode`] and [`Updates::decode`] translate;
+//! an entry of a field the schema no longer has is dropped when read.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::{corrupt, Result};
+use crate::schema::Schema;
 use crate::segment::DocId;
 use crate::value::{Document, Value};
 
@@ -204,12 +210,16 @@ impl Updates {
         Updates { layers: vec![Arc::new(map)] }
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        let entries: Vec<(usize, DocId, &Value)> = self.iter().collect();
+    /// The updates of a segment of a table of `schema`, as written beside
+    /// it: by field id.
+    pub fn encode(&self, schema: &Schema) -> Vec<u8> {
+        let id = |f: usize| if f == SEQ { SEQ as u16 } else { schema.id_of(f) as u16 };
+        let mut entries: Vec<(u16, DocId, &Value)> = self.iter().map(|(f, d, v)| (id(f), d, v)).collect();
+        entries.sort_by_key(|&(f, d, _)| (f, d));
         let mut out = Vec::with_capacity(4 + entries.len() * 15);
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for (f, d, v) in entries {
-            out.extend_from_slice(&(f as u16).to_le_bytes());
+            out.extend_from_slice(&f.to_le_bytes());
             out.extend_from_slice(&d.to_le_bytes());
             let (tag, bits) = match v {
                 Value::Int(x) => (1u8, *x as u64),
@@ -222,7 +232,8 @@ impl Updates {
         out
     }
 
-    pub fn decode(b: &[u8]) -> Result<Updates> {
+    /// Reads what [`Updates::encode`] wrote for `schema`'s table.
+    pub fn decode(b: &[u8], schema: &Schema) -> Result<Updates> {
         let bad = || corrupt("bad in-place updates");
         let n = u32::from_le_bytes(b.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
         if b.len() != 4 + n * 15 {
@@ -239,7 +250,14 @@ impl Updates {
                 2 => Value::Float(f64::from_bits(bits)),
                 _ => return Err(bad()),
             };
-            map.insert((f, d), v);
+            let f = match f as usize {
+                SEQ => SEQ,
+                _ => match schema.position_of(f as u32) {
+                    Some(i) => i,
+                    None => continue,
+                },
+            };
+            map.insert((f as u16, d), v);
         }
         Ok(Updates { layers: vec![Arc::new(map)] })
     }
@@ -248,6 +266,34 @@ impl Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{Field, FieldType};
+
+    /// A table with enough fields for the tests' positions.
+    fn schema() -> Schema {
+        Schema::new("t", (0..8).map(|i| Field::new(&format!("n{i}"), FieldType::Int)).collect(), None).unwrap()
+    }
+
+    #[test]
+    fn written_by_field_id() {
+        // Fields 1 and 2 have ids 7 and 4 (as after columns were dropped).
+        let mut ids = schema();
+        ids.fields.truncate(3);
+        ids.fields[1].id = 7;
+        ids.fields[2].id = 4;
+        ids.next_field_id = 8;
+        let mut a = Updates::default();
+        a.set(1, 5, Value::Int(10));
+        a.set(2, 5, Value::Int(20));
+        a.set(SEQ, 5, Value::Int(3));
+        let b = a.encode(&ids);
+        assert_eq!(u16::from_le_bytes(b[4..6].try_into().unwrap()), 4, "sorted by id");
+        assert_eq!(Updates::decode(&b, &ids).unwrap(), a);
+        // A field the schema no longer has is dropped.
+        let mut fewer = ids.clone();
+        fewer.fields.remove(1);
+        let back = Updates::decode(&b, &fewer).unwrap();
+        assert_eq!((back.get(1, 5), back.get(SEQ, 5), back.len()), (Some(&Value::Int(20)), Some(&Value::Int(3)), 2));
+    }
 
     #[test]
     fn round_trip_merge_and_slice() {
@@ -256,7 +302,7 @@ mod tests {
         assert!(a.set(1, 9, Value::Float(2.5)));
         assert!(!a.set(2, 7, Value::Int(4)));
         a.set(2, 300, Value::Null);
-        assert_eq!(Updates::decode(&a.encode()).unwrap(), a);
+        assert_eq!(Updates::decode(&a.encode(&schema()), &schema()).unwrap(), a);
         let mut b = Updates::default();
         b.set(2, 7, Value::Int(10));
         let m = Updates::merged(Some(&a), &b);
@@ -265,7 +311,7 @@ mod tests {
         let s = m.slice(256, 100);
         assert_eq!(s.get(2, 44), Some(&Value::Null));
         assert_eq!(s.len(), 1);
-        assert!(Updates::decode(&[1, 0, 0, 0, 9]).is_err());
+        assert!(Updates::decode(&[1, 0, 0, 0, 9], &schema()).is_err());
     }
 
     /// Sets with copies taken in between (as snapshots take them) against
@@ -311,7 +357,7 @@ mod tests {
                     let s = c.slice(from, len);
                     let want: Vec<_> = m.iter().filter(|((_, d), _)| (from..from + len).contains(d)).map(|(&(f, d), v)| (f as usize, d - from, v.clone())).collect();
                     assert!(s.iter().map(|(f, d, v)| (f, d, v.clone())).eq(want));
-                    assert_eq!(Updates::decode(&c.encode()).unwrap(), *c);
+                    assert_eq!(Updates::decode(&c.encode(&schema()), &schema()).unwrap(), *c);
                 }
             }
         }
@@ -325,7 +371,7 @@ mod tests {
         for d in 0..1000 {
             base.set(1, d, Value::Int(d as i64));
         }
-        let base = Updates::decode(&base.encode()).unwrap();
+        let base = Updates::decode(&base.encode(&schema()), &schema()).unwrap();
         let mut newer = Updates::default();
         newer.set(1, 5, Value::Int(-1));
         let m = Updates::merged(Some(&base), &newer);

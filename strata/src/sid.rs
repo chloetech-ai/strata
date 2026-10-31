@@ -526,16 +526,16 @@ impl Ties {
             if field.semantic_id.is_none() {
                 continue;
             }
-            if let Some(b) = seg.section(&gone_section(&field.name))? {
+            if let Some(b) = seg.section(&gone_section(&field.key()))? {
                 for (p, t) in decode_gone(&b)? {
                     let e = self.next.entry(f).or_default().entry(p).or_insert(0);
                     *e = (*e).max(t);
                 }
             }
-            if !seg.has(&format!("kw.{}.dict", field.name)) {
+            if !seg.has(&format!("kw.{}.dict", field.key())) {
                 continue;
             }
-            let col = crate::forward::KeywordColumn::open(seg, &field.name)?;
+            let col = crate::forward::KeywordColumn::open(seg, &field.key())?;
             let n = col.n_values() as u32;
             for c in 0..n {
                 // A full code is a value no other extends: in byte order a
@@ -564,7 +564,7 @@ pub fn gone_sections(schema: &Schema, dropped: &Ties, kept: &Ties) -> Vec<(Strin
         let Some(m) = dropped.next.get(&f) else { continue };
         let gone: HashMap<u32, u32> = m.iter().filter(|&(&p, &t)| kept.get(f, p) < t).map(|(&p, &t)| (p, t)).collect();
         if !gone.is_empty() {
-            out.push((gone_section(&field.name), encode_gone(&gone)));
+            out.push((gone_section(&field.key()), encode_gone(&gone)));
         }
     }
     out

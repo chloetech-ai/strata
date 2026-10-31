@@ -16,9 +16,12 @@
 //! segments at page-aligned file offsets, so a section mapped from disk can be
 //! viewed in place as `&[u64]` (see [`crate::postings::bytes`]).
 //!
-//! Section names are `component.field.part`, e.g. `text.body.dict`,
-//! `col.year`, `kw.category.post`, `vec.emb.ivf`, `graph.links`,
-//! `store.data`, `pk`.
+//! Section names are `component.field.part`, e.g. `text.f1.dict`,
+//! `col.f2`, `kw.f3.post`, `vec.f4.ivf`, `graph.f5`, `store.data`, `pk`,
+//! where the field is named by its key ([`crate::schema::Field::key`]: its
+//! id, or in a database written before field ids its name, as in
+//! `text.body.dict`). Section [`FIELDS`] lists the ids of the fields the
+//! segment was written with.
 
 pub mod build;
 pub mod filter;
@@ -39,6 +42,35 @@ use crate::value::Value;
 pub type DocId = u32;
 
 pub const MAGIC: &[u8; 8] = b"STRSEG01";
+
+/// The section that lists the ids of the fields a segment was written with
+/// ([`crate::schema::Field::id`]), in the order of its table's schema then,
+/// as little-endian `u32`s; a segment of a database written before field
+/// ids has none. A field added to its table later is one the segment does
+/// not hold, and one dropped since is one the table no longer has.
+pub const FIELDS: &str = "fields";
+
+/// A section's name with its field's key ([`crate::schema::Field::key`])
+/// replaced by the field's name, for people to read: `text.f1.dict` of a
+/// table whose field 1 is `body` reads `text.body.dict`. Other names are
+/// returned as they are.
+pub fn label(schema: &crate::schema::Schema, section: &str) -> String {
+    let mut parts: Vec<&str> = section.splitn(3, '.').collect();
+    let field = parts.get(1).and_then(|k| k.strip_prefix('f')).and_then(|id| id.parse::<u32>().ok()).filter(|_| !schema.is_legacy()).and_then(|id| schema.position_of(id));
+    match field {
+        Some(i) => {
+            parts[1] = &schema.fields[i].name;
+            parts.join(".")
+        }
+        None => section.to_string(),
+    }
+}
+
+/// [`FIELDS`] for a segment of a table of `schema`.
+pub fn encode_field_ids(schema: &crate::schema::Schema) -> Vec<u8> {
+    schema.fields.iter().flat_map(|f| f.id.to_le_bytes()).collect()
+}
+
 pub const PAGE: usize = 4096;
 
 /// Builds one field's index sections from its values, in docID order.
@@ -319,6 +351,16 @@ impl SegmentFile {
     }
 
     /// Section names with sizes in bytes, for size breakdowns.
+    /// The ids of the fields the segment was written with ([`FIELDS`]),
+    /// or `None` for a segment written before field ids.
+    pub fn field_ids(&self) -> Result<Option<Vec<u32>>> {
+        let Some(b) = self.section(FIELDS)? else { return Ok(None) };
+        if b.len() % 4 != 0 {
+            return Err(corrupt("bad fields section"));
+        }
+        Ok(Some(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()))
+    }
+
     pub fn section_sizes(&self) -> Vec<(String, usize)> {
         self.sections.iter().map(|(n, s)| (n.clone(), s.len)).collect()
     }

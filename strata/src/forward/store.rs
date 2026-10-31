@@ -9,9 +9,14 @@
 //! floats 8 bytes little-endian (a FLOAT field given an integer stores it
 //! as a float). Fetching a document decompresses one block.
 //!
-//! Sections: `store.index` (the stored fields and their types, then per
-//! block its first docID, its byte offset in `store.data` and its
-//! uncompressed size) and `store.data` (the compressed blocks).
+//! Sections: `store.index` (the stored fields, by id
+//! ([`crate::schema::Field::id`]), and their types, then per block its
+//! first docID, its byte offset in `store.data` and its uncompressed size)
+//! and `store.data` (the compressed blocks). A reader finds each field of
+//! its schema among the index's by id, so the columns a row holds need not
+//! be the schema's in its order, and a column whose field the schema no
+//! longer has is passed over. (A database written before field ids wrote
+//! positions there, which its schema reads as ids.)
 
 use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
@@ -37,7 +42,22 @@ enum Kind {
     Ints = 4,
 }
 
+/// The position of a doc store column whose field the schema does not
+/// have.
+const GONE: usize = usize::MAX;
+
 impl Kind {
+    fn from_u8(k: u8) -> Option<Kind> {
+        Some(match k {
+            0 => Kind::Str,
+            1 => Kind::Int,
+            2 => Kind::Float,
+            3 => Kind::Strs,
+            4 => Kind::Ints,
+            _ => return None,
+        })
+    }
+
     fn of(ty: &FieldType) -> Option<Kind> {
         match ty {
             FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges | FieldType::Sparse => Some(Kind::Str),
@@ -48,7 +68,7 @@ impl Kind {
     }
 }
 
-/// The stored, non-vector fields of `schema`: (field index, kind).
+/// The stored, non-vector fields of `schema`: (position, kind).
 fn stored_fields(schema: &Schema) -> Vec<(usize, Kind)> {
     schema
         .fields
@@ -137,6 +157,8 @@ pub(crate) fn build(schema: &Schema, docs: &[Document], opts: &BuildOptions, out
 pub struct StoreBuilder {
     target: usize,
     fields: Vec<(usize, Kind)>,
+    /// Each stored field's id, as `store.index` names it.
+    ids: Vec<u32>,
     blocks: Blocks,
     /// Documents added, and the first of the open block.
     n: usize,
@@ -145,9 +167,11 @@ pub struct StoreBuilder {
 
 impl StoreBuilder {
     pub fn new(schema: &Schema, opts: &BuildOptions) -> Result<Self> {
+        let fields = stored_fields(schema);
         Ok(StoreBuilder {
             target: super::usize_option(opts, "forward.store_block", DEFAULT_BLOCK)?,
-            fields: stored_fields(schema),
+            ids: fields.iter().map(|&(i, _)| schema.id_of(i)).collect(),
+            fields,
             blocks: Blocks { first: Vec::new(), offs: vec![0], raw_len: Vec::new(), data: Vec::new(), rows: Vec::new(), lens: Vec::new() },
             n: 0,
             block_start: 0,
@@ -175,7 +199,7 @@ impl StoreBuilder {
         let mut w = ByteWriter::new();
         w.u64(VERSION);
         w.u64(self.n as u64);
-        w.array(&self.fields.iter().map(|&(i, _)| i as u32).collect::<Vec<u32>>());
+        w.array(&self.ids);
         w.array(&self.fields.iter().map(|&(_, k)| k as u8).collect::<Vec<u8>>());
         w.array(&b.first);
         w.array(&b.offs);
@@ -219,6 +243,8 @@ impl Blocks {
 pub struct DocStore {
     n: usize,
     n_fields: usize,
+    /// Each column of a row: the schema position of its field
+    /// ([`GONE`] for a field the schema no longer has), and its kind.
     fields: Vec<(usize, Kind)>,
     first: Slice<u32>,
     offs: Slice<u64>,
@@ -227,8 +253,9 @@ pub struct DocStore {
 }
 
 impl DocStore {
-    /// Opens the doc store; `schema` must be the one the segment was built
-    /// with (its stored fields and their types are checked).
+    /// Opens the doc store, reading it as `schema` names its fields: each
+    /// stored field of `schema` must be a column of it, by id, of the
+    /// field's type.
     pub fn open(seg: &SegmentFile, schema: &Schema) -> Result<Self> {
         let mut r = ByteReader::new(seg.require("store.index")?);
         if r.u64().map_err(corrupt)? != VERSION {
@@ -241,9 +268,30 @@ impl DocStore {
         let offs: Slice<u64> = r.array().map_err(corrupt)?;
         let raw_len: Slice<u32> = r.array().map_err(corrupt)?;
         let data = seg.require("store.data")?;
-        let fields = stored_fields(schema);
-        if fields.len() != idx.len() || fields.iter().zip(idx.iter().zip(kinds.iter())).any(|(&(i, k), (&j, &kj))| i != j as usize || k as u8 != kj) {
-            return Err(Error::Schema("doc store fields do not match the schema".into()));
+        let mismatch = || Error::Schema("doc store fields do not match the schema".into());
+        if idx.len() != kinds.len() {
+            return Err(corrupt("bad doc store index"));
+        }
+        let mut fields = Vec::with_capacity(idx.len());
+        for (&id, &k) in idx.iter().zip(kinds.iter()) {
+            let kind = Kind::from_u8(k).ok_or_else(|| corrupt("bad doc store index"))?;
+            fields.push((schema.position_of(id).unwrap_or(GONE), kind));
+        }
+        let mut seen: Vec<usize> = fields.iter().map(|&(i, _)| i).filter(|&i| i != GONE).collect();
+        seen.sort_unstable();
+        if seen.windows(2).any(|w| w[0] == w[1]) {
+            return Err(corrupt("doc store index names a field twice"));
+        }
+        for (i, k) in stored_fields(schema) {
+            match fields.iter().find(|&&(j, _)| j == i) {
+                Some(&(_, kj)) if kj == k => {}
+                _ => return Err(mismatch()),
+            }
+        }
+        // A column of a field the schema no longer has is read past; one of
+        // a field it has but does not store does not fit it.
+        if fields.iter().any(|&(i, _)| i != GONE && !schema.fields[i].stored) {
+            return Err(mismatch());
         }
         if n != seg.n_docs()
             || first.len() != raw_len.len()
@@ -282,7 +330,7 @@ impl DocStore {
     /// If `d` is out of range or the block is corrupt.
     pub fn get(&self, d: DocId) -> Document {
         let mut doc = vec![Value::Null; self.n_fields];
-        let want: Vec<usize> = self.fields.iter().map(|&(i, _)| i).collect();
+        let want: Vec<usize> = self.fields.iter().map(|&(i, _)| i).filter(|&i| i != GONE).collect();
         for (i, v) in want.iter().zip(self.get_fields(d, &want)) {
             doc[*i] = v;
         }

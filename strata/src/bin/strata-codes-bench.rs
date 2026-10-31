@@ -101,7 +101,7 @@ fn main() {
             let t = Instant::now();
             let seg = SegmentFile::from_vec(build_segment(&schema, &values, &opts).unwrap()).unwrap();
             let build_s = t.elapsed().as_secs_f64();
-            let r = VectorReader::open(&seg, "emb").unwrap();
+            let r = VectorReader::open(&seg, &schema.key_of("emb").unwrap()).unwrap();
             let code_mb = r.code_bytes() as f64 / 1e6;
             let f32_mb = (a.n * r.info().stride_f32 * 4) as f64 / 1e6;
             for depth in a.rerank.split(',').map(|x| x.parse::<usize>().unwrap()) {

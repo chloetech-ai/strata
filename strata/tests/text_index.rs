@@ -171,10 +171,10 @@ fn builds_through_the_segment_builder() {
     for format in ["loom", "bp128"] {
         let opts = BuildOptions::default().set("text.postings", format).set("text.loom_min_df", 16);
         let seg = SegmentFile::from_vec(build_segment(&schema, &c.docs, &opts).unwrap()).unwrap();
-        let r = TextFieldReader::open(&seg, "body").unwrap();
+        let r = TextFieldReader::open(&seg, &schema.key_of("body").unwrap()).unwrap();
         assert_eq!(r.n_docs(), 300);
         assert_eq!(r.format(), PostingsFormat::parse(format).unwrap());
-        assert!(TextFieldReader::open(&seg, "title").is_err(), "stored-only fields are not indexed");
+        assert!(TextFieldReader::open(&seg, &schema.key_of("title").unwrap()).is_err(), "stored-only fields are not indexed");
         let s = r.sizes();
         assert!(s.docs > 0 && s.freqs > 0 && s.positions > 0 && s.dict > 0 && s.norms == 300);
     }

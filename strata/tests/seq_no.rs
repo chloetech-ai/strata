@@ -113,7 +113,7 @@ fn writes_are_numbered_once_started() {
         // Not numbered: written as before.
         assert_eq!(upsert(&db, &mut model, 1, 1), None);
         assert_eq!(db.storage().seq_no(), None);
-        assert_eq!((magic(&path).as_str(), on_disk(&path)), ("STRWAL01", 1));
+        assert_eq!((magic(&path).as_str(), on_disk(&path)), ("STRWAL01", 3));
         assert!(db.storage().begin_term(2).unwrap_err().to_string().contains("does not number its writes"));
 
         db.storage().start_seq_no().unwrap();
