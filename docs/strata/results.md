@@ -123,7 +123,7 @@ Latency, alone on the cloud container (Intel Xeon @ 2.30 GHz, 4 cores, Linux), t
 | top 20 reranked | 997 / 1,320 | 872 / 1,151 | 1,000 / 1,645 |
 | top 100 reranked | 4,789 / 5,866 | 4,512 / 5,380 | 5,225 / 7,269 |
 
-About 50 ms a row on four cores. A server's `--max-rerank` defaults to 100 rows, about what fits its default 5 s deadline.
+About 50 ms a row on four cores. A server's `--max-rerank` defaults to 20 rows, whose p99 is a third of its default 5 s deadline; the top 100's median is about the whole deadline.
 
 ## Hybrid ranking
 

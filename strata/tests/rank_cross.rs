@@ -258,6 +258,23 @@ mod models {
         }
     }
 
+    /// Queries that arrive together while a model is not open yet open it
+    /// once and share that copy (PERF-N3 of the review of 31 October: a
+    /// copy each, up to a gigabyte apiece).
+    #[test]
+    fn queries_arriving_together_open_a_model_once() {
+        let models = Arc::new(Models::default());
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let models = models.clone();
+                std::thread::spawn(move || models.cross_encoder(&models_dir(), "ce_xlmr").unwrap())
+            })
+            .collect();
+        let got: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(got.iter().all(|m| Arc::ptr_eq(m, &got[0])), "one copy of the model");
+        assert!(Arc::ptr_eq(&models.cross_encoder(&models_dir(), "ce_xlmr").unwrap(), &got[0]));
+    }
+
     /// A changed file of a model is a model of another hash: a plan made
     /// with the first is refused.
     #[test]
