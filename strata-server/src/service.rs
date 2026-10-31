@@ -1134,6 +1134,35 @@ impl Service {
         }
     }
 
+    /// The type and bytes of the file whose SHA-256 is `sha256`, found
+    /// through the first row of a MEDIA field that names it and read as
+    /// writes read files (the media store, or a place `--media-fetch`
+    /// lists), checked against the hash. Only files rows name can be
+    /// read. A coordinator refuses: its shards hold the files.
+    pub async fn media_file(self: &Arc<Self>, sha256: &str) -> Result<(String, Vec<u8>), ApiError> {
+        if !strata::media::is_sha256(sha256) {
+            return Err(ApiError::bad("a file is named by the SHA-256 of its bytes: 64 lowercase hex digits"));
+        }
+        let Backend::Local(db) = &self.backend else {
+            return Err(ApiError::bad("a coordinator holds no files: ask the shard server whose rows name it"));
+        };
+        let catalog = self.catalog();
+        for schema in catalog.iter() {
+            for f in schema.fields.iter().filter(|f| f.media.is_some()) {
+                let sql = format!("SELECT {} FROM {} WHERE {} = :h LIMIT 1", quoted(&f.name), ident(&schema.table), quoted(&f.name));
+                let params = Params::new().set("h", Value::Str(sha256.into()));
+                let a = self.query(QueryReq { sql, params, ..Default::default() }).await?;
+                let Some(Value::Str(text)) = a.rs.rows.into_iter().next().and_then(|r| r.into_iter().next()) else { continue };
+                let m = strata::media::Media::parse(&text).map_err(ApiError::internal)?;
+                let resolver = db.media_resolver();
+                let mime = m.mime.clone();
+                let bytes = tokio::task::spawn_blocking(move || resolver.bytes_of(&m)).await.map_err(ApiError::internal)??;
+                return Ok((mime, bytes));
+            }
+        }
+        Err(ApiError { status: 404, message: format!("no row names a file of sha256 {sha256}") })
+    }
+
     /// Runs a query, or its plan when it has one. A coordinator plans a
     /// query by a rank profile with the profile its shards held when it
     /// last asked; when a shard refuses the plan because its profile has

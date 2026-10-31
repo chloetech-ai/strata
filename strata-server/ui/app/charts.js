@@ -356,3 +356,97 @@ export function gauge(v, { size = 120, warn = 0.75, bad = 0.9, label } = {}) {
     s("text", { x: cx, y: cy - 4, "text-anchor": "middle", style: { fill: "var(--text)", fontSize: "18px", fontWeight: 650 } }, v == null ? "–" : fmt.pct(x, 0)),
     label ? s("text", { x: cx, y: cy + 12, "text-anchor": "middle", style: { fill: "var(--muted)", fontSize: "10.5px" } }, label) : null);
 }
+
+/**
+ * A line chart over a numeric x (positions, days, characters typed).
+ * opts: {height, series: [{name, color, points: [[x, y, extra]], dash, area}],
+ * xfmt(x), yfmt(y), xticks: [x] (default: nice steps), min, max,
+ * marks: [{x, label}] (dashed vertical lines), tipTitle(x), tipExtra(x)}.
+ * Hovering reads every series at the nearest x. update(series) redraws.
+ */
+export function xyChart(opts) {
+  const height = opts.height || 200;
+  const yfmt = opts.yfmt || fmt.si, xfmt = opts.xfmt || ((x) => fmt.si(x));
+  const hidden = new Set();
+  let series = opts.series || [];
+  const root = h("div", { class: "chart" });
+  const legend = h("div", { class: "legend" });
+  const svgEl = s("svg", { height, role: "img", "aria-label": opts.label || "chart" });
+  root.append(legend, svgEl);
+  const M = { l: 46, r: 16, t: 10, b: 22, ...(opts.margin || {}) };
+  let width = 0;
+  function drawLegend() {
+    legend.style.display = series.length > 1 ? "" : "none";
+    clear(legend, series.map((sr, i) => {
+      const b = h("button", { type: "button", class: hidden.has(i) ? "off" : "", "aria-pressed": String(!hidden.has(i)), title: "Show or hide" },
+        h("span", { class: "k", style: { background: sr.color || SERIES[i] } }), sr.name);
+      b.onclick = () => { if (hidden.has(i)) hidden.delete(i); else hidden.add(i); drawLegend(); draw(); };
+      return b;
+    }));
+  }
+  function draw() {
+    width = svgEl.clientWidth || root.clientWidth || 600;
+    svgEl.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svgEl.replaceChildren();
+    const W = width - M.l - M.r, H = height - M.t - M.b;
+    const shown = series.map((sr, i) => ({ ...sr, i, color: sr.color || SERIES[i] })).filter((sr) => !hidden.has(sr.i));
+    const xs = [...new Set(shown.flatMap((sr) => sr.points.map((p) => p[0])))].sort((a, b) => a - b);
+    if (!xs.length) { svgEl.append(s("text", { x: M.l + W / 2, y: M.t + H / 2, "text-anchor": "middle", class: "axis" }, opts.emptyText || "nothing to draw")); return; }
+    const x0 = opts.xmin ?? xs[0], x1 = opts.xmax ?? xs[xs.length - 1];
+    const X = (x) => M.l + (x1 === x0 ? W / 2 : (x - x0) / (x1 - x0) * W);
+    let ymax = opts.max ?? 0, ymin = opts.min ?? 0;
+    for (const sr of shown) for (const p of sr.points) { if (p[1] != null && p[1] > ymax && opts.max == null) ymax = p[1]; if (p[1] != null && p[1] < ymin && opts.min == null) ymin = p[1]; }
+    if (!(ymax > ymin)) ymax = ymin + 1;
+    const step = niceStep(ymax - ymin, 4);
+    if (opts.max == null) ymax = Math.ceil(ymax / step) * step;
+    const Y = (v) => M.t + H - (v - ymin) / (ymax - ymin) * H;
+    const g = s("g", { class: "grid" }), ax = s("g", { class: "axis" });
+    for (let v = Math.ceil(ymin / step) * step; v <= ymax + 1e-9; v += step) {
+      g.append(s("line", { x1: M.l, x2: width - M.r, y1: Y(v), y2: Y(v) }));
+      ax.append(s("text", { x: M.l - 6, y: Y(v) + 3.5, "text-anchor": "end" }, yfmt(v)));
+    }
+    const want = Math.max(2, Math.floor(W / 70));
+    const ticks = opts.xticks || (xs.length <= want ? xs : (() => { const st = niceStep(x1 - x0, want); const out = []; for (let x = Math.ceil(x0 / st) * st; x <= x1 + 1e-9; x += st) out.push(x); return out; })());
+    for (const x of ticks) ax.append(s("text", { x: X(x), y: height - 6, "text-anchor": "middle" }, xfmt(x)));
+    svgEl.append(g, ax, s("line", { class: "base", x1: M.l, x2: width - M.r, y1: Y(Math.max(ymin, 0)), y2: Y(Math.max(ymin, 0)) }));
+    for (const m of opts.marks || []) {
+      const x = X(m.x);
+      svgEl.append(s("line", { class: "ann", x1: x, x2: x, y1: M.t, y2: M.t + H }), s("text", { class: "axis", x: x + 4, y: M.t + 10 }, m.label));
+    }
+    for (const sr of shown) {
+      const pts = sr.points.map((p) => [X(p[0]), p[1] == null ? null : Y(p[1])]);
+      if (sr.area) {
+        const run = pts.filter((p) => p[1] != null);
+        if (run.length > 1) svgEl.append(s("path", { class: "area", d: "M" + run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join("L") + `L${run[run.length - 1][0].toFixed(1)},${Y(Math.max(ymin, 0))}L${run[0][0].toFixed(1)},${Y(Math.max(ymin, 0))}Z`, style: { fill: sr.color } }));
+      }
+      svgEl.append(s("path", { class: "line", d: linePath(pts), style: { stroke: sr.color, strokeDasharray: sr.dash || null } }));
+      if (sr.points.length <= 40) for (const [x, y] of pts) if (y != null) svgEl.append(s("circle", { cx: x, cy: y, r: 3, style: { fill: sr.color, stroke: "var(--surface)", strokeWidth: 1.5 } }));
+    }
+    const xh = s("line", { class: "xhair", y1: M.t, y2: M.t + H, style: { display: "none" } });
+    const dots = s("g");
+    const over = s("rect", { x: M.l, y: M.t, width: W, height: H, fill: "transparent" });
+    svgEl.append(xh, dots, over);
+    over.addEventListener("pointermove", (e) => {
+      const r = svgEl.getBoundingClientRect();
+      const cx = (e.clientX - r.left) * (width / r.width);
+      let best = xs[0];
+      for (const x of xs) if (Math.abs(X(x) - cx) < Math.abs(X(best) - cx)) best = x;
+      xh.setAttribute("x1", X(best)); xh.setAttribute("x2", X(best)); xh.style.display = "";
+      dots.replaceChildren();
+      const rows = [];
+      for (const sr of shown) {
+        const p = sr.points.find((q) => q[0] === best);
+        if (p && p[1] != null) dots.append(s("circle", { class: "dot-hl", cx: X(best), cy: Y(p[1]), r: 4.5, style: { fill: sr.color } }));
+        rows.push(h("div", { class: "r" }, h("span", { class: "k", style: { background: sr.color } }), h("b", {}, p && p[1] != null ? yfmt(p[1]) : "–"), h("span", { class: "n" }, sr.name + (p && p[2] != null ? ` · ${p[2]}` : ""))));
+      }
+      showTip(e.clientX, e.clientY, [h("div", { class: "t" }, opts.tipTitle ? opts.tipTitle(best) : xfmt(best)), ...rows, ...(opts.tipExtra ? [opts.tipExtra(best)] : [])]);
+    });
+    over.addEventListener("pointerleave", () => { xh.style.display = "none"; dots.replaceChildren(); hideTip(); });
+  }
+  drawLegend();
+  const ro = new ResizeObserver(() => { if (root.isConnected && Math.abs((svgEl.clientWidth || 0) - width) > 2) draw(); });
+  ro.observe(root);
+  root.update = (sr) => { series = sr || []; drawLegend(); draw(); };
+  setTimeout(draw, 0);
+  return root;
+}

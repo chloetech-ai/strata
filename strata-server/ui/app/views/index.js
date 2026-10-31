@@ -13,7 +13,12 @@ import builder from "./builder.js";
 import schema from "./schema.js";
 import importer from "./import.js";
 import relevance from "./relevance.js";
+import recsys from "./recsys.js";
+import sid from "./sid.js";
+import autocomplete from "./autocomplete.js";
+import media from "./media.js";
+import graph from "./graph.js";
 import classic from "./classic.js";
 
-export const GROUPS = ["Monitor", "Workload", "Data", "Tune", "Admin", "More"];
-export const VIEWS = [overview, topology, performance, alerts, queries, logs, sql, builder, schema, importer, relevance, access, system, classic];
+export const GROUPS = ["Monitor", "Workload", "Data", "Tune", "Explore", "Admin", "More"];
+export const VIEWS = [overview, topology, performance, alerts, queries, logs, sql, builder, schema, importer, relevance, recsys, sid, autocomplete, media, graph, access, system, classic];
