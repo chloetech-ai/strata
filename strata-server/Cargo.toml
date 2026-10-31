@@ -29,6 +29,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 libc = "0.2"
 # The slot hash (`slots`): xxh3, 64 bits.
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"] }
+# The stacks of sampled allocations (`heap`).
+backtrace = "0.3"
 # SQLite files sent to `/v1/import` and written for `/v1/export`.
 tempfile = "3"
 # API keys are kept as the SHA-256 of their secrets (`keys`).

@@ -16,7 +16,9 @@
 //! its own clock. Reading the clock costs about 25 ns, so every query
 //! records its steps. The CPU time of a step's thread ([`thread_cpu_us`])
 //! costs a system call, about 0.3 µs, and is read only for a query run
-//! with [`ExecOptions::profile`](crate::query::exec::ExecOptions::profile).
+//! with [`ExecOptions::profile`](crate::query::exec::ExecOptions::profile),
+//! as are the bytes a step allocated, when the process counts each
+//! thread's allocations ([`count_allocations`]).
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -45,6 +47,14 @@ pub struct Step {
     /// microseconds; measured with `ExecOptions::profile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_us: Option<f64>,
+    /// Bytes allocated in it, and how many allocations, on every thread
+    /// that worked for it; measured with `ExecOptions::profile` in a
+    /// process that counts them ([`count_allocations`]). Bytes allocated,
+    /// not kept: what it freed is not taken off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alloc_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocs: Option<u64>,
     /// The rows (documents, candidates, groups) it ended with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
@@ -107,36 +117,65 @@ pub fn thread_cpu_us() -> Option<f64> {
     }
 }
 
+static ALLOCATED: OnceLock<fn() -> (u64, u64)> = OnceLock::new();
+
+/// Has steps measured with CPU time carry the bytes they allocated too:
+/// `f` answers the bytes the calling thread has allocated so far, and how
+/// many allocations, as a counting allocator keeps them. Set once per
+/// process; later calls do nothing.
+pub fn count_allocations(f: fn() -> (u64, u64)) {
+    let _ = ALLOCATED.set(f);
+}
+
+/// The bytes the calling thread has allocated so far, and how many
+/// allocations; `None` unless the process counts them.
+pub fn thread_allocated() -> Option<(u64, u64)> {
+    ALLOCATED.get().map(|f| f())
+}
+
 /// Where a step began: the steps recorded so far, the time, and with CPU
-/// time measured, this thread's CPU time and what helper threads had spent
-/// on the query by then ([`Clock::helped`]).
+/// time measured, this thread's CPU time and allocations and what helper
+/// threads had spent and allocated for the query by then
+/// ([`Clock::helped`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Mark {
     pub at: usize,
     pub t0: Instant,
     pub cpu0: Option<(f64, f64)>,
+    pub alloc0: Option<((u64, u64), (u64, u64))>,
 }
 
 /// What a query's steps are timed with: whether CPU time is measured, and
-/// the CPU time helper threads spent on the query so far, which a step on
-/// the query's thread counts as its own when it spans their work.
+/// the CPU time helper threads spent on the query so far and what they
+/// allocated, which a step on the query's thread counts as its own when it
+/// spans their work.
 #[derive(Debug, Default)]
 pub struct Clock {
     pub cpu: bool,
     pub helped: f64,
+    pub helped_alloc: (u64, u64),
 }
 
 impl Clock {
     pub fn new(cpu: bool) -> Clock {
         // Fixed before any step's time is read, so none comes before it.
         epoch();
-        Clock { cpu, helped: 0.0 }
+        Clock { cpu, ..Clock::default() }
     }
 
     /// A step begins, `steps` being the steps recorded so far.
     pub fn mark(&self, steps: &[Step]) -> Mark {
         let cpu0 = if self.cpu { thread_cpu_us().map(|c| (c, self.helped)) } else { None };
-        Mark { at: steps.len(), t0: Instant::now(), cpu0 }
+        let alloc0 = if self.cpu { thread_allocated().map(|a| (a, self.helped_alloc)) } else { None };
+        Mark { at: steps.len(), t0: Instant::now(), cpu0, alloc0 }
+    }
+
+    /// What helper threads did for the query in a step of theirs: it
+    /// counts in the steps around it.
+    pub fn helped_by(&mut self, s: &Step) {
+        self.helped += s.cpu_us.unwrap_or(0.0);
+        self.helped_alloc.0 += s.alloc_bytes.unwrap_or(0);
+        self.helped_alloc.1 += s.allocs.unwrap_or(0);
     }
 
     /// The step that began at `m` ends: it goes before the steps recorded
@@ -147,7 +186,14 @@ impl Clock {
             Some((c0, h0)) => thread_cpu_us().map(|c| tenth((c - c0).max(0.0) + (self.helped - h0).max(0.0))),
             None => None,
         };
-        let step = Step { op: op.to_string(), detail, start_us: us_at(m.t0), us: tenth(m.t0.elapsed().as_nanos() as f64 / 1e3), cpu_us, rows, ..Step::default() };
+        let (alloc_bytes, allocs) = match (m.alloc0, thread_allocated()) {
+            (Some(((b0, n0), (hb0, hn0))), Some((b, n))) => {
+                let (hb, hn) = self.helped_alloc;
+                (Some(b.saturating_sub(b0) + hb.saturating_sub(hb0)), Some(n.saturating_sub(n0) + hn.saturating_sub(hn0)))
+            }
+            _ => (None, None),
+        };
+        let step = Step { op: op.to_string(), detail, start_us: us_at(m.t0), us: tenth(m.t0.elapsed().as_nanos() as f64 / 1e3), cpu_us, alloc_bytes, allocs, rows, ..Step::default() };
         wrap(steps, m.at, step).then_some(m.at.min(steps.len().saturating_sub(1)))
     }
 }

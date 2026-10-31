@@ -86,7 +86,7 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     assert_eq!(status, 403, "{j}");
     assert!(j["error"].as_str().unwrap().contains("write scope"), "{j}");
     assert_eq!(call(&base, "POST", "/v1/write", r, Some(json!({"ops": []}))).await.0, 403);
-    for (m, path) in [("POST", "/v1/admin/vacuum"), ("GET", "/v1/queries"), ("GET", "/v1/logs"), ("GET", "/v1/admin/keys"), ("GET", "/v1/export"), ("GET", "/v1/profile/settings"), ("POST", "/v1/profile/cpu")] {
+    for (m, path) in [("POST", "/v1/admin/vacuum"), ("GET", "/v1/queries"), ("GET", "/v1/logs"), ("GET", "/v1/admin/keys"), ("GET", "/v1/export"), ("GET", "/v1/profile/settings"), ("POST", "/v1/profile/cpu"), ("GET", "/v1/profile/memory"), ("POST", "/v1/profile/heap"), ("GET", "/v1/profile/threads")] {
         assert_eq!(call(&base, m, path, r, None).await.0, 403, "{path}");
     }
     // write: rows, not tables.
@@ -94,6 +94,7 @@ async fn keys_have_scopes_and_the_audit_log_keeps_what_they_did() {
     assert_eq!(call(&base, "POST", "/v1/sql", w, Some(create.clone())).await.0, 403);
     assert_eq!(call(&base, "POST", "/v1/admin/keys", w, Some(json!({"name": "x", "scope": "admin"}))).await.0, 403);
     assert_eq!(call(&base, "POST", "/v1/profile/cpu", w, Some(json!({"seconds": 0.1}))).await.0, 403);
+    assert_eq!(call(&base, "POST", "/v1/profile/heap", w, Some(json!({"seconds": 0.1}))).await.0, 403);
     // The token may do it all; a table's statement is audited.
     assert_eq!(call(&base, "POST", "/v1/sql", root, Some(create)).await.0, 200);
 
