@@ -153,10 +153,14 @@ struct Args {
     /// The private key of --tls-cert (PEM).
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
-    /// With --shards or --replicas: the token the shards or replicas
-    /// require (default: --token).
-    #[arg(long, env = "STRATA_SHARD_TOKEN", hide_env_values = true)]
-    shard_token: Option<String>,
+    /// The token the servers of a cluster send each other: a coordinator
+    /// its shards, a primary its replicas. Give every server of the
+    /// cluster the same one. With it, only it may make the calls between
+    /// servers (replication, slots, keys), and --token is an admin's
+    /// credential that may not; clients get API keys. Without it, --token
+    /// plays both parts.
+    #[arg(long, env = "STRATA_CLUSTER_TOKEN", hide_env_values = true)]
+    cluster_token: Option<String>,
     /// With --shards or --replicas: a CA certificate (PEM) for https://
     /// shards or replicas, besides the public roots.
     #[arg(long)]
@@ -252,9 +256,10 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     slow_ms: u64,
     /// The API keys' file (default: DB.keys.json beside --db; a
-    /// coordinator keeps its keys in memory without it). Keys have scopes
-    /// (read, write, admin) and are made in the UI or with POST
-    /// /v1/admin/keys; --token stays the root credential.
+    /// coordinator keeps its keys in memory without it, and takes them
+    /// from its shards when it starts). Keys have scopes (read, write,
+    /// admin), are made in the UI or with POST /v1/admin/keys, and are
+    /// passed on to the cluster's other servers.
     #[arg(long)]
     keys: Option<PathBuf>,
     /// Append the requests that need the admin scope, and refused ones, to
@@ -475,6 +480,10 @@ async fn main() {
         auth::server_config(t).unwrap_or_else(|e| fail(&e));
     }
     let token = a.token.clone().filter(|t| !t.is_empty()).map(Secret::new);
+    let cluster = a.cluster_token.clone().filter(|t| !t.is_empty()).map(Secret::new);
+    if cluster.is_some() && cluster == token {
+        tracing::warn!("--cluster-token is --token: whoever holds the token can make the calls between servers. Give the cluster a token of its own");
+    }
     let write_acks = strata_server::replication::Acks::parse(&a.write_acks).unwrap_or_else(|| fail(&format!("--write-acks is all, majority or primary, not {:?}", a.write_acks)));
     if a.replica && a.grpc == "off" {
         fail("a replica takes its primary's writes over gRPC: --replica needs --grpc");
@@ -500,7 +509,7 @@ async fn main() {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
             shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),
             partial: a.partial,
-            token: a.shard_token.clone().filter(|t| !t.is_empty()).map(Secret::new).or_else(|| token.clone()),
+            token: cluster.clone().or_else(|| token.clone()),
             ca: a.shard_ca.as_ref().map(read),
             slots: a.slot_map.as_ref().map(|p| {
                 let j: serde_json::Value = serde_json::from_slice(&read(p)).unwrap_or_else(|e| fail(&format!("{}: {e}", p.display())));
@@ -553,13 +562,13 @@ async fn main() {
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
-    if token.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
+    if token.is_none() && cluster.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
         tracing::warn!("this server has no token and no admin key that never expires: once its admin keys expire, only starting it with --token manages it. Make an admin key without expires_days");
     }
     let bind = |addr: &str| {
         let addr = addr.to_string();
         // API keys close a server as a token does.
-        let open = token.is_none() && svc.keys.is_empty() && !a.no_token;
+        let open = token.is_none() && cluster.is_none() && svc.keys.is_empty() && !a.no_token;
         async move {
             let l = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
             let ip = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}"))).ip();
@@ -570,7 +579,7 @@ async fn main() {
         }
     };
     let (http, ip) = bind(&a.listen).await;
-    let access = Access { token: token.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
+    let access = Access { token: token.clone(), cluster: cluster.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls };
     let h = svc.health().await;
     tracing::info!(table = %svc.schema.table, rows = %h["docs"], segments = %h["segments"], version = env!("CARGO_PKG_VERSION"), simd = %strata::simd::describe(), "serving");
     let scheme = if access.tls.is_some() { "https" } else { "http" };

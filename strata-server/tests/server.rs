@@ -645,6 +645,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
+    }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
@@ -713,6 +716,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
     }
     type WriteStreamStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::WriteResponse, tonic::Status>> + Send>>;
     async fn write_stream(&self, _: tonic::Request<tonic::Streaming<pb::WriteRequest>>) -> Result<tonic::Response<Self::WriteStreamStream>, tonic::Status> {
@@ -998,6 +1004,9 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
     }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;

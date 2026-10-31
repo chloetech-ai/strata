@@ -29,6 +29,7 @@ pub mod http;
 pub mod idem;
 pub mod json;
 pub mod keys;
+pub mod keysync;
 pub mod logstore;
 pub mod media;
 pub mod metrics;
