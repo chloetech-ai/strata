@@ -404,6 +404,9 @@ message HelloResponse {
   // On a primary that a primary of a newer term replaced: that term. It
   // takes no writes and serves no reads.
   uint64 replaced_by_term = 10;
+  // Protocol 9: the term of its last transaction (`term` is the newest it
+  // began or follows, which may have none yet).
+  uint64 last_term = 11;
 }
 
 enum Role {
@@ -750,8 +753,9 @@ message Expr {
     Node scalar = 34;
     // A row's sequence number (seq_no()); plan feature "seq_no".
     Empty seq_no = 35;
-    // minmax(x) or rank(x) over the rows a Search ranks; plan feature
-    // "rank_expressions".
+    // minmax(x), rank(x), tmm(x) or zscore(x) over the rows a Search
+    // ranks; plan feature "rank_expressions" (and "score_norms" for tmm
+    // and zscore).
     Norm norm = 36;
     // A ranking model's score of a row; plan feature "rank_models".
     Gbdt gbdt = 37;
@@ -821,6 +825,9 @@ message Encode {
 message Norm {
   NormKind kind = 1;
   Expr input = 2;
+  // tmm's least value of input; absent, the input's own (0 for bm25, -1
+  // for similarity).
+  optional double lo = 3;
 }
 
 message Ranked {
@@ -840,6 +847,10 @@ message KeyValue {
 enum NormKind {
   NORM_KIND_MIN_MAX = 0;
   NORM_KIND_RANK = 1;
+  // (x - lo) / (max - lo), max over the candidates: theoretical min-max.
+  NORM_KIND_TMM = 2;
+  // (x - mean) / sd over the candidates.
+  NORM_KIND_Z_SCORE = 3;
 }
 
 // The best similarity of a VECTOR field with any of `vectors` (a list

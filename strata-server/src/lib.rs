@@ -34,6 +34,7 @@ pub mod logstore;
 pub mod media;
 pub mod metrics;
 pub mod obs;
+pub mod operator;
 pub mod plan_pb;
 pub mod profiler;
 pub mod profiling;
@@ -79,6 +80,8 @@ impl From<strata::Error> for ApiError {
             // As Elasticsearch's circuit breakers.
             strata::Error::Memory(_) => 429,
             strata::Error::Timeout(_) => 504,
+            // A hosted embedding model that refused or did not answer.
+            strata::Error::Unavailable(_) => 503,
             strata::Error::Io(_) | strata::Error::Corrupt(_) => 500,
         };
         ApiError { status, message: e.to_string() }

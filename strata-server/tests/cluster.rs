@@ -299,6 +299,22 @@ async fn replicas_join_and_leave_a_shard() {
     assert_eq!(ids(&svc_a).await.len(), N - 1);
     let health = shards[0].health().await;
     assert_eq!(health["replication"]["replicas"].as_array().unwrap().len(), 1, "{health}");
+
+    // A replica that joined a shard holding no transaction (its rows came
+    // in the copy) is handed the primary: no copy holds a transaction it
+    // lacks.
+    let r2db = create(d, "r2.strata", |_| false);
+    let (r2, u_r2) = serve(r2db.clone(), d, "r2.strata").await;
+    a.add_replica(1, &u_r2, false).await.unwrap();
+    until("the new replica serves reads", || async {
+        r2.query(QueryReq { sql: "SELECT id FROM products LIMIT 10000".into(), ..Default::default() }).await.is_ok()
+    })
+    .await;
+    let j = a.promote(1, &u_r2, false).await.unwrap();
+    assert_eq!((&j["primary"], &j["seq_no"]), (&serde_json::json!(u_r2.clone()), &serde_json::json!(0)), "{j}");
+    assert_eq!((r2.role(), shards[1].role()), (pb::Role::Primary, pb::Role::Replica));
+    sql(&svc_a, &format!("DELETE FROM products WHERE id = '{}'", all.iter().find(|id| !mine.contains(id)).unwrap())).await.unwrap();
+    assert_eq!(ids(&svc_a).await.len(), N - 2);
 }
 
 /// `Configure` refuses the changes of part that would lose writes.

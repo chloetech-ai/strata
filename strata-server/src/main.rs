@@ -365,6 +365,34 @@ enum Command {
         #[arg(long, env = "STRATA_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
+    /// Run the Kubernetes operator: it makes and changes the Strata clusters
+    /// that StrataCluster resources describe (see deploy/README.md). In a
+    /// pod it talks to the API server as its service account.
+    Operator {
+        /// Only the clusters of this namespace (default: every namespace).
+        #[arg(long)]
+        namespace: Option<String>,
+        /// How often each cluster is looked at, in milliseconds.
+        #[arg(long, default_value_t = 3000)]
+        every_ms: u64,
+        /// Do not install or update the StrataCluster resource definition
+        /// when starting (it needs to be there already).
+        #[arg(long)]
+        no_crd: bool,
+        /// Print the resource definition (JSON, for kubectl apply -f) and
+        /// exit.
+        #[arg(long)]
+        print_crd: bool,
+        /// The API server, outside a pod (as https://host:6443).
+        #[arg(long)]
+        kube_api: Option<String>,
+        /// A bearer token for --kube-api.
+        #[arg(long, env = "STRATA_KUBE_TOKEN", hide_env_values = true)]
+        kube_token: Option<String>,
+        /// The CA of --kube-api, PEM.
+        #[arg(long)]
+        kube_ca: Option<PathBuf>,
+    },
     /// Load rows from JSON Lines, JSON, CSV or TSV files, and the tables of
     /// SQLite databases, into a database. A database that does not exist
     /// is created with --schema, or from the first SQLite file's tables. A
@@ -473,6 +501,25 @@ async fn main() {
             match server::promote(url, replicas, write_acks, *force, token.as_deref()).await {
                 Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
                 Err(e) => fail(&e),
+            }
+            return;
+        }
+        Some(Command::Operator { namespace, every_ms, no_crd, print_crd, kube_api, kube_token, kube_ca }) => {
+            if *print_crd {
+                println!("{}", serde_json::to_string_pretty(&strata_server::operator::crd()).unwrap_or_default());
+                return;
+            }
+            let ca = kube_ca.as_ref().map(|p| std::fs::read(p).unwrap_or_else(|e| fail(&format!("--kube-ca {}: {e}", p.display()))));
+            let o = strata_server::operator::kube::Options {
+                api: kube_api.clone(),
+                token: kube_token.clone(),
+                ca,
+                namespace: namespace.clone(),
+                every: std::time::Duration::from_millis((*every_ms).max(100)),
+                install_crd: !no_crd,
+            };
+            if let Err(e) = strata_server::operator::kube::run(o).await {
+                fail(&e);
             }
             return;
         }

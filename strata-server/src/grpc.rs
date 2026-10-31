@@ -482,7 +482,7 @@ impl pb::strata_server::Strata for Grpc {
     async fn hello(&self, req: Request<pb::HelloRequest>) -> Result<Response<pb::HelloResponse>, Status> {
         self.serve("Hello", req, |svc, _who, _| async move {
             let n = svc.local_db().and_then(|db| db.storage().numbering()).unwrap_or_default();
-            Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), role: svc.role() as i32, term: n.term, seq_no: n.seq, replaced_by_term: svc.replaced_by(), ..hello() })
+            Ok(pb::HelloResponse { slot_epoch: svc.slot_epoch(), role: svc.role() as i32, term: n.term, seq_no: n.seq, last_term: n.last().term, replaced_by_term: svc.replaced_by(), ..hello() })
         })
         .await
     }
