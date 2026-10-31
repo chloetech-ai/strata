@@ -138,7 +138,7 @@ function cpu(body) {
       h("div", { class: "row", style: { flexWrap: "wrap", gap: "14px" } },
         seg([["server", "the whole server"], ["query", "a query in a loop"]], what, (v) => { what = v; store.set("profile.cpu.what", v); showQ(); }, { title: "Sample whatever the server is doing, or one query run again and again" }),
         h("span", { class: "row nw small dim", style: { gap: "6px" } }, "for", seg(SECONDS, seconds, (v) => { seconds = v; store.set("profile.cpu.seconds", v); })),
-        h("span", { class: "row nw small dim", style: { gap: "6px" }, title: "Samples a second of each thread's CPU time: more is finer and costs the server more (at 99 Hz well under 1%)" }, "at", seg(HZ, hz, (v) => { hz = v; store.set("profile.cpu.hz", v); }))),
+        h("span", { class: "row nw small dim", style: { gap: "6px" }, title: "Samples a second of each thread's CPU time: more is finer, and slows the threads it interrupts more" }, "at", seg(HZ, hz, (v) => { hz = v; store.set("profile.cpu.hz", v); }))),
       qbox,
       h("div", { class: "row" }, go, h("span", { class: "sep" }), h("span", { class: "small muted" }, "One profile at a time. The stacks are sampled with SIGPROF; frames are named from the binary's symbols."))),
     attrs: { style: { marginBottom: "14px" } } }),
