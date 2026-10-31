@@ -97,6 +97,12 @@ pub struct Options {
     pub api_base: String,
     /// Where embedded fields' models are ([`strata::embed::open`]).
     pub models: PathBuf,
+    /// Fill in the vectors of rows stored while their embedded field had
+    /// no model open, once it has one ([`Service::keep_models`]).
+    pub backfill: bool,
+    /// Fetch the models Strata knows ([`strata::embed::KNOWN_MODELS`]) that
+    /// an embedded field names and `models` lacks.
+    pub fetch_models: bool,
     /// The synonym list for `synonyms => 1` searches (Solr format), read at
     /// start if it exists and written by `PUT /v1/synonyms`.
     pub synonyms: Option<PathBuf>,
@@ -307,6 +313,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     svc.audit = Audit::new(o.audit_log.clone())?;
     svc.alerts = Alerts::new(o.alerts.clone(), o.alert_webhook.clone())?;
+    (svc.backfill, svc.fetch_models) = (o.backfill, o.fetch_models);
     svc.open_models(&o.models);
     for m in svc.models().iter() {
         match &m.model {
@@ -394,6 +401,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     spawn_sampler(&svc);
+    tokio::spawn(svc.clone().keep_models());
     svc.start_failover();
     // The cluster's keys: a coordinator takes them from its shards before
     // it serves, and a coordinator or primary passes changes on.
