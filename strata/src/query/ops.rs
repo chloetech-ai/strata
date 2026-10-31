@@ -1131,29 +1131,52 @@ impl<'a> Ops<'a, '_> {
         let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
         for r in &rows.rows {
             self.tick()?;
-            let vals: Vec<Value> = keys.iter().map(|k| value(k, r)).collect::<Result<_>>()?;
-            let key: Vec<Part> = vals.iter().map(|v| if let Value::List(_) = v { Part::Str(format!("{v:?}")) } else { Part::of(v) }).collect();
-            let g = match at.get(&key) {
-                Some(&g) => g,
-                None => {
-                    self.charge.row(&vals)?;
-                    at.insert(key, groups.len());
-                    groups.push((vals, new_accs()));
-                    groups.len() - 1
-                }
-            };
-            for (acc, arg) in groups[g].1.iter_mut().zip(&args) {
-                match arg {
-                    None => acc.add_row(),
-                    Some(a) => match value(a, r)? {
-                        Value::List(xs) => xs.iter().for_each(|x| {
-                            acc.add(x);
-                        }),
-                        v => {
-                            acc.add(&v);
+            // Each key's values: a multi-valued key puts the row in a group
+            // per distinct value, and in the group NULL with none, as a
+            // table's GROUP BY does.
+            let each: Vec<Vec<Value>> = keys
+                .iter()
+                .map(|k| {
+                    Ok(match value(k, r)? {
+                        Value::List(xs) => {
+                            let mut seen = HashSet::new();
+                            let xs: Vec<Value> = xs.into_iter().filter(|x| seen.insert(Part::of(x))).collect();
+                            if xs.is_empty() { vec![Value::Null] } else { xs }
                         }
-                    },
+                        v => vec![v],
+                    })
+                })
+                .collect::<Result<_>>()?;
+            // Every combination of the keys' values, the last key fastest.
+            let mut pick = vec![0usize; each.len()];
+            loop {
+                let vals: Vec<Value> = each.iter().zip(&pick).map(|(vs, &i)| vs[i].clone()).collect();
+                let key: Vec<Part> = vals.iter().map(Part::of).collect();
+                let g = match at.get(&key) {
+                    Some(&g) => g,
+                    None => {
+                        self.charge.row(&vals)?;
+                        at.insert(key, groups.len());
+                        groups.push((vals, new_accs()));
+                        groups.len() - 1
+                    }
+                };
+                for (acc, arg) in groups[g].1.iter_mut().zip(&args) {
+                    match arg {
+                        None => acc.add_row(),
+                        Some(a) => match value(a, r)? {
+                            Value::List(xs) => xs.iter().for_each(|x| {
+                                acc.add(x);
+                            }),
+                            v => {
+                                acc.add(&v);
+                            }
+                        },
+                    }
                 }
+                let Some(k) = (0..pick.len()).rev().find(|&k| pick[k] + 1 < each[k].len()) else { break };
+                pick[k] += 1;
+                pick[k + 1..].iter_mut().for_each(|p| *p = 0);
             }
         }
         // Aggregates of no rows, without groups: one row.
