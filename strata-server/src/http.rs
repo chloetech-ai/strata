@@ -32,14 +32,18 @@
 //! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
 //! | `PUT /v1/logs/filter` | `{filter}` (as `--log`) | `{filter}`: what is logged from now on |
 //! | `GET /v1/system`, `/v1/cluster`, `/v1/routes` | | the process and its limits; the cluster's copies; requests by route and queries by kind |
+//! | `GET /v1/whoami` | | `{name, key, scope, root}`: who the request's credential is ([`crate::keys`]) |
+//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id` | `{name, scope, expires_days?}` | the API keys; a new one's secret is answered once |
+//! | `GET /v1/admin/audit?limit=n` | | the latest requests that needed the admin scope or were refused |
+//! | `GET /v1/alerts`, `PUT /v1/alerts/rules` | `{rules}` | the alert rules with their states and the latest changes ([`crate::alerts`]) |
 //!
 //! Every answer carries the request's id in `x-request-id`: the one the
 //! client sent, if it is 1 to 64 letters, digits, '-', '_', '.' or ':', or
 //! a new one ([`crate::obs`]).
 //!
-//! With a token set, every route but `/`, `/livez`, `/readyz` and
-//! `/v1/health` needs
-//! `Authorization: Bearer <token>`. Every route checks the `Host` header
+//! With a token set or an API key made, every route but `/`, `/livez`,
+//! `/readyz` and `/v1/health` needs `Authorization: Bearer <token or
+//! key>`, and a key the scope of its route ([`route_scope`]). Every route checks the `Host` header
 //! and, on a request that can change something, the `Origin` header
 //! ([`crate::auth`]).
 
@@ -63,6 +67,7 @@ use strata::storage::Layout;
 use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
+use crate::keys::{self, Principal, Scope};
 use crate::{agent, json as js, obs, telemetry, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
@@ -143,6 +148,12 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/system", get(system))
         .route("/v1/cluster", get(cluster))
         .route("/v1/routes", get(routes))
+        .route("/v1/whoami", get(whoami))
+        .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
+        .route("/v1/admin/keys/:id", axum::routing::delete(revoke_key))
+        .route("/v1/admin/audit", get(audit_log))
+        .route("/v1/alerts", get(alerts))
+        .route("/v1/alerts/rules", put(put_alert_rules))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .route("/", get(|| async { Html(UI) }))
@@ -183,13 +194,75 @@ fn header_str<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-async fn auth(State(app): State<App>, headers: HeaderMap, req: Request, next: Next) -> Response {
-    if let Some(token) = &app.token {
-        if !token.admits(header_str(&headers, header::AUTHORIZATION)) {
-            return ApiError { status: 401, message: "missing or wrong token".into() }.into_response();
+/// Who the request is from ([`crate::keys`]), and whether that may call
+/// its route ([`route_scope`]); a statement's own scope is checked where
+/// it is read (`/v1/sql`, `/v1/plan`, a logged query). Requests that need
+/// the admin scope, and refused ones, go to the audit log.
+async fn auth(State(app): State<App>, headers: HeaderMap, mut req: Request, next: Next) -> Response {
+    let t0 = Instant::now();
+    let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
+    let method = req.method().clone();
+    let who = app.svc.keys.resolve(app.token.as_ref(), header_str(&headers, header::AUTHORIZATION));
+    let need = route_scope(&method, &route);
+    let refused = match &who {
+        None => Some(ApiError { status: 401, message: "missing or wrong token".into() }),
+        Some(w) => w.may(need, &format!("{method} {route}")).err(),
+    };
+    let res = match refused {
+        Some(e) => e.into_response(),
+        None => {
+            if let Some(w) = &who {
+                req.extensions_mut().insert(w.clone());
+            }
+            next.run(req).await
         }
+    };
+    let status = res.status().as_u16();
+    if need == Scope::Admin || status == 401 || status == 403 || res.extensions().get::<Audited>().is_some() {
+        app.svc.audit.add(keys::Entry {
+            ts_ms: telemetry::now_ms(),
+            who: who.as_ref().map_or("unknown".into(), |w| w.name.clone()),
+            key: who.as_ref().and_then(|w| w.key.clone()),
+            scope: who.as_ref().map(|w| w.scope.name()),
+            method: method.to_string(),
+            route,
+            status,
+            ms: t0.elapsed().as_secs_f64() * 1e3,
+            request_id: obs::current().map(|id| id.to_string()),
+            detail: res.extensions().get::<Audited>().map(|a| a.0.clone()),
+        });
     }
-    next.run(req).await
+    res
+}
+
+/// What the audit log says a request did, set on its answer.
+#[derive(Clone)]
+struct Audited(String);
+
+/// The answer `j`, with what the audit log says of it.
+fn audited(j: Json, detail: String) -> Response {
+    let mut r = AxJson(j).into_response();
+    r.extensions_mut().insert(Audited(detail));
+    r
+}
+
+/// The scope a route needs ([`crate::keys`]). What shows other clients'
+/// SQL (the running and latest queries, logs) is the admin's.
+fn route_scope(method: &axum::http::Method, route: &str) -> Scope {
+    use axum::http::Method;
+    match route {
+        "/v1/write" | "/v1/import" | "/v1/stream" | "/v1/agent" => Scope::Write,
+        "/v1/export" => Scope::Admin,
+        "/v1/synonyms" if method == Method::PUT => Scope::Admin,
+        "/v1/alerts/rules" => Scope::Admin,
+        r if r.starts_with("/v1/admin/") || r.starts_with("/v1/queries") || r.starts_with("/v1/logs") => Scope::Admin,
+        _ => Scope::Read,
+    }
+}
+
+/// Who a request is from (the open server's root when no auth ran).
+fn who(req_who: Option<axum::Extension<Principal>>) -> Principal {
+    req_who.map_or_else(Principal::open, |axum::Extension(p)| p)
 }
 
 /// Keeps out pages on other sites: one that reached this server through
@@ -300,7 +373,7 @@ async fn metrics(State(app): State<App>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.svc.prometheus().await)
 }
 
-async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let stats = match b.get("stats") {
         None | Some(Json::Null) => None,
         Some(s) => Some(serde_json::from_value(s.clone()).map_err(|e| ApiError::bad(format!("bad stats: {e}")))?),
@@ -320,6 +393,7 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         if req.shard {
             return Err(ApiError::bad("a shard's query is not logged: log through the coordinator"));
         }
+        who(w).may(Scope::Write, "a logged query (it writes the rank log)")?;
         return logged(&app, req, log).await;
     }
     let a = app.svc.query(req).await?;
@@ -383,13 +457,25 @@ fn answer(a: &crate::service::Answer) -> Json {
     j
 }
 
-async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
     let params = app.svc.params(b.get("params")).await?;
+    let w = who(w);
+    let need = app.svc.statement_scope(body_str(&b, "sql")?, &params).await?;
+    w.may(need, &format!("a {} statement", match need { Scope::Read => "query", Scope::Write => "write", Scope::Admin => "table or rank profile" }))?;
+    let j = sql_answer(&app, &b, params).await?.0;
+    // A table's or rank profile's statement is the admin's: audited.
+    Ok(match need {
+        Scope::Admin => audited(j, obs::truncate(body_str(&b, "sql")?, 500).into_owned()),
+        _ => AxJson(j).into_response(),
+    })
+}
+
+async fn sql_answer(app: &App, b: &Json, params: strata::query::Params) -> Res {
     if let Some(log) = b.get("log") {
-        let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params, timeout_ms: body_u64(&b, "timeout_ms"), after: after(&b)?, ..Default::default() };
-        return logged(&app, req, log).await;
+        let req = QueryReq { sql: body_str(b, "sql")?.to_string(), params, timeout_ms: body_u64(b, "timeout_ms"), after: after(b)?, ..Default::default() };
+        return logged(app, req, log).await;
     }
-    match app.svc.sql(body_str(&b, "sql")?, &params, after(&b)?, body_u64(&b, "timeout_ms")).await? {
+    match app.svc.sql(body_str(b, "sql")?, &params, after(b)?, body_u64(b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
     }
@@ -413,8 +499,11 @@ fn written(w: Written, took_ms: f64) -> Json {
 }
 
 /// Runs a plan ([`strata::query::ir`]) as `/v1/sql` runs a statement.
-async fn run_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+async fn run_plan(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let plan = strata::query::ir::Plan::from_json(b.get("plan").ok_or_else(|| ApiError::bad("the body needs a \"plan\""))?)?;
+    if plan.is_write() {
+        who(w).may(Scope::Write, "a write plan")?;
+    }
     match app.svc.run_plan(plan, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
@@ -944,11 +1033,11 @@ async fn live_queries(State(app): State<App>) -> AxJson<Json> {
     AxJson(json!({"queries": app.svc.live.list(), "running": app.svc.running()}))
 }
 
-async fn cancel_query(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<u64>) -> Res {
+async fn cancel_query(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<u64>) -> Result<Response, ApiError> {
     match app.svc.live.cancel(id) {
         true => {
             tracing::info!(query = id, "query cancelled by an operator");
-            Ok(AxJson(json!({"cancelled": true, "id": id})))
+            Ok(audited(json!({"cancelled": true, "id": id}), format!("cancelled query {id}")))
         }
         false => Err(ApiError { status: 404, message: format!("query {id} is not running") }),
     }
@@ -989,11 +1078,11 @@ async fn logs(Query(q): Params) -> Res {
     Ok(AxJson(json!({"lines": lines, "last": ring.last(), "filter": obs::log_filter()})))
 }
 
-async fn log_filter(AxJson(b): AxJson<Json>) -> Res {
+async fn log_filter(AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
     let filter = body_str(&b, "filter")?;
     obs::set_log_filter(filter).map_err(ApiError::bad)?;
     tracing::info!(filter, "log filter changed");
-    Ok(AxJson(json!({"filter": filter})))
+    Ok(audited(json!({"filter": filter}), format!("log filter {filter}")))
 }
 
 async fn system(State(app): State<App>) -> AxJson<Json> {
@@ -1009,4 +1098,57 @@ async fn cluster(State(app): State<App>) -> AxJson<Json> {
 
 async fn routes(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.metrics.routes())
+}
+
+async fn whoami(State(app): State<App>, w: Option<axum::Extension<Principal>>) -> AxJson<Json> {
+    let w = who(w);
+    let mut j = w.json();
+    j["auth"] = json!({"token": app.token.is_some(), "keys": !app.svc.keys.is_empty(), "open": app.token.is_none() && app.svc.keys.is_empty()});
+    AxJson(j)
+}
+
+async fn list_keys(State(app): State<App>) -> AxJson<Json> {
+    AxJson(json!({"keys": app.svc.keys.list(), "file": app.svc.keys.file().map(|p| p.display().to_string())}))
+}
+
+/// `{"name": ..., "scope": "read" | "write" | "admin", "expires_days": n}`:
+/// a new key; its secret is in this answer only.
+async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let name = body_str(&b, "name")?;
+    let scope = Scope::parse(b.get("scope").and_then(|v| v.as_str()).unwrap_or("read")).ok_or_else(|| ApiError::bad("scope is read, write or admin"))?;
+    let expires = match b.get("expires_days") {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(telemetry::now_ms() + v.as_f64().filter(|d| *d > 0.0).ok_or_else(|| ApiError::bad("expires_days is a number of days above 0"))?.mul_add(86_400_000.0, 0.0) as u64),
+    };
+    let open = app.token.is_none() && app.svc.keys.is_empty();
+    let (key, secret) = app.svc.keys.create(name, scope, expires, open)?;
+    tracing::info!(key = %key.id, name = %key.name, scope = scope.name(), "API key created");
+    let detail = format!("created key {} ({}, {})", key.name, key.id, scope.name());
+    Ok(audited(json!({"key": key.json(), "secret": secret, "closed": open}), detail))
+}
+
+async fn revoke_key(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
+    match app.svc.keys.revoke(&id, app.token.is_some())? {
+        true => {
+            tracing::info!(key = %id, "API key revoked");
+            Ok(audited(json!({"revoked": id}), format!("revoked key {id}")))
+        }
+        false => Err(ApiError { status: 404, message: format!("no key {id}") }),
+    }
+}
+
+async fn audit_log(State(app): State<App>, Query(q): Params) -> Res {
+    let limit = param_u64(&q, "limit", 200)?.min(keys::AUDIT as u64) as usize;
+    Ok(AxJson(json!({"entries": app.svc.audit.latest(limit), "file": app.svc.audit.path().map(|p| p.display().to_string())})))
+}
+
+async fn alerts(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.alerts.json())
+}
+
+async fn put_alert_rules(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let rules: Vec<crate::alerts::Rule> = serde_json::from_value(b.get("rules").cloned().ok_or_else(|| ApiError::bad("the body needs \"rules\""))?).map_err(|e| ApiError::bad(format!("bad rules: {e}")))?;
+    let n = rules.len();
+    app.svc.alerts.set_rules(rules)?;
+    Ok(audited(app.svc.alerts.json(), format!("{n} alert rules")))
 }
