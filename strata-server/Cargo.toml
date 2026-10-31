@@ -34,6 +34,10 @@ tempfile = "3"
 # API keys are kept as the SHA-256 of their secrets (`keys`).
 sha2 = "0.10"
 
+# CPU profiles (`profiler`): every thread's stack, sampled on SIGPROF.
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", default-features = false }
+
 [features]
 # BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.
 bert = ["strata/bert"]

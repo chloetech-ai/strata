@@ -142,6 +142,7 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         after: After::of(r.min_seq_no, r.min_seq_nos)?,
         // A shard measures CPU time when set to for every query.
         profile: false,
+        quiet: false,
     })
 }
 

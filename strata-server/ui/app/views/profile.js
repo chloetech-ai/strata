@@ -9,11 +9,12 @@
 import { h, icon, clear, fmt, api, store, toast, card, empty, seg, every, failure, table, pill, toggle, debounce, sqlBlock, copy } from "../core.js";
 import { editor } from "../sqledit.js";
 import { tables, cached } from "../catalog.js";
-import { profileView, profileFigures } from "../profile.js";
+import { profileView, profileFigures, kpi } from "../profile.js";
+import { flameGraph, folded, shortName } from "../flame.js";
 
-export default { id: "profile", title: "Profiler", icon: "flame", group: "Workload", keywords: "profile profiler explain analyze flame chart cpu threads segments operators steps slow queries debug latency", render, onParams };
+export default { id: "profile", title: "Profiler", icon: "flame", group: "Workload", keywords: "profile profiler explain analyze flame chart flame graph cpu sampling pprof perf folded speedscope hot functions threads segments operators steps slow queries debug latency", render, onParams };
 
-const TABS = [["query", "Profile a query"], ["slow", "Slow queries"], ["recent", "Latest queries"]];
+const TABS = [["query", "Profile a query"], ["cpu", "CPU"], ["slow", "Slow queries"], ["recent", "Latest queries"]];
 const OUTCOMES = { ok: "ok", partial: "warn", error: "bad", timeout: "bad", rejected: "warn", cancelled: "info" };
 
 let route = null;
@@ -30,7 +31,7 @@ function render(page, r) {
       tab = t; stop?.();
       clear(tabs, TABS.map(([k, v]) => h("button", { role: "tab", "aria-selected": String(k === t), onclick: () => { location.hash = "#/profile?tab=" + k; } }, v)));
       clear(body);
-      view = t === "query" ? runner(body) : ended(body, t);
+      view = t === "query" ? runner(body) : t === "cpu" ? cpu(body) : ended(body, t);
       stop = view.stop;
     }
     view.open?.(params);
@@ -106,6 +107,109 @@ function runner(body) {
     stop: () => {},
     open(params) { const q = params.get("sql"); if (q) { ed.value = q; sql = q; store.set("profile.sql", q); run(); } },
   };
+}
+
+// ---------------------------------------------------------------- CPU
+
+const SECONDS = [[1, "1 s"], [5, "5 s"], [10, "10 s"], [30, "30 s"]];
+const HZ = [[49, "49 Hz"], [99, "99 Hz"], [499, "499 Hz"], [997, "997 Hz"]];
+const CLIENTS = [[1, "1"], [4, "4"], [16, "16"]];
+
+/**
+ * A CPU profile: every thread of the server sampled for a while, what it
+ * was running, as a flame graph and by function. Of the whole server
+ * (whatever its clients send), or of one query run again and again.
+ */
+function cpu(body) {
+  let what = store.get("profile.cpu.what", "server");
+  let seconds = store.get("profile.cpu.seconds", 5);
+  let hz = store.get("profile.cpu.hz", 99);
+  let clients = store.get("profile.cpu.clients", 1);
+  let sql = store.get("profile.cpu.sql", store.get("profile.sql", ""));
+  const ed = editor({ value: sql, onChange: (v) => { sql = v; store.set("profile.cpu.sql", v); }, onRun: () => take(), catalog: cached, label: "SQL to run while sampling" });
+  const qbox = h("div", { class: "stack" },
+    h("div", { class: "wb-ed", style: { height: "110px", border: "1px solid var(--line)", borderRadius: "var(--r-sm)", overflow: "hidden" } }, ed.el),
+    h("div", { class: "row small dim" }, "Run by", seg(CLIENTS, clients, (v) => { clients = v; store.set("profile.cpu.clients", v); }, { title: "How many callers run it at once: 1 shows one query's work, more shows the server under load" }), "callers at once, again and again until the profile ends. Its runs are not kept among the latest queries."));
+  const showQ = () => { qbox.style.display = what === "query" ? "" : "none"; };
+  const go = h("button", { class: "btn primary", onclick: () => take() }, icon("flame"), "Take a CPU profile");
+  const out = h("div");
+  body.append(
+    card({ body: h("div", { class: "stack" },
+      h("div", { class: "row", style: { flexWrap: "wrap", gap: "14px" } },
+        seg([["server", "the whole server"], ["query", "a query in a loop"]], what, (v) => { what = v; store.set("profile.cpu.what", v); showQ(); }, { title: "Sample whatever the server is doing, or one query run again and again" }),
+        h("span", { class: "row nw small dim", style: { gap: "6px" } }, "for", seg(SECONDS, seconds, (v) => { seconds = v; store.set("profile.cpu.seconds", v); })),
+        h("span", { class: "row nw small dim", style: { gap: "6px" }, title: "Samples a second of each thread's CPU time: more is finer, and slows the threads it interrupts more" }, "at", seg(HZ, hz, (v) => { hz = v; store.set("profile.cpu.hz", v); }))),
+      qbox,
+      h("div", { class: "row" }, go, h("span", { class: "sep" }), h("span", { class: "small muted" }, "One profile at a time. The stacks are sampled with SIGPROF; frames are named from the binary's symbols."))),
+    attrs: { style: { marginBottom: "14px" } } }),
+    out);
+  showQ();
+  if (!sql) tables().then(() => { if (!sql && cached()[0]) { const t = cached()[0]; const f = (t.short?.fields || []).find((x) => x.type === "text" && x.indexed !== false); ed.value = f ? `SELECT * FROM ${t.table} ORDER BY bm25(${f.name}, 'search') DESC LIMIT 10` : `SELECT * FROM ${t.table} LIMIT 10`; sql = ed.value; } }).catch(() => {});
+  clear(out, empty("flame", "Sample the server's CPU", "Take a profile of the whole server while it serves its clients, or of a query run in a loop: every thread's stacks, as a flame graph and the functions that took the most time."));
+  let busy = false, tick = null, gone = false;
+  async function take() {
+    if (busy) return;
+    const req = { seconds, hz };
+    if (what === "query") {
+      const text = (ed.value || "").trim().replace(/;\s*$/, "");
+      if (!text) { toast("Write a query first"); return; }
+      req.sql = text; req.clients = clients;
+    }
+    busy = true; go.disabled = true;
+    const t0 = performance.now();
+    const bar = h("i", { style: { width: "0%" } });
+    const status = h("div", { class: "small muted" }, `${seconds} s left`);
+    clear(out, card({ body: h("div", { class: "stack", style: { alignItems: "center", padding: "26px 0" } },
+      h("div", { class: "small dim" }, what === "query" ? `Running the query in a loop and sampling every thread at ${hz} Hz…` : `Sampling every thread at ${hz} Hz…`),
+      h("div", { class: "meter", style: { width: "min(420px, 90%)" } }, bar), status) }));
+    tick = setInterval(() => { const el = (performance.now() - t0) / 1000; bar.style.width = Math.min(100, el / seconds * 100) + "%"; status.textContent = el < seconds ? `${Math.ceil(seconds - el)} s left` : "Reading the frames' names…"; }, 200);
+    try {
+      const p = await api("/v1/profile/cpu", { body: req });
+      if (gone) return;
+      show(p, req);
+    } catch (e) {
+      if (gone) return;
+      clear(out, e.status === 409 ? empty("clock", "A profile is being taken", "One at a time: the timer is the process's. Try again when it ends.") : e.status === 501 ? empty("info", "No CPU profiles here", e.message) : h("div", { class: "error" }, e.message));
+    } finally { clearInterval(tick); busy = false; go.disabled = false; }
+  }
+  function show(p, req) {
+    const total = p.stacks.reduce((a, s) => a + s.samples, 0);
+    // A sample stands for its share of the process's measured CPU time:
+    // the system's timer delivers fewer than asked when the process is busy.
+    const per = p.samples && p.cpu_seconds ? p.cpu_seconds * 1000 / p.samples : 1000 / p.hz;
+    const unit = (n) => fmt.ms(n * per);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const save = (name, text, type) => { const a = h("a", { href: URL.createObjectURL(new Blob([text], { type })), download: name }); document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); };
+    const fg = flameGraph(p, { unit });
+    const r = p.runs;
+    const top = p.threads[0];
+    const few = p.rate && p.rate < p.hz * 0.6;
+    // The function most samples were in, itself.
+    const self = new Map();
+    for (const s of p.stacks) { const f = s.frames[s.frames.length - 1]; if (f != null) self.set(f, (self.get(f) || 0) + s.samples); }
+    const best = [...self].sort((x, y) => y[1] - x[1])[0];
+    const hot = best ? [p.names[best[0]], best[1]] : null;
+    clear(out, h("div", { class: "stack" },
+      h("div", { class: "row" }, h("span", { class: "small muted" }, `${req.sql ? "a query in a loop" : "the whole server"} · ${fmt.n(p.seconds)} s at ${p.hz} Hz · ${new Date().toLocaleTimeString()}`), h("span", { class: "sep" }),
+        h("button", { class: "btn sm", title: "Folded stacks (thread;root;…;leaf samples) for flamegraph.pl, inferno or speedscope", onclick: () => save(`strata-cpu-${stamp}.folded`, folded(p), "text/plain") }, icon("download"), "Folded"),
+        h("button", { class: "btn sm", onclick: () => save(`strata-cpu-${stamp}.json`, JSON.stringify(p), "application/json") }, icon("download"), "JSON"),
+        req.sql ? h("a", { class: "btn sm", href: "#/profile?tab=query&sql=" + encodeURIComponent(req.sql), title: "Its steps, once" }, icon("flame"), "Profile its steps") : null),
+      req.sql ? sqlBlock(req.sql) : null,
+      r?.error ? h("div", { class: "error" }, "A run failed, so the loop stopped: " + r.error) : null,
+      h("div", { class: "grid g6 prof-kpis" },
+        kpi("CPU time", fmt.ms(p.cpu_seconds * 1000), `of every thread, in ${fmt.n(p.seconds)} s`, "The process's CPU time (user and system) while the profile was taken, from the system"),
+        kpi("Cores busy", p.cores.toFixed(2), `of ${fmt.n(p.seconds)} s`, "CPU seconds over wall seconds: the cores the process kept busy on average"),
+        kpi("Samples", fmt.n(p.samples), `${fmt.n(Math.round(p.rate || 0))} a CPU second`, `${p.hz} asked for a CPU second; each sample stands for ${fmt.ms(per)} of CPU time`),
+        kpi("Threads", fmt.n(p.threads.reduce((a, t) => a + t.count, 0)), top ? `${top.name} ${fmt.pct(top.samples / Math.max(1, total), 0)}` : null, "Threads sampled at least once; the busiest pool"),
+        r ? kpi("Runs", fmt.n(r.count), r.count ? `${fmt.n(Math.round(r.count / p.seconds))} a second${r.clients > 1 ? `, ${r.clients} callers` : ""}` : null) : kpi("Stacks", fmt.n(p.stacks.length), `${fmt.n(p.names.length)} functions`),
+        r ? kpi("Median run", r.median_ms != null ? fmt.ms(r.median_ms) : "–", r.p99_ms != null ? `p99 ${fmt.ms(r.p99_ms)} · max ${fmt.ms(r.max_ms)}` : null) : hot ? kpi("Hottest function", h("span", { class: "mono", style: { fontSize: "15px" } }, shortName(hot[0])), `${fmt.pct(hot[1] / Math.max(1, total), 1)} of the samples in itself`, hot[0]) : kpi("Stacks", "–")),
+      few ? h("div", { class: "small muted" }, `The system delivered ${fmt.n(Math.round(p.rate))} samples a CPU second of the ${p.hz} asked: its timer gives the whole process at most one a tick (250 a second on many Linux kernels). Each sample is weighed by the measured CPU time, so the times are right; fewer samples make small functions noisier, so sample for longer.`) : null,
+      (p.blocked || []).includes("libc") ? h("div", { class: "small muted" }, "Samples inside the C library (malloc, memcpy, system calls) are not taken on this system: unwinding from there could deadlock before glibc 2.35. Their CPU time is spread over the rest.") : null,
+      !total ? empty("info", "No samples", "No thread used the CPU while the profile was taken. Sample for longer, or while the server is busy.") : null,
+      total ? card({ title: "Flame graph", sub: "each frame as wide as its CPU time, what it called under it; click one to zoom in", body: fg.graph }) : null,
+      total ? card({ title: "Functions", sub: "self: CPU time in the function itself · total: with what it called · click one to find it in the graph", body: fg.functions, flush: true }) : null));
+  }
+  return { stop: () => { gone = true; clearInterval(tick); } };
 }
 
 // ---------------------------------------------------------------- ended ones

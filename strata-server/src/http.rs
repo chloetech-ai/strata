@@ -30,6 +30,7 @@
 //! | `GET /v1/queries/request/:id` | | `{queries}`: those a request (its `x-request-id`) ran |
 //! | `GET /v1/queries/finished/:id` | | one ended query with its whole profile: trace, steps ([`strata::query::steps`]) and plan lines (the lists give each without them, unless `full=true`) |
 //! | `GET /v1/profile/settings`, `PUT /v1/profile/settings` | `{slow_ms?, cpu_all?}` | the slow threshold (until restarted) and whether every query's CPU time is measured |
+//! | `POST /v1/profile/cpu?format=folded` | `{seconds?, hz?, sql?, params?, clients?}` | a CPU profile ([`crate::profiler`]) of the whole server for `seconds`, or of `sql` run again and again for that long by `clients` callers at once (1 to 64): every thread's stacks, sampled `hz` times a CPU second; `format=folded` answers folded lines (flamegraph.pl, speedscope); 409 while another is taken |
 //! | `GET /v1/queries/stats?limit=n`, `POST /v1/queries/stats/reset` | | statistics per statement shape, by time spent ([`crate::telemetry::Statements`]) |
 //! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
 //! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
@@ -71,7 +72,7 @@ use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
 use crate::keys::{self, Principal, Scope};
-use crate::{agent, json as js, obs, telemetry, ui, ApiError};
+use crate::{agent, json as js, obs, profiler, telemetry, ui, ApiError};
 
 
 /// Why a request failed on the server's side, for [`observe`] to log.
@@ -145,6 +146,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/queries/request/:id", get(request_queries))
         .route("/v1/queries/finished/:id", get(finished_query))
         .route("/v1/profile/settings", get(profile_settings).merge(put(put_profile_settings)))
+        .route("/v1/profile/cpu", post(cpu_profile))
         .route("/v1/queries/stats", get(query_stats))
         .route("/v1/queries/stats/reset", post(reset_query_stats))
         .route("/v1/timeseries", get(timeseries))
@@ -1135,6 +1137,80 @@ async fn put_profile_settings(State(app): State<App>, AxJson(b): AxJson<Json>) -
     }
     tracing::info!(settings = %did.join(", "), "profiling settings changed");
     Ok(audited(profile_settings_json(&app), format!("profiling: {}", did.join(", "))))
+}
+
+/// A CPU profile ([`profiler`]): of the whole server for `seconds`
+/// (default 5), or of `sql` run again and again, one run after another,
+/// for that long, the runs kept out of the query lists. It answers the
+/// profile with how busy the server was (`cores`) and, for a query, its
+/// runs and their times; with `?format=folded`, folded lines to download.
+async fn cpu_profile(State(app): State<App>, Query(q): Params, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let seconds = match b.get("seconds") {
+        None | Some(Json::Null) => 5.0,
+        Some(v) => v.as_f64().filter(|s| *s > 0.0 && *s <= profiler::MAX_SECONDS).ok_or_else(|| ApiError::bad(format!("seconds is a number above 0 and at most {}", profiler::MAX_SECONDS)))?,
+    };
+    let hz = match b.get("hz") {
+        None | Some(Json::Null) => 99,
+        Some(v) => v.as_i64().filter(|h| (1..=profiler::MAX_HZ as i64).contains(h)).ok_or_else(|| ApiError::bad(format!("hz is a whole number from 1 to {}", profiler::MAX_HZ)))? as i32,
+    };
+    let query = match b.get("sql") {
+        None | Some(Json::Null) => None,
+        Some(_) => {
+            let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params: app.svc.params(b.get("params")).await?, quiet: true, ..Default::default() };
+            // Once first: a query that fails answers at once, and the
+            // caches it reads are warm when sampling starts.
+            app.svc.query(req.clone()).await?;
+            Some(req)
+        }
+    };
+    let clients = match b.get("clients") {
+        None | Some(Json::Null) => 1,
+        Some(v) => v.as_u64().filter(|c| (1..=64).contains(c)).ok_or_else(|| ApiError::bad("clients is a whole number from 1 to 64"))? as usize,
+    };
+    let runs: std::sync::Arc<std::sync::Mutex<(Vec<f64>, Option<ApiError>)>> = Default::default();
+    let svc = app.svc.clone();
+    let kept = runs.clone();
+    // The query run again and again by `clients` callers at once, until the
+    // profile ends or a run fails.
+    let during = async move {
+        let Some(req) = query else { return std::future::pending::<()>().await };
+        futures::future::join_all((0..clients).map(|_| async {
+            loop {
+                let t = Instant::now();
+                let r = svc.query(req.clone()).await;
+                let mut k = kept.lock().unwrap_or_else(|e| e.into_inner());
+                if k.1.is_some() {
+                    return;
+                }
+                match r {
+                    Ok(_) => k.0.push(t.elapsed().as_secs_f64() * 1e3),
+                    Err(e) => {
+                        k.1 = Some(e);
+                        return;
+                    }
+                }
+            }
+        }))
+        .await;
+    };
+    let (p, _) = profiler::take(hz, seconds, during).await.map_err(|e| match e {
+        profiler::Refused::Busy => ApiError { status: 409, message: "a CPU profile is being taken: one at a time".into() },
+        profiler::Refused::Unavailable(m) => ApiError { status: 501, message: format!("no CPU profile: {m}") },
+    })?;
+    let (mut ms, error) = std::mem::take(&mut *runs.lock().unwrap_or_else(|e| e.into_inner()));
+    tracing::info!(seconds = p.seconds, hz, samples = p.samples, query = b.get("sql").is_some(), "CPU profile taken");
+    if q.get("format").map(String::as_str) == Some("folded") {
+        return Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"strata-cpu.folded\"")], p.folded()).into_response());
+    }
+    let mut j = json!(p);
+    j["cores"] = json!(p.cores());
+    j["rate"] = json!(p.rate());
+    if b.get("sql").is_some_and(|s| !s.is_null()) {
+        ms.sort_by(f64::total_cmp);
+        let at = |f: f64| ms.get(((ms.len() as f64 - 1.0) * f).round() as usize).copied();
+        j["runs"] = json!({"count": ms.len(), "clients": clients, "min_ms": at(0.0), "median_ms": at(0.5), "p99_ms": at(0.99), "max_ms": at(1.0), "error": error.map(|e| e.message)});
+    }
+    Ok(AxJson(j).into_response())
 }
 
 async fn request_queries(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> AxJson<Json> {
