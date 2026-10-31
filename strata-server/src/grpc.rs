@@ -208,7 +208,7 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 /// Every method is named, so that a new one must say what it needs.
 fn method_scope(method: &str) -> Option<Scope> {
     match method {
-        "Replicate" | "Restore" | "Verify" | "Slots" | "Configure" => None,
+        "Replicate" | "Restore" | "Verify" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" => None,
         "Write" | "WriteStream" => Some(Scope::Write),
         "Logs" => Some(Scope::Admin),
         "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
@@ -265,7 +265,7 @@ impl Grpc {
             obs::scope(Some(id.clone()), async { audit(&self.0, &who, method, e.status, t0, None) }).await;
             return Err(Status::from(e));
         }
-        let call = keys::noting(f(self.0.clone(), who.clone(), req.into_inner()));
+        let call = keys::noting(crate::service::ROUTED.scope(std::cell::Cell::new(0), f(self.0.clone(), who.clone(), req.into_inner())));
         let (r, note) = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), call)).instrument(span.clone()).await;
         let status = r.as_ref().map_or_else(|e| e.status, |_| 200);
         obs::scope(Some(id.clone()), async { audit(&self.0, &who, method, status, t0, note) }).await;
@@ -363,14 +363,32 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn write(&self, req: Request<pb::WriteRequest>) -> Result<Response<pb::WriteResponse>, Status> {
+        if req.get_ref().moved {
+            // Rows of moving slots: a call between the servers of a cluster.
+            let (who, may) = may_call(&req, "Write (moved)");
+            if let Err(e) = may {
+                self.0.metrics.grpc("Write", "PermissionDenied", 0.0);
+                audit(&self.0, &who, "Write (moved)", e.status, Instant::now(), None);
+                return Err(Status::from(e));
+            }
+        }
         self.serve("Write", req, |svc, who, r| async move {
             svc.check_epoch(r.epoch)?;
             let w = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
-                svc.write_ops(ops, key).await?
+                svc.write_ops_as(ops, key, r.moved).await?
+            } else if r.moved {
+                return Err(ApiError::bad("rows of moving slots come as write operations (ops_json), not SQL"));
             } else {
-                match svc.sql(&who, &r.sql, &params_from_pb(r.params), After::Any, 0).await? {
+                let slots = match r.slots_json.is_empty() {
+                    true => None,
+                    false => {
+                        let ranges: Vec<(usize, usize)> = from_json(&r.slots_json, "slots")?;
+                        Some(ranges.into_iter().flat_map(|(a, b)| a..b.min(crate::slots::SLOTS)).collect())
+                    }
+                };
+                match svc.sql_in(&who, &r.sql, &params_from_pb(r.params), After::Any, 0, slots).await? {
                     crate::service::SqlAnswer::Written { w, .. } => w,
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
@@ -500,6 +518,39 @@ impl pb::strata_server::Strata for Grpc {
                 a => Some(crate::replication::Acks::parse(a).ok_or_else(|| ApiError::bad(format!("write_acks is all, majority or primary, not {a:?}")))?),
             };
             svc.configure(r.role(), r.replicas, acks, r.force).await
+        })
+        .await
+    }
+
+    type ExportSlotsStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<pb::ExportSlotsChunk, Status>> + Send>>;
+
+    async fn export_slots(&self, req: Request<pb::ExportSlotsRequest>) -> Result<Response<Self::ExportSlotsStream>, Status> {
+        let rx = self
+            .serve("ExportSlots", req, |svc, _who, r| async move {
+                svc.check_epoch(r.epoch)?;
+                svc.export_slots(r.changes, if r.batch_rows == 0 { 1000 } else { r.batch_rows as usize }).await
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(|c| c.map_err(Status::from)))))
+    }
+
+    async fn freeze_slots(&self, req: Request<pb::FreezeRequest>) -> Result<Response<pb::FreezeResponse>, Status> {
+        self.serve("FreezeSlots", req, |svc, _who, r| async move {
+            svc.check_epoch(r.epoch)?;
+            let ttl = match r.ttl_ms {
+                0 => crate::service::FREEZE_TTL,
+                ms => std::time::Duration::from_millis(ms.min(600_000) as u64),
+            };
+            Ok(pb::FreezeResponse { seq_no: svc.freeze_slots(ttl, r.thaw).await? })
+        })
+        .await
+    }
+
+    async fn cleanup_slots(&self, req: Request<pb::CleanupRequest>) -> Result<Response<pb::CleanupResponse>, Status> {
+        self.serve("CleanupSlots", req, |svc, _who, r| async move {
+            svc.check_epoch(r.epoch)?;
+            Ok(pb::CleanupResponse { deleted: svc.cleanup_slots().await? })
         })
         .await
     }

@@ -94,6 +94,24 @@ service Strata {
   // to `replicas`; a replica, applying what a primary ships; or
   // standalone. Answers its part now.
   rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+  // Protocol 9: the rows of the slots moving from this shard (its cluster
+  // map's move), for the coordinator to write to the shard they move to
+  // (Write with `moved`): every row of them, at a new version, or with
+  // `changes` what changed since the export before (rows written since,
+  // and deletes of those gone). A shard that cannot tell what changed (it
+  // does not number its writes, or a table has no primary key) first holds
+  // writes to the moving slots, as FreezeSlots does, and says so.
+  rpc ExportSlots(ExportSlotsRequest) returns (stream ExportSlotsChunk);
+  // Protocol 9: holds writes to the slots moving from this shard, and
+  // UPDATE and DELETE statements, until `thaw` or for `ttl_ms`; answers
+  // once the writes under way have committed. A held write that then finds
+  // the cluster map changed is refused (FailedPrecondition), for its
+  // coordinator to route it by the new map.
+  rpc FreezeSlots(FreezeRequest) returns (FreezeResponse);
+  // Protocol 9: deletes this shard's rows of moving slots that it does not
+  // serve, which it hides: those left on the shard the slots moved from,
+  // or those a move given up sent to the shard they were to move to.
+  rpc CleanupSlots(CleanupRequest) returns (CleanupResponse);
   // Replication: a primary (--replicas) ships its numbered transactions to
   // a replica (--replica), which applies them in order under the
   // primary's term and numbers.
@@ -223,6 +241,48 @@ message ConfigureResponse {
   // A primary's replicas and acks.
   repeated string replicas = 4;
   string write_acks = 5;
+}
+
+message ExportSlotsRequest {
+  // The epoch of the coordinator's map, as WriteRequest.epoch.
+  uint64 epoch = 1;
+  // What changed since the export before, rather than every row.
+  bool changes = 2;
+  // Rows per chunk (0: 1,000).
+  uint32 batch_rows = 3;
+}
+
+message ExportSlotsChunk {
+  // Upserts and deletes, as WriteRequest.ops_json takes them.
+  bytes ops_json = 1;
+  uint64 rows = 2;
+  // On the last chunk: the version exported (its last transaction, from
+  // a shard that numbers its writes), and whether the shard holds writes
+  // to the moving slots since the export began.
+  bool last = 3;
+  uint64 seq_no = 4;
+  bool frozen = 5;
+}
+
+message FreezeRequest {
+  uint64 epoch = 1;
+  // How long the hold lasts unless asked again (0: 30 s).
+  uint32 ttl_ms = 2;
+  // Ends the hold instead.
+  bool thaw = 3;
+}
+
+message FreezeResponse {
+  // The shard's last transaction, once the writes under way committed.
+  uint64 seq_no = 1;
+}
+
+message CleanupRequest {
+  uint64 epoch = 1;
+}
+
+message CleanupResponse {
+  uint64 deleted = 1;
 }
 
 message ReleaseRequest {
@@ -981,6 +1041,14 @@ message WriteRequest {
   string idempotency_key = 4;
   // Protocol 4: the epoch of the coordinator's slot map; 0 for none.
   uint64 epoch = 5;
+  // Protocol 9: rows of slots moving to or from this shard, written by the
+  // coordinator moving them (ExportSlots, CleanupSlots), which its slot
+  // map would refuse otherwise.
+  bool moved = 6;
+  // Protocol 9: an UPDATE or DELETE over the rows of these slots alone, as
+  // JSON [start, end) ranges: the coordinator sends a statement so again to
+  // the shard that slots moved to while it ran.
+  bytes slots_json = 7;
 }
 
 message WriteResponse {

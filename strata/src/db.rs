@@ -28,7 +28,7 @@ use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Co
 use crate::rank_log::{self, Export, Log, Logged};
 use crate::schema::{Derive, Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
-use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn, SOURCES};
+use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Mask, Snapshot, TableTxn, SOURCES};
 use crate::value::{Document, Value};
 use crate::vector::VectorReader;
 
@@ -50,6 +50,21 @@ pub struct PreparedWrite {
     write: Write,
     known: Known,
     derived: Derived,
+    /// Rows an UPDATE or DELETE passes over ([`PreparedWrite::masked`]).
+    mask: Option<Arc<Mask>>,
+    /// Asked as the write runs ([`PreparedWrite::guarded`]).
+    guard: Option<Guard>,
+}
+
+/// A check a write passes as it runs, under the writer lock, answering the
+/// rows an UPDATE or DELETE passes over then ([`PreparedWrite::guarded`]).
+#[derive(Clone)]
+struct Guard(Arc<dyn Fn() -> Result<Option<Arc<Mask>>> + Send + Sync>);
+
+impl std::fmt::Debug for Guard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Guard")
+    }
 }
 
 impl PreparedWrite {
@@ -76,6 +91,27 @@ impl PreparedWrite {
     /// The table it writes.
     pub fn table(&self) -> &Schema {
         &self.schema
+    }
+
+    /// The same UPDATE or DELETE passing over the rows `mask` hides
+    /// ([`Snapshot::masked`]): a shard runs a statement over some of its
+    /// slots so. Refused for an INSERT, whose rows are its own.
+    pub fn masked(mut self, mask: Arc<Mask>) -> Result<PreparedWrite> {
+        if matches!(self.write, Write::Insert { .. }) {
+            return Err(Error::Query("an INSERT writes its own rows: only an UPDATE or DELETE passes over some".into()));
+        }
+        self.mask = Some(mask);
+        Ok(self)
+    }
+
+    /// The same write running only if `guard` passes, asked under the
+    /// writer lock as the write starts; an UPDATE or DELETE passes over
+    /// the rows of the mask it answers too (an INSERT's rows are its own).
+    /// A shard checks so that the rows it holds without serving, and the
+    /// slots it serves, are still those the statement was routed by.
+    pub fn guarded(mut self, guard: impl Fn() -> Result<Option<Arc<Mask>>> + Send + Sync + 'static) -> PreparedWrite {
+        self.guard = Some(Guard(Arc::new(guard)));
+        self
     }
 }
 
@@ -379,6 +415,25 @@ impl Db {
                 }
             }
         })
+    }
+
+    /// Rows `rows` of the table `snap` looks at, each a segment ordinal
+    /// and a docID, increasing within each segment ([`Snapshot::covered`]
+    /// gives them so), rebuilt as [`Db::documents`] rebuilds every row.
+    pub fn documents_of(&self, snap: &Snapshot, rows: &[(usize, DocId)]) -> Result<Vec<Document>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for group in rows.chunk_by(|a, b| a.0 == b.0) {
+            let v = snap.segments().get(group[0].0).ok_or_else(|| Error::Query(format!("segment {} of {}", group[0].0, snap.segments().len())))?;
+            let docs: Vec<DocId> = group.iter().map(|r| r.1).collect();
+            let mut got = StoredSource.documents(snap.schema(), &v.file, &docs)?;
+            if let Some(u) = &v.updates {
+                for (doc, &d) in got.iter_mut().zip(&docs) {
+                    u.apply(d, doc);
+                }
+            }
+            out.extend(got);
+        }
+        Ok(out)
     }
 
     /// Bulk-loads the rows of `other`, a database with another schema,
@@ -966,7 +1021,7 @@ impl Db {
             Write::Delete { .. } => {}
         }
         let (known, derived) = self.embed_ahead(&schema, &write, &Files { resolver: &media, held })?;
-        Ok(PreparedWrite { schema, write, known, derived })
+        Ok(PreparedWrite { schema, write, known, derived, mask: None, guard: None })
     }
 
     /// The text `write` will derive and the vectors it will compute, from
@@ -1038,7 +1093,17 @@ impl Db {
         let media = self.media_resolver();
         let files = Files { resolver: &media, held: Held::new() };
         // Read under the writer lock: no other write lands between.
-        let snap = self.snapshot().table(&schema.table).expect("the writer lock keeps the table");
+        let guarded = match &p.guard {
+            Some(g) => (g.0)()?,
+            None => None,
+        };
+        let mut snap = self.snapshot();
+        if !matches!(p.write, Write::Insert { .. }) {
+            for m in guarded.iter().chain(&p.mask) {
+                snap = snap.masked(m)?;
+            }
+        }
+        let snap = snap.table(&schema.table).expect("the writer lock keeps the table");
         let pk = || schema.primary_key.ok_or_else(|| Error::Query(format!("{} has no primary key", schema.table)));
         let mut n = 0u64;
         match p.write.clone() {
