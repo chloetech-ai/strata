@@ -10,7 +10,7 @@
 //! background threads; a write waits for a flush only once the memtable
 //! holds twice `flush_docs` before the flush under way ends.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -175,6 +175,7 @@ impl Store {
                 return Err(err(format!("{} holds {dim}-dimension vectors; the embedder {} makes {want}", path.display(), embedder.name())));
             }
         }
+        count_entity_links(&db)?;
         let last = db.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1", &Params::new())?;
         let next = last.rows.first().and_then(|r| r[0].as_i64()).map_or(1, |s| s + 1);
         let db = Arc::new(db);
@@ -582,6 +583,8 @@ fn apply(db: &Db, next_seq: &AtomicI64, group: &mut [Job]) -> std::result::Resul
     let mut txn = db.storage().begin().map_err(refused)?;
     let mut next = next_seq.load(Ordering::SeqCst);
     let mut entities = HashSet::new();
+    // Links each entity gains (or loses, with a deleted record).
+    let mut counts: HashMap<String, f64> = HashMap::new();
     let mut out = Vec::with_capacity(group.len());
     for (op, _) in group.iter_mut() {
         let mut done = Done::default();
@@ -602,20 +605,64 @@ fn apply(db: &Db, next_seq: &AtomicI64, group: &mut [Job]) -> std::result::Resul
                     schema.fill_generated(&mut doc);
                     txn.upsert(doc).map_err(refused)?;
                     if p.how == How::New {
+                        count_links(&mut counts, &p.rec.links, 1.0);
                         done.stored.push(p.rec.clone());
                     }
                 }
             }
-            Op::Delete(id) => done.found = txn.delete(&Value::Str(id.clone())).map_err(refused)?,
+            Op::Delete(id) => {
+                let key = Value::Str(id.clone());
+                if let Some(v) = txn.table("memory").and_then(|mut t| t.value(&key, "links")).map_err(refused)? {
+                    count_links(&mut counts, &links_of(&v), -1.0);
+                }
+                done.found = txn.delete(&key).map_err(refused)?;
+            }
             Op::Load(_) | Op::Flush => unreachable!("only puts and deletes are grouped"),
         }
         out.push(done);
+    }
+    for (id, n) in counts {
+        if n != 0.0 {
+            txn.add(&Value::Str(id), "importance", &Value::Float(n)).map_err(refused)?;
+        }
     }
     let r = txn.commit();
     // A failed commit may have been logged: its numbers are not given again.
     next_seq.store(next, Ordering::SeqCst);
     r.map_err(|e| (e.into(), true))?;
     Ok(out)
+}
+
+/// Adds `by` to the count of each entity `links` points to.
+fn count_links(counts: &mut HashMap<String, f64>, links: &[Link], by: f64) {
+    for l in links.iter().filter(|l| is_entity(&l.to)) {
+        *counts.entry(l.to.clone()).or_default() += by;
+    }
+}
+
+/// Entity ids: `e:` names and `f:` files.
+fn is_entity(id: &str) -> bool {
+    id.starts_with("e:") || id.starts_with("f:")
+}
+
+/// Counts the links to each entity in a store written before entities kept
+/// that count (their `importance` was 0), in one transaction.
+fn count_entity_links(db: &Db) -> Result<()> {
+    let p = Params::new();
+    let any = |sql: &str| db.query(sql, &p).map(|r| !r.rows.is_empty());
+    if any("SELECT id FROM memory WHERE kind = 'entity' AND importance > 0 LIMIT 1")? || !any("SELECT id FROM memory WHERE kind = 'entity' LIMIT 1")? {
+        return Ok(());
+    }
+    let mut counts = HashMap::new();
+    for r in db.query("SELECT links FROM memory WHERE kind != 'entity' LIMIT 1000000000", &p)?.rows {
+        count_links(&mut counts, &r.first().map(links_of).unwrap_or_default(), 1.0);
+    }
+    let mut txn = db.storage().begin()?;
+    for (id, n) in counts {
+        txn.add(&Value::Str(id), "importance", &Value::Float(n))?;
+    }
+    txn.commit()?;
+    Ok(())
 }
 
 /// A row projected with [`COLUMNS`] as a record.
@@ -824,12 +871,53 @@ mod tests {
         assert_eq!(s.len(), 640 + 1 + 8);
         assert_eq!(s.last_seq(), 649);
         assert_eq!(s.get(&["e:count sheet".into()]).unwrap().len(), 1);
+        // Every note counted once on the entities it links to.
+        let links = |s: &Store, id: &str| s.get(&[id.to_string()]).unwrap()[0].importance;
+        assert_eq!((links(&s, "e:count sheet"), links(&s, "e:bin 3")), (320.0, 40.0));
         assert!(s.delete(&ids[0][0]).unwrap());
         assert!(!s.delete(&ids[0][0]).unwrap());
+        assert_eq!((links(&s, "e:count sheet"), links(&s, "e:bin 0")), (319.0, 39.0));
         s.flush().unwrap();
         drop(s);
         let s = store(dir.path());
         assert_eq!((s.len(), s.last_seq()), (648, 649));
+        assert_eq!(links(&s, "e:count sheet"), 319.0);
+    }
+
+    /// Entities count the records that link to them, and a store whose
+    /// entities have no counts yet gets them when it is opened.
+    #[test]
+    fn entities_count_their_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let d = |text: &str, ents: &[&str], files: &[&str]| Draft::new(Kind::Fact, text).entities(ents.iter().map(|e| e.to_string()).collect()).files(files.iter().map(|f| f.to_string()).collect());
+        s.append("a", 1, 100, vec![d("The count sheet lists bins", &["count sheet", "bins"], &["src/sheet.py"]), d("Bins are numbered", &["bin"], &[])]).unwrap();
+        s.append("b", 1, 200, vec![d("The sheet module prints the count sheet", &["Count sheets"], &["src/sheet.py"])]).unwrap();
+        // A tool call names a file without linking to it.
+        s.append("b", 1, 201, vec![Draft::new(Kind::ToolCall, "Read src/sheet.py").files(vec!["src/sheet.py".into()])]).unwrap();
+        let counts = |s: &Store| -> Vec<(String, f64)> {
+            let rs = s.query("SELECT id, importance FROM memory WHERE kind = 'entity' ORDER BY importance DESC, id LIMIT 10").unwrap();
+            rs.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())).collect()
+        };
+        let want = vec![("e:bin".to_string(), 2.0), ("e:count sheet".into(), 2.0), ("f:src/sheet.py".into(), 2.0)];
+        assert_eq!(counts(&s), want);
+        // Completion: entity names and files by a prefix of their id, most
+        // linked first.
+        let rs = s.query("SELECT id FROM memory WHERE kind = 'entity' AND (PREFIX(id, 'e:co') OR PREFIX(id, 'f:src/')) ORDER BY importance DESC, id LIMIT 10").unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        // With a typo, as the inspector fills its list.
+        let rs = s.query("SELECT id FROM memory WHERE kind = 'entity' AND (PREFIX(id, 'e:cuont', fuzzy => 1) OR PREFIX(id, 'f:cuont', fuzzy => 1)) ORDER BY importance DESC, id LIMIT 10").unwrap();
+        assert_eq!(rs.rows, vec![vec![Value::Str("e:count sheet".into())]]);
+        // A store from before the counts: they are made when it opens.
+        let mut txn = s.db.storage().begin().unwrap();
+        for (id, _) in &want {
+            txn.set(&Value::Str(id.clone()), "importance", Value::Float(0.0)).unwrap();
+        }
+        txn.commit().unwrap();
+        assert!(counts(&s).iter().all(|(_, n)| *n == 0.0));
+        drop(s);
+        let s = store(dir.path());
+        assert_eq!(counts(&s), want);
     }
 
     /// Strata's background threads flush the memtable and merge segments
