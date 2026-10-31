@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use super::{Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, SortKey};
+use super::{Agg, ArithOp, CmpOp, Expr, Graph, GraphKind, GuardSite, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, SortKey};
 use crate::query::logical::{AggFn, DecayShape, Direction, Expand, Fuzzy, Opts};
 use crate::query::sql::ident;
 use crate::schema::{FieldType, Logical, Schema};
@@ -83,6 +83,15 @@ impl<'a> Text<'a> {
                 if let Some(r) = &s.profile {
                     lines.push(format!("  rank profile: {} (hash {})", ident(&r.name), r.hash));
                 }
+                if let Some(g) = &s.guard {
+                    let site = match &g.site {
+                        GuardSite::AtLeast { conds } => format!("AT_LEAST(level, {})", conds.iter().map(|x| self.expr(x, &names)).collect::<Vec<_>>().join(", ")),
+                        GuardSite::Match { field: f, text, expand } => format!("MATCH({}, {}{}, min => level)", field(&names, *f), quote(text), expansion(expand)),
+                        GuardSite::Bm25 { field: f, text } => format!("the min of bm25({}, {})", field(&names, *f), quote(text)),
+                    };
+                    let rows: Vec<String> = [("min_rows", g.min_rows), ("max_rows", g.max_rows)].into_iter().filter_map(|(k, v)| v.map(|v| format!("{k} {v}"))).collect();
+                    lines.push(format!("  guard: {site}, the level from all of them down to {} as {} choose", g.need, rows.join(" and ")));
+                }
                 // For one release: `+` between scores meant min-max fusion
                 // before.
                 if s.order.iter().map(|k| &k.expr).chain(s.phases.iter().map(|p| &p.expr)).any(|e| e.adds_raw_scores()) {
@@ -156,7 +165,13 @@ impl<'a> Text<'a> {
                 (vec![format!("Ref {}", ident(name))], Names { schema: None, outputs: names.outputs })
             }
             Node::Distinct { input } => over(input, &|_| "Distinct".into()),
-            Node::DistinctOn { input, keys } => over(input, &|names| format!("Distinct on: {}", keys.iter().map(|k| self.expr(k, names)).collect::<Vec<_>>().join(", "))),
+            Node::DistinctOn { input, keys, per } => over(input, &|names| {
+                let keys = keys.iter().map(|k| self.expr(k, names)).collect::<Vec<_>>().join(", ");
+                match *per {
+                    1 => format!("Distinct on: {keys}"),
+                    k => format!("At most {k} per: {keys}"),
+                }
+            }),
             Node::KeyOrder { input, by } => {
                 let (il, names) = self.node(input);
                 let lines = match &**by {
@@ -257,11 +272,12 @@ impl<'a> Text<'a> {
             Expr::Lit(v) => lit(v),
             Expr::Not(x) => match &**x {
                 Expr::IsNull(y) => format!("{} IS NOT NULL", self.operand(y, names)),
-                x @ (Expr::Field(_) | Expr::Lit(_) | Expr::Match { .. } | Expr::Graph(_)) => format!("NOT {}", self.expr(x, names)),
+                x @ (Expr::Field(_) | Expr::Lit(_) | Expr::Match { .. } | Expr::Graph(_) | Expr::AtLeast { .. }) => format!("NOT {}", self.expr(x, names)),
                 x => format!("NOT ({})", self.expr(x, names)),
             },
             Expr::And(xs) => xs.iter().map(|x| self.operand(x, names)).collect::<Vec<_>>().join(" AND "),
             Expr::Or(xs) => xs.iter().map(|x| self.operand(x, names)).collect::<Vec<_>>().join(" OR "),
+            Expr::AtLeast { need, conds } => format!("AT_LEAST({need}, {})", conds.iter().map(|x| self.expr(x, names)).collect::<Vec<_>>().join(", ")),
             Expr::IsNull(x) => format!("{} IS NULL", self.operand(x, names)),
             Expr::Cmp { op, left, right } => {
                 let op = match op {

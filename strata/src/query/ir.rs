@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 17] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH];
+pub const FEATURES: [&str; 20] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -138,6 +138,19 @@ pub const PREFIX_EDITS: &str = "prefix_edits";
 /// reads `)@2` as a word and ignores `min`, and so returns other rows.
 pub const MIN_MATCH: &str = "min_match";
 
+/// The feature of a plan that counts conditions: `AT_LEAST(n, ..)`
+/// ([`Expr::AtLeast`]) or `count_true(..)` ([`Func::CountTrue`]).
+pub const AT_LEAST: &str = "at_least";
+
+/// The feature of a plan with a guarded Search ([`Search::guard`]:
+/// `min_rows`, `max_rows`).
+pub const GUARD: &str = "guard";
+
+/// The feature of a plan that keeps more than the first row of each
+/// group ([`Node::DistinctOn`] with `per` above 1: `MAX k PER field`). A
+/// Strata from before it would keep one.
+pub const PER_CAP: &str = "per_cap";
+
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
@@ -206,11 +219,18 @@ pub enum Node {
     Ref { name: String },
     /// The input's rows, each once.
     Distinct { input: Box<Node> },
-    /// The first of the input's rows with equal `keys`, in the input's
-    /// order (`DISTINCT ON`): a row per group, the groups in the order of
-    /// their first rows. Keys are equal when their values are, NULL equal
-    /// to NULL and a list to the same list. Needs [`DISTINCT_ON`].
-    DistinctOn { input: Box<Node>, keys: Vec<Expr> },
+    /// The first `per` of the input's rows with equal `keys`, in the
+    /// input's order (`DISTINCT ON`, and `MAX k PER field` for `per` k):
+    /// the other rows of a group are dropped, the rows kept stay in their
+    /// order. Keys are equal when their values are, NULL equal to NULL and
+    /// a list to the same list. Needs [`DISTINCT_ON`], and [`PER_CAP`]
+    /// with `per` above 1.
+    DistinctOn {
+        input: Box<Node>,
+        keys: Vec<Expr>,
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        per: u64,
+    },
     /// The input's rows (rows of one table) in the order of the rows of
     /// `by` with the same primary key.
     KeyOrder { input: Box<Node>, by: Box<Node> },
@@ -270,6 +290,41 @@ pub struct Search {
     /// (feature [`RANK_PROFILES`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileRef>,
+    /// Guarded relaxation (feature [`GUARD`]): the rows choose how many of
+    /// an `AT_LEAST`'s conditions, or of a `MATCH`'s or a `bm25`'s words,
+    /// a row needs ([`crate::query::logical::Guard`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<Box<Guard>>,
+}
+
+/// A [`Search`]'s guard: what it relaxes, the loosest level and the row
+/// limits that choose the level.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Guard {
+    pub site: GuardSite,
+    /// The loosest level: a count (`2`) or a share of the items (`"75%"`).
+    pub need: crate::text::query::Need,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
+}
+
+/// What a [`Guard`] relaxes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardSite {
+    /// `AT_LEAST(level, conds...)`, joined to the Search's filter.
+    AtLeast { conds: Vec<Expr> },
+    /// `MATCH(field, '(text)@level')`, joined to the Search's filter.
+    Match {
+        field: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Expand::is_none")]
+        expand: Expand,
+    },
+    /// The `min` of the Search's `bm25(field, text, min => ...)`.
+    Bm25 { field: u32, text: String },
 }
 
 /// A rank profile a Search ranks as ([`crate::query::profile`]): its name
@@ -414,6 +469,9 @@ pub enum Func {
     /// The prefix of `args[1]` levels of a semantic ID `args[0]`
     /// ([`crate::sid::sid_at`]); needs [`SEMANTIC_ID`].
     SidAt,
+    /// How many of its arguments, conditions, are TRUE (UNKNOWN counts
+    /// as not); needs [`AT_LEAST`].
+    CountTrue,
 }
 
 impl Func {
@@ -437,6 +495,7 @@ impl Func {
             Func::Clamp => "clamp",
             Func::Dot => "dot",
             Func::SidAt => "sid_at",
+            Func::CountTrue => "count_true",
         }
     }
 
@@ -467,7 +526,7 @@ impl Func {
             Func::Round | Func::Log => n == 1 || n == 2,
             Func::Pow | Func::Dot | Func::SidAt => n == 2,
             Func::Clamp => n == 3,
-            Func::Coalesce | Func::Least | Func::Greatest => n >= 1,
+            Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue => n >= 1,
         };
         match (ok, self) {
             (true, _) => Ok(()),
@@ -475,7 +534,7 @@ impl Func {
             (_, Func::Pow | Func::Dot) => Err("two arguments"),
             (_, Func::SidAt) => Err("two arguments: a semantic ID and a number of levels"),
             (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
-            (_, Func::Coalesce | Func::Least | Func::Greatest) => Err("at least one argument"),
+            (_, Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue) => Err("at least one argument"),
             _ => Err("one argument"),
         }
     }
@@ -488,7 +547,7 @@ impl Func {
         // NULL in, NULL out, except where a function skips it: `pow(1,
         // NULL)` and `clamp(NULL, 0, 1)` are not 1 and 0, as f64's pow and
         // max would make them.
-        if !matches!(self, Func::Coalesce | Func::Least | Func::Greatest) && args.iter().any(|a| a.is_nan()) {
+        if !matches!(self, Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue) && args.iter().any(|a| a.is_nan()) {
             return f64::NAN;
         }
         let x = args.first().copied().unwrap_or(f64::NAN);
@@ -515,6 +574,8 @@ impl Func {
             Func::Least => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::min).unwrap_or(f64::NAN),
             Func::Greatest => args.iter().copied().filter(|v| !v.is_nan()).reduce(f64::max).unwrap_or(f64::NAN),
             Func::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            // Conditions as 1 and 0.
+            Func::CountTrue => args.iter().filter(|&&v| v != 0.0 && !v.is_nan()).count() as f64,
             Func::Clamp => match (args.get(1), args.get(2)) {
                 (Some(&lo), Some(&hi)) => x.max(lo).min(hi),
                 _ => f64::NAN,
@@ -576,6 +637,10 @@ pub enum Expr {
     Not(Box<Expr>),
     And(Vec<Expr>),
     Or(Vec<Expr>),
+    /// Whether at least `need` of `conds` are TRUE (`AT_LEAST(n, c1,
+    /// ..)`): FALSE where fewer are TRUE and UNKNOWN, UNKNOWN where the
+    /// UNKNOWN ones decide it (feature [`AT_LEAST`]).
+    AtLeast { need: u32, conds: Vec<Expr> },
     /// The expression has no value (a multi-valued field: holds none).
     IsNull(Box<Expr>),
     Cmp { op: CmpOp, left: Box<Expr>, right: Box<Expr> },
@@ -838,6 +903,12 @@ impl Node {
         matches!(self, Node::DistinctOn { .. }) || self.inputs().into_iter().any(Node::keeps_firsts)
     }
 
+    /// Whether the node or one below it (outside subqueries) keeps more
+    /// than the first row of a group ([`PER_CAP`]).
+    fn caps_per(&self) -> bool {
+        matches!(self, Node::DistinctOn { per, .. } if *per > 1) || self.inputs().into_iter().any(Node::caps_per)
+    }
+
     /// Whether the node has the shape the executor runs: `Project [Limit]
     /// [Sort] [Filter] [Aggregate] Search` ([`Plan::to_select`] says
     /// whether it is one it takes). Its subqueries ([`Expr::Values`] and
@@ -1050,6 +1121,9 @@ impl Node {
                 each(&s.filter);
                 s.order.iter().for_each(|k| each(&k.expr));
                 s.phases.iter().for_each(|p| each(&p.expr));
+                if let Some(GuardSite::AtLeast { conds }) = s.guard.as_deref().map(|g| &g.site) {
+                    conds.iter().for_each(&mut each);
+                }
             }
             Node::Aggregate { input, keys, aggs } => {
                 keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).for_each(&mut each);
@@ -1094,7 +1168,7 @@ impl Node {
                 input.visit_exprs(f);
                 by.visit_exprs(f);
             }
-            Node::DistinctOn { input, keys } => {
+            Node::DistinctOn { input, keys, .. } => {
                 keys.iter().for_each(&mut each);
                 input.visit_exprs(f);
             }
@@ -1119,6 +1193,11 @@ impl Node {
                 each(&mut s.filter)?;
                 for e in s.order.iter_mut().map(|k| &mut k.expr).chain(s.phases.iter_mut().map(|p| &mut p.expr)) {
                     each(e)?;
+                }
+                if let Some(GuardSite::AtLeast { conds }) = s.guard.as_deref_mut().map(|g| &mut g.site) {
+                    for e in conds {
+                        each(e)?;
+                    }
                 }
                 Ok(())
             }
@@ -1182,7 +1261,7 @@ impl Node {
                 input.visit_exprs_mut(f)?;
                 by.visit_exprs_mut(f)
             }
-            Node::DistinctOn { input, keys } => {
+            Node::DistinctOn { input, keys, .. } => {
                 for k in keys {
                     each(k)?;
                 }
@@ -1398,7 +1477,7 @@ impl Expr {
         };
         match self {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } => x.visit(f),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
+            Expr::And(xs) | Expr::Or(xs) | Expr::AtLeast { conds: xs, .. } | Expr::Concat(xs) | Expr::Product(xs) => xs.iter().for_each(|x| x.visit(f)),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.visit(f);
                 right.visit(f);
@@ -1439,7 +1518,14 @@ impl Expr {
         let mut within: Vec<&mut Expr> = Vec::new();
         match self {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
-            Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
+            Expr::And(xs)
+            | Expr::Or(xs)
+            | Expr::AtLeast { conds: xs, .. }
+            | Expr::Concat(xs)
+            | Expr::Product(xs)
+            | Expr::Call { args: xs, .. }
+            | Expr::Gbdt { args: xs, .. }
+            | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. }
             | Expr::Prefix { expr: left, prefix: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
@@ -1477,6 +1563,14 @@ impl Expr {
 
 fn is_zero(x: &u64) -> bool {
     *x == 0
+}
+
+fn one() -> u64 {
+    1
+}
+
+fn is_one(x: &u64) -> bool {
+    *x == 1
 }
 
 fn is_zero_u8(x: &u8) -> bool {
@@ -1540,14 +1634,18 @@ impl Plan {
         if edits {
             features.push(PREFIX_EDITS.to_string());
         }
-        let mut distinct_on = root.keeps_firsts();
+        let (mut distinct_on, mut per_cap) = (root.keeps_firsts(), root.caps_per());
         root.visit_exprs(&mut |e| {
             if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) = e {
                 distinct_on |= n.keeps_firsts();
+                per_cap |= n.caps_per();
             }
         });
         if distinct_on {
             features.push(DISTINCT_ON.to_string());
+        }
+        if per_cap {
+            features.push(PER_CAP.to_string());
         }
         if root.walks_edge_tables() {
             features.push(EDGE_TABLE.to_string());
@@ -1567,6 +1665,16 @@ impl Plan {
         }
         if root.has_min_match() {
             features.push(MIN_MATCH.to_string());
+        }
+        let mut counts = false;
+        root.visit_exprs(&mut |e| counts |= matches!(e, Expr::AtLeast { .. } | Expr::Call { func: Func::CountTrue, .. }));
+        if counts {
+            features.push(AT_LEAST.to_string());
+        }
+        let mut guarded = false;
+        root.each_search(&mut |s| guarded |= s.guard.is_some());
+        if guarded {
+            features.push(GUARD.to_string());
         }
         Plan { version: VERSION, features, root }
     }

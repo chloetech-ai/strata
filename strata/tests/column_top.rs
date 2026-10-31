@@ -65,7 +65,7 @@ fn run(db: &Db, sql: &str, opts: &ExecOptions) -> (Vec<(String, Value, Value)>, 
 fn check(db: &Db) -> usize {
     let scan = ExecOptions { column_blocks: false, ..ExecOptions::default() };
     let modes = [ExecOptions::default(), ExecOptions { filter_mode: Some(FilterMode::Probe), ..ExecOptions::default() }, ExecOptions { filter_mode: Some(FilterMode::Materialize), ..ExecOptions::default() }];
-    let filters = ["", "WHERE PREFIX(id, 'a')", "WHERE tag = 't3'", "WHERE n < 50", "WHERE PREFIX(id, 'q1')", "WHERE x > 100 AND PREFIX(id, 'b')", "WHERE n IS NULL OR tag = 't1'"];
+    let filters = ["", "WHERE PREFIX(id, 'a')", "WHERE tag = 't3'", "WHERE n < 50", "WHERE PREFIX(id, 'q1')", "WHERE x > 100 AND PREFIX(id, 'b')", "WHERE n IS NULL OR tag = 't1'", "WHERE AT_LEAST(2, n < 50, x > 100, PREFIX(id, 'a'))"];
     let orders = ["n DESC", "n", "n DESC NULLS FIRST", "n NULLS FIRST", "x DESC", "x", "x DESC NULLS FIRST"];
     let mut on_blocks = 0;
     for (fi, f) in filters.iter().enumerate() {

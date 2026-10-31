@@ -23,7 +23,7 @@
 //! `ppr(field, seeds, ...)` and the column `hops()`. Seeds are a key, a
 //! parameter, a tuple of keys or a subquery over the same table.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ use crate::query::compound::outer_field;
 use crate::query::ir::{ArithOp, CmpOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::rank::Rank;
-use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
+use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Guard, GuardSite, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
@@ -439,7 +439,7 @@ pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
     let projection = every_field(schema);
     let types = projection_types(schema, &projection);
     let filter = if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } };
-    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types })
+    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types, guard: None })
 }
 
 fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
@@ -596,7 +596,11 @@ pub(crate) fn bind_query_with(q: &sql::Query, schema: &Schema, tables: &[&Schema
 /// ORDER BY expressions of the phases before it, first to last, which
 /// `features()` lists with its own.
 pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, tables: &[&Schema], params: &Params, subs: &Subs, earlier: &[Expr]) -> Result<Select> {
-    Binder { subs: Some(subs), earlier, tables, ..Binder::new(schema, params) }.query(q)
+    let s = Binder { subs: Some(subs), earlier, tables, ..Binder::new(schema, params) }.query(q)?;
+    if s.guard.is_some() {
+        return Err(err("min_rows and max_rows guard a search's first ranking, not a rerank phase"));
+    }
+    Ok(s)
 }
 
 /// `sql_text`, one SELECT that ranks rows (a table's, or rerank phases'),
@@ -651,11 +655,77 @@ struct Binder<'a> {
     /// The database's tables, whose edge tables a walk may follow
     /// (`ppr(cooc, ...)`); empty when the query is bound alone.
     tables: &'a [&'a Schema],
+    /// Guards bound so far (`max_rows`, `min_rows`), each with the `WHERE`
+    /// condition it guards (none for a `bm25`'s) and whether it was bound
+    /// in `ORDER BY`.
+    guards: RefCell<Vec<(Guard, Option<Pred>, bool)>>,
+    /// Whether `ORDER BY` is being bound.
+    ordering: Cell<bool>,
 }
 
 impl<'a> Binder<'a> {
     fn new(schema: &'a Schema, params: &'a Params) -> Self {
-        Binder { schema, params, subs: None, graphs: RefCell::new(Vec::new()), now: crate::timestamp::now(), earlier: &[], tables: &[] }
+        Binder {
+            schema,
+            params,
+            subs: None,
+            graphs: RefCell::new(Vec::new()),
+            now: crate::timestamp::now(),
+            earlier: &[],
+            tables: &[],
+            guards: RefCell::new(Vec::new()),
+            ordering: Cell::new(false),
+        }
+    }
+
+    /// Records a guard of `site` if `opts` give `min_rows` or `max_rows`,
+    /// taking them out of `opts`; `term` is the `WHERE` condition it guards.
+    fn guard(&self, opts: &mut Opts, site: impl FnOnce() -> GuardSite, need: Option<crate::text::query::Need>, term: Option<&Pred>, what: &str) -> Result<()> {
+        let mut rows = |k: &str| {
+            opts.remove(k)
+                .map(|v| v.as_f64().filter(|x| x.fract() == 0.0 && (0.0..1e15).contains(x)).map(|x| x as u64).ok_or_else(|| err(format!("{k} => a count of rows (500), not {v:?}"))))
+                .transpose()
+        };
+        let (min_rows, max_rows) = (rows("min_rows")?, rows("max_rows")?);
+        if min_rows.is_none() && max_rows.is_none() {
+            return Ok(());
+        }
+        let need = need.ok_or_else(|| err(format!("min_rows and max_rows on {what} relax its min => n, which it needs")))?;
+        self.guards.borrow_mut().push((Guard { site: site(), need, min_rows, max_rows }, term.cloned(), self.ordering.get()));
+        Ok(())
+    }
+
+    /// `filter` without the condition a guard of `WHERE` guards, and the
+    /// query's guard: one at most, on a condition joined to the rest by
+    /// `AND`, or on a `bm25` of `ORDER BY`.
+    fn take_guard(&self, filter: Pred) -> Result<(Pred, Option<Guard>)> {
+        let mut guards = self.guards.take();
+        if guards.len() > 1 {
+            return Err(err("a query has one guard (min_rows, max_rows) at most"));
+        }
+        let Some((guard, term, in_order)) = guards.pop() else { return Ok((filter, None)) };
+        let multi = |f: usize| self.schema.fields[f].multi;
+        let guard = match guard.site {
+            GuardSite::AtLeast(items) => Guard { site: GuardSite::AtLeast(items.into_iter().map(|p| p.three_valued(&multi).simplify()).collect()), ..guard },
+            _ => guard,
+        };
+        let Some(term) = term else {
+            return match in_order {
+                true => Ok((filter, Some(guard))),
+                false => Err(err("min_rows and max_rows on bm25 guard the ranking of ORDER BY")),
+            };
+        };
+        let mut terms = match filter {
+            Pred::And(ps) => ps,
+            p => vec![p],
+        };
+        match terms.iter().position(|p| *p == term) {
+            Some(i) => {
+                terms.remove(i);
+                Ok((Pred::And(terms), Some(guard)))
+            }
+            None => Err(err("min_rows and max_rows guard a condition of WHERE joined to the others by AND, not one inside OR, NOT or another condition")),
+        }
     }
 
     /// The expression a compound query's subquery stands for.
@@ -691,8 +761,9 @@ impl<'a> Binder<'a> {
                 return Err(err("ORDER BY ... WITH FILL and INTERPOLATE are not supported"));
             }
         }
+        // Simplified once ORDER BY's guard is known too.
         let filter = match &s.selection {
-            Some(e) => self.pred(e)?.three_valued(&|f| self.schema.fields[f].multi).simplify(),
+            Some(e) => self.pred(e)?,
             None => Pred::True,
         };
         let group_by: Vec<usize> = match &s.group_by {
@@ -765,7 +836,10 @@ impl<'a> Binder<'a> {
                     let mut order = if aggregated {
                         self.group_order(&es[0].expr, desc, &projection, &group_by)?
                     } else {
-                        self.order(&es[0].expr, desc, &projection)?
+                        self.ordering.set(true);
+                        let order = self.order(&es[0].expr, desc, &projection);
+                        self.ordering.set(false);
+                        order?
                     };
                     // Rows without the column's value come last, either way
                     // (as in Elasticsearch); `NULLS FIRST` puts them first.
@@ -794,9 +868,11 @@ impl<'a> Binder<'a> {
                 (Some(self.usize_lit(limit)?), self.usize_lit(offset)?)
             }
         };
+        let (filter, guard) = self.take_guard(filter)?;
+        let filter = filter.three_valued(&|f| self.schema.fields[f].multi).simplify();
         let graphs = self.graphs.take();
         let types = projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases: Vec::new(), limit, offset, graphs, types })
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases: Vec::new(), limit, offset, graphs, types, guard })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -1380,9 +1456,11 @@ impl<'a> Binder<'a> {
                         let [field, text] = args.as_slice() else { return Err(err("bm25(field, text)")) };
                         let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
+                        let mut opts = opts;
                         Expand::from_opts(&opts).map_err(err)?;
                         crate::query::exec::plain_syntax(&opts)?;
-                        crate::query::exec::min_need(&opts)?;
+                        let need = crate::query::exec::min_need(&opts)?;
+                        self.guard(&mut opts, || GuardSite::Bm25 { field, text: text.clone() }, need, None, "bm25")?;
                         Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
                     "similarity" => self.similarity(&args, opts, false),
@@ -1426,6 +1504,14 @@ impl<'a> Binder<'a> {
                             return Err(err(usage));
                         }
                         Ok(Score::Gbdt { model, hash: String::new(), args: features.iter().map(|a| self.rank(a)).collect::<Result<_>>()?, open: Default::default() })
+                    }
+                    // Each condition 1 where WHERE would keep the row, else 0.
+                    "count_true" => {
+                        if args.is_empty() || !opts.is_empty() {
+                            return Err(err("count_true(condition, ...) takes one or more conditions"));
+                        }
+                        let cond = |c: &Expr| Ok(Score::Cond(Box::new(self.pred(c)?.three_valued(&|f| self.schema.fields[f].multi).simplify())));
+                        Ok(Score::Call { func: Func::CountTrue, args: args.iter().map(|a| cond(a)).collect::<Result<_>>()? })
                     }
                     n => match Func::numeric(n) {
                         Some(func) => {
@@ -1617,17 +1703,39 @@ impl<'a> Binder<'a> {
                 if !self.schema.fields[field].indexed {
                     return Err(err(format!("{} is not indexed", self.schema.fields[field].name)));
                 }
-                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "synonyms" | "fuzzy" | "min")) {
-                    return Err(err(format!("unknown option {k} for MATCH: synonyms, fuzzy, min")));
+                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "synonyms" | "fuzzy" | "min" | "min_rows" | "max_rows")) {
+                    return Err(err(format!("unknown option {k} for MATCH: synonyms, fuzzy, min, min_rows, max_rows")));
                 }
+                let text = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
+                crate::text::query::parse_match_with(&text, self.schema.fields[field].text_analyzer())?;
+                let need = crate::query::exec::min_need(&opts)?;
+                let mut guarded = opts.clone();
                 let expand = Expand::from_opts(&opts).map_err(err)?;
-                let mut query = self.literal(q)?.as_str().ok_or_else(|| err("MATCH query must be a string"))?.to_string();
-                crate::text::query::parse_match_with(&query, self.schema.fields[field].text_analyzer())?;
                 // `min => n`: the query as one group a row needs n of.
-                if let Some(need) = crate::query::exec::min_need(&opts)? {
-                    query = format!("({query})@{need}");
+                let query = match need {
+                    Some(need) => format!("({text})@{need}"),
+                    None => text.clone(),
+                };
+                let p = Pred::Match { field, query, expand };
+                self.guard(&mut guarded, || GuardSite::Match { field, text, expand }, need, Some(&p), "MATCH")?;
+                p
+            }
+            // At least n of the conditions; n may be a share of them.
+            Expr::Function(func) if fname(func) == "at_least" => {
+                let usage = "AT_LEAST(n, condition, ...): n a count (2) or a percentage ('75%') of the conditions";
+                let (args, mut opts) = self.args(func)?;
+                let [n, conds @ ..] = args.as_slice() else { return Err(err(usage)) };
+                if conds.is_empty() {
+                    return Err(err(usage));
                 }
-                Pred::Match { field, query, expand }
+                if let Some(k) = opts.keys().find(|k| !matches!(k.as_str(), "min_rows" | "max_rows")) {
+                    return Err(err(format!("unknown option {k} for AT_LEAST: min_rows, max_rows")));
+                }
+                let need = crate::query::exec::need_of(&self.literal(n)?, "AT_LEAST's n is")?.of(conds.len());
+                let items: Vec<Pred> = conds.iter().map(|c| self.pred(c)).collect::<Result<_>>()?;
+                let p = Pred::AtLeast { need, items: items.clone() };
+                self.guard(&mut opts, || GuardSite::AtLeast(items), Some(crate::text::query::Need::Count(need)), Some(&p), "AT_LEAST")?;
+                p
             }
             Expr::Like { negated, any: false, expr, pattern, escape_char } => {
                 let f = self.prefix_field(expr)?;
@@ -2163,7 +2271,7 @@ fn check_select(s: &sql::Select) -> Result<()> {
 fn contains_graph(p: &Pred) -> bool {
     match p {
         Pred::Graph { .. } => true,
-        Pred::And(ps) | Pred::Or(ps) => ps.iter().any(contains_graph),
+        Pred::And(ps) | Pred::Or(ps) | Pred::AtLeast { items: ps, .. } => ps.iter().any(contains_graph),
         Pred::Not(q) => contains_graph(q),
         _ => false,
     }

@@ -113,6 +113,31 @@ impl Need {
     }
 }
 
+/// A count as a number (`2`), a percentage as text (`"75%"`).
+impl serde::Serialize for Need {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Need::Count(n) => s.serialize_u64(*n as u64),
+            Need::Percent(_) => s.serialize_str(&self.to_string()),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Need {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Need, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Count(u64),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Count(n) => usize::try_from(n).map(Need::Count).map_err(serde::de::Error::custom),
+            Raw::Text(t) => Need::parse(t.trim()).ok_or_else(|| serde::de::Error::custom(format!("a count (2) or a percentage (\"75%\"), not {t:?}"))),
+        }
+    }
+}
+
 impl std::fmt::Display for Need {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -371,6 +396,17 @@ pub const MAX_DEPTH: usize = 100;
 /// field. A query whose words are all stopwords matches nothing (`Or([])`).
 pub fn parse_match(q: &str) -> Result<BoolQuery> {
     parse_match_with(q, Analyzer::English)
+}
+
+/// How many items a row could count of the group `(q)@n`: its top-level
+/// operands that are not negated and analyse to something.
+pub fn group_size(q: &str, analyzer: Analyzer) -> Result<usize> {
+    let mut p = Parser { toks: lex(q)?.0, analyzer, pos: 0, depth: 0 };
+    Ok(match p.or()? {
+        None | Some(BoolQuery::Not(_)) => 0,
+        Some(BoolQuery::And(cs) | BoolQuery::Or(cs)) => cs.iter().filter(|c| !matches!(c, BoolQuery::Not(_))).count(),
+        Some(_) => 1,
+    })
 }
 
 /// [`parse_match`] of a field whose text `analyzer` analyses.

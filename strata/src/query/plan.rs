@@ -205,6 +205,33 @@ impl<E: Estimator> Planner<'_, E> {
                 let mat_cost = es.iter().map(|e| e.mat_cost).sum::<f64>() + es.iter().skip(1).map(|e| e.card.min(es[0].card)).sum::<f64>() * c.emit;
                 PredEstimate { card, mat_cost, probe_cost, probeable: es.iter().all(|e| e.probeable) }
             }
+            Pred::AtLeast { need, items } => {
+                // Independent items: the chance of at least `need`, from
+                // the distribution of how many hold (each item's chance
+                // its share of rows).
+                let es: Vec<PredEstimate> = items.iter().map(|q| self.estimate(q)).collect();
+                let mut dist = vec![1.0];
+                for e in &es {
+                    let p = (e.card / n).clamp(0.0, 1.0);
+                    let mut next = vec![0.0; dist.len() + 1];
+                    for (k, &q) in dist.iter().enumerate() {
+                        next[k] += q * (1.0 - p);
+                        next[k + 1] += q * p;
+                    }
+                    dist = next;
+                }
+                let card = n * dist.iter().skip(*need).sum::<f64>().min(1.0);
+                // Counting: each item's word of 64 rows rippled through the
+                // counter's ⌈log2(y + 1)⌉ words, then one comparison.
+                let planes = (usize::BITS - es.len().leading_zeros()) as f64;
+                let count = n / 64.0 * planes * (es.len() + 1) as f64 * c.emit;
+                PredEstimate {
+                    card,
+                    mat_cost: es.iter().map(|e| e.mat_cost).sum::<f64>() + count + card * c.emit,
+                    probe_cost: es.iter().map(|e| e.probe_cost).sum(),
+                    probeable: es.iter().all(|e| e.probeable),
+                }
+            }
             Pred::Or(ps) => {
                 let es: Vec<PredEstimate> = ps.iter().map(|q| self.estimate(q)).collect();
                 let miss = es.iter().fold(1.0, |acc, e| acc * (1.0 - e.card / n));
