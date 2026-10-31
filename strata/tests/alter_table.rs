@@ -327,7 +327,7 @@ fn an_added_embedding_embeds_new_rows_and_follows_renames() {
     run(&db, "ALTER TABLE items ADD COLUMN emb VECTOR OPTIONS(embed = 'title', model = 'hash:8', index = 'flat')");
     assert!(db.embedder_in("items", "emb").is_some());
     let h = strata::embed::HashEmbedder { dim: 8 };
-    let vector = |text: &str| Value::Vector(strata::embed::Embedder::embed(&h, &[text]).remove(0).into());
+    let vector = |text: &str| Value::Vector(strata::embed::Embedder::embed(&h, &[text]).unwrap().remove(0).into());
     run(&db, "INSERT INTO items (id, title) VALUES ('d', 'ripe mango')");
     assert_eq!(rows(&db, "SELECT emb FROM items WHERE id = 'd'"), [[vector("ripe mango")]]);
     // Older rows have no vector until their source is written again.
