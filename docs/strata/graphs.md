@@ -106,7 +106,7 @@ flowchart LR
 
 The traversals:
 
-- **Reachability:** breadth-first search, frontier by frontier, stopping at `max_nodes`.
+- **Reachability:** breadth-first search, frontier by frontier; a search that would meet more than `max_nodes` rows besides its seeds is an error rather than an answer that depends on the order of the edges.
 - **Shortest paths:** bidirectional breadth-first search, always expanding the smaller frontier, forward along the edges or backward against them.
 - **Personalized PageRank:** forward push (Andersen, Chung and Lang, 2006). The vector π solves
 

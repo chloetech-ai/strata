@@ -527,6 +527,9 @@ impl<'a> Raise<'a> {
                 Some(p)
             }
         };
+        if g.max_nodes == 0 || g.k == 0 {
+            return Err(err("a traversal's max_nodes and k are 1 or more"));
+        }
         let g = GraphQuery {
             field,
             edges: g.edges.clone(),

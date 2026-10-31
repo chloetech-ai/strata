@@ -392,7 +392,7 @@ fn traversal_study(db: &Db, table: &str, field: &str, ids: &[i64], edges: &[(i64
         let (ms, lens) = time_all(queries, |i| db.query(&sql, &Params::new().set("a", Value::Int(pairs[i].0)).set("b", Value::Int(pairs[i].1))).unwrap().rows.len());
         csr.dir = dir_code(dir);
         let (cms, clens) = time_all(queries, |i| {
-            traverse::shortest_path(&mut csr, &[pos[&pairs[i].0] as Node], &[pos[&pairs[i].1] as Node], 10, usize::MAX).unwrap().0.map_or(0, |p| p.len())
+            traverse::shortest_path(&mut csr, &[pos[&pairs[i].0] as Node], &[pos[&pairs[i].1] as Node], 10, usize::MAX).unwrap().nodes.map_or(0, |p| p.len())
         });
         assert_eq!(lens, clens, "path lengths disagree ({dir})");
         let found = lens.iter().filter(|&&l| l > 0).count();

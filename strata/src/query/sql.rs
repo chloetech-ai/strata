@@ -983,6 +983,14 @@ impl<'a> Binder<'a> {
             }
             Ok(x as u32)
         };
+        // A limit: 0 would be read as nothing, so it is refused.
+        let at_least_one = |k: &str, d: f64, most: f64| -> Result<f64> {
+            let x = num(k, d)?;
+            if x < 1.0 || x.fract() != 0.0 || x > most {
+                return Err(err(format!("{k} must be a whole number from 1 to {most}")));
+            }
+            Ok(x)
+        };
         let dir = match opts.get("dir").map(|v| v.as_str().unwrap_or("")) {
             None => if name == "ppr" { Direction::Both } else { Direction::Out },
             Some("out") => Direction::Out,
@@ -1000,7 +1008,8 @@ impl<'a> Binder<'a> {
             return Err(err(format!("the edges of edge table {t} have no labels")));
         }
         let kind = match name {
-            "path" => GraphKind::Path { to: self.seeds(args[2])?, max_hops: count("max_hops", 6.0)?.max(1) },
+            // `max_hops => 0`: only a seed that is also a target.
+            "path" => GraphKind::Path { to: self.seeds(args[2])?, max_hops: count("max_hops", 6.0)? },
             "ppr" => {
                 let alpha = num("alpha", 0.15)?;
                 let eps = num("eps", 1e-4)?;
@@ -1026,8 +1035,8 @@ impl<'a> Binder<'a> {
             dir,
             labels,
             through,
-            max_nodes: num("max_nodes", 100_000.0)?.max(1.0) as usize,
-            k: count("k", 10.0)?.max(1) as usize,
+            max_nodes: at_least_one("max_nodes", 100_000.0, 1e9)? as usize,
+            k: at_least_one("k", 10.0, 1e6)? as usize,
             min_sim: num("min_sim", f64::NEG_INFINITY)?,
         };
         // The same computation named twice (in SELECT and ORDER BY) runs
@@ -1483,6 +1492,13 @@ impl<'a> Binder<'a> {
                         Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
                     "similarity" => self.similarity(&args, opts, false),
+                    // A field's dot product with a vector is its similarity
+                    // (NULL for a row without one), in either order.
+                    "dot" => match args.as_slice() {
+                        [a, b] if self.field_of(a).is_err() && self.field_of(b).is_ok() => self.similarity(&[*b, *a], opts, false),
+                        [_, _] => self.similarity(&args, opts, false),
+                        _ => Err(err("dot(field, vector) takes two arguments")),
+                    },
                     "distance" => Err(err("distance(...) ranks on its own, ORDER BY distance(...) ASC; in an expression, use similarity(...), which ranks larger first")),
                     "maxsim" => self.maxsim(&args, opts),
                     "rrf" => {
@@ -2060,6 +2076,7 @@ impl<'a> Binder<'a> {
                 sql::Value::Placeholder(p) => Ok(self.params.get(p)?.clone()),
                 other => Err(err(format!("unsupported literal {other}"))),
             },
+            Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } if negative_integer(expr).is_some() => Ok(Value::Int(negative_integer(expr).expect("an integer"))),
             Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match self.literal(expr)? {
                 // -i64::MIN is the one integer without a negation.
                 Value::Int(x) => Ok(x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int)),
@@ -2407,6 +2424,19 @@ pub(crate) fn encode_call(f: &sql::Function, literal: &dyn Fn(&Expr) -> Result<V
 
 fn fname(f: &sql::Function) -> String {
     f.name.to_string().to_ascii_lowercase()
+}
+
+/// `-n` written as a minus and a number, as one integer: the only way to
+/// write `-9223372036854775808` (i64::MIN), whose number alone is past an
+/// INT.
+pub(crate) fn negative_integer(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            sql::Value::Number(s, _) => format!("-{s}").parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn literal_usize(e: &Expr) -> Option<usize> {

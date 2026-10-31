@@ -408,6 +408,7 @@ fn default_value(e: &Expr) -> std::result::Result<J, String> {
             sql::Value::Number(n, _) => n.parse::<i64>().map(|n| json!(n)).or_else(|_| n.parse::<f64>().map(|x| json!(x))).map_err(|_| format!("DEFAULT {n} is not a number")),
             _ => Err(format!("DEFAULT {e} is not a constant")),
         },
+        Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } if super::sql::negative_integer(expr).is_some() => Ok(json!(super::sql::negative_integer(expr))),
         Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match default_value(expr)? {
             J::Number(n) if n.is_i64() => Ok(json!(-n.as_i64().unwrap_or(0))),
             J::Number(n) if n.is_f64() => Ok(json!(-n.as_f64().unwrap_or(0.0))),

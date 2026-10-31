@@ -361,6 +361,9 @@ struct Cte {
     columns: Vec<String>,
     keyed: Option<String>,
     multi: Vec<bool>,
+    /// The ORDER BY its rows were ranked by, which `score()` over them
+    /// reads when the query reading them has none.
+    order: Option<sql::OrderBy>,
 }
 
 struct Planner<'a> {
@@ -514,7 +517,8 @@ impl<'a> Planner<'a> {
                     p = Planned { node: ir::Node::Project { input: Box::new(p.node), columns: exprs }, columns, keyed: None, multi: p.multi };
                 }
                 let name = cte.alias.name.value.clone();
-                self.ctes.borrow_mut().push(Cte { name: name.clone(), columns: p.columns, keyed: p.keyed, multi: p.multi });
+                let order = cte.query.order_by.clone().filter(|_| p.keyed.is_some());
+                self.ctes.borrow_mut().push(Cte { name: name.clone(), columns: p.columns, keyed: p.keyed, multi: p.multi, order });
                 defs.push(ir::Cte { name, input: p.node });
             }
         }
@@ -873,6 +877,17 @@ impl<'a> Planner<'a> {
         }
         *name = sql::ObjectName::from(vec![sql::Ident::new(schema.table.clone())]);
         let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s) || s.distinct.is_some();
+        // `score()` without an ORDER BY is the score the WITH result ranked
+        // its rows by: ranking them again by it keeps their order.
+        let mut score = false;
+        for i in &s.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = i {
+                walk(e, &mut |x| score |= matches!(x, Expr::Function(f) if fname(f) == "score"));
+            }
+        }
+        if q.order_by.is_none() && !grouped && score {
+            q.order_by = cte.order.clone();
+        }
         // Without an ORDER BY, rows keep the WITH result's order, so the
         // cut happens after reordering.
         let reorder = q.order_by.is_none() && !grouped;
@@ -1687,7 +1702,10 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         Expr::Nested(x) | Expr::UnaryOp { op: UnaryOperator::Plus, expr: x } => go(x)?,
         Expr::Value(v) => ir::Expr::Lit(literal(&v.value, params)?),
         Expr::UnaryOp { op: UnaryOperator::Not, expr } => ir::Expr::Not(bx(expr)?),
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => ir::Expr::Neg(bx(expr)?),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match super::sql::negative_integer(expr) {
+            Some(n) => ir::Expr::Lit(Value::Int(n)),
+            None => ir::Expr::Neg(bx(expr)?),
+        },
         Expr::IsNull(x) => ir::Expr::IsNull(bx(x)?),
         Expr::IsNotNull(x) => ir::Expr::Not(Box::new(ir::Expr::IsNull(bx(x)?))),
         Expr::BinaryOp { left, op, right } => {
@@ -1897,18 +1915,23 @@ impl Planner<'_> {
         let grouped = !group_exprs.is_empty() || !calls.is_empty();
         // ORDER BY an output column's name or number, or an expression over
         // the input row.
-        let by_alias = |e: &Expr| -> Option<usize> {
-            match e {
+        // A number is a position (`ORDER BY 2`), and one past the columns
+        // an error, not a constant that orders nothing.
+        let by_alias = |e: &Expr, what: &str| -> Result<Option<usize>> {
+            Ok(match e {
                 Expr::Identifier(id) => items.iter().position(|(n, _)| n.eq_ignore_ascii_case(&id.value)),
-                Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => e.to_string().parse::<usize>().ok().filter(|n| (1..=items.len()).contains(n)).map(|n| n - 1),
+                Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => match e.to_string().parse::<usize>() {
+                    Ok(n) if (1..=items.len()).contains(&n) => Some(n - 1),
+                    _ => return Err(err(format!("{what} {e}: no such column (the SELECT list has {} columns)", items.len()))),
+                },
                 _ => None,
-            }
+            })
         };
         let sort_keys = |items_at: &[ir::Expr], slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<Vec<ir::SortKey>> {
             order
                 .iter()
                 .map(|(e, desc, nulls_first)| {
-                    let expr = match by_alias(e) {
+                    let expr = match by_alias(e, "ORDER BY")? {
                         Some(i) => items_at[i].clone(),
                         None => compile_with(e, params, slot, multi, Some(&subs))?,
                     };
@@ -1925,7 +1948,7 @@ impl Planner<'_> {
             }
             let keys = on
                 .iter()
-                .map(|e| match by_alias(e) {
+                .map(|e| match by_alias(e, "DISTINCT ON")? {
                     Some(i) => Ok(items_at[i].clone()),
                     None => compile_with(e, params, slot, multi, Some(&subs)),
                 })
