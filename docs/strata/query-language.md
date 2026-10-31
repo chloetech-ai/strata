@@ -58,7 +58,7 @@ SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() 
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
-[ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]]]
+[ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]] [MAX k PER <field>]]
 [LIMIT n [OFFSET m]]
 ```
 
@@ -68,7 +68,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 - **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `WINDOW`, `QUALIFY`, `GROUP BY ... WITH ROLLUP` and the like.
 - **`SELECT *`** returns every stored, non-vector column.
 - **`score()`** is the value of the `ORDER BY` score for each row; **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by. A [ranking expression](#features-the-values-a-ranking-read) that scores each row by itself is a column too (`bm25(title, :q) AS t`), and **`features()`** stands for the inputs of the query's ranking.
-- **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`.
+- **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`. `MAX k PER field` at its end keeps at most k rows of each value ([below](#at-most-k-rows-of-a-value-max-k-per)).
 - **Parameters** are `:name` placeholders, bound from the API or from the shell's `--param name=value`. A vector parameter is a JSON array.
 - **Limits.** An expression nests at most 1,000 levels, counting parentheses and the operators of a chain such as `a OR b OR …` (SQLite has the same default); a long list of values belongs in `IN (…)`, which has no such limit. A `LIMIT` larger than the table returns every row that qualifies. A query ranked by a score without a `LIMIT` returns 100 rows, counted after its `OFFSET`, on one database and through a coordinator alike.
 
@@ -87,7 +87,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | `MEDIA` | a file by reference: URI, SHA-256, type, size; a `KEYWORD` index of the hashes | `=`, `IN` on the hash; `GROUP BY` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
 
-Predicates combine with `AND`, `OR`, `NOT` and parentheses, across all of these.
+Predicates combine with `AND`, `OR`, `NOT`, [`AT_LEAST`](#some-of-the-conditions-at_least) and parentheses, across all of these, and [`max_rows`](#as-many-as-fit-min_rows-and-max_rows) lets an `AT_LEAST` choose its count.
 
 `INT` values are 64-bit integers and compare exactly: `id = 9007199254740993` finds that row and not 9007199254740992, which a double cannot tell apart. A fraction bounds integers by rounding inward (`n > 2.5` is `n >= 3`, `n = 2.5` matches nothing).
 
@@ -105,6 +105,50 @@ A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.
 
 A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), `sound_emb VECTOR OPTIONS(embed = 'recording', model = 'clap-htsat-unfused')` ([vectors of sound](server.md#vectors-of-sound)), and whose captions or transcripts a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')`, `transcript TEXT OPTIONS(derive = 'recording', model = 'whisper-small')` ([text from media](server.md#text-from-media)).
 
+## Some of the conditions: `AT_LEAST`
+
+`AT_LEAST(n, c1, c2, …)` holds where at least `n` of the conditions do. A condition is anything `WHERE` takes: a comparison, `IN`, `IS NULL`, `MATCH`, a graph predicate, a subquery condition, a group in parentheses, another `AT_LEAST`.
+
+```sql
+-- two of three signals, ranked by the text
+SELECT id, title FROM papers
+WHERE AT_LEAST(2, MATCH(title, 'covid'), year >= 2020, venue IN ('nejm', 'lancet'))
+ORDER BY bm25(body, :q) DESC LIMIT 20;
+
+-- rows meeting more of the conditions rank higher
+SELECT id FROM papers
+ORDER BY bm25(body, :q) * (1 + 0.1 * count_true(year >= 2021, venue IN ('nejm', 'lancet', 'jama'))) DESC LIMIT 20;
+```
+
+- **`n`** is a count, a percentage of the conditions (`'75%'`, rounded down) or a parameter (`:n`). Either is clamped to between 1 and the number of conditions, as [`MATCH`'s groups](#full-text-match) are: `AT_LEAST(1, …)` is the `OR` of the conditions, and a count past the end is their `AND`.
+- **`NULL`.** A condition that is UNKNOWN (a comparison with a `NULL`) is not met. Under `NOT`, `AT_LEAST` follows SQL's three-valued logic: `NOT AT_LEAST(n, …)` holds where fewer than `n` conditions would be TRUE even if every UNKNOWN one were, so it never returns a row whose answer depends on a `NULL`. With `a = 1` and `c` `NULL`, `AT_LEAST(2, a > 0, c = 'x')` leaves the row out, and so does `NOT AT_LEAST(2, a > 0, c = 'x')`.
+- **`count_true(c1, c2, …)`** is how many of the conditions hold, a number for [ranking expressions](#ranking-expressions) and `SELECT`, exactly the sum of `CASE WHEN c THEN 1 ELSE 0 END` over them: a condition on a `NULL` counts 0. In a `SELECT` over rows in memory (a join, a `WITH` result) its conditions cannot use `MATCH` or graph predicates, which only a table's indexes answer.
+- **How it runs.** Each condition becomes the set of rows it holds for, as `WHERE` evaluates it, and a counter adds the sets up 64 rows to a machine word, in ⌈log2(y + 1)⌉ words for each 64 rows; sets with few rows are merged instead. A ranking that checks its candidates one at a time tests their conditions in turn, until the count is reached or out of reach. The cost grows with the number of conditions, not with `n`: over 1,000,000 rows where each condition holds for an independent 20% of them, counting the rows took 3.0 ms for 2 of 4 conditions, 4.1 ms for 4 of 8 and 9.3 ms for 8 of 16, against 0.37 ms for one condition. The same conditions written as an `OR` of every `AND` of `n` took 8.2 ms for 2 of 4 (6 `AND`s) and 114 ms for 4 of 8 (70), and 8 of 16 would need 12,870 (`strata-at-least-bench` on a 4-core cloud VM, Intel Xeon @ 2.10GHz, `strata/results/strata/at_least.json`).
+- A plan with `AT_LEAST` or `count_true` needs the plan feature `at_least`. From Python, [`at_least(2, match("title", "covid"), col("year") >= 2020)`](python.md#queries-built-in-python) and `count_true(…)` build them.
+
+## As many as fit: `min_rows` and `max_rows`
+
+An "x of y" condition can choose its own x. With `max_rows` or `min_rows`, an `AT_LEAST`, a `MATCH(…, min => n)` or a `bm25(…, min => n)` asks for all y of its items first, and relaxes towards `n` while the rows are too few, stopping before a level that would match more than `max_rows`:
+
+```sql
+-- as many of the signals as keep the candidates to 2,000 or fewer
+SELECT id, title FROM papers
+WHERE year >= 2015 AND AT_LEAST(2, MATCH(title, 'covid'), venue IN ('nejm', 'lancet'), cited > 100, max_rows => 2000)
+ORDER BY bm25(body, :q) DESC LIMIT 20;
+
+-- all four words if 50 rows have them, else three, else two
+SELECT id, score() FROM docs
+ORDER BY bm25(body, 'mrna vaccine trial phase', min => 2, min_rows => 50) DESC LIMIT 10;
+```
+
+- **The level.** From the strictest level, all y items, a guard relaxes one item at a time while the level matches fewer than `min_rows` rows and the next looser one no more than `max_rows`, down to `n`. With `max_rows` alone that is the loosest level that fits, and with `min_rows` alone the strictest with enough rows. If even all y match more than `max_rows`, the query runs at y. The rows counted are those the rest of `WHERE` keeps; `LIMIT` does not cut them.
+- **Where.** A guard is an `AT_LEAST` or a `MATCH` joined to the rest of `WHERE` by `AND` (not one under `OR`, `NOT` or another condition), or a `bm25` of the first ranking of `ORDER BY`. `MATCH` and `bm25` need a `min`, the loosest level; `AT_LEAST`'s is its `n`. A query has one guard at most, and a [rerank phase](#rerank-phases) none. A `SELECT` over a `WITH` result that is not a rerank phase counts that result's rows.
+- **The plan line** gives each level's rows and the level chosen: `guard: AT_LEAST 3 of 4 (4: 12, 3: 340, 2: 5120, 1: 23000; max_rows 2000)`.
+- **Its cost** is counting the rows of every level, over all the rows the rest of `WHERE` keeps, before running at one: a guarded query costs about what counting its matches does, whatever its `LIMIT`. Over 1,000,000 rows where each condition holds for an independent 20% of them, `AT_LEAST(1, …, max_rows => 10000) LIMIT 100` took 2.5 ms over 4 conditions, 6.1 ms over 8 and 11.6 ms over 16, against 0.25, 0.51 and 0.98 ms for the same query written at the level chosen. For four words of different frequencies, over rows of 12 words drawn by Zipf's law from 5,000, `bm25(body, …, min => 1, max_rows => 1000)` took 2.4 ms at the median of 50 queries (`LIMIT 10`), against 1.4 ms at the level chosen and 0.75 ms without `min`, and a `MATCH` guarded alike 2.3 ms against 1.3 ms. A text's words are counted once each, as `AT_LEAST`'s conditions are, unless it has required or excluded words, when each level is counted in turn (`strata-guard-bench` on a 4-core cloud VM, Intel Xeon @ 2.10GHz, `strata/results/strata/guard.json`).
+- **What it keeps.** BEIR's queries are sentences, and few rows hold all of a sentence's words. On five BEIR collections the top 100 rows by `bm25(body, :q, min => '100%')` held 0.03 to 0.40 of the relevant rows (recall@100), against 0.13 to 0.97 for any of the words; `min => 1, min_rows => 100`, all the words while 100 rows have them, else as many as 100 rows have, held 0.10 to 0.96, within 0.4 to 7.7 points of any word, with nDCG@10 within 0.013 of it, at a median of 0.15 to 2.05 ms a query, 0.8 to 1.6 times the any-word query's (`strata-bm25-eval`, the `_r100` variants, 3 runs each on a 4-core cloud VM, Intel Xeon @ 2.10GHz, `strata/results/text/bm25_guard.json`).
+- **Over shards**, a coordinator first asks every shard for its counts (protocol 8, so a shard of an older server is refused by name), adds them up, chooses the level as one database would, and sends the shards the query at that level: one round more. A shard answering a coordinator runs the level it is sent, never one of its own. With rows like those above split over 4 shards on one machine, the guarded `AT_LEAST` of 4, 8 and 16 conditions took 4.3, 7.4 and 12.6 ms through the coordinator (1.6, 2.6 and 1.8 ms at the level chosen) against 2.3, 3.9 and 7.7 ms on one database, and the guarded `bm25` 4.3 ms against 1.7 ms, medians of 50 queries (`strata-guard-shards-bench`, the same VM, `strata-server/results/guard/shards-4.json`).
+- A plan with a guard needs the plan feature `guard`. From Python, `at_least(2, …, max_rows=2000)`, `match(field, query, min=2, max_rows=500)` and `bm25(field, text, min=2, min_rows=50)`.
+
 ## Full text: `MATCH`
 
 `MATCH(field, query)` is a boolean predicate. The query grammar follows SQLite FTS5:
@@ -113,7 +157,7 @@ A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256"
 query   := and ("OR" and)*
 and     := unary (["AND"] unary)*          juxtaposition is AND
 unary   := ("NOT" | "-") unary | primary    "a NOT b" is "a AND NOT b"
-primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
+primary := "(" query ")" ["@" n | "@" p "%"] | ("\"phrase\"" | word | word* | word~ | word~N) ["^" weight]
 ```
 
 | query | matches |
@@ -125,8 +169,11 @@ primary := "(" query ")" | ("\"phrase\"" | word | word* | word~ | word~N) ["^" w
 | `vacc*` | every indexed term with that prefix |
 | `vacine~`, `vacine~1` | the word and the indexed terms an edit or two from it ([typos](#typos-and-synonyms)) |
 | `vaccine AND (mrna OR "messenger rna") -animal` | any combination, with parentheses |
+| `(mrna vaccine trial phase)@2`, `(…)@50%` | at least 2 of the group's items, or half of them |
 
 Operators are uppercase; lowercase `and`, `or` and `not` are ordinary words (and stopwords). Parentheses and `NOT`s nest at most 100 deep. Words and phrases are analysed like the field's documents, by its [analyzer](#tables): a word that analyses to several terms (`e-mail`) becomes a phrase, and one that analyses to none (a stopword) is dropped. A prefix is lowercased and folded but not stemmed, and matches the stemmed terms that start with it. A weight (`vaccine^2`, `"messenger rna"^0.5`) is read and ignored, since `MATCH` only says whether a row matches: `vaccine^2 mrna` matches what `vaccine mrna` does, so one text can go to both `MATCH` and [`bm25`](#weights-required-and-excluded-words).
+
+A group with `@n` matches a row with at least `n` of its items: its operands, whether juxtaposed, joined by `AND` or by `OR`, each a word, a phrase, a prefix, a typo-tolerant word or a parenthesised query (`vaccine AND (mrna "messenger rna" trial~ (phase OR stage))@2`). A negated item (`-animal`) is not counted: the row must not have it. A stopword is not an item, and a word's synonyms and typo neighbours count as it does. `@p%` asks for p percent of the items, rounded down; either count is clamped to between 1 and the number of items, as Lucene's `minimum_should_match` is, so `@1` is any of them and a count past the end is all of them. `MATCH(body, 'a b c d', min => 2)` (or `min => '75%'`) treats the whole query as one group. A group nests anywhere a parenthesised query does. A group reads each item's matches once, so it costs about what an `OR` of its items does.
 
 ## Prefixes and autocomplete
 
@@ -139,6 +186,9 @@ SELECT id, n FROM queries WHERE PREFIX(id, :typed) ORDER BY n DESC, id LIMIT 10;
 -- a user's own history first: keys of the form '<user>|<query>'
 SELECT id, n FROM user_queries WHERE PREFIX(id, 'u42|how to') ORDER BY n DESC LIMIT 3;
 
+-- with typos: 'hwo to ins' still finds 'how to install'
+SELECT id, n FROM queries WHERE PREFIX(id, :typed, fuzzy => 'auto') ORDER BY n DESC, id LIMIT 10;
+
 SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/ir/%';
 ```
 
@@ -146,9 +196,10 @@ SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/
 - `ESCAPE 'c'` makes the character after `c` literal: `LIKE 'snake!_%' ESCAPE '!'` is the prefix `snake_`. `PREFIX` needs no escaping.
 - `ILIKE` is refused on a table's own field: store the value lowercased (and a display form beside it) and use `LIKE`.
 - `PREFIX(x, p)` also works over joined or derived rows, as a test of each value; `PREFIX(kw, '')` and `LIKE '%'` are `IS NOT NULL`.
+- **`PREFIX(kw, p, fuzzy => 1 | 2 | 'auto')`** also selects the values that start with a prefix within that many edits of `p` whose first letter is `p`'s own, with the edits `MATCH` counts ([typos](#typos-and-synonyms)); `'auto'` goes by `p`'s length, as it does for a word: none up to 2 letters, 1 up to 5, else 2. The dictionary is walked as a trie, one row of the edit-distance table per letter, jumping past every value whose start is already too far from `p` and past the whole run of a start close enough, so the cost follows the values near what was typed rather than the dictionary's size. The values found are a few runs of the dictionary, read as an exact prefix's one is. Typo matches rank by the `ORDER BY` like exact ones; to show exact completions first, run the exact query and fill what is left with the fuzzy one. `LIKE` takes no typos.
 - Counts kept with `UPDATE ... SET n = n + 1` or a write's `add` change in place, so a query log's popularity stays current without rewriting rows.
 
-A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
+A plan with a prefix needs the plan feature `prefix`, and one with typos also `prefix_edits`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
 
 **Cluster a completion table by its key.** `ORDER BY n DESC LIMIT 10` reads the count column's blocks best first ([ordering by a column](#a-column)), and with `OPTIONS(cluster_by = 'id')` a prefix's rows sit together in each segment, so the ten most asked queries under a prefix read about ten blocks whatever the prefix's length:
 
@@ -167,6 +218,8 @@ Over ORCAS's 10.4 million queries, loaded in no particular order and merged by t
 
 The full runs, with medians and the 105 segments straight after the load, are [`results/text/complete-orcas.json` and `complete-orcas-clustered.json`](https://github.com/rkonow/strata/tree/main/strata/results/text) (`strata-complete-bench`).
 
+Typos cost the walk of each segment's dictionary. On the same clustered table, the median top 10 with `fuzzy => 'auto'` takes 1.9 ms at 3 letters and 2.7 ms at 4, where it allows one edit, and 7.9 to 10.7 ms from 6 letters, where it allows two (p99 up to 21 ms); with `fuzzy => 1` it takes 3.1 to 3.6 ms from 6 letters (p99 up to 6.9 ms). Up to 2 letters `'auto'` allows none, so it costs what an exact prefix does. Straight after a load, with 105 segments, the same queries take 2.5 to 4 times as long. Results: `complete-orcas-clustered-fuzzy.json` and `complete-orcas-clustered-fuzzy1.json`.
+
 ## Scores
 
 ### `bm25(field, text)`
@@ -181,6 +234,7 @@ BM25 of the analysed terms of `text`, disjunctively: a row scores if it contains
 | `fuzzy` | 0 | `1`, `2` or `'auto'`: also score the indexed terms that many edits from each word ([typos](#typos-and-synonyms)) |
 | `synonyms` | 0 | `1`: also score each word's synonyms |
 | `syntax` | `'query'` | `'plain'` reads `+`, `-`, quotes and `^` as punctuation: the text is words alone |
+| `min` | none | `n` or `'p%'`: rank only the rows with at least that many of the text's optional words and phrases |
 
 Keeping function words is better for short questions: on Quora it gains 0.055 nDCG@10, while on TREC-COVID, whose queries are full questions, dropping them gains the same amount.
 
@@ -202,10 +256,12 @@ The text may weigh a word, require it or exclude it, as a search box does:
 - With `fuzzy` or `synonyms`, a word's typo neighbours and synonyms take the highest weight the word is written with (writing it twice weighs the word twice, not them), and a required or excluded word counts as present when one of them is, as in `MATCH`.
 - A required or excluded word is a filter on the ranked rows: the top-k loop (all three `algo`s), a [rank-safe boost](#rank-safe-boosts), a [rerank phase](#rerank-phases) (where a row the filter drops scores 0, as one without the words does) and shards all apply it, so the rows and scores are those of the rows the text allows.
 - Weights and signs cost little. With each query's first word weighed 2 (`word^2`) or required (`+word`), or its last word excluded (`-word`), the median query took 0.27, 0.28 and 0.23 ms on Quora's 10,000 queries against 0.25 ms for the plain text, and 0.24, 0.18 and 0.22 ms on FiQA against 0.22 ms; a required word can make a query faster, as the filter drops rows before they are scored. Text written without operators ranks and times as the plain text does on all five collections measured (`strata/results/text/bm25_term_operators.json`, one core of a 4-core cloud VM while another job held the other three). The operators were put on words mechanically to time them, so these queries rank worse than the plain text: an operator helps when it says what the person searching means.
+- **`min => n`** (or `'p%'`) ranks only the rows with at least `n` of the text's optional words and phrases: those without a sign, each counted once however often it is written, whatever its weight (`^0` counts too). Required and excluded words are not counted; a text without optional words ignores `min`. Counts are clamped to between 1 and the number of optional words, and a percentage rounds down, as in `MATCH`'s groups: `bm25(body, 'vaccine mrna trial phase', min => 2)` ranks the rows with two of the four words, by all of them. With `syntax => 'plain'`, each word is an optional word.
+- `min` filters the ranked rows, as a required word does, so its cost depends on how many rows hold one of the words. With `min => 2` the median query took 0.24 ms on Quora's 10,000 queries (0.25 ms plain) and 0.41 ms on FiQA (0.23 ms plain). On TREC-COVID, whose query words appear in most of its documents, it took 1.6 ms (0.5 ms plain), because the filter counts every row that holds one of the words (`strata/results/text/bm25_min_match.json`, one core of a 4-core cloud VM while another job held the other three). `min` is for leaving rows out, not for ranking better. Asking every BEIR query for two of its words, or half of them, left nDCG@10 unchanged on TREC-COVID and lowered it elsewhere, by as much as 0.077 (SciFact, half the words).
 - **`syntax => 'plain'`** reads the text as words alone, as `bm25` did before: for text not written for a search box, such as a user's message passed through, or a benchmark's recorded queries. BEIR's hold `+1`, `-word` or `x^2` here and there, so the evaluations and benchmarks in this repository pass `syntax => 'plain'`, and so does Engram.
-- A plan that ranks with weights, signs, or a `MATCH` with weights needs the plan feature `text_operators`. From Python, `bm25("body", "+mrna vaccine^2")` reads them, and `bm25("body", text, syntax="plain")` does not.
+- A plan that ranks with weights, signs, or a `MATCH` with weights needs the plan feature `text_operators`, and one with `min` or a `MATCH` group `(…)@n` needs `min_match`. From Python, `bm25("body", "+mrna vaccine^2")` reads them, `bm25("body", text, syntax="plain")` does not, and `bm25("body", text, min=2)` and `match("body", text, min="75%")` ask for some of the words.
 
-**Changed:** `bm25` read `+`, `-`, `"` and `^` as punctuation before; text with them now ranks as above, and `syntax => 'plain'` keeps the old reading. In `MATCH`, `^` separated words: `vaccine^2` matched `vaccine` and `2`, and now matches `vaccine`.
+**Changed:** `bm25` read `+`, `-`, `"` and `^` as punctuation before; text with them now ranks as above, and `syntax => 'plain'` keeps the old reading. In `MATCH`, `^` separated words: `vaccine^2` matched `vaccine` and `2`, and now matches `vaccine`; and `)@2` closes a group a row needs 2 of, where `@2` was a word before.
 
 ### `similarity(field, vector)` and `distance(field, vector)`
 
@@ -315,6 +371,7 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 | `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
 | `rank(x)` | 1 plus the number of rows ranked with a greater `x`; `NULL` places after every other |
 | `CASE WHEN c THEN x … ELSE y END` | the first branch whose condition holds (any `WHERE` condition), else `y`, else `NULL` |
+| `count_true(c, …)` | how many of the conditions hold ([`AT_LEAST`](#some-of-the-conditions-at_least)) |
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 
@@ -574,7 +631,7 @@ SELECT id, score() FROM papers ORDER BY bm25(body, 'nueral netwrok', fuzzy => 1)
 SELECT id FROM papers WHERE MATCH(body, 'gnn', synonyms => 1) LIMIT 10;
 ```
 
-- **`fuzzy => 1` or `2`** also matches the indexed terms within that many edits of each word, counting an insertion, deletion, substitution or swap of two neighbouring letters as one edit (optimal string alignment). **`fuzzy => 'auto'`** allows no edits for words of 1 or 2 letters, 1 for 3 to 5 letters and 2 for longer ones. In the `MATCH` grammar, `word~` is `'auto'` for one word and `word~1`, `word~2` choose. A ranked query adds the 50 nearest terms of each word, each weighted `1 − edits / length` (at least 0.1), as Lucene's fuzzy queries do. A word and its typo neighbours share one document frequency, the largest among them, so a rare misspelling scores below the word rather than above it; the expansion is found once per query over every segment's dictionary, so all segments, and the plan line `bm25 expanded with N terms`, agree.
+- **`fuzzy => 1` or `2`** also matches the indexed terms within that many edits of each word, counting an insertion, deletion, substitution or swap of two neighbouring letters as one edit (optimal string alignment). **`fuzzy => 'auto'`** allows no edits for words of 1 or 2 letters, 1 for 3 to 5 letters and 2 for longer ones. In the `MATCH` grammar, `word~` is `'auto'` for one word and `word~1`, `word~2` choose. A ranked query adds the 50 nearest terms of each word, each weighted `1 − edits / length` (at least 0.1), as Lucene's fuzzy queries do. A word and its typo neighbours share one document frequency, the largest among them, so a rare misspelling scores below the word rather than above it; the expansion is found once per query over every segment's dictionary, so all segments, and the plan line `bm25 expanded with N terms`, agree. Each dictionary is walked as a trie, skipping every run of terms whose start is already too many edits away, rather than tested term by term: for a word of a typed query looked up in the 797,472 analysed terms of ORCAS's 10.4 million queries, the median lookup takes 2.1 ms with one edit and 16 ms with two, against 79 and 100 ms testing every term (one thread of a 4-core cloud VM, Intel Xeon @ 2.10GHz; [`results/text/fuzzy-orcas.json`](https://github.com/rkonow/strata/tree/main/strata/results/text), `strata-fuzzy-bench`).
 - **`synonyms => 1`** also matches what the server's synonym list says a word or phrase means. The list is in Solr's format: `laptop, notebook, portable computer` makes each find the others, and `tv => television` makes `tv` find `television` but not the reverse. Both sides are analysed like documents, so `laptops` finds `notebook`. A one-word synonym of a word shares that word's document frequency, as Lucene's synonym queries do; the words of a longer synonym score on their own. [strata-server](server.md) loads it from `--synonyms FILE` and edits it at `/v1/synonyms`; from Rust, set `ExecOptions::synonyms`. Without a list, `synonyms => 1` is an error that says so.
 
 ## Aggregates
@@ -668,6 +725,46 @@ SELECT DISTINCT ON (country) country, seller, SUM(price) AS total FROM sales GRO
 
 The plan's node is `DistinctOn` (`Distinct on: video` in `EXPLAIN`), and its JSON needs the plan features `operators` and `distinct_on`; a version of Strata from before it refuses the plan by that name.
 
+## At most k rows of a value: `MAX k PER`
+
+`ORDER BY ... MAX k PER field` keeps, of the rows with equal values of `field`, the first `k` in the query's order, and the rows kept stay in that order: a ranking with at most two clips of a video, three products of a brand or two arguments of a debate. `LIMIT` and `OFFSET` count the rows kept.
+
+```sql
+-- the 20 best clips, at most two of a video
+SELECT id, video, score() FROM clips ORDER BY bm25(transcript, :q) DESC MAX 2 PER video LIMIT 20;
+
+-- the newest products in stock, at most three of a brand
+SELECT id, brand, title FROM products WHERE in_stock ORDER BY added DESC, id MAX 3 PER brand LIMIT 30;
+
+-- in a subquery: of each video's two most viewed clips, those about a dog
+SELECT id FROM clips WHERE MATCH(transcript, 'dog')
+  AND id IN (SELECT id FROM clips ORDER BY views DESC, id MAX 2 PER video LIMIT 1000);
+```
+
+- **It ends `ORDER BY`**, and needs one: the rows a value keeps are its first in that order. `k` is a whole number, 1 or more, and `MAX 1 PER x` is `DISTINCT ON (x)`, with the same plan.
+- **A field of one value.** `field` is a field of the rows (`video`, `t.brand` in a join), and `NULL` is one value of its own. A multi-valued field is refused, since a row with several values would be in several groups.
+- **Not with `DISTINCT`** or `DISTINCT ON`, which already keep one row of each.
+- **Reads** are those of [`DISTINCT ON`](#the-first-row-of-each-group-distinct-on): growing slices of the scan until `LIMIT` rows are kept or the scan runs out. A field whose values cannot fill the `LIMIT`, such as one row of each of 15 topics for a `LIMIT` of 20, reads every row that matches.
+- **Shards.** A coordinator keeps each value's first rows over its shards' merged rows, so three shards give what one database does.
+
+The plan's node is `DistinctOn` with `per` (`At most 2 per: video` in `EXPLAIN`). With `k` above 1 its JSON needs the plan feature `per_cap`, so a version of Strata from before it refuses the plan rather than keeping one row of each value. Python's builder writes it `.max_per(2, "video")`.
+
+On ArguAna (BEIR's 8,674 arguments from 592 debates on 15 topics; a document's debate and topic are in its id), every one of the 1,406 queries ranked by `bm25(body, :q)`, its own argument left out as BEIR scores it, top 20. Times are the median over queries of each query's median of 3 runs, one thread on a 4-core cloud VM (Intel Xeon @ 2.10GHz):
+
+| top 20 | nDCG@10 | debates | topics | p50 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| uncapped | 0.489 | 7.5 | 3.8 | 3.3 | 8.0 |
+| `MAX 1 PER debate` | 0.307 | 20.0 | 7.2 | 6.1 | 25.6 |
+| `MAX 2 PER debate` | 0.379 | 14.5 | 5.9 | 6.0 | 12.6 |
+| `MAX 3 PER debate` | 0.419 | 12.6 | 5.4 | 6.0 | 11.3 |
+| `MAX 1 PER topic` | 0.301 | 14.9 | 15.0 | 549 | 635 |
+| `MAX 2 PER topic` | 0.376 | 16.3 | 11.4 | 18.8 | 35.9 |
+| `MAX 3 PER topic` | 0.416 | 14.2 | 9.1 | 7.1 | 30.1 |
+
+Debates and topics are the mean number of each in a query's answer. A cap of debates costs about twice the uncapped query, for the growing slices, and the fewer a field's values the deeper a cap reads: two per topic take 18.8 ms. One row of each of the 15 topics cannot fill 20 rows, so that query reads every argument that matches and returns 15.
+
+Caps trade relevance for spread. ArguAna's answer to a query is the argument against it, in the query's own debate, so a cap on debates also caps how many of the right debate's arguments the ranking can show: nDCG@10 falls from 0.489 to 0.307 with one per debate, and to 0.419 with three. The run is `strata-per-cap-bench` ([`results/text/per_cap.json`](https://github.com/rkonow/strata/blob/main/strata/results/text/per_cap.json)).
+
 ## Graphs
 
 Rows with an `EDGES` field are nodes of a graph. Graph predicates and scores take **seeds**: a key (`'p1'`), a parameter, a tuple of keys (`('p1', 'p2')`), or a subquery, whose filters, ranking and `LIMIT` are those of any query. A subquery over the same table seeds with its rows; one over another table returns one column, whose values are the keys to start from, such as the items a user's recent events name: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 20))`. With `weighted => 1`, a seed's restart weight is its row's score, summed over the rows that name it: `ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY w DESC), weighted => 1)` starts from each item in proportion to the sum of its events' `w`, and ordering the events by `decay(ts, ...)` instead weighs recent ones more.
@@ -700,7 +797,7 @@ ORDER BY rrf(bm25(body, :t), ppr(cites, (SELECT id FROM papers ORDER BY similari
 | `ppr(f, seeds, …)` | personalized PageRank, usable wherever a score is, including `rrf` and weighted sums | `alpha 0.15`, `eps 1e-4`, `dir 'both'`, `label`, `max_pushes`, `weighted 0` (`1`: the seed subquery's scores are the restart weights) |
 | a `VECTOR` field as `f` | `REACHABLE` and `PATH` follow similarity edges: a row's neighbours are its `k` most similar rows | `k 10`, `min_sim` |
 
-The [query UI](server.md#the-ui)'s Graph tab builds these queries (seeds from keys, a search or a condition; links or similarity; neighbourhood, path or PageRank) and draws the answer.
+The [query console](server.md#the-query-console)'s Graph tab builds these queries (seeds from keys, a search or a condition; links or similarity; neighbourhood, path or PageRank) and draws the answer.
 
 `through` restricts the rows a traversal may pass through (seeds and end points are exempt); the rest of `WHERE` filters the rows it ends at. `REACHABLE(f, seeds, hops => 0, min_hops => 0)` is the seed set itself, so `NOT` of it removes the seeds from a result. `hops()` refers to the first `REACHABLE` or `PATH` in `WHERE`. The [Graphs](graphs.md) page explains how edges are stored and what these queries cost.
 
@@ -728,7 +825,7 @@ ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMI
 
 - Each row is an edge from the row whose key is in `src` to the row whose key is in `dst`, weighted by `w`, or by 1 without a weight column (`edges = 'src, dst'`). `src` and `dst` are stored, single-valued `KEYWORD` or `INT` columns of the type of the other table's key, and the weight is a stored `FLOAT` or `INT`. If `src` references a table, walks are over that table.
 - Writing an edge writes its row and nothing else: insert it, delete it, or add to its weight with an `add` operation, whose `doc` creates the row on the edge's first event ([writes](server.md#writes)).
-- Edges are directed, from `src` to `dst`. For a click on item *i* after the user's last items *h*₁ … *h*₅ (*h*₁ the most recent), adding 1/*g* to the edge *h*_g → *i* records what comes after what: `ppr(cooc, :x, dir => 'out')` and `REACHABLE(cooc, :x, dir => 'out')` follow the items that came after *x*, and `dir => 'both'`, `ppr`'s default, reads them as seen together. That is five `add` operations per event.
+- Edges are directed, from `src` to `dst`. For a click on item *i* after the user's last items *h*₁ … *h*₅ (*h*₁ the most recent), adding 1/*g* to the edge *h*_g → *i* records what comes after what: `ppr(cooc, :x, dir => 'out')` and `REACHABLE(cooc, :x, dir => 'out')` follow the items that came after *x*, and `dir => 'both'`, `ppr`'s default, reads them as seen together. That is five `add` operations per event. For the next item alone, counts of what came after the last one or two items are cheaper and exact ([Next items](next-items.md)).
 - An edge is followed while its weight, as it is now, is above 0. `UPDATE cooc SET w = w * 0.9` decays every weight in place, and an edge whose weight is 0 or `NULL` stays in the table without being followed. `src` and `dst` are never changed in place: an `UPDATE` of a `KEYWORD` one rewrites the row, and `set`, `add` or an `UPDATE` of an `INT` one is refused, as for `shard_by` (delete the row and insert it again).
 - `REACHABLE`, `PATH`, `hops()` and `ppr` take an edge table with every option but `label`, since its edges have none. A walk over `cooc` and a walk over an `EDGES` field holding the same edges and weights find the same rows at the same hops and the same PageRank, up to rounding.
 - Each segment of the edge table indexes its rows by the keys they link, which flushes and merges build, so a walk finds a row's edges with one lookup of its key in each of the edge table's segments ([how, and what it costs](graphs.md#edge-tables)).

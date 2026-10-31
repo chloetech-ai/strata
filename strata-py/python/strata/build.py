@@ -44,6 +44,7 @@ __all__ = [
     "col",
     "lit",
     "match",
+    "at_least",
     "bm25",
     "similarity",
     "maxsim",
@@ -63,6 +64,7 @@ __all__ = [
     "greatest",
     "coalesce",
     "case",
+    "count_true",
     "score",
     "hops",
     "features",
@@ -187,13 +189,22 @@ class Expr:
         """`lo <= expr <= hi`; a bound of None is open."""
         return _Between(self, lo, hi)
 
-    def startswith(self, prefix: str) -> Expr:
+    def startswith(self, prefix: str, fuzzy: int | str = 0) -> Expr:
         """The text starts with `prefix` (a multi-valued field: one of its
         values does); on a KEYWORD field, one run of its index, as SQL's
-        `LIKE 'p%'` and `PREFIX(field, 'p')` are."""
+        `LIKE 'p%'` and `PREFIX(field, 'p')` are. `fuzzy` (1, 2 or
+        "auto", by the prefix's length as MATCH does: none up to 2
+        letters, 1 up to 5, else 2) also takes a prefix that many edits
+        away whose first letter is the same, as `PREFIX(field, 'p', fuzzy
+        => 1)` does."""
         if not isinstance(prefix, str):
             raise TypeError("startswith takes a str")
-        return _Prefix(self, prefix)
+        if isinstance(fuzzy, str) and fuzzy.lower() == "auto":
+            n = len(prefix)
+            fuzzy = 0 if n <= 2 else 1 if n <= 5 else 2
+        if fuzzy not in (0, 1, 2) or isinstance(fuzzy, bool):
+            raise StrataError("fuzzy is 0, 1, 2 or 'auto'")
+        return _Prefix(self, prefix, int(fuzzy))
 
     def is_null(self) -> Expr:
         """The expression has no value (a multi-valued field: holds none)."""
@@ -397,11 +408,14 @@ class _IsNull(Expr):
 
 
 class _Prefix(Expr):
-    def __init__(self, e: Expr, prefix: str):
-        self.e, self.prefix = e, prefix
+    def __init__(self, e: Expr, prefix: str, edits: int = 0):
+        self.e, self.prefix, self.edits = e, prefix, edits
 
     def _ir(self, ctx: _Ctx) -> Any:
-        return {"prefix": {"expr": self.e._ir(ctx), "prefix": _operand(self.prefix, ctx, _field_of(self.e, ctx))}}
+        ir = {"expr": self.e._ir(ctx), "prefix": _operand(self.prefix, ctx, _field_of(self.e, ctx))}
+        if self.edits:
+            ir["edits"] = self.edits
+        return {"prefix": ir}
 
 
 class _In(Expr):
@@ -478,8 +492,10 @@ class _Fn(Expr):
     """A function of the row: a score (BM25, a similarity, RRF) or a
     condition (MATCH, a traversal). `inputs` are the scores RRF fuses."""
 
-    def __init__(self, build, text: str, score: bool = True, inputs: list[Expr] | None = None):
+    def __init__(self, build, text: str, score: bool = True, inputs: list[Expr] | None = None, guard=None):
         self.build, self.text, self.score, self.inputs = build, text, score, inputs
+        # The plan's guard, from a context, when the function has one.
+        self.guard = guard
 
     def _ir(self, ctx: _Ctx) -> Any:
         return self.build(ctx)
@@ -610,25 +626,121 @@ class _Features(Expr):
         return "features()"
 
 
-def match(field: str, query: str) -> Expr:
+def _need(min: int | str) -> str:
+    """A count or a percentage (`2`, `"75%"`), as MATCH's `@` writes it."""
+    if isinstance(min, bool) or not isinstance(min, (int, str)):
+        raise StrataError(f"min is a count or a percentage ('75%'), not {min!r}")
+    return str(min)
+
+
+def _rows(what: str, min: int | str | None, min_rows: int | None, max_rows: int | None) -> dict[str, int]:
+    """`min_rows` and `max_rows` of a guard of `what`, which relaxes its
+    `min`: only the ones given."""
+    rows: dict[str, int] = {}
+    for k, v in (("min_rows", min_rows), ("max_rows", max_rows)):
+        if v is not None:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise StrataError(f"{k} is a count of rows (500), not {v!r}")
+            rows[k] = v
+    if rows and min is None:
+        raise StrataError(f"min_rows and max_rows on {what} relax its min, which it needs")
+    return rows
+
+
+def _need_ir(need: int | str) -> int | str:
+    """A guard's loosest level: a count, or a percentage as text."""
+    return need.strip() if isinstance(need, str) and need.strip().endswith("%") else int(need)
+
+
+def _guarded(rows: dict[str, int], site, need: int | str):
+    """The guard of a plan, from a context, if `rows` asks for one."""
+    if not rows:
+        return None
+    return lambda ctx: {"site": site(ctx), "need": _need_ir(need), **rows}
+
+
+def match(field: str, query: str, *, min: int | str | None = None, min_rows: int | None = None, max_rows: int | None = None) -> Expr:
     """`field` (an indexed TEXT field) matches the full-text `query`, in
-    MATCH's syntax (`a b` both words, `a | b` either, `"a b"` the phrase,
-    `-a` not, `a~` with typos)."""
-    return _Fn(lambda ctx: {"match": {"field": ctx.field(field)[0], "query": query}}, f"match({field!r}, {query!r})", score=False)
+    MATCH's syntax (`a b` both words, `a OR b` either, `"a b"` the phrase,
+    `-a` not, `a~` with typos, `(a b c)@2` two of them). `min=2` or
+    `min="75%"` asks for that many of the query's items. With
+    `max_rows=500` (or `min_rows`), in `where`, it asks for as many items
+    as it can, all of them down to `min`, while the rows fit (or are too
+    few), as SQL's `MATCH(..., min => n, max_rows => 500)` does."""
+    q = query if min is None else f"({query})@{_need(min)}"
+    rows = _rows("match", min, min_rows, max_rows)
+    site = lambda ctx: {"match": {"field": ctx.field(field)[0], "text": query}}
+    extra = "".join(f", {k}={v!r}" for k, v in rows.items())
+    return _Fn(lambda ctx: {"match": {"field": ctx.field(field)[0], "query": q}}, f"match({field!r}, {q!r}{extra})", score=False, guard=_guarded(rows, site, min))
 
 
-def bm25(field: str, text: str, *, syntax: str | None = None) -> Expr:
+def _of(need: int | str, y: int) -> int:
+    """`need` of `y` items: a count, or a percentage (`"75%"`) rounded
+    down, clamped to between 1 and `y`, as SQL's AT_LEAST reads it."""
+    s = str(need).strip() if isinstance(need, (int, str)) and not isinstance(need, bool) else ""
+    p = s[:-1] if s.endswith("%") else None
+    if not (p if p is not None else s).isdigit() or (p is not None and int(p) > 100):
+        raise StrataError(f"at_least takes a count (2) or a percentage ('75%'), not {need!r}")
+    n = y * int(p) // 100 if p is not None else int(s)
+    return max(1, min(n, y))
+
+
+class _AtLeast(Expr):
+    def __init__(self, need: int | str, conds: list[Expr], rows: dict[str, int]):
+        self.text, self.conds, self.rows = need, conds, rows
+        self.need = _of(need, len(conds))
+        site = lambda ctx: {"at_least": {"conds": [c._ir(ctx) for c in self.conds]}}
+        self.guard = _guarded(rows, site, need if isinstance(need, str) and need.strip().endswith("%") else self.need)
+
+    def _ir(self, ctx: _Ctx) -> Any:
+        return {"at_least": {"need": self.need, "conds": [c._ir(ctx) for c in self.conds]}}
+
+    def __repr__(self) -> str:
+        extra = "".join(f", {k}={v!r}" for k, v in self.rows.items())
+        return f"at_least({self.text!r}, {', '.join(map(repr, self.conds))}{extra})"
+
+
+def at_least(n: int | str, *conds: Expr, min_rows: int | None = None, max_rows: int | None = None) -> Expr:
+    """At least `n` of the conditions hold, as SQL's `AT_LEAST(n, ...)`:
+    `at_least(2, match("title", "covid"), col("year") >= 2020,
+    col("venue").isin(["nejm", "lancet"]))`. `n` is a count or a
+    percentage (`"75%"`, rounded down), clamped to between 1 and the
+    number of conditions. A condition on a NULL is not met, and
+    `~at_least(...)` keeps only the rows with too few met whatever their
+    NULLs are. With `max_rows=500` (or `min_rows`), in `where`, it asks
+    for as many of the conditions as it can, all of them down to `n`,
+    while the rows fit (or are too few)."""
+    if not conds:
+        raise StrataError("at_least(n, *conds) takes one or more conditions")
+    return _AtLeast(n, [_expr(c) for c in conds], _rows("at_least", n, min_rows, max_rows))
+
+
+def bm25(field: str, text: str, *, syntax: str | None = None, min: int | str | None = None, min_rows: int | None = None, max_rows: int | None = None) -> Expr:
     """BM25 of a TEXT field for `text`, as a score. `text` may weigh a
     word (`word^2`), require one (`+word`, `+"a phrase"`) or exclude one
-    (`-word`); `syntax="plain"` reads it as plain words."""
+    (`-word`); `syntax="plain"` reads it as plain words. `min=2` or
+    `min="75%"` ranks only the rows with that many of its optional words.
+    With `max_rows=500` (or `min_rows`), in `order_by`, it ranks the rows
+    with as many of them as it can, all of them down to `min`, while the
+    rows fit (or are too few)."""
+    if min is not None:
+        _need(min)
+    rows = _rows("bm25", min, min_rows, max_rows)
 
     def build(ctx: _Ctx) -> Any:
         m: dict[str, Any] = {"field": ctx.field(field)[0], "text": text}
+        opts: dict[str, Any] = {}
         if syntax is not None:
-            m["opts"] = {"syntax": {"text": syntax}}
+            opts["syntax"] = {"text": syntax}
+        if min is not None:
+            opts["min"] = {"text": min} if isinstance(min, str) else {"int": min}
+        if opts:
+            m["opts"] = opts
         return {"bm25": m}
 
-    return _Fn(build, f"bm25({field!r}, {text!r}" + ("" if syntax is None else f", syntax={syntax!r}") + ")")
+    extra = "".join(f", {k}={v!r}" for k, v in (("syntax", syntax), ("min", min), *rows.items()) if v is not None)
+    site = lambda ctx: {"bm25": {"field": ctx.field(field)[0], "text": text}}
+    return _Fn(build, f"bm25({field!r}, {text!r}{extra})", guard=_guarded(rows, site, min))
 
 
 def similarity(field: str, query: Sequence[float] | Mapping[str, float]) -> Expr:
@@ -806,6 +918,17 @@ def case(*whens: tuple[Expr, Any], otherwise: Any = None) -> Expr:
     return _Ranked("case", conds + values + rest, build, f"CASE {text}{f' ELSE {rest[0]!r}' if rest else ''} END", inputs=values + rest)
 
 
+def count_true(*conds: Expr) -> Expr:
+    """How many of the conditions hold, a number to rank by:
+    `bm25("body", q) * (1 + 0.1 * count_true(col("year") >= 2021,
+    col("venue").isin(["nejm", "lancet"])))`. A condition on a NULL counts
+    as not met."""
+    if not conds:
+        raise StrataError("count_true(*conds) takes one or more conditions")
+    parts = [_expr(c) for c in conds]
+    return _Fn(lambda ctx: {"call": {"func": "count_true", "args": [c._ir(ctx) for c in parts]}}, f"count_true({', '.join(map(repr, parts))})")
+
+
 def _graph(field: str, seeds: Any, kind: dict, dir: str, labels: Iterable[str], through: Expr | None, max_nodes: int, k: int, min_sim: float | None):
     def build(ctx: _Ctx) -> dict:
         key = ctx.field(ctx.key)[1] if ctx.key else None
@@ -868,6 +991,8 @@ class Query:
         self._limit: int | None = None
         self._offset = 0
         self._distinct_on: list[Expr] = []
+        self._per = 1
+        self._per_field: str | None = None
 
     def _copy(self, **kw: Any) -> Query:
         q = Query.__new__(Query)
@@ -922,7 +1047,19 @@ class Query:
         `SELECT DISTINCT ON (...)`: `.distinct_on("video")` with
         `.order_by(score)` gives each video's best row, the best videos
         first, and `limit` counts groups."""
-        return self._copy(distinct_on=[col(k) if isinstance(k, str) else _expr(k) for k in keys])
+        return self._copy(distinct_on=[col(k) if isinstance(k, str) else _expr(k) for k in keys], per=1, per_field=None)
+
+    def max_per(self, k: int, field: str) -> Query:
+        """Keeps at most `k` rows of each value of `field`, the first `k`
+        in the query's order, as SQL's `MAX k PER field`:
+        `.order_by(score).max_per(2, "venue").limit(20)` gives the best 20
+        rows with no more than 2 of a venue. NULL is one value; a
+        multi-valued field is refused."""
+        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+            raise StrataError(f"max_per keeps a whole number of rows, 1 or more ({k!r})")
+        if not isinstance(field, str):
+            raise StrataError("max_per takes a field's name")
+        return self._copy(distinct_on=[col(field)], per=k, per_field=field)
 
     def having(self, *conditions: Expr) -> Query:
         """Keeps the groups every condition on their aggregates holds for."""
@@ -938,8 +1075,24 @@ class Query:
         """The query's plan, as `Database.plan` gives a statement's."""
         ctx = _Ctx(self._schema)
         search: dict[str, Any] = {"node": "search", "table": ctx.table}
-        if self._where:
-            cond = self._where[0] if len(self._where) == 1 else _Bool("and", self._where)
+        # A guard is a condition of where() joined to the rest by AND, or
+        # a bm25 of the ranking, taken out of them into the search.
+        where = [p for c in self._where for p in (c.parts if isinstance(c, _Bool) and c.op == "and" else [c])]
+        guards = [c for c in where if getattr(c, "guard", None) is not None]
+        where = [c for c in where if getattr(c, "guard", None) is None]
+        if any(_guards(c) for c in where):
+            raise StrataError("min_rows and max_rows guard a condition of where() joined to the others by AND, not one inside |, ~ or another condition")
+        guards += [g for k in self._order for g in _guards(k.e)]
+        if any(_guards(e) for e, _ in self._phases):
+            raise StrataError("min_rows and max_rows guard a search's first ranking, not a rerank phase")
+        if any(_guards(c) for c in self._select or []):
+            raise StrataError("min_rows and max_rows on bm25 guard the ranking of order_by")
+        if len(guards) > 1:
+            raise StrataError("a query has one guard (min_rows, max_rows) at most")
+        if guards:
+            search["guard"] = guards[0].guard(ctx)
+        if where:
+            cond = where[0] if len(where) == 1 else _Bool("and", where)
             search["filter"] = cond._ir(ctx)
         columns = self._select
         if columns is None:
@@ -990,6 +1143,11 @@ class Query:
         if self._distinct_on:
             if grouped:
                 raise StrataError("distinct_on keeps rows of the table: not with group_by or aggregates")
+            if self._per_field is not None:
+                if not self._order:
+                    raise StrataError("max_per needs an order_by: it keeps each value's first rows in its order")
+                if ctx.field(self._per_field)[1].get("multi"):
+                    raise StrataError(f"max_per: {self._per_field} is multi-valued, and a row with several values is in several groups")
             # The scan's rows with the answer's columns and the fields of
             # the keys, which are computed over them, the first row of each
             # group kept in their order. A LIMIT reads the scan in growing
@@ -1008,6 +1166,9 @@ class Query:
             node = {"node": "distinct_on", "input": leaf, "keys": [k._ir(ctx) for k in self._distinct_on]}
             ctx.outputs = None
             features = ["operators", "distinct_on"]
+            if self._per > 1:
+                node["per"] = self._per
+                features.append("per_cap")
         if self._limit is not None or self._offset:
             node = {"node": "limit", "input": node}
             if self._offset:
@@ -1100,6 +1261,18 @@ def _cols(e: Any) -> list[str]:
         for x in v if isinstance(v, list) else [v]:
             if isinstance(x, Expr):
                 out += _cols(x)
+    return out
+
+
+def _guards(e: Any) -> list[Expr]:
+    """The guarded conditions and scores in an expression."""
+    if getattr(e, "guard", None) is not None:
+        return [e]
+    out: list[Expr] = []
+    for k, v in getattr(e, "__dict__", {}).items():
+        for x in v if isinstance(v, list) else [v]:
+            if isinstance(x, Expr):
+                out += _guards(x)
     return out
 
 

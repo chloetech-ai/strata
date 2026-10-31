@@ -79,6 +79,7 @@ Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for
 | `delete(keys)` | deletes the rows with a key or keys; returns how many there were |
 | `sql("UPDATE ...")` | `INSERT`, `UPDATE` and `DELETE` statements; returns the rows written. It also runs `CREATE TABLE` and `DROP TABLE` ([tables](query-language.md#tables)) and `CREATE` and `DROP RANK PROFILE` ([rank profiles](query-language.md#rank-profiles-a-ranking-kept-with-its-table)), which return 0, and writes any table |
 | `import_file(path, format=None)` | loads a JSON Lines, JSON, CSV or TSV file ([how files are read](server.md#loading-rows)); returns `{rows, bulk, skipped_fields}` |
+| `write(ops)` | applies write operations in one transaction, as the server's `/v1/write` takes them: `insert`, `upsert` and `delete`, and `set` or `add` of a numeric field in place (`{"op": "add", "key": k, "field": "n", "value": 1}`; with a `doc` instead of a `key`, an `add` inserts the row when no row has its key); each names its `table` or writes the first; returns the rows written |
 | `import_sqlite(path, tables=None, schemas=None)` | imports a SQLite database's tables, each into the table of its name, created when missing ([SQLite in and out](sqlite.md)); returns what it did and what did not carry over |
 | `export_sqlite(path, tables=None, fts=True, indexes=True)` | writes the tables to a new SQLite file, with indexes, an FTS5 index over the text and the Strata schemas |
 
@@ -154,8 +155,9 @@ db.table().select("video", "id", score()).distinct_on("video").order_by(bm25("tr
 | `==`, `!=`, `<`, `<=`, `>`, `>=` | comparisons with a value or another expression |
 | `&`, `\|`, `~` | and, or, not (Python's `and`, `or`, `not` and chained comparisons such as `1 < col("x") < 5` raise `TypeError`) |
 | `.isin(values)`, `.between(lo, hi)`, `.is_null()`, `.is_not_null()` | as SQL's `IN`, `BETWEEN` (a bound of `None` is open), `IS NULL` |
-| `match(field, query)` | the full-text condition, in [MATCH's syntax](query-language.md#full-text-match) |
-| `bm25(field, text, syntax=None)`, `similarity(field, vector)`, `rrf(*scores, k=60, depth=100)`, `ranked(keys)` | scores; `bm25` reads [weights, required and excluded words](query-language.md#weights-required-and-excluded-words) (`"+mrna vaccine^2 -animal"`) unless `syntax="plain"`; `similarity` takes a vector (`embed(text)` gives a text's), or `{term: weight}` for a SPARSE field; `ranked` is a [ranking from elsewhere](query-language.md#rankedkeys-a-ranking-from-elsewhere), primary keys best first |
+| `match(field, query, min=None, min_rows=None, max_rows=None)` | the full-text condition, in [MATCH's syntax](query-language.md#full-text-match); `min=2` or `min="75%"` asks for that many of its items, and with `max_rows` (or `min_rows`) for [as many as fit](query-language.md#as-many-as-fit-min_rows-and-max_rows) |
+| `at_least(n, *conds, min_rows=None, max_rows=None)`, `count_true(*conds)` | at least `n` of the conditions hold (`n` a count, or a percentage such as `"75%"`), as SQL's [`AT_LEAST`](query-language.md#some-of-the-conditions-at_least), or with `max_rows` (or `min_rows`) [as many as fit](query-language.md#as-many-as-fit-min_rows-and-max_rows); how many hold, a number to rank by |
+| `bm25(field, text, syntax=None, min=None, min_rows=None, max_rows=None)`, `similarity(field, vector)`, `rrf(*scores, k=60, depth=100)`, `ranked(keys)` | scores; `bm25` reads [weights, required and excluded words](query-language.md#weights-required-and-excluded-words) (`"+mrna vaccine^2 -animal"`) unless `syntax="plain"`, and in `order_by` with `max_rows` ranks the rows with [as many of its words as fit](query-language.md#as-many-as-fit-min_rows-and-max_rows); `similarity` takes a vector (`embed(text)` gives a text's), or `{term: weight}` for a SPARSE field; `ranked` is a [ranking from elsewhere](query-language.md#rankedkeys-a-ranking-from-elsewhere), primary keys best first |
 | `+`, `-`, `*`, `/`, `%`, `**`, `abs()`, `round()`, `ln`, `log`, `exp`, `sqrt`, `sigmoid`, `clamp`, `least`, `greatest`, `coalesce`, `minmax`, `rank`, `case((cond, value), ..., otherwise=None)` | a [ranking expression](query-language.md#ranking-expressions) of scores, fields and numbers: `bm25("body", q) * (1 + 0.2 * coalesce(col("rating"), 0))`. `+` adds raw values; `0.7 * minmax(a) + 0.3 * minmax(b)` is weighted fusion |
 | `gbdt(model, *features)` | a [ranking model](query-language.md#ranking-models-gbdtmodel-features)'s score of a row from its features: `gbdt("docs_ltr", bm25("body", q), col("rating"))`, the LightGBM or XGBoost model `<models>/docs_ltr/gbdt.json` |
 | `reachable(field, seeds, hops=1, ...)`, `path(field, seeds, to, ...)`, `ppr(field, seeds, ...)` | [graph](graphs.md) conditions and PageRank as a score, with the SQL functions' options as keyword arguments |
@@ -164,7 +166,7 @@ db.table().select("video", "id", score()).distinct_on("video").order_by(bm25("tr
 | `count()`, `col(f).count(distinct=True)`, `.sum()`, `.avg()`, `.min()`, `.max()` | aggregates, for `select`, `having` and `order_by` over groups |
 | `.alias(name)`, `.asc()`, `.desc(nulls_first=False)` | a column's name; an `order_by` direction |
 
-`select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, `distinct_on(...)` keeps the [first row of each group](query-language.md#the-first-row-of-each-group-distinct-on) in the query's order, and `limit(n)` and `offset(n)` page (groups, after `distinct_on`). A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
+`select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, `distinct_on(...)` keeps the [first row of each group](query-language.md#the-first-row-of-each-group-distinct-on) in the query's order, `max_per(k, field)` keeps [at most k rows of each value](query-language.md#at-most-k-rows-of-a-value-max-k-per), and `limit(n)` and `offset(n)` page (groups, after `distinct_on`). A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
 
 ## The rank log
 
@@ -202,6 +204,18 @@ items.query("SELECT id FROM items WHERE sid = '12.7'")
 ```
 
 It returns the SHA-256 of the file, which the table records. The options are `levels` (1 to 4, default 3), `k` centroids a level (up to 256), `iterations` of k-means a level (25), `sample`, the vectors it trains on (100 a centroid by default, drawn at random), `seed` (the same vectors and options give the same codebook), `table` (a database's first by default) and `models` (the default models directory, as for `Database.create`). Pass the same `models=` to `Database.create` and `Database.open`: a codebook that does not open is listed in `db.embed_errors`, and writes that need a code then fail.
+
+## Next items
+
+`strata.ngrams` keeps counts of what came after the last one or two items in a table, and `strata.next_items(db, history, k=10)` reads them with backoff ([Next items](next-items.md)):
+
+```python
+from strata import ngrams
+
+db = strata.open("next.strata", ngrams.schema())
+db.write(ngrams.ops(["a", "b"], "c"))       # after each event: "c" after [..., "a", "b"]
+strata.next_items(db, ["a", "b"], k=10)     # [("c", 1.0), ...]
+```
 
 ## A server from Python
 

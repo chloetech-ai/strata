@@ -3,18 +3,21 @@
 //! * [`service`]: the operations, over a local database or, as a
 //!   coordinator ([`coord`]), over shard servers.
 //! * [`http`]: the JSON API (`/v1/...`), Prometheus metrics (`/metrics`)
-//!   and the query UI (`/`).
+//!   and the command center ([`ui`], at `/`).
 //! * [`grpc`]: the same operations over gRPC (`proto/strata.proto`), which
 //!   a coordinator uses to reach its shards; [`plan_pb`]: plans as protobuf.
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
 //! * [`replication`]: a primary shipping its writes to its replicas.
 //! * [`media`]: fetching the files MEDIA fields name over HTTP(S).
+//! * [`keys`]: API keys with scopes, and the audit log; [`alerts`]: alert
+//!   rules over the series.
 //! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves;
 //!   [`telemetry`]: the running and latest queries, their traces, and the
 //!   series of rates and gauges the UI draws.
 
 pub mod agent;
+pub mod alerts;
 pub mod auth;
 pub mod coord;
 pub mod demo;
@@ -22,6 +25,7 @@ pub mod grpc;
 pub mod http;
 pub mod idem;
 pub mod json;
+pub mod keys;
 pub mod media;
 pub mod metrics;
 pub mod obs;
@@ -31,6 +35,7 @@ pub mod server;
 pub mod service;
 pub mod slots;
 pub mod telemetry;
+pub mod ui;
 
 pub mod pb {
     tonic::include_proto!("strata.v1");

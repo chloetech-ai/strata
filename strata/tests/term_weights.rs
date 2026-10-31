@@ -1,10 +1,12 @@
-//! Term weights and required words in `bm25`: `word^w` weighs a word,
-//! `+word` and `+"a phrase"` must occur in a row, `-word` must not, and
-//! `syntax => 'plain'` reads the text as plain words. Every answer is
-//! checked against BM25 computed by hand over a naive index, for each
-//! top-k algorithm, with filters, as a rank-safe boost and as a rerank
+//! Term weights, required words and x of y in `bm25` and `MATCH`:
+//! `word^w` weighs a word, `+word` and `+"a phrase"` must occur in a row,
+//! `-word` must not, `min => n` (or `'p%'`) asks for n of the optional
+//! words, and `syntax => 'plain'` reads the text as plain words. Every
+//! answer is checked against BM25 computed by hand over a naive index, for
+//! each top-k algorithm, with filters, as a rank-safe boost and as a rerank
 //! phase's values, and over shards. `MATCH` reads a weight and matches as
-//! without it.
+//! without it, and its groups `(a b c)@2` and `min =>` match as counted by
+//! hand.
 
 mod text_common;
 
@@ -15,13 +17,13 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use strata::cluster;
 use strata::db::Db;
 use strata::query::exec::{ExecOptions, ResultSet};
-use strata::query::ir::{Plan, TEXT_OPERATORS};
+use strata::query::ir::{Plan, MIN_MATCH, TEXT_OPERATORS};
 use strata::query::plan::FilterMode;
 use strata::query::stats::TermStats;
 use strata::query::{bind, Params};
 use strata::schema::{Field, FieldType, Schema};
 use strata::storage::DbOptions;
-use strata::text::query::{has_operators, ranked_items, Occur};
+use strata::text::query::{has_operators, parse_match, ranked_items, Need, Occur};
 use strata::text::{Analyzer, BoolQuery};
 use strata::value::Value;
 use text_common::Naive;
@@ -85,7 +87,15 @@ impl<'a> Reference<'a> {
 
     /// The rows `q` matches among `rows`, scored, best first.
     fn rank(&mut self, q: &str, rows: impl Fn(u32) -> bool) -> Vec<(u32, f64)> {
-        let (weights, must, not) = parse(q);
+        self.rank_min(q, None, rows)
+    }
+
+    /// [`Self::rank`], the rows also holding `min` of its optional items.
+    fn rank_min(&mut self, q: &str, min: Option<Need>, rows: impl Fn(u32) -> bool) -> Vec<(u32, f64)> {
+        let (weights, mut must, not, should) = parse(q);
+        if let (Some(need), false) = (min, should.is_empty()) {
+            must.push(BoolQuery::AtLeast { n: need.of(should.len()), items: should });
+        }
         let mut scores: BTreeMap<u32, f64> = BTreeMap::new();
         for (t, w) in &weights {
             for (&d, &s) in self.term(t) {
@@ -100,10 +110,10 @@ impl<'a> Reference<'a> {
     }
 }
 
-/// A query's scored terms and weights, and its required and excluded
-/// words, read by hand from the items.
-fn parse(q: &str) -> (BTreeMap<String, f64>, Vec<BoolQuery>, Vec<BoolQuery>) {
-    let (mut weights, mut must, mut not) = (BTreeMap::new(), Vec::new(), Vec::new());
+/// A query's scored terms and weights, its required and excluded words,
+/// and its optional ones (each once), read by hand from the items.
+fn parse(q: &str) -> (BTreeMap<String, f64>, Vec<BoolQuery>, Vec<BoolQuery>, Vec<BoolQuery>) {
+    let (mut weights, mut must, mut not, mut should) = (BTreeMap::new(), Vec::new(), Vec::new(), Vec::new());
     for item in ranked_items(q) {
         let terms = Analyzer::English.query_term_seq(item.text, true);
         let bool_q = match terms.len() {
@@ -117,6 +127,7 @@ fn parse(q: &str) -> (BTreeMap<String, f64>, Vec<BoolQuery>, Vec<BoolQuery>) {
                 continue;
             }
             Occur::Must => must.push(bool_q),
+            Occur::Should if !should.contains(&bool_q) => should.push(bool_q),
             Occur::Should => {}
         }
         let w = item.weight.unwrap_or(1.0) as f64;
@@ -126,7 +137,7 @@ fn parse(q: &str) -> (BTreeMap<String, f64>, Vec<BoolQuery>, Vec<BoolQuery>) {
             }
         }
     }
-    (weights, must, not)
+    (weights, must, not, should)
 }
 
 /// `got` (ids and scores) against the reference's best `k`: the same
@@ -319,6 +330,8 @@ fn shards_answer_as_one_database() {
         for sql in [
             "SELECT id, score() FROM t WHERE year >= 2000 ORDER BY bm25(body, :q) DESC LIMIT 15",
             "SELECT id, score() FROM t ORDER BY bm25(body, :q) * (1 + 0.01 * (year - 1990)) DESC LIMIT 15",
+            "SELECT id, score() FROM t WHERE year >= 2000 ORDER BY bm25(body, :q, min => 2) DESC LIMIT 15",
+            "SELECT id, score() FROM t ORDER BY bm25(body, :q, min => '50%') * (1 + 0.01 * (year - 1990)) DESC LIMIT 15",
         ] {
             let whole = db.query(sql, &params).unwrap();
             let snaps: Vec<_> = shards.iter().map(|d| d.snapshot()).collect();
@@ -351,6 +364,23 @@ fn plans_name_text_operators() {
     assert!(!features("SELECT id FROM t WHERE MATCH(body, 'topic even') LIMIT 5", ""));
     let e = Plan::readable_by(1, &[TEXT_OPERATORS], &["operators"]).unwrap_err().to_string();
     assert!(e.contains("text_operators"), "{e}");
+    // Groups and min: min_match, and text_operators only with weights or signs.
+    let min = |sql: &str, q: &str| db.explain(sql, &Params::new().set("q", Value::Str(q.into()))).unwrap().features.iter().any(|f| f == MIN_MATCH);
+    let ranked_min = "SELECT id FROM t ORDER BY bm25(body, :q, min => 2) DESC LIMIT 5";
+    assert!(min(ranked_min, "topic even w1z") && !features(ranked_min, "topic even w1z"));
+    assert!(min("SELECT id FROM t ORDER BY bm25(body, :q, min => '50%', syntax => 'plain') DESC LIMIT 5", "topic even"));
+    assert!(!min(rank, "+topic even"));
+    for m in ["(topic even w1z)@2", "topic AND (even OR w1z)@50%"] {
+        let sql = format!("SELECT id FROM t WHERE MATCH(body, '{m}') LIMIT 5");
+        assert!(min(&sql, "") && !features(&sql, ""), "{m}");
+    }
+    assert!(min("SELECT id FROM t WHERE MATCH(body, 'topic even w1z', min => 2) LIMIT 5", ""));
+    let e = Plan::readable_by(1, &[MIN_MATCH], &["operators", TEXT_OPERATORS]).unwrap_err().to_string();
+    assert!(e.contains("min_match"), "{e}");
+    let params = Params::new().set("q", Value::Str("topic even w1z sub3".into()));
+    let plan = db.explain(ranked_min, &params).unwrap();
+    let strata::db::SqlResult::Rows(a) = db.run(&plan).unwrap() else { panic!("rows") };
+    assert_eq!(a.keys, db.query(ranked_min, &params).unwrap().keys);
     // A plan with them runs as the SQL does.
     let params = Params::new().set("q", Value::Str("+topic even^2 -w1z".into()));
     let plan = db.explain(rank, &params).unwrap();
@@ -368,4 +398,168 @@ fn match_reads_weights_and_matches_without_them() {
         assert_eq!(ids(weighted), ids(plain), "{weighted}");
     }
     assert!(!ids("topic^2").is_empty());
+}
+
+/// A random `min`: a count or a percentage.
+fn random_need(rng: &mut StdRng) -> (Need, String) {
+    match rng.gen_range(0..6) {
+        0 => (Need::Count(1), "1".into()),
+        1 | 2 => (Need::Count(2), "2".into()),
+        3 => (Need::Count(3), "3".into()),
+        4 => (Need::Percent(50), "'50%'".into()),
+        _ => (Need::Percent(75), "'75%'".into()),
+    }
+}
+
+#[test]
+fn min_counts_optional_words_as_by_hand() {
+    let dir = tempfile::tempdir().unwrap();
+    let texts = texts();
+    let db = create(dir.path(), "t.strata", rows(&texts, |_| true));
+    let naive = Naive::new(&texts);
+    let mut reference = Reference::new(&naive);
+    let mut rng = StdRng::seed_from_u64(61);
+    let (mut matched, mut fewer) = (0, 0);
+    for i in 0..150 {
+        let q = random_query(&mut rng, &texts);
+        let (need, min) = random_need(&mut rng);
+        let (lo, hi) = if i % 3 == 0 { (1990, 2019) } else { (1995 + (i % 10) as i64, 2005 + (i % 10) as i64) };
+        let want = reference.rank_min(&q, Some(need), |d| (lo..=hi).contains(&year(d as usize)));
+        matched += want.len().min(1);
+        fewer += (want.len() < reference.rank(&q, |d| (lo..=hi).contains(&year(d as usize))).len()) as usize;
+        for algo in ["exhaustive", "maxscore", "bmw"] {
+            for k in [1, 10, 50] {
+                let sql = format!("SELECT id, score() FROM t WHERE year BETWEEN {lo} AND {hi} ORDER BY bm25(body, :q, algo => '{algo}', min => {min}) DESC LIMIT {k}");
+                for mode in [FilterMode::Materialize, FilterMode::Probe] {
+                    let opts = ExecOptions { filter_mode: Some(mode), ..ExecOptions::default() };
+                    let got = db.query_with(&sql, &Params::new().set("q", Value::Str(q.clone())), &opts).unwrap_or_else(|e| panic!("{sql} [{q}]: {e}"));
+                    check(&got, &want, k, &format!("{q} | min {min} {algo} k={k} {mode:?}"));
+                }
+            }
+        }
+        // A rank-safe boost, and a rerank phase over rows the text did not
+        // choose (a row with too few of the words scores 0).
+        let all = reference.rank_min(&q, Some(need), |_| true);
+        let mut boosted: Vec<(u32, f64)> = all.iter().map(|&(d, s)| (d, s * (1.0 + 0.01 * (year(d as usize) - 1990) as f64))).collect();
+        boosted.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let sql = format!("SELECT id, score() FROM t ORDER BY bm25(body, :q, min => {min}) * (1 + 0.01 * (year - 1990)) DESC LIMIT 20");
+        check(&query(&db, &sql, &q), &boosted, 20, &format!("{q} | min {min} boost"));
+        let by_id: BTreeMap<u32, f64> = all.iter().copied().collect();
+        let sql = format!("WITH top AS (SELECT * FROM t ORDER BY year DESC LIMIT 300) SELECT id FROM top ORDER BY bm25(body, :q, min => {min}) DESC LIMIT 300");
+        let got = query(&db, &sql, &q);
+        for (key, s) in got.keys.iter().zip(&got.scores) {
+            let d = key.as_i64().unwrap() as u32;
+            let w = by_id.get(&d).copied().unwrap_or(0.0);
+            assert!((s - w).abs() <= 1e-4 * w.abs().max(1.0), "{q} min {min}: row {d} scored {s}, by hand {w}");
+        }
+    }
+    assert!(matched > 60 && fewer > 30, "queries with rows: {matched}, cut by min: {fewer}");
+}
+
+#[test]
+fn min_reads_plain_words_and_ignores_a_text_without_optional_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let texts = texts();
+    let db = create(dir.path(), "t.strata", rows(&texts, |_| true));
+    let sql = |opts: &str| format!("SELECT id, score() FROM t ORDER BY bm25(body, :q{opts}) DESC LIMIT 40");
+    let same = |a: &ResultSet, b: &ResultSet, what: &str| {
+        assert_eq!(a.keys, b.keys, "{what}");
+        assert_eq!(a.scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(), b.scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(), "{what}");
+    };
+    // Plain syntax counts each word once.
+    for q in ["topic even w1z", "topic topic even sub3 w5z", "w0z w1z w2z w5z"] {
+        same(&query(&db, &sql(", min => 2, syntax => 'plain'"), q), &query(&db, &sql(", min => 2"), q), q);
+    }
+    // A word written twice is one item: two of `topic topic even` is both.
+    same(&query(&db, &sql(", min => 2"), "topic topic even"), &query(&db, &sql(""), "+topic topic +even"), "repeats");
+    // Weight 0 scores nothing but counts.
+    same(&query(&db, &sql(", min => 2"), "topic^0 even"), &query(&db, &sql(""), "+topic^0 +even"), "^0");
+    // Required words and no optional ones: min changes nothing.
+    same(&query(&db, &sql(", min => 3"), "+topic +even"), &query(&db, &sql(""), "+topic +even"), "no optional");
+    // min => 1 is any of them, which bm25 already asks; over the count, all.
+    same(&query(&db, &sql(", min => 1"), "topic even w1z"), &query(&db, &sql(""), "topic even w1z"), "min 1");
+    same(&query(&db, &sql(", min => 9"), "topic even w1z"), &query(&db, &sql(""), "+topic +even +w1z"), "min 9");
+    for bad in ["'x'", "-1", "1.5", "'150%'"] {
+        let e = db.query(&sql(&format!(", min => {bad}")), &Params::new().set("q", Value::Str("topic".into()))).unwrap_err().to_string();
+        assert!(e.contains("min => a count"), "{bad}: {e}");
+    }
+}
+
+/// A random `MATCH` group of words, phrases, prefixes, nested groups and
+/// excluded words, with `@n` or `@p%`, alone or beside other operands.
+fn random_group(rng: &mut StdRng, texts: &[String], depth: usize) -> String {
+    let words: Vec<String> = loop {
+        let d = rng.gen_range(0..texts.len());
+        let w: Vec<String> = texts[d].split(|c: char| c == ' ' || c == ',').filter(|w| w.starts_with('w')).map(str::to_string).collect();
+        if w.len() >= 2 {
+            break w;
+        }
+    };
+    let common = ["topic", "even", "sub3", "w0z", "w1z", "w2z", "w5z", "doc"];
+    let mut items = Vec::new();
+    for _ in 0..rng.gen_range(2..6) {
+        items.push(match rng.gen_range(0..9) {
+            0 | 1 => common[rng.gen_range(0..common.len())].to_string(),
+            2 => {
+                let i = rng.gen_range(0..words.len() - 1);
+                format!("\"{} {}\"", words[i], words[i + 1])
+            }
+            3 => format!("w{}*", rng.gen_range(1..30)),
+            4 if depth < 2 => random_group(rng, texts, depth + 1),
+            5 => format!("({} OR {})", common[rng.gen_range(0..common.len())], words[0]),
+            6 => format!("-{}", common[rng.gen_range(0..common.len())]),
+            _ => words[rng.gen_range(0..words.len())].clone(),
+        });
+    }
+    let need = ["@1", "@2", "@2", "@3", "@50%", "@75%", "@9"][rng.gen_range(0..7)];
+    let join = if rng.gen_bool(0.3) { " OR " } else { " " };
+    let group = format!("({}){need}", items.join(join));
+    match (depth, rng.gen_range(0..4)) {
+        (0, 0) => format!("topic AND {group}"),
+        (0, 1) => format!("{group} OR sub2"),
+        _ => group,
+    }
+}
+
+/// Whether the query has a group that counts its items.
+fn counts(q: &BoolQuery) -> bool {
+    match q {
+        BoolQuery::AtLeast { .. } => true,
+        BoolQuery::And(cs) | BoolQuery::Or(cs) => cs.iter().any(counts),
+        BoolQuery::Not(c) => counts(c),
+        _ => false,
+    }
+}
+
+#[test]
+fn match_groups_match_as_counted_by_hand() {
+    let dir = tempfile::tempdir().unwrap();
+    let texts = texts();
+    let db = create(dir.path(), "t.strata", rows(&texts, |_| true));
+    let naive = Naive::new(&texts);
+    let mut rng = StdRng::seed_from_u64(67);
+    let ids = |sql: &str, mode: FilterMode| -> Vec<u32> {
+        let opts = ExecOptions { filter_mode: Some(mode), ..ExecOptions::default() };
+        db.query_with(sql, &Params::new(), &opts).unwrap_or_else(|e| panic!("{sql}: {e}")).keys.iter().map(|k| k.as_i64().unwrap() as u32).collect()
+    };
+    let (mut some, mut cut) = (0, 0);
+    for _ in 0..200 {
+        let m = random_group(&mut rng, &texts, 0);
+        let want: Vec<u32> = naive.eval(&parse_match(&m).unwrap()).into_iter().collect();
+        some += !want.is_empty() as usize;
+        cut += counts(&parse_match(&m).unwrap()) as usize;
+        for mode in [FilterMode::Materialize, FilterMode::Probe] {
+            assert_eq!(ids(&format!("SELECT id FROM t WHERE MATCH(body, '{m}') ORDER BY id LIMIT 5000"), mode), want, "{m} {mode:?}");
+            let sql = format!("SELECT id FROM t WHERE year BETWEEN 2000 AND 2004 AND MATCH(body, '{m}') ORDER BY id LIMIT 5000");
+            let kept: Vec<u32> = want.iter().copied().filter(|&d| (2000..=2004).contains(&year(d as usize))).collect();
+            assert_eq!(ids(&sql, mode), kept, "{m} {mode:?} with a filter");
+        }
+    }
+    assert!(some > 100 && cut > 40, "groups with rows: {some}, counted groups: {cut}");
+    // min => on MATCH is the whole query as one group.
+    for (q, min) in [("topic even w1z sub3", "2"), ("topic OR even OR w1z", "'50%'"), ("topic even -w1z \"w0z w1z\"", "2"), ("the topic", "3")] {
+        let a = ids(&format!("SELECT id FROM t WHERE MATCH(body, '{q}', min => {min}) ORDER BY id LIMIT 5000"), FilterMode::Materialize);
+        let b = ids(&format!("SELECT id FROM t WHERE MATCH(body, '({q})@{}') ORDER BY id LIMIT 5000", min.trim_matches('\'')), FilterMode::Materialize);
+        assert_eq!(a, b, "{q} min {min}");
+    }
 }

@@ -15,6 +15,7 @@ use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
 use crate::service::{After, QueryReq, Service, Stream};
+use crate::keys::{Principal, Scope};
 use crate::{obs, plan_pb, ApiError};
 
 pub fn to_pb(v: &Value) -> pb::Value {
@@ -91,10 +92,11 @@ pub fn result_from_pb(r: pb::QueryResponse) -> Result<ResultSet, ApiError> {
 /// takes SQL or a JSON plan, 2 a typed plan, 3 holds a query's snapshot
 /// for the fetch that follows, 4 places keys in slots, 5 reads the writes
 /// a read must see (`min_seq_no`), which a replica waits for, 6 keeps
-/// stream sources' offsets ([`SOURCES_PROTOCOL`]), and 7 answers the next
-/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]).
+/// stream sources' offsets ([`SOURCES_PROTOCOL`]), 7 answers the next
+/// codes of semantic-ID prefixes ([`SIDNEXT_PROTOCOL`]), and 8 counts the
+/// rows of a guard's levels ([`GUARD_PROTOCOL`]).
 pub const MIN_PROTOCOL: u32 = 1;
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 8;
 
 /// The protocol whose writes carry stream sources' offsets
 /// ([`crate::service::op_source`]), and that answers `Sources`.
@@ -102,6 +104,9 @@ pub const SOURCES_PROTOCOL: u32 = 6;
 
 /// The protocol of `SidNext`, the next codes of semantic-ID prefixes.
 pub const SIDNEXT_PROTOCOL: u32 = 7;
+
+/// The protocol of `GuardCounts`, the rows of a guard's levels.
+pub const GUARD_PROTOCOL: u32 = 8;
 
 /// A write's answer ([`crate::service::Written`]).
 pub fn write_response(w: crate::service::Written) -> pb::WriteResponse {
@@ -186,6 +191,19 @@ pub fn code_name(c: tonic::Code) -> &'static str {
     }
 }
 
+/// Refuses a call its credential may not make ([`crate::keys`]): the
+/// internal methods only the root may (the token the servers of a
+/// cluster share), writes a write or admin key, the rest any key.
+fn may_call<T>(req: &Request<T>, method: &str) -> Result<(), Status> {
+    let who = req.extensions().get::<Principal>().cloned().unwrap_or_else(Principal::open);
+    let internal = matches!(method, "Replicate" | "Restore" | "Verify" | "Slots");
+    if internal && !who.root {
+        return Err(Status::permission_denied(format!("{method} is a call between the servers of a cluster: it needs the token they share, not a key ({:?})", who.name)));
+    }
+    let need = if matches!(method, "Write" | "WriteStream") { Scope::Write } else { Scope::Read };
+    who.may(need, method).map_err(|e| Status::permission_denied(e.message))
+}
+
 impl Grpc {
     /// Serves one call: gives it its id (the caller's `x-request-id`, or a
     /// new one, sent back in the answer's metadata), runs it in a span that
@@ -196,6 +214,10 @@ impl Grpc {
     {
         let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
         let span = tracing::info_span!("request", id = %id, method);
+        if let Err(s) = may_call(&req, method) {
+            self.0.metrics.grpc(method, "PermissionDenied", 0.0);
+            return Err(s);
+        }
         let t0 = Instant::now();
         let r = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), f(self.0.clone(), req.into_inner()))).instrument(span.clone()).await;
         let secs = t0.elapsed().as_secs_f64();
@@ -251,6 +273,17 @@ impl pb::strata_server::Strata for Grpc {
         .await
     }
 
+    async fn guard_counts(&self, req: Request<pb::QueryRequest>) -> Result<Response<pb::GuardCountsResponse>, Status> {
+        self.serve("GuardCounts", req, |svc, r| async move {
+            svc.check_epoch(r.epoch)?;
+            let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
+            let after = After::of(r.min_seq_no, r.min_seq_nos)?;
+            let (need, counts) = svc.guard_counts(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
+            Ok(pb::GuardCountsResponse { need: need as u32, counts })
+        })
+        .await
+    }
+
     async fn sid_next(&self, req: Request<pb::SidNextRequest>) -> Result<Response<pb::SidNextResponse>, Status> {
         self.serve("SidNext", req, |svc, r| async move {
             let q = r.query.unwrap_or_default();
@@ -291,6 +324,7 @@ impl pb::strata_server::Strata for Grpc {
     /// it; the first that fails ends the stream with its error, so that no
     /// batch after it is applied ([`Service::stream_write`]).
     async fn write_stream(&self, req: Request<tonic::Streaming<pb::WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
+        may_call(&req, "WriteStream")?;
         let id = obs::request_id(req.metadata().get(obs::HEADER).and_then(|v| v.to_str().ok()));
         let mut input = req.into_inner();
         let svc = self.0.clone();

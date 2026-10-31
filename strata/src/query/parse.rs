@@ -20,12 +20,88 @@ use crate::error::{Error, Result};
 /// SQLite's default limit is 1,000 too.
 pub const MAX_EXPR_DEPTH: usize = 1000;
 
+/// The call `MAX k PER field` parses as, the last item of its query's
+/// ORDER BY: `__max_per(k, field)` ([`crate::query::compound`]).
+pub const PER_CAP: &str = "__max_per";
+
 /// Parses `sql_text` into its statements (generic SQL dialect).
 pub fn parse(sql_text: &str) -> Result<Vec<Statement>> {
     let dialect = GenericDialect {};
-    let tokens = Tokenizer::new(&dialect, sql_text).tokenize().map_err(|e| Error::Query(e.to_string()))?;
+    let tokens = per_caps(Tokenizer::new(&dialect, sql_text).tokenize().map_err(|e| Error::Query(e.to_string()))?);
     check_depth(&tokens)?;
     Parser::new(&dialect).with_tokens(tokens).parse_statements().map_err(|e| Error::Query(e.to_string()))
+}
+
+/// `MAX k PER field` (after an ORDER BY, or without one) as the call
+/// [`PER_CAP`] ending the ORDER BY: `ORDER BY a DESC MAX 2 PER b` parses
+/// as `ORDER BY a DESC, __max_per(2, b)`. `MAX` followed by a number is
+/// nothing else in SQL. The field is a name, or names joined by dots.
+fn per_caps(tokens: Vec<Token>) -> Vec<Token> {
+    let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    // Whether the query of each open parenthesis has had an ORDER BY.
+    let mut ordered = vec![false];
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut last: Option<Token> = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        match t {
+            Token::LParen => ordered.push(false),
+            Token::RParen if ordered.len() > 1 => {
+                ordered.pop();
+            }
+            Token::Word(w) if w.keyword == Keyword::SELECT => *ordered.last_mut().expect("the statement level") = false,
+            Token::Word(w) if w.keyword == Keyword::BY && last.as_ref().is_some_and(|l| word(l, "ORDER")) => *ordered.last_mut().expect("the statement level") = true,
+            _ => {}
+        }
+        if word(t, "MAX") {
+            let next: Vec<usize> = (i + 1..tokens.len()).filter(|&j| !matches!(tokens[j], Token::Whitespace(_))).take(3).collect();
+            if let [k, per, name] = next[..] {
+                if matches!(tokens[k], Token::Number(..)) && word(&tokens[per], "PER") && matches!(tokens[name], Token::Word(_)) {
+                    let mut end = name + 1;
+                    while end + 1 < tokens.len() && tokens[end] == Token::Period && matches!(tokens[end + 1], Token::Word(_)) {
+                        end += 2;
+                    }
+                    let level = ordered.last_mut().expect("the statement level");
+                    match *level {
+                        true => out.push(Token::Comma),
+                        false => out.extend([Token::make_keyword("ORDER"), Token::Whitespace(sqlparser::tokenizer::Whitespace::Space), Token::make_keyword("BY")]),
+                    }
+                    *level = true;
+                    out.extend([Token::Whitespace(sqlparser::tokenizer::Whitespace::Space), Token::make_word(PER_CAP, None), Token::LParen, tokens[k].clone(), Token::Comma]);
+                    out.extend(tokens[name..end].iter().cloned());
+                    out.push(Token::RParen);
+                    last = Some(Token::RParen);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if !matches!(t, Token::Whitespace(_)) {
+            last = Some(t.clone());
+        }
+        out.push(t.clone());
+        i += 1;
+    }
+    out
+}
+
+/// `sql` printed from a parsed statement, its [`PER_CAP`] calls written
+/// back as `MAX k PER field`.
+pub fn unparse_per_caps(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(&format!("{PER_CAP}(")) {
+        let args_at = at + PER_CAP.len() + 1;
+        let (Some(close), Some(comma)) = (rest[args_at..].find(')'), rest[args_at..].find(", ")) else { break };
+        let before = &rest[..at];
+        let before = before.strip_suffix(", ").or_else(|| before.strip_suffix("ORDER BY ")).unwrap_or(before);
+        out.push_str(before.trim_end());
+        out.push_str(&format!(" MAX {} PER {}", &rest[args_at..args_at + comma], &rest[args_at + comma + 2..args_at + close]));
+        rest = &rest[args_at + close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// An upper bound of the expression depth `tokens` can parse into: within
@@ -118,6 +194,21 @@ fn chains(t: &Token) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_k_per_parses_as_the_last_ordering() {
+        let as_sql = |q: &str| parse(q).unwrap()[0].to_string();
+        assert_eq!(as_sql("SELECT id FROM t ORDER BY bm25(body, 'x') DESC MAX 2 PER venue LIMIT 20"), "SELECT id FROM t ORDER BY bm25(body, 'x') DESC, __max_per(2, venue) LIMIT 20");
+        assert_eq!(as_sql("SELECT id FROM t max 1 per a.b"), "SELECT id FROM t ORDER BY __max_per(1, a.b)");
+        assert_eq!(
+            as_sql("SELECT id FROM t WHERE id IN (SELECT id FROM t ORDER BY n MAX 3 PER v LIMIT 5) ORDER BY MAX(n) DESC"),
+            "SELECT id FROM t WHERE id IN (SELECT id FROM t ORDER BY n, __max_per(3, v) LIMIT 5) ORDER BY MAX(n) DESC"
+        );
+        assert_eq!(as_sql("SELECT MAX(n) FROM t"), "SELECT MAX(n) FROM t");
+        for q in ["SELECT id FROM t ORDER BY n DESC MAX 2 PER venue LIMIT 20", "SELECT id FROM t WHERE id IN (SELECT id FROM t ORDER BY n MAX 3 PER a.v) LIMIT 5"] {
+            assert_eq!(unparse_per_caps(&as_sql(q)), q);
+        }
+    }
 
     #[test]
     fn long_lists_pass_and_long_chains_do_not() {

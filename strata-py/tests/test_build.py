@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import bm25, case, clamp, coalesce, col, count, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt
+from strata import at_least, bm25, case, clamp, coalesce, col, count, count_true, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt
 from conftest import BOOKS, book
 
 
@@ -39,6 +39,10 @@ def test_builder_runs_as_its_sql(db):
     r = same(db, t.select("id").where(col("id").startswith("b000") & ~col("genres").startswith("cl")).order_by(col("year")),
              "SELECT id FROM books WHERE PREFIX(id, 'b000') AND NOT PREFIX(genres, 'cl') ORDER BY year")
     assert len(r) > 0
+    # With typos: 'calssic' is a swap away from 'classic'.
+    r = same(db, t.select("id").where(col("genres").startswith("calssic", fuzzy="auto")).order_by(col("year")),
+             "SELECT id FROM books WHERE PREFIX(genres, 'calssic', fuzzy => 'auto') ORDER BY year")
+    assert len(r) > 0 and r.rows == db.query("SELECT id FROM books WHERE genres IN ('classic') ORDER BY year").rows
     # Without select: the stored fields but vectors, as SELECT * gives.
     same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
 
@@ -54,6 +58,72 @@ def test_bm25_weighs_requires_and_excludes_words(db):
     assert plain.rows != r.rows
     with pytest.raises(strata.StrataError, match="'query' or 'plain'"):
         db.run(t.select("id").order_by(bm25("description", q, syntax="lucene")).limit(5))
+
+
+def test_min_asks_for_some_of_the_words(db):
+    t = db.table()
+    q = "dragon ship river secret"
+    r = same(db, t.select("id", score()).order_by(bm25("description", q, min=3)).limit(20),
+             f"SELECT id, score() FROM books ORDER BY bm25(description, '{q}', min => 3) DESC LIMIT 20")
+    assert len(r) > 0 and all(sum(w in d for w in q.split()) >= 3 for d in (book(int(i[1:]))["description"] for i, _ in r.rows))
+    same(db, t.select("id").order_by(bm25("description", q, min="50%", syntax="plain")).limit(20),
+         f"SELECT id FROM books ORDER BY bm25(description, '{q}', min => '50%', syntax => 'plain') DESC LIMIT 20")
+    same(db, t.select("id").where(match("description", q, min=3)).order_by(col("year")).limit(100),
+         f"SELECT id FROM books WHERE MATCH(description, '{q}', min => 3) ORDER BY year LIMIT 100")
+    same(db, t.select("id").where(match("description", "(dragon ship river)@2 -secret")).order_by(col("year")).limit(100),
+         "SELECT id FROM books WHERE MATCH(description, '(dragon ship river)@2 -secret') ORDER BY year LIMIT 100")
+    with pytest.raises(strata.StrataError, match="count or a percentage"):
+        bm25("description", q, min=1.5)
+
+
+def test_at_least_and_count_true_run_as_their_sql(db):
+    t = db.table()
+    conds = [match("description", "dragon"), col("year") >= 1990, col("genres").isin(["classic"]), col("rating") < 3]
+    sql = "MATCH(description, 'dragon'), year >= 1990, genres IN ('classic'), rating < 3"
+    for n, text in [(2, "2"), (3, "3"), ("50%", "'50%'"), (9, "9")]:
+        r = same(db, t.select("id").where(at_least(n, *conds)).order_by(col("year")).limit(100),
+                 f"SELECT id FROM books WHERE AT_LEAST({text}, {sql}) ORDER BY year LIMIT 100")
+        assert len(r) > 0, text
+    # A count past the conditions' needs every one of them.
+    every = "MATCH(description, 'dragon') AND year >= 1990 AND genres IN ('classic') AND rating < 3"
+    assert r.keys == db.query(f"SELECT id FROM books WHERE {every} ORDER BY year LIMIT 100").keys
+    same(db, t.select("id").where(~at_least(2, *conds)).order_by(col("year")).limit(100),
+         f"SELECT id FROM books WHERE NOT AT_LEAST(2, {sql}) ORDER BY year LIMIT 100")
+    r = same(db, t.select("id", count_true(*conds).alias("k")).order_by(bm25("description", "river") * (1 + count_true(*conds))).limit(20),
+             f"SELECT id, count_true({sql}) AS k FROM books ORDER BY bm25(description, 'river') * (1 + count_true({sql})) DESC LIMIT 20")
+    assert len(r) == 20 and all(0 <= k <= 4 for _, k in r.rows) and len({k for _, k in r.rows}) > 1
+    with pytest.raises(strata.StrataError, match="a count .2. or a percentage"):
+        at_least("120%", *conds)
+    with pytest.raises(strata.StrataError, match="one or more conditions"):
+        count_true()
+
+
+def test_guards_run_as_their_sql(db):
+    t = db.table()
+    conds = [match("description", "dragon"), col("year") >= 1990, col("genres").isin(["classic"]), col("rating") < 3]
+    sql = "MATCH(description, 'dragon'), year >= 1990, genres IN ('classic'), rating < 3"
+    for opts, text in [(dict(max_rows=40), "max_rows => 40"), (dict(min_rows=30), "min_rows => 30"), (dict(min_rows=10, max_rows=90), "min_rows => 10, max_rows => 90")]:
+        q = t.select("id").where(col("year") > 1910, at_least(1, *conds, **opts)).order_by(col("year")).limit(200)
+        r = same(db, q, f"SELECT id FROM books WHERE year > 1910 AND AT_LEAST(1, {sql}, {text}) ORDER BY year LIMIT 200")
+        assert "guard" in q.plan()["root"]["input"]["input"]
+        q = t.select("id").where(match("description", "dragon ship river winter", min="25%", **opts)).order_by(col("year")).limit(200)
+        same(db, q, f"SELECT id FROM books WHERE MATCH(description, 'dragon ship river winter', min => '25%', {text}) ORDER BY year LIMIT 200")
+        q = t.select("id", score()).order_by(bm25("description", "dragon ship river winter", min=1, **opts)).limit(10)
+        same(db, q, f"SELECT id, score() FROM books ORDER BY bm25(description, 'dragon ship river winter', min => 1, {text}) DESC LIMIT 10")
+    assert len(r) > 0
+    with pytest.raises(strata.StrataError, match="relax its min, which it needs"):
+        match("description", "dragon ship", max_rows=10)
+    with pytest.raises(strata.StrataError, match="a count of rows"):
+        at_least(1, *conds, max_rows=2.5)
+    guarded = at_least(1, *conds, max_rows=40)
+    for q, msg in [
+        (t.select("id").where(guarded | (col("year") > 2000)), "joined to the others by AND"),
+        (t.select("id").where(~guarded), "joined to the others by AND"),
+        (t.select("id").where(guarded, match("description", "dragon ship", min=1, max_rows=5)), "one guard"),
+        (t.select("id").order_by(bm25("description", "dragon")).rerank(bm25("description", "ship river", min=1, max_rows=5), 20), "not a rerank phase"),
+    ]:
+        with pytest.raises(strata.StrataError, match=msg):
+            db.run(q)
 
 
 def test_a_ranking_given_by_keys_runs_as_its_sql(db):
@@ -176,6 +246,25 @@ def test_distinct_on(db):
     assert len(r) == 40  # a rating fixes the parity of the year
     with pytest.raises(strata.StrataError, match="distinct_on"):
         t.select("genres", count()).group_by("genres").distinct_on("genres").plan()
+
+
+def test_max_per(db):
+    """At most k rows of each value, the first k in the query's order, as
+    SQL's MAX k PER keeps them."""
+    t = db.table()
+    # Five books have each rating: two of each of the three best.
+    q = t.select("id", "rating").order_by(col("rating").desc()).max_per(2, "rating").limit(6)
+    r = same(db, q, "SELECT id, rating FROM books ORDER BY rating DESC MAX 2 PER rating LIMIT 6")
+    assert [row[1] for row in r.rows] == [4.9, 4.9, 4.8, 4.8, 4.7, 4.7]
+    assert q.plan()["features"] == ["operators", "distinct_on", "per_cap"]
+    same(db, t.select("id", "year", score()).where(match("description", "dragon")).order_by(bm25("description", "dragon")).max_per(3, "year").limit(6).offset(1),
+         "SELECT id, year, score() FROM books WHERE MATCH(description, 'dragon') ORDER BY bm25(description, 'dragon') DESC MAX 3 PER year LIMIT 6 OFFSET 1")
+    # One a value is DISTINCT ON, which needs no per_cap.
+    assert t.select("id").order_by(col("year")).max_per(1, "rating").limit(3).plan()["features"] == ["operators", "distinct_on"]
+    for bad, msg in [(lambda: t.select("id").max_per(2, "rating").limit(3), "order_by"), (lambda: t.select("id").order_by(col("year")).max_per(2, "genres"), "multi-valued"),
+                     (lambda: t.select("id").order_by(col("year")).max_per(0, "rating"), "1 or more")]:
+        with pytest.raises(strata.StrataError, match=msg):
+            bad().plan()
 
 
 def test_values_need_no_quoting(tmp_path):
