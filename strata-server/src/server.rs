@@ -381,6 +381,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     spawn_sampler(&svc);
+    // The cluster's keys: a coordinator takes them from its shards before
+    // it serves, and a coordinator or primary passes changes on.
+    crate::keysync::start(&svc).await;
     Ok(svc)
 }
 
@@ -688,8 +691,9 @@ pub async fn serve_http(svc: Arc<Service>, listener: TcpListener, access: Access
     }
 }
 
-/// Serves gRPC: every call needs `access.token` or a key of the scope
-/// its method needs ([`crate::keys`]), over TLS with `access.tls`.
+/// Serves gRPC: every call needs `access.cluster`, `access.token` or a key
+/// of the scope its method needs ([`crate::keys`]), over TLS with
+/// `access.tls`.
 pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access) -> Result<(), tonic::transport::Error> {
     use tokio_stream::StreamExt;
     // A gRPC answer is several small writes (headers, data, trailers); with
@@ -701,10 +705,10 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access
         }
         s
     });
-    let token = access.token.clone();
+    let (token, cluster) = (access.token.clone(), access.cluster.clone());
     let counted = svc.clone();
     // Who the call is from, for each method to check its scope.
-    let check = move |mut req: tonic::Request<()>| match counted.keys.resolve(token.as_ref(), req.metadata().get("authorization").and_then(|v| v.to_str().ok())) {
+    let check = move |mut req: tonic::Request<()>| match counted.keys.resolve(token.as_ref(), cluster.as_ref(), req.metadata().get("authorization").and_then(|v| v.to_str().ok())) {
         Some(who) => {
             req.extensions_mut().insert(who);
             Ok(req)

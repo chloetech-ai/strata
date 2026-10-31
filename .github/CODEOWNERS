@@ -28,6 +28,7 @@
 # Authentication and authorization.
 /strata-server/src/auth.rs        @rkonow
 /strata-server/src/keys.rs        @rkonow
+/strata-server/src/keysync.rs     @rkonow
 
 # The merge gate itself.
 /.github/                         @rkonow

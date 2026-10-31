@@ -42,7 +42,7 @@
 //! | `GET /v1/logs/store` | | `{store, schemas, nodes?}`: the log store (its path, rows, bytes, retention, what it wrote, dropped and deleted; null without one), its tables, and on a coordinator every server's |
 //! | `GET /v1/system`, `/v1/cluster`, `/v1/routes` | | the process and its limits; the cluster's copies; requests by route and queries by kind |
 //! | `GET /v1/whoami` | | `{name, key, scope, root}`: who the request's credential is ([`crate::keys`]) |
-//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id` | `{name, scope, expires_days?}` | the API keys; a new one's secret is answered once |
+//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id` | `{name, scope, expires_days?}` | the API keys, how many were revoked, and how the last merge of keys went with each server of the cluster (`peers`, [`crate::keysync`]); a new one's secret is answered once |
 //! | `GET /v1/admin/audit?limit=n` | | the latest requests that needed the admin scope or were refused |
 //! | `GET /v1/alerts`, `PUT /v1/alerts/rules` | `{rules}` | the alert rules with their states and the latest changes ([`crate::alerts`]) |
 //!
@@ -50,9 +50,9 @@
 //! client sent, if it is 1 to 64 letters, digits, '-', '_', '.' or ':', or
 //! a new one ([`crate::obs`]).
 //!
-//! With a token set or an API key made, every route but `/`, `/livez`,
-//! `/readyz` and `/v1/health` needs `Authorization: Bearer <token or
-//! key>`, and a key the scope of its route ([`route_scope`]). Every route checks the `Host` header
+//! With a token or a cluster token set, or an API key made, every route but
+//! `/`, `/livez`, `/readyz` and `/v1/health` needs `Authorization: Bearer
+//! <token or key>`, and a key the scope of its route ([`route_scope`]). Every route checks the `Host` header
 //! and, on a request that can change something, the `Origin` header
 //! ([`crate::auth`]).
 
@@ -106,13 +106,22 @@ type Res = Result<AxJson<Json>, ApiError>;
 struct App {
     svc: Arc<Service>,
     token: Option<Secret>,
+    cluster: Option<Secret>,
     hosts: Option<Arc<[String]>>,
+}
+
+impl App {
+    /// Whether callers must prove themselves by more than a key: a token or
+    /// the cluster's.
+    fn guarded(&self) -> bool {
+        self.token.is_some() || self.cluster.is_some()
+    }
 }
 
 pub fn router(svc: Arc<Service>, access: &Access) -> Router {
     // Rows come in writes and imports; every other body is small.
     let rows = DefaultBodyLimit::max(svc.max_body);
-    let app = App { svc, token: access.token.clone(), hosts: access.hosts.clone().map(Into::into) };
+    let app = App { svc, token: access.token.clone(), cluster: access.cluster.clone(), hosts: access.hosts.clone().map(Into::into) };
     let api = Router::new()
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
@@ -234,7 +243,7 @@ async fn auth(State(app): State<App>, headers: HeaderMap, mut req: Request, next
     let t0 = Instant::now();
     let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
     let method = req.method().clone();
-    let who = app.svc.keys.resolve(app.token.as_ref(), header_str(&headers, header::AUTHORIZATION));
+    let who = app.svc.keys.resolve(app.token.as_ref(), app.cluster.as_ref(), header_str(&headers, header::AUTHORIZATION));
     let need = route_scope(&method, &route);
     let refused = match &who {
         None => Some(ApiError { status: 401, message: "missing or wrong token".into() }),
@@ -1386,7 +1395,7 @@ async fn log_store(State(app): State<App>) -> AxJson<Json> {
 
 async fn system(State(app): State<App>) -> AxJson<Json> {
     let mut j = app.svc.system();
-    j["auth"] = json!({"token": app.token.is_some()});
+    j["auth"] = json!({"token": app.token.is_some(), "cluster_token": app.cluster.is_some()});
     j["logs"] = json!({"filter": obs::log_filter()});
     AxJson(j)
 }
@@ -1402,12 +1411,12 @@ async fn routes(State(app): State<App>) -> AxJson<Json> {
 async fn whoami(State(app): State<App>, w: Option<axum::Extension<Principal>>) -> AxJson<Json> {
     let w = who(w);
     let mut j = w.json();
-    j["auth"] = json!({"token": app.token.is_some(), "keys": !app.svc.keys.is_empty(), "open": app.token.is_none() && app.svc.keys.is_empty()});
+    j["auth"] = json!({"token": app.token.is_some(), "cluster_token": app.cluster.is_some(), "keys": !app.svc.keys.is_empty(), "open": !app.guarded() && app.svc.keys.is_empty()});
     AxJson(j)
 }
 
 async fn list_keys(State(app): State<App>) -> AxJson<Json> {
-    AxJson(json!({"keys": app.svc.keys.list(), "file": app.svc.keys.file().map(|p| p.display().to_string())}))
+    AxJson(json!({"keys": app.svc.keys.list(), "revoked": app.svc.keys.set().revoked.len(), "file": app.svc.keys.file().map(|p| p.display().to_string()), "peers": app.svc.keys.peers()}))
 }
 
 /// `{"name": ..., "scope": "read" | "write" | "admin", "expires_days": n}`:
@@ -1419,15 +1428,17 @@ async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<R
         None | Some(Json::Null) => None,
         Some(v) => Some(telemetry::now_ms() + v.as_f64().filter(|d| *d > 0.0).ok_or_else(|| ApiError::bad("expires_days is a number of days above 0"))?.mul_add(86_400_000.0, 0.0) as u64),
     };
-    let open = app.token.is_none() && app.svc.keys.is_empty();
-    let (key, secret) = app.svc.keys.create(name, scope, expires, app.token.is_some())?;
+    let open = !app.guarded() && app.svc.keys.is_empty();
+    // A shard, or a copy in replication, whose callers send no credential.
+    let in_cluster = app.svc.slots().is_some() || app.svc.role() != crate::pb::Role::Standalone;
+    let (key, secret) = app.svc.keys.create(name, scope, expires, app.guarded(), in_cluster)?;
     tracing::info!(key = %key.id, name = %key.name, scope = scope.name(), "API key created");
     let detail = format!("created key {} ({}, {})", key.name, key.id, scope.name());
     Ok(audited(json!({"key": key.json(), "secret": secret, "closed": open}), detail))
 }
 
 async fn revoke_key(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
-    match app.svc.keys.revoke(&id, app.token.is_some())? {
+    match app.svc.keys.revoke(&id, app.guarded())? {
         true => {
             tracing::info!(key = %id, "API key revoked");
             Ok(audited(json!({"revoked": id}), format!("revoked key {id}")))

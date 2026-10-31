@@ -645,6 +645,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
     }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
+    }
     async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no profiles"))
     }
@@ -716,6 +719,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
     }
     async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no profiles"))
@@ -1007,6 +1013,9 @@ impl pb::strata_server::Strata for Recording {
     }
     async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no log store"))
+    }
+    async fn keys(&self, _: tonic::Request<pb::KeysRequest>) -> Result<tonic::Response<pb::KeysResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no keys"))
     }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;
