@@ -786,7 +786,9 @@ impl Coordinator {
         self.topo.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Every server of every shard: its shard, URL and client.
+    /// Every server of every shard: its shard, URL and client (to ask each
+    /// server, as a profile or a query of the logs does,
+    /// [`crate::logstore::cluster_query`]).
     pub fn replica_clients(&self) -> Vec<(usize, String, Client)> {
         let t = self.topo();
         t.replicas.iter().enumerate().flat_map(|(i, rs)| rs.iter().map(move |r| (i, r.url.clone(), r.client.clone()))).collect()
