@@ -1,0 +1,16 @@
+# strata-encode-bench <model> --lengths 1,10,50,100,200 (2000 random histories a length, one thread)
+# cloud VM: Intel Xeon @ 2.80GHz, 4 cores, 16.5 GB, Linux 6.18; 2026-10-31
+$ strata-encode-bench ml-1m/models/ml1m
+SequenceModel(bench bfb00d995ffd6226, items.emb of 64, 2 layers of 64)
+1 events: mean 17.7 us, p50 13.5, p99 49.1
+10 events: mean 86.2 us, p50 90.8, p99 202.0
+50 events: mean 301.3 us, p50 275.3, p99 504.6
+100 events: mean 659.6 us, p50 621.5, p99 1041.6
+200 events: mean 1510.9 us, p50 1476.1, p99 2228.6
+$ strata-encode-bench beauty/models/beauty   # max_len 50: longer histories read their newest 50
+SequenceModel(bench 130880b947fadb9a, items.emb of 64, 2 layers of 64)
+1 events: mean 22.8 us, p50 21.3, p99 61.6
+10 events: mean 79.5 us, p50 64.9, p99 173.8
+50 events: mean 288.5 us, p50 276.9, p99 379.5
+100 events: mean 290.1 us, p50 271.9, p99 470.4
+200 events: mean 294.0 us, p50 272.3, p99 443.0

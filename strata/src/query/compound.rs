@@ -738,6 +738,10 @@ impl<'a> Planner<'a> {
                 one("a subquery of query vectors")?;
                 ir::Expr::Values(node)
             }
+            Sub::Rows if p.columns.is_empty() || p.columns.len() > 3 => {
+                return Err(err(format!("encode's history returns the item's key, then its action and time (one to three columns), not {}", p.columns.len())));
+            }
+            Sub::Rows => ir::Expr::Values(node),
             Sub::Exists => ir::Expr::Exists(node),
             Sub::Scalar => {
                 one("a scalar subquery")?;
@@ -1686,6 +1690,13 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             let ir::Expr::Lit(n) = go(n)? else { return Err(err(usage)) };
             let need = crate::query::exec::need_of(&n, "AT_LEAST's n is")?.of(conds.len());
             ir::Expr::AtLeast { need: need as u32, conds: conds.iter().map(|c| go(c)).collect::<Result<_>>()? }
+        }
+        Expr::Function(f) if fname(f) == "encode" => {
+            let lit = |x: &Expr| match x {
+                Expr::Value(v) => literal(&v.value, params),
+                x => Err(err(format!("encode's model and now are values, not {x}"))),
+            };
+            super::sql::encode_call(f, &lit, &|q| sub(q, Sub::Rows))?
         }
         Expr::Function(f) => {
             let func = match fname(f).as_str() {

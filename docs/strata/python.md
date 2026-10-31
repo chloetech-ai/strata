@@ -217,6 +217,26 @@ db.write(ngrams.ops(["a", "b"], "c"))       # after each event: "c" after [..., 
 strata.next_items(db, ["a", "b"], k=10)     # [("c", 1.0), ...]
 ```
 
+## Sequence models
+
+[`encode('model', history)`](query-language.md#sequence-models-encodemodel-history) turns a user's events into a vector of an item field, by a model that `strata.train.sequence` trains with PyTorch (`pip install torch`) and saves in the models directory:
+
+```python
+import strata.train
+db = strata.Database.open("shop.strata", models="models")
+out = strata.train.sequence(db, "next", table="items", field="emb",
+                            events={"table": "events", "user": "usr", "item": "item", "action": "action", "time": "ts"},
+                            learn_items=True, negatives="all", holdout=True, models="models")
+db.upsert([{"id": k, "emb": v} for k, v in out["vectors"].items()])
+db.query("""SELECT id FROM items ORDER BY similarity(emb, encode('next',
+            (SELECT item, action, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200))) DESC LIMIT 10""", {"u": "u42"})
+```
+
+- **The histories** come from one of `events` (a table of the database: its columns of users, items, and optionally actions, times, and `order` for events with equal times), `sequences` (a dict from user to a list of `(item, action, time in seconds)`, oldest first) or `records` (the [rank log's export](#the-rank-log) with `history`: each record's history is a training example, and its row the target when its label is positive or missing). The item vectors are the field's, or `vectors` (a dict from key to vector).
+- **What it learns**: every event is the target of the events before it. Each item is scored as `similarity` scores it, the dot product of the model's unit vector with the item's vector, over `temperature` (0.05), and the loss is cross-entropy against the other targets of the batch (`negatives="in_batch"`, the default) or every item (`"all"`, for catalogs that fit). With `learn_items=True` the item vectors are trained too, starting from the field's, and returned normalized in `out["vectors"]` for you to write back; without it the field keeps its vectors and the model learns to map histories into their space, so a new item is found as soon as it has a vector.
+- **Options**: `width` (64), `layers` (2), `heads` (1), `ffn` (4 × width), `max_len` (200 events), `gap_buckets` (32), `actions` (the actions seen by default; others count as one more), `epochs` (50), `batch` (128), `lr` (1e-3), `dropout` (0.2), `seed`. With `holdout=True` each user's last event is kept out of training, and training stops when NDCG@10 on those has not risen for `patience` epochs (5), keeping the best epoch. `max_seconds` stops it after the first epoch that ends past that many seconds. `log=print` prints each epoch's loss and metrics, which `out["history"]` also holds.
+- It returns `{"path", "history", "vectors"}`. Pass the same `models=` to `Database.open`, or start the server with `--models`: a coordinator needs the model, its shards don't.
+
 ## A server from Python
 
 `strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set), `import_sqlite(path, tables=None)` and `plan_sqlite(path)` (a SQLite file's tables, uploaded the same way; [SQLite in and out](sqlite.md#over-http-and-in-the-ui)), `export_sqlite(path, tables=None)` (the server's tables downloaded as a SQLite file) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api), or `embed(image=data)` an image's and `embed(audio=data)` a sound's), `query_logged` and `export_rank_log` ([the rank log](#the-rank-log)), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).

@@ -69,6 +69,8 @@ On Amazon Beauty (22,363 users' reviews of 12,101 products in time order, the 5-
 
 SASRec's published numbers on the same split are 0.0605 and 0.0318 (as [TIGER](https://arxiv.org/abs/2305.05065) reports them, from P5), so counted the way SASRec trains, counts match its recall and beat its NDCG: a strong baseline on this data. Two caveats: 43.5% of users wrote their last two reviews on the same day, which the usual preprocessing leaves in product order and which favours counted transitions; and with under nine reviews per user, the pair's context adds little over the last item's (order 3 adds nothing). Answers were the same as scoring every item for the first 2,000 users. Fewer than 10 scored items were filled with the most frequent ones. Script and results: [`results/sequence/ngrams_beauty.py` and `ngrams-beauty.json`](https://github.com/rkonow/strata/tree/main/strata/results/sequence).
 
+A sequence model ([`encode()`](query-language.md#sequence-models-encodemodel-history)) trained on the same split, reading items only, has 0.0662 and 0.0406 ([results](https://github.com/rkonow/strata/tree/main/strata/results/sequence)), at 0.6 ms a query.
+
 ## Several steps ahead
 
 Counts predict the next item. For items further ahead, or for "seen together", the same events can feed an [edge table](query-language.md#edge-tables), whose edges are directed: adding 1/*g* to the edge from the item *g* steps back to the new one records what comes after what, and `ppr(cooc, :x, dir => 'out')` walks forward from the last items. `dir => 'both'`, `ppr`'s default, reads the same edges as seen together.

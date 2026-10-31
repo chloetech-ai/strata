@@ -1,3 +1,6 @@
+import datetime
+import json
+
 import pytest
 
 import strata
@@ -106,3 +109,52 @@ def test_next_codes_in_process_and_over_http(tmp_path, serve):
     c = strata.connect(url)
     assert c.sid_next(prefixes, field="sid") == want
     assert c.sid_next(prefixes, field="sid", where="tag = :t", params={"t": "red"}) == red
+
+
+def test_a_sequence_model_trained_from_a_table_ranks_in_strata_as_in_pytorch(tmp_path):
+    torch = pytest.importorskip("torch")
+    import random
+
+    from strata import _sequence as S
+
+    rng = random.Random(3)
+    models = tmp_path / "models"
+    schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "emb", "type": "vector", "dim": 8, "index": "flat"}]}
+    db = strata.Database.create(tmp_path / "db", schema, models=models)
+    db.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD NOT NULL, action KEYWORD, ts TIMESTAMP NOT NULL)")
+    db.upsert([{"id": f"i{i}", "emb": [rng.gauss(0, 0.3) for _ in range(8)]} for i in range(30)])
+    # Each user walks the items two at a time from a start of their own.
+    events, e = [], 0
+    for u in range(60):
+        start = rng.randrange(30)
+        for j in range(rng.randrange(4, 12)):
+            events.append({"id": e, "usr": f"u{u}", "item": f"i{(start + 2 * j) % 30}", "action": rng.choice(["view", "buy"]), "ts": 1_700_000_000 + j * 60})
+            e += 1
+    iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    db.insert([{**x, "ts": iso(x["ts"])} for x in events], table="events")
+    out = strata.train.sequence(db, "walk", events={"table": "events", "user": "usr", "item": "item", "action": "action", "time": "ts"},
+                                models=models, width=16, max_len=10, learn_items=True, epochs=80, batch=16, lr=1e-2, seed=1)
+    assert (models / "walk" / "config.json").exists() and (models / "walk" / "model.safetensors").exists()
+    config = json.loads((models / "walk" / "config.json").read_text())
+    assert (config["table"], config["field"], config["dim"], config["actions"]) == ("items", "emb", 8, ["", "buy", "view"])
+    db.upsert([{"id": k, "emb": v} for k, v in out["vectors"].items()])
+
+    model, cfg = S.load(str(models / "walk"))
+    keys = list(out["vectors"])
+    index = {k: i for i, k in enumerate(keys)}
+    E = torch.tensor([out["vectors"][k] for k in keys])
+    history = "(SELECT item, action, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200)"
+    sql = f"SELECT id, score() FROM items ORDER BY similarity(emb, encode('walk', {history}, now => :t)) DESC LIMIT 5"
+    learned = 0
+    for u in range(20):
+        mine = [x for x in events if x["usr"] == f"u{u}"]
+        now = mine[-1]["ts"] + 60
+        r = db.query(sql, {"u": f"u{u}", "t": iso(now)})
+        h = [(x["item"], x["action"], float(x["ts"])) for x in mine]
+        v = S.encode_batch(model, [h], index, {a: i for i, a in enumerate(cfg["actions"])}, cfg, E, [float(now)])[0]
+        want = sorted(keys, key=lambda k: -float(E[index[k]] @ v))[:5]
+        assert [row[0] for row in r.rows] == want
+        assert all(abs(s - float(E[index[k]] @ v)) < 1e-4 for k, s in r.rows)
+        # The next item of the walk.
+        learned += r.rows[0][0] == f"i{(int(mine[-1]['item'][1:]) + 2) % 30}"
+    assert learned >= 15, learned

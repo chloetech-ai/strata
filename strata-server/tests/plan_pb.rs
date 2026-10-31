@@ -111,6 +111,10 @@ const COMPOUND: &[&str] = &[
     "SELECT d.id FROM (SELECT id, title FROM papers) AS d WHERE PREFIX(d.title, upper('gr'))",
     // A correlated subquery, which names the row it ranks.
     "WITH a AS (SELECT * FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 50) SELECT id FROM a ORDER BY bm25(body, 'graph') + (SELECT COUNT(*) FROM papers p WHERE p.category = a.category AND p.year < a.year) DESC LIMIT 5",
+    // A history's vector by a sequence model, as a query vector and in a
+    // dot product.
+    "SELECT id FROM papers ORDER BY similarity(emb, encode('seq', (SELECT id, category, published FROM papers WHERE year > 2000 ORDER BY year DESC LIMIT 20), now => 1800000000.5)) DESC LIMIT 5",
+    "SELECT id, dot(emb, encode('seq', (SELECT id FROM papers ORDER BY year DESC LIMIT 3))) FROM papers WHERE year > 2000",
 ];
 
 /// Writes of each kind.
@@ -279,7 +283,7 @@ fn every_plan_round_trips() {
     // Every kind of node and expression was among them.
     let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
     let exprs = [
-        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "cross_encoder", "maxsim", "prefix", "outer", "by_key", "at_least",
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "cross_encoder", "maxsim", "prefix", "outer", "by_key", "at_least", "encode",
     ];
     let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
     let missing: Vec<&String> = want.difference(&seen).collect();

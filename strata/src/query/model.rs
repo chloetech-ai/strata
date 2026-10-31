@@ -491,6 +491,8 @@ fn fnv(bytes: &[u8]) -> u64 {
 pub struct Models {
     open: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<Gbdt>)>>,
     cross: Mutex<HashMap<PathBuf, (Vec<(SystemTime, u64)>, Arc<CrossEncoder>)>>,
+    /// Sequence models (`encode()`), from the same directories.
+    sequences: crate::query::sequence::SequenceModels,
 }
 
 /// Refuses a model name that is not a directory's own name.
@@ -566,6 +568,15 @@ impl Models {
                 }
                 Expr::CrossEncoder { model, hash, open, .. } if cross => {
                     let m = self.cross_encoder(dir, model)?;
+                    if !hash.is_empty() && *hash != m.hash {
+                        return Err(stale(model, &m.hash, hash));
+                    }
+                    hash.clone_from(&m.hash);
+                    *open = Opened(Some(m));
+                }
+                // Sequence models the same way.
+                Expr::Encode { model, hash, open, .. } => {
+                    let m = self.sequences.get(dir, model)?;
                     if !hash.is_empty() && *hash != m.hash {
                         return Err(stale(model, &m.hash, hash));
                     }

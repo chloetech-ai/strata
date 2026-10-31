@@ -420,6 +420,10 @@ impl<'a> Text<'a> {
             Expr::Scalar(n) => self.subquery(n),
             Expr::Outer(n) => format!("outer ${n}"),
             Expr::ByKey(vs) => format!("by key ({} rows)", vs.len()),
+            Expr::Encode { model, rows, now, .. } => match now {
+                Some(t) => format!("encode('{model}', {}, now => {t})", self.subquery(rows)),
+                None => format!("encode('{model}', {})", self.subquery(rows)),
+            },
         }
     }
 
