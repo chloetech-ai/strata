@@ -368,6 +368,8 @@ curl -s localhost:7700/v1/sid/next -H 'content-type: application/json' -d '{
 
 Each prefix's next codes come in the order of their last numbers, with the rows under each that `where` matches (every row without it), and a code no matching row has is left out. The filter is worked out once per segment; the codes below a prefix are found by jumping through the field's sorted dictionary, where every prefix is a value, and each is counted against the filter. `Db::sid_next` answers the same from Rust. A coordinator asks every shard (gRPC `SidNext`, protocol 7) and adds their counts. Each shard numbers the ties of its own rows, so on a coordinator a full code can name one row on each shard: the counts of the levels are the table's, and a tie's are those of every row with that code.
 
+**With a decoder.** A TIGER-style decoder over these codes, each step's numbers from `sid_next` among the items a user does not have, comes within 0.0023 Recall@10 of published TIGER on Amazon Beauty and Sports (0.0085 below it on Toys). Alone it ranks no better than a sequence model's [`encode()`](query-language.md#sequence-models-encodemodel-history), at 30 to 40 times its time, most of it the decoder's own; its answer, given to a query as `ranked(:gen)` and fused with `rrf`, adds to that model's and to a walk's ([results](https://github.com/rkonow/strata/tree/main/strata/results/generative)).
+
 A database with a semantic-ID field needs the manifest feature `semantic_id`, and a plan that uses `sid_at` the plan feature of the same name, which versions of Strata before them refuse by name.
 
 ## HTTP API
