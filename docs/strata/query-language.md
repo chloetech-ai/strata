@@ -579,9 +579,19 @@ The plan's node is `DistinctOn` with `per` (`At most 2 per: video` in `EXPLAIN`)
 
 On ArguAna (BEIR's 8,674 arguments from 592 debates on 15 topics; a document's debate and topic are in its id), every one of the 1,406 queries ranked by `bm25(body, :q)`, its own argument left out as BEIR scores it, top 20. Times are the median over queries of each query's median of 3 runs, one thread on a 4-core cloud VM (Intel Xeon @ 2.10GHz):
 
-PER_CAP_TABLE
+| top 20 | nDCG@10 | debates | topics | p50 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| uncapped | 0.489 | 7.5 | 3.8 | 3.3 | 8.0 |
+| `MAX 1 PER debate` | 0.307 | 20.0 | 7.2 | 6.1 | 25.6 |
+| `MAX 2 PER debate` | 0.379 | 14.5 | 5.9 | 6.0 | 12.6 |
+| `MAX 3 PER debate` | 0.419 | 12.6 | 5.4 | 6.0 | 11.3 |
+| `MAX 1 PER topic` | 0.301 | 14.9 | 15.0 | 549 | 635 |
+| `MAX 2 PER topic` | 0.376 | 16.3 | 11.4 | 18.8 | 35.9 |
+| `MAX 3 PER topic` | 0.416 | 14.2 | 9.1 | 7.1 | 30.1 |
 
-Caps trade relevance for spread. ArguAna's answer to a query is the argument against it, in the query's own debate, so a cap on debates also caps how many of the right debate's arguments the ranking can show: nDCG@10 falls from UNCAPPED to K1_DEBATE with one per debate. The run is `strata-per-cap-bench` ([`results/text/per_cap.json`](https://github.com/rkonow/strata/blob/main/strata/results/text/per_cap.json)).
+Debates and topics are the mean number of each in a query's answer. A cap of debates costs about twice the uncapped query, for the growing slices, and the fewer a field's values the deeper a cap reads: two per topic take 18.8 ms. One row of each of the 15 topics cannot fill 20 rows, so that query reads every argument that matches and returns 15.
+
+Caps trade relevance for spread. ArguAna's answer to a query is the argument against it, in the query's own debate, so a cap on debates also caps how many of the right debate's arguments the ranking can show: nDCG@10 falls from 0.489 to 0.307 with one per debate, and to 0.419 with three. The run is `strata-per-cap-bench` ([`results/text/per_cap.json`](https://github.com/rkonow/strata/blob/main/strata/results/text/per_cap.json)).
 
 ## Graphs
 
