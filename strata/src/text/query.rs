@@ -10,7 +10,8 @@
 //! `(a b c d)@2` matches a row with at least 2 of the group's items: its
 //! operands, joined by `AND`, by juxtaposition or by `OR`, each a word, a
 //! phrase, a prefix, a typo-tolerant word or a parenthesised query. A
-//! negated item (`-a`) is not counted: the row must not have it. `@p%`
+//! negated item (`-a`) is not counted: the row must not have it, and an
+//! item written twice is one item, as `bm25`'s `min =>` counts it. `@p%`
 //! asks for p percent of the items, rounded down; either is clamped to
 //! between 1 and the number of items, as Lucene's `minimum_should_match`
 //! is ([`Need`]).
@@ -18,6 +19,9 @@
 //! A weight (`vaccine^2`, `"mrna vaccine"^0.5`) changes nothing about
 //! which rows match: it is there so that the same text read by `bm25`
 //! weighs the word ([`ranked_items`], the operators of a ranked query).
+//! A `^` before what starts like a number but is not a weight
+//! (`vaccine^1e308`), and `word~N` with N over 2, are errors: as words they
+//! would match nothing that `bm25` of the same text ranks.
 //!
 //! Operators are uppercase (`AND`, `OR`, `NOT`), as in SQLite FTS5;
 //! lowercase `and`/`or`/`not` are words (and stopwords). `-` negates when it
@@ -149,9 +153,10 @@ impl std::fmt::Display for Need {
 
 /// A group of `items` a row needs `need` of: the negated items are
 /// required to be absent and not counted; with `n` of the `y` others,
-/// `Or` for 1, `And` for all, else [`BoolQuery::AtLeast`].
+/// `Or` for 1, `And` for all, else [`BoolQuery::AtLeast`]. An item written
+/// twice is one item, as `bm25`'s `min =>` counts it.
 pub fn at_least(need: Need, items: Vec<BoolQuery>) -> Option<BoolQuery> {
-    let (not, pos): (Vec<BoolQuery>, Vec<BoolQuery>) = items.into_iter().partition(|c| matches!(c, BoolQuery::Not(_)));
+    let (not, pos): (Vec<BoolQuery>, Vec<BoolQuery>) = distinct(items).into_iter().partition(|c| matches!(c, BoolQuery::Not(_)));
     let n = need.of(pos.len());
     let counted = match pos.len() {
         0 => None,
@@ -161,6 +166,17 @@ pub fn at_least(need: Need, items: Vec<BoolQuery>) -> Option<BoolQuery> {
         _ => Some(BoolQuery::AtLeast { n, items: pos }),
     };
     combine(std::iter::once(counted).chain(not.into_iter().map(Some)).collect(), BoolQuery::And)
+}
+
+/// `items` without repeats, in the order first written.
+fn distinct(items: Vec<BoolQuery>) -> Vec<BoolQuery> {
+    let mut out: Vec<BoolQuery> = Vec::with_capacity(items.len());
+    for i in items {
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,11 +249,15 @@ fn lex(q: &str) -> Result<(Vec<Tok>, MatchFeatures)> {
                 // A weight right after the closing quote.
                 let rest = &q[end + 1..];
                 let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"')).unwrap_or(rest.len());
-                if rest.starts_with('^') && weight(&rest[1..len]).is_some() {
-                    weighted = true;
-                    while it.peek().is_some_and(|&(j, _)| j < end + 1 + len) {
-                        it.next();
+                match rest[..len].strip_prefix('^') {
+                    Some(w) if weight(w).is_some() => {
+                        weighted = true;
+                        while it.peek().is_some_and(|&(j, _)| j < end + 1 + len) {
+                            it.next();
+                        }
                     }
+                    Some(w) if looks_numeric(w) => return Err(bad_weight(&q[start - 1..end + 1 + len], q)),
+                    _ => {}
                 }
             }
             '-' => {
@@ -254,7 +274,17 @@ fn lex(q: &str) -> Result<(Vec<Tok>, MatchFeatures)> {
                     }
                     it.next();
                 }
-                out.push(match split_weight(&q[start..end]) {
+                let word = &q[start..end];
+                let (w, x) = split_weight(word);
+                if x.is_none() && word.rsplit_once('^').is_some_and(|(base, n)| !base.is_empty() && looks_numeric(n)) {
+                    return Err(bad_weight(word, q));
+                }
+                if let Some((base, n)) = w.rsplit_once('~') {
+                    if !base.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !matches!(n, "0" | "1" | "2") {
+                        return Err(Error::Query(format!("`{w}` in MATCH query {q:?}: a word allows at most 2 typos (`word~`, `word~1`, `word~2`)")));
+                    }
+                }
+                out.push(match (w, x) {
                     // A weighted word is a word, whatever it spells.
                     (w, Some(_)) => {
                         weighted = true;
@@ -275,6 +305,20 @@ fn lex(q: &str) -> Result<(Vec<Tok>, MatchFeatures)> {
 /// (nothing if it does not parse).
 pub fn match_features(q: &str) -> MatchFeatures {
     lex(q).map(|(_, f)| f).unwrap_or_default()
+}
+
+/// A weight in `MATCH` that does not read as one (`vaccine^1e308`): an
+/// error, where the text after `^` would otherwise be searched as a word
+/// and match nothing that `bm25` of the same text ranks.
+fn bad_weight(item: &str, q: &str) -> Error {
+    Error::Query(format!("`{item}` in MATCH query {q:?}: a weight is digits with an optional fraction (`word^2`, `\"a phrase\"^0.5`)"))
+}
+
+/// Text after `^` that was meant as a number: it starts with a digit, a
+/// point or a sign.
+fn looks_numeric(s: &str) -> bool {
+    let s = s.strip_prefix(['-', '+']).unwrap_or(s);
+    s.starts_with(|c: char| c.is_ascii_digit() || c == '.')
 }
 
 /// A weight: digits with an optional fraction (`2`, `0.5`, `.5`), finite.
@@ -404,7 +448,7 @@ pub fn group_size(q: &str, analyzer: Analyzer) -> Result<usize> {
     let mut p = Parser { toks: lex(q)?.0, analyzer, pos: 0, depth: 0 };
     Ok(match p.or()? {
         None | Some(BoolQuery::Not(_)) => 0,
-        Some(BoolQuery::And(cs) | BoolQuery::Or(cs)) => cs.iter().filter(|c| !matches!(c, BoolQuery::Not(_))).count(),
+        Some(BoolQuery::And(cs) | BoolQuery::Or(cs)) => distinct(cs).iter().filter(|c| !matches!(c, BoolQuery::Not(_))).count(),
         Some(_) => 1,
     })
 }
