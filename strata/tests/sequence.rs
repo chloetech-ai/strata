@@ -8,7 +8,62 @@ fn reference() -> serde_json::Value {
 }
 
 fn small() -> SequenceModel {
-    SequenceModel::parse("seq_small", include_bytes!("models/seq_small/config.json"), include_bytes!("models/seq_small/model.safetensors")).unwrap()
+    SequenceModel::parse("seq_small", include_bytes!("models/seq_small/config.json"), include_bytes!("models/seq_small/model.safetensors"), None).unwrap()
+}
+
+/// An items file (`items.safetensors`): the keys, then the vectors.
+pub fn items_file(items: &[(serde_json::Value, Vec<f32>)]) -> Vec<u8> {
+    let dim = items.first().map_or(0, |(_, v)| v.len());
+    let keys = serde_json::to_string(&items.iter().map(|(k, _)| k).collect::<Vec<_>>()).unwrap();
+    let header = serde_json::json!({"__metadata__": {"keys": keys}, "vectors": {"dtype": "F32", "shape": [items.len(), dim], "data_offsets": [0, items.len() * dim * 4]}}).to_string();
+    let mut out = (header.len() as u64).to_le_bytes().to_vec();
+    out.extend(header.as_bytes());
+    for (_, v) in items {
+        for x in v {
+            out.extend(x.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The reference's items, as an items file lists them.
+fn reference_items() -> Vec<(serde_json::Value, Vec<f32>)> {
+    let r = reference();
+    r["items"].as_object().unwrap().iter().map(|(k, v)| (serde_json::Value::String(k.clone()), serde_json::from_value(v.clone()).unwrap())).collect()
+}
+
+#[test]
+fn a_model_keeps_the_item_vectors_it_was_trained_with() {
+    use strata::value::Value;
+    let cfg = include_bytes!("models/seq_small/config.json");
+    let w = include_bytes!("models/seq_small/model.safetensors");
+    let items = reference_items();
+    let m = SequenceModel::parse("m", cfg, w, Some(&items_file(&items))).unwrap();
+    assert!(m.has_items() && !small().has_items());
+    assert_eq!(m.item_vector(&Value::Str("i3".into())), Some(&items.iter().find(|(k, _)| k == "i3").unwrap().1[..]));
+    assert_eq!(m.item_vector(&Value::Str("nope".into())), None);
+    // Versioned with them: other vectors are another model.
+    let mut other = items.clone();
+    other[0].1[0] += 1.0;
+    let o = SequenceModel::parse("m", cfg, w, Some(&items_file(&other))).unwrap();
+    assert_ne!(m.hash, o.hash);
+    assert_ne!(m.hash, SequenceModel::parse("m", cfg, w, None).unwrap().hash);
+    // Whole-number keys; and files that are not an items file.
+    let ints: Vec<_> = items.iter().enumerate().map(|(i, (_, v))| (serde_json::json!(i * 10), v.clone())).collect();
+    let n = SequenceModel::parse("m", cfg, w, Some(&items_file(&ints))).unwrap();
+    assert_eq!(n.item_vector(&Value::Int(20)), Some(&items[2].1[..]));
+    let short: Vec<_> = items.iter().map(|(k, v)| (k.clone(), v[..4].to_vec())).collect();
+    let twice: Vec<_> = items.iter().take(2).chain(items.iter().take(1)).cloned().collect();
+    let float = vec![(serde_json::json!(1.5), items[0].1.clone())];
+    for (raw, says) in [
+        (items_file(&short), "not 30 keys by 8"),
+        (items_file(&twice), "listed twice"),
+        (items_file(&float), "text or a whole number"),
+        (b"\x02\0\0\0\0\0\0\0{}".to_vec(), "no keys"),
+    ] {
+        let e = SequenceModel::parse("m", cfg, w, Some(&raw)).unwrap_err().to_string();
+        assert!(e.contains(says) && e.contains("items.safetensors"), "{says}: {e}");
+    }
 }
 
 #[test]
@@ -43,10 +98,10 @@ fn a_model_that_does_not_match_its_config_is_refused() {
         ("\"heads\": 2", "\"heads\": 3", "multiple of heads"),
     ] {
         assert!(cfg.contains(from), "{from}");
-        let e = SequenceModel::parse("m", cfg.replace(from, to).as_bytes(), w).unwrap_err().to_string();
+        let e = SequenceModel::parse("m", cfg.replace(from, to).as_bytes(), w, None).unwrap_err().to_string();
         assert!(e.contains(says) && e.contains("sequence model m"), "{to}: {e}");
     }
-    let e = SequenceModel::parse("m", cfg.as_bytes(), &w[..w.len() - 4]).unwrap_err().to_string();
+    let e = SequenceModel::parse("m", cfg.as_bytes(), &w[..w.len() - 4], None).unwrap_err().to_string();
     assert!(e.contains("bytes for shape"), "{e}");
 }
 
@@ -143,18 +198,24 @@ mod query {
             assert_eq!(x[0], y[0]);
             assert!((x[1].as_f64().unwrap() - y[1].as_f64().unwrap()).abs() < 1e-5);
         }
-        // Two columns: the item and a time (a TIMESTAMP or microseconds), or the
-        // item and an action; three with no action, or no time, are the same.
+        // Two columns: the item and a TIMESTAMP, or the item and an action;
+        // three with no action, or no time, are the same. Microseconds are a
+        // time only as the third column: as the second, a number could be
+        // either.
         let top = |cols: &str| {
             let sql = format!("SELECT id, score() FROM items ORDER BY similarity(emb, encode('seq_small', (SELECT {cols} FROM events WHERE usr = :u ORDER BY seq DESC LIMIT 200), now => :now)) DESC LIMIT 5");
-            db.query(&sql, &p).unwrap().rows
+            db.query(&sql, &p).map(|r| r.rows).map_err(|e| e.to_string())
         };
         assert_eq!(top("item, ts"), top("item, none_k, ts"));
-        assert_eq!(top("item, micros"), top("item, none_k, micros"));
-        assert_eq!(top("item, micros"), top("item, ts"));
+        assert_eq!(top("item, none_k, micros"), top("item, ts"));
         assert_eq!(top("item, action"), top("item, action, none_t"));
         assert_ne!(top("item, ts"), top("item, action"));
         assert_ne!(top("item, ts"), top("item, action, ts"));
+        let e = top("item, micros").unwrap_err();
+        assert!(e.contains("SELECT item, NULL, ts"), "{e}");
+        // Newest first, or the model would read the history backwards.
+        let e = db.query(&format!("SELECT id FROM items ORDER BY similarity(emb, encode('seq_small', (SELECT item, action, ts FROM events WHERE usr = :u ORDER BY seq LIMIT 200), now => :now)) DESC LIMIT 3"), &p).unwrap_err().to_string();
+        assert!(e.contains("ORDER BY ts DESC"), "{e}");
         // A user without events: no vector, no rows.
         let none = Params::new().set("u", Value::Str("nobody".into())).set("now", Value::Int(0));
         assert!(db.query(&format!("SELECT id FROM items ORDER BY similarity(emb, encode('seq_small', {history}, now => :now)) DESC LIMIT 3"), &none).unwrap().rows.is_empty());
@@ -178,6 +239,71 @@ mod query {
             let e = db.query(&sql, &p).unwrap_err().to_string();
             assert!(e.contains(says), "{sql}: {e}");
         }
+    }
+
+    #[test]
+    fn a_model_serves_only_over_the_item_vectors_it_was_trained_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, r) = data(dir.path());
+        let p = Params::new().set("u", Value::Str("u5".into())).set("now", Value::Timestamp(1_800_000_000_000_000));
+        let sql = "SELECT id, score() FROM items ORDER BY similarity(emb, encode('seq_small', (SELECT item, action, ts FROM events WHERE usr = :u ORDER BY seq DESC LIMIT 200), now => :now)) DESC LIMIT 5";
+        let without = db.query(sql, &p).unwrap().rows;
+        // The same model, with the items file of the table's vectors.
+        let models = dir.path().join("models");
+        let m = models.join("seq_small");
+        std::fs::create_dir_all(&m).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/models/seq_small");
+        for f in ["config.json", "model.safetensors"] {
+            std::fs::copy(src.join(f), m.join(f)).unwrap();
+        }
+        std::fs::write(m.join("items.safetensors"), super::items_file(&super::reference_items())).unwrap();
+        db.open_embedders(&models);
+        assert_eq!(db.query(sql, &p).unwrap().rows, without);
+        // One of the user's items has another vector in the table: refused,
+        // naming it, rather than encoded in a space the model never saw.
+        let item = r["cases"][5]["history"][0][0].as_str().unwrap().to_string();
+        let mut v: Vec<f32> = serde_json::from_value(r["items"][&item].clone()).unwrap();
+        v[0] += 0.5;
+        db.sql("UPDATE items SET emb = :v WHERE id = :id", &Params::new().set("v", Value::Vector(v.into())).set("id", Value::Str(item.clone()))).unwrap();
+        let e = db.query(sql, &p).unwrap_err().to_string();
+        assert!(e.contains("not those sequence model seq_small was trained with") && e.contains(&format!("item {item:?} differs")) && e.contains("write_vectors"), "{e}");
+        // A user whose items all have the model's vectors is still served.
+        let fine = (0..14).map(|c| format!("u{c}")).find(|u| {
+            let c: usize = u[1..].parse().unwrap();
+            r["cases"][c]["history"].as_array().unwrap().iter().all(|e| e[0] != item.as_str())
+        });
+        if let Some(u) = fine {
+            db.query(sql, &Params::new().set("u", Value::Str(u)).set("now", Value::Timestamp(1_800_000_000_000_000))).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_newest_events_with_vectors_are_read_as_training_reads_them() {
+        // Items without a vector are dropped before the newest max_len (12)
+        // are kept, as strata.train.sequence builds its histories.
+        let dir = tempfile::tempdir().unwrap();
+        let (db, r) = data(dir.path());
+        let case = r["cases"].as_array().unwrap().iter().position(|c| c["history"].as_array().unwrap().len() == 12 && c["now"].is_number()).unwrap();
+        let u = format!("u{case}");
+        let now = Value::Timestamp((r["cases"][case]["now"].as_f64().unwrap() * 1e6).round() as i64);
+        let p = Params::new().set("u", Value::Str(u.clone())).set("now", now);
+        let sql = "SELECT id, score() FROM items ORDER BY similarity(emb, encode('seq_small', (SELECT item, action, ts FROM events WHERE usr = :u ORDER BY seq DESC LIMIT 200), now => :now)) DESC LIMIT 5";
+        let want = db.query(sql, &p).unwrap().rows;
+        // Ten events of an item with no row, newer than the user's own but
+        // older than the request: without the drop first, the model would
+        // read two of the user's twelve.
+        let last = r["cases"][case]["history"].as_array().unwrap().iter().filter_map(|e| e[2].as_f64()).fold(f64::MIN, f64::max);
+        for j in 0..10 {
+            let q = Params::new()
+                .set("id", Value::Int(10_000 + j))
+                .set("u", Value::Str(u.clone()))
+                .set("s", Value::Int(1_000 + j))
+                .set("t", Value::Timestamp((last * 1e6).round() as i64));
+            db.sql("INSERT INTO events (id, usr, seq, item, ts) VALUES (:id, :u, :s, 'gone', :t)", &q).unwrap();
+        }
+        let got = db.query(sql, &p).unwrap();
+        assert_eq!(got.rows, want);
+        assert!(got.stats.plan.iter().any(|l| l == "encode: seq_small over 22 events, 12 with vectors"), "{:?}", got.stats.plan);
     }
 
     #[test]

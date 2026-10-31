@@ -795,9 +795,51 @@ impl<'a> Ops<'a, '_> {
         if history.rows.first().is_some_and(|r| r.is_empty() || r.len() > 3) {
             return Err(err(format!("encode's history returns the item's key, then its action and time (one to three columns), not {}", history.columns.len())));
         }
-        // The newest events the model reads, then their items' vectors.
-        let events = &history.rows[..history.rows.len().min(m.max_len)];
-        let keys: Vec<Value> = events.iter().map(|r| r[0].clone()).filter(|k| !matches!(k, Value::Null)).collect();
+        // Item, action, time; or of two columns, the item and an action (a
+        // KEYWORD) or a time (a TIMESTAMP). A number second of two is
+        // refused: it could be either.
+        let at = |r: &[Value]| -> Result<(Option<usize>, Option<usize>)> {
+            Ok(match r.len() {
+                2 => match &r[1] {
+                    Value::Timestamp(_) => (None, Some(1)),
+                    Value::Int(_) | Value::Float(_) => {
+                        return Err(err(format!(
+                            "encode's history of two columns has an item, then an action (text) or a time (a TIMESTAMP), not the number {:?}: give a time in microseconds as the third of (item, action, time), e.g. SELECT item, NULL, ts",
+                            r[1]
+                        )))
+                    }
+                    _ => (Some(1), None),
+                },
+                3 => (Some(1), Some(2)),
+                _ => (None, None),
+            })
+        };
+        let time_of = |r: &[Value]| -> Result<Option<f64>> {
+            Ok(match at(r)?.1.map(|i| &r[i]) {
+                // Microseconds, as TIMESTAMPs and the rank log's export.
+                Some(Value::Timestamp(t) | Value::Int(t)) => Some(*t as f64 / 1e6),
+                Some(Value::Float(t)) if t.is_finite() => Some(*t / 1e6),
+                Some(Value::Null) | None => None,
+                Some(v) => return Err(err(format!("encode's history has times (a TIMESTAMP, or microseconds since the Unix epoch) in its last column, not {v:?}"))),
+            })
+        };
+        // Newest first, as the model reads the newest: times that rise
+        // down the rows are a history in the wrong order.
+        let mut newest: Option<(usize, f64)> = None;
+        for (i, r) in history.rows.iter().enumerate() {
+            let Some(t) = time_of(r)? else { continue };
+            if let Some((j, before)) = newest.filter(|&(_, before)| t > before) {
+                return Err(err(format!(
+                    "encode's history is read newest first, and its row {} is newer than its row {} ({t} s against {before} s since the epoch): order it by time, descending (ORDER BY ts DESC)",
+                    i + 1,
+                    j + 1
+                )));
+            }
+            newest = Some((i, t));
+        }
+        // The items' vectors; then, as training reads a history, the
+        // events whose item has one, the newest the model reads.
+        let keys: Vec<Value> = history.rows.iter().map(|r| r[0].clone()).filter(|k| !matches!(k, Value::Null)).collect();
         let mut vectors: HashMap<Part, std::sync::Arc<[f32]>> = HashMap::new();
         if !keys.is_empty() {
             let leaf = Node::Project {
@@ -814,41 +856,42 @@ impl<'a> Ops<'a, '_> {
             };
             for r in self.node(&leaf, "encode's items")?.rows {
                 if let [k, Value::Vector(v)] = &r[..] {
+                    // The table's vectors must be those the model was
+                    // trained with, where it keeps them.
+                    if let Some(want) = m.item_vector(k) {
+                        if want.len() != v.len() || want.iter().zip(v.iter()).any(|(a, b)| (a - b).abs() > 1e-5 * a.abs().max(1.0)) {
+                            return Err(err(format!(
+                                "the vectors of {}.{} are not those sequence model {model} was trained with (hash {}; item {} differs): write the model's vectors into the table (strata.train.write_vectors), or train it on the table's",
+                                m.table,
+                                m.field,
+                                m.hash,
+                                show_key(k)
+                            )));
+                        }
+                    }
                     vectors.insert(part(k), v.clone());
                 }
             }
         }
-        // Item, action, time; or of two columns, the item and an action
-        // (text) or a time (a TIMESTAMP or number).
-        let at = |r: &[Value]| match r.len() {
-            2 if matches!(r[1], Value::Timestamp(_) | Value::Int(_) | Value::Float(_)) => (None, Some(1)),
-            2 => (Some(1), None),
-            3 => (Some(1), Some(2)),
-            _ => (None, None),
-        };
+        let events: Vec<&Vec<Value>> = history.rows.iter().filter(|r| vectors.contains_key(&part(&r[0]))).take(m.max_len).collect();
         let text: Vec<Option<String>> = events
             .iter()
-            .map(|r| match at(r).0.map(|i| &r[i]) {
-                Some(Value::Str(a)) => Some(a.clone()),
-                Some(Value::Null) | None => None,
-                Some(Value::Int(n)) => Some(n.to_string()),
-                Some(v) => Some(format!("{v:?}")),
+            .map(|r| -> Result<Option<String>> {
+                Ok(match at(r)?.0.map(|i| &r[i]) {
+                    Some(Value::Str(a)) => Some(a.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(Value::Int(n)) => Some(n.to_string()),
+                    Some(v) => Some(format!("{v:?}")),
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let mut steps = Vec::with_capacity(events.len());
         for (r, action) in events.iter().zip(&text).rev() {
-            let Some(item) = vectors.get(&part(&r[0])) else { continue };
-            let time = match at(r).1.map(|i| &r[i]) {
-                // Microseconds, as TIMESTAMPs and the rank log's export.
-                Some(Value::Timestamp(t) | Value::Int(t)) => Some(*t as f64 / 1e6),
-                Some(Value::Float(t)) if t.is_finite() => Some(*t / 1e6),
-                Some(Value::Null) | None => None,
-                Some(v) => return Err(err(format!("encode's history has times (a TIMESTAMP, or microseconds since the Unix epoch) in its last column, not {v:?}"))),
-            };
-            steps.push(crate::query::sequence::Event { item, action: action.as_deref(), time });
+            let item = &vectors[&part(&r[0])];
+            steps.push(crate::query::sequence::Event { item, action: action.as_deref(), time: time_of(r)? });
         }
         let now = now.unwrap_or_else(|| crate::timestamp::now() as f64 / 1e6);
-        self.plan.push(format!("encode: {model} over {} events, {} with vectors", events.len(), steps.len()));
+        self.plan.push(format!("encode: {model} over {} events, {} with vectors", history.rows.len(), steps.len()));
         Ok(m.encode(&steps, Some(now)).map(Into::into))
     }
 
@@ -1289,6 +1332,15 @@ fn part(v: &Value) -> Part {
     match v {
         Value::Float(x) if x.fract() == 0.0 && x.abs() < 9e15 => Part::Int(*x as i64),
         v => Part::of(v),
+    }
+}
+
+/// A row key as an error names it.
+fn show_key(v: &Value) -> String {
+    match v {
+        Value::Str(s) => format!("{s:?}"),
+        Value::Int(n) => n.to_string(),
+        v => format!("{v:?}"),
     }
 }
 
