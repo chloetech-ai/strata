@@ -30,7 +30,8 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
-use crate::query::ir::{ArithOp, Func, NormKind};
+use crate::query::compound::outer_field;
+use crate::query::ir::{ArithOp, CmpOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::rank::Rank;
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
@@ -575,6 +576,9 @@ pub(crate) enum Sub {
     Seeds,
     /// `maxsim`'s query vectors: its one column's values, in order.
     Vectors,
+    /// A number in a ranking expression: its one value, for each row
+    /// ranked when it names the row (a correlated subquery).
+    Score,
 }
 
 /// Plans a subquery for the binder ([`bind_query_with`]): the expression
@@ -1060,6 +1064,8 @@ impl<'a> Binder<'a> {
                 _ => self.feature(e),
             },
             Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } => self.feature(e),
+            // A number of each row, from the rows it names.
+            Expr::Subquery(_) if self.subs.is_some() => self.feature(e),
             _ => Err(err(format!("unsupported select expression: {e}"))),
         }
     }
@@ -1317,6 +1323,8 @@ impl<'a> Binder<'a> {
         let bx = |e: &Expr| self.rank(e).map(Box::new);
         match e {
             Expr::Nested(inner) => self.rank(inner),
+            // A number of each row ranked, from the rows it names.
+            Expr::Subquery(q) => Ok(Score::Sub(Box::new(self.sub(q, Sub::Score)?))),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
                 if self.schema.fields[f].multi {
@@ -1540,6 +1548,7 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => Pred::Or(vec![self.pred(left)?, self.pred(right)?]),
             Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Pred::Not(Box::new(self.pred(expr)?)),
             Expr::BinaryOp { left, op, right } if self.subs.is_some() && (subquery_of(left).is_some() || subquery_of(right).is_some()) => self.sub_comparison(left, op, right)?,
+            Expr::BinaryOp { left, op, right } if outer_field(left).is_some() || outer_field(right).is_some() => self.outer_comparison(left, op, right)?,
             Expr::BinaryOp { left, op, right } => self.comparison(left, op, right)?,
             Expr::Between { expr, negated, low, high } if self.subs.is_some() && (subquery_of(low).is_some() || subquery_of(high).is_some()) => {
                 let f = self.numeric_field(expr)?;
@@ -1664,6 +1673,31 @@ impl<'a> Binder<'a> {
     }
 
     /// `field op (SELECT ...)`, or the other way round.
+    /// A comparison of a field with a column of the row a correlated
+    /// subquery is computed for (`cat = first.cat`), which takes its value
+    /// for each distinct one ([`ir::Expr::Outer`]).
+    fn outer_comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
+        let (field, outer, flipped) = match (outer_field(left), outer_field(right)) {
+            (None, Some(o)) => (left, o, false),
+            (Some(o), None) => (right, o, true),
+            _ => return Err(err(format!("{left} {op} {right}: a correlated subquery compares its own columns with the outer row's"))),
+        };
+        let f = self.field_of(field).map_err(|_| err(format!("{left} {op} {right}: a correlated subquery of a table compares a column of the table with one of the outer row (cat = first.cat)")))?;
+        if matches!(self.schema.fields[f].ty, FieldType::Edges | FieldType::Text { .. } | FieldType::Vector { .. } | FieldType::Sparse) {
+            return Err(err(format!("{left} {op} {right}: a correlated subquery compares KEYWORD, INT, FLOAT, BOOL or TIMESTAMP fields")));
+        }
+        let op = match (op, flipped) {
+            (BinaryOperator::Eq, _) => CmpOp::Eq,
+            (BinaryOperator::NotEq, _) => CmpOp::Ne,
+            (BinaryOperator::Lt, false) | (BinaryOperator::Gt, true) => CmpOp::Lt,
+            (BinaryOperator::LtEq, false) | (BinaryOperator::GtEq, true) => CmpOp::Le,
+            (BinaryOperator::Gt, false) | (BinaryOperator::Lt, true) => CmpOp::Gt,
+            (BinaryOperator::GtEq, false) | (BinaryOperator::LtEq, true) => CmpOp::Ge,
+            (o, _) => return Err(err(format!("a correlated subquery compares with =, !=, <, <=, > or >=, not {o}"))),
+        };
+        Ok(Pred::Sub(Box::new(ir::Expr::Cmp { op, left: Box::new(ir::Expr::Field(f as u32)), right: Box::new(ir::Expr::Outer(outer)) })))
+    }
+
     fn sub_comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
         use BinaryOperator::*;
         let (field_e, q, op) = match (subquery_of(left), subquery_of(right)) {

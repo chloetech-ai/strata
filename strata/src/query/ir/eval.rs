@@ -203,6 +203,8 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
         | Expr::Ranked { .. }
         | Expr::Subquery(_) => return Err(err("full-text, graph and score expressions are answered by indexes in a Search, not row by row")),
         Expr::Values(_) | Expr::Keys(_) | Expr::Exists(_) | Expr::Scalar(_) => return Err(err("a subquery is run before the rows it is evaluated over")),
+        Expr::Outer(_) => return Err(err("a correlated subquery runs with the values of the row around it in place")),
+        Expr::ByKey(_) => return Err(err("values by key rank a Search's rows, not rows in memory")),
     })
 }
 
