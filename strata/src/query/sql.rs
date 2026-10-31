@@ -738,6 +738,15 @@ impl<'a> Binder<'a> {
     }
 
     fn query(&self, q: &sql::Query) -> Result<Select> {
+        // `SELECT DISTINCT a, b` is `GROUP BY a, b`, as a compound query
+        // plans it, so that a shard answers it with groups to merge.
+        if let sql::SetExpr::Select(s) = q.body.as_ref() {
+            if matches!(s.distinct, Some(sql::Distinct::Distinct)) {
+                let mut s = s.clone();
+                super::compound::distinct_to_group(&mut s)?;
+                return self.query(&sql::Query { body: Box::new(sql::SetExpr::Select(s)), ..q.clone() });
+            }
+        }
         let sql::Query { with, body, order_by: _, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
         if with.is_some() {
             return Err(err("WITH runs as a compound query (Db::query), not as one SELECT"));
@@ -1736,7 +1745,25 @@ impl<'a> Binder<'a> {
                 if self.schema.fields[f].ty == FieldType::Edges {
                     return Err(err(format!("{} is an EDGES field: use REACHABLE({}, keys) for rows linked to keys", self.schema.fields[f].name, self.schema.fields[f].name)));
                 }
+                // A list naming the outer row's columns: a correlated
+                // subquery's, compared once the outer row is known.
+                if list.iter().any(|v| outer_field(v).is_some()) {
+                    let items = list
+                        .iter()
+                        .map(|v| match outer_field(v) {
+                            Some(o) => Ok(ir::Expr::Outer(o)),
+                            None => Ok(ir::Expr::Lit(match self.literal(v)? {
+                                Value::Null => Value::Null,
+                                x => self.coerce(f, x)?,
+                            })),
+                        })
+                        .collect::<Result<_>>()?;
+                    let p = Pred::Sub(Box::new(ir::Expr::In { expr: Box::new(ir::Expr::Field(f as u32)), list: items }));
+                    return Ok(if *negated { Pred::Not(Box::new(p)) } else { p });
+                }
                 // A list-valued parameter stands for its values (`IN (:ids)`).
+                // A NULL is kept: `x IN (1, NULL)` is UNKNOWN where x is not
+                // 1, so `NOT IN` holds for no row ([`Pred::three_valued`]).
                 let mut values = Vec::with_capacity(list.len());
                 for v in list {
                     match as_list(self.literal(v)?) {
@@ -1745,6 +1772,7 @@ impl<'a> Binder<'a> {
                                 values.push(self.coerce(f, x)?);
                             }
                         }
+                        Err(Value::Null) => values.push(Value::Null),
                         Err(x) => values.push(self.coerce(f, x)?),
                     }
                 }
@@ -1803,7 +1831,9 @@ impl<'a> Binder<'a> {
                 let pattern = pattern.as_str().ok_or_else(|| err("LIKE's pattern must be text"))?;
                 let p = match like_prefix(pattern, escape)? {
                     LikePrefix::Exact(v) => Pred::In { field: f, values: vec![Value::Str(v)] },
-                    LikePrefix::Prefix(p) if p.is_empty() => Pred::Present { field: f },
+                    // The empty prefix is any value, and UNKNOWN without
+                    // one: `NOT LIKE '%'` holds for no row
+                    // ([`Pred::simplify`] makes it `IS NOT NULL`).
                     LikePrefix::Prefix(p) => Pred::Prefix { field: f, prefix: p, edits: 0 },
                 };
                 if *negated { Pred::Not(Box::new(p)) } else { p }
@@ -1818,7 +1848,7 @@ impl<'a> Binder<'a> {
                 let fuzzy = Expand::from_opts(&opts).map_err(err)?.fuzzy;
                 let f = self.prefix_field(field)?;
                 match self.literal(p)? {
-                    Value::Str(p) if p.is_empty() => Pred::Present { field: f },
+                    Value::Str(p) if p.is_empty() => Pred::Prefix { field: f, prefix: p, edits: 0 },
                     // 'auto' by the typed prefix's length, as MATCH does
                     // by a word's.
                     Value::Str(p) => Pred::Prefix { edits: fuzzy.map_or(0, |z| z.edits(p.chars().count())), field: f, prefix: p },
@@ -2306,7 +2336,7 @@ fn check_select(s: &sql::Select) -> Result<()> {
     } = s;
     let modifiers = matches!(group_by, sql::GroupByExpr::Expressions(_, m) if !m.is_empty());
     let clause = if distinct.is_some() {
-        "SELECT DISTINCT (it runs as a compound query, through Db::query)"
+        "SELECT DISTINCT ON (it runs as a compound query, through Db::query)"
     } else if top.is_some() {
         "TOP (use LIMIT)"
     } else if into.is_some() {

@@ -175,18 +175,35 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
             }
             Value::Str(out)
         }
-        Expr::Like { expr, pattern, case_insensitive } => match (eval(expr, row)?, eval(pattern, row)?) {
-            (Value::Str(s), Value::Str(p)) => {
-                let (s, p) = if *case_insensitive { (s.to_lowercase(), p.to_lowercase()) } else { (s, p) };
-                Value::Bool(like(&s.chars().collect::<Vec<_>>(), &p.chars().collect::<Vec<_>>()))
+        // A list (a multi-valued field's values) matches when one of its
+        // values does, as over a table.
+        Expr::Like { expr, pattern, case_insensitive } => {
+            let x = eval(expr, row)?;
+            match eval(pattern, row)? {
+                Value::Str(p) => {
+                    let fold = |s: &str| if *case_insensitive { s.to_lowercase() } else { s.to_string() };
+                    let p: Vec<char> = fold(&p).chars().collect();
+                    any(&x, |v| Ok(if let Value::Str(s) = v { Some(like(&fold(s).chars().collect::<Vec<_>>(), &p)) } else { None }))?
+                }
+                _ => Value::Null,
             }
-            _ => Value::Null,
-        },
-        Expr::Prefix { expr, prefix, edits } => match (eval(expr, row)?, eval(prefix, row)?) {
-            (Value::Str(s), Value::Str(p)) if *edits == 0 => Value::Bool(s.starts_with(&p)),
-            (Value::Str(s), Value::Str(p)) => Value::Bool(crate::text::fuzzy::prefix_within(&p.chars().collect::<Vec<_>>(), &s, *edits)),
-            _ => Value::Null,
-        },
+        }
+        Expr::Prefix { expr, prefix, edits } => {
+            let x = eval(expr, row)?;
+            match eval(prefix, row)? {
+                Value::Str(p) => {
+                    let chars: Vec<char> = p.chars().collect();
+                    any(&x, |v| {
+                        Ok(match v {
+                            Value::Str(s) if *edits == 0 => Some(s.starts_with(&p)),
+                            Value::Str(s) => Some(crate::text::fuzzy::prefix_within(&chars, s, *edits)),
+                            _ => None,
+                        })
+                    })?
+                }
+                _ => Value::Null,
+            }
+        }
         Expr::Case { operand, whens, otherwise } => {
             let base = operand.as_ref().map(|o| eval(o, row)).transpose()?;
             for w in whens {

@@ -1561,7 +1561,7 @@ fn distinct_on(s: &sql::Select) -> &[Expr] {
 }
 
 /// `SELECT DISTINCT a, b` as `GROUP BY a, b`.
-fn distinct_to_group(s: &mut sql::Select) -> Result<()> {
+pub(crate) fn distinct_to_group(s: &mut sql::Select) -> Result<()> {
     if !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(s) {
         return Err(err("SELECT DISTINCT with GROUP BY or aggregates: drop DISTINCT"));
     }
@@ -1666,7 +1666,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
     }
     let go = |x: &Expr| compile_with(x, params, slot, multi, subs);
     let bx = |x: &Expr| go(x).map(Box::new);
-    // An operand of a comparison.
+    // An operand of a comparison, IN, LIKE or PREFIX.
     let listy = |x: &Expr| -> Result<Box<ir::Expr>> {
         Ok(Box::new(match go(x)? {
             // NULL as the empty list (coalesce would skip the empty list).
@@ -1738,7 +1738,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             if *any || escape_char.is_some() {
                 return Err(err(format!("unsupported expression: {e}")));
             }
-            not_if(*negated, ir::Expr::Like { expr: bx(expr)?, pattern: bx(pattern)?, case_insensitive: matches!(e, Expr::ILike { .. }) })
+            not_if(*negated, ir::Expr::Like { expr: listy(expr)?, pattern: bx(pattern)?, case_insensitive: matches!(e, Expr::ILike { .. }) })
         }
         Expr::Case { operand, conditions, else_result, .. } => ir::Expr::Case {
             operand: operand.as_deref().map(bx).transpose()?,
@@ -1748,7 +1748,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         Expr::Function(_) if outer_field(e).is_some() => ir::Expr::Outer(outer_field(e).expect("a field")),
         Expr::Function(f) if fname(f) == "prefix" => {
             let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
-            ir::Expr::Prefix { expr: bx(x)?, prefix: bx(p)?, edits: 0 }
+            ir::Expr::Prefix { expr: listy(x)?, prefix: bx(p)?, edits: 0 }
         }
         Expr::Function(f) if fname(f) == "at_least" => {
             let usage = "AT_LEAST(n, condition, ...): n a count (2) or a percentage ('75%') of the conditions";

@@ -360,7 +360,14 @@ impl<'a> Raise<'a> {
             }
             Expr::In { expr, list } => {
                 let f = self.field_of(expr)?;
-                let values = list.iter().map(|v| self.stored(f, self.lit(v)?)).collect::<Result<Vec<_>>>()?;
+                // A NULL is kept for three_valued and simplify to read.
+                let values = list
+                    .iter()
+                    .map(|v| match self.lit(v)? {
+                        Value::Null => Ok(Value::Null),
+                        v => self.stored(f, v),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 if values.is_empty() {
                     Pred::False
                 } else {
@@ -387,6 +394,9 @@ impl<'a> Raise<'a> {
                     return Err(err(format!("PREFIX allows 0 to 2 edits, not {edits}")));
                 }
                 match self.lit(prefix)? {
+                    // The empty prefix (`IS NOT NULL` once simplified), so
+                    // that its negation leaves out rows without a value.
+                    Value::Str(p) if p.is_empty() && *edits == 0 => Pred::Prefix { field: f, prefix: p, edits: 0 },
                     Value::Str(p) if p.is_empty() => Pred::Present { field: f },
                     Value::Str(p) => Pred::Prefix { field: f, prefix: p, edits: *edits },
                     v => return Err(err(format!("PREFIX of {} takes text, not {v:?}", fld.name))),
