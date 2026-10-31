@@ -893,4 +893,7 @@ message HealthResponse {
   uint64 docs = 2;
   uint64 segments = 3;
   uint64 txn = 4;
+  // The server's health, its latest point of rates and gauges, and its
+  // version, as JSON (`/v1/cluster` on a coordinator shows each copy's).
+  string detail = 5;
 }

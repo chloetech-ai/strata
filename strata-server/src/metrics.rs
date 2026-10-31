@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use strata::query::{OrderBy, Projection, Score, Select};
 
 /// Upper bounds of the latency buckets, in seconds.
-const BUCKETS: [f64; 14] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
+pub const BUCKETS: [f64; 14] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
 
 /// Upper bounds of the stream lag buckets, in seconds: a stream catching
 /// up may be hours behind.
@@ -43,6 +43,24 @@ impl Default for Lag {
 impl Histogram {
     fn with(bounds: &'static [f64]) -> Histogram {
         Histogram { bounds, counts: vec![0; bounds.len()], sum: 0.0, n: 0 }
+    }
+
+    /// The counts per bucket, and last those past every bound.
+    fn counts(&self) -> Vec<u64> {
+        let mut c = self.counts.clone();
+        c.push(self.n - self.counts.iter().sum::<u64>());
+        c
+    }
+
+    /// Adds its counts per bucket into `into` (counts of the same bounds).
+    fn add_to(&self, into: &mut Vec<u64>) {
+        let c = self.counts();
+        if into.len() < c.len() {
+            into.resize(c.len(), 0);
+        }
+        for (a, b) in into.iter_mut().zip(c) {
+            *a += b;
+        }
     }
 
     fn observe(&mut self, secs: f64) {
@@ -247,6 +265,87 @@ impl Metrics {
         serde_json::json!({ "queries": by_kind, "writes": m.writes, "written_docs": m.written_docs, "write_errors": write_errors, "rejected": m.rejected, "agent_runs": m.agent_runs })
     }
 
+    /// The counters a sample of the series takes ([`crate::telemetry::Sample`]).
+    pub fn totals(&self, s: &mut crate::telemetry::Sample) {
+        let m = self.inner();
+        for (&(kind, outcome), &n) in &m.queries {
+            s.queries += n;
+            *s.by_kind.entry(kind).or_default() += n;
+            match outcome {
+                "error" | "timeout" => s.query_errors += n,
+                "rejected" => s.rejected += n,
+                "partial" => s.partial += n,
+                _ => {}
+            }
+        }
+        let mut hist = Vec::new();
+        for h in m.query_seconds.values() {
+            h.add_to(&mut hist);
+        }
+        s.query_hist = hist;
+        for (&(_, status), &n) in &m.http {
+            s.http += n;
+            match status {
+                400..=499 => s.http_4xx += n,
+                500.. => s.http_5xx += n,
+                _ => {}
+            }
+        }
+        s.writes = m.writes;
+        s.written_docs = m.written_docs;
+        s.write_errors = m.write_errors.values().sum();
+        s.write_hist = m.write_seconds.counts();
+        s.slow = m.slow.values().sum();
+    }
+
+    /// Requests by route: how many, how many failed (4xx and 5xx), and
+    /// their mean and 99th percentile latency, in milliseconds.
+    pub fn routes(&self) -> serde_json::Value {
+        let m = self.inner();
+        let mut by: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
+        for ((route, status), &n) in &m.http {
+            let e = by.entry(route.as_str()).or_default();
+            e.0 += n;
+            if (400..500).contains(status) {
+                e.1 += n;
+            }
+            if *status >= 500 {
+                e.2 += n;
+            }
+        }
+        let routes: Vec<serde_json::Value> = by
+            .into_iter()
+            .map(|(route, (n, c4, c5))| {
+                let h = m.http_seconds.get(route);
+                let p99 = h.and_then(|h| crate::telemetry::quantile(&BUCKETS, &h.counts(), 0.99)).map(|s| s * 1e3);
+                let mean = h.map(|h| h.sum / h.n.max(1) as f64 * 1e3);
+                serde_json::json!({"route": route, "requests": n, "client_errors": c4, "server_errors": c5, "mean_ms": mean, "p99_ms": p99})
+            })
+            .collect();
+        let grpc: Vec<serde_json::Value> = m
+            .grpc_seconds
+            .iter()
+            .map(|(method, h)| {
+                let failed: u64 = m.grpc.iter().filter(|((mm, code), _)| mm == method && *code != "Ok").map(|(_, n)| n).sum();
+                serde_json::json!({"method": method, "calls": h.n, "failed": failed, "mean_ms": h.sum / h.n.max(1) as f64 * 1e3, "p99_ms": crate::telemetry::quantile(&BUCKETS, &h.counts(), 0.99).map(|s| s * 1e3)})
+            })
+            .collect();
+        let kinds: Vec<serde_json::Value> = m
+            .query_seconds
+            .iter()
+            .map(|(kind, h)| {
+                let by: serde_json::Map<String, serde_json::Value> = m.queries.iter().filter(|((k, _), _)| k == kind).map(|((_, o), n)| (o.to_string(), serde_json::json!(n))).collect();
+                serde_json::json!({
+                    "kind": kind, "queries": h.n, "outcomes": by, "mean_ms": h.sum / h.n.max(1) as f64 * 1e3,
+                    "p50_ms": crate::telemetry::quantile(&BUCKETS, &h.counts(), 0.5).map(|s| s * 1e3),
+                    "p99_ms": crate::telemetry::quantile(&BUCKETS, &h.counts(), 0.99).map(|s| s * 1e3),
+                    "hist": h.counts(),
+                })
+            })
+            .collect();
+        serde_json::json!({"http": routes, "grpc": grpc, "kinds": kinds, "buckets_s": BUCKETS, "admission_p99_ms": crate::telemetry::quantile(&BUCKETS, &m.admission_seconds.counts(), 0.99).map(|s| s * 1e3)})
+    }
+
     /// The text format: what this records, then `more`.
     pub fn render(&self, more: &[Family]) -> String {
         let m = self.inner();
@@ -278,7 +377,7 @@ impl Metrics {
             h.render(o, "strata_grpc_request_duration_seconds", &format!("method=\"{method}\""));
         }
 
-        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, reranked, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected).");
+        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, reranked, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected, cancelled).");
         for (&(k, outcome), n) in &m.queries {
             let _ = writeln!(o, "strata_queries_total{{kind=\"{k}\",outcome=\"{outcome}\"}} {n}");
         }

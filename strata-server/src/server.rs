@@ -307,6 +307,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
+    spawn_sampler(&svc);
     Ok(svc)
 }
 
@@ -511,6 +512,24 @@ pub fn spawn_maintenance(svc: &Arc<Service>) {
                 tracing::error!(error = why.as_deref().unwrap_or_default(), "the database cannot merge");
             }
             reported = why;
+        }
+    });
+}
+
+/// Samples the service's counters and gauges every interval of its
+/// series ([`crate::telemetry::Series`]), for the UI's charts, until the
+/// service is dropped.
+pub fn spawn_sampler(svc: &Arc<Service>) {
+    let every = svc.series.interval;
+    let svc = Arc::downgrade(svc);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(svc) = svc.upgrade() else { return };
+            let s = svc.sample();
+            svc.series.add(s);
         }
     });
 }

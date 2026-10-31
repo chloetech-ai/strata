@@ -72,23 +72,203 @@ impl LogFormat {
     }
 }
 
-/// Sends log events at `filter`'s levels (`info`, or per module as
-/// `info,strata=debug`) to stderr in `format`. The libraries the server is
-/// built on log only warnings unless `filter` names them.
-pub fn init_logs(filter: &str, format: LogFormat) -> Result<(), String> {
-    use tracing_subscriber::EnvFilter;
+/// The filter `filter` names (`info`, or per module as
+/// `info,strata=debug`), with the libraries the server is built on at
+/// warnings unless it names them.
+fn env_filter(filter: &str) -> Result<tracing_subscriber::EnvFilter, String> {
     let quiet = ["h2", "hyper", "hyper_util", "tower", "tonic", "rustls", "reqwest"];
     let mut directives = filter.to_string();
     for m in quiet.iter().filter(|m| !filter.contains(*m)) {
         directives.push_str(&format!(",{m}=warn"));
     }
-    let filter = EnvFilter::try_new(&directives).map_err(|e| format!("bad log filter {filter:?}: {e}"))?;
-    let b = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    tracing_subscriber::EnvFilter::try_new(&directives).map_err(|e| format!("bad log filter {filter:?}: {e}"))
+}
+
+type Reload = tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// The filter [`init_logs`] set, which [`set_log_filter`] changes.
+static FILTER: OnceLock<(Reload, Mutex<String>)> = OnceLock::new();
+
+/// Sends log events at `filter`'s levels (`info`, or per module as
+/// `info,strata=debug`) to stderr in `format`, and keeps the latest in
+/// [`ring`]. The libraries the server is built on log only warnings
+/// unless `filter` names them.
+pub fn init_logs(filter: &str, format: LogFormat) -> Result<(), String> {
+    use tracing_subscriber::prelude::*;
+    let (env, handle) = tracing_subscriber::reload::Layer::new(env_filter(filter)?);
+    let fmt = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
     let r = match format {
-        LogFormat::Text => b.with_ansi(false).try_init(),
-        LogFormat::Json => b.json().flatten_event(true).with_current_span(true).with_span_list(false).try_init(),
+        LogFormat::Text => tracing_subscriber::registry().with(env).with(fmt.with_ansi(false)).with(RingLayer).try_init(),
+        LogFormat::Json => tracing_subscriber::registry().with(env).with(fmt.json().flatten_event(true).with_current_span(true).with_span_list(false)).with(RingLayer).try_init(),
     };
-    r.map_err(|e| e.to_string())
+    r.map_err(|e| e.to_string())?;
+    let _ = FILTER.set((handle, Mutex::new(filter.to_string())));
+    Ok(())
+}
+
+/// The log filter now (`None` when logs were not set up by
+/// [`init_logs`]: a test's own subscriber).
+pub fn log_filter() -> Option<String> {
+    FILTER.get().map(|(_, f)| f.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+/// Changes what is logged while the server runs: `debug` to see every
+/// request, `info` to go back.
+pub fn set_log_filter(filter: &str) -> Result<(), String> {
+    let (handle, now) = FILTER.get().ok_or("logs are not set up by the server here")?;
+    handle.reload(env_filter(filter)?).map_err(|e| e.to_string())?;
+    *now.lock().unwrap_or_else(|e| e.into_inner()) = filter.to_string();
+    Ok(())
+}
+
+/// A log line kept in the [`ring`]: its number, time, level, module, text,
+/// fields, and the request it was written for.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LogLine {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub level: &'static str,
+    pub target: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The request's method or gRPC call, and its route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+/// The latest log lines, for `GET /v1/logs`.
+pub struct LogRing {
+    lines: Mutex<std::collections::VecDeque<Arc<LogLine>>>,
+    next: AtomicU64,
+}
+
+/// Lines the ring keeps.
+pub const RING_LINES: usize = 5000;
+
+/// The ring every server's log lines go to (as well as to stderr).
+pub fn ring() -> &'static LogRing {
+    static RING: OnceLock<LogRing> = OnceLock::new();
+    RING.get_or_init(|| LogRing { lines: Mutex::new(std::collections::VecDeque::with_capacity(RING_LINES)), next: AtomicU64::new(0) })
+}
+
+impl LogRing {
+    fn push(&self, mut line: LogLine) {
+        let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        line.seq = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        if lines.len() == RING_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(Arc::new(line));
+    }
+
+    /// The lines after number `after` at `min` level or more severe (as
+    /// "warn"), of request `request` and holding `text` if given, the
+    /// oldest first, at most `limit` (the latest of them).
+    pub fn lines(&self, after: u64, min: Option<&str>, request: Option<&str>, text: Option<&str>, limit: usize) -> Vec<Arc<LogLine>> {
+        let rank = |l: &str| ["trace", "debug", "info", "warn", "error"].iter().position(|x| x.eq_ignore_ascii_case(l)).unwrap_or(0);
+        let min = min.map_or(0, rank);
+        let text = text.map(|t| t.to_lowercase());
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<Arc<LogLine>> = lines
+            .iter()
+            .rev()
+            .filter(|l| l.seq > after && rank(l.level) >= min)
+            .filter(|l| request.is_none_or(|r| l.request_id.as_deref() == Some(r)))
+            .filter(|l| text.as_ref().is_none_or(|t| l.message.to_lowercase().contains(t) || l.target.contains(t.as_str()) || serde_json::Value::Object(l.fields.clone()).to_string().to_lowercase().contains(t)))
+            .take(limit)
+            .cloned()
+            .collect();
+        out.reverse();
+        out
+    }
+
+    /// The number of the latest line (0: none yet).
+    pub fn last(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+}
+
+/// Keeps every event in the [`ring`], with its request's id.
+struct RingLayer;
+
+/// A span's fields, kept in its extensions for [`RingLayer`].
+struct SpanFields(serde_json::Map<String, serde_json::Value>);
+
+#[derive(Default)]
+struct Fields(serde_json::Map<String, serde_json::Value>);
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        self.0.insert(f.name().to_string(), serde_json::json!(format!("{v:?}")));
+    }
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        self.0.insert(f.name().to_string(), serde_json::json!(v));
+    }
+    fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+        self.0.insert(f.name().to_string(), serde_json::json!(v));
+    }
+    fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+        self.0.insert(f.name().to_string(), serde_json::json!(v));
+    }
+    fn record_f64(&mut self, f: &tracing::field::Field, v: f64) {
+        self.0.insert(f.name().to_string(), serde_json::json!(v));
+    }
+    fn record_bool(&mut self, f: &tracing::field::Field, v: bool) {
+        self.0.insert(f.name().to_string(), serde_json::json!(v));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for RingLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut f = Fields::default();
+        attrs.record(&mut f);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanFields(f.0));
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut f = Fields::default();
+        event.record(&mut f);
+        let message = f.0.remove("message").map(|m| m.as_str().map_or_else(|| m.to_string(), str::to_string)).unwrap_or_default();
+        let (mut request_id, mut method, mut route) = (None, None, None);
+        if let Some(scope) = ctx.event_scope(event) {
+            for span in scope {
+                if let Some(SpanFields(sf)) = span.extensions().get::<SpanFields>() {
+                    let get = |k: &str| sf.get(k).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+                    request_id = request_id.or_else(|| get("id"));
+                    method = method.or_else(|| get("method"));
+                    route = route.or_else(|| get("route"));
+                }
+            }
+        }
+        let m = event.metadata();
+        ring().push(LogLine {
+            seq: 0,
+            ts_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+            level: match *m.level() {
+                tracing::Level::ERROR => "error",
+                tracing::Level::WARN => "warn",
+                tracing::Level::INFO => "info",
+                tracing::Level::DEBUG => "debug",
+                tracing::Level::TRACE => "trace",
+            },
+            target: m.target().to_string(),
+            message,
+            fields: f.0,
+            request_id,
+            method,
+            route,
+        });
+    }
 }
 
 /// Lets through at most `per_second` lines a second and counts the rest,
@@ -172,6 +352,27 @@ mod tests {
     fn long_text_is_cut_at_a_character() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("ééé", 3), "é... (6 bytes)");
+    }
+
+    #[test]
+    fn the_ring_keeps_lines_with_their_request() {
+        use tracing_subscriber::prelude::*;
+        let sub = tracing_subscriber::registry().with(RingLayer);
+        let before = ring().last();
+        tracing::subscriber::with_default(sub, || {
+            let span = tracing::info_span!("request", id = "ring-1", method = "POST", route = "/v1/query");
+            let _in = span.enter();
+            tracing::warn!(rows = 3, "slow ring query");
+            tracing::debug!("detail of ring-1");
+        });
+        let all = ring().lines(before, None, Some("ring-1"), None, 10);
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[0].message, "slow ring query");
+        assert_eq!(all[0].fields["rows"], 3);
+        assert_eq!(all[0].route.as_deref(), Some("/v1/query"));
+        assert_eq!(ring().lines(before, Some("warn"), Some("ring-1"), None, 10).len(), 1);
+        assert_eq!(ring().lines(before, None, None, Some("DETAIL OF"), 10).len(), 1);
+        assert_eq!(ring().lines(all[1].seq, None, Some("ring-1"), None, 10).len(), 0);
     }
 
     #[tokio::test]
