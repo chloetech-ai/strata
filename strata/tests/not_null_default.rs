@@ -63,6 +63,11 @@ fn now() -> i64 {
     strata::timestamp::now()
 }
 
+/// The features the database at `path` needs.
+fn required(path: &Path) -> Vec<String> {
+    strata::storage::manifest::read(path).unwrap().features()
+}
+
 fn format_on_disk(path: &Path) -> u32 {
     if path.is_dir() {
         let cur: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("CURRENT")).unwrap()).unwrap();
@@ -130,12 +135,12 @@ fn through_sql(layout: Layout) {
     }
     // A key declared NOT NULL needs no feature: it always holds a value.
     written(&db, "CREATE TABLE plain (id KEYWORD PRIMARY KEY NOT NULL, n INT NULL, m INT DEFAULT NULL)");
-    assert_eq!(format_on_disk(&path), 2);
+    assert_eq!(required(&path), ["field_ids"]);
     let plain = db.catalog().into_iter().find(|t| t.table == "plain").unwrap();
     assert!(plain.fields.iter().all(|f| !f.not_null && f.default.is_none()), "{plain:?}");
 
     written(&db, TASKS);
-    assert_eq!(format_on_disk(&path), 3);
+    assert_eq!(required(&path), ["bool", "default", "field_ids", "not_null", "timestamp"]);
     let schema = db.catalog().into_iter().find(|t| t.table == "tasks").unwrap();
     let short = schema.to_short_json();
     assert_eq!(short["fields"][0], serde_json::json!({"name": "id", "type": "keyword"}));
@@ -225,14 +230,14 @@ fn through_sql(layout: Layout) {
     assert_eq!(format_on_disk(&path), 3);
     check(&db);
 
-    // Without the table, the database needs format 2 again (two tables).
+    // Without the table, the database needs field ids alone.
     written(&db, "DROP TABLE tasks");
-    assert_eq!(format_on_disk(&path), 2);
+    assert_eq!(required(&path), ["field_ids"]);
     written(&db, "DROP TABLE plain");
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(required(&path), ["field_ids"]);
     if layout == Layout::SingleFile {
         let slots = meta_slots(&path);
-        assert!(slots.iter().all(|m| m.is_some_and(|m| m.format == 1)), "{slots:?}");
+        assert!(slots.iter().all(|m| m.is_some_and(|m| m.format == 3)), "{slots:?}");
     }
 }
 
@@ -249,7 +254,9 @@ fn json_csv_and_the_rust_api() {
         ]}"#,
     )
     .unwrap();
-    assert_eq!(schema.fields[1], Field::new("kind", FieldType::Keyword).not_null().default(serde_json::json!("click")));
+    let mut kind = Field::new("kind", FieldType::Keyword).not_null().default(serde_json::json!("click"));
+    kind.id = 1;
+    assert_eq!(schema.fields[1], kind);
     for bad in [
         r#"{"name": "n", "type": "int", "default": "one"}"#,
         r#"{"name": "n", "type": "float", "default": true}"#,

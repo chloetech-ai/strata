@@ -71,7 +71,12 @@ fn schema() -> Schema {
     let mut s = data::beir_schema(1024, VectorIndexKind::Flat);
     s.fields.push(Field::new("seq", FieldType::Int).not_stored());
     s.fields.push(Field::new("tier", FieldType::Keyword).not_stored());
-    s
+    s.with_new_ids().unwrap()
+}
+
+/// The name of field `name`'s sections (by its id).
+fn key(name: &str) -> String {
+    schema().key_of(name).unwrap()
 }
 
 /// The documents of `docs.jsonl` in the bench table (no body, no vector).
@@ -229,12 +234,12 @@ fn sizes(seg: &SegmentFile, schema: &Schema) -> Json {
     let n = seg.n_docs() as f64;
     let bits = |b: usize| b as f64 * 8.0 / n;
     let sections: serde_json::Map<String, Json> =
-        seg.section_sizes().into_iter().map(|(name, b)| (name, json!({"bytes": b, "bits_per_doc": bits(b)}))).collect();
+        seg.section_sizes().into_iter().map(|(name, b)| (strata::segment::label(schema, &name), json!({"bytes": b, "bits_per_doc": bits(b)}))).collect();
     let mut cols = serde_json::Map::new();
     for name in ["year", "rating", "seq"] {
-        let c = NumericColumn::open(seg, name).unwrap();
+        let c = NumericColumn::open(seg, &key(name)).unwrap();
         let [zone, offs, data, presence, hist] = c.byte_sizes();
-        let range = RangeIndex::open_if_present(seg, name).unwrap().map_or(0, |r| r.byte_len());
+        let range = RangeIndex::open_if_present(seg, &key(name)).unwrap().map_or(0, |r| r.byte_len());
         cols.insert(
             name.into(),
             json!({
@@ -259,7 +264,7 @@ fn sizes(seg: &SegmentFile, schema: &Schema) -> Json {
         );
     }
     for name in ["category", "topic", "tier", "id"] {
-        let c = KeywordColumn::open(seg, name).unwrap();
+        let c = KeywordColumn::open(seg, &key(name)).unwrap();
         let s = c.byte_sizes();
         let codes: usize = s.codes.iter().sum();
         cols.insert(
@@ -307,8 +312,8 @@ fn window(sorted: &[f64], s: f64, rng: &mut StdRng) -> (f64, f64) {
 fn ranges(seg: &SegmentFile, docs: &[Document], reps: usize, rng: &mut StdRng) -> Json {
     let mut out = Vec::new();
     for (name, fi) in [("year", f::YEAR), ("rating", f::RATING), ("seq", f::SEQ)] {
-        let col = NumericColumn::open(seg, name).unwrap();
-        let idx = RangeIndex::open(seg, name).unwrap();
+        let col = NumericColumn::open(seg, &key(name)).unwrap();
+        let idx = RangeIndex::open(seg, &key(name)).unwrap();
         let mut sorted: Vec<f64> = docs.iter().filter_map(|d| d[fi].as_f64()).collect();
         sorted.sort_by(f64::total_cmp);
         for s in [0.001, 0.01, 0.1, 0.5] {
@@ -355,11 +360,11 @@ fn ranges(seg: &SegmentFile, docs: &[Document], reps: usize, rng: &mut StdRng) -
 
 fn probes(seg: &SegmentFile, reps: usize, rng: &mut StdRng) -> Json {
     let n = seg.n_docs() as u32;
-    let year = NumericColumn::open(seg, "year").unwrap();
-    let rating = NumericColumn::open(seg, "rating").unwrap();
-    let cat = KeywordColumn::open(seg, "category").unwrap();
-    let topic = KeywordColumn::open(seg, "topic").unwrap();
-    let tier = KeywordColumn::open(seg, "tier").unwrap();
+    let year = NumericColumn::open(seg, &key("year")).unwrap();
+    let rating = NumericColumn::open(seg, &key("rating")).unwrap();
+    let cat = KeywordColumn::open(seg, &key("category")).unwrap();
+    let topic = KeywordColumn::open(seg, &key("topic")).unwrap();
+    let tier = KeywordColumn::open(seg, &key("tier")).unwrap();
     // Candidate streams in docID order (as from a posting list) and in
     // random order (as from a vector index).
     let m = 100_000.min(n as usize);
@@ -409,7 +414,7 @@ fn top_values(col: &KeywordColumn, k: usize) -> Vec<String> {
 fn keywords(seg: &SegmentFile, reps: usize) -> Json {
     let mut out = Vec::new();
     for name in ["category", "topic", "tier"] {
-        let col = KeywordColumn::open(seg, name).unwrap();
+        let col = KeywordColumn::open(seg, &key(name)).unwrap();
         let nv = col.n_values();
         for rank in [0, nv / 4, nv / 2, nv - 1] {
             let v = col.value(most_frequent(&col, rank)).to_string();
@@ -443,7 +448,7 @@ fn facets(seg: &SegmentFile, reps: usize, rng: &mut StdRng) -> Json {
     let n = seg.n_docs() as u32;
     let mut out = Vec::new();
     for name in ["category", "topic", "tier"] {
-        let col = KeywordColumn::open(seg, name).unwrap();
+        let col = KeywordColumn::open(seg, &key(name)).unwrap();
         for density in [1e-4, 1e-3, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0] {
             let docs = if density >= 1.0 { DocSet::all(n) } else { forward_docset(rng, n, density) };
             let codes = time(reps, || col.facet_code_counts(&docs, FacetStrategy::Codes).len());

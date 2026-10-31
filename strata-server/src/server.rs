@@ -298,7 +298,8 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
                 db.snapshot().n_live_docs()
             }
             Fill::Copy(from) => {
-                let old = Db::open(&from, DbOptions::default()).map_err(|e| format!("open {}: {e}", from.display()))?;
+                // A database from before field ids opens to be copied too.
+                let old = Db::open(&from, DbOptions { open_old: true, ..DbOptions::default() }).map_err(|e| format!("open {}: {e}", from.display()))?;
                 db.load_from(&old).map_err(|e| format!("copy from {}: {e}", from.display()))?
             }
         };

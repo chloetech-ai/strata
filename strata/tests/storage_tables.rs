@@ -131,10 +131,11 @@ fn transactions_span_tables(name: &str) {
     let path = dir.path().join(name);
     let src = Arc::new(Source::default());
     let o = options(&src, layout_of(&path));
+    // Format 3 with field ids, however many tables.
     let db = Database::create(&path, schema("papers"), o.clone()).unwrap();
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(format_on_disk(&path), 3);
     db.create_table(schema("authors")).unwrap();
-    assert_eq!(format_on_disk(&path), 2);
+    assert_eq!(format_on_disk(&path), 3);
     let names: Vec<String> = db.tables().iter().map(|s| s.table.clone()).collect();
     assert_eq!(names, ["papers", "authors"]);
     assert_eq!(db.schema().table, "papers");
@@ -227,7 +228,7 @@ fn transactions_span_tables(name: &str) {
     drop(db);
     let db = Database::open(&path, o).unwrap();
     assert_eq!(state(&db), want);
-    assert_eq!(format_on_disk(&path), 2);
+    assert_eq!(format_on_disk(&path), 3);
     db.check().unwrap();
 }
 
@@ -306,15 +307,14 @@ fn create_and_drop_tables(name: &str) {
     let names: Vec<String> = db.tables().iter().map(|s| s.table.clone()).collect();
     assert_eq!(names, ["t", "v_2", "u"]);
 
-    // Back to the first table alone: format 1 again (in both meta slots,
-    // which versions from before tables check), and the freed pages go
-    // back to the file.
+    // Back to the first table alone: still format 3 (in both meta slots),
+    // for its field ids, and the freed pages go back to the file.
     db.drop_table("u").unwrap();
     db.drop_table("v_2").unwrap();
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(format_on_disk(&path), 3);
     if !path.is_dir() {
         let formats: Vec<u32> = meta_slots(&path).into_iter().map(|m| m.unwrap().format).collect();
-        assert_eq!(formats, [1, 1]);
+        assert_eq!(formats, [3, 3]);
     }
     db.vacuum().unwrap();
     assert_eq!(state(&db), model(&[("t", 0..30)]));
@@ -328,7 +328,7 @@ fn create_and_drop_tables(name: &str) {
     tx.commit().unwrap();
     db.flush().unwrap();
     assert_eq!(state(&db), model(&[("t", 1..30)]));
-    assert_eq!(format_on_disk(&path), 1);
+    assert_eq!(format_on_disk(&path), 3);
     db.check().unwrap();
 }
 
@@ -356,7 +356,9 @@ fn bulk_loads_into_a_named_table() {
 /// Files written by Strata before tables (main at 6b85211, with the
 /// program in `tests/fixtures/format1/README.md`): a single file and a
 /// directory, each with two flushes, deletes, values set in place and a
-/// transaction left in the WAL. They open, take writes and stay format 1.
+/// transaction left in the WAL. Written before field ids too, they are
+/// refused by a plain open; opened to be copied, they take writes and stay
+/// format 1, and `strata::upgrade` copies them.
 #[test]
 fn files_from_before_tables_open_and_stay_format_1() {
     for name in ["one.strata", "one.dir"] {
@@ -368,7 +370,9 @@ fn files_from_before_tables_open_and_stay_format_1() {
             copy(&fixtures.join(format!("{name}-wal")), &dir.path().join(format!("{name}-wal")));
         }
         let src = Arc::new(Source::default());
-        let o = options(&src, layout_of(&path));
+        let e = Database::open(&path, options(&src, layout_of(&path))).err().expect("refused").to_string();
+        assert!(e.contains("before field ids"), "{name}: {e}");
+        let o = DbOptions { open_old: true, ..options(&src, layout_of(&path)) };
         let db = Database::open(&path, o.clone()).unwrap();
         // 0..40 less the deletes of 0..5 and of 10.
         let mut want: BTreeSet<u64> = (5..40).collect();
@@ -397,7 +401,14 @@ fn files_from_before_tables_open_and_stay_format_1() {
         }
         drop(db);
         let db = Database::open(&path, o).unwrap();
-        assert_eq!(state(&db), BTreeMap::from([("t".to_string(), want)]));
+        assert_eq!(state(&db), BTreeMap::from([("t".to_string(), want.clone())]));
+        drop(db);
+        let up = strata::upgrade::upgrade(&path).unwrap().unwrap();
+        assert_eq!((up.tables, up.rows), (1, want.len() as u64), "{name}");
+        let db = Database::open(&path, options(&src, layout_of(&path))).unwrap();
+        assert_eq!(state(&db), BTreeMap::from([("t".to_string(), want)]), "{name}: upgraded");
+        assert_eq!(format_on_disk(&path), 3, "{name}");
+        db.check().unwrap();
     }
 }
 
@@ -502,12 +513,11 @@ fn random_operations(seed: u64, name: &str) {
             }
         }
         assert_eq!(state(db.as_ref().unwrap()), model, "seed {seed} step {step}");
-        let format = if model.len() == 1 { 1 } else { 2 };
         // A version on disk follows every commit except a WAL append.
         if step % 25 == 0 {
             db.as_ref().unwrap().check().unwrap();
             db.as_ref().unwrap().flush().unwrap();
-            assert_eq!(format_on_disk(&path), format, "seed {seed} step {step}");
+            assert_eq!(format_on_disk(&path), 3, "seed {seed} step {step}");
         }
     }
     db.as_ref().unwrap().check().unwrap();

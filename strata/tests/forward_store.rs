@@ -144,12 +144,13 @@ fn build_segment_writes_forward_sections() {
         .map(|d| vec![Value::Str(format!("{d}")), Value::Int(1990 + d % 35), Value::Float((d % 500) as f64 / 100.0), Value::Str("n".into())])
         .collect();
     let seg = SegmentFile::from_vec(build_segment(&schema, &docs, &BuildOptions::default()).unwrap()).unwrap();
-    let names: Vec<String> = seg.section_sizes().into_iter().map(|(n, _)| n).collect();
+    // Sections are named by field id; label() names them by field.
+    let names: Vec<String> = seg.section_sizes().into_iter().map(|(n, _)| strata::segment::label(&schema, &n)).collect();
     for s in ["col.year", "col.year.hist", "range.year", "col.rating", "kw.id.dict", "kw.id.codes", "kw.id.post", "store.index", "store.data"] {
         assert!(names.iter().any(|n| n == s), "missing {s} in {names:?}");
     }
     assert!(!names.iter().any(|n| n.starts_with("kw.note")));
     let want = (0..500).filter(|d| (10..20).contains(&(d % 35))).count();
-    assert_eq!(NumericColumn::open(&seg, "year").unwrap().scan_count(2000.0, 2009.0), want);
+    assert_eq!(NumericColumn::open(&seg, &schema.key_of("year").unwrap()).unwrap().scan_count(2000.0, 2009.0), want);
     assert_eq!(DocStore::open(&seg, &schema).unwrap().get(7)[3], Value::Str("n".into()));
 }

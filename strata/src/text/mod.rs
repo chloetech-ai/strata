@@ -63,5 +63,5 @@ pub fn text_builder(field: &Field, opts: &BuildOptions) -> Result<TextFieldBuild
         return Err(Error::Schema(format!("field {} is not TEXT", field.name)));
     };
     let (format, loom_min_df) = builder::options(opts)?;
-    Ok(TextFieldBuilder::new(&field.name, positions, format, loom_min_df).with_analyzer(field.text_analyzer()))
+    Ok(TextFieldBuilder::new(&field.key(), positions, format, loom_min_df).with_analyzer(field.text_analyzer()))
 }

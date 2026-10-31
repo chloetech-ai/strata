@@ -174,6 +174,7 @@ fn build(args: &Args, name: &str, path: &Path, codes: VectorCodes, dim: usize, d
     let snap = db.snapshot();
     for v in snap.segments() {
         for (name, len) in v.file.section_sizes() {
+            let name = strata::segment::label(snap.schema(), &name);
             let mut parts = name.split('.');
             let key = match parts.next().unwrap_or("") {
                 "text" => format!("text index ({})", parts.next().unwrap_or("")),

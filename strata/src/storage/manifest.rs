@@ -13,12 +13,19 @@
 //! features: {required: [..], optional: [..]}, ...}`, and is the last
 //! format number: later changes add features instead. A reader refuses a
 //! manifest that requires a feature it does not know, naming it, and
-//! ignores optional ones. A version is written in format 3 only while it
-//! uses a feature ([`Manifest::features`]: a BOOL or TIMESTAMP field, a
-//! NOT NULL field or a field with a DEFAULT, sequence numbers, or a rank
-//! profile), so a database that uses none stays readable by versions of
-//! Strata from before format 3, which refuse format 3 as newer than they
-//! read.
+//! ignores optional ones.
+//!
+//! Every database this version creates is format 3 with feature
+//! [`FIELD_IDS`]: each field of each table has an id
+//! ([`crate::schema::Field::id`]), and the database's segments, doc stores
+//! and values written in place name fields by it. A database written
+//! before field ids (format 1, 2, or 3 without the feature) opens only to
+//! be copied into a new one ([`crate::upgrade`]); written to meanwhile, it
+//! stays in its format, which it takes as the versions before did: format 3
+//! only while it uses a feature ([`Manifest::features`]: a BOOL or
+//! TIMESTAMP field, a NOT NULL field or a field with a DEFAULT, sequence
+//! numbers, or a rank profile), else 1 while it holds only its first table,
+//! else 2.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -191,10 +198,11 @@ impl Manifest {
         Manifest { txn: 1, wal_txn: 0, next_segment_id: 1, next_table_id: 1, tables: vec![TableMeta { id: 0, schema, segments: Vec::new(), profiles: Vec::new() }], seq_no: None }
     }
 
-    /// 3 while the database uses a feature ([`Manifest::features`]), else
-    /// 1 while it holds only the table it was created with, else 2.
+    /// 3 while the database uses a feature ([`Manifest::features`]), as
+    /// every database with field ids does; for one written before them, 1
+    /// while it holds only the table it was created with, else 2.
     pub fn format(&self) -> u32 {
-        if self.seq_no.is_some() || self.tables.iter().any(|t| t.schema.features().next().is_some() || !t.profiles.is_empty()) {
+        if !self.is_legacy() || self.seq_no.is_some() || self.tables.iter().any(|t| t.schema.features().next().is_some() || !t.profiles.is_empty()) {
             3
         } else if self.tables.len() == 1 && self.tables[0].id == 0 {
             1
@@ -203,12 +211,16 @@ impl Manifest {
         }
     }
 
-    /// The format 3 features the database needs, sorted: its tables'
+    /// The format 3 features the database needs, sorted: [`FIELD_IDS`]
+    /// unless it was written before field ids, its tables'
     /// ([`crate::schema::Schema::features`]), `seq_no` once it numbers its
     /// writes, `rank_profiles` while a table has a rank profile, and
     /// `sources` once it has [`SOURCES`].
     pub fn features(&self) -> Vec<String> {
         let mut used: BTreeSet<String> = self.tables.iter().flat_map(|t| t.schema.features()).collect();
+        if !self.is_legacy() {
+            used.insert(FIELD_IDS.to_string());
+        }
         if self.seq_no.is_some() {
             used.insert("seq_no".to_string());
         }
@@ -219,6 +231,13 @@ impl Manifest {
             used.insert("sources".to_string());
         }
         used.into_iter().collect()
+    }
+
+    /// Whether the database was written before field ids: its tables'
+    /// fields have none ([`crate::schema::Schema::is_legacy`]). Its tables
+    /// are all alike: a table created in such a database gets none either.
+    pub fn is_legacy(&self) -> bool {
+        self.tables.first().is_some_and(|t| t.schema.is_legacy())
     }
 
     /// The table with this id.
@@ -266,21 +285,24 @@ impl Manifest {
         match v.get("format").and_then(|f| f.as_u64()) {
             None => {
                 let m: V1 = serde_json::from_value(v).map_err(bad)?;
-                Ok(Manifest {
+                Manifest {
                     txn: m.txn,
                     wal_txn: m.wal_txn,
                     next_segment_id: m.next_segment_id,
                     next_table_id: 1,
                     tables: vec![TableMeta { id: 0, schema: m.schema, segments: m.segments, profiles: Vec::new() }],
                     seq_no: None,
-                })
+                }
+                .checked(false)
             }
             Some(f @ (2 | 3)) => {
+                let mut ids = false;
                 if f == 3 {
                     let features: Features = serde_json::from_value(v.get("features").cloned().unwrap_or_default()).map_err(bad)?;
                     if let Some(x) = features.required.iter().find(|x| !known_feature(x)) {
                         return Err(Error::Schema(format!("the database uses feature {x:?}, which this version of Strata does not have: open it with a newer one")));
                     }
+                    ids = features.required.iter().any(|x| x == FIELD_IDS);
                 }
                 let m: V2 = serde_json::from_value(v).map_err(bad)?;
                 if m.tables.first().is_none_or(|t| t.id != 0) {
@@ -289,10 +311,24 @@ impl Manifest {
                 if m.seq_no.as_ref().is_some_and(|n| !n.valid()) {
                     return Err(corrupt("manifest: the terms of its sequence numbers are out of order"));
                 }
-                Ok(Manifest { txn: m.txn, wal_txn: m.wal_txn, next_segment_id: m.next_segment_id, next_table_id: m.next_table_id, tables: m.tables, seq_no: m.seq_no })
+                Manifest { txn: m.txn, wal_txn: m.wal_txn, next_segment_id: m.next_segment_id, next_table_id: m.next_table_id, tables: m.tables, seq_no: m.seq_no }.checked(ids)
             }
             Some(f) => Err(corrupt(format!("manifest format {f} is newer than this version of Strata reads"))),
         }
+    }
+
+    /// Checks the tables' field ids against whether the manifest requires
+    /// [`FIELD_IDS`] (`ids`): with it every field of every table has a
+    /// valid id, without it none has one.
+    fn checked(self, ids: bool) -> Result<Manifest> {
+        for t in &self.tables {
+            t.schema.check_ids().map_err(|e| corrupt(format!("manifest: {e}")))?;
+            if t.schema.is_legacy() == ids {
+                let has = if ids { "has no field ids, and the manifest requires them" } else { "has field ids, and the manifest does not require feature field_ids" };
+                return Err(corrupt(format!("manifest: table {} {has}", t.schema.table)));
+            }
+        }
+        Ok(self)
     }
 }
 
@@ -317,7 +353,14 @@ struct V1 {
 
 /// The features this version of Strata reads, besides its analyzers'
 /// ([`known_feature`]).
-pub const FEATURES: &[&str] = &["bool", "cluster_by", "default", "derive", "edge_table", "media", "multi_vector", "not_null", RANK_PROFILES, "retain", "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
+pub const FEATURES: &[&str] = &["bool", "cluster_by", "default", "derive", "edge_table", FIELD_IDS, "media", "multi_vector", "not_null", RANK_PROFILES, "retain", "semantic_id", "seq_no", "shard_by", "sources", "timestamp"];
+
+/// The feature of a database whose fields have ids
+/// ([`crate::schema::Field::id`]): every database this version creates.
+/// Versions of Strata from before it refuse such a database by name, and
+/// this one opens a database without it only to copy it
+/// ([`crate::upgrade`]).
+pub const FIELD_IDS: &str = "field_ids";
 
 /// The feature of a database with a rank profile ([`RankProfile`]), and of
 /// a write-ahead log that may hold one ([`crate::storage::wal`]).
@@ -393,13 +436,36 @@ struct V2 {
     seq_no: Option<Numbering>,
 }
 
+/// The manifest of the newest version of the database at `path` whose
+/// manifest reads (as opening falls back to the version before a damaged
+/// one), without opening the database: a directory's `CURRENT`, or a
+/// single file's meta slots.
+pub fn read(path: &std::path::Path) -> Result<Manifest> {
+    if path.is_dir() {
+        return Ok(crate::storage::dir::read_current(path)?.1);
+    }
+    let file = std::fs::File::open(path)?;
+    let mut last = None;
+    for (meta, _) in crate::storage::pager::read_metas(&file)? {
+        match crate::storage::pager::read_extent(&file, meta.manifest, meta.manifest_crc).and_then(|b| Manifest::decode(&b)) {
+            Ok(m) => return Ok(m),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| corrupt("no valid meta slot")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::{Field, FieldType};
 
+    /// A table as a version from before field ids wrote it, which these
+    /// tests use to check the formats such a database stays in (1, 2 and 3
+    /// as its features say); [`field_ids_are_format_3`] covers this
+    /// version's.
     fn schema(name: &str) -> Schema {
-        Schema::new(name, vec![Field::new("id", FieldType::Keyword), Field::new("body", FieldType::Text { positions: true })], Some("id")).unwrap()
+        Schema::new(name, vec![Field::new("id", FieldType::Keyword), Field::new("body", FieldType::Text { positions: true })], Some("id")).unwrap().without_ids()
     }
 
     fn segment(id: u64) -> SegmentMeta {
@@ -461,7 +527,7 @@ mod tests {
 
     fn typed(name: &str) -> Schema {
         let fields = vec![Field::new("id", FieldType::Keyword), Field::timestamp("at"), Field::boolean("done"), Field::boolean("seen")];
-        Schema::new(name, fields, Some("id")).unwrap()
+        Schema::new(name, fields, Some("id")).unwrap().without_ids()
     }
 
     #[test]
@@ -497,9 +563,9 @@ mod tests {
         // Saying english is saying nothing: every version has it.
         let english = Schema::new("t", vec![Field::new("id", FieldType::Keyword), text().analyzer(Analyzer::English)], Some("id")).unwrap();
         assert_eq!(english.fields[1].analyzer, None);
-        assert_eq!(Manifest::new(english).format(), 1);
+        assert_eq!(Manifest::new(english.without_ids()).format(), 1);
         let simple = Schema::new("t", vec![Field::new("id", FieldType::Keyword), text().analyzer(Analyzer::Simple)], Some("id")).unwrap();
-        let m = Manifest::new(simple);
+        let m = Manifest::new(simple.without_ids());
         assert_eq!((m.format(), m.features()), (3, strings(&["analyzer:simple:1"])));
         let bytes = m.encode();
         let text = String::from_utf8(bytes.clone()).unwrap();
@@ -521,14 +587,14 @@ mod tests {
             Field::new("state", FieldType::Keyword).default(serde_json::json!("open")),
             Field::new("n", FieldType::Int).not_null(),
         ];
-        let mut m = Manifest::new(Schema::new("t", fields, Some("id")).unwrap());
+        let mut m = Manifest::new(Schema::new("t", fields, Some("id")).unwrap().without_ids());
         assert_eq!((m.format(), m.features()), (3, strings(&["default", "not_null"])));
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
         m.tables.push(TableMeta { id: 1, schema: typed("tasks"), segments: Vec::new(), profiles: Vec::new() });
         assert_eq!(m.features(), ["bool", "default", "not_null", "timestamp"]);
         // A key said to be NOT NULL needs nothing: keys always are.
         let key = Schema::new("k", vec![Field::new("id", FieldType::Keyword).not_null()], Some("id")).unwrap();
-        assert_eq!(Manifest::new(key).format(), 1);
+        assert_eq!(Manifest::new(key.without_ids()).format(), 1);
     }
 
     #[test]
@@ -602,5 +668,45 @@ mod tests {
         // Format 3 must say which features it needs.
         v.as_object_mut().unwrap().remove("features");
         assert!(Manifest::decode(&serde_json::to_vec(&v).unwrap()).is_err());
+    }
+
+    /// A database of this version names each field by its id: format 3,
+    /// feature `field_ids`, each table's ids and the next to give in its
+    /// schema. Ids that clash, a table without them (or with them, in a
+    /// manifest that does not require them) are damage.
+    #[test]
+    fn field_ids_are_format_3() {
+        let ids = |name: &str| schema(name).with_new_ids().unwrap();
+        let mut m = Manifest::new(ids("papers"));
+        m.tables.push(TableMeta { id: 1, schema: ids("authors"), segments: vec![segment(1)], profiles: Vec::new() });
+        m.next_table_id = 2;
+        assert!(!m.is_legacy());
+        assert_eq!((m.format(), m.features()), (3, strings(&[FIELD_IDS])));
+        let text = String::from_utf8(m.encode()).unwrap();
+        assert!(text.starts_with(r#"{"format":3,"features":{"required":["field_ids"]},"#), "{text}");
+        assert!(text.contains(r#""fields":[{"id":0,"name":"id","#) && text.contains(r#"{"id":1,"name":"body","#) && text.contains(r#""next_field_id":2"#), "{text}");
+        assert_eq!(Manifest::decode(text.as_bytes()).unwrap(), m);
+        // With other features, sorted.
+        m.tables[1].schema = typed("tasks").with_new_ids().unwrap();
+        assert_eq!(m.features(), ["bool", "field_ids", "timestamp"]);
+        assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
+
+        let corrupt = |text: String, why: &str| {
+            let e = Manifest::decode(text.as_bytes()).unwrap_err();
+            assert!(matches!(e, Error::Corrupt(_)) && e.to_string().contains(why), "{why}: {e}");
+        };
+        let text = String::from_utf8(Manifest { tables: m.tables[..1].to_vec(), ..m.clone() }.encode()).unwrap();
+        corrupt(text.replacen(r#"{"id":1,"name":"body""#, r#"{"id":0,"name":"body""#, 1), "the same id");
+        corrupt(text.replacen(r#""next_field_id":2"#, r#""next_field_id":1"#, 1), "next field id");
+        corrupt(text.replacen(r#""next_field_id":2"#, r#""next_field_id":70000"#, 1), "past the most");
+        corrupt(text.replacen(r#"{"id":1,"name":"body""#, r#"{"name":"body""#, 1), "next field id");
+        corrupt(text.replacen(r#"["field_ids"]"#, "[]", 1), "does not require feature field_ids");
+        let mixed = Manifest { tables: vec![m.tables[0].clone(), TableMeta { id: 1, schema: schema("authors"), segments: Vec::new(), profiles: Vec::new() }], ..m.clone() };
+        corrupt(String::from_utf8(mixed.encode()).unwrap(), "table authors has no field ids");
+        // A legacy manifest that names the feature is damage as well.
+        let old = Manifest::new(schema("docs"));
+        let mut v: serde_json::Value = serde_json::from_slice(&Manifest { tables: vec![TableMeta { id: 0, schema: schema("docs"), segments: Vec::new(), profiles: Vec::new() }, TableMeta { id: 1, schema: typed("t2"), segments: Vec::new(), profiles: Vec::new() }], next_table_id: 2, ..old }.encode()).unwrap();
+        v["features"]["required"] = serde_json::json!(["bool", "field_ids", "timestamp"]);
+        corrupt(serde_json::to_string(&v).unwrap(), "has no field ids, and the manifest requires them");
     }
 }
