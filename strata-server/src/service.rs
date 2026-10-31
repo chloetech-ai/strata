@@ -467,7 +467,12 @@ impl Service {
     /// Applies a batch its primary shipped (`Replicate`), on a replica.
     pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
         match &self.replication() {
-            Replication::Replica(f) => f.replicate(r).await,
+            Replication::Replica(f) => {
+                let before = self.catalog();
+                let r = f.replicate(r).await;
+                self.tables_shipped(&before);
+                r
+            }
             Replication::Primary(p) => p.shipped_to(&r.primary, r.term),
             Replication::None => Err(conflict("this server is not a replica (--replica): it takes no shipped transactions".into())),
         }
@@ -476,9 +481,22 @@ impl Service {
     /// Installs a copy of its primary (`Restore`), on a replica.
     pub async fn restore(&self, chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
         match &self.replication() {
-            Replication::Replica(f) => f.restore(chunks).await,
+            Replication::Replica(f) => {
+                let before = self.catalog();
+                let r = f.restore(chunks).await;
+                self.tables_shipped(&before);
+                r
+            }
             Replication::Primary(p) => p.copied_to(chunks).await,
             Replication::None => Err(conflict("this server is not a replica (--replica): it takes no copy of a primary".into())),
+        }
+    }
+
+    /// Lists the models again when what a primary shipped, or its copy,
+    /// changed the tables, which were `before`.
+    fn tables_shipped(&self, before: &[Arc<Schema>]) {
+        if self.catalog() != before {
+            self.refresh_models();
         }
     }
 
@@ -2181,7 +2199,7 @@ impl Service {
                 return Ok(SqlAnswer::Rows(a));
             }
             Command::Explain { .. } => return Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain")),
-            Command::CreateTable { .. } | Command::DropTable { .. } => Some(Ddl::Table),
+            Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => true,
             Command::AlterTable { alters, .. } => {
                 // A coordinator's plans name a table's columns by their
                 // place, and its shards drop a column one by one: a query
@@ -2189,18 +2207,22 @@ impl Service {
                 if matches!(self.backend, Backend::Cluster(_)) && alters.iter().any(|a| matches!(a, Alter::DropField(_))) {
                     return Err(ApiError::bad("ALTER TABLE ... DROP COLUMN does not run through a coordinator yet (its plans name columns by place); ADD COLUMN and RENAME COLUMN do"));
                 }
-                Some(Ddl::Table)
+                // A primary ships CREATE TABLE and DROP TABLE, but no
+                // replica applies a shipped ALTER TABLE yet.
+                if let (Backend::Local(_), Replication::Primary(_)) = (&self.backend, self.replication()) {
+                    return Err(conflict("ALTER TABLE does not reach replicas yet: change a table's columns before its copies replicate".into()));
+                }
+                true
             }
-            Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Some(Ddl::RankProfile),
-            Command::Write { .. } => None,
+            Command::Write { .. } => false,
         };
         if after != After::Any {
             return Err(ApiError::bad(FOR_READS));
         }
         let t0 = Instant::now();
         let r = match (&self.backend, ddl) {
-            (_, Some(ddl)) => self.ddl(sql, params, ddl, timeout_ms).await,
-            (Backend::Local(db), None) => {
+            (_, true) => self.ddl(sql, params, timeout_ms).await,
+            (Backend::Local(db), false) => {
                 let (text, p) = (sql.to_string(), params.clone());
                 let only = slots.map(|s| moving::mask_outside(&s));
                 let refused = Arc::new(Mutex::new(None));
@@ -2220,7 +2242,7 @@ impl Service {
                     _ => r,
                 }
             }
-            (Backend::Cluster(c), None) => c.sql(sql, params).await,
+            (Backend::Cluster(c), false) => c.sql(sql, params).await,
         };
         let w = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
@@ -2229,25 +2251,21 @@ impl Service {
     /// `CREATE TABLE`, `ALTER TABLE` or `DROP TABLE`, `CREATE RANK PROFILE`
     /// or `DROP RANK PROFILE`: on a local database, once no write holds the writer;
     /// through a coordinator, on every shard ([`Coordinator::ddl`]). A
-    /// replica refuses it, as it refuses every write. A primary refuses a
-    /// table's: the tables a primary has are not shipped to its replicas
-    /// yet, so each copy takes them before replication starts. A rank
-    /// profile is logged as a write is, so a primary ships it, and answers
-    /// once the copies its acks name hold it.
-    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, ddl: Ddl, timeout_ms: u64) -> Result<Written, ApiError> {
+    /// replica refuses it, as it refuses every write. Each is a numbered
+    /// transaction in a database that numbers its writes, so a primary
+    /// ships it as it ships a write, and answers once the copies its acks
+    /// name hold it.
+    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<Written, ApiError> {
         let r = match &self.backend {
             Backend::Local(db) => {
                 self.takes_writes()?;
-                if let (Replication::Primary(_), Ddl::Table) = (self.replication(), ddl) {
-                    return Err(conflict("CREATE TABLE, ALTER TABLE and DROP TABLE do not reach replicas yet: give each copy its tables before it replicates".into()));
-                }
                 let timeout = self.timeout_of(timeout_ms);
                 let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
                 let w = tokio::task::spawn_blocking(move || {
                     wait_for_writer(Instant::now() + timeout, || {
                         db.sql(&sql, &params)?;
                         // Its number, or a later one.
-                        Ok(Written { seq_no: db.storage().seq_no().map(|n| n.seq).filter(|_| ddl == Ddl::RankProfile), ..Default::default() })
+                        Ok(Written { seq_no: db.storage().seq_no().map(|n| n.seq), ..Default::default() })
                     })
                 })
                 .await
@@ -2600,16 +2618,13 @@ impl Service {
     }
 
     /// Creates a table, as `CREATE TABLE` does ([`Self::ddl`]): on a local
-    /// database, once no write holds the writer. A coordinator creates
-    /// tables only through `CREATE TABLE`.
+    /// database, once no write holds the writer; a primary ships it with
+    /// the rows. A coordinator creates tables only through `CREATE TABLE`.
     async fn create_table(self: &Arc<Self>, schema: Schema, timeout_ms: u64) -> Result<(), ApiError> {
         let Backend::Local(db) = &self.backend else {
             return Err(ApiError::bad(format!("a coordinator imports into the tables its shards have: create table {} first (CREATE TABLE through the coordinator), or import on each shard", schema.table)));
         };
         self.takes_writes()?;
-        if let Replication::Primary(_) = self.replication() {
-            return Err(conflict(format!("the import would create table {}, and CREATE TABLE does not reach replicas yet: give each copy its tables before it replicates", schema.table)));
-        }
         let deadline = Instant::now() + self.timeout_of(timeout_ms);
         let db = db.clone();
         tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.create_table(schema.clone())?))).await.map_err(ApiError::internal)??;
@@ -2920,13 +2935,6 @@ impl Service {
 pub enum SqlAnswer {
     Rows(Answer),
     Written { w: Written, took_ms: f64 },
-}
-
-/// What a statement that changes the catalog changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ddl {
-    Table,
-    RankProfile,
 }
 
 /// What a write did: the rows it wrote and, in a database that numbers
