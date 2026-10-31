@@ -32,6 +32,8 @@ pub mod audio;
 #[cfg(feature = "baselines")]
 pub mod baselines;
 pub mod beir;
+#[cfg(feature = "audio")]
+pub mod clap;
 pub mod cluster;
 pub mod data;
 pub mod db;

@@ -597,15 +597,15 @@ impl Schema {
                 if e.from.len() > 1 {
                     return bad(format!("an embedded field embeds one MEDIA field ({}), or text fields, not both", m.name));
                 }
-                if m.media != Some(MediaKind::Image) {
-                    return bad(format!("source {}: the MEDIA field an embedded field embeds is of kind image", m.name));
+                if !matches!(m.media, Some(MediaKind::Image | MediaKind::Audio)) {
+                    return bad(format!("source {}: the MEDIA field an embedded field embeds is of kind image or audio", m.name));
                 }
                 continue;
             }
             for src in &e.from {
                 let ok = s.field(src).is_some_and(|g| (g.stored || !g.generated_from.is_empty()) && matches!(g.ty, FieldType::Text { .. } | FieldType::Keyword) && !g.multi);
                 if !ok {
-                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field, or a MEDIA field of images"));
+                    return bad(format!("source {src} must be a stored or generated TEXT or KEYWORD field, or a MEDIA field of images or sound"));
                 }
             }
         }
@@ -971,7 +971,7 @@ impl Schema {
     }
 
     /// The MEDIA field that field `f` is the embedding of, if it embeds
-    /// one (images) rather than text.
+    /// one (images or sound) rather than text.
     pub fn embeds_media(&self, f: usize) -> Option<usize> {
         let e = self.fields[f].embed.as_ref()?;
         let i = self.field_index(e.from.first()?)?;

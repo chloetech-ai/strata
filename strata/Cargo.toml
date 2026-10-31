@@ -76,6 +76,11 @@ name = "strata-asr-eval"
 path = "src/bin/strata-asr-eval.rs"
 required-features = ["audio"]
 
+[[bin]]
+name = "strata-clap-eval"
+path = "src/bin/strata-clap-eval.rs"
+required-features = ["audio"]
+
 [dev-dependencies]
 tempfile = "3"
 # PNGs written by the tests of `vision`.

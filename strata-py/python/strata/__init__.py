@@ -279,11 +279,11 @@ class Database(Search):
         notes}]}."""
         return json.loads(self._db.export_sqlite(os.fspath(path), _names(tables), fts, indexes, schemas))
 
-    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None) -> list[float]:
+    def embed(self, text: str | None = None, field: str | None = None, *, table: str | None = None, image: bytes | None = None, audio: bytes | None = None) -> list[float]:
         """The query vector of `text` by an embedded field's model (of the
-        first table, or of `table`), or of `image`, the bytes of an image
-        file, by a model of images."""
-        return self._db.embed(text, field, table, None if image is None else bytes(image))
+        first table, or of `table`), or of `image` or `audio`, the bytes of
+        an image or sound file, by a model of that."""
+        return self._db.embed(text, field, table, None if image is None else bytes(image), None if audio is None else bytes(audio))
 
     def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
         """The codes that can follow each prefix of semantic-ID field
