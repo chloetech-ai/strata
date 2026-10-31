@@ -45,7 +45,7 @@ pub trait Embedder: Send + Sync {
     fn embed_inputs(&self, inputs: &[Input<'_>]) -> Result<Vec<Vec<f32>>> {
         let texts: Vec<&str> = inputs.iter().filter_map(|i| if let Input::Text(t) = i { Some(*t) } else { None }).collect();
         match inputs.iter().find(|i| !matches!(i, Input::Text(_))) {
-            Some(i) => Err(model_err(format!("model {} does not embed {}s", self.name(), i.modality().as_str()))),
+            Some(i) => Err(model_err(format!("model {} does not embed {}", self.name(), modality_name(i.modality())))),
             None => Ok(self.embed(&texts)),
         }
     }
@@ -104,12 +104,62 @@ impl Input<'_> {
     }
 }
 
-/// The vector of an image file (JPEG, PNG, WebP, GIF, BMP) by `e`, a
-/// model of images: a query by image, as `{"embed": {"image": ...}}`
-/// gives it.
-pub fn embed_image_file(e: &dyn Embedder, data: &[u8]) -> Result<Vec<f32>> {
-    let image = crate::media::decode_image(data)?;
-    Ok(e.embed_inputs(&[Input::Image(&image)])?.pop().unwrap_or_default())
+/// What a media file is to a model: sound if its bytes are of an audio
+/// file, else an image.
+pub fn file_modality(data: &[u8]) -> Modality {
+    match crate::media::describe(data).mime.is_some_and(|m| m.starts_with("audio/")) {
+        true => Modality::Audio,
+        false => Modality::Image,
+    }
+}
+
+/// The vector of an image file (JPEG, PNG, WebP, GIF, BMP) or a sound
+/// file (WAV, FLAC, MP3, Ogg Vorbis, AAC) by `e`, a model of images or of
+/// sound ([`file_modality`]): a query by a file, as `{"embed": {"image":
+/// ...}}` or `{"embed": {"audio": ...}}` gives it.
+pub fn embed_file(e: &dyn Embedder, data: &[u8]) -> Result<Vec<f32>> {
+    let m = file_modality(data);
+    if !e.modalities().contains(&m) {
+        return Err(model_err(format!("model {} does not embed {}", e.name(), modality_name(m))));
+    }
+    let v = match m {
+        Modality::Audio => e.embed_inputs(&[Input::Audio(&crate::media::decode_audio(data)?)])?,
+        _ => e.embed_inputs(&[Input::Image(&crate::media::decode_image(data)?)])?,
+    };
+    Ok(v.into_iter().next().unwrap_or_default())
+}
+
+/// A query's file, the `embed` of a parameter `{"embed": {"image":
+/// "<base64>"}}` or `{"embed": {"audio": "<base64>"}}`: its modality and
+/// bytes, which have to be of that kind ([`file_is`]).
+pub fn query_file(kind: &str, base64: &str) -> Result<(Modality, Vec<u8>)> {
+    let want = match kind {
+        "image" => Modality::Image,
+        "audio" => Modality::Audio,
+        k => return Err(Error::Query(format!("\"embed\" is a text, {{\"image\": \"<base64>\"}} or {{\"audio\": \"<base64>\"}}, not {{{k:?}: ...}}"))),
+    };
+    let data = crate::media::base64_bytes(base64).map_err(|m| Error::Query(format!("{{\"embed\": {{\"{kind}\": ...}}}} is a file in base64: {m}")))?;
+    file_is(want, &data)?;
+    Ok((want, data))
+}
+
+/// Refuses a query's file given as an image that is a sound file, or given
+/// as a sound that is not one.
+pub fn file_is(want: Modality, data: &[u8]) -> Result<()> {
+    match (want, file_modality(data)) {
+        (Modality::Audio, Modality::Audio) | (Modality::Image, Modality::Image) => Ok(()),
+        (Modality::Audio, _) => Err(Error::Query("the file given as audio is not a sound file (WAV, FLAC, MP3, Ogg Vorbis, AAC)".into())),
+        _ => Err(Error::Query("the file given as an image is a sound file".into())),
+    }
+}
+
+/// What a model takes, as a query's file names it: "images", "sound".
+pub fn modality_name(m: Modality) -> &'static str {
+    match m {
+        Modality::Text => "text",
+        Modality::Image => "images",
+        Modality::Audio => "sound",
+    }
 }
 
 fn normalize(v: &mut [f32]) {
@@ -141,6 +191,7 @@ pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[
     ("bge-small-en-v1.5", "BAAI/bge-small-en-v1.5", "BERT, 384 dimensions (feature bert)"),
     ("snowflake-arctic-embed-m-v1.5", "Snowflake/snowflake-arctic-embed-m-v1.5", "BERT, 768 dimensions (feature bert)"),
     ("siglip-base-patch16-224", "google/siglip-base-patch16-224", "SigLIP, images and text, 768 dimensions (feature vision)"),
+    ("clap-htsat-unfused", "laion/clap-htsat-unfused", "CLAP, sound and text, 512 dimensions (feature audio)"),
 ];
 
 /// The dimensions of a model [`open`] knows by name (`hash:N` included),
@@ -149,23 +200,29 @@ pub fn known_dim(model: &str) -> Option<usize> {
     if let Some(n) = model.strip_prefix("hash:") {
         return n.parse().ok();
     }
-    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("siglip-base-patch16-224", 768), ("cohere/embed-english-v3.0", 1024)];
+    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("siglip-base-patch16-224", 768), ("clap-htsat-unfused", 512), ("cohere/embed-english-v3.0", 1024)];
     dims.iter().find(|(m, _)| m.eq_ignore_ascii_case(model)).map(|&(_, d)| d)
 }
 
-/// The files a model directory needs.
-pub const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+/// The files the model directory of `name` needs: CLAP's repository
+/// ships its weights as a PyTorch file only.
+pub fn model_files(name: &str) -> &'static [&'static str] {
+    match name.starts_with("clap") {
+        true => &["config.json", "tokenizer.json", "pytorch_model.bin"],
+        false => &["config.json", "tokenizer.json", "model.safetensors"],
+    }
+}
 
 /// Opens the model a schema names: `hash:<dim>`, or a directory under
-/// `models` (or an absolute path) holding a Model2Vec, BERT or SigLIP
-/// model ([`MODEL_FILES`]).
+/// `models` (or an absolute path) holding a Model2Vec, BERT, SigLIP or
+/// CLAP model ([`model_files`]).
 pub fn open(model: &str, models: &Path) -> Result<Arc<dyn Embedder>> {
     if let Some(dim) = model.strip_prefix("hash:") {
         let dim = dim.parse().map_err(|_| model_err(format!("model {model}: hash:<dimensions>")))?;
         return Ok(Arc::new(HashEmbedder { dim }));
     }
     let dir = if Path::new(model).is_absolute() { PathBuf::from(model) } else { models.join(model) };
-    if !dir.join("model.safetensors").exists() {
+    if !dir.join("model.safetensors").exists() && !dir.join("pytorch_model.bin").exists() {
         return Err(model_err(format!("model {model}: no {} (fetch it first)", dir.join("model.safetensors").display())));
     }
     let config: serde_json::Value = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
@@ -180,6 +237,12 @@ pub fn open(model: &str, models: &Path) -> Result<Arc<dyn Embedder>> {
         return Ok(Arc::new(SiglipEmbedder::open(&dir)?));
         #[cfg(not(feature = "vision"))]
         return Err(model_err(format!("model {model} is a SigLIP model: build with the `vision` feature")));
+    }
+    if config["model_type"] == "clap" {
+        #[cfg(feature = "audio")]
+        return Ok(Arc::new(crate::clap::ClapEmbedder::open(&dir)?));
+        #[cfg(not(feature = "audio"))]
+        return Err(model_err(format!("model {model} is a CLAP model: build with the `audio` feature")));
     }
     #[cfg(feature = "embed")]
     return Ok(Arc::new(StaticEmbedder::open(&dir)?));
@@ -359,7 +422,7 @@ impl Embedder for HashEmbedder {
             .map(|i| match i {
                 Input::Text(t) => Ok(self.embed(&[t]).pop().unwrap()),
                 Input::Image(image) => Ok(self.of_words(Self::colour_words(image).iter().map(String::as_str))),
-                Input::Audio(_) => Err(model_err(format!("model {} does not embed audio", self.name()))),
+                Input::Audio(_) => Err(model_err(format!("model {} does not embed sound", self.name()))),
             })
             .collect()
     }
@@ -552,7 +615,7 @@ impl Embedder for SiglipEmbedder {
     }
     fn embed_inputs(&self, inputs: &[Input<'_>]) -> Result<Vec<Vec<f32>>> {
         if inputs.iter().any(|i| matches!(i, Input::Audio(_))) {
-            return Err(model_err(format!("model {} does not embed audio", self.name)));
+            return Err(model_err(format!("model {} does not embed sound", self.name)));
         }
         let texts: Vec<&str> = inputs.iter().filter_map(|i| if let Input::Text(t) = i { Some(*t) } else { None }).collect();
         let images: Vec<&Image> = inputs.iter().filter_map(|i| if let Input::Image(m) = i { Some(*m) } else { None }).collect();

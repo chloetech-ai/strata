@@ -1,0 +1,42 @@
+{
+  "library": "transformers 4.46.3, PyTorch 2.5.1",
+  "machine": "cloud container, 4 vCPU Xeon 2.10 GHz, 15 GB",
+  "split": "clotho_captions_evaluation.csv",
+  "resampling": "scipy.signal.resample_poly 44.1 to 48 kHz",
+  "windows": {
+    "mode": "windows",
+    "recordings": 1045,
+    "captions": 5225,
+    "audio_seconds_to_embed": 385.4672939777374,
+    "text_to_audio": {
+      "R@1": 0.15866028708133972,
+      "R@5": 0.40038277511961723,
+      "R@10": 0.535311004784689,
+      "mAP@10": 0.2645369484316853
+    },
+    "audio_to_text": {
+      "R@1": 0.23253588516746412,
+      "R@5": 0.48325358851674644,
+      "R@10": 0.6191387559808612,
+      "mAP@10": 0.33746715273031064
+    }
+  },
+  "crop": {
+    "mode": "crop",
+    "recordings": 1045,
+    "captions": 5225,
+    "audio_seconds_to_embed": 250.35176849365234,
+    "text_to_audio": {
+      "R@1": 0.15770334928229665,
+      "R@5": 0.37779904306220097,
+      "R@10": 0.5121531100478469,
+      "mAP@10": 0.2529768360294676
+    },
+    "audio_to_text": {
+      "R@1": 0.21722488038277513,
+      "R@5": 0.46411483253588515,
+      "R@10": 0.5980861244019139,
+      "mAP@10": 0.3199802536644642
+    }
+  }
+}

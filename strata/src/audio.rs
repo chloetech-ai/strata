@@ -214,6 +214,26 @@ pub fn power_spectrogram(x: &[f32], n_fft: usize, hop: usize, dev: &Device) -> c
     re.sqr()? + im.sqr()?
 }
 
+/// GELU (the exact one, of `erf`) of `x`, its rows split among the
+/// cores: candle computes it on one.
+pub fn gelu(x: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let width = *dims.last().expect("a tensor of rows");
+    let rows = x.elem_count() / width.max(1);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(rows).max(1);
+    if threads == 1 {
+        return x.gelu_erf();
+    }
+    let flat = x.reshape((rows, width))?;
+    let per = rows.div_ceil(threads);
+    let parts = std::thread::scope(|s| {
+        let flat = &flat;
+        let jobs: Vec<_> = (0..rows).step_by(per).map(|at| s.spawn(move || flat.narrow(0, at, per.min(rows - at))?.gelu_erf())).collect();
+        jobs.into_iter().map(|j| j.join().expect("a GELU thread")).collect::<candle_core::Result<Vec<_>>>()
+    })?;
+    Tensor::cat(&parts, 0)?.reshape(dims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

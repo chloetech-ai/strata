@@ -15,7 +15,7 @@ use std::sync::Arc;
 use base64::Engine;
 use serde_json::json;
 use strata::db::{Db, SqlResult};
-use strata::embed::{embed_image_file, Embedder, HashEmbedder};
+use strata::embed::{embed_file, Embedder, HashEmbedder};
 use strata::media::{Allowlist, Media, MediaKind, Resolver};
 use strata::query::Params;
 use strata::schema::{Field, FieldType, Schema};
@@ -65,7 +65,7 @@ fn vectors(db: &Db) -> Vec<(String, Vec<f32>)> {
 
 /// The ids of the rows nearest to an image file, nearest first.
 fn nearest(db: &Db, file: &[u8]) -> Vec<String> {
-    let q = embed_image_file(db.embedder("emb").unwrap().as_ref(), file).unwrap();
+    let q = embed_file(db.embedder("emb").unwrap().as_ref(), file).unwrap();
     let r = db.query("SELECT id FROM photos ORDER BY similarity(emb, :q) DESC LIMIT 3", &Params::new().set("q", Value::Vector(q.into()))).unwrap();
     r.rows.into_iter().map(|r| r[0].as_str().unwrap().to_string()).collect()
 }
@@ -136,7 +136,7 @@ fn images_that_cannot_be_read_or_decoded_are_refused() {
     let mut docs = vec![doc("x", json!({"uri": "bad.png", "data": b64(&bad)}))];
     let e = db.fill_in("photos", &mut docs).unwrap_err().to_string();
     assert!(e.contains("bad.png") && e.contains("could not be decoded"), "{e}");
-    assert!(embed_image_file(&HashEmbedder { dim: 16 }, b"not an image").is_err());
+    assert!(embed_file(&HashEmbedder { dim: 16 }, b"not an image").is_err());
     assert_eq!(sql(&db, "SELECT COUNT(*) FROM photos")[0][0], Value::Int(0));
 }
 
