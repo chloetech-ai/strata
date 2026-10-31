@@ -65,6 +65,10 @@ pub struct Options {
     /// the primary's, in seconds (0: only when asked, `POST
     /// /v1/admin/verify`).
     pub verify_every_s: u64,
+    /// On a primary or a replica: how long a replica hears nothing from
+    /// its primary before it asks its shard's copies to elect it, in
+    /// milliseconds (0: never; [`Service::start_failover`]).
+    pub failover_after_ms: u64,
     /// Coordinate these shard servers (gRPC URLs; replicas of a shard
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
@@ -339,12 +343,14 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     }
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
     if let (Backend::Local(_), Some(file)) = (&svc.backend, &replication_file) {
-        svc.promote_options = Some(PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() });
+        svc.promote_options = Some(PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), acks: o.write_acks, ..Default::default() });
+        svc.failover_after = Duration::from_millis(o.failover_after_ms);
         svc.keep_replication_in(file.clone());
     }
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
         // How it ships as a primary, but for its replicas and acks.
         let ships = PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() };
+        let ships = crate::service::failover_tuned(ships, Duration::from_millis(o.failover_after_ms));
         let kept = match replicating {
             true => (None, false),
             false => replication::kept_role(db.storage().path())?,
@@ -352,7 +358,14 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         if kept.0.is_some() && db.storage().seq_no().is_none() {
             return Err(format!("{} keeps a part in replication, but does not number its writes", db.storage().path().display()));
         }
-        if let (Some(replication::KeptRole::Primary { replicas, acks }), false) = &kept {
+        // With automatic failover, a primary that starts again is a replica
+        // until its shard's copies elect one: another may have been
+        // elected while it was down.
+        let elects = o.failover_after_ms > 0 && svc.slots().is_some_and(|(m, s)| m.replicas().get(s).is_some_and(|c| c.len() > 1));
+        if let (Some(replication::KeptRole::Primary { .. }), false, true) = (&kept.0, kept.1, elects) {
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            tracing::info!("was its shard's primary: starts as a replica, until its shard's copies elect one (--failover-after-ms)");
+        } else if let (Some(replication::KeptRole::Primary { replicas, acks }), false) = &kept {
             let opts = PrimaryOptions { replicas: replicas.clone(), acks: *acks, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %replicas.join(", "), write_acks = acks.name(), "primary, as kept beside the database: ships its writes to its replicas");
@@ -380,6 +393,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     spawn_sampler(&svc);
+    svc.start_failover();
     Ok(svc)
 }
 

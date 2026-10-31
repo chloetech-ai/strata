@@ -110,6 +110,13 @@ struct Args {
     /// copy of the primary (0: only when asked, POST /v1/admin/verify).
     #[arg(long, default_value_t = 600)]
     verify_every_s: u64,
+    /// With --replicas or --replica, in a cluster (servers holding a
+    /// cluster map): a replica that hears nothing from its primary for this
+    /// many milliseconds asks its shard's copies to elect it primary, and a
+    /// primary that does not hear from a majority of its copies for most of
+    /// it serves no reads (0: no automatic failover; promote by hand).
+    #[arg(long, default_value_t = 0)]
+    failover_after_ms: u64,
     /// Coordinate these shard servers (comma-separated gRPC URLs; replicas
     /// of one shard joined by '|'). Servers of protocol 9 hold the cluster
     /// map, which names every shard's servers: the coordinator then routes
@@ -316,25 +323,28 @@ enum Command {
         models: Option<PathBuf>,
     },
     /// Make a running replica the primary of a new term (POST
-    /// /v1/admin/promote): it ships to --replicas from then on. It refuses
-    /// while one of them holds transactions it does not, unless --force.
+    /// /v1/admin/promote), once a majority of its shard's copies vote for
+    /// it: a primary that serves steps down. It refuses while a copy holds
+    /// transactions it does not, or when it is not elected, unless --force.
     Promote {
         /// The replica's HTTP URL, as http://host:7700.
         url: String,
-        /// The copies it is to ship to (comma-separated gRPC URLs): the
-        /// shard's other replicas, and the old primary, which is sent a
-        /// copy once it starts again with --replica. None: the copies the
-        /// replica was started with (its --replicas). Promotion calls each
-        /// with the cluster's token, so with an API key only those may be
-        /// named; with the token, any.
+        /// The copies it is to ship to (comma-separated gRPC URLs), which
+        /// vote: the shard's other replicas, and the old primary, which is
+        /// sent a copy once it starts again with --replica. None: the
+        /// servers its cluster map names for its shard, or without a map
+        /// the copies it was started with (its --replicas). Promotion calls
+        /// each with the cluster's token, so with an API key only those may
+        /// be named; with the token, any.
         #[arg(long, value_delimiter = ',')]
         replicas: Vec<String>,
         /// The copies that hold a write before it is answered, as
         /// --write-acks: all, majority or primary.
         #[arg(long, default_value = "all")]
         write_acks: String,
-        /// Promote it though a copy holds transactions it does not, which
-        /// a copy of the new primary then drops.
+        /// Promote it with no votes, though a copy holds transactions it
+        /// does not, which a copy of the new primary then drops: only when
+        /// a majority of the shard's copies is lost for good.
         #[arg(long)]
         force: bool,
         /// The replica's --token.
@@ -495,6 +505,7 @@ async fn main() {
         write_acks,
         ship_log_mb: a.ship_log_mb,
         verify_every_s: a.verify_every_s,
+        failover_after_ms: a.failover_after_ms,
         shards: a.shards,
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),

@@ -208,7 +208,7 @@ pub fn code_name(c: tonic::Code) -> &'static str {
 /// Every method is named, so that a new one must say what it needs.
 fn method_scope(method: &str) -> Option<Scope> {
     match method {
-        "Replicate" | "Restore" | "Verify" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" => None,
+        "Replicate" | "Restore" | "Verify" | "Vote" | "Slots" | "Configure" | "ExportSlots" | "FreezeSlots" | "CleanupSlots" | "Write (moved)" => None,
         "Write" | "WriteStream" => Some(Scope::Write),
         "Logs" => Some(Scope::Admin),
         "Query" | "TermStats" | "GuardCounts" | "SidNext" | "Sources" | "Schema" | "Hello" | "Release" | "Health" => Some(Scope::Read),
@@ -496,6 +496,10 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("Verify", req, |svc, _who, r| async move { svc.verify_for(r).await }).await
     }
 
+    async fn vote(&self, req: Request<pb::VoteRequest>) -> Result<Response<pb::VoteResponse>, Status> {
+        self.serve("Vote", req, |svc, _who, r| async move { svc.vote(r).await }).await
+    }
+
     async fn slots(&self, req: Request<pb::SlotsRequest>) -> Result<Response<pb::SlotsResponse>, Status> {
         self.serve("Slots", req, |svc, _who, r| async move {
             if !r.map_json.is_empty() {
@@ -512,11 +516,16 @@ impl pb::strata_server::Strata for Grpc {
     }
 
     async fn configure(&self, req: Request<pb::ConfigureRequest>) -> Result<Response<pb::ConfigureResponse>, Status> {
-        self.serve("Configure", req, |svc, _who, r| async move {
+        self.serve("Configure", req, |svc, who, r| async move {
             let acks = match r.write_acks.as_str() {
                 "" => None,
                 a => Some(crate::replication::Acks::parse(a).ok_or_else(|| ApiError::bad(format!("write_acks is all, majority or primary, not {a:?}")))?),
             };
+            if r.promote && r.role() == pb::Role::Primary {
+                let acks = acks.unwrap_or_default();
+                svc.promote(&who, r.replicas, acks, r.force).await?;
+                return Ok(svc.configured());
+            }
             svc.configure(r.role(), r.replicas, acks, r.force).await
         })
         .await
