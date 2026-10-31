@@ -1940,8 +1940,11 @@ fn set_rows(
     }
     derive_known(derivers, schema, &mut p.rewrites, derived, files)?;
     embed_known(models, schema, &mut p.rewrites, known, files)?;
+    // The rest of each row was read back: its multi-vector values were
+    // pooled when they were written.
+    let assigned: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
     for doc in p.rewrites {
-        tt.upsert(doc)?;
+        tt.rewrite(doc, &assigned)?;
     }
     Ok(p.rows)
 }

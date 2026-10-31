@@ -120,6 +120,7 @@ A database starts with one table, whose schema is set when the database is creat
 | `multi` | `keyword`, `int`, `vector` | false | a list of values per row (stored, not the key); a list of vectors, ranked by [`maxsim`](query-language.md#maxsimfield-vectors-several-query-vectors) |
 | `keep_f32` | multi `vector` | false | keep the float32 vectors to score with instead of 8-bit codes |
 | `pool` | multi `vector` | | merge a row's vectors at least this similar (cosine, such as `0.9`) into their mean at write |
+| `pool_factor` | multi `vector` | | cluster a row's vectors into one group for every this many (such as `2`, half as many) by Ward's linkage, and keep each group's mean at write; not with `pool` |
 | `positions` | `text` | true | keep word positions, for phrase searches |
 | `analyzer` | `text` | `"english"` | how text becomes words to search: `"english"` drops stopwords and stems (`running` finds `run`), `"simple"` keeps every word as written; another than `"english"` makes the database format 3 |
 | `from` | `text` | | generated: the named fields' text joined, such as a `body` of title and description to search at once |

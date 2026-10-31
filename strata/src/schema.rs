@@ -178,6 +178,12 @@ pub struct Field {
     /// ([`crate::vector::multi::pool`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<f32>,
+    /// A multi-vector field clusters a row's vectors into one group for
+    /// about every this many (Ward's linkage) and keeps each group's mean
+    /// when the row is written: hierarchical token pooling with a pool
+    /// factor ([`crate::vector::multi::ward`]). Exclusive with `pool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_factor: Option<f32>,
     /// A VECTOR field's compressed codes (default SQ8).
     #[serde(default, skip_serializing_if = "VectorCodes::is_sq8")]
     pub codes: VectorCodes,
@@ -336,6 +342,7 @@ impl Field {
             multi: false,
             keep_f32: false,
             pool: None,
+            pool_factor: None,
             codes: VectorCodes::Sq8,
             embed: None,
             references: None,
@@ -497,6 +504,12 @@ impl Field {
     /// ([`Field::pool`]).
     pub fn pooled(mut self, min_cosine: f32) -> Self {
         self.pool = Some(min_cosine);
+        self
+    }
+    /// Pools a multi-vector field's vectors at write into about one for
+    /// every `factor` ([`Field::pool_factor`]).
+    pub fn pooled_by(mut self, factor: f32) -> Self {
+        self.pool_factor = Some(factor);
         self
     }
     /// Whether this is a multi-vector field (`VECTOR(d)[]`).
@@ -842,10 +855,16 @@ impl Schema {
                 if f.pool.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
                     return Err(Error::Schema(format!("field {}: pool is a cosine similarity above 0 and at most 1", f.name)));
                 }
+                if f.pool_factor.is_some_and(|p| !(p > 1.0 && p <= crate::vector::multi::MAX_POOL_FACTOR)) {
+                    return Err(Error::Schema(format!("field {}: pool_factor is above 1 and at most {}, such as 2 (half the vectors)", f.name, crate::vector::multi::MAX_POOL_FACTOR)));
+                }
+                if f.pool.is_some() && f.pool_factor.is_some() {
+                    return Err(Error::Schema(format!("field {}: pool (a cosine similarity) or pool_factor, not both", f.name)));
+                }
                 continue;
             }
-            if f.keep_f32 || f.pool.is_some() {
-                return Err(Error::Schema(format!("field {}: keep_f32 and pool are options of a multi-vector field (VECTOR(d)[])", f.name)));
+            if f.keep_f32 || f.pool.is_some() || f.pool_factor.is_some() {
+                return Err(Error::Schema(format!("field {}: keep_f32, pool and pool_factor are options of a multi-vector field (VECTOR(d)[])", f.name)));
             }
             if f.multi && (!matches!(f.ty, FieldType::Keyword | FieldType::Int) || !f.stored || s.primary_key == Some(i)) {
                 return Err(Error::Schema(format!("multi-valued field {} must be a stored KEYWORD or INT, or a VECTOR, and not the primary key", f.name)));
@@ -1569,6 +1588,9 @@ impl Schema {
                         if let Some(p) = f.pool {
                             m.insert("pool".into(), json!(p));
                         }
+                        if let Some(p) = f.pool_factor {
+                            m.insert("pool_factor".into(), json!(p));
+                        }
                         if let Some(e) = &f.embed {
                             m.insert("embed".into(), json!({"from": e.from, "model": e.model}));
                         }
@@ -1655,7 +1677,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "keep_f32", "pool", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "keep_f32", "pool", "pool_factor", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -1742,6 +1764,10 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     f.pool = match j.get("pool") {
         None | Some(J::Null) => None,
         Some(p) => Some(p.as_f64().ok_or_else(|| bad("pool is a cosine similarity, such as 0.9"))? as f32),
+    };
+    f.pool_factor = match j.get("pool_factor") {
+        None | Some(J::Null) => None,
+        Some(p) => Some(p.as_f64().ok_or_else(|| bad("pool_factor is a number above 1, such as 2"))? as f32),
     };
     if let Some(c) = j.get("codes").filter(|c| !c.is_null()) {
         f.codes = c.as_str().and_then(VectorCodes::parse).ok_or_else(|| bad("codes is \"sq8\" or \"binary\""))?;

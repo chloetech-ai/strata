@@ -23,7 +23,7 @@
 //! `EDGES` and `MEDIA` (a file's reference, [`crate::media`]; `OPTIONS(kind
 //! = 'image')`, `'audio'`, `'video'` or `'pdf'` says what file); `KEYWORD[]`
 //! and `INT[]` hold lists, and `VECTOR(dimensions)[]` several vectors per
-//! row (options `keep_f32` and `pool` besides a vector's,
+//! row (options `keep_f32`, `pool` and `pool_factor` besides a vector's,
 //! [`crate::vector::multi`]). A table with a BOOL, TIMESTAMP or MEDIA column
 //! makes the database format 3 ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
@@ -366,7 +366,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer", "derive", "model"],
-        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool"],
+        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
         "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
@@ -376,7 +376,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
         return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
     }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "dim", "embed", "model", "kind", "semantic_id", "codebook", "derive"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor", "dim", "embed", "model", "kind", "semantic_id", "codebook", "derive"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -449,6 +449,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
         match k.as_str() {
             "positions" | "stored" | "indexed" | "keep_f32" if !v.is_boolean() => return Err(bad(format!("{k} is true or false"))),
             "pool" if !v.is_number() => return Err(bad("pool is a cosine similarity, such as 0.9".into())),
+            "pool_factor" if !v.is_number() => return Err(bad("pool_factor is a number above 1, such as 2".into())),
             "dim" => {
                 positive(&v).map_err(|m| bad(format!("dim {m}")))?;
             }

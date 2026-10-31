@@ -634,3 +634,38 @@ fn a_replica_makes_the_tables_its_primary_makes() {
         assert_eq!(r2.catalog(), primary.catalog());
     }
 }
+
+/// A replica keeps the vectors its primary pooled: rows pooled by a factor
+/// at the primary are not pooled again where they are replayed.
+#[test]
+fn a_replica_keeps_the_vectors_its_primary_pooled() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = || {
+        let patches = Field::new("patches", FieldType::Vector { dim: 2, index: strata::VectorIndexKind::Flat }).multi().keep_f32().pooled_by(2.0);
+        Schema::new("t", vec![Field::new("id", FieldType::Keyword), Field::new("title", FieldType::Keyword), patches], Some("id")).unwrap()
+    };
+    let primary = Db::create(&dir.path().join("p.strata"), schema(), options(Layout::SingleFile)).unwrap();
+    let replica = Db::create(&dir.path().join("r.strata"), schema(), options(Layout::SingleFile)).unwrap();
+    for db in [&primary, &replica] {
+        db.storage().start_seq_no().unwrap();
+    }
+    let v = |x: f32, y: f32| Value::Vector(vec![x, y].into());
+    let eight = Value::List(vec![v(1.0, 0.0), v(1.0, 0.01), v(0.0, 1.0), v(0.01, 1.0), v(-1.0, 0.0), v(-1.0, 0.01), v(0.0, -1.0), v(0.01, -1.0)]);
+    let mut tx = primary.storage().begin().unwrap();
+    tx.insert(vec![Value::Str("a".into()), Value::Str("one".into()), eight]).unwrap();
+    tx.commit_seq().unwrap();
+    primary.sql("UPDATE t SET title = 'two' WHERE id = 'a'", &Params::new()).unwrap();
+    ship(&primary, &replica, usize::MAX);
+    let stored = |db: &Db| match &db.query("SELECT patches FROM t WHERE id = 'a'", &Params::new()).unwrap().rows[0][0] {
+        Value::List(xs) => xs.len(),
+        v => panic!("{v:?}"),
+    };
+    assert_eq!(stored(&primary), 4);
+    assert_eq!(stored(&replica), 4, "the replica holds the primary's pooled vectors");
+    let (p, r) = (documents_of(&primary), documents_of(&replica));
+    assert_eq!(p, r);
+}
+
+fn documents_of(db: &Db) -> Vec<Document> {
+    db.documents(&db.snapshot()).map(|d| d.unwrap()).collect()
+}

@@ -56,7 +56,7 @@ use crate::storage::state::{mem_seq, Check, Key, Loc, SegHandle, State, TableSta
 use crate::storage::updates::{Updates, SEQ};
 use crate::storage::ship::{Applied, LogRead, ShipLog, Shipped};
 use crate::storage::wal::{self, Op, Wal, WalTxn};
-use crate::value::{conform, validate, Document, Value};
+use crate::value::{conform, conform_as, validate, Document, Pooling, Value};
 
 /// Ids of in-memory segments have this bit set.
 const MEM_ID: u64 = 1 << 63;
@@ -3732,6 +3732,13 @@ impl TableTxn<'_, '_> {
         self.txn.upsert_in(&self.t, doc)
     }
 
+    /// [`TableTxn::upsert`] of a row read back with the fields at
+    /// positions `assigned` given new values (an UPDATE that rewrites the
+    /// row): only those are pooled ([`Pooling`]).
+    pub fn rewrite(&mut self, doc: Document, assigned: &[usize]) -> Result<()> {
+        self.txn.upsert_as(&self.t, doc, Pooling::Fields(assigned))
+    }
+
     /// [`WriteTxn::upsert_if_newer`] into this table.
     pub fn upsert_if_newer(&mut self, doc: Document, version: &str) -> Result<bool> {
         self.txn.upsert_if_newer_in(&self.t, doc, version)
@@ -3883,8 +3890,12 @@ impl<'a> WriteTxn<'a> {
         self.add_or_insert_in(&t, doc, field, delta)
     }
 
-    fn insert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
-        conform(&t.schema, &mut doc)?;
+    fn insert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
+        self.insert_as(t, doc, Pooling::All)
+    }
+
+    fn insert_as(&mut self, t: &TableRef, mut doc: Document, pooling: Pooling) -> Result<()> {
+        conform_as(&t.schema, &mut doc, pooling)?;
         self.fill_sids(t, &mut doc, false)?;
         if let Some(pk) = t.schema.primary_key {
             let key = Key::of(&doc[pk]).expect("validated key");
@@ -3902,8 +3913,12 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
-    fn upsert_in(&mut self, t: &TableRef, mut doc: Document) -> Result<()> {
-        conform(&t.schema, &mut doc)?;
+    fn upsert_in(&mut self, t: &TableRef, doc: Document) -> Result<()> {
+        self.upsert_as(t, doc, Pooling::All)
+    }
+
+    fn upsert_as(&mut self, t: &TableRef, mut doc: Document, pooling: Pooling) -> Result<()> {
+        conform_as(&t.schema, &mut doc, pooling)?;
         let pk = t.primary_key()?;
         self.fill_sids(t, &mut doc, true)?;
         self.delete_in(t, &doc[pk].clone())?;
@@ -4069,7 +4084,8 @@ impl<'a> WriteTxn<'a> {
         for (table, op) in ops {
             let t = self.db.table_by_id(table)?;
             match op {
-                Op::Insert(doc) => self.insert_in(&t, Arc::unwrap_or_clone(doc)).map_err(|e| differs(format!("inserts a row it cannot ({e})")))?,
+                // The primary pooled its rows' vectors already.
+                Op::Insert(doc) => self.insert_as(&t, Arc::unwrap_or_clone(doc), Pooling::None).map_err(|e| differs(format!("inserts a row it cannot ({e})")))?,
                 Op::Delete(key) => {
                     if !self.delete_in(&t, &key)? {
                         return Err(differs(format!("deletes {key:?}, which no row here has")));

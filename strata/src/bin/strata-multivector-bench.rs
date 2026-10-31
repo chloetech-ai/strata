@@ -10,7 +10,8 @@
 //! `meta.json` (`{"dataset", "model", "dim"}`).
 //!
 //! Loads the pages into a database per layout (the default: binary codes
-//! searched, SQ8 codes to score; `keep_f32`; pooled at write), then for each
+//! searched, SQ8 codes to score; `keep_f32`; pooled at write by a cosine
+//! threshold or by Ward's linkage with a pool factor), then for each
 //! query on one thread: `maxsim(patches, :q)` at several candidate caps and
 //! exactly, `bm25(text, :q)` over the OCR text, and their `rrf`. Reports
 //! NDCG@5 (one relevant page per query), latency, and the bytes per page of
@@ -40,12 +41,18 @@ struct Args {
     /// The encoder's output directory for one dataset.
     #[arg(long)]
     data: PathBuf,
-    /// Layouts: sq8 (the default), f32 (keep_f32), pool-<cosine>.
-    #[arg(long, default_value = "sq8,f32,pool-0.95,pool-0.9")]
+    /// Layouts: sq8 (the default), f32 (keep_f32), pool-<cosine> (pooled
+    /// by a cosine threshold), ward-<factor> (pooled by Ward's linkage with a
+    /// pool factor).
+    #[arg(long, default_value = "sq8,f32,pool-0.95,pool-0.9,ward-2,ward-3")]
     layouts: String,
     /// Candidate caps, comma-separated.
     #[arg(long, default_value = "10,25,50,100,200,400")]
     caps: String,
+    /// The layouts every page is also scored exactly on (`all`, or a
+    /// comma-separated list): a second a question at 1,000 vectors a page.
+    #[arg(long, default_value = "all")]
+    exact: String,
     #[arg(long, default_value_t = 4)]
     threads: usize,
     #[arg(long, default_value = "results/vector")]
@@ -82,6 +89,11 @@ fn ndcg5(ranked: &[String], page: &str) -> f64 {
 /// A question as plain words, read the same with or without query operators.
 fn words(q: &str) -> String {
     q.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The prefix of the `patches` field's section names.
+fn section_prefix(db: &Db) -> String {
+    format!("vec.{}.", db.schema().key_of("patches").expect("patches"))
 }
 
 fn main() {
@@ -128,6 +140,7 @@ fn main() {
             "sq8" => {}
             "f32" => patches = patches.keep_f32(),
             l if l.starts_with("pool-") => patches = patches.pooled(l["pool-".len()..].parse().unwrap()),
+            l if l.starts_with("ward-") => patches = patches.pooled_by(l["ward-".len()..].parse().unwrap()),
             l => panic!("layout {l}"),
         }
         let schema = Schema::new("pages", vec![Field::new("id", FieldType::Keyword), Field::new("text", FieldType::Text { positions: true }), patches], Some("id")).unwrap();
@@ -142,16 +155,18 @@ fn main() {
         .unwrap();
         let load_s = t.elapsed().as_secs_f64();
         let snap = db.snapshot();
+        // Sections are named by the field's id (`vec.f3.codes`).
+        let prefix = section_prefix(&db);
         let mut sections: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
         for s in snap.segments() {
             for (name, bytes) in s.file.section_sizes() {
-                if let Some(part) = name.strip_prefix("vec.patches.") {
+                if let Some(part) = name.strip_prefix(prefix.as_str()) {
                     *sections.entry(part.to_string()).or_default() += bytes;
                 }
             }
         }
         let total: usize = sections.values().sum();
-        let stored: usize = snap.segments().iter().map(|s| s.file.section_sizes().iter().filter(|(n, _)| n.starts_with("vec.patches.") && n.ends_with(".owner")).map(|(_, b)| b / 4).sum::<usize>()).sum();
+        let stored: usize = snap.segments().iter().map(|s| s.file.section_sizes().iter().filter(|(n, _)| n.starts_with(prefix.as_str()) && n.ends_with(".owner")).map(|(_, b)| b / 4).sum::<usize>()).sum();
         let per_page = total as f64 / pages.len() as f64;
         eprintln!("{layout}: {:.0} vectors a page kept, {:.0} bytes a page ({:?}), load {load_s:.1} s", stored as f64 / pages.len() as f64, per_page, sections);
         layouts.push(json!({"layout": layout, "vectors_per_page": stored as f64 / pages.len() as f64, "bytes_per_page": per_page, "sections_bytes": sections, "load_s": load_s}));
@@ -159,7 +174,9 @@ fn main() {
         let schema = snap.schema().clone();
         let exec = ExecOptions { threads: 1, ..ExecOptions::default() };
         let mut cases: Vec<(String, String)> = caps.iter().map(|c| (format!("maxsim, {c} candidates"), format!("maxsim(patches, :qs, candidates => {c})"))).collect();
-        cases.push(("maxsim, exact".into(), "maxsim(patches, :qs, depth => 100000000, candidates => 100000000)".into()));
+        if a.exact == "all" || a.exact.split(',').any(|l| l == layout) {
+            cases.push(("maxsim, exact".into(), "maxsim(patches, :qs, depth => 100000000, candidates => 100000000)".into()));
+        }
         if layout == "sq8" {
             cases.push(("bm25 over OCR text".into(), "bm25(text, :t)".into()));
             cases.push(("rrf(bm25, maxsim)".into(), "rrf(bm25(text, :t), maxsim(patches, :qs))".into()));
