@@ -398,6 +398,8 @@ impl<'a> Text<'a> {
             Expr::Keys(n) => format!("keys of {}", self.subquery(n)),
             Expr::Exists(n) => format!("EXISTS {}", self.subquery(n)),
             Expr::Scalar(n) => self.subquery(n),
+            Expr::Outer(n) => format!("outer ${n}"),
+            Expr::ByKey(vs) => format!("by key ({} rows)", vs.len()),
         }
     }
 
