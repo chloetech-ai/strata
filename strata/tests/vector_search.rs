@@ -271,7 +271,7 @@ fn post_filter_widens_its_walk() {
     let n = 4000;
     let vecs: Vec<Option<Vec<f32>>> = clustered(n, dim, 8, 21).into_iter().map(Some).collect();
     let seg = segment(&vecs, dim, &opts("hnsw"));
-    let r = VectorReader::open(&seg, "emb").unwrap();
+    let r = VectorReader::open(&seg, EMB).unwrap();
     let queries = clustered(10, dim, 8, 22);
     let (mut found, mut total, mut retried) = (0, 0, 0);
     for q in &queries {
