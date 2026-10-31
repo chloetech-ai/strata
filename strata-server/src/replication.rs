@@ -68,20 +68,28 @@
 //! held other values under the same keys before numbering began (loaded
 //! from other rows) is not found by them.
 //!
-//! A replica is made the primary of a new term by hand
-//! ([`Follow::promote`]: `POST /v1/admin/promote`, `strata-server
-//! promote`), or a stopped one with `--promote` ([`PrimaryOptions::promote`]).
-//! It first asks the copies it is to ship to for their last transaction
-//! (`Hello`) and refuses while one holds a later one, which the new
-//! primary would not hold, unless forced. It then begins a term above
-//! every term it knows ([`strata::storage::Database::begin_term`]), so
-//! that the replicas follow it, and an old primary that ships to a copy
-//! of the new term is answered with it and stops taking writes and serving
-//! reads (it is fenced). It keeps that beside its database, and starts
-//! again as a primary only with `--promote`. A primary that a primary of
-//! a newer term ships to is fenced the same way, and one of an older term
-//! is answered with this one's. There is no automatic failover: who is
-//! primary is not agreed by the copies themselves.
+//! A shard's copies elect its primary, as Raft does: each keeps the newest
+//! term it knows and the copy it voted for in it (`Kept`), and grants
+//! its vote only to a copy whose last transaction is not behind its own
+//! (`decide`). A copy wins with a majority of the copies its cluster map
+//! names for its shard ([`Follow::campaign`]); a write `all` or `majority`
+//! answers is held by a majority too ([`Primary::acknowledged`]), so the
+//! winner holds every write answered. A replica elects itself when its
+//! primary is silent (`--failover-after-ms`, `service::failover`), or is
+//! made the primary by hand ([`Follow::promote`]: `POST /v1/admin/promote`,
+//! `strata-server promote`, a coordinator's
+//! `POST /v1/admin/shards/:i/promote`), a stopped one with `--promote`
+//! ([`PrimaryOptions::promote`]). By hand, it first asks the copies for
+//! their last transaction (`Hello`) and refuses while one holds a later
+//! one, then asks for their votes as a handover, which a serving primary
+//! grants and steps down for; with `force`, neither. The winner begins
+//! the term it won ([`strata::storage::Database::begin_term`]), so that
+//! the replicas follow it, and an old primary that ships to a copy of the
+//! new term is answered with it and stops taking writes and serving reads
+//! (it is fenced). It keeps that beside its database, and starts again as
+//! a primary only with `--promote`. A primary that a primary of a newer
+//! term ships to is fenced the same way, and one of an older term is
+//! answered with this one's.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -230,6 +238,11 @@ pub struct PrimaryOptions {
     /// lack rows that took no number (a bulk load). A replica added later
     /// ([`Primary::reconfigure`]) joins so too.
     pub joining: bool,
+    /// Serves reads only while a majority of its shard's copies answered a
+    /// call that started within this (zero: always): the copies may elect
+    /// another primary once they have not heard from this one for longer
+    /// (`--failover-after-ms`), and it would serve what that one replaced.
+    pub lease: Duration,
 }
 
 impl Default for PrimaryOptions {
@@ -248,6 +261,7 @@ impl Default for PrimaryOptions {
             verify_every: Duration::from_secs(600),
             promote: false,
             joining: false,
+            lease: Duration::ZERO,
         }
     }
 }
@@ -280,6 +294,11 @@ struct Kept {
     /// Its part, as last set (`None`: standalone, or kept by a version
     /// from before roles were kept, whose flags say).
     role: Option<KeptRole>,
+    /// The term it last voted in, and the copy it voted for ([`vote`]).
+    voted: Option<(u64, String)>,
+    /// Whether a primary counted it among the copies a majority is counted
+    /// of (`ReplicateRequest.member`): it grants votes from then.
+    member: bool,
 }
 
 /// The part in replication kept beside the database at `db`
@@ -320,16 +339,23 @@ impl Kept {
                 }
                 Some(r) => return Err(format!("{}: role {r:?} is primary or replica", path.display())),
             };
-            return Ok(Kept { id, follows, replaced_by, role });
+            let voted = match &j["voted"] {
+                Json::Null => None,
+                v => Some((v["term"].as_u64().ok_or_else(|| format!("{}: no term voted in", path.display()))?, v["for"].as_str().unwrap_or_default().to_string())),
+            };
+            let member = j["member"].as_bool().unwrap_or(false);
+            return Ok(Kept { id, follows, replaced_by, role, voted, member });
         }
         let k = Kept { id: new_id(), ..Kept::default() };
         k.save(Some(path)).map_err(|e| format!("keep the replication id in {}: {e}", path.display()))?;
         Ok(k)
     }
 
-    /// The newest term it knows of, besides the database's `term`.
+    /// The newest term it knows of, besides the database's `term`: of the
+    /// primary it follows, the one that replaced it, and the term it voted
+    /// in.
     fn newest(&self, term: u64) -> u64 {
-        term.max(self.follows.as_ref().map_or(0, |f| f.1)).max(self.replaced_by.unwrap_or(0))
+        term.max(self.follows.as_ref().map_or(0, |f| f.1)).max(self.replaced_by.unwrap_or(0)).max(self.voted.as_ref().map_or(0, |v| v.0))
     }
 
     fn save(&self, path: Option<&Path>) -> std::io::Result<()> {
@@ -340,6 +366,12 @@ impl Kept {
         }
         if let Some(t) = self.replaced_by {
             j["replaced_by"] = json!(t);
+        }
+        if let Some((term, candidate)) = &self.voted {
+            j["voted"] = json!({"term": term, "for": candidate});
+        }
+        if self.member {
+            j["member"] = json!(true);
         }
         match &self.role {
             None => {}
@@ -453,6 +485,12 @@ struct Follower {
     /// other replicas ([`Primary::reconfigure`]) takes over the replicas
     /// it keeps, and the shipper before stops.
     owner: AtomicU64,
+    /// Whether it counts among the copies a majority is counted of: from
+    /// the start, or once it caught up after joining. Its calls say so.
+    member: AtomicBool,
+    /// When the last call it answered started, for the primary's lease on
+    /// reads ([`Primary::readable`]).
+    answered: Mutex<Option<Instant>>,
 }
 
 /// Numbers each [`Primary`] made by this process.
@@ -478,6 +516,8 @@ impl Follower {
             verify_failures: AtomicU64::new(0),
             wake: Arc::new(tokio::sync::Notify::new()),
             owner: AtomicU64::new(0),
+            member: AtomicBool::new(true),
+            answered: Mutex::new(None),
         })
     }
 
@@ -488,6 +528,7 @@ impl Follower {
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some("it joined: it is sent a copy of the primary first".into());
         self.in_sync.store(false, Ordering::Relaxed);
         self.diverged.store(true, Ordering::Relaxed);
+        self.member.store(false, Ordering::Relaxed);
         self
     }
 }
@@ -546,8 +587,18 @@ impl Follower {
         j
     }
 
-    /// Puts it in sync: it holds the primary's last transaction.
-    fn caught_up(&self) {
+    fn member(&self) -> bool {
+        self.member.load(Ordering::Relaxed)
+    }
+
+    /// Puts it in sync: it holds the primary's last transaction. A replica
+    /// that joined counts among the copies from then, once a call it
+    /// answered says so (`shipped`): not on installing a copy, whose call
+    /// started too long ago to count toward the primary's lease on reads.
+    fn caught_up(&self, shipped: bool) {
+        if shipped {
+            self.member.store(true, Ordering::Relaxed);
+        }
         if !self.in_sync.swap(true, Ordering::Relaxed) {
             tracing::info!(replica = %self.url, seq_no = self.acked(), "a replica is in sync");
         }
@@ -575,6 +626,8 @@ pub struct Primary {
     fenced: AtomicU64,
     /// Requests to compare the replicas now ([`Primary::verify`]).
     verify_asked: AtomicU64,
+    /// Held while it answers a vote ([`Primary::vote`]).
+    voting: Mutex<()>,
 }
 
 impl Primary {
@@ -641,6 +694,7 @@ impl Primary {
             progress: watch::channel(0).0,
             fenced: AtomicU64::new(0),
             verify_asked: AtomicU64::new(0),
+            voting: Mutex::new(()),
         });
         for k in 0..p.followers.len() {
             tokio::spawn(ship(Arc::downgrade(&p), k));
@@ -680,7 +734,7 @@ impl Primary {
             })
             .collect::<Result<Vec<_>, String>>()
             .map_err(ApiError::bad)?;
-        let kept = Kept { id: self.id.clone(), ..Kept::default() };
+        let kept = Kept { id: self.id.clone(), voted: self.voted(), ..Kept::default() };
         let p = Primary::run_with(self.db.clone(), self.file.as_deref(), kept, opts, followers).map_err(ApiError::internal)?;
         tracing::info!(replicas = %p.opts.replicas.join(", "), write_acks = p.opts.acks.name(), "primary: ships to these replicas from now on");
         Ok(p)
@@ -690,9 +744,21 @@ impl Primary {
         self.db.storage().numbering().map_or(0, |n| n.term)
     }
 
-    /// Copies in all, the primary among them, and how many make a majority.
+    /// The copies a majority is counted of: the primary, and the replicas
+    /// but those that joined and have not caught up yet, which grant no
+    /// votes ([`Follower::member`]).
+    fn copies(&self) -> usize {
+        1 + self.followers.iter().filter(|f| f.member()).count()
+    }
+
+    /// How many copies make a majority ([`Self::copies`]).
     fn majority(&self) -> usize {
-        (self.followers.len() + 1) / 2 + 1
+        self.copies() / 2 + 1
+    }
+
+    /// The vote kept beside its database, if any.
+    fn voted(&self) -> Option<(u64, String)> {
+        Kept::open(self.file.as_deref()).ok().and_then(|k| k.voted)
     }
 
     /// The highest number every in-sync replica holds (the primary's last
@@ -720,7 +786,7 @@ impl Primary {
         }
         tracing::error!(term = self.term(), replaced_by = term, "a primary of a newer term replaced this one, which takes no more writes and serves no reads");
         // It starts again as a replica of the primary that replaced it.
-        let kept = Kept { id: self.id.clone(), follows: None, replaced_by: Some(term), role: Some(KeptRole::Replica) };
+        let kept = Kept { id: self.id.clone(), follows: None, replaced_by: Some(term), role: Some(KeptRole::Replica), voted: self.voted(), member: true };
         if let Err(e) = kept.save(self.file.as_deref()) {
             tracing::error!(error = %e, "could not keep that another primary replaced this one");
         }
@@ -730,11 +796,31 @@ impl Primary {
     /// Refuses a read once another primary replaced this one (503): it
     /// may hold writes the new primary does not, and not the new
     /// primary's.
+    ///
+    /// With a lease ([`PrimaryOptions::lease`]), refused too while fewer
+    /// than a majority of the copies answered a call started within it:
+    /// the others may have elected another primary.
     pub fn readable(&self) -> Result<(), ApiError> {
-        match self.replaced_by() {
-            0 => Ok(()),
-            t => Err(ApiError { status: 503, message: format!("a primary of term {t} replaced this one (term {}), which serves no reads: read from another copy", self.term()) }),
+        if let t @ 1.. = self.replaced_by() {
+            return Err(ApiError { status: 503, message: format!("a primary of term {t} replaced this one (term {}), which serves no reads: read from another copy", self.term()) });
         }
+        let lease = self.opts.lease;
+        if !lease.is_zero() && !self.followers.is_empty() {
+            let now = Instant::now();
+            let fresh = |f: &Follower| f.answered.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| now.duration_since(at) < lease);
+            let up = 1 + self.followers.iter().filter(|f| f.member() && fresh(f)).count();
+            if up < self.majority() {
+                return Err(ApiError {
+                    status: 503,
+                    message: format!(
+                        "{up} of this primary's {} copies answered it within {} ms, fewer than a majority: the others may have elected another primary, so it serves no reads; read from another copy",
+                        self.copies(),
+                        lease.as_millis()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Answers a primary's call to ship to this one (`Replicate`,
@@ -759,6 +845,43 @@ impl Primary {
         Err(conflict(format!("this server is the primary of term {term}, not a replica, and primary {primary} ships to it in the same term: a shard has one primary in a term")))
     }
 
+    /// Answers a copy asking to be made the primary of a newer term
+    /// (`Vote`). A primary another replaced answers as a replica would.
+    /// One that serves grants only a `handover`, a promotion asked by hand,
+    /// and only to a copy holding every transaction it holds: it then
+    /// steps down, as a primary the new one replaced, and writes it had
+    /// not acknowledged are refused.
+    pub fn vote(&self, r: &pb::VoteRequest) -> pb::VoteResponse {
+        let _one = self.voting.lock().unwrap_or_else(|e| e.into_inner());
+        let numbering = self.db.storage().numbering().unwrap_or_default();
+        let mut kept = match Kept::open(self.file.as_deref()) {
+            Ok(k) => k,
+            Err(e) => return refused(numbering.term, numbering.last(), format!("its replication state: {e}")),
+        };
+        // In memory, its id is its own.
+        kept.id = self.id.clone();
+        kept.member = true;
+        let fenced = self.replaced_by();
+        if fenced == 0 && !r.handover && r.candidate != self.id {
+            return refused(
+                kept.newest(numbering.term),
+                numbering.last(),
+                format!("this server is the shard's primary (term {}) and ships to its replicas: promote another copy by hand to hand over", numbering.term),
+            );
+        }
+        let a = decide(&kept, numbering.term, numbering.last(), r);
+        if !a.granted || r.pre || a.candidate {
+            return a;
+        }
+        kept.voted = Some((r.term, r.candidate.clone()));
+        if let Err(e) = kept.save(self.file.as_deref()) {
+            return refused(numbering.term, numbering.last(), format!("keep the vote: {e}"));
+        }
+        tracing::warn!(term = r.term, candidate = %r.candidate, "voted for another copy to be the shard's primary: this one steps down");
+        self.fence(r.term);
+        a
+    }
+
     /// Answers a primary's copy of itself (`Restore`), as
     /// [`Primary::shipped_to`] answers a call.
     pub async fn copied_to(&self, mut chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
@@ -777,12 +900,12 @@ impl Primary {
                 self.term()
             )));
         }
-        if self.opts.acks == Acks::Majority {
-            let up = 1 + self.followers.iter().filter(|f| f.in_sync()).count();
+        if self.opts.acks != Acks::Primary {
+            let up = 1 + self.followers.iter().filter(|f| f.member() && f.in_sync()).count();
             if up < self.majority() {
                 return Err(ApiError {
                     status: 503,
-                    message: format!("{up} of {} copies are in sync, and --write-acks majority needs {}: the write was not applied", self.followers.len() + 1, self.majority()),
+                    message: format!("{up} of {} copies are in sync, and --write-acks {} needs {}: the write was not applied", self.copies(), self.opts.acks.name(), self.majority()),
                 });
             }
         }
@@ -802,31 +925,35 @@ impl Primary {
                     "the write is durable on this primary as sequence number {seq}, but a primary of term {t} replaced this one before it was acknowledged, and the new primary may not hold it: write to the new primary"
                 )));
             }
-            let holding = 1 + self.followers.iter().filter(|f| f.acked() >= seq).count();
+            let holding = 1 + self.followers.iter().filter(|f| f.member() && f.acked() >= seq).count();
+            let majority = holding >= self.majority();
             match self.opts.acks {
                 Acks::Primary => return Ok(()),
-                Acks::All if self.followers.iter().all(|f| !f.in_sync() || f.acked() >= seq) => return Ok(()),
-                Acks::Majority if holding >= self.majority() => return Ok(()),
+                Acks::All if majority && self.followers.iter().all(|f| !f.in_sync() || f.acked() >= seq) => return Ok(()),
+                Acks::Majority if majority => return Ok(()),
                 _ => {}
             }
             if tokio::time::timeout_at(deadline.into(), progress.changed()).await.is_ok() {
                 continue;
             }
-            if self.opts.acks == Acks::Majority {
-                return Err(ApiError {
-                    status: 504,
-                    message: format!(
-                        "the write is durable on the primary as sequence number {seq}, but {holding} of {} copies held it by its deadline, and --write-acks majority needs {}",
-                        self.followers.len() + 1,
-                        self.majority()
-                    ),
-                });
+            // Every replica in sync, but never fewer than a majority: a
+            // write fewer copies hold could be lost to an election.
+            if self.opts.acks == Acks::All && majority {
+                for f in self.followers.iter().filter(|f| f.in_sync() && f.acked() < seq) {
+                    f.drop_out(format!("it did not acknowledge transaction {seq} within the write's deadline"));
+                }
+                self.changed();
+                return Ok(());
             }
-            for f in self.followers.iter().filter(|f| f.in_sync() && f.acked() < seq) {
-                f.drop_out(format!("it did not acknowledge transaction {seq} within the write's deadline"));
-            }
-            self.changed();
-            return Ok(());
+            return Err(ApiError {
+                status: 504,
+                message: format!(
+                    "the write is durable on the primary as sequence number {seq}, but {holding} of {} copies held it by its deadline, and --write-acks {} needs {}",
+                    self.copies(),
+                    self.opts.acks.name(),
+                    self.majority()
+                ),
+            });
         }
     }
 
@@ -871,7 +998,7 @@ impl Primary {
                     "url": f.url, "seq_no": f.acked(), "behind": last.saturating_sub(f.acked()), "in_sync": f.in_sync(),
                     "copying": f.copying.load(Ordering::Relaxed), "copies": f.copies.load(Ordering::Relaxed),
                     "verifications": f.verifications.load(Ordering::Relaxed), "divergences": f.divergences.load(Ordering::Relaxed),
-                    "verify_failures": f.verify_failures.load(Ordering::Relaxed),
+                    "verify_failures": f.verify_failures.load(Ordering::Relaxed), "member": f.member(),
                 });
                 if let Some(e) = f.error() {
                     j["error"] = json!(e);
@@ -884,7 +1011,7 @@ impl Primary {
             })
             .collect();
         let mut h = json!({
-            "role": "primary", "id": self.id, "term": self.term(), "seq_no": last, "write_acks": self.opts.acks.name(),
+            "role": "primary", "id": self.id, "term": self.term(), "seq_no": last, "write_acks": self.opts.acks.name(), "copies": self.copies(), "majority": self.majority(),
             "global_checkpoint": self.global_checkpoint(), "verify_every_s": self.opts.verify_every.as_secs(), "replicas": replicas,
         });
         let fenced = self.fenced.load(Ordering::Relaxed);
@@ -915,6 +1042,38 @@ impl Primary {
 /// A round comparing a replica's rows with its primary's: the primary's
 /// version, its last transaction, and the latest request
 /// ([`Primary::verify`]) the round answers.
+/// A vote refused, by a copy that knows of term `term` and holds `last`.
+fn refused(term: u64, last: SeqNo, reason: String) -> pb::VoteResponse {
+    pb::VoteResponse { granted: false, term, last_seq: last.seq, last_term: last.term, reason, candidate: false }
+}
+
+/// Whether a copy keeping `kept`, at `term` and holding `last`, grants
+/// vote `r`: one vote a term, for a newer term than any it knows, and for
+/// a copy holding every transaction it holds (by last term, then last
+/// number), once a primary counted it a member. The candidate asking
+/// itself is told so.
+fn decide(kept: &Kept, term: u64, last: SeqNo, r: &pb::VoteRequest) -> pb::VoteResponse {
+    let newest = kept.newest(term);
+    if r.candidate == kept.id {
+        return pb::VoteResponse { granted: true, term: newest, last_seq: last.seq, last_term: last.term, reason: String::new(), candidate: true };
+    }
+    let no = |reason: String| refused(newest, last, reason);
+    match &kept.voted {
+        Some((t, c)) if *t == r.term && *c == r.candidate && !r.pre => {}
+        Some((t, c)) if *t >= r.term => return no(format!("it voted for {c} in term {t}")),
+        _ if r.term <= newest => return no(format!("it knows term {newest}, not older than the term asked for ({})", r.term)),
+        _ => {}
+    }
+    if (r.last_term, r.last_seq) < (last.term, last.seq) {
+        return no(format!("it holds transactions up to {} of term {}, past the candidate's last ({} of term {})", last.seq, last.term, r.last_seq, r.last_term));
+    }
+    if !kept.member {
+        return no("it has not caught up with a primary since it joined its shard, so it grants no votes".into());
+    }
+    let term = if r.pre { newest } else { newest.max(r.term) };
+    pb::VoteResponse { granted: true, term, last_seq: last.seq, last_term: last.term, reason: String::new(), candidate: false }
+}
+
 struct Round {
     snap: Snapshot,
     seq: u64,
@@ -1007,11 +1166,16 @@ async fn ship(p: Weak<Primary>, k: usize) {
                     primary: p.id.clone(),
                     behind: end < last,
                     pin,
+                    member: f.member(),
                 };
                 drop(txns);
                 let mut c = f.client.clone();
+                let started = Instant::now();
                 let answer = match tokio::time::timeout(p.opts.call_timeout, c.replicate(req)).await {
-                    Ok(Ok(r)) => Ok(r.into_inner()),
+                    Ok(Ok(r)) => {
+                        *f.answered.lock().unwrap_or_else(|e| e.into_inner()) = Some(started);
+                        Ok(r.into_inner())
+                    }
                     Ok(Err(s)) => Err(format!("{}: {}", crate::grpc::code_name(s.code()), s.message())),
                     Err(_) => Err(format!("no answer within {} s", p.opts.call_timeout.as_secs())),
                 };
@@ -1057,7 +1221,7 @@ async fn ship(p: Weak<Primary>, k: usize) {
                         None => p.db.storage().numbering().map_or(last, |n| n.seq),
                     };
                     if r.seq >= last {
-                        f.caught_up();
+                        f.caught_up(end.is_some());
                         // Shipped up to the last, and not just copied: what
                         // followed the copy is no longer needed.
                         if end.is_some() {
@@ -1263,7 +1427,25 @@ pub struct Follow {
     /// follows, and the digests it computed for its primary.
     pinned: Mutex<Option<Snapshot>>,
     digests: AtomicU64,
+    /// When it started following here, for [`Follow::silent_for`].
+    opened: Instant,
 }
+
+/// What a copy that won an election holds ([`Follow::campaign`]).
+#[derive(Clone, Debug)]
+pub struct Elected {
+    /// The term it won.
+    pub term: u64,
+    /// The shard's other copies asked, which it ships to as primary.
+    pub others: Vec<String>,
+    /// What each copy answered.
+    pub votes: Json,
+}
+
+/// How recently a replica's primary called for the replica to refuse
+/// another copy's vote that is no handover, when the replica has no
+/// failover delay of its own.
+pub const STICKY: Duration = Duration::from_secs(5);
 
 impl Follow {
     /// A replica of `db`, keeping its id and the primary it follows in
@@ -1296,7 +1478,120 @@ impl Follow {
             reads_refused: AtomicU64::new(0),
             pinned: Mutex::new(None),
             digests: AtomicU64::new(0),
+            opened: Instant::now(),
         })
+    }
+
+    /// How long since its primary last called, or since it started
+    /// following when none has.
+    pub fn silent_for(&self) -> Duration {
+        self.called_at.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(self.opened).elapsed()
+    }
+
+    /// Answers a copy asking to be made the primary of a newer term
+    /// (`Vote`), as [`decide`] does, keeping the vote unless only asked
+    /// (`pre`). Refused, but for a `handover`, while its primary called
+    /// within `sticky`: that primary serves.
+    pub async fn vote(&self, r: &pb::VoteRequest, sticky: Duration) -> Result<pb::VoteResponse, ApiError> {
+        let mut kept = self.kept.lock().await;
+        let n = self.db.storage().numbering().ok_or_else(|| ApiError::internal("the replica does not number its writes"))?;
+        let quiet = self.silent_for();
+        if !r.handover && r.candidate != kept.id && self.called_at.lock().unwrap_or_else(|e| e.into_inner()).is_some() && quiet < sticky {
+            return Ok(refused(kept.newest(n.term), n.last(), format!("its primary called {} ms ago", quiet.as_millis())));
+        }
+        let a = decide(&kept, n.term, n.last(), r);
+        if a.granted && !a.candidate && !r.pre {
+            let mut next = kept.clone();
+            next.voted = Some((r.term, r.candidate.clone()));
+            next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the vote: {e}")))?;
+            *kept = next;
+            tracing::info!(term = r.term, candidate = %r.candidate, handover = r.handover, "voted for a copy to be the shard's primary");
+        }
+        Ok(a)
+    }
+
+    /// Asks `copies`, the servers of its shard (itself among them or not),
+    /// to make this replica the primary of the next term: first whether
+    /// they would (`pre`), which changes nothing, then for their votes,
+    /// keeping its own. Wins with a majority of the copies, itself counted
+    /// once; refused (409) otherwise, saying what each answered. A
+    /// `handover` is a promotion asked by hand. The term it asked for stays
+    /// voted in when it loses: copies that granted it refuse the primary
+    /// of an older term from then.
+    pub async fn campaign(&self, copies: &[String], opts: &PrimaryOptions, handover: bool) -> Result<Elected, ApiError> {
+        let (id, newest) = {
+            let kept = self.kept.lock().await;
+            (kept.id.clone(), kept.newest(self.db.storage().numbering().map_or(0, |n| n.term)))
+        };
+        let term = newest + 1;
+        let ask = |pre: bool| {
+            let last = self.db.storage().numbering().unwrap_or_default().last();
+            let req = pb::VoteRequest { term, candidate: id.clone(), last_seq: last.seq, last_term: last.term, pre, handover };
+            futures::future::join_all(copies.iter().map(move |url| {
+                let req = req.clone();
+                async move {
+                    let mut c = coord::client(url, opts.token.as_ref(), opts.ca.as_deref())?;
+                    match tokio::time::timeout(opts.call_timeout, c.vote(req)).await {
+                        Ok(Ok(a)) => Ok(a.into_inner()),
+                        Ok(Err(s)) => Err(ApiError::bad(format!("{}: {}", crate::grpc::code_name(s.code()), s.message()))),
+                        Err(_) => Err(ApiError::bad(format!("no answer within {} s", opts.call_timeout.as_secs()))),
+                    }
+                }
+            }))
+        };
+        // The copies besides this one, what they answered, and whether a
+        // majority grants.
+        let tally = |answers: Vec<Result<pb::VoteResponse, ApiError>>| {
+            let mut others = Vec::new();
+            let (mut granted, mut newer, mut said) = (1, 0, Vec::new());
+            for (url, a) in copies.iter().zip(answers) {
+                match a {
+                    Ok(a) if a.candidate => {}
+                    Ok(a) => {
+                        others.push(url.clone());
+                        granted += a.granted as usize;
+                        newer = newer.max(a.term);
+                        let mut j = json!({"url": url, "granted": a.granted, "term": a.term, "seq_no": a.last_seq});
+                        if !a.reason.is_empty() {
+                            j["reason"] = json!(a.reason);
+                        }
+                        said.push(j);
+                    }
+                    Err(e) => {
+                        others.push(url.clone());
+                        said.push(json!({"url": url, "granted": false, "error": e.message}));
+                    }
+                }
+            }
+            let need = (others.len() + 1) / 2 + 1;
+            (others, granted, need, newer, Json::Array(said))
+        };
+        let lost = |round: &str, granted: usize, need: usize, said: &Json| {
+            conflict(format!("{granted} of {} copies {round} for this replica to be the primary of term {term}, and it needs {need}: {said}", said.as_array().map_or(0, Vec::len) + 1))
+        };
+        let (_, granted, need, newer, said) = tally(ask(true).await);
+        if newer >= term {
+            return Err(conflict(format!("a copy knows term {newer}, not older than the term this replica would ask for ({term}): {said}")));
+        }
+        if granted < need {
+            return Err(lost("would vote", granted, need, &said));
+        }
+        {
+            let mut kept = self.kept.lock().await;
+            if kept.newest(self.db.storage().numbering().map_or(0, |n| n.term)) >= term {
+                return Err(conflict(format!("this replica learned of term {term} or newer while it asked: another copy was elected first")));
+            }
+            let mut next = kept.clone();
+            next.voted = Some((term, id.clone()));
+            next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the vote: {e}")))?;
+            *kept = next;
+        }
+        let (others, granted, need, _, said) = tally(ask(false).await);
+        if granted < need {
+            return Err(lost("voted", granted, need, &said));
+        }
+        tracing::info!(term, votes = granted, of = others.len() + 1, "elected the shard's primary");
+        Ok(Elected { term, others, votes: said })
     }
 
     /// Whether a read may take a new snapshot here: once a call from its
@@ -1349,18 +1644,27 @@ impl Follow {
         self.kept.lock().await.follows.as_ref().map(|(p, _)| p.clone())
     }
 
-    /// Makes this replica the primary of a new term, shipping as `opts`
-    /// says: once the copies in `opts.replicas` that answer hold no
-    /// transaction past this replica's last, nor a newer term (409
-    /// otherwise, unless `force`: the new primary would not hold those
-    /// transactions, and a copy of it drops them), it begins a term above
-    /// every term it knows, under the lock calls from its primary take,
-    /// so that a call of the old primary that follows is answered with
-    /// the new term. Answers the new term, its last transaction and what
-    /// each copy said.
-    pub async fn promote(&self, opts: PrimaryOptions, force: bool) -> Result<(Arc<Primary>, Json), ApiError> {
+    /// Makes this replica the primary of a new term by hand, shipping as
+    /// `opts` says: once the copies in `opts.replicas` that answer hold no
+    /// transaction past this replica's last, nor a newer term, and a
+    /// majority of `voters` (the shard's copies; `opts.replicas` when
+    /// `None`) voted for it ([`Self::campaign`], as a handover: a primary
+    /// that serves steps down). Refused (409) otherwise, unless `force`,
+    /// which asks for no votes: the new primary may then not hold
+    /// transactions another copy holds, which a copy of it drops, and a
+    /// primary that serves still may until it hears of the new term.
+    /// Answers the new term, its last transaction, what each copy said and
+    /// the votes.
+    pub async fn promote(&self, mut opts: PrimaryOptions, voters: Option<Vec<String>>, force: bool) -> Result<(Arc<Primary>, Json), ApiError> {
         let mine = self.db.storage().numbering().ok_or_else(|| ApiError::internal("the replica does not number its writes"))?;
-        let asks = opts.replicas.iter().map(|url| async {
+        // With no replicas named, the shard's copies are asked, and shipped
+        // to once elected.
+        let named = !opts.replicas.is_empty();
+        let checked = match (named, &voters) {
+            (false, Some(v)) => v.clone(),
+            _ => opts.replicas.clone(),
+        };
+        let asks = checked.iter().map(|url| async {
             let mut c = coord::client(url, opts.token.as_ref(), opts.ca.as_deref())?;
             let hello = c.hello(pb::HelloRequest { min_protocol: crate::grpc::MIN_PROTOCOL, max_protocol: crate::grpc::PROTOCOL });
             match tokio::time::timeout(opts.call_timeout, hello).await {
@@ -1369,52 +1673,123 @@ impl Follow {
                 Err(_) => Err(ApiError::bad(format!("no answer within {} s", opts.call_timeout.as_secs()))),
             }
         });
+        // This replica's last transaction; when it holds none (its rows
+        // came in a copy), its term, as a copy that holds none is taken.
+        let last = match mine.seq {
+            0 => (mine.term, 0),
+            seq => (mine.last().term, seq),
+        };
         let mut copies = Vec::new();
         let mut ahead = Vec::new();
-        for (url, a) in opts.replicas.iter().zip(futures::future::join_all(asks).await) {
+        for (url, a) in checked.iter().zip(futures::future::join_all(asks).await) {
             copies.push(match a {
                 Ok(h) => {
-                    if h.seq_no > mine.seq || h.term > mine.term {
-                        ahead.push(format!("{url} holds transactions up to {} (term {})", h.seq_no, h.term));
+                    // By its last transaction: a copy that began or follows a
+                    // newer term but holds nothing of it holds nothing more.
+                    // (A server that does not say its last term, or holds no
+                    // transaction, is taken at its term.)
+                    let last_term = if h.last_term > 0 { h.last_term } else { h.term };
+                    if (last_term, h.seq_no) > last {
+                        ahead.push(format!("{url} holds transactions up to {} (term {last_term})", h.seq_no));
                     }
                     json!({"url": url, "role": h.role().as_str_name().to_lowercase(), "term": h.term, "seq_no": h.seq_no})
                 }
                 Err(e) => json!({"url": url, "error": e.message}),
             });
         }
+        if checked.is_empty() && !force {
+            return Err(conflict("this replica knows no other copy of its shard to ask for votes (it has no cluster map): name its shard's other servers as its replicas, or pass force".into()));
+        }
         if !ahead.is_empty() && !force {
             return Err(conflict(format!(
                 "{}, past this replica's last ({} of term {}): the new primary would not hold those transactions, and a copy of it would drop them. Promote the copy with the latest transaction, or pass force",
                 ahead.join("; "),
-                mine.seq,
-                mine.last().term
+                last.1,
+                last.0
             )));
         }
+        let elected = match force {
+            true => None,
+            false => Some(self.campaign(voters.as_deref().unwrap_or(&opts.replicas), &opts, true).await?),
+        };
+        match (named, &elected, &voters) {
+            (false, Some(e), _) => opts.replicas = e.others.clone(),
+            (false, None, Some(v)) => opts.replicas = self.others(v, &opts).await,
+            _ => {}
+        }
+        let (p, mut answer) = self.take_over(elected.as_ref().map(|e| e.term), opts).await?;
+        answer["replicas"] = json!(copies);
+        if let Some(e) = elected {
+            answer["votes"] = e.votes;
+        }
+        Ok((p, answer))
+    }
+
+    /// The servers of `copies` that are not this one, which each says when
+    /// asked whether it would vote (a vote of no term, which none grants
+    /// or keeps); one that does not answer is taken for another.
+    async fn others(&self, copies: &[String], opts: &PrimaryOptions) -> Vec<String> {
+        let id = self.kept.lock().await.id.clone();
+        let req = pb::VoteRequest { candidate: id, pre: true, ..Default::default() };
+        let asks = copies.iter().map(|url| {
+            let req = req.clone();
+            async move {
+                let mut c = coord::client(url, opts.token.as_ref(), opts.ca.as_deref()).ok()?;
+                match tokio::time::timeout(opts.call_timeout, c.vote(req)).await {
+                    Ok(Ok(a)) => Some(a.into_inner().candidate),
+                    _ => None,
+                }
+            }
+        });
+        let said = futures::future::join_all(asks).await;
+        copies.iter().zip(said).filter(|(_, me)| *me != Some(true)).map(|(u, _)| u.clone()).collect()
+    }
+
+    /// Begins the term it won (`won`, [`Self::campaign`]), or, when none,
+    /// a term above every term it knows, under the lock calls from its
+    /// primary take, so that a call of the old primary that follows is
+    /// answered with the new term; then ships as `opts` says. Refused (409)
+    /// when it learned of a newer term than the one it won.
+    pub async fn take_over(&self, won: Option<u64>, opts: PrimaryOptions) -> Result<(Arc<Primary>, Json), ApiError> {
         let mut kept = self.kept.lock().await;
-        let term = kept.newest(self.db.storage().numbering().map_or(0, |n| n.term)) + 1;
+        let newest = kept.newest(self.db.storage().numbering().map_or(0, |n| n.term));
+        let term = match won {
+            Some(t) if newest > t || kept.voted.as_ref().is_none_or(|(vt, c)| *vt != t || *c != kept.id) => {
+                return Err(conflict(format!("this replica won term {t}, but learned of term {newest} since: another copy was elected")));
+            }
+            Some(t) => t,
+            None => newest + 1,
+        };
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().begin_term(term).map_err(ApiError::from)))
             .await
             .map_err(ApiError::internal)??;
-        let next = Kept { id: kept.id.clone(), role: Some(KeptRole::Primary { replicas: opts.replicas.clone(), acks: opts.acks }), ..Kept::default() };
+        let next = Kept { id: kept.id.clone(), role: Some(KeptRole::Primary { replicas: opts.replicas.clone(), acks: opts.acks }), voted: kept.voted.clone(), member: true, ..Kept::default() };
         next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the replication id: {e}")))?;
         *kept = next.clone();
         let at = self.db.storage().numbering().unwrap_or_default();
-        tracing::info!(term, seq_no = at.seq, replicas = %opts.replicas.join(", "), write_acks = opts.acks.name(), "promoted: the primary of a new term");
+        tracing::info!(term, seq_no = at.seq, replicas = %opts.replicas.join(", "), write_acks = opts.acks.name(), elected = won.is_some(), "promoted: the primary of a new term");
         let p = Primary::run(self.db.clone(), self.file.as_deref(), next, opts).map_err(ApiError::internal)?;
-        Ok((p, json!({"term": at.term, "seq_no": at.seq, "replicas": copies})))
+        Ok((p, json!({"term": at.term, "seq_no": at.seq})))
     }
 
     /// Applies a primary's batch (`Replicate`), one batch at a time.
     pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
         let mut kept = self.kept.lock().await;
         let numbering = self.db.storage().numbering().ok_or_else(|| ApiError::internal("the replica does not number its writes"))?;
-        let term = numbering.term.max(kept.follows.as_ref().map_or(0, |f| f.1));
+        // A term it voted in counts: the primary of an older one lost.
+        let term = kept.newest(numbering.term);
         let answer = |matched: bool, at: SeqNo, replica_term: u64| pb::ReplicateResponse { matched, seq: at.seq, term: at.term, replica_term };
         if r.term < term {
             return Ok(answer(false, numbering.last(), term));
         }
         self.follow(&mut kept, &r.primary, r.term)?;
+        if r.member && !kept.member {
+            let mut next = kept.clone();
+            next.member = true;
+            next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep that it counts among its shard's copies: {e}")))?;
+            *kept = next;
+        }
         let (db, prev, txns) = (self.db.clone(), SeqNo { term: r.prev_term, seq: r.prev_seq }, r.txns);
         let n = txns.len() as u64;
         let applied = tokio::task::spawn_blocking(move || {
@@ -1487,7 +1862,7 @@ impl Follow {
             }
             Some((_, t)) if *t == term => {}
             _ => {
-                let next = Kept { id: kept.id.clone(), follows: Some((primary.to_string(), term)), replaced_by: None, role: Some(KeptRole::Replica) };
+                let next = Kept { id: kept.id.clone(), follows: Some((primary.to_string(), term)), replaced_by: None, role: Some(KeptRole::Replica), voted: kept.voted.clone(), member: kept.member };
                 next.save(self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep the primary followed: {e}")))?;
                 *kept = next;
             }
@@ -1507,7 +1882,7 @@ impl Follow {
         let first = chunks.message().await.map_err(cut)?.ok_or_else(|| ApiError::bad("the copy is empty"))?;
         let mut kept = self.kept.lock().await;
         let numbering = self.db.storage().numbering().ok_or_else(|| ApiError::internal("the replica does not number its writes"))?;
-        let term = numbering.term.max(kept.follows.as_ref().map_or(0, |f| f.1));
+        let term = kept.newest(numbering.term);
         if first.term < term {
             return Ok(pb::ReplicateResponse { matched: false, seq: numbering.seq, term: numbering.last().term, replica_term: term });
         }
@@ -1586,6 +1961,10 @@ impl Follow {
         if let Some((primary, term)) = kept.follows {
             h["follows"] = json!({"primary": primary, "term": term});
         }
+        if let Some((term, candidate)) = kept.voted {
+            h["voted"] = json!({"term": term, "for": candidate});
+        }
+        h["member"] = json!(kept.member);
         if let Some(at) = *self.called_at.lock().unwrap_or_else(|e| e.into_inner()) {
             h["called_ms_ago"] = json!(at.elapsed().as_millis() as u64);
         }

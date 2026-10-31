@@ -380,7 +380,7 @@ function render(page) {
             (rep.replicas || []).map((x) => h("div", { class: "row nw small" }, h("span", { class: "dot " + (x.in_sync ? "ok" : "warn") }), h("span", { class: "mono grow ellipsis" }, short(x.url)), h("span", { class: "dim" }, `${x.in_sync ? "in sync" : fmt.n(x.behind) + " behind"} · ${x.copies} copies · ${x.divergences} divergences`))))
           : h("dl", { class: "kv" }, [["term", rep.term], ["sequence", fmt.n(rep.seq_no)], ["follows", rep.follows?.primary], ["serves reads", rep.serves_reads ? "yes" : "no"], ["read waits", fmt.n(rep.read_waits)], ["reads refused", fmt.n(rep.reads_refused)], ["copies restored", fmt.n(rep.restores)], ["last shipped", rep.called_ms_ago != null ? fmt.ms(rep.called_ms_ago) + " ago" : "–"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v ?? "–")])) }) : null,
         card({ title: "Operate it", sub: "from a shell that reaches it", body: h("div", { class: "stack", style: { gap: "8px" } },
-          !r.takes_writes ? cmd(`strata-server promote --replica ${r.url} --token "$STRATA_TOKEN"`, "Make this replica the primary of a new term") : null,
+          !r.takes_writes ? cmd(`curl -s -H "authorization: Bearer $STRATA_TOKEN" -X POST ${location.origin}/v1/admin/shards/${sh.shard}/promote -d '{"url": "${r.url}"}'`, "Make this replica its shard's primary, once a majority of the shard's copies vote for it: a primary that serves steps down and follows it") : null,
           cmd(`curl -s -H "authorization: Bearer $STRATA_TOKEN" -X POST http://<its HTTP address>/v1/admin/checkpoint`, "Write a checkpoint on it"),
           cmd(`curl -s -H "authorization: Bearer $STRATA_TOKEN" http://<its HTTP address>/v1/stats`, "Its storage statistics")) }),
       ],

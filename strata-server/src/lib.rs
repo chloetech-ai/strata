@@ -34,6 +34,7 @@ pub mod logstore;
 pub mod media;
 pub mod metrics;
 pub mod obs;
+pub mod operator;
 pub mod plan_pb;
 pub mod profiler;
 pub mod profiling;

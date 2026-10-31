@@ -107,10 +107,12 @@ fn scifact_round_trip_and_zero_copy() {
     }
     let (compressed, raw) = store.byte_sizes();
     eprintln!("scifact doc store: {raw} bytes raw, {compressed} compressed, {} blocks", store.n_blocks());
+    // Sections are named by field id (`key_of`), not by the field's name.
     for f in ["year", "rating"] {
-        let col = NumericColumn::open(&seg, f).unwrap();
+        let key = schema.key_of(f).unwrap();
+        let col = NumericColumn::open(&seg, &key).unwrap();
         assert!(col.is_view());
-        let idx = RangeIndex::open(&seg, f).unwrap();
+        let idx = RangeIndex::open(&seg, &key).unwrap();
         assert!((0..idx.len()).all(|b| idx.bucket(b).is_view()));
         let fi = schema.field_index(f).unwrap();
         for (d, doc) in c.docs.iter().enumerate() {
@@ -118,7 +120,7 @@ fn scifact_round_trip_and_zero_copy() {
         }
     }
     for f in ["category", "topic", "id"] {
-        let col = KeywordColumn::open(&seg, f).unwrap();
+        let col = KeywordColumn::open(&seg, &schema.key_of(f).unwrap()).unwrap();
         assert!(col.is_view());
         let fi = schema.field_index(f).unwrap();
         for (d, doc) in c.docs.iter().enumerate() {
