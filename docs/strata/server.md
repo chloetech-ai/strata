@@ -72,7 +72,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 ## Schemas
 
-A database starts with one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the UI's schema designer, or `strata.Database.create` in [Python](python.md)). [`CREATE TABLE`](query-language.md#tables) and `DROP TABLE` over `POST /v1/sql` add and drop more, and the server serves every table: SQL names its tables, write operations and imports name theirs (`"table"`, `?table=`; the first table when they name none), `GET /v1/tables` lists the schemas and `GET /v1/schema?table=` gives one. [`CREATE RANK PROFILE`](query-language.md#rank-profiles-a-ranking-kept-with-its-table) and `DROP RANK PROFILE` keep rankings with a table the same way; unlike tables, a primary takes them and ships them to its replicas as it ships writes, and answers once the copies its acks name hold them. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
+A database starts with one table, whose schema is set when the database is created (`--schema FILE`, `strata-server import --schema FILE`, the query console's schema designer, or `strata.Database.create` in [Python](python.md)). [`CREATE TABLE`](query-language.md#tables) and `DROP TABLE` over `POST /v1/sql` add and drop more, and the server serves every table: SQL names its tables, write operations and imports name theirs (`"table"`, `?table=`; the first table when they name none), `GET /v1/tables` lists the schemas and `GET /v1/schema?table=` gives one. [`CREATE RANK PROFILE`](query-language.md#rank-profiles-a-ranking-kept-with-its-table) and `DROP RANK PROFILE` keep rankings with a table the same way; unlike tables, a primary takes them and ships them to its replicas as it ships writes, and answers once the copies its acks name hold them. A schema is JSON: the table's name, its key, and its fields by type, with options only where they differ from the defaults.
 
 ```json
 {
@@ -174,7 +174,7 @@ The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text e
 
 - writes that leave the vector out get it computed: `/v1/write` documents and SQL `INSERT`, and an `UPDATE` that changes a source recomputes it, all before the write queues for the writer (on as many writes at once as there are cores), so the writer never waits for a model (with bge-small on 4 cores, an in-place `UPDATE` beside two clients inserting rows went from 4.7 to 500 a second, and four inserting clients from 10 to 23 rows a second: [results](https://github.com/rkonow/strata/tree/main/strata-server/results/sql-writes)); a vector a write supplies is kept as given;
 - an `UPDATE` that changes a source recomputes the vector; merges do not (they keep the stored vectors);
-- a parameter `{"embed": "some text", "field": "emb_title"}` is the text's vector by that field's model, so queries and rows are always embedded alike (`field` defaults to the first embedded field with a model); the UI's "Similar to: a description" uses the chosen vector field's model.
+- a parameter `{"embed": "some text", "field": "emb_title"}` is the text's vector by that field's model, so queries and rows are always embedded alike (`field` defaults to the first embedded field with a model); the query console's "Similar to: a description" uses the chosen vector field's model.
 
 Several fields can embed different sources side by side, and a query picks one: `ORDER BY similarity(emb_title, :q)`, or both fused, `rrf(similarity(emb_title, :q), similarity(emb_both, :p))`. Each 512-dimension field costs about 0.5 KB a row as 8-bit codes, plus its HNSW graph.
 
@@ -395,7 +395,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `GET /livez`, `/readyz` | | `{status}`, with 503 when the server must be restarted ([health](#health)) |
 | `GET /v1/stats`, `/v1/config` | | JSON |
 | `GET /metrics` | | Prometheus text |
-| `GET /` | | the UI |
+| `GET /`, `/classic`, `/ui/*` | | the [command center](#the-ui), the [query console](#the-query-console) and their files |
 
 ```sh
 curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
@@ -429,7 +429,7 @@ An `add` with a `"doc"` creates the row when no row has its key: the row is the 
 
 An answer of 200 means the batch is durable, and an error that nothing of it was written, so a client can retry on an error. When an answer is lost (a timeout, a dropped connection, a coordinator whose other replica failed), send the retry with the same `idempotency_key` (or an `Idempotency-Key` header), 1 to 256 characters: a server that already applied that batch answers with its first `written` instead of applying it again, so an `add` counts once and an `insert` does not fail as a duplicate of itself. The same key with other operations is refused (422), and while the first attempt still runs a retry gets 409. A server remembers keys for an hour, the latest 100,000, in memory, so a restart forgets them. A coordinator passes the key to each shard as `key/shard`. Over gRPC, `WriteRequest.idempotency_key` does the same.
 
-With `--token`, every route except `/`, `/v1/health`, `/livez` and `/readyz` needs `Authorization: Bearer <token>`; the UI asks for the token.
+With `--token`, every route except the UI's (`/`, `/classic`, `/ui/*`), `/v1/health`, `/livez` and `/readyz` needs `Authorization: Bearer <token>`; the UI asks for the token.
 
 ### Conditional writes
 
@@ -735,7 +735,30 @@ A local database merges its segments on merger threads as writes add them ([how 
 
 ## The UI
 
-`GET /` serves a single page with six tabs.
+`GET /` serves the command center, a console for one server or a whole cluster. It reads the same API as any client (the series, health, alerts, the cluster's shards, running and recent queries, the logs, keys and the audit log), so what it shows is what the server reports, and every change it makes is an API call a key's scope allows.
+
+![The command center's overview of a coordinator over two shards, each with a replica](../assets/img/strata-command-center.png)
+
+- **Overview**: the headline numbers with their last minutes (queries per second, p99, the share failing, rows written and stored, CPU), throughput and latency over the chosen range with the moments alerts fired, the cluster in small (or, on a single server, where writes go: write-ahead log, memtable, segments), the mix of queries by kind, how full the limits are, the alerts firing, the costliest statements and the queries running now.
+- **Topology** (a coordinator) draws the coordinator and each shard's copies, with calls per second on the links and each replica's lag behind its primary; drag the boxes, pan and zoom, and click a copy for its health, load, replication and the commands that act on it (promote a replica, write a checkpoint, read its statistics). The slot ring shows which shard owns which keys. A single server shows its storage instead, with writes flowing through it.
+
+![The topology: the coordinator, two shards and their replicas, calls per second on each link](../assets/img/strata-command-center-topology.png)
+
+- **Performance** charts queries (rate, latency percentiles, a latency heatmap, refusals), writes, resources, storage and replication over the range; drag across a chart to zoom every chart to that span. Tables rank the routes, query kinds and gRPC calls, and a tuning advisor reads the numbers and says what to change (a merge, a vacuum, `--max-concurrent`, `--query-memory-mb`, `cluster_by`, a `LIMIT`).
+- **Alerts** lists the rules with each one's metric over the range and its threshold, a timeline of when rules fired, and the events. Drag a rule to reorder it, switch it off, or edit it: pick the metric, drag its threshold on the chart, and see how often it would have fired over the range before saving.
+- **Queries** shows the running queries (cancel one), the latest and the slow ones, and the statements by total time. A dot per query plots latency against time; click one for its SQL, its plan as a waterfall of spans across shards, the other queries of the same request and its log lines.
+- **Logs** follows the server's latest lines, by level, text or request id, with the rate of lines by level, and changes what the server logs while it runs (`PUT /v1/logs/filter`).
+- **Access** says who you are, checks the server's posture (a token, keys, loopback, TLS), makes keys with a scope and an expiry (showing the secret once), revokes them, and reads the audit log.
+- **System** shows the process, the database and its disk, the limits and the configuration, the segments and merges, the operations (check, vacuum, checkpoint, verify replicas, reset statistics) and the `/metrics` text with a filter.
+- **Query console** is the earlier UI, below (`#/classic`).
+
+The time range (5 minutes to an hour), live or paused, applies to every chart; each view has an address (`#/queries?tab=slow`), so a link opens the same view. `Ctrl K` (`⌘K`) finds any view or action, `g` then a letter goes to a view, and `?` lists the shortcuts. The page follows the system's light or dark theme unless you choose one.
+
+The page and its modules (`strata-server/ui/`) are compiled into the binary. To work on them without rebuilding, start the server with `STRATA_UI_DIR=strata-server/ui`: it then reads them from there on each request.
+
+### The query console
+
+`GET /classic`, and the command center's **Query console**, serve the query console, a single page with six tabs.
 
 ![The query builder: search text, similar to a description, weighted fusion, a filter, the SQL it writes, and the results](../assets/img/strata-server-builder.png)
 
@@ -750,6 +773,6 @@ A local database merges its segments on merger threads as writes add them ([how 
 
 ## The agent
 
-`POST /v1/agent`, and the UI's third tab, give a Claude model one tool, `run_sql`, which runs a read-only `SELECT` on the table. The model sees the schema and a description of Strata's SQL (it runs facet queries to learn a field's values), then searches, filters, ranks, counts and facets until it can answer, for at most `max_steps` model calls (8 by default, 20 at most). The answer lists every query it ran, with its row count and time, so you can check its work or open a query in the editor. Writes are refused.
+`POST /v1/agent`, and the query console's **Ask an agent** tab, give a Claude model one tool, `run_sql`, which runs a read-only `SELECT` on the table. The model sees the schema and a description of Strata's SQL (it runs facet queries to learn a field's values), then searches, filters, ranks, counts and facets until it can answer, for at most `max_steps` model calls (8 by default, 20 at most). The answer lists every query it ran, with its row count and time, so you can check its work or open a query in the editor. Writes are refused.
 
 The model is a setting: `--model` sets the server's default (`claude-haiku-5-5`), and a request or the UI can name any other model id and an effort level. The API key comes from `ANTHROPIC_API_KEY` on the server, or from the request (`api_key`, never stored by the server; the UI keeps it in the browser only if you tick "remember").

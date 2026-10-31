@@ -55,7 +55,7 @@ use futures::StreamExt;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json as AxJson, Router};
 use serde_json::{json, Value as Json};
@@ -68,9 +68,8 @@ use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
 use crate::keys::{self, Principal, Scope};
-use crate::{agent, json as js, obs, telemetry, ApiError};
+use crate::{agent, json as js, obs, telemetry, ui, ApiError};
 
-const UI: &str = include_str!("../ui/index.html");
 
 /// Why a request failed on the server's side, for [`observe`] to log.
 #[derive(Clone)]
@@ -156,7 +155,9 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/alerts/rules", put(put_alert_rules))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
-        .route("/", get(|| async { Html(UI) }))
+        .route("/", get(ui::index))
+        .route("/classic", get(ui::classic))
+        .route("/ui/*file", get(ui::file))
         .route("/v1/health", get(health))
         .route("/livez", get(live))
         .route("/readyz", get(live))
