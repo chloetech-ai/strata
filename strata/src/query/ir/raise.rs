@@ -373,15 +373,18 @@ impl<'a> Raise<'a> {
                 crate::text::query::parse_match_with(query, fld.text_analyzer())?;
                 Pred::Match { field: f, query: query.clone(), expand: *expand }
             }
-            Expr::Prefix { expr, prefix } => {
+            Expr::Prefix { expr, prefix, edits } => {
                 let f = self.field_of(expr)?;
                 let fld = &self.schema.fields[f];
                 if fld.ty != FieldType::Keyword || !fld.indexed {
                     return Err(err(format!("a Search's PREFIX needs an indexed KEYWORD field, not {}", fld.name)));
                 }
+                if *edits > 2 {
+                    return Err(err(format!("PREFIX allows 0 to 2 edits, not {edits}")));
+                }
                 match self.lit(prefix)? {
                     Value::Str(p) if p.is_empty() => Pred::Present { field: f },
-                    Value::Str(p) => Pred::Prefix { field: f, prefix: p },
+                    Value::Str(p) => Pred::Prefix { field: f, prefix: p, edits: *edits },
                     v => return Err(err(format!("PREFIX of {} takes text, not {v:?}", fld.name))),
                 }
             }
@@ -759,7 +762,7 @@ impl<'a> Raise<'a> {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) => go(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::AtLeast { conds: xs, .. } | Expr::Concat(xs) => all(xs),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => go(left).and_then(|_| go(right)),
-            Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern } => go(expr).and_then(|_| go(pattern)),
+            Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern, .. } => go(expr).and_then(|_| go(pattern)),
             Expr::Between { expr, lo, hi } => [Some(expr), lo.as_ref(), hi.as_ref()].into_iter().flatten().try_for_each(|x| go(x)),
             Expr::In { expr, list } => go(expr).and_then(|_| all(list)),
             Expr::Case { operand, whens, otherwise } => {

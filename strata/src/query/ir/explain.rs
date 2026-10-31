@@ -320,7 +320,8 @@ impl<'a> Text<'a> {
             Expr::Like { expr, pattern, case_insensitive } => {
                 format!("{} {} {}", self.operand(expr, names), if *case_insensitive { "ILIKE" } else { "LIKE" }, self.operand(pattern, names))
             }
-            Expr::Prefix { expr, prefix } => format!("PREFIX({}, {})", self.expr(expr, names), self.expr(prefix, names)),
+            Expr::Prefix { expr, prefix, edits: 0 } => format!("PREFIX({}, {})", self.expr(expr, names), self.expr(prefix, names)),
+            Expr::Prefix { expr, prefix, edits } => format!("PREFIX({}, {}, fuzzy => {edits})", self.expr(expr, names), self.expr(prefix, names)),
             Expr::Case { operand, whens, otherwise } => {
                 let mut s = "CASE".to_string();
                 if let Some(o) = operand {

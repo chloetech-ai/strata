@@ -182,8 +182,9 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
             }
             _ => Value::Null,
         },
-        Expr::Prefix { expr, prefix } => match (eval(expr, row)?, eval(prefix, row)?) {
-            (Value::Str(s), Value::Str(p)) => Value::Bool(s.starts_with(&p)),
+        Expr::Prefix { expr, prefix, edits } => match (eval(expr, row)?, eval(prefix, row)?) {
+            (Value::Str(s), Value::Str(p)) if *edits == 0 => Value::Bool(s.starts_with(&p)),
+            (Value::Str(s), Value::Str(p)) => Value::Bool(crate::text::fuzzy::prefix_within(&p.chars().collect::<Vec<_>>(), &s, *edits)),
             _ => Value::Null,
         },
         Expr::Case { operand, whens, otherwise } => {

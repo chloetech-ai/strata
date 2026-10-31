@@ -221,7 +221,7 @@ fn expr(e: &Expr) -> E {
         Expr::Neg(x) => E::Neg(Box::new(ex(x))),
         Expr::Concat(xs) => E::Concat(exprs(xs)),
         Expr::Like { expr, pattern, case_insensitive } => E::Like(Box::new(pb::Like { expr: bex(expr), pattern: bex(pattern), case_insensitive: *case_insensitive })),
-        Expr::Prefix { expr, prefix } => E::Prefix(Box::new(pb::Prefix { expr: bex(expr), prefix: bex(prefix) })),
+        Expr::Prefix { expr, prefix, edits } => E::Prefix(Box::new(pb::Prefix { expr: bex(expr), prefix: bex(prefix), edits: *edits as u32 })),
         Expr::Case { operand, whens, otherwise } => E::Case(Box::new(pb::Case {
             operand: operand.as_deref().and_then(bex),
             whens: whens.iter().map(|w| pb::When { when: Some(ex(&w.when)), then: Some(ex(&w.then)) }).collect(),
@@ -564,7 +564,8 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
         }
         E::Prefix(p) => {
             let p = *p;
-            Expr::Prefix { expr: from_bex(p.expr)?, prefix: from_bex(p.prefix)? }
+            let edits = u8::try_from(p.edits).ok().filter(|&e| e <= 2).ok_or_else(|| bad(format!("a prefix allows 0 to 2 edits, not {}", p.edits)))?;
+            Expr::Prefix { expr: from_bex(p.expr)?, prefix: from_bex(p.prefix)?, edits }
         }
         E::Case(c) => {
             let c = *c;

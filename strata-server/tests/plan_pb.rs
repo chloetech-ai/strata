@@ -83,6 +83,7 @@ const SELECTS: &[&str] = &[
     // Some of the conditions, and how many hold.
     "SELECT id, count_true(year > 2000, tags = 'x', MATCH(body, 'net')) AS k FROM papers WHERE AT_LEAST(2, MATCH(body, 'graph'), year >= 2019, NOT AT_LEAST('50%', rating > 1, category IN ('a', 'b'))) ORDER BY bm25(body, 'graph') * (1 + count_true(done, rating IS NULL)) DESC LIMIT 5",
     "SELECT id FROM papers WHERE category LIKE 'm%' OR (PREFIX(id, 'p1') AND id NOT LIKE 'p1!_%' ESCAPE '!') ORDER BY year DESC LIMIT 5",
+    "SELECT id FROM papers WHERE PREFIX(category, 'mtah', fuzzy => 'auto') OR PREFIX(id, 'p2', fuzzy => 1) ORDER BY year DESC LIMIT 5",
 ];
 
 /// Compound queries: operators over single-table queries.

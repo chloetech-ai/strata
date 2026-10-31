@@ -35,13 +35,14 @@ pub trait Estimator {
     fn range_count(&self, field: usize, lo: f64, hi: f64) -> f64;
     /// Documents whose keyword field equals one of `values` (exact).
     fn in_count(&self, field: usize, values: &[Value]) -> f64;
-    /// Documents whose keyword field has a value starting with `prefix`.
-    fn prefix_count(&self, _field: usize, _prefix: &str) -> f64 {
+    /// Documents whose keyword field has a value starting with `prefix`
+    /// (or one within `edits` edits of it, [`Pred::Prefix`]).
+    fn prefix_count(&self, _field: usize, _prefix: &str, _edits: u8) -> f64 {
         self.n_docs()
     }
     /// Nanoseconds to materialise a prefix, if the index can estimate it
     /// (otherwise its matches' postings).
-    fn prefix_cost(&self, _field: usize, _prefix: &str) -> Option<f64> {
+    fn prefix_cost(&self, _field: usize, _prefix: &str, _edits: u8) -> Option<f64> {
         None
     }
     /// Documents with a value of `field`.
@@ -174,9 +175,9 @@ impl<E: Estimator> Planner<'_, E> {
                     probeable: true,
                 }
             }
-            Pred::Prefix { field, prefix } => {
-                let card = self.est.prefix_count(*field, prefix).min(n);
-                let cost = self.est.prefix_cost(*field, prefix).unwrap_or(card * (c.posting + c.emit));
+            Pred::Prefix { field, prefix, edits } => {
+                let card = self.est.prefix_count(*field, prefix, *edits).min(n);
+                let cost = self.est.prefix_cost(*field, prefix, *edits).unwrap_or(card * (c.posting + c.emit));
                 PredEstimate { card, mat_cost: c.leaf + cost, probe_cost: c.probe_keyword, probeable: true }
             }
             Pred::Graph { id } => {
