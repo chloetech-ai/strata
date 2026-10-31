@@ -260,6 +260,12 @@ impl Service {
         // Steps count from this moment, which must come before any
         // request's start for them to line up with its trace.
         steps::epoch();
+        // With the counting allocator, a profiled query's steps carry the
+        // bytes they allocated, and the heap's peak is kept.
+        if crate::heap::installed() {
+            steps::count_allocations(crate::heap::thread_allocated);
+            crate::heap::watch();
+        }
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let idempotency = Arc::new(idem::Keys::default());
         let writer_state = Arc::new(WriterState::default());
@@ -2182,9 +2188,15 @@ impl Service {
         self.metrics.totals(&mut s);
         let (rss, cpu) = telemetry::process_usage();
         s.cpu_s = cpu;
+        let heap = crate::heap::stats();
+        (s.alloc_bytes, s.allocs) = (heap.allocated_bytes, heap.allocs);
         let g = &mut s.gauges;
         if let Some(r) = rss {
             g.insert("rss_bytes", r as f64);
+        }
+        if heap.installed {
+            g.insert("heap_bytes", heap.in_use_bytes as f64);
+            g.insert("heap_peak_bytes", heap.peak_bytes as f64);
         }
         g.insert("running", self.running() as f64);
         g.insert("live", self.live.len() as f64);

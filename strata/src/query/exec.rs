@@ -1389,9 +1389,10 @@ impl<'a> Executor<'a> {
         let mut res = Vec::with_capacity(outs.len());
         for o in outs {
             let (r, l) = o.expect("every segment ran");
-            // A helper thread's CPU time counts in the steps around it.
+            // A helper thread's CPU time and allocations count in the
+            // steps around it.
             if let Some(seg) = l.steps.first().filter(|s| s.thread != 0) {
-                self.clock.helped += seg.cpu_us.unwrap_or(0.0);
+                self.clock.helped_by(seg);
             }
             self.absorb(l);
             res.push(r?);

@@ -17,6 +17,11 @@
 
 use std::path::PathBuf;
 
+/// Every allocation counted: the heap's size, its rate and where it is
+/// allocated (`strata_server::heap`).
+#[global_allocator]
+static ALLOC: strata_server::heap::Counting = strata_server::heap::Counting;
+
 use clap::{Parser, Subcommand};
 use strata_server::auth::{self, Access, Secret, Tls};
 use strata_server::obs;

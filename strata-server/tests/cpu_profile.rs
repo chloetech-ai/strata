@@ -107,3 +107,14 @@ async fn a_cpu_profile_samples_the_server_s_threads() {
     assert_eq!(p["runs"]["clients"], 4);
     assert!(p["runs"]["count"].as_u64().unwrap() >= 4, "{}", p["runs"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_counting_allocator_memory_says_so() {
+    // This test binary keeps the system's allocator.
+    let base = serve().await;
+    let m: Json = reqwest::get(format!("{base}/v1/profile/memory")).await.unwrap().json().await.unwrap();
+    assert_eq!(m["heap"]["installed"], false, "{m}");
+    assert_eq!(m["heap"]["in_use_bytes"], 0, "{m}");
+    let (status, body) = post(&base, "/v1/profile/heap", json!({"seconds": 0.1})).await;
+    assert_eq!(status, 501, "{body}");
+}

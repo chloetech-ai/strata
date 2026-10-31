@@ -22,6 +22,7 @@ pub mod auth;
 pub mod coord;
 pub mod demo;
 pub mod grpc;
+pub mod heap;
 pub mod http;
 pub mod idem;
 pub mod json;
