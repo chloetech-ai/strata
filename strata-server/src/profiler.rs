@@ -13,7 +13,7 @@
 //! at 99 Hz and 11% fewer at 997 Hz, and by four callers within the noise
 //! (about 4%). The names are read from the binary's symbol table after the
 //! timer stops, so that work is not in the profile. The first profile
-//! makes the sampler's table, about 100 MB, which the process keeps
+//! makes the sampler's table, about 70 MB, which the process keeps
 //! (`release`).
 
 use std::collections::HashMap;
@@ -170,10 +170,13 @@ async fn sample<T>(hz: i32, seconds: f64, during: impl Future<Output = T>) -> Re
     let raw = guard.report().build_unresolved().map_err(|e| Refused::Unavailable(e.to_string()))?;
     // The timer stops before the names are read.
     drop(guard);
-    release();
-    let stacks: Vec<(pprof::Frames, u64)> = tokio::task::spawn_blocking(move || raw.data.into_iter().map(|(f, n)| (pprof::Frames::from(f), n.max(0) as u64)).collect())
-        .await
-        .map_err(|e| Refused::Unavailable(e.to_string()))?;
+    let stacks: Vec<(pprof::Frames, u64)> = tokio::task::spawn_blocking(move || {
+        let named = raw.data.into_iter().map(|(f, n)| (pprof::Frames::from(f), n.max(0) as u64)).collect();
+        release();
+        named
+    })
+    .await
+    .map_err(|e| Refused::Unavailable(e.to_string()))?;
     let mut p = profile(hz, took, stacks.iter().map(|(f, n)| (f.thread_name.as_str(), f.thread_id, f.frames.iter().rev().flat_map(|syms| syms.iter().rev()).map(|s| s.name()), *n)));
     p.seconds = (took * 1000.0).round() / 1000.0;
     p.cpu_seconds = (cpu * 1e4).round() / 1e4;
@@ -181,13 +184,16 @@ async fn sample<T>(hz: i32, seconds: f64, during: impl Future<Output = T>) -> Re
     Ok((p, out))
 }
 
-/// Gives the system back the memory the C library holds freed. The
-/// sampler's table of stacks (`pprof`'s, 16,384 places of 128 frames,
-/// about 100 MB) is made the first time a profile is taken and kept by
-/// the process; each profile that ends makes a new one and frees the old,
-/// which glibc would otherwise keep, resident, for later allocations.
-#[cfg(unix)]
-fn release() {
+/// Gives back what a profile leaves behind once its frames are named: the
+/// debug information read to name them, which `backtrace` would otherwise
+/// keep parsed (about 30 MB of heap for this binary), and the memory the C
+/// library holds freed. The CPU sampler's table of stacks (`pprof`'s,
+/// 16,384 places of 128 frames, about 70 MB) is made the first time a
+/// profile is taken and kept by the process; each profile that ends makes
+/// a new one and frees the old, which glibc would otherwise keep,
+/// resident, for later allocations.
+pub(crate) fn release() {
+    backtrace::clear_symbol_cache();
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: malloc_trim takes the allocator's own locks, and is called
     // outside any of its functions.
@@ -290,7 +296,7 @@ where
 /// A thread's name without the number that tells a pool's threads apart
 /// (`strata-query-3` is `strata-query`); a thread with no name is named by
 /// its id.
-fn pool_name(name: &str, id: u64) -> String {
+pub(crate) fn pool_name(name: &str, id: u64) -> String {
     if name.is_empty() {
         return format!("thread {id}");
     }
@@ -305,11 +311,59 @@ fn pool_name(name: &str, id: u64) -> String {
 
 /// A frame's name without the hash a Rust symbol ends with
 /// (`strata::db::Db::execute::h0123456789abcdef`).
-fn clean(name: &str) -> String {
+pub(crate) fn clean(name: &str) -> String {
     match name.rfind("::h") {
         Some(i) if name.len() - i == 19 && name[i + 3..].bytes().all(|b| b.is_ascii_hexdigit()) => name[..i].to_string(),
         _ => name.to_string(),
     }
+}
+
+/// A thread of the process, as the system sees it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ThreadInfo {
+    pub tid: u64,
+    pub name: String,
+    /// R running, S sleeping, D waiting on the disk, ...
+    pub state: String,
+    /// CPU time, user and system, in seconds.
+    pub cpu_s: f64,
+    /// Times it gave the CPU up (waiting on a lock, a read, a timer) and
+    /// times it was made to.
+    pub voluntary: u64,
+    pub involuntary: u64,
+}
+
+/// The process's threads, from `/proc/self/task` (Linux; empty elsewhere).
+pub fn threads() -> Vec<ThreadInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let tick = (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as f64;
+        let Ok(dir) = std::fs::read_dir("/proc/self/task") else { return Vec::new() };
+        let mut out: Vec<ThreadInfo> = dir.filter_map(|e| thread_info(&e.ok()?.path(), tick)).collect();
+        out.sort_by_key(|t| t.tid);
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn thread_info(dir: &std::path::Path, tick: f64) -> Option<ThreadInfo> {
+    let tid = dir.file_name()?.to_str()?.parse().ok()?;
+    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+    // pid (name) state ...: the name may hold spaces and parentheses.
+    let (head, rest) = stat.rsplit_once(')')?;
+    let name = head.split_once('(')?.1.to_string();
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // After the name: state is field 3, utime 14 and stime 15.
+    let state = f.first()?.to_string();
+    let ticks = f.get(11)?.parse::<f64>().ok()? + f.get(12)?.parse::<f64>().ok()?;
+    let status = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
+    let field = |k: &str| status.lines().find_map(|l| l.strip_prefix(k)?.trim().parse::<u64>().ok()).unwrap_or(0);
+    Some(ThreadInfo { tid, name, state, cpu_s: ticks / tick, voluntary: field("voluntary_ctxt_switches:"), involuntary: field("nonvoluntary_ctxt_switches:") })
 }
 
 #[cfg(test)]
@@ -341,6 +395,18 @@ mod tests {
         let folded = p.folded();
         assert!(folded.lines().any(|l| l == "strata-query;main;run;bm25 5"), "{folded}");
         assert_eq!(folded.lines().count(), 3);
+    }
+
+    #[test]
+    fn the_threads_are_listed_with_their_cpu_time() {
+        let ts = threads();
+        if cfg!(target_os = "linux") {
+            // This thread, reading them, is running.
+            assert!(ts.iter().any(|t| t.state == "R" && !t.name.is_empty()), "{ts:?}");
+            assert!(ts.iter().all(|t| t.cpu_s >= 0.0));
+        } else {
+            assert!(ts.is_empty());
+        }
     }
 
     #[test]

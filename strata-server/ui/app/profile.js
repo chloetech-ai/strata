@@ -77,9 +77,12 @@ export function profileFigures(p) {
   const top = steps.filter((x) => !x.depth);
   // CPU time: each measured step's, those inside it counted in it (a
   // coordinator measures none of its own, its shards theirs).
-  let cpu = null;
+  let cpu = null, alloc = null, allocs = null;
   const walk = (n) => { if (n.cpu_us != null) cpu = (cpu || 0) + n.cpu_us; else n.kids.forEach(walk); };
-  stepTree(steps).forEach(walk);
+  const walkAlloc = (n) => { if (n.alloc_bytes != null) { alloc = (alloc || 0) + n.alloc_bytes; allocs = (allocs || 0) + (n.allocs || 0); } else n.kids.forEach(walkAlloc); };
+  const tree = stepTree(steps);
+  tree.forEach(walk);
+  tree.forEach(walkAlloc);
   // The segments searched: each step's that names one, and the threads
   // their steps ran on (on a coordinator, each shard's own).
   const onSeg = steps.filter((x) => x.seg != null);
@@ -89,7 +92,7 @@ export function profileFigures(p) {
   const threads = new Set((segSteps.length ? segSteps : onSeg).map((x) => x.thread || 0));
   const exec = (p.trace || []).find((x) => x.name === "execute");
   const wall = exec ? exec.dur_us : top.length ? Math.max(...top.map((x) => x.start_us + x.us)) - Math.min(...top.map((x) => x.start_us)) : 0;
-  return { cpu, segs: segs.size, threads: threads.size, wall, shards: steps.filter((x) => x.op === "shard").length };
+  return { cpu, alloc, allocs, segs: segs.size, threads: threads.size, wall, shards: steps.filter((x) => x.op === "shard").length };
 }
 
 export function kpi(label, value, sub, title) {
@@ -108,7 +111,9 @@ export function profileView(p, { compact = false } = {}) {
     kpi("Executing", us(f.wall), took ? `${fmt.pct(f.wall / 1000 / took, 0)} of the server's time` : null, "The executor's run (the trace's execute span)"),
     kpi("CPU", f.cpu == null ? "–" : us(f.cpu), f.cpu == null ? (p.profiled === false ? "run it with profile on" : "not measured") : f.wall ? `${(f.cpu / f.wall).toFixed(1)}× parallel` : null, "CPU time of every thread that worked for the query; above the wall time when segments ran on several threads"),
     kpi("Segments", fmt.n(f.segs), f.threads ? `on ${fmt.plural(f.threads, "thread")}` : null),
-    f.shards ? kpi("Shards", fmt.n(f.shards), "calls in the profile") : kpi("Steps", fmt.n(steps.length), p.steps_dropped ? `${fmt.n(p.steps_dropped)} not kept` : null),
+    f.shards ? kpi("Shards", fmt.n(f.shards), "calls in the profile")
+      : f.alloc != null ? kpi("Allocated", fmt.bytes(f.alloc), `${fmt.plural(f.allocs, "allocation")} · ${fmt.plural(steps.length, "step")}`, "Bytes the query's threads allocated while it ran (not what they kept: frees are not taken off)")
+      : kpi("Steps", fmt.n(steps.length), p.steps_dropped ? `${fmt.n(p.steps_dropped)} not kept` : null),
     kpi("Rows", fmt.n(Array.isArray(p.rows) ? p.rows.length : p.rows), [p.filter_docs != null ? `${fmt.si(p.filter_docs)} filtered` : null, p.scored ? `${fmt.si(p.scored)} scored` : null].filter(Boolean).join(" · ") || null));
   const parts = [figures];
   parts.push(card({ title: "Flame chart", sub: "every step on one time scale · click a step to zoom, hover for its figures", body: flameChart(roots, p.trace || []), tools: legend(steps) }));
@@ -146,6 +151,7 @@ function tipOf(n) {
     h("div", { class: "r" }, h("span", { class: "k box", style: { background: stepColor(n.op) } }), h("b", {}, us(n.us)), h("span", { class: "n" }, "total")),
     n.self != null && n.kids?.length ? h("div", { class: "r" }, h("span", { class: "k box", style: { background: "transparent" } }), h("b", {}, us(n.self)), h("span", { class: "n" }, "self")) : null,
     n.cpu_us != null ? h("div", { class: "r" }, h("span", { class: "k box", style: { background: "transparent" } }), h("b", {}, us(n.cpu_us)), h("span", { class: "n" }, "CPU")) : null,
+    n.alloc_bytes != null ? h("div", { class: "r" }, h("span", { class: "k box", style: { background: "transparent" } }), h("b", {}, fmt.bytes(n.alloc_bytes)), h("span", { class: "n" }, `allocated, ${fmt.n(n.allocs || 0)}×`)) : null,
     n.rows != null ? h("div", { class: "r" }, h("span", { class: "k box", style: { background: "transparent" } }), h("b", {}, fmt.n(n.rows)), h("span", { class: "n" }, "rows")) : null,
     h("div", { class: "small muted", style: { marginTop: "3px" } }, `from ${us(n.start_us)}`)];
 }
@@ -273,9 +279,10 @@ function clip(t, n) { return t.length > n ? t.slice(0, Math.max(1, n - 1)) + "�
 export function opTree(roots, { bars = true } = {}) {
   const total = Math.max(1, ...roots.map((n) => n.start_us + n.us)) - Math.min(0, ...roots.map((n) => n.start_us));
   const hasCpu = flat(roots).some((n) => n.cpu_us != null);
+  const hasAlloc = flat(roots).some((n) => n.alloc_bytes != null);
   const tbody = h("tbody");
   const open = new Set();
-  const head = h("thead", {}, h("tr", {}, h("th", {}, "step"), h("th", { class: "num" }, "total"), bars ? h("th", {}, "") : null, h("th", { class: "num", title: "time not inside a child step" }, "self"), hasCpu ? h("th", { class: "num" }, "CPU") : null, h("th", { class: "num" }, "rows"), h("th", {}, "where")));
+  const head = h("thead", {}, h("tr", {}, h("th", {}, "step"), h("th", { class: "num" }, "total"), bars ? h("th", {}, "") : null, h("th", { class: "num", title: "time not inside a child step" }, "self"), hasCpu ? h("th", { class: "num" }, "CPU") : null, hasAlloc ? h("th", { class: "num", title: "bytes allocated in the step, on every thread that worked for it" }, "allocated") : null, h("th", { class: "num" }, "rows"), h("th", {}, "where")));
   function rowsOf(n, depth, out) {
     out.push(tr(n, depth));
     if (n.kids.length && !n.folded) {
@@ -290,12 +297,12 @@ export function opTree(roots, { bars = true } = {}) {
   }
   function segSummary(parent, segs, depth) {
     const t = segs.map((x) => x.us).sort((a, b) => a - b);
-    const sum = t.reduce((a, b) => a + b, 0), cpu = segs.reduce((a, x) => a + (x.cpu_us || 0), 0);
+    const sum = t.reduce((a, b) => a + b, 0), cpu = segs.reduce((a, x) => a + (x.cpu_us || 0), 0), alloc = segs.reduce((a, x) => a + (x.alloc_bytes || 0), 0);
     const rows = segs.reduce((a, x) => a + (x.rows || 0), 0);
     const b = h("button", { class: "btn ghost sm", onclick: () => { open.add(parent.i); draw(); } }, icon("right"), `${segs.length} segments`);
     return h("tr", { class: "prof-sum" },
       h("td", {}, h("div", { class: "row nw", style: { paddingLeft: depth * 16 + "px", gap: "6px" } }, h("span", { class: "dot", style: { background: stepColor("segment") } }), b, h("span", { class: "small muted" }, `median ${us(t[Math.floor(t.length / 2)])} · slowest ${us(t[t.length - 1])}`))),
-      h("td", { class: "num" }, us(sum)), bars ? h("td", {}, h("span", { class: "small muted" }, "summed")) : null, h("td", { class: "num" }, "–"), hasCpu ? h("td", { class: "num" }, us(cpu)) : null, h("td", { class: "num" }, rows ? fmt.n(rows) : "–"), h("td", { class: "small muted" }, fmt.plural(new Set(segs.map((x) => x.thread || 0)).size, "thread")));
+      h("td", { class: "num" }, us(sum)), bars ? h("td", {}, h("span", { class: "small muted" }, "summed")) : null, h("td", { class: "num" }, "–"), hasCpu ? h("td", { class: "num" }, us(cpu)) : null, hasAlloc ? h("td", { class: "num" }, fmt.bytes(alloc)) : null, h("td", { class: "num" }, rows ? fmt.n(rows) : "–"), h("td", { class: "small muted" }, fmt.plural(new Set(segs.map((x) => x.thread || 0)).size, "thread")));
   }
   function tr(n, depth) {
     const toggle = n.kids.length ? h("button", { class: "btn ghost icon sm prof-tg", "aria-label": n.folded ? "Open" : "Fold", onclick: () => { n.folded = !n.folded; draw(); } }, icon(n.folded ? "right" : "down")) : h("span", { style: { width: "26px", display: "inline-block" } });
@@ -306,6 +313,7 @@ export function opTree(roots, { bars = true } = {}) {
       bars ? h("td", {}, h("div", { class: "barbox", style: { width: "110px" } }, h("div", { class: "bar", style: { width: Math.min(100, n.us / total * 100) + "%", background: stepColor(n.op) } }))) : null,
       h("td", { class: "num" }, n.kids.length ? us(n.self) : h("span", { class: "muted" }, "–")),
       hasCpu ? h("td", { class: "num" }, n.cpu_us != null ? us(n.cpu_us) : "–") : null,
+      hasAlloc ? h("td", { class: "num" }, n.alloc_bytes != null ? fmt.bytes(n.alloc_bytes) : "–") : null,
       h("td", { class: "num" }, n.rows != null ? fmt.n(n.rows) : "–"),
       h("td", { class: "small muted nowrap" }, where || ""));
     r.addEventListener("pointermove", (e) => showTip(e.clientX, e.clientY, tipOf(n)));

@@ -321,6 +321,9 @@ impl Finished {
             if let Some(cpu) = cpu_ms(&self.steps) {
                 o.insert("cpu_ms".into(), json!(cpu));
             }
+            if let Some(b) = alloc_bytes(&self.steps) {
+                o.insert("alloc_bytes".into(), json!(b));
+            }
         }
         j
     }
@@ -330,18 +333,29 @@ impl Finished {
 /// the steps inside it counted in it (a coordinator measures none of its
 /// own steps, its shards their own); `None` unless any was measured.
 pub fn cpu_ms(steps: &[Step]) -> Option<f64> {
+    outermost(steps, |s| s.cpu_us).map(|us| us / 1e3)
+}
+
+/// The bytes a query's steps allocated, counted as [`cpu_ms`] counts CPU
+/// time; `None` unless any step counted them.
+pub fn alloc_bytes(steps: &[Step]) -> Option<u64> {
+    outermost(steps, |s| s.alloc_bytes.map(|b| b as f64)).map(|b| b as u64)
+}
+
+/// The sum of `f` over the outermost steps that have it.
+fn outermost(steps: &[Step], f: impl Fn(&Step) -> Option<f64>) -> Option<f64> {
     let (mut total, mut inside) = (None, None);
     for s in steps {
         if inside.is_some_and(|d| s.depth > d) {
             continue;
         }
         inside = None;
-        if let Some(c) = s.cpu_us {
+        if let Some(c) = f(s) {
             *total.get_or_insert(0.0) += c;
             inside = Some(s.depth);
         }
     }
-    total.map(|us: f64| us / 1e3)
+    total
 }
 
 /// Profiling settings an operator changes while the server runs
@@ -696,6 +710,10 @@ pub struct Sample {
     pub slow: u64,
     /// The process's CPU time, in seconds.
     pub cpu_s: f64,
+    /// Bytes allocated and allocations, since the process started (with
+    /// the counting allocator, [`crate::heap`]).
+    pub alloc_bytes: u64,
+    pub allocs: u64,
     /// Gauges, by name.
     pub gauges: BTreeMap<&'static str, f64>,
 }
@@ -774,6 +792,7 @@ fn point(a: &Sample, b: &Sample) -> Json {
         "write_p99_ms": ms(&wh, 0.99),
         "slow_s": rate(a.slow, b.slow),
         "cpu": ((b.cpu_s - a.cpu_s) / secs).max(0.0),
+        "alloc_bytes_s": rate(a.alloc_bytes, b.alloc_bytes), "allocs_s": rate(a.allocs, b.allocs),
         "by_kind": by_kind,
         "latency_hist": qh,
     });
@@ -823,6 +842,17 @@ fn rss() -> Option<u64> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rss() -> Option<u64> {
     None
+}
+
+/// The most resident memory the process has had, in bytes.
+pub fn peak_rss() -> Option<u64> {
+    // SAFETY: getrusage writes the struct it is given.
+    let max = unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        (libc::getrusage(libc::RUSAGE_SELF, &mut u) == 0).then_some(u.ru_maxrss as u64)?
+    };
+    // Linux counts ru_maxrss in KiB, macOS in bytes.
+    Some(if cfg!(target_os = "macos") { max } else { max * 1024 })
 }
 
 /// The space of the file system holding `path`: total, free, and
