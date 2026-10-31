@@ -12,7 +12,9 @@
 //! query run in a loop by one caller ran 6% fewer times a second sampled
 //! at 99 Hz and 11% fewer at 997 Hz, and by four callers within the noise
 //! (about 4%). The names are read from the binary's symbol table after the
-//! timer stops, so that work is not in the profile.
+//! timer stops, so that work is not in the profile. The first profile
+//! makes the sampler's table, about 100 MB, which the process keeps
+//! (`release`).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -168,6 +170,7 @@ async fn sample<T>(hz: i32, seconds: f64, during: impl Future<Output = T>) -> Re
     let raw = guard.report().build_unresolved().map_err(|e| Refused::Unavailable(e.to_string()))?;
     // The timer stops before the names are read.
     drop(guard);
+    release();
     let stacks: Vec<(pprof::Frames, u64)> = tokio::task::spawn_blocking(move || raw.data.into_iter().map(|(f, n)| (pprof::Frames::from(f), n.max(0) as u64)).collect())
         .await
         .map_err(|e| Refused::Unavailable(e.to_string()))?;
@@ -176,6 +179,21 @@ async fn sample<T>(hz: i32, seconds: f64, during: impl Future<Output = T>) -> Re
     p.cpu_seconds = (cpu * 1e4).round() / 1e4;
     p.blocked = blocked.iter().map(|s| s.to_string()).collect();
     Ok((p, out))
+}
+
+/// Gives the system back the memory the C library holds freed. The
+/// sampler's table of stacks (`pprof`'s, 16,384 places of 128 frames,
+/// about 100 MB) is made the first time a profile is taken and kept by
+/// the process; each profile that ends makes a new one and frees the old,
+/// which glibc would otherwise keep, resident, for later allocations.
+#[cfg(unix)]
+fn release() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes the allocator's own locks, and is called
+    // outside any of its functions.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// The libraries a sample is not taken in. A sample unwinds the stack of
