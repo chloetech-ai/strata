@@ -1510,8 +1510,10 @@ impl Service {
     /// it, on every shard through a coordinator. A replica refuses it, the
     /// log being a write. Returns the request's id and the log's write.
     /// A logged query needs a write key, and the first one to a table,
-    /// which creates it, an admin key.
-    pub async fn query_logged(self: &Arc<Self>, who: &Principal, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+    /// which creates it, an admin key. An interleaved one
+    /// ([`Log::interleave`]) runs both rankings at once and answers their
+    /// [`rank_log::interleave`], with each row's team.
+    pub async fn query_logged(self: &Arc<Self>, who: &Principal, mut req: QueryReq, log: Log) -> Result<(Answer, rank_log::Served, Written), ApiError> {
         who.may(Scope::Write, "a logged query (it writes the rank log)")?;
         self.takes_writes()?;
         let schema = match self.table(&log.table).await {
@@ -1525,17 +1527,36 @@ impl Service {
         };
         rank_log::check(&schema)?;
         let p = rank_log::prepare(&req.sql, &req.params, &log)?;
-        req.sql = p.sql.clone();
-        let mut a = self.query(req).await?;
-        let rs = std::mem::replace(&mut a.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
-        let served = rank_log::serve(rs, &p, &log)?;
-        a.rs = served.rs;
+        let take = |a: &mut Answer| std::mem::replace(&mut a.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
+        let (mut a, mut served) = match &log.interleave {
+            None => {
+                req.sql = p.sql.clone();
+                let mut a = self.query(req).await?;
+                let served = rank_log::serve(take(&mut a), &p, &log)?;
+                (a, served)
+            }
+            Some(il) => {
+                let pb = rank_log::prepare(&il.sql, &req.params, &log)?;
+                let mut rb = req.clone();
+                req.sql = p.sql.clone();
+                rb.sql = pb.sql.clone();
+                let (mut a, mut b) = tokio::try_join!(self.query(req), self.query(rb))?;
+                let (sa, sb) = (rank_log::serve(take(&mut a), &p, &log)?, rank_log::serve(take(&mut b), &pb, &log)?);
+                for m in b.missing {
+                    if !a.missing.contains(&m) {
+                        a.missing.push(m);
+                    }
+                }
+                (a, rank_log::interleave(sa, sb, &p, il)?)
+            }
+        };
+        a.rs = std::mem::replace(&mut served.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
         let ops: Vec<Json> = served.entries.iter().map(|e| json!({"op": "upsert", "table": log.table, "doc": e.to_json()})).collect();
         let w = match ops.is_empty() {
             true => Written { rows: 0, seq_no: None, seq_nos: Vec::new(), skipped: 0, stamps: Vec::new() },
             false => self.write_ops(ops, None).await?,
         };
-        Ok((a, served.request, w))
+        Ok((a, served, w))
     }
 
     /// Runs a plan ([`strata::query::ir`]): a read answers as

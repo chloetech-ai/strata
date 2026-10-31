@@ -716,6 +716,10 @@ svg.focus .tbl:not(.hot) { opacity: .45; }
 .rl-g { display: inline-flex; gap: 2px; flex: none; }
 .rl-g button { width: 22px; height: 22px; border-radius: 6px; border: 1px solid var(--line-2); background: var(--surface); color: var(--muted); font-size: 11px; font-weight: 650; cursor: pointer; padding: 0; }
 .rl-g button:hover { border-color: var(--accent); color: var(--text); }
+.rl-llm { flex: none; display: inline-flex; gap: 1px; align-items: baseline; margin-right: 4px; padding: 1px 5px; border: 1px dashed var(--line-2); border-radius: 6px; color: var(--muted); font-size: 10.5px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.rl-llm.g1 { border-color: var(--seq-3); color: var(--text); }
+.rl-llm.g2 { border-color: var(--seq-4); color: var(--seq-4); }
+.rl-llm.g3 { border-color: var(--seq-6); color: var(--seq-6); }
 .rl-g button[aria-pressed="true"].g0 { background: var(--surface-3); color: var(--text); border-color: var(--line-2); }
 .rl-g button[aria-pressed="true"].g1 { background: var(--seq-2); color: var(--text); border-color: var(--seq-3); }
 .rl-g button[aria-pressed="true"].g2 { background: var(--seq-4); color: #fff; border-color: var(--seq-4); }
@@ -802,6 +806,16 @@ button.rx-node:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--
 .rx-var.ctl { box-shadow: inset 0 0 0 1px var(--line-2); }
 .rx-var .rl-letter { background: var(--c); }
 .rx-vfoot { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 12px; }
+.rx-il { display: flex; flex-direction: column; gap: 6px; padding: 4px 0 10px; }
+.rx-il + .rx-il { border-top: 1px solid var(--line); padding-top: 10px; }
+.rx-il-hd { display: flex; gap: 10px; align-items: center; }
+.rx-il-bar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--surface-2); }
+.rx-il-bar i { display: block; height: 100%; }
+.rx-il-bar .a { background: var(--s1); }
+.rx-il-bar .t { background: var(--surface-3); }
+.rx-il-bar .b { background: var(--s2); }
+.rx-il-legend { display: flex; gap: 14px; flex-wrap: wrap; }
+.rx-il-legend b { color: var(--text); font-variant-numeric: tabular-nums; }
 .rx-vfoot b { color: var(--text); font-variant-numeric: tabular-nums; }
 .rx-row { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 12px; }
 @media (max-width: 1100px) { .rx-row { grid-template-columns: minmax(0, 1fr); } }

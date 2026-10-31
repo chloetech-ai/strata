@@ -795,7 +795,9 @@ impl Db {
     /// per row answered, or per candidate ([`Log::candidates`]), with the
     /// values its ranking read. The answer has the columns the query asked
     /// for. The query reads one snapshot and the log is written after it in
-    /// one transaction, as [`Db::sql`] writes.
+    /// one transaction, as [`Db::sql`] writes. With [`Log::interleave`],
+    /// both rankings read the snapshot and the rows shown are their
+    /// [`rank_log::interleave`].
     pub fn query_logged(&self, sql: &str, params: &Params, log: &Log) -> Result<Logged> {
         if self.storage.table(&log.table).is_none() {
             self.sql(&rank_log::create_sql(&log.table)?, &Params::new())?;
@@ -803,7 +805,16 @@ impl Db {
         let schema = self.table(&log.table)?;
         rank_log::check(&schema)?;
         let p = rank_log::prepare(sql, params, log)?;
-        let served = rank_log::serve(self.query(&p.sql, params)?, &p, log)?;
+        let served = match &log.interleave {
+            None => rank_log::serve(self.query(&p.sql, params)?, &p, log)?,
+            Some(il) => {
+                let pb = rank_log::prepare(&il.sql, params, log)?;
+                let snap = self.snapshot();
+                let a = rank_log::serve(self.query_at(&snap, &p.sql, params, &self.exec)?, &p, log)?;
+                let b = rank_log::serve(self.query_at(&snap, &pb.sql, params, &self.exec)?, &pb, log)?;
+                rank_log::interleave(a, b, &p, il)?
+            }
+        };
         let now = crate::timestamp::now();
         let mut t = self.storage.begin()?;
         {
@@ -813,7 +824,19 @@ impl Db {
             }
         }
         let seq_no = t.commit_seq()?;
-        Ok(Logged { rs: served.rs, request: served.request, seq_no })
+        Ok(Logged { rs: served.rs, request: served.request, seq_no, teams: served.teams })
+    }
+
+    /// The credit of each pair of interleaved rankings in a log table
+    /// ([`rank_log::Credits`]), over its export `x` ([`Db::export_rank_log`]),
+    /// whose events and window label the rows acted on.
+    pub fn interleaving_credit(&self, x: &Export) -> Result<Vec<rank_log::Credit>> {
+        let mut c = rank_log::Credits::default();
+        self.export_rank_log(x, |r| {
+            c.add(&r);
+            Ok(())
+        })?;
+        Ok(c.finish())
     }
 
     /// Exports a log table ([`rank_log::export`]) from one snapshot: one

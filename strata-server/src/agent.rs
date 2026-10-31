@@ -201,7 +201,7 @@ async fn run_sql(svc: &Arc<Service>, input: &Json) -> (Result<Json, String>, Jso
 }
 
 /// One Messages API call, retried on 429, 5xx and network errors.
-async fn call(client: &reqwest::Client, base: &str, key: &str, body: &Json) -> Result<Json, ApiError> {
+pub(crate) async fn call(client: &reqwest::Client, base: &str, key: &str, body: &Json) -> Result<Json, ApiError> {
     let mut wait = Duration::from_millis(500);
     for attempt in 0..3 {
         let r = client
