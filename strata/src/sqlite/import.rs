@@ -235,8 +235,7 @@ impl Source {
             skipped.retain(|(n, _)| opts.tables.iter().any(|t| t.eq_ignore_ascii_case(n)));
         }
         // Strata's names for the tables, distinct in any case.
-        let mut used = HashSet::new();
-        let names: Vec<String> = tables.iter().map(|t| distinct(ident(&t.name), &mut used)).collect();
+        let names = idents(&tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>());
         let given = |t: &Table, name: &str| {
             let by_source = opts.schemas.iter().find(|g| g.source.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&t.name)));
             by_source.or_else(|| opts.schemas.iter().find(|g| g.source.is_none() && (g.schema.table.eq_ignore_ascii_case(name) || g.schema.table.eq_ignore_ascii_case(&t.name))))
@@ -667,6 +666,21 @@ fn ident(name: &str) -> String {
     s
 }
 
+/// Strata's names for SQLite's `names` ([`ident`]), distinct in any case:
+/// a name Strata spells as SQLite does keeps it, and a respelled one that
+/// meets another takes a suffix (`x-y` is `x_y_2` beside a table `x_y`,
+/// whichever comes first).
+fn idents(names: &[&str]) -> Vec<String> {
+    let mut used = HashSet::new();
+    let mut out: Vec<Option<String>> = names.iter().map(|n| (ident(n) == *n && used.insert(n.to_ascii_lowercase())).then(|| n.to_string())).collect();
+    for (o, n) in out.iter_mut().zip(names) {
+        if o.is_none() {
+            *o = Some(distinct(ident(n), &mut used));
+        }
+    }
+    out.into_iter().map(|o| o.expect("named")).collect()
+}
+
 // ------------------------------------------------------------------ types
 
 /// What a column's declared type says, by SQLite's affinity rules and the
@@ -738,6 +752,8 @@ struct Stats {
     blobs: u64,
     /// The largest integer, in absolute value.
     max_abs: u64,
+    /// Reals that are infinite (SQLite keeps no NaN).
+    infinite: u64,
     /// An integer or real other than 0 and 1.
     not_bool_number: bool,
     /// The longest text, in bytes, and the words of all of them (runs
@@ -770,6 +786,7 @@ impl Default for Stats {
             texts: 0,
             blobs: 0,
             max_abs: 0,
+            infinite: 0,
             not_bool_number: false,
             text_max: 0,
             words: 0,
@@ -806,6 +823,7 @@ impl Stats {
             }
             ValueRef::Real(r) => {
                 self.reals += 1;
+                self.infinite += u64::from(!r.is_finite());
                 self.not_bool_number |= r != 0.0 && r != 1.0;
             }
             ValueRef::Text(b) => {
@@ -996,12 +1014,11 @@ fn infer(t: &Table, name: &str, stats: &[Stats], cat: &Catalog, tables: &[&Table
     }
     let key = (t.pk.len() == 1).then(|| lower(&t.pk[0]));
     let referencing: HashSet<String> = t.fks.iter().filter(|(from, target, _)| from.len() == 1 && tables.iter().any(|x| x.name.eq_ignore_ascii_case(target))).map(|(from, _, _)| lower(&from[0])).collect();
-    let mut used = HashSet::new();
     let mut fields = Vec::new();
     let mut columns = Vec::new();
     let mut reads = Vec::new();
-    for (c, st) in t.columns.iter().zip(stats) {
-        let fname = distinct(ident(&c.name), &mut used);
+    let fnames = idents(&t.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>());
+    for ((c, st), fname) in t.columns.iter().zip(stats).zip(fnames) {
         let role = Role { key: key.as_deref() == Some(&lower(&c.name)), reference: referencing.contains(&lower(&c.name)), indexed: t.indexed.contains(&lower(&c.name)), fts: fts.get(&lower(&c.name)).copied() };
         let h = hint(&c.decl);
         let (mut f, read) = match choose(&fname, h, st, &role, opts) {
@@ -1023,6 +1040,13 @@ fn infer(t: &Table, name: &str, stats: &[Stats], cat: &Catalog, tables: &[&Table
                 notes.push(format!("column {:?}{declared} holds text, so its numbers are text too", c.name));
             }
         }
+        if f.ty == FieldType::Float && f.logical.is_none() && st.ints > 0 && st.max_abs > 1 << 53 {
+            notes.push(format!("column {:?} is FLOAT: its integers past 2^53 round to the nearest double (9223372036854775807 reads as 9223372036854775808)", c.name));
+        }
+        if f.ty == FieldType::Float && st.infinite > 0 {
+            let values = if st.infinite == 1 { "value is" } else { "values are" };
+            notes.push(format!("column {:?}: {} infinite {values} NULL, as a FLOAT holds finite numbers", c.name, st.infinite));
+        }
         if f.logical == Some(Logical::Timestamp) && st.numbers() > 0 {
             let unit = match read {
                 Read::Plain { time_unit: 1_000_000 } => "seconds",
@@ -1034,7 +1058,7 @@ fn infer(t: &Table, name: &str, stats: &[Stats], cat: &Catalog, tables: &[&Table
         if c.generated {
             notes.push(format!("column {:?} is generated in SQLite: its values are imported", c.name));
         }
-        if c.not_null && !role.key && st.nulls == 0 {
+        if c.not_null && !role.key && st.nulls == 0 && st.infinite == 0 {
             f.not_null = true;
         }
         if let Some(d) = &c.default {
@@ -1248,7 +1272,8 @@ fn value(schema: &Schema, f: usize, v: ValueRef<'_>, read: Read) -> Result<Value
             let s = text(b);
             Value::Int(s.trim().parse().map_err(|_| bad(format!("{s:?} is not an integer")))?)
         }
-        (FieldType::Float, ValueRef::Real(r)) if !r.is_finite() => return Err(bad(format!("{r} is not a finite number"))),
+        // As the plan notes: one infinite value does not refuse the import.
+        (FieldType::Float, ValueRef::Real(r)) if !r.is_finite() => Value::Null,
         (FieldType::Float, ValueRef::Text(b)) => {
             let s = text(b);
             Value::Float(s.trim().parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| bad(format!("{s:?} is not a number")))?)
@@ -1317,6 +1342,9 @@ mod tests {
         let mut used = HashSet::new();
         assert_eq!(distinct("a".into(), &mut used), "a");
         assert_eq!(distinct("A".into(), &mut used), "A_2");
+        // A name that needs no respelling keeps it, whatever comes first.
+        assert_eq!(idents(&["x-y", "x_y", "a", "A", "x y"]), ["x_y_2", "x_y", "a", "A_2", "x_y_3"]);
+        assert_eq!(idents(&["x_y", "x-y"]), ["x_y", "x_y_2"]);
     }
 
     #[test]
