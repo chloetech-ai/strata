@@ -1852,6 +1852,14 @@ async fn imports_files_over_http() {
     let (status, r) = post(&c, &format!("{base}/v1/schema/check"), json!({"table": "t", "key": "id", "fields": [{"name": "id", "type": "keyword"}]})).await;
     assert_eq!((status, &r["short"]["key"]), (200, &json!("id")), "{r}");
     assert_eq!(r["schema"]["primary_key"], json!(0), "{r}");
+    // And the CREATE TABLE statement that makes it, which runs.
+    assert_eq!(r["sql"], "CREATE TABLE t (\n  id KEYWORD PRIMARY KEY\n);", "{r}");
+    let r: Json = c.get(format!("{base}/v1/tables")).send().await.unwrap().json().await.unwrap();
+    let ddl = r["tables"][0]["sql"].as_str().unwrap().replacen("CREATE TABLE items", "CREATE TABLE items_copy", 1);
+    let (status, r) = post(&c, &format!("{base}/v1/sql"), json!({ "sql": ddl })).await;
+    assert_eq!(status, 200, "{ddl}: {r}");
+    let r: Json = c.get(format!("{base}/v1/schema?table=items_copy")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["short"]["fields"], short["fields"], "{r}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

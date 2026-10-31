@@ -473,6 +473,131 @@ pub(crate) fn drop_table(stmt: &sql::Statement) -> Result<(Vec<String>, DropOpti
     Ok((tables, DropOptions { cascade: *cascade, if_exists: *if_exists }))
 }
 
+/// The `CREATE TABLE` statement that makes `s`, a column a line:
+/// [`create_table`] reads it back as `s`, but for a semantic-ID field's
+/// codebook hash, which the database fills in when it creates the table.
+/// It is written from the short JSON form, so it names only the options
+/// that differ from their defaults.
+pub fn create_sql(s: &Schema) -> String {
+    let j = s.to_short_json();
+    let key = j.get("key").and_then(J::as_str);
+    let columns: Vec<String> = j["fields"].as_array().into_iter().flatten().map(|f| column_sql(f, key)).collect();
+    let opts: Vec<String> = TABLE_OPTIONS.iter().filter_map(|k| j.get(*k).map(|v| format!("{k} = {}", value_sql(v)))).collect();
+    let opts = if opts.is_empty() { String::new() } else { format!(" OPTIONS({})", opts.join(", ")) };
+    format!("CREATE TABLE {} (\n  {}\n){opts};", name_sql(&s.table), columns.join(",\n  "))
+}
+
+/// A field of the short JSON form as a column of `CREATE TABLE`.
+fn column_sql(f: &J, key: Option<&str>) -> String {
+    let name = f["name"].as_str().unwrap_or_default();
+    let ty = f["type"].as_str().unwrap_or_default();
+    let mut out = format!("{} {}", name_sql(name), match (ty, f.get("dim")) {
+        ("vector", Some(d)) => format!("VECTOR({d})"),
+        (t, _) => t.to_ascii_uppercase(),
+    });
+    if f.get("multi") == Some(&J::Bool(true)) {
+        out.push_str("[]");
+    }
+    if key == Some(name) {
+        out.push_str(" PRIMARY KEY");
+    }
+    if f.get("not_null") == Some(&J::Bool(true)) {
+        out.push_str(" NOT NULL");
+    }
+    match f.get("default") {
+        None | Some(J::Null) => {}
+        Some(J::String(d)) if d == "now" && ty == "timestamp" => out.push_str(" DEFAULT CURRENT_TIMESTAMP"),
+        Some(d) => out.push_str(&format!(" DEFAULT {}", value_sql(d))),
+    }
+    if let Some(r) = f.get("references").and_then(J::as_str) {
+        out.push_str(&format!(" REFERENCES {}", name_sql(r)));
+    }
+    let mut opts = Vec::new();
+    for (k, v) in f.as_object().into_iter().flatten() {
+        match (k.as_str(), v) {
+            ("name" | "type" | "multi" | "dim" | "not_null" | "default" | "references", _) => {}
+            // {"hnsw": {"m": .., "ef_construction": ..}} or {"ivf": {"nlist": ..}}
+            ("index", J::Object(o)) => {
+                for (kind, params) in o {
+                    opts.push(format!("index = {}", lit(kind)));
+                    opts.extend(params.as_object().into_iter().flatten().map(|(p, n)| format!("{p} = {n}")));
+                }
+            }
+            ("embed" | "derive", J::Object(o)) => {
+                opts.push(format!("{k} = {}", list_sql(&o["from"])));
+                opts.push(format!("model = {}", value_sql(&o["model"])));
+            }
+            ("semantic_id", J::Object(o)) => {
+                opts.push(format!("semantic_id = {}", value_sql(&o["from"])));
+                opts.push(format!("codebook = {}", value_sql(&o["codebook"])));
+            }
+            ("from", v) => opts.push(format!("from = {}", list_sql(v))),
+            (k, v) => opts.push(format!("{k} = {}", value_sql(v))),
+        }
+    }
+    if !opts.is_empty() {
+        out.push_str(&format!(" OPTIONS({})", opts.join(", ")));
+    }
+    out
+}
+
+/// A table or column name as SQL reads it back: bare where both
+/// `CREATE TABLE` and a query take it bare as that name (`id`, `name`),
+/// else in double quotes (`"order"`, `"doc no"`).
+fn name_sql(n: &str) -> String {
+    let bare = crate::query::sql::ident(n);
+    if bare != n {
+        return bare;
+    }
+    let parse = |text: String| crate::query::parse::parse(&text);
+    let reads_back = parse(format!("CREATE TABLE {n} ({n} INT REFERENCES {n})")).is_ok_and(|s| match s.as_slice() {
+        [sql::Statement::CreateTable(ct)] => {
+            single_name(&ct.name).is_ok_and(|t| t == n) && matches!(ct.columns.as_slice(), [c] if c.name.value == n && c.name.quote_style.is_none() && c.options.len() == 1)
+        }
+        _ => false,
+    }) && parse(format!("SELECT {n} FROM {n} WHERE {n} = 1 ORDER BY {n}")).is_ok();
+    // Words that end a clause read bare here and there, but not everywhere.
+    use sqlparser::keywords::{ALL_KEYWORDS, ALL_KEYWORDS_INDEX, RESERVED_FOR_COLUMN_ALIAS, RESERVED_FOR_IDENTIFIER, RESERVED_FOR_TABLE_ALIAS};
+    let reserved = ALL_KEYWORDS.binary_search(&n.to_ascii_uppercase().as_str()).is_ok_and(|i| [RESERVED_FOR_COLUMN_ALIAS, RESERVED_FOR_IDENTIFIER, RESERVED_FOR_TABLE_ALIAS].iter().any(|l| l.contains(&ALL_KEYWORDS_INDEX[i])));
+    let reads_back = reads_back && !reserved;
+    if reads_back {
+        bare
+    } else {
+        crate::query::sql::quoted(n)
+    }
+}
+
+/// A string literal.
+fn lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// An option's or default's value: a string, number or boolean.
+fn value_sql(v: &J) -> String {
+    match v {
+        J::String(s) => lit(s),
+        J::Bool(true) => "TRUE".into(),
+        J::Bool(false) => "FALSE".into(),
+        J::Array(xs) => list_sql(&J::Array(xs.clone())),
+        v => v.to_string(),
+    }
+}
+
+/// Field names as a list option: `'title, abstract'`, or an `ARRAY` when a
+/// name would not survive the split on commas.
+fn list_sql(v: &J) -> String {
+    let names: Vec<&str> = match v {
+        J::Array(xs) => xs.iter().filter_map(J::as_str).collect(),
+        J::String(s) => vec![s.as_str()],
+        v => return value_sql(v),
+    };
+    if names.iter().all(|n| !n.contains(',') && n.trim() == *n) {
+        lit(&names.join(", "))
+    } else {
+        format!("ARRAY[{}]", names.iter().map(|n| lit(n)).collect::<Vec<_>>().join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +612,40 @@ mod tests {
 
     fn papers() -> Schema {
         Schema::new("papers", vec![crate::schema::Field::new("id", FieldType::Keyword), crate::schema::Field::new("n", FieldType::Int)], Some("id")).unwrap()
+    }
+
+    #[test]
+    fn create_sql_reads_back_as_the_same_table() {
+        let p = papers();
+        for text in [
+            "CREATE TABLE IF NOT EXISTS authors (
+               id KEYWORD PRIMARY KEY, name TEXT OPTIONS(analyzer = 'simple'), bio TEXT OPTIONS(positions = false), born INTEGER OPTIONS(stored = false),
+               score DOUBLE DEFAULT -1.5, topics KEYWORD[], ns INT[], links EDGES REFERENCES authors, sp SPARSE,
+               papers KEYWORD[] REFERENCES papers (id), both_ TEXT OPTIONS(from = 'name, topics'),
+               emb VECTOR(8) OPTIONS(index = 'ivf', nlist = 4, codes = 'binary'),
+               e2 VECTOR OPTIONS(embed = ARRAY['name', 'bio'], model = 'hash:16', m = 8, ef_construction = 100),
+               hidden INT OPTIONS(indexed = false), flat VECTOR(3) OPTIONS(index = 'flat'),
+               sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq'),
+               patches VECTOR(4)[] OPTIONS(keep_f32 = true, pool = 0.9))",
+            "CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD REFERENCES papers, done BOOL DEFAULT FALSE,
+               note TEXT DEFAULT 'it''s new', ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, at TIMESTAMP DEFAULT '2026-01-01')
+               OPTIONS(shard_by = 'usr', cluster_by = 'usr', retain = '400 days', retain_by = 'ts')",
+            "CREATE TABLE photos (id KEYWORD PRIMARY KEY, image MEDIA OPTIONS(kind = 'image'), any_file MEDIA,
+               caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base'), emb VECTOR(8) OPTIONS(embed = 'caption', model = 'hash:8'))",
+            "CREATE TABLE cooc (id KEYWORD PRIMARY KEY, src KEYWORD NOT NULL REFERENCES papers, dst KEYWORD NOT NULL REFERENCES papers, w FLOAT DEFAULT 0) OPTIONS(edges = 'src, dst, w')",
+            "CREATE TABLE \"select\" (\"order\" INT PRIMARY KEY, \"doc no\" KEYWORD, \"say \"\"hi\"\"\" TEXT, \"Mixed\" FLOAT, name TEXT, \"a,b\" TEXT, c TEXT OPTIONS(from = ARRAY['a,b', 'name']))",
+            "CREATE TABLE log (line TEXT)",
+        ] {
+            let (s, _) = create(text, &[&p]).unwrap();
+            let sql = create_sql(&s);
+            let (back, ine) = create(&sql, &[&p]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(!ine);
+            assert_eq!(back, s, "{sql}");
+            assert_eq!(create_sql(&back), sql);
+        }
+        // A column a line, defaults left out, names quoted only where needed.
+        let (s, _) = create("CREATE TABLE \"order\" (id KEYWORD PRIMARY KEY, name TEXT, \"from\" INT NOT NULL)", &[]).unwrap();
+        assert_eq!(create_sql(&s), "CREATE TABLE \"order\" (\n  id KEYWORD PRIMARY KEY,\n  name TEXT,\n  \"from\" INT NOT NULL\n);");
     }
 
     #[test]

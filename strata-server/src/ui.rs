@@ -24,6 +24,9 @@ pub const FILES: &[(&str, &str, &str)] = &[
     ("charts.js", JS, include_str!("../ui/app/charts.js")),
     ("data.js", JS, include_str!("../ui/app/data.js")),
     ("main.js", JS, include_str!("../ui/app/main.js")),
+    ("sqledit.js", JS, include_str!("../ui/app/sqledit.js")),
+    ("catalog.js", JS, include_str!("../ui/app/catalog.js")),
+    ("results.js", JS, include_str!("../ui/app/results.js")),
     ("views/index.js", JS, include_str!("../ui/app/views/index.js")),
     ("views/overview.js", JS, include_str!("../ui/app/views/overview.js")),
     ("views/topology.js", JS, include_str!("../ui/app/views/topology.js")),
@@ -33,6 +36,11 @@ pub const FILES: &[(&str, &str, &str)] = &[
     ("views/logs.js", JS, include_str!("../ui/app/views/logs.js")),
     ("views/access.js", JS, include_str!("../ui/app/views/access.js")),
     ("views/system.js", JS, include_str!("../ui/app/views/system.js")),
+    ("views/sql.js", JS, include_str!("../ui/app/views/sql.js")),
+    ("views/builder.js", JS, include_str!("../ui/app/views/builder.js")),
+    ("views/schema.js", JS, include_str!("../ui/app/views/schema.js")),
+    ("views/import.js", JS, include_str!("../ui/app/views/import.js")),
+    ("views/relevance.js", JS, include_str!("../ui/app/views/relevance.js")),
     ("views/classic.js", JS, include_str!("../ui/app/views/classic.js")),
 ];
 

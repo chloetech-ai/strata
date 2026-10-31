@@ -345,6 +345,8 @@ fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json
         "table": s.table,
         "schema": s,
         "short": s.to_short_json(),
+        // The CREATE TABLE statement that makes it.
+        "sql": strata::query::ddl::create_sql(s),
         "primary_key": s.primary_key.map(|k| s.fields[k].name.clone()),
         "shard_by": s.shard_by,
         // Its rank profiles, by name.
@@ -830,10 +832,11 @@ fn source_json(s: strata::db::Source) -> Json {
     json!({"name": s.name, "offset": s.offset, "updated": s.updated.map(strata::timestamp::format)})
 }
 
-/// A schema validated, in both JSON forms.
+/// A schema validated, in both JSON forms and as the `CREATE TABLE`
+/// statement that makes it.
 async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
     let s = strata::schema::Schema::from_json_value(&b)?;
-    Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
+    Ok(AxJson(json!({"schema": s, "short": s.to_short_json(), "sql": strata::query::ddl::create_sql(&s)})))
 }
 
 /// The vector of a text, or of an image or sound file (`"image"` or

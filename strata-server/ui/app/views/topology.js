@@ -73,7 +73,7 @@ function edge(x1, y1, x2, y2, cls, label, speed) {
 }
 
 /** Pan and zoom of a <g> inside an <svg>. */
-function viewport(svgEl, root, { mini } = {}) {
+export function viewport(svgEl, root, { mini } = {}) {
   let k = 1, x = 0, y = 0;
   const apply = () => root.setAttribute("transform", `translate(${x.toFixed(1)},${y.toFixed(1)}) scale(${k.toFixed(3)})`);
   const vp = {
@@ -103,7 +103,7 @@ function viewport(svgEl, root, { mini } = {}) {
 }
 
 /** Makes a <g> draggable in content space; onMove(dx, dy), onEnd(). */
-function draggable(g, vp, onMove, onEnd) {
+export function draggable(g, vp, onMove, onEnd) {
   g.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
     e.stopPropagation();
