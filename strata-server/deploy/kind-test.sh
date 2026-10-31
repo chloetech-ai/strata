@@ -13,12 +13,15 @@
 #   deploy/kind-test.sh delete POD            # stop POD gracefully; its controller replaces it
 #   deploy/kind-test.sh pause POD SECONDS     # freeze POD's node for SECONDS
 #   deploy/kind-test.sh delay POD MS          # add MS ms to every packet sent to POD (0 removes it)
+#   deploy/kind-test.sh operator [FILE]       # the operator, and the StrataCluster of FILE (k8s/operator/cluster.yaml)
+#   deploy/kind-test.sh scale SHARDS COPIES   # change that cluster (NAME, default demo); follow: watch it until Ready
 #   deploy/kind-test.sh down
 #
 # STRATA_WORK holds the databases (strata-server-bench --build-only writes
 # them) and is mounted at /data on every node; reports land in
 # STRATA_WORK/results. STRATA_DATA holds the prepared BEIR collections the
-# client reads its queries from, mounted read-only at /beir.
+# client reads its queries from, mounted read-only at /beir. The operator
+# steps need neither: its clusters keep their data on volumes.
 set -euo pipefail
 
 CLUSTER=${CLUSTER:-strata}
@@ -32,9 +35,9 @@ cmd=${1:-}
 shift || true
 case "$cmd" in
 up)
-    : "${STRATA_WORK:?set STRATA_WORK to the directory of the databases}"
-    : "${STRATA_DATA:?set STRATA_DATA to the directory of the BEIR collections}"
-    mkdir -p "$STRATA_WORK/results"
+    # Without STRATA_WORK and STRATA_DATA, a cluster for the operator only.
+    mounts=${STRATA_WORK:+${STRATA_DATA:+yes}}
+    [ -z "$mounts" ] || mkdir -p "$STRATA_WORK/results"
     cfg=$(mktemp)
     {
         echo "kind: Cluster"
@@ -43,6 +46,7 @@ up)
         echo "  - role: control-plane"
         for _ in $(seq "$WORKERS"); do
             echo "  - role: worker"
+            [ -n "$mounts" ] || continue
             echo "    extraMounts:"
             echo "      - {hostPath: \"$STRATA_WORK\", containerPath: /data}"
             echo "      - {hostPath: \"$STRATA_DATA\", containerPath: /beir, readOnly: true}"
@@ -179,11 +183,49 @@ delay)
     fi
     echo "$pod ($ip on $node, $dev): +${ms} ms"
     ;;
+operator)
+    file=${1:-$HERE/k8s/operator/cluster.yaml}
+    KK="kubectl --context kind-$CLUSTER"
+    # The resource definition first (the operator installs it too), so
+    # that the cluster's file applies at once.
+    $KK apply --server-side --force-conflicts -f "$HERE/k8s/operator/crd.json"
+    $KK wait --for condition=established crd/strataclusters.strata.chloetech.ai --timeout=60s
+    $KK apply -f "$HERE/k8s/operator/operator.yaml"
+    $KK -n strata-system rollout status deploy/strata-operator --timeout=120s
+    $KK apply -f "$file"
+    "$0" follow
+    ;;
+scale)
+    shards=${1:?scale SHARDS COPIES}
+    copies=${2:?scale SHARDS COPIES}
+    $K patch strata "${NAME:-demo}" --type merge -p "{\"spec\": {\"shards\": $shards, \"replicas\": $copies}}"
+    "$0" follow
+    ;;
+follow)
+    # Prints the cluster's status as it changes, until the operator has
+    # seen its latest spec and found it Ready (or Failed); TIMEOUT s at most.
+    last="" t0=$(date +%s)
+    while :; do
+        now=$($K get strata "${NAME:-demo}" -o jsonpath='{.metadata.generation} {.status.observedGeneration} {.status.phase}: {.status.message}' 2>/dev/null || true)
+        read -r gen seen state <<<"$now" || true
+        [ "$state" = "$last" ] || { echo "$(date +%T) $state"; last=$state; }
+        if [ -n "$gen" ] && [ "$gen" = "$seen" ]; then
+            case "$state" in
+            Ready:*) break ;;
+            Failed:*) exit 1 ;;
+            esac
+        fi
+        [ $(($(date +%s) - t0)) -lt "${TIMEOUT:-900}" ] || { echo "not Ready after ${TIMEOUT:-900} s"; exit 1; }
+        sleep 2
+    done
+    $K get strata "${NAME:-demo}" -o wide
+    $K get pods -o wide
+    ;;
 down)
     kind delete cluster --name "$CLUSTER"
     ;;
 *)
-    sed -n '2,20p' "$0"
+    sed -n '2,24p' "$0"
     exit 2
     ;;
 esac

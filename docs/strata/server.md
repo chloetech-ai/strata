@@ -697,6 +697,18 @@ A write's answer carries its sequence number (`seq_no`). A read with `"min_seq_n
 
 Through a coordinator, a write answers `seq_nos`, each shard's number (0 where it wrote nothing), and a read passes them back as `"min_seq_nos": [...]`; each shard's copy then holds that shard's write. A replica that refuses the read is passed over for the shard's primary. A replica that speaks a protocol before 5 would not wait, so such a read is sent to the primary instead, without counting against the replica. A shard whose copies each take its writes (no primary) numbers them on each copy in its own order: its number is 0, and a read naming one there is refused (400).
 
+## On Kubernetes
+
+`strata-server operator` runs Strata clusters on Kubernetes. A `StrataCluster` resource names the shards, the copies of each shard, the first table's schema and what each server needs (image, volume size, failover delay, write acks, a token's Secret); the operator makes a StatefulSet of copies per shard, each copy a pod with its own volume, and the coordinators behind a Service named as the cluster, and changes the cluster through a coordinator's admin calls, one step every few seconds, until it is as the resource says. More shards join the cluster and [slots move](#moving-slots) to them; fewer are drained first. More copies join their shards as replicas and are sent a copy of the primary; fewer leave their shards first, a primary being [handed over](#failover) before its pod goes. A pod that comes back without its volume joins its shard again. The copies elect their primaries themselves, so a dead pod costs a few seconds of its shard's writes whether the operator runs or not. The resource's status says what it found and does (`kubectl get strata -o wide`).
+
+```sh
+kubectl apply -f strata-server/deploy/k8s/operator/operator.yaml    # the operator, in strata-system
+kubectl apply -f strata-server/deploy/k8s/operator/cluster.yaml     # 2 shards of 3 copies, 10,000 demo products
+kubectl -n strata patch strata demo --type merge -p '{"spec": {"shards": 3}}'
+```
+
+The spec's fields, what each change does, and a run on kind are in the [deploy README](https://github.com/rkonow/strata/tree/main/strata-server/deploy#the-operator).
+
 ## Deadlines, admission and metrics
 
 Every query runs under a deadline (`timeout_ms` up to `--max-timeout-ms`, or the server's default) and gets its share of the cores: a query arriving when *r* are running searches its segments on about *cores / r* threads, its own and threads it borrows from one pool the whole server shares, as many as the cores (`strata_query_pool_threads`). A query starts no threads of its own, and when the pool is busy it goes on with the threads it has instead of waiting for more. At most `--max-concurrent` run at once; the rest wait for a slot, and one still waiting at its deadline is refused with 429 (`ResourceExhausted` over gRPC) and counted in `strata_rejected_total`. A query still running at its deadline stops and returns an error. So does a query whose caller stopped waiting (a client that hung up, a coordinator's hedge that lost), and it holds its slot and counts as running until it has stopped. A query checks between segments and, inside a segment, every 1,024 rows it groups, orders by a column or lists, every 1,024 rows a graph walk expands (16 when each hop is a vector search), and every 1,024 rows a join hashes or compares, so it stops within milliseconds even in one large segment.

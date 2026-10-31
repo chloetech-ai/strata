@@ -404,6 +404,9 @@ message HelloResponse {
   // On a primary that a primary of a newer term replaced: that term. It
   // takes no writes and serves no reads.
   uint64 replaced_by_term = 10;
+  // Protocol 9: the term of its last transaction (`term` is the newest it
+  // began or follows, which may have none yet).
+  uint64 last_term = 11;
 }
 
 enum Role {
