@@ -38,6 +38,8 @@
 //! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
 //! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
 //! | `PUT /v1/logs/filter` | `{filter}` (as `--log`) | `{filter}`: what is logged from now on |
+//! | `POST /v1/logs/query` | `{sql, params?, timeout_ms?, scope?}` (SQL over tables `logs` and `queries`) | rows of the server's log store ([`crate::logstore`]); on a coordinator, of every server's merged, with `nodes`: each server's rows, time and error (`"scope": "local"`: its own store alone) |
+//! | `GET /v1/logs/store` | | `{store, schemas, nodes?}`: the log store (its path, rows, bytes, retention, what it wrote, dropped and deleted; null without one), its tables, and on a coordinator every server's |
 //! | `GET /v1/system`, `/v1/cluster`, `/v1/routes` | | the process and its limits; the cluster's copies; requests by route and queries by kind |
 //! | `GET /v1/whoami` | | `{name, key, scope, root}`: who the request's credential is ([`crate::keys`]) |
 //! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id` | `{name, scope, expires_days?}` | the API keys; a new one's secret is answered once |
@@ -141,6 +143,9 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/vacuum", post(admin_vacuum))
         .route("/v1/admin/verify", post(admin_verify))
         .route("/v1/admin/promote", post(admin_promote))
+        .route("/v1/admin/shards", post(add_shard))
+        .route("/v1/admin/shards/:i", axum::routing::delete(remove_shard))
+        .route("/v1/admin/shards/:i/replicas", post(add_replica).merge(axum::routing::delete(remove_replica)))
         .route("/v1/agent", post(agent_run))
         .route("/v1/queries", get(live_queries))
         .route("/v1/queries/:id", axum::routing::delete(cancel_query))
@@ -158,6 +163,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/timeseries", get(timeseries))
         .route("/v1/logs", get(logs))
         .route("/v1/logs/filter", put(log_filter))
+        .route("/v1/logs/query", post(log_query))
+        .route("/v1/logs/store", get(log_store))
         .route("/v1/system", get(system))
         .route("/v1/cluster", get(cluster))
         .route("/v1/routes", get(routes))
@@ -184,7 +191,10 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
 
 /// Gives the request its id (answered in `x-request-id`), serves it in a
 /// span that names it, counts it by route and status, and logs it: at
-/// debug level, or as an error when it failed on the server's side.
+/// debug level, or as an error when it failed on the server's side. The
+/// log viewer's own requests (`/v1/logs...`) are not logged as answered:
+/// a viewer following the logs would otherwise read lines of its reading.
+/// 
 async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
     let id = obs::request_id(header_str(req.headers(), header::HeaderName::from_static(obs::HEADER)));
     let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
@@ -200,6 +210,7 @@ async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
     let _in = span.enter();
     match res.extensions().get::<Failure>() {
         Some(Failure(why)) => obs::server_error(status, why),
+        None if route.starts_with("/v1/logs") => {}
         None => tracing::debug!(status, secs, "answered"),
     }
     res
@@ -1028,6 +1039,57 @@ async fn admin_promote(State(app): State<App>, w: Option<axum::Extension<Princip
     Ok(AxJson(app.svc.promote(&who(w), replicas, acks, force).await?))
 }
 
+/// The gRPC URLs a request names under `key`.
+fn urls(b: &Json, key: &str) -> Result<Vec<String>, ApiError> {
+    let bad = || ApiError::bad(format!("{key} is a list of gRPC URLs (http://host:port)"));
+    match b.get(key) {
+        Some(Json::Array(a)) => a.iter().map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from).ok_or_else(bad)).collect(),
+        _ => Err(bad()),
+    }
+}
+
+fn body_bool(b: &Json, key: &str) -> Result<bool, ApiError> {
+    match b.get(key) {
+        None | Some(Json::Null) => Ok(false),
+        Some(v) => v.as_bool().ok_or_else(|| ApiError::bad(format!("{key} is true or false"))),
+    }
+}
+
+/// `POST /v1/admin/shards {"servers": [...], "write_acks"?}`: a new
+/// shard, holding no slot until slots move to it.
+async fn add_shard(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let servers = urls(&b, "servers")?;
+    let acks = match b.get("write_acks") {
+        None | Some(Json::Null) => Acks::All,
+        Some(v) => v.as_str().and_then(Acks::parse).ok_or_else(|| ApiError::bad("write_acks is all, majority or primary"))?,
+    };
+    let j = app.svc.coordinator()?.add_shard(servers.clone(), acks).await?;
+    let detail = format!("added shard {} served by {}", j["shard"], servers.join(", "));
+    Ok(audited(j, detail))
+}
+
+/// `DELETE /v1/admin/shards/:i`: removes a shard that holds no slot.
+async fn remove_shard(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>) -> Result<Response, ApiError> {
+    let j = app.svc.coordinator()?.remove_shard(i).await?;
+    Ok(audited(j, format!("removed shard {i}")))
+}
+
+/// `POST /v1/admin/shards/:i/replicas {"url", "force"?}`: one more
+/// server for shard `i`, a replica of its primary.
+async fn add_replica(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let url = body_str(&b, "url")?.to_string();
+    let j = app.svc.coordinator()?.add_replica(i, &url, body_bool(&b, "force")?).await?;
+    Ok(audited(j, format!("added {url} to shard {i}")))
+}
+
+/// `DELETE /v1/admin/shards/:i/replicas?url=`: one server fewer for shard
+/// `i`.
+async fn remove_replica(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, Query(q): Params) -> Result<Response, ApiError> {
+    let url = q.get("url").filter(|u| !u.is_empty()).ok_or_else(|| ApiError::bad("url is the gRPC URL of the server to remove (?url=http://host:port)"))?;
+    let j = app.svc.coordinator()?.remove_replica(i, url).await?;
+    Ok(audited(j, format!("removed {url} from shard {i}")))
+}
+
 /// How long `POST /v1/admin/verify` waits for the replicas' digests by
 /// default.
 const VERIFY_WAIT: Duration = Duration::from_secs(60);
@@ -1302,6 +1364,53 @@ async fn log_filter(AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
     obs::set_log_filter(filter).map_err(ApiError::bad)?;
     tracing::info!(filter, "log filter changed");
     Ok(audited(json!({"filter": filter}), format!("log filter {filter}")))
+}
+
+/// A query of the log store: this server's, or on a coordinator every
+/// server's merged ([`crate::logstore::cluster_query`]) unless `"scope":
+/// "local"`.
+async fn log_query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let sql = body_str(&b, "sql")?;
+    let params = app.svc.params(b.get("params")).await?;
+    let timeout = app.svc.timeout_of(body_u64(&b, "timeout_ms"));
+    let local = match b.get("scope").and_then(|v| v.as_str()) {
+        None | Some("cluster") => false,
+        Some("local") => true,
+        Some(other) => return Err(ApiError::bad(format!("scope is \"cluster\" or \"local\", not {other:?}"))),
+    };
+    let store = app.svc.log_store.as_ref();
+    match &app.svc.backend {
+        crate::service::Backend::Cluster(c) if !local => Ok(AxJson(crate::logstore::cluster_query(store, c, sql, &params, timeout).await?)),
+        _ => {
+            let store = store.ok_or_else(crate::logstore::none_here)?;
+            let (rs, took_ms) = store.query(sql, &params, false, timeout).await?;
+            let mut j = js::result(&rs, took_ms);
+            j["nodes"] = json!([{"node": store.options().node, "rows": rs.rows.len(), "ms": took_ms}]);
+            Ok(AxJson(j))
+        }
+    }
+}
+
+/// The log store: this server's (`store`, null without one), its tables
+/// (`schemas`, in the short JSON form), and on a coordinator every
+/// server's (`nodes`), as each answered `Health`.
+async fn log_store(State(app): State<App>) -> AxJson<Json> {
+    let schemas: Vec<Json> = crate::logstore::schemas().iter().map(|s| json!({"table": s.table, "short": s.to_short_json(), "sql": strata::query::ddl::create_sql(s)})).collect();
+    let mut j = json!({"store": app.svc.log_store.as_ref().map(|s| s.status()), "schemas": schemas});
+    if let crate::service::Backend::Cluster(c) = &app.svc.backend {
+        let cluster = c.cluster().await;
+        let nodes: Vec<Json> = cluster["shards"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|s| {
+                let shard = s["shard"].clone();
+                s["replicas"].as_array().cloned().unwrap_or_default().into_iter().map(move |r| json!({"shard": shard, "url": r["url"], "status": r["status"], "error": r["error"], "store": r["detail"]["log_store"]}))
+            })
+            .collect();
+        j["nodes"] = json!(nodes);
+    }
+    AxJson(j)
 }
 
 async fn system(State(app): State<App>) -> AxJson<Json> {

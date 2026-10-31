@@ -123,6 +123,18 @@ pub struct Options {
     pub alerts: Option<PathBuf>,
     /// Post alerts that fire or resolve to this URL.
     pub alert_webhook: Option<String>,
+    /// The log store ([`crate::logstore`]): `None` beside the database
+    /// (`<db>.logs`), and none on a coordinator; `Some(None)` none.
+    pub log_store: Option<Option<PathBuf>>,
+    /// The name this server's rows carry in log stores (empty: the host's
+    /// name and the HTTP port, [`crate::logstore::hostname`]).
+    pub node_name: String,
+    /// Log store rows kept this long (zero: 7 days).
+    pub log_retain: Duration,
+    /// The most bytes the log store takes (0: no limit).
+    pub log_store_bytes: u64,
+    /// Queries a second the log store keeps besides slow and failed ones.
+    pub log_queries_per_sec: u64,
 }
 
 /// How writes resolve MEDIA values, from `--media-fetch`,
@@ -180,7 +192,10 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if o.promote && o.replica {
         return Err("a server is a primary (--replicas, --promote) or a replica (--replica), not both".into());
     }
-    let ship_log_bytes = match replicating {
+    // A server that numbers its writes keeps a log of them to ship, so that
+    // it can become a primary while it serves (`Configure`), and so that
+    // rows moving to another shard catch up from it.
+    let ship_log_bytes = match replicating || o.seq_no {
         true => (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20,
         false => 0,
     };
@@ -201,11 +216,20 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             }
         };
         let schema = c.schema.clone();
-        (Backend::Cluster(Arc::new(c)), schema)
+        let c = Arc::new(c);
+        // Follows the cluster map as admin calls (here or at another
+        // coordinator) change it.
+        c.watch();
+        (Backend::Cluster(c), schema)
     } else {
         let path = o.db.clone().ok_or("pass --db PATH (or --shards to coordinate shard servers)")?;
         slots_file = Some(crate::slots::file_of(&path));
         replication_file = Some(replication::file_of(&path));
+        // A part in replication kept beside the database is taken up again
+        // (`Configure` set it, or a promotion): such a database numbers
+        // its writes, and keeps a log of them.
+        let kept = if path.exists() && !replicating { replication::kept_role(&path)?.0 } else { None };
+        let ship_log_bytes = if kept.is_some() && ship_log_bytes == 0 { (if o.ship_log_mb > 0 { o.ship_log_mb } else { 64 }) << 20 } else { ship_log_bytes };
         if o.copy_from.is_some() && (path.exists() || o.schema.is_none()) {
             return Err("--copy-from fills a new database: pass a --db that does not exist and its --schema".into());
         }
@@ -315,10 +339,32 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.set_media(media_resolver(o)?).map_err(|e| e.message)?;
     }
     // Once loaded: bulk loads are not shipped, so every copy loads the same.
+    if let (Backend::Local(_), Some(file)) = (&svc.backend, &replication_file) {
+        svc.promote_options = Some(PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() });
+        svc.keep_replication_in(file.clone());
+    }
     if let (Backend::Local(db), Some(file)) = (&svc.backend, &replication_file) {
         // How it ships as a primary, but for its replicas and acks.
         let ships = PrimaryOptions { token: o.coord.token.clone(), ca: o.coord.ca.clone(), verify_every: Duration::from_secs(o.verify_every_s), ..Default::default() };
-        if (!o.replicas.is_empty() && !o.replica) || o.promote {
+        let kept = match replicating {
+            true => (None, false),
+            false => replication::kept_role(db.storage().path())?,
+        };
+        if kept.0.is_some() && db.storage().seq_no().is_none() {
+            return Err(format!("{} keeps a part in replication, but does not number its writes", db.storage().path().display()));
+        }
+        if let (Some(replication::KeptRole::Primary { replicas, acks }), false) = &kept {
+            let opts = PrimaryOptions { replicas: replicas.clone(), acks: *acks, ..ships };
+            let p = Primary::start(db.clone(), Some(file), opts)?;
+            tracing::info!(replicas = %replicas.join(", "), write_acks = acks.name(), "primary, as kept beside the database: ships its writes to its replicas");
+            svc.set_replication(Replication::Primary(p));
+        } else if kept.0.is_some() {
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            match kept.1 {
+                true => tracing::info!("replica: a primary of a newer term replaced this one, which follows it"),
+                false => tracing::info!("replica, as kept beside the database: applies the writes its primary ships"),
+            }
+        } else if (!o.replicas.is_empty() && !o.replica) || o.promote {
             let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
@@ -331,10 +377,42 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             tracing::info!(copies = %o.replicas.join(", "), "replica: applies the writes its primary ships, and takes none from clients");
         }
     }
+    open_log_store(&mut svc, o)?;
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
     spawn_sampler(&svc);
     Ok(svc)
+}
+
+/// Opens the server's log store ([`crate::logstore`]), beside the database
+/// unless `o.log_store` says where or that there is none, and hands it the
+/// service's queries; a coordinator keeps one only where told. Without one
+/// the lines kept for it are let go ([`obs::Sink::stop`]).
+fn open_log_store(svc: &mut Service, o: &Options) -> Result<(), String> {
+    let path = match &o.log_store {
+        Some(p) => p.clone(),
+        None => o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::logstore::file_of),
+    };
+    let Some(path) = path else {
+        crate::obs::sink().stop();
+        return Ok(());
+    };
+    let node = match o.node_name.is_empty() {
+        true => crate::logstore::hostname(),
+        false => o.node_name.clone(),
+    };
+    let mut lo = crate::logstore::LogOptions::new(path, node);
+    if !o.log_retain.is_zero() {
+        lo.retain = o.log_retain;
+    }
+    lo.max_bytes = o.log_store_bytes;
+    lo.queries_per_sec = o.log_queries_per_sec;
+    let store = crate::logstore::LogStore::open(lo)?;
+    tracing::info!(path = %store.options().path.display(), node = %store.options().node, retain_s = store.options().retain.as_secs(), max_mib = store.options().max_bytes >> 20, "keeps its logs in a log store");
+    let keep = store.clone();
+    let _ = svc.query_log.keep.set(Box::new(move |q, slow| keep.keep_query(q, slow)));
+    svc.log_store = Some(store);
+    Ok(())
 }
 
 /// Asks the replica serving HTTP at `url` to become the primary of a new
