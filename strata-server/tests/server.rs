@@ -641,6 +641,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
     }
+    async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no log store"))
+    }
     async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no profiles"))
     }
@@ -696,6 +699,9 @@ impl pb::strata_server::Strata for Overloaded {
     }
     async fn verify(&self, _: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not a replica"))
+    }
+    async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no log store"))
     }
     async fn profile(&self, _: tonic::Request<pb::ProfileRequest>) -> Result<tonic::Response<pb::ProfileResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("no profiles"))
@@ -971,6 +977,9 @@ impl pb::strata_server::Strata for Recording {
             6.. => self.inner.sources(r).await,
             _ => Err(tonic::Status::unimplemented("unknown method Sources")),
         }
+    }
+    async fn logs(&self, _: tonic::Request<pb::QueryRequest>) -> Result<tonic::Response<pb::QueryResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no log store"))
     }
     async fn verify(&self, r: tonic::Request<pb::VerifyRequest>) -> Result<tonic::Response<pb::VerifyResponse>, tonic::Status> {
         self.up()?;
