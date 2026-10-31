@@ -104,13 +104,15 @@ async fn a_query_s_profile_is_on_its_request_s_clock() {
     let segs: Vec<&Json> = children(&st, bm25).iter().map(|&i| &st[i]).filter(|s| s["op"] == "segment").collect();
     assert!(segs.len() >= 5, "a step per segment: {j}");
     assert!(segs.iter().all(|s| s["cpu_us"].as_f64().is_some() && s["seg"].as_u64().is_some()));
-    // The steps lie inside the trace's execute span, on the same clock.
+    // The steps lie inside the trace's execute span, on the same clock:
+    // the span's start and length are whole microseconds, each rounded
+    // down, so its end reads up to 2 µs early.
     let trace = j["trace"].as_array().unwrap();
     let exec = trace.iter().find(|s| s["name"] == "execute").unwrap();
     let (e0, e1) = (exec["start_us"].as_f64().unwrap(), exec["start_us"].as_f64().unwrap() + exec["dur_us"].as_f64().unwrap());
     for s in &st {
         let (a, b) = (s["start_us"].as_f64().unwrap(), s["start_us"].as_f64().unwrap() + s["us"].as_f64().unwrap());
-        assert!(a + 1.0 >= e0 && b <= e1 + 1.0, "{s} outside execute {exec}");
+        assert!(a + 1.0 >= e0 && b <= e1 + 2.0, "{s} outside execute {exec}");
     }
 
     // The latest queries list each without its steps, which its own route
