@@ -1951,7 +1951,9 @@ impl Service {
             let dir = tempfile::tempdir().map_err(ApiError::internal)?;
             let path = dir.path().join("import.sqlite");
             std::fs::write(&path, &body).map_err(ApiError::internal)?;
-            let src = strata::sqlite::Source::open(&path).map_err(|e| ApiError::bad(e.to_string()))?;
+            // The server's temporary path is no business of the client's.
+            let shown = path.display().to_string();
+            let src = strata::sqlite::Source::open(&path).map_err(|e| ApiError::bad(e.to_string().replace(&shown, "the uploaded file")))?;
             let plan = src.plan_over(&catalog, &opts)?;
             if !plan_only {
                 for t in &plan.tables {
