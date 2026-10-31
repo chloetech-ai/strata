@@ -2,7 +2,9 @@
 //! a value starting with `p`, as one run of the field's sorted dictionary,
 //! and agree with a scan of the documents through the WAL, flushes,
 //! reopening and merges; the autocomplete shape (a prefix, `ORDER BY` a
-//! count, `LIMIT k`) returns the top k.
+//! count, `LIMIT k`) returns the top k. With `fuzzy`, a walk of the
+//! dictionary selects the values with a prefix within that many edits,
+//! first letter exact, as a scan of every value finds them.
 
 use strata::db::{Db, SqlResult};
 use strata::query::ir::Plan;
@@ -73,6 +75,17 @@ fn any_tag(d: &Document, p: &str) -> bool {
     d[2].items().iter().any(|v| starts(v, p))
 }
 
+/// Whether `v` has a prefix within `k` edits of `p` with `p`'s first
+/// letter, by the edit distance of every prefix of `v`.
+fn near(v: &Value, p: &str, k: u8) -> bool {
+    let (Some(v), q) = (v.as_str(), p.chars().collect::<Vec<char>>()) else { return false };
+    let v: Vec<char> = v.chars().collect();
+    match q.first() {
+        None => true,
+        Some(c) => v.first() == Some(c) && (1..=v.len()).any(|j| strata::text::fuzzy::within(&q, &v[..j].iter().collect::<String>(), k).is_some()),
+    }
+}
+
 /// A literal for SQL: quotes doubled.
 fn q(s: &str) -> String {
     s.replace('\'', "''")
@@ -123,6 +136,39 @@ fn check(db: &Db, docs: &[Document]) {
         top.sort();
         let top: Vec<String> = top.into_iter().take(10).map(|(_, id)| id).collect();
         assert_eq!(r.rows.iter().map(|r| r[0].as_str().unwrap().to_string()).collect::<Vec<_>>(), top, "top {p:?}");
+    }
+    // With typos, by a scan of every value; a sample of the prefixes, and
+    // some typed with a swap, a missing or an extra letter.
+    let mut typos: Vec<String> = prefixes(docs).into_iter().step_by(3).collect();
+    typos.extend(["hwo to", "hiw ot", "ainstal", "hinstnat", "a tto", "aété", "hho too", "h", "ab", "qwerty"].map(String::from));
+    for p in &typos {
+        let auto = match p.chars().count() {
+            0..=2 => 0,
+            3..=5 => 1,
+            _ => 2,
+        };
+        for (fz, k) in [("1", 1), ("2", 2), ("'auto'", auto)] {
+            let w = want(docs, |d| near(&d[0], p, k));
+            assert_eq!(ids(db, &format!("{all} WHERE PREFIX(id, '{}', fuzzy => {fz})", q(p))), w, "fuzzy {fz} {p:?}");
+            assert_eq!(ids(db, &format!("{all} WHERE PREFIX(tags, '{}', fuzzy => {fz})", q(p))), want(docs, |d| d[2].items().iter().any(|v| near(v, p, k))), "tags fuzzy {fz} {p:?}");
+            assert_eq!(
+                ids(db, &format!("{all} WHERE NOT PREFIX(tags, '{}', fuzzy => {fz})", q(p))),
+                want(docs, |d| !d[2].items().iter().any(|v| near(v, p, k))),
+                "NOT tags fuzzy {fz} {p:?}"
+            );
+            assert_eq!(
+                ids(db, &format!("{all} WHERE n < 300 AND PREFIX(id, '{}', fuzzy => {fz})", q(p))),
+                want(docs, |d| d[3].as_i64().unwrap() < 300 && near(&d[0], p, k)),
+                "probe fuzzy {fz} {p:?}"
+            );
+            let count = db.query(&format!("SELECT COUNT(*) FROM queries WHERE PREFIX(id, '{}', fuzzy => {fz})", q(p)), &Params::new()).unwrap();
+            assert_eq!(count.rows[0][0], Value::Int(w.len() as i64), "count fuzzy {fz} {p:?}");
+            let r = db.query(&format!("SELECT id, n FROM queries WHERE PREFIX(id, '{}', fuzzy => {fz}) ORDER BY n DESC, id LIMIT 10", q(p)), &Params::new()).unwrap();
+            let mut top: Vec<(i64, String)> = docs.iter().filter(|d| near(&d[0], p, k)).map(|d| (-d[3].as_i64().unwrap(), d[0].as_str().unwrap().to_string())).collect();
+            top.sort();
+            let top: Vec<String> = top.into_iter().take(10).map(|(_, id)| id).collect();
+            assert_eq!(r.rows.iter().map(|r| r[0].as_str().unwrap().to_string()).collect::<Vec<_>>(), top, "top fuzzy {fz} {p:?}");
+        }
     }
     // A nullable field: NOT holds only where there is a value.
     assert_eq!(ids(db, &format!("{all} WHERE lang LIKE 'en%'")), want(docs, |d| starts(&d[1], "en")));
@@ -178,7 +224,8 @@ fn like_patterns_the_index_cannot_answer_are_refused() {
         ("SELECT id FROM queries WHERE id LIKE 'a_b%'", "not indexed"),
         ("SELECT id FROM queries WHERE id ILIKE 'how%'", "lowercased"),
         ("SELECT id FROM queries WHERE n LIKE '1%'", "KEYWORD"),
-        ("SELECT id FROM queries WHERE PREFIX(id, 'a', fuzzy => 1)", "unknown option"),
+        ("SELECT id FROM queries WHERE PREFIX(id, 'a', synonyms => 1)", "unknown option"),
+        ("SELECT id FROM queries WHERE PREFIX(id, 'a', fuzzy => 3)", "fuzzy => 0, 1, 2 or 'auto'"),
         ("SELECT id FROM queries WHERE PREFIX(id, 3)", "text"),
         ("SELECT id FROM queries WHERE id LIKE 'a!' ESCAPE '!'", "escape"),
     ] {
@@ -208,6 +255,22 @@ fn a_prefix_plan_names_its_feature_and_runs_from_json() {
     // A reader without the feature refuses the plan by name.
     let e = Plan::readable_by(1, &["prefix"], &["operators"]).unwrap_err().to_string();
     assert!(e.contains("prefix"), "{e}");
+    // With typos, a second feature, which a reader of exact prefixes only
+    // refuses rather than read the prefix as exact.
+    let sql = "SELECT id FROM queries WHERE PREFIX(id, 'hwo', fuzzy => 'auto') ORDER BY n DESC, id LIMIT 5";
+    let plan = db.explain(sql, &none).unwrap();
+    assert!(plan.features.iter().any(|f| f == "prefix_edits"), "{:?}", plan.features);
+    let text = plan.explain(&[db.schema()]).join("\n");
+    assert!(text.contains("PREFIX(id, 'hwo', fuzzy => 1)"), "{text}");
+    let again = Plan::from_json(&serde_json::from_str(&plan.to_json_text().unwrap()).unwrap()).unwrap();
+    let want = db.query(sql, &none).unwrap().rows;
+    assert!(!want.is_empty());
+    match db.run(&again).unwrap() {
+        SqlResult::Rows(r) => assert_eq!(r.rows, want),
+        SqlResult::Written(_) => panic!("a query"),
+    }
+    let e = Plan::readable_by(1, &["prefix", "prefix_edits"], &["prefix"]).unwrap_err().to_string();
+    assert!(e.contains("prefix_edits"), "{e}");
     // Over rows of a subquery, PREFIX tests each value.
     let rows = db.query("SELECT id FROM (SELECT id, lang FROM queries) AS t WHERE PREFIX(id, 'ha') AND PREFIX(lang, 'en')", &none).unwrap().rows;
     assert_eq!(rows.len(), want_len(&docs, |d| starts(&d[0], "ha") && starts(&d[1], "en")));

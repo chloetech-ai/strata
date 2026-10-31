@@ -81,6 +81,7 @@ const SELECTS: &[&str] = &[
     "SELECT category, COUNT(*) AS n, AVG(rating), MAX(published), MIN(year), SUM(rating) FROM papers WHERE year > 2000 GROUP BY category HAVING COUNT(*) >= 2 AND AVG(rating) < 3 ORDER BY n DESC LIMIT 5",
     "SELECT COUNT(*), COUNT(DISTINCT category), COUNT(rating) FROM papers WHERE MATCH(body, 'graph')",
     "SELECT id FROM papers WHERE category LIKE 'm%' OR (PREFIX(id, 'p1') AND id NOT LIKE 'p1!_%' ESCAPE '!') ORDER BY year DESC LIMIT 5",
+    "SELECT id FROM papers WHERE PREFIX(category, 'mtah', fuzzy => 'auto') OR PREFIX(id, 'p2', fuzzy => 1) ORDER BY year DESC LIMIT 5",
 ];
 
 /// Compound queries: operators over single-table queries.

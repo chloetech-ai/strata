@@ -619,6 +619,9 @@ message Like {
 message Prefix {
   Expr expr = 1;
   Expr prefix = 2;
+  // Edits a prefix with typos may be away (0: exact); plan feature
+  // prefix_edits.
+  uint32 edits = 3;
 }
 
 message Case {

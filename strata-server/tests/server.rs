@@ -147,6 +147,7 @@ fn queries() -> Vec<(&'static str, Json)> {
         // Autocomplete: a prefix's most rated, and a prefix counted.
         ("SELECT id, rating FROM products WHERE PREFIX(id, 'p00001') ORDER BY rating DESC, id LIMIT 10", none.clone()),
         ("SELECT COUNT(*) FROM products WHERE category LIKE 'k%' AND id NOT LIKE 'p0000%'", none.clone()),
+        ("SELECT id, rating FROM products WHERE PREFIX(category, 'kicthen', fuzzy => 'auto') ORDER BY rating DESC, id LIMIT 10", none.clone()),
     ]
 }
 

@@ -27,8 +27,11 @@ pub enum Pred {
     /// Keyword (or numeric) equality with any of `values`.
     In { field: usize, values: Vec<Value> },
     /// KEYWORD values starting with `prefix` (`LIKE 'p%'`, `PREFIX(f, 'p')`):
-    /// one run of the field's sorted dictionary.
-    Prefix { field: usize, prefix: String },
+    /// one run of the field's sorted dictionary. With `edits`, values with
+    /// a prefix within that many edits of it whose first letter is its own
+    /// (`PREFIX(f, 'p', fuzzy => 1)`): the runs a walk of the dictionary
+    /// finds.
+    Prefix { field: usize, prefix: String, edits: u8 },
     /// Rows with a value of the field (`IS NOT NULL`; a multi-valued field
     /// needs at least one).
     Present { field: usize },

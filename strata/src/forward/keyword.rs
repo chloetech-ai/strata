@@ -404,37 +404,65 @@ impl KeywordColumn {
         start..lo as u32
     }
 
-    /// Documents with a value starting with `prefix` (multi-valued: at
-    /// least one). A long run of a single-valued field scans the code
-    /// column, as a range of numbers does; a short one unions its lists.
-    pub fn docs_prefix(&self, prefix: &str) -> DocSet {
-        let codes = self.prefix_codes(prefix);
-        if codes.is_empty() {
-            return DocSet::empty(self.n as u32);
+    /// The runs of codes whose values start with `prefix` or, with
+    /// `edits`, with a prefix within that many edits of it whose first
+    /// letter is its own ([`crate::text::fuzzy::Match::Prefix`]), in
+    /// order, a run of the dictionary per prefix found.
+    pub fn prefix_runs(&self, prefix: &str, edits: u8) -> Vec<std::ops::Range<u32>> {
+        use crate::text::fuzzy::{walk, Match};
+        if edits == 0 {
+            let r = self.prefix_codes(prefix);
+            return if r.is_empty() { Vec::new() } else { vec![r] };
         }
-        if !self.multi && codes.len() > PREFIX_LISTS {
-            let r = super::KeyRange { lo: codes.start as i64, hi: codes.end as i64 - 1 };
-            return DocSet::from_bits(self.codes.scan_bits(r), self.n as u32);
-        }
-        self.docs_codes(&codes.collect::<Vec<u32>>())
+        let q: Vec<char> = prefix.chars().collect();
+        let mut runs: Vec<std::ops::Range<u32>> = Vec::new();
+        walk(&q, edits, Match::Prefix, &mut ValueCursor { col: self, pos: 0 }, |_, r, _| {
+            let r = r.start as u32..r.end as u32;
+            match runs.last_mut() {
+                Some(last) if last.end == r.start => last.end = r.end,
+                _ => runs.push(r),
+            }
+        });
+        runs
     }
 
-    /// Documents with a value starting with `prefix`: exact for a run of
-    /// up to [`PREFIX_LISTS`] values, else the run's share of the
-    /// documents with a value.
-    pub fn count_prefix(&self, prefix: &str) -> usize {
-        let codes = self.prefix_codes(prefix);
-        if codes.len() <= PREFIX_LISTS {
-            return codes.map(|c| self.count_code(c)).sum();
+    /// Documents with a value in `runs` of [`Self::prefix_runs`]
+    /// (multi-valued: at least one). A long run of a single-valued field
+    /// scans the code column, as a range of numbers does; short ones union
+    /// their lists.
+    pub fn docs_prefix(&self, runs: &[std::ops::Range<u32>]) -> DocSet {
+        let n = self.n as u32;
+        let (long, short): (Vec<_>, Vec<_>) = runs.iter().cloned().partition(|r| !self.multi && r.len() > PREFIX_LISTS);
+        let short: Vec<u32> = short.into_iter().flatten().collect();
+        let mut out = (!short.is_empty()).then(|| self.docs_codes(&short));
+        for r in long {
+            let r = super::KeyRange { lo: r.start as i64, hi: r.end as i64 - 1 };
+            let set = DocSet::from_bits(self.codes.scan_bits(r), n);
+            out = Some(match out {
+                Some(o) => o.union(&set),
+                None => set,
+            });
         }
-        (self.n_present() as f64 * codes.len() as f64 / self.n_values().max(1) as f64) as usize
+        out.unwrap_or_else(|| DocSet::empty(n))
     }
 
-    /// A probe for a prefix against the code column of a single-valued
+    /// Documents with a value in `runs`: exact for runs of up to
+    /// [`PREFIX_LISTS`] values, else a run's share of the documents with a
+    /// value.
+    pub fn count_prefix(&self, runs: &[std::ops::Range<u32>]) -> usize {
+        runs.iter()
+            .map(|r| match r.len() {
+                l if l <= PREFIX_LISTS => r.clone().map(|c| self.count_code(c)).sum(),
+                l => (self.n_present() as f64 * l as f64 / self.n_values().max(1) as f64) as usize,
+            })
+            .sum()
+    }
+
+    /// A probe for `runs` against the code column of a single-valued
     /// field: one code lookup and a range test per document.
-    pub fn filter_prefix(&self, prefix: &str) -> CodeRangeFilter {
-        let codes = self.prefix_codes(prefix);
-        CodeRangeFilter { card: self.count_prefix(prefix), codes: self.codes.clone(), lo: codes.start as i64, hi: codes.end as i64 }
+    pub fn filter_prefix(&self, runs: &[std::ops::Range<u32>]) -> CodeRangeFilter {
+        let ranges = runs.iter().map(|r| (r.start as i64, r.end as i64)).collect();
+        CodeRangeFilter { card: self.count_prefix(runs), codes: self.codes.clone(), ranges }
     }
 
     /// Codes of the INT values in `lo..=hi` of a multi-valued INT field.
@@ -895,19 +923,26 @@ impl DocFilter for CodeSetFilter {
     }
 }
 
-/// Documents whose code is in `lo..hi`: a prefix's run of values
+/// Documents whose code is in one of some runs `lo..hi`: a prefix's run
+/// of values, or the runs of a prefix with typos
 /// ([`KeywordColumn::filter_prefix`]).
 pub struct CodeRangeFilter {
     codes: Blocks,
-    lo: i64,
-    hi: i64,
+    /// In order, apart.
+    ranges: Vec<(i64, i64)>,
     card: usize,
 }
 
 impl DocFilter for CodeRangeFilter {
     #[inline]
     fn contains(&self, doc: DocId) -> bool {
-        self.codes.get(doc).is_some_and(|c| self.lo <= c && c < self.hi)
+        self.codes.get(doc).is_some_and(|c| match self.ranges[..] {
+            [(lo, hi)] => lo <= c && c < hi,
+            _ => {
+                let i = self.ranges.partition_point(|&(_, hi)| hi <= c);
+                self.ranges.get(i).is_some_and(|&(lo, _)| lo <= c)
+            }
+        })
     }
 
     fn cardinality(&self) -> usize {
@@ -915,6 +950,56 @@ impl DocFilter for CodeRangeFilter {
     }
 
     fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
-        self.lo < self.hi && self.codes.may_have(docs, super::KeyRange { lo: self.lo, hi: self.hi - 1 })
+        // A few runs one by one, more as the span from the first to the
+        // last.
+        let (Some(&(lo, _)), Some(&(_, hi))) = (self.ranges.first(), self.ranges.last()) else { return false };
+        match self.ranges.len() {
+            1..=4 => self.ranges.iter().any(|&(lo, hi)| self.codes.may_have(docs.clone(), super::KeyRange { lo, hi: hi - 1 })),
+            _ => self.codes.may_have(docs, super::KeyRange { lo, hi: hi - 1 }),
+        }
+    }
+}
+
+/// A dictionary's values in order, by code, for typo walks.
+struct ValueCursor<'a> {
+    col: &'a KeywordColumn,
+    pos: usize,
+}
+
+impl crate::text::fuzzy::Sorted for ValueCursor<'_> {
+    fn term(&self) -> Option<&[u8]> {
+        (self.pos < self.col.n_values()).then(|| self.col.value_bytes(self.pos as u32))
+    }
+
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn next(&mut self) {
+        self.pos = (self.pos + 1).min(self.col.n_values());
+    }
+
+    fn seek(&mut self, t: &[u8]) {
+        // Galloping: a walk's jumps are mostly short.
+        let n = self.col.n_values();
+        let below = |i: usize| self.col.value_bytes(i as u32) < t;
+        let (mut lo, mut step) = (self.pos, 1);
+        while lo + step < n && below(lo + step) {
+            lo += step;
+            step *= 2;
+        }
+        let mut hi = (lo + step).min(n);
+        if lo < n && below(lo) {
+            lo += 1;
+        }
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if below(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.pos = lo;
     }
 }

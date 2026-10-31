@@ -139,6 +139,9 @@ SELECT id, n FROM queries WHERE PREFIX(id, :typed) ORDER BY n DESC, id LIMIT 10;
 -- a user's own history first: keys of the form '<user>|<query>'
 SELECT id, n FROM user_queries WHERE PREFIX(id, 'u42|how to') ORDER BY n DESC LIMIT 3;
 
+-- with typos: 'hwo to ins' still finds 'how to install'
+SELECT id, n FROM queries WHERE PREFIX(id, :typed, fuzzy => 'auto') ORDER BY n DESC, id LIMIT 10;
+
 SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/ir/%';
 ```
 
@@ -146,9 +149,10 @@ SELECT id FROM files WHERE path LIKE 'src/query/%' AND path NOT LIKE 'src/query/
 - `ESCAPE 'c'` makes the character after `c` literal: `LIKE 'snake!_%' ESCAPE '!'` is the prefix `snake_`. `PREFIX` needs no escaping.
 - `ILIKE` is refused on a table's own field: store the value lowercased (and a display form beside it) and use `LIKE`.
 - `PREFIX(x, p)` also works over joined or derived rows, as a test of each value; `PREFIX(kw, '')` and `LIKE '%'` are `IS NOT NULL`.
+- **`PREFIX(kw, p, fuzzy => 1 | 2 | 'auto')`** also selects the values that start with a prefix within that many edits of `p` whose first letter is `p`'s own, with the edits `MATCH` counts ([typos](#typos-and-synonyms)); `'auto'` goes by `p`'s length, as it does for a word: none up to 2 letters, 1 up to 5, else 2. The dictionary is walked as a trie, one row of the edit-distance table per letter, jumping past every value whose start is already too far from `p` and past the whole run of a start close enough, so the cost follows the values near what was typed rather than the dictionary's size. The values found are a few runs of the dictionary, read as an exact prefix's one is. Typo matches rank by the `ORDER BY` like exact ones; to show exact completions first, run the exact query and fill what is left with the fuzzy one. `LIKE` takes no typos.
 - Counts kept with `UPDATE ... SET n = n + 1` or a write's `add` change in place, so a query log's popularity stays current without rewriting rows.
 
-A plan with a prefix needs the plan feature `prefix`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
+A plan with a prefix needs the plan feature `prefix`, and one with typos also `prefix_edits`, so a shard of an older version refuses it rather than misreading it. The same run of the dictionary answers [semantic-ID next codes](server.md#semantic-ids).
 
 **Cluster a completion table by its key.** `ORDER BY n DESC LIMIT 10` reads the count column's blocks best first ([ordering by a column](#a-column)), and with `OPTIONS(cluster_by = 'id')` a prefix's rows sit together in each segment, so the ten most asked queries under a prefix read about ten blocks whatever the prefix's length:
 
@@ -166,6 +170,8 @@ Over ORCAS's 10.4 million queries, loaded in no particular order and merged by t
 | blocks, clustered by `id` | 0.27 | 0.53 | 0.48 | 0.38 | 0.35 | 0.33 | 0.28 |
 
 The full runs, with medians and the 105 segments straight after the load, are [`results/text/complete-orcas.json` and `complete-orcas-clustered.json`](https://github.com/rkonow/strata/tree/main/strata/results/text) (`strata-complete-bench`).
+
+Typos cost the walk of each segment's dictionary. On the same clustered table, the median top 10 with `fuzzy => 'auto'` takes 1.9 ms at 3 letters and 2.7 ms at 4, where it allows one edit, and 7.9 to 10.7 ms from 6 letters, where it allows two (p99 up to 21 ms); with `fuzzy => 1` it takes 3.1 to 3.6 ms from 6 letters (p99 up to 6.9 ms). Up to 2 letters `'auto'` allows none, so it costs what an exact prefix does. Straight after a load, with 105 segments, the same queries take 2.5 to 4 times as long. Results: `complete-orcas-clustered-fuzzy.json` and `complete-orcas-clustered-fuzzy1.json`.
 
 ## Scores
 
@@ -551,7 +557,7 @@ SELECT id, score() FROM papers ORDER BY bm25(body, 'nueral netwrok', fuzzy => 1)
 SELECT id FROM papers WHERE MATCH(body, 'gnn', synonyms => 1) LIMIT 10;
 ```
 
-- **`fuzzy => 1` or `2`** also matches the indexed terms within that many edits of each word, counting an insertion, deletion, substitution or swap of two neighbouring letters as one edit (optimal string alignment). **`fuzzy => 'auto'`** allows no edits for words of 1 or 2 letters, 1 for 3 to 5 letters and 2 for longer ones. In the `MATCH` grammar, `word~` is `'auto'` for one word and `word~1`, `word~2` choose. A ranked query adds the 50 nearest terms of each word, each weighted `1 − edits / length` (at least 0.1), as Lucene's fuzzy queries do. A word and its typo neighbours share one document frequency, the largest among them, so a rare misspelling scores below the word rather than above it; the expansion is found once per query over every segment's dictionary, so all segments, and the plan line `bm25 expanded with N terms`, agree.
+- **`fuzzy => 1` or `2`** also matches the indexed terms within that many edits of each word, counting an insertion, deletion, substitution or swap of two neighbouring letters as one edit (optimal string alignment). **`fuzzy => 'auto'`** allows no edits for words of 1 or 2 letters, 1 for 3 to 5 letters and 2 for longer ones. In the `MATCH` grammar, `word~` is `'auto'` for one word and `word~1`, `word~2` choose. A ranked query adds the 50 nearest terms of each word, each weighted `1 − edits / length` (at least 0.1), as Lucene's fuzzy queries do. A word and its typo neighbours share one document frequency, the largest among them, so a rare misspelling scores below the word rather than above it; the expansion is found once per query over every segment's dictionary, so all segments, and the plan line `bm25 expanded with N terms`, agree. Each dictionary is walked as a trie, skipping every run of terms whose start is already too many edits away, rather than tested term by term: for a word of a typed query looked up in the 797,472 analysed terms of ORCAS's 10.4 million queries, the median lookup takes 2.1 ms with one edit and 16 ms with two, against 79 and 100 ms testing every term (one thread of a 4-core cloud VM, Intel Xeon @ 2.10GHz; [`results/text/fuzzy-orcas.json`](https://github.com/rkonow/strata/tree/main/strata/results/text), `strata-fuzzy-bench`).
 - **`synonyms => 1`** also matches what the server's synonym list says a word or phrase means. The list is in Solr's format: `laptop, notebook, portable computer` makes each find the others, and `tv => television` makes `tv` find `television` but not the reverse. Both sides are analysed like documents, so `laptops` finds `notebook`. A one-word synonym of a word shares that word's document frequency, as Lucene's synonym queries do; the words of a longer synonym score on their own. [strata-server](server.md) loads it from `--synonyms FILE` and edits it at `/v1/synonyms`; from Rust, set `ExecOptions::synonyms`. Without a list, `synonyms => 1` is an error that says so.
 
 ## Aggregates
@@ -705,7 +711,7 @@ ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMI
 
 - Each row is an edge from the row whose key is in `src` to the row whose key is in `dst`, weighted by `w`, or by 1 without a weight column (`edges = 'src, dst'`). `src` and `dst` are stored, single-valued `KEYWORD` or `INT` columns of the type of the other table's key, and the weight is a stored `FLOAT` or `INT`. If `src` references a table, walks are over that table.
 - Writing an edge writes its row and nothing else: insert it, delete it, or add to its weight with an `add` operation, whose `doc` creates the row on the edge's first event ([writes](server.md#writes)).
-- Edges are directed, from `src` to `dst`. For a click on item *i* after the user's last items *h*₁ … *h*₅ (*h*₁ the most recent), adding 1/*g* to the edge *h*_g → *i* records what comes after what: `ppr(cooc, :x, dir => 'out')` and `REACHABLE(cooc, :x, dir => 'out')` follow the items that came after *x*, and `dir => 'both'`, `ppr`'s default, reads them as seen together. That is five `add` operations per event.
+- Edges are directed, from `src` to `dst`. For a click on item *i* after the user's last items *h*₁ … *h*₅ (*h*₁ the most recent), adding 1/*g* to the edge *h*_g → *i* records what comes after what: `ppr(cooc, :x, dir => 'out')` and `REACHABLE(cooc, :x, dir => 'out')` follow the items that came after *x*, and `dir => 'both'`, `ppr`'s default, reads them as seen together. That is five `add` operations per event. For the next item alone, counts of what came after the last one or two items are cheaper and exact ([Next items](next-items.md)).
 - An edge is followed while its weight, as it is now, is above 0. `UPDATE cooc SET w = w * 0.9` decays every weight in place, and an edge whose weight is 0 or `NULL` stays in the table without being followed. `src` and `dst` are never changed in place: an `UPDATE` of a `KEYWORD` one rewrites the row, and `set`, `add` or an `UPDATE` of an `INT` one is refused, as for `shard_by` (delete the row and insert it again).
 - `REACHABLE`, `PATH`, `hops()` and `ppr` take an edge table with every option but `label`, since its edges have none. A walk over `cooc` and a walk over an `EDGES` field holding the same edges and weights find the same rows at the same hops and the same PageRank, up to rounding.
 - Each segment of the edge table indexes its rows by the keys they link, which flushes and merges build, so a walk finds a row's edges with one lookup of its key in each of the edge table's segments ([how, and what it costs](graphs.md#edge-tables)).
