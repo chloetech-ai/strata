@@ -107,6 +107,9 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         TableFactor::Table { name, .. } if is_table(name, schema) => {}
         _ => return true,
     }
+    if orders_by_text(q, s, schema) {
+        return true;
+    }
     let mut found = false;
     let mut check = |e: &Expr| {
         // A graph's seed subquery over the table is the executor's own.
@@ -194,6 +197,24 @@ fn computes_columns(q: &sql::Query, s: &sql::Select) -> bool {
         _ => true,
     };
     computed && order_ok && items.iter().all(|e| plain(e) || !ranks(e))
+}
+
+/// Whether `q`, a query of `schema`'s table that does not group, orders by
+/// a stored KEYWORD or TEXT column of one value first: the row evaluator
+/// sorts text, where the scan orders by numbers and scores.
+fn orders_by_text(q: &sql::Query, s: &sql::Select, schema: &Schema) -> bool {
+    let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(s);
+    let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &q.order_by else { return false };
+    let text = |e: &Expr| {
+        let name = match e {
+            Expr::Identifier(id) => &id.value,
+            Expr::CompoundIdentifier(ids) => &ids.last().expect("a name").value,
+            _ => return false,
+        };
+        schema.field(name).is_some_and(|f| f.stored && !f.multi && matches!(f.ty, FieldType::Keyword | FieldType::Text { .. }))
+    };
+    // The first key: a text tie-break (the primary key) the scan orders by.
+    !grouped && es.first().is_some_and(|o| text(&o.expr))
 }
 
 /// The expressions of a SELECT outside its FROM and ORDER BY.
@@ -361,6 +382,9 @@ struct Cte {
     columns: Vec<String>,
     keyed: Option<String>,
     multi: Vec<bool>,
+    /// The ORDER BY its rows were ranked by, which `score()` over them
+    /// reads when the query reading them has none.
+    order: Option<sql::OrderBy>,
 }
 
 struct Planner<'a> {
@@ -514,7 +538,8 @@ impl<'a> Planner<'a> {
                     p = Planned { node: ir::Node::Project { input: Box::new(p.node), columns: exprs }, columns, keyed: None, multi: p.multi };
                 }
                 let name = cte.alias.name.value.clone();
-                self.ctes.borrow_mut().push(Cte { name: name.clone(), columns: p.columns, keyed: p.keyed, multi: p.multi });
+                let order = cte.query.order_by.clone().filter(|_| p.keyed.is_some());
+                self.ctes.borrow_mut().push(Cte { name: name.clone(), columns: p.columns, keyed: p.keyed, multi: p.multi, order });
                 defs.push(ir::Cte { name, input: p.node });
             }
         }
@@ -722,8 +747,9 @@ impl<'a> Planner<'a> {
             // The first rows of each group: the scan's rows, kept by operators.
             Some(sql::Distinct::On(_)) => return self.join(&q, &s),
             _ if per_capped(&q) => return self.join(&q, &s),
-            // Columns computed from the rows' values, by the row evaluator.
-            _ if computes_columns(&q, &s) => return self.join(&q, &s),
+            // Columns computed from the rows' values, and an order by
+            // text, by the row evaluator.
+            _ if computes_columns(&q, &s) || orders_by_text(&q, &s, schema) => return self.join(&q, &s),
             Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
             None => {}
         }
@@ -873,6 +899,17 @@ impl<'a> Planner<'a> {
         }
         *name = sql::ObjectName::from(vec![sql::Ident::new(schema.table.clone())]);
         let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s) || s.distinct.is_some();
+        // `score()` without an ORDER BY is the score the WITH result ranked
+        // its rows by: ranking them again by it keeps their order.
+        let mut score = false;
+        for i in &s.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = i {
+                walk(e, &mut |x| score |= matches!(x, Expr::Function(f) if fname(f) == "score"));
+            }
+        }
+        if q.order_by.is_none() && !grouped && score {
+            q.order_by = cte.order.clone();
+        }
         // Without an ORDER BY, rows keep the WITH result's order, so the
         // cut happens after reordering.
         let reorder = q.order_by.is_none() && !grouped;
@@ -1085,6 +1122,9 @@ impl<'a> Planner<'a> {
         if let Some((i, c)) = cap.as_ref().map(|(_, field)| sides.column(field)).transpose()?.flatten() {
             if table(i).and_then(|t| t.field(&c)).is_some_and(|f| f.multi) {
                 return Err(err(format!("MAX k PER {c}: {c} is multi-valued, and a row with several values is in several groups; cap a field of one value")));
+            }
+            if table(i).and_then(|t| t.field(&c)).is_some_and(|f| matches!(f.ty, FieldType::Text { .. })) {
+                return Err(err(format!("MAX k PER {c}: {c} is TEXT, searched by its words, whose rows rarely share a value; cap a KEYWORD or a number")));
             }
         }
 
@@ -1687,7 +1727,10 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         Expr::Nested(x) | Expr::UnaryOp { op: UnaryOperator::Plus, expr: x } => go(x)?,
         Expr::Value(v) => ir::Expr::Lit(literal(&v.value, params)?),
         Expr::UnaryOp { op: UnaryOperator::Not, expr } => ir::Expr::Not(bx(expr)?),
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => ir::Expr::Neg(bx(expr)?),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => match super::sql::negative_integer(expr) {
+            Some(n) => ir::Expr::Lit(Value::Int(n)),
+            None => ir::Expr::Neg(bx(expr)?),
+        },
         Expr::IsNull(x) => ir::Expr::IsNull(bx(x)?),
         Expr::IsNotNull(x) => ir::Expr::Not(Box::new(ir::Expr::IsNull(bx(x)?))),
         Expr::BinaryOp { left, op, right } => {
@@ -1897,18 +1940,23 @@ impl Planner<'_> {
         let grouped = !group_exprs.is_empty() || !calls.is_empty();
         // ORDER BY an output column's name or number, or an expression over
         // the input row.
-        let by_alias = |e: &Expr| -> Option<usize> {
-            match e {
+        // A number is a position (`ORDER BY 2`), and one past the columns
+        // an error, not a constant that orders nothing.
+        let by_alias = |e: &Expr, what: &str| -> Result<Option<usize>> {
+            Ok(match e {
                 Expr::Identifier(id) => items.iter().position(|(n, _)| n.eq_ignore_ascii_case(&id.value)),
-                Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => e.to_string().parse::<usize>().ok().filter(|n| (1..=items.len()).contains(n)).map(|n| n - 1),
+                Expr::Value(v) if matches!(v.value, sql::Value::Number(..)) => match e.to_string().parse::<usize>() {
+                    Ok(n) if (1..=items.len()).contains(&n) => Some(n - 1),
+                    _ => return Err(err(format!("{what} {e}: no such column (the SELECT list has {} columns)", items.len()))),
+                },
                 _ => None,
-            }
+            })
         };
         let sort_keys = |items_at: &[ir::Expr], slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<Vec<ir::SortKey>> {
             order
                 .iter()
                 .map(|(e, desc, nulls_first)| {
-                    let expr = match by_alias(e) {
+                    let expr = match by_alias(e, "ORDER BY")? {
                         Some(i) => items_at[i].clone(),
                         None => compile_with(e, params, slot, multi, Some(&subs))?,
                     };
@@ -1925,7 +1973,7 @@ impl Planner<'_> {
             }
             let keys = on
                 .iter()
-                .map(|e| match by_alias(e) {
+                .map(|e| match by_alias(e, "DISTINCT ON")? {
                     Some(i) => Ok(items_at[i].clone()),
                     None => compile_with(e, params, slot, multi, Some(&subs)),
                 })

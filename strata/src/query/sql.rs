@@ -686,12 +686,17 @@ impl<'a> Binder<'a> {
     fn guard(&self, opts: &mut Opts, site: impl FnOnce() -> GuardSite, need: Option<crate::text::query::Need>, term: Option<&Pred>, what: &str) -> Result<()> {
         let mut rows = |k: &str| {
             opts.remove(k)
-                .map(|v| v.as_f64().filter(|x| x.fract() == 0.0 && (0.0..1e15).contains(x)).map(|x| x as u64).ok_or_else(|| err(format!("{k} => a count of rows (500), not {v:?}"))))
+                .map(|v| v.as_f64().filter(|x| x.fract() == 0.0 && (1.0..1e15).contains(x)).map(|x| x as u64).ok_or_else(|| err(format!("{k} => a count of rows, 1 or more (500), not {v:?}"))))
                 .transpose()
         };
         let (min_rows, max_rows) = (rows("min_rows")?, rows("max_rows")?);
         if min_rows.is_none() && max_rows.is_none() {
             return Ok(());
+        }
+        if let (Some(lo), Some(hi)) = (min_rows, max_rows) {
+            if lo > hi {
+                return Err(err(format!("min_rows => {lo} is above max_rows => {hi}: no level has at least {lo} rows and at most {hi}")));
+            }
         }
         let need = need.ok_or_else(|| err(format!("min_rows and max_rows on {what} relax its min => n, which it needs")))?;
         self.guards.borrow_mut().push((Guard { site: site(), need, min_rows, max_rows }, term.cloned(), self.ordering.get()));
@@ -983,6 +988,14 @@ impl<'a> Binder<'a> {
             }
             Ok(x as u32)
         };
+        // A limit: 0 would be read as nothing, so it is refused.
+        let at_least_one = |k: &str, d: f64, most: f64| -> Result<f64> {
+            let x = num(k, d)?;
+            if x < 1.0 || x.fract() != 0.0 || x > most {
+                return Err(err(format!("{k} must be a whole number from 1 to {most}")));
+            }
+            Ok(x)
+        };
         let dir = match opts.get("dir").map(|v| v.as_str().unwrap_or("")) {
             None => if name == "ppr" { Direction::Both } else { Direction::Out },
             Some("out") => Direction::Out,
@@ -1000,7 +1013,8 @@ impl<'a> Binder<'a> {
             return Err(err(format!("the edges of edge table {t} have no labels")));
         }
         let kind = match name {
-            "path" => GraphKind::Path { to: self.seeds(args[2])?, max_hops: count("max_hops", 6.0)?.max(1) },
+            // `max_hops => 0`: only a seed that is also a target.
+            "path" => GraphKind::Path { to: self.seeds(args[2])?, max_hops: count("max_hops", 6.0)? },
             "ppr" => {
                 let alpha = num("alpha", 0.15)?;
                 let eps = num("eps", 1e-4)?;
@@ -1026,8 +1040,8 @@ impl<'a> Binder<'a> {
             dir,
             labels,
             through,
-            max_nodes: num("max_nodes", 100_000.0)?.max(1.0) as usize,
-            k: count("k", 10.0)?.max(1) as usize,
+            max_nodes: at_least_one("max_nodes", 100_000.0, 1e9)? as usize,
+            k: at_least_one("k", 10.0, 1e6)? as usize,
             min_sim: num("min_sim", f64::NEG_INFINITY)?,
         };
         // The same computation named twice (in SELECT and ORDER BY) runs
@@ -1483,6 +1497,13 @@ impl<'a> Binder<'a> {
                         Ok(Score::Bm25 { field, text, opts: without_norm(opts) })
                     }
                     "similarity" => self.similarity(&args, opts, false),
+                    // A field's dot product with a vector is its similarity
+                    // (NULL for a row without one), in either order.
+                    "dot" => match args.as_slice() {
+                        [a, b] if self.field_of(a).is_err() && self.field_of(b).is_ok() => self.similarity(&[*b, *a], opts, false),
+                        [_, _] => self.similarity(&args, opts, false),
+                        _ => Err(err("dot(field, vector) takes two arguments")),
+                    },
                     "distance" => Err(err("distance(...) ranks on its own, ORDER BY distance(...) ASC; in an expression, use similarity(...), which ranks larger first")),
                     "maxsim" => self.maxsim(&args, opts),
                     "rrf" => {
@@ -1754,7 +1775,7 @@ impl<'a> Binder<'a> {
                             Some(o) => Ok(ir::Expr::Outer(o)),
                             None => Ok(ir::Expr::Lit(match self.literal(v)? {
                                 Value::Null => Value::Null,
-                                x => self.coerce(f, x)?,
+                                x => self.compared(f, x)?,
                             })),
                         })
                         .collect::<Result<_>>()?;
@@ -1769,11 +1790,11 @@ impl<'a> Binder<'a> {
                     match as_list(self.literal(v)?) {
                         Ok(xs) => {
                             for x in xs {
-                                values.push(self.coerce(f, x)?);
+                                values.push(self.compared(f, x)?);
                             }
                         }
                         Err(Value::Null) => values.push(Value::Null),
-                        Err(x) => values.push(self.coerce(f, x)?),
+                        Err(x) => values.push(self.compared(f, x)?),
                     }
                 }
                 let p = if values.is_empty() { Pred::False } else { Pred::In { field: f, values } };
@@ -1954,7 +1975,7 @@ impl<'a> Binder<'a> {
             return Err(err(format!("{e} compares with NULL, which is never true: use IS NULL or IS NOT NULL", e = Expr::BinaryOp { left: Box::new(left.clone()), op: op.clone(), right: Box::new(right.clone()) })));
         }
         if matches!(ty, FieldType::Keyword) {
-            let v = self.field_value(f, lit_e)?;
+            let v = self.compared(f, self.literal(lit_e)?)?;
             return match op {
                 Eq => Ok(Pred::In { field: f, values: vec![v] }),
                 NotEq => Ok(Pred::Not(Box::new(Pred::In { field: f, values: vec![v] }))),
@@ -2050,6 +2071,8 @@ impl<'a> Binder<'a> {
     fn literal(&self, e: &Expr) -> Result<Value> {
         match e {
             Expr::Nested(x) => self.literal(x),
+            // The statement's time, as text a TIMESTAMP takes.
+            e if is_now(e) => Ok(Value::Str(crate::timestamp::format(self.now))),
             Expr::Value(v) => match &v.value {
                 sql::Value::Number(s, _) => {
                     Ok(s.parse::<i64>().map(Value::Int).or_else(|_| s.parse::<f64>().map(Value::Float)).map_err(|_| err("bad number"))?)
@@ -2060,6 +2083,7 @@ impl<'a> Binder<'a> {
                 sql::Value::Placeholder(p) => Ok(self.params.get(p)?.clone()),
                 other => Err(err(format!("unsupported literal {other}"))),
             },
+            Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } if negative_integer(expr).is_some() => Ok(Value::Int(negative_integer(expr).expect("an integer"))),
             Expr::UnaryOp { op: sql::UnaryOperator::Minus, expr } => match self.literal(expr)? {
                 // -i64::MIN is the one integer without a negation.
                 Value::Int(x) => Ok(x.checked_neg().map_or(Value::Float(-(x as f64)), Value::Int)),
@@ -2118,6 +2142,21 @@ impl<'a> Binder<'a> {
     /// ([`crate::schema::Field::store`]).
     fn coerce(&self, f: usize, v: Value) -> Result<Value> {
         coerce(&self.schema.fields[f], v)
+    }
+
+    /// A value a condition compares field `f` with, coerced as a write's
+    /// is ([`Binder::coerce`]), except that a KEYWORD is compared with
+    /// text only: a write may store the number 1 as '1', but `k = 1` would
+    /// match the text '1' alone, as no row of numbers does.
+    fn compared(&self, f: usize, v: Value) -> Result<Value> {
+        let field = &self.schema.fields[f];
+        if field.ty == FieldType::Keyword && field.logical.is_none() {
+            if let Value::Int(_) | Value::Float(_) = v {
+                let n = v.as_f64().map_or_else(String::new, |x| x.to_string());
+                return Err(err(format!("{} is a KEYWORD: compare it with text ('{n}'), not the number {n}", field.name)));
+            }
+        }
+        self.coerce(f, v)
     }
 
     /// A bound of an INT field's range: a number, or for a BOOL or
@@ -2407,6 +2446,37 @@ pub(crate) fn encode_call(f: &sql::Function, literal: &dyn Fn(&Expr) -> Result<V
 
 fn fname(f: &sql::Function) -> String {
     f.name.to_string().to_ascii_lowercase()
+}
+
+/// Whether `e` is the time of the statement: `CURRENT_TIMESTAMP`,
+/// `LOCALTIMESTAMP` or `now()`.
+pub(crate) fn is_now(e: &Expr) -> bool {
+    let now = |n: &str| matches!(n.to_ascii_lowercase().as_str(), "current_timestamp" | "now" | "localtimestamp");
+    match e {
+        Expr::Function(f) => {
+            now(&f.name.to_string())
+                && match &f.args {
+                    sql::FunctionArguments::None => true,
+                    sql::FunctionArguments::List(l) => l.args.is_empty(),
+                    _ => false,
+                }
+        }
+        Expr::Identifier(id) => id.quote_style.is_none() && now(&id.value),
+        _ => false,
+    }
+}
+
+/// `-n` written as a minus and a number, as one integer: the only way to
+/// write `-9223372036854775808` (i64::MIN), whose number alone is past an
+/// INT.
+pub(crate) fn negative_integer(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            sql::Value::Number(s, _) => format!("-{s}").parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn literal_usize(e: &Expr) -> Option<usize> {

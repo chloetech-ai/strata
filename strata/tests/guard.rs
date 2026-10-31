@@ -214,12 +214,17 @@ fn a_guard_keeps_the_rows_of_the_level_its_counts_choose() {
         // Limits around the counts, so that each stops the relaxing somewhere.
         let near = |rng: &mut StdRng| {
             let x = counts[rng.gen_range(0..counts.len())];
-            [x.saturating_sub(1), x, x + 1, 0, 100_000][rng.gen_range(0..5)]
+            // A bound is 1 or more.
+            [x.saturating_sub(1), x, x + 1, 1, 100_000][rng.gen_range(0..5)].max(1)
         };
         let (min_rows, max_rows) = match rng.gen_range(0..3) {
             0 => (None, Some(near(&mut rng))),
             1 => (Some(near(&mut rng)), None),
-            _ => (Some(near(&mut rng)), Some(near(&mut rng))),
+            // min_rows is at most max_rows.
+            _ => {
+                let (a, b) = (near(&mut rng), near(&mut rng));
+                (Some(a.min(b)), Some(a.max(b)))
+            }
         };
         let mut opts = String::new();
         if let Some(x) = min_rows {
@@ -270,8 +275,10 @@ fn guards_are_refused_where_they_guard_nothing() {
     let mut rng = StdRng::seed_from_u64(3);
     let db = table(&dir.path().join("g.strata"), &mut rng, 50);
     for (q, msg) in [
-        ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', max_rows => 'many')", "max_rows => a count of rows (500)"),
-        ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', max_rows => 2.5)", "max_rows => a count of rows (500)"),
+        ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', max_rows => 'many')", "max_rows => a count of rows, 1 or more (500)"),
+        ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', max_rows => 2.5)", "max_rows => a count of rows, 1 or more (500)"),
+        ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', max_rows => 0)", "max_rows => a count of rows, 1 or more (500)"),
+        ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', min_rows => 9, max_rows => 3)", "min_rows => 9 is above max_rows => 3"),
         ("SELECT id FROM t WHERE AT_LEAST(1, a > 0, c = 'x', rows => 10)", "unknown option rows for AT_LEAST: min_rows, max_rows"),
         ("SELECT id FROM t WHERE MATCH(body, 'amber birch', max_rows => 10)", "min_rows and max_rows on MATCH relax its min => n, which it needs"),
         ("SELECT id FROM t ORDER BY bm25(body, 'amber birch', min_rows => 10) DESC LIMIT 5", "relax its min => n, which it needs"),

@@ -529,6 +529,7 @@ impl<'a> Ops<'a, '_> {
                 }
                 Ok(())
             })?;
+            outer_lists(&mut q)?;
             unknown(&mut q, &self.catalog);
             *runs += 1;
             let v = number(&self.scalar(&q, None, None)?)?;
@@ -1301,6 +1302,39 @@ fn unknown(n: &mut Node, catalog: &[&Schema]) {
         fold(&mut s.filter, true, schema);
     }
     n.inputs_mut().into_iter().for_each(|n| unknown(n, catalog));
+}
+
+/// The comparisons of `n` with a multi-valued column of the outer row,
+/// its values substituted (a list), as a filter on a multi-valued field
+/// reads them: `x = t.tags` holds when x is one of the values, `x !=
+/// t.tags` when it is none of them, and `x < t.sizes` when it is below
+/// one of them.
+fn outer_lists(n: &mut Node) -> Result<()> {
+    n.visit_exprs_mut(&mut |x| {
+        let Expr::Cmp { op, left, right } = x else { return Ok(()) };
+        // The list on the right: `x op list`.
+        let (op, other, values) = match (&**left, &**right) {
+            (o, Expr::Lit(Value::List(vs))) => (*op, o.clone(), vs.clone()),
+            (Expr::Lit(Value::List(vs)), o) => {
+                let flipped = match *op {
+                    CmpOp::Lt => CmpOp::Gt,
+                    CmpOp::Le => CmpOp::Ge,
+                    CmpOp::Gt => CmpOp::Lt,
+                    CmpOp::Ge => CmpOp::Le,
+                    op => op,
+                };
+                (flipped, o.clone(), vs.clone())
+            }
+            _ => return Ok(()),
+        };
+        let one_of = Expr::In { expr: Box::new(other.clone()), list: values.iter().cloned().map(Expr::Lit).collect() };
+        *x = match op {
+            CmpOp::Eq => one_of,
+            CmpOp::Ne => Expr::Not(Box::new(one_of)),
+            op => Expr::Or(values.into_iter().map(|v| Expr::Cmp { op, left: Box::new(other.clone()), right: Box::new(Expr::Lit(v)) }).collect()),
+        };
+        Ok(())
+    })
 }
 
 /// A subquery's value as a ranking reads it.

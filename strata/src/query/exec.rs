@@ -3217,9 +3217,9 @@ pub(crate) fn min_need(opts: &Opts) -> Result<Option<text::query::Need>> {
 pub(crate) fn need_of(v: &Value, what: &str) -> Result<text::query::Need> {
     let need = match v {
         Value::Str(s) => text::query::Need::parse(s.trim()),
-        v => v.as_f64().filter(|x| x.fract() == 0.0 && (0.0..1e9).contains(x)).map(|x| text::query::Need::Count(x as usize)),
+        v => v.as_f64().filter(|x| x.fract() == 0.0 && (1.0..1e9).contains(x)).map(|x| text::query::Need::Count(x as usize)),
     };
-    need.ok_or_else(|| err(format!("{what} a count (2) or a percentage ('75%'), not {v:?}")))
+    need.ok_or_else(|| err(format!("{what} a count (2) or a percentage ('75%'), above 0, not {v:?}")))
 }
 
 /// The scored terms of a `bm25` query in order, each with the weight of
