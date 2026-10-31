@@ -404,6 +404,8 @@ fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json
             "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
             // A model behind an API: the requests it sent.
             "usage": m.model.as_ref().ok().and_then(|e| e.usage()).map(|u| json!({"requests": u.requests, "retries": u.retries, "failures": u.failures, "texts": u.texts, "tokens": u.tokens})),
+            // Rows stored without a vector, filled in once the model opened.
+            "backfill": svc.backfill_of(&m.table, &m.field).map(|b| json!({"state": b.state, "missing": b.missing, "embedded": b.embedded, "error": b.error})),
         })).collect::<Vec<_>>(),
         // Each derived TEXT field: its MEDIA field, model, and whether this
         // server makes its text (null on a coordinator: its shards do).
