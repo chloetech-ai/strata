@@ -26,12 +26,13 @@ table records its SHA-256 and opens it from the same models directory.
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any
+from typing import Any, Mapping
 
 from . import _strata
 
-__all__ = ["codebook", "sequence"]
+__all__ = ["codebook", "sequence", "write_vectors"]
 
 
 def codebook(
@@ -172,9 +173,12 @@ def sequence(
     the loss is cross-entropy against the other items of the batch
     (`negatives="in_batch"`) or every item (`"all"`, for catalogs that fit).
     With `learn_items` the item vectors are trained too (from the field's,
-    or from `vectors`) and returned normalized, for the caller to write
-    into the field: the model then ranks like SASRec, but a new item needs
-    a vector before it can be found. `holdout` keeps each sequence's last
+    or from `vectors`) and returned normalized: the model then ranks like
+    SASRec, but a new item needs a vector before it can be found. Either
+    way the model is saved with the item vectors it was trained with
+    (`items.safetensors`), and `encode()` refuses a history whose items
+    have other vectors in the field: write learned ones in with
+    `write_vectors`. `holdout` keeps each sequence's last
     event out of training and stops when NDCG@10 on those stops rising for
     `patience` epochs, keeping the best epoch. `max_seconds` stops training
     after the first epoch that ends past that many seconds.
@@ -213,11 +217,35 @@ def sequence(
         "actions": acts,
         "eps": S.EPS,
     }
-    model, learned, history = S.train(
+    model, items, learned, history = S.train(
         sequences or {}, records, vectors, cfg, learn_items=learn_items, negatives=negatives, temperature=temperature,
         epochs=epochs, batch=batch, lr=lr, dropout=dropout, holdout=holdout, patience=patience, seed=seed, log=log, max_seconds=max_seconds,
     )
-    root = os.fspath(models) if models is not None else os.environ.get("STRATA_MODELS") or os.path.expanduser("~/.local/share/strata/models")
-    path = os.path.join(root, name)
-    S.save(model, cfg, path)
+    path = os.path.join(_models_dir(models), name)
+    S.save(model, cfg, path, items=items)
     return {"path": path, "history": history, "vectors": learned}
+
+
+def _models_dir(models: str | os.PathLike | None) -> str:
+    return os.fspath(models) if models is not None else os.environ.get("STRATA_MODELS") or os.path.expanduser("~/.local/share/strata/models")
+
+
+def write_vectors(source: Any, name: str, *, models: str | os.PathLike | None = None) -> int:
+    """Writes the item vectors sequence model `name` was trained with (its
+    `items.safetensors`, under `models`) into the field of the table its
+    config names, in `source` (a `Database` or a `Client`): each item's row
+    keeps its other columns, and only that field changes. An item without
+    a row is skipped. Returns how many rows were written."""
+    from . import _sequence as S
+
+    path = os.path.join(_models_dir(models), name)
+    cfg = json.load(open(os.path.join(path, S.CONFIG)))
+    items = S.read_items(path)
+    if not items:
+        raise ValueError(f"sequence model {name} was saved without its item vectors ({S.ITEMS}): train it again with strata.train.sequence")
+    table, field = cfg["table"], cfg["field"]
+    pk = _key(source, table)
+    written = 0
+    for k, v in items.items():
+        written += int(source.sql(f"UPDATE {table} SET {field} = :v WHERE {pk} = :k", {"k": k, "v": v}) or 0)
+    return written
