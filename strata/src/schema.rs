@@ -657,6 +657,9 @@ impl Schema {
         }
         s.check_semantic_ids()?;
         s.check_references()?;
+        if s.fields.iter().any(|f| f.name.trim().is_empty()) {
+            return Err(Error::Schema(format!("a column of {} has an empty name", s.table)));
+        }
         // Names are matched in any case, so they must differ in more than case.
         let mut names: Vec<String> = s.fields.iter().map(|f| f.name.to_ascii_lowercase()).collect();
         names.sort();

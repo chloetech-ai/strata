@@ -107,9 +107,10 @@ impl Need {
         n.clamp(1, y.max(1))
     }
 
-    /// `n` or `p%` (`p` at most 100), as `@` and `min =>` write it.
+    /// `n` (1 or more) or `p%` (from 1 to 100), as `@` and `min =>` write
+    /// it: none of no items would keep every row, which is no condition.
     pub fn parse(s: &str) -> Option<Need> {
-        let digits = |d: &str| (!d.is_empty() && d.len() <= 9 && d.bytes().all(|b| b.is_ascii_digit())).then(|| d.parse::<u32>().ok()).flatten();
+        let digits = |d: &str| (!d.is_empty() && d.len() <= 9 && d.bytes().all(|b| b.is_ascii_digit())).then(|| d.parse::<u32>().ok()).flatten().filter(|&n| n > 0);
         match s.strip_suffix('%') {
             Some(p) => digits(p).filter(|&p| p <= 100).map(Need::Percent),
             None => digits(s).map(|n| Need::Count(n as usize)),
@@ -224,7 +225,7 @@ fn lex(q: &str) -> Result<(Vec<Tok>, MatchFeatures)> {
                 let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"')).unwrap_or(rest.len());
                 match rest.strip_prefix('@') {
                     Some(_) => {
-                        let need = Need::parse(&rest[1..len]).ok_or_else(|| Error::Query(format!("`)@` takes a count or a percentage (`)@2`, `)@50%`) in MATCH query {q:?}")))?;
+                        let need = Need::parse(&rest[1..len]).ok_or_else(|| Error::Query(format!("`)@` takes a count or a percentage above 0 (`)@2`, `)@50%`) in MATCH query {q:?}")))?;
                         at_least = true;
                         out.push(Tok::RParenAtLeast(need));
                         while it.peek().is_some_and(|&(j, _)| j < i + 1 + len) {
@@ -723,9 +724,10 @@ mod tests {
         let at = |n, items: Vec<BoolQuery>| AtLeast { n, items };
         assert_eq!(parse_match("(cat dog fox owl)@2").unwrap(), at(2, vec![cat.clone(), dog.clone(), fox.clone(), owl.clone()]));
         assert_eq!(parse_match("(cat OR dog OR fox)@2").unwrap(), at(2, vec![cat.clone(), dog.clone(), fox.clone()]));
-        // One of them is OR, all of them AND; counts are clamped to 1..=y.
+        // One of them is OR, all of them AND; counts are clamped to 1..=y,
+        // and none of them is no condition.
         assert_eq!(parse_match("(cat dog fox)@1").unwrap(), Or(vec![cat.clone(), dog.clone(), fox.clone()]));
-        assert_eq!(parse_match("(cat dog fox)@0").unwrap(), Or(vec![cat.clone(), dog.clone(), fox.clone()]));
+        assert!(parse_match("(cat dog fox)@0").is_err() && parse_match("(cat dog fox)@0%").is_err());
         assert_eq!(parse_match("(cat dog fox)@3").unwrap(), And(vec![cat.clone(), dog.clone(), fox.clone()]));
         assert_eq!(parse_match("(cat dog fox)@9").unwrap(), And(vec![cat.clone(), dog.clone(), fox.clone()]));
         // Percentages round down: 75% of 4 is 3, of 3 is 2; 10% of 3 is 1.

@@ -107,6 +107,9 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         TableFactor::Table { name, .. } if is_table(name, schema) => {}
         _ => return true,
     }
+    if orders_by_text(q, s, schema) {
+        return true;
+    }
     let mut found = false;
     let mut check = |e: &Expr| {
         // A graph's seed subquery over the table is the executor's own.
@@ -194,6 +197,24 @@ fn computes_columns(q: &sql::Query, s: &sql::Select) -> bool {
         _ => true,
     };
     computed && order_ok && items.iter().all(|e| plain(e) || !ranks(e))
+}
+
+/// Whether `q`, a query of `schema`'s table that does not group, orders by
+/// a stored KEYWORD or TEXT column of one value first: the row evaluator
+/// sorts text, where the scan orders by numbers and scores.
+fn orders_by_text(q: &sql::Query, s: &sql::Select, schema: &Schema) -> bool {
+    let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(s);
+    let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &q.order_by else { return false };
+    let text = |e: &Expr| {
+        let name = match e {
+            Expr::Identifier(id) => &id.value,
+            Expr::CompoundIdentifier(ids) => &ids.last().expect("a name").value,
+            _ => return false,
+        };
+        schema.field(name).is_some_and(|f| f.stored && !f.multi && matches!(f.ty, FieldType::Keyword | FieldType::Text { .. }))
+    };
+    // The first key: a text tie-break (the primary key) the scan orders by.
+    !grouped && es.first().is_some_and(|o| text(&o.expr))
 }
 
 /// The expressions of a SELECT outside its FROM and ORDER BY.
@@ -726,8 +747,9 @@ impl<'a> Planner<'a> {
             // The first rows of each group: the scan's rows, kept by operators.
             Some(sql::Distinct::On(_)) => return self.join(&q, &s),
             _ if per_capped(&q) => return self.join(&q, &s),
-            // Columns computed from the rows' values, by the row evaluator.
-            _ if computes_columns(&q, &s) => return self.join(&q, &s),
+            // Columns computed from the rows' values, and an order by
+            // text, by the row evaluator.
+            _ if computes_columns(&q, &s) || orders_by_text(&q, &s, schema) => return self.join(&q, &s),
             Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
             None => {}
         }
@@ -1100,6 +1122,9 @@ impl<'a> Planner<'a> {
         if let Some((i, c)) = cap.as_ref().map(|(_, field)| sides.column(field)).transpose()?.flatten() {
             if table(i).and_then(|t| t.field(&c)).is_some_and(|f| f.multi) {
                 return Err(err(format!("MAX k PER {c}: {c} is multi-valued, and a row with several values is in several groups; cap a field of one value")));
+            }
+            if table(i).and_then(|t| t.field(&c)).is_some_and(|f| matches!(f.ty, FieldType::Text { .. })) {
+                return Err(err(format!("MAX k PER {c}: {c} is TEXT, searched by its words, whose rows rarely share a value; cap a KEYWORD or a number")));
             }
         }
 

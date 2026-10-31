@@ -257,6 +257,41 @@ pub fn check(profile: &RankProfile, table: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks what [`check`] cannot without the table: that every column a
+/// profile's rankings name is a field of `schema`'s table, and that a
+/// ranking by a column alone ranks by a number.
+pub fn check_columns(profile: &RankProfile, schema: &crate::schema::Schema) -> Result<()> {
+    let q = super::sql::parse_query(&profile.ranking)?;
+    let mut steps: Vec<&sql::Query> = q.with.iter().flat_map(|w| w.cte_tables.iter().map(|c| &*c.query)).collect();
+    steps.push(&q);
+    for step in steps {
+        let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &step.order_by else { continue };
+        for o in es {
+            let mut missing: Option<String> = None;
+            super::compound::walk(&o.expr, &mut |x| {
+                let name = match x {
+                    Expr::Identifier(id) => &id.value,
+                    Expr::CompoundIdentifier(ids) => &ids.last().expect("a name").value,
+                    _ => return,
+                };
+                if missing.is_none() && schema.field(name).is_none() {
+                    missing = Some(name.clone());
+                }
+            });
+            if let Some(name) = missing {
+                return Err(err(format!("rank profile {}: no such column {name} in {}", profile.name, schema.table)));
+            }
+            if let Expr::Identifier(id) = &o.expr {
+                let f = schema.field(&id.value).expect("checked above");
+                if f.multi || !matches!(f.ty, crate::schema::FieldType::Int | crate::schema::FieldType::Float) {
+                    return Err(err(format!("rank profile {}: it ranks by {}, which is not a number of one value", profile.name, f.name)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The names of the parameters `q` reads (`:q` is `q`), lower case.
 fn parameters(q: &sql::Query) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
