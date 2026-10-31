@@ -14,6 +14,7 @@ use strata::storage::DbOptions;
 use strata::value::Value;
 use strata_server::auth::Access;
 use strata_server::coord::Coordinator;
+use strata_server::keys::Principal;
 use strata_server::replication::{self, Acks, KeptRole, PrimaryOptions};
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Service};
 use strata_server::{demo, pb, server, slots};
@@ -74,7 +75,7 @@ async fn ids(svc: &Arc<Service>) -> Vec<String> {
 }
 
 async fn sql(svc: &Arc<Service>, s: &str) -> Result<(), String> {
-    svc.sql(s, &Params::new(), After::Any, 0).await.map(|_| ()).map_err(|e| e.message)
+    svc.sql(&Principal::open(), s, &Params::new(), After::Any, 0).await.map(|_| ()).map_err(|e| e.message)
 }
 
 fn servers(c: &Coordinator) -> Vec<Vec<String>> {

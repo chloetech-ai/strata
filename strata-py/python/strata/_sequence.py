@@ -11,9 +11,13 @@ item dimension, then normalized, is the vector. A row's score is its dot
 product with an item's vector as stored, which is what `similarity` in
 Strata computes.
 
-Strata reads the files this module writes (`<models>/<name>/config.json`
-and `model.safetensors`) and runs the same arithmetic in Rust; the names
-and shapes of the tensors here are the format.
+Strata reads the files this module writes (`<models>/<name>/config.json`,
+`model.safetensors` and `items.safetensors`) and runs the same arithmetic
+in Rust; the names and shapes of the tensors here are the format. The
+items file holds the item vectors the model was trained with, the tensor
+`vectors` (a row an item) with the items' keys as a JSON array in its
+metadata's `keys`: Strata serves the model only over a field that holds
+those vectors.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 CONFIG = "config.json"
 WEIGHTS = "model.safetensors"
+ITEMS = "items.safetensors"
 EPS = 1e-5
 
 
@@ -94,10 +99,13 @@ def _module(torch, dim: int, cfg: Mapping[str, Any]):
     return Encoder()
 
 
-def _write_safetensors(path: str, tensors: Mapping[str, Any]) -> None:
+def _write_safetensors(path: str, tensors: Mapping[str, Any], metadata: Mapping[str, str] | None = None) -> None:
     """The safetensors format: an 8-byte little-endian header length, the
-    JSON header (names, dtype, shape, byte offsets), then the data."""
+    JSON header (names, dtype, shape, byte offsets; text `__metadata__`),
+    then the data."""
     header, blobs, at = {}, [], 0
+    if metadata:
+        header["__metadata__"] = dict(metadata)
     for name, t in tensors.items():
         b = t.detach().to("cpu").float().contiguous().numpy().astype("<f4").tobytes()
         header[name] = {"dtype": "F32", "shape": list(t.shape), "data_offsets": [at, at + len(b)]}
@@ -112,14 +120,33 @@ def _write_safetensors(path: str, tensors: Mapping[str, Any]) -> None:
             f.write(b)
 
 
-def save(model, cfg: Mapping[str, Any], directory: str) -> None:
-    """Writes `config.json` and `model.safetensors` into `directory`, each
-    through a temporary file so that a reader never sees half of one."""
+def _item_keys(keys: Sequence[Any]) -> str:
+    """The keys as the items file lists them: text or whole numbers."""
+    for k in keys:
+        if isinstance(k, bool) or not isinstance(k, (str, int)):
+            raise ValueError(f"an item's key is text or a whole number, as a table's primary key, not {k!r}")
+    return json.dumps(list(keys), separators=(",", ":"))
+
+
+def save(model, cfg: Mapping[str, Any], directory: str, items: tuple[Sequence[Any], Any] | None = None) -> None:
+    """Writes `config.json`, `model.safetensors` and, given `items` (the
+    keys, and a tensor of their vectors in that order), `items.safetensors`
+    into `directory`, each through a temporary file so that a reader never
+    sees half of one. Without `items` an items file left there is removed:
+    it would be another model's."""
     os.makedirs(directory, exist_ok=True)
-    for file, write in (
-        (WEIGHTS, lambda p: _write_safetensors(p, model.state_dict())),
-        (CONFIG, lambda p: open(p, "w").write(json.dumps(cfg, indent=2) + "\n")),
-    ):
+    files = []
+    if items is not None:
+        keys, matrix = items
+        meta = {"keys": _item_keys(keys)}
+        if tuple(matrix.shape) != (len(keys), cfg["dim"]):
+            raise ValueError(f"the item vectors are {tuple(matrix.shape)}, not {len(keys)} keys by {cfg['dim']}")
+        files.append((ITEMS, lambda p: _write_safetensors(p, {"vectors": matrix}, meta)))
+    elif os.path.exists(os.path.join(directory, ITEMS)):
+        os.unlink(os.path.join(directory, ITEMS))
+    files.append((WEIGHTS, lambda p: _write_safetensors(p, model.state_dict())))
+    files.append((CONFIG, lambda p: open(p, "w").write(json.dumps(cfg, indent=2) + "\n")))
+    for file, write in files:
         fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + file)
         os.close(fd)
         try:
@@ -133,20 +160,43 @@ def save(model, cfg: Mapping[str, Any], directory: str) -> None:
             raise
 
 
+def _read_safetensors(path: str):
+    """The header and the data of a safetensors file."""
+    raw = open(path, "rb").read()
+    n = int.from_bytes(raw[:8], "little")
+    return json.loads(raw[8 : 8 + n]), raw[8 + n :]
+
+
+def read_items(directory: str) -> dict:
+    """The item vectors a model in `directory` was trained with (key to a
+    list of floats), or {} for a model saved without them."""
+    path = os.path.join(directory, ITEMS)
+    if not os.path.exists(path):
+        return {}
+    import numpy as np
+
+    header, data = _read_safetensors(path)
+    keys = json.loads(header["__metadata__"]["keys"])
+    t = header["vectors"]
+    a, b = t["data_offsets"]
+    rows = np.frombuffer(data[a:b], dtype="<f4").reshape(t["shape"])
+    return {k: rows[i].tolist() for i, k in enumerate(keys)}
+
+
 def load(directory: str, item_dim: int | None = None):
     """The model saved in `directory` and its config, for evaluation."""
     torch = _torch()
     cfg = json.load(open(os.path.join(directory, CONFIG)))
     m = _module(torch, cfg["dim"], cfg)
-    raw = open(os.path.join(directory, WEIGHTS), "rb").read()
-    n = int.from_bytes(raw[:8], "little")
-    header = json.loads(raw[8 : 8 + n])
+    header, data = _read_safetensors(os.path.join(directory, WEIGHTS))
     import numpy as np
 
     state = {}
     for name, t in header.items():
+        if name == "__metadata__":
+            continue
         a, b = t["data_offsets"]
-        state[name] = torch.from_numpy(np.frombuffer(raw[8 + n + a : 8 + n + b], dtype="<f4").reshape(t["shape"]).copy())
+        state[name] = torch.from_numpy(np.frombuffer(data[a:b], dtype="<f4").reshape(t["shape"]).copy())
     m.load_state_dict(state)
     m.eval()
     return m, cfg
@@ -328,7 +378,7 @@ def train(
     model.eval()
     E = item_matrix(torch, base, learned).detach()
     out_vectors = {k: E[i].tolist() for i, k in enumerate(keys)} if learn_items else None
-    return model, out_vectors, history_
+    return model, (keys, E), out_vectors, history_
 
 
 def _seconds(t: Any) -> float:

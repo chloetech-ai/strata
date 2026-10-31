@@ -465,6 +465,18 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then pip install torch --index-url https://download.pytorch.org/whl/cpu; else pip install torch; fi
           maturin develop --release
           pytest tests -v
+      # The recommender gate (strata/results/sequence/gate.py): every
+      # candidate source and two baselines on MovieLens-1M, checked against
+      # strata/tests/fixtures/recsys_gate.json. The ratings come from a
+      # mirror on Hugging Face, pinned by revision and SHA-256.
+      - name: Recommender gate
+        if: runner.os == 'Linux'
+        working-directory: strata-py
+        run: |
+          . .venv/bin/activate
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/ml-1m-ratings.csv" https://huggingface.co/datasets/hazemessam/ml-1m/resolve/b7ed0ffb2157bfbc794a1e47e9044ab323bee57f/ratings.csv
+          echo "d2baa264e8ef4c7fb0c555acae5dc80239612481efff5814df9eab98cb9e1fe0  $RUNNER_TEMP/ml-1m-ratings.csv" | sha256sum -c
+          python ../strata/results/sequence/gate.py --ratings "$RUNNER_TEMP/ml-1m-ratings.csv"
       - name: Clippy
         working-directory: strata-py
         run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings

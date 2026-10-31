@@ -12,6 +12,7 @@ use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::Schema;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::coord::Coordinator;
 use strata_server::replication::Follow;
 use strata_server::service::{After, AgentConfig, Backend, QueryReq, Replication, Service, SqlAnswer};
@@ -113,7 +114,7 @@ async fn load(svc: &Arc<Service>) {
     let (items, users, events) = rows();
     svc.write_ops(items, None).await.unwrap();
     for sql in users {
-        svc.sql(&sql, &Params::new(), After::Any, 0).await.unwrap();
+        svc.sql(&Principal::open(), &sql, &Params::new(), After::Any, 0).await.unwrap();
     }
     for ops in events {
         svc.write_ops(ops, None).await.unwrap_or_else(|e| panic!("{}", e.message));
@@ -121,7 +122,7 @@ async fn load(svc: &Arc<Service>) {
 }
 
 async fn sql(svc: &Arc<Service>, s: &str) -> Result<SqlAnswer, String> {
-    svc.sql(s, &Params::new(), After::Any, 0).await.map_err(|e| e.message)
+    svc.sql(&Principal::open(), s, &Params::new(), After::Any, 0).await.map_err(|e| e.message)
 }
 
 async fn query(svc: &Arc<Service>, s: &str) -> Json {

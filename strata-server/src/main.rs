@@ -78,7 +78,9 @@ struct Args {
     /// Ship this database's writes to these replicas, as their primary
     /// (comma-separated gRPC URLs of servers started with --replica), so
     /// that each holds the same rows under the same sequence numbers.
-    /// Needs --seq-no.
+    /// Needs --seq-no. With --replica: the shard's other copies (its
+    /// primary and the other replicas), which it ships to once promoted;
+    /// a promotion asked for with an API key ships only to these.
     #[arg(long, value_delimiter = ',')]
     replicas: Vec<String>,
     /// Serve as a replica: apply the writes a primary ships here (its
@@ -299,7 +301,10 @@ enum Command {
         url: String,
         /// The copies it is to ship to (comma-separated gRPC URLs): the
         /// shard's other replicas, and the old primary, which is sent a
-        /// copy once it starts again with --replica.
+        /// copy once it starts again with --replica. None: the copies the
+        /// replica was started with (its --replicas). Promotion calls each
+        /// with the cluster's token, so with an API key only those may be
+        /// named; with the token, any.
         #[arg(long, value_delimiter = ',')]
         replicas: Vec<String>,
         /// The copies that hold a write before it is answered, as
@@ -514,6 +519,9 @@ async fn main() {
     };
     let coordinator = !o.shards.is_empty();
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
+    if token.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
+        tracing::warn!("this server has no token and no admin key that never expires: once its admin keys expire, only starting it with --token manages it. Make an admin key without expires_days");
+    }
     let bind = |addr: &str| {
         let addr = addr.to_string();
         // API keys close a server as a token does.

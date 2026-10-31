@@ -119,10 +119,10 @@ def test_a_sequence_model_trained_from_a_table_ranks_in_strata_as_in_pytorch(tmp
 
     rng = random.Random(3)
     models = tmp_path / "models"
-    schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "emb", "type": "vector", "dim": 8, "index": "flat"}]}
+    schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "tag", "type": "keyword"}, {"name": "emb", "type": "vector", "dim": 8, "index": "flat"}]}
     db = strata.Database.create(tmp_path / "db", schema, models=models)
     db.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD NOT NULL, action KEYWORD, ts TIMESTAMP NOT NULL)")
-    db.upsert([{"id": f"i{i}", "emb": [rng.gauss(0, 0.3) for _ in range(8)]} for i in range(30)])
+    db.upsert([{"id": f"i{i}", "tag": f"t{i % 3}", "emb": [rng.gauss(0, 0.3) for _ in range(8)]} for i in range(30)])
     # Each user walks the items two at a time from a start of their own.
     events, e = [], 0
     for u in range(60):
@@ -137,14 +137,21 @@ def test_a_sequence_model_trained_from_a_table_ranks_in_strata_as_in_pytorch(tmp
     assert (models / "walk" / "config.json").exists() and (models / "walk" / "model.safetensors").exists()
     config = json.loads((models / "walk" / "config.json").read_text())
     assert (config["table"], config["field"], config["dim"], config["actions"]) == ("items", "emb", 8, ["", "buy", "view"])
-    db.upsert([{"id": k, "emb": v} for k, v in out["vectors"].items()])
+    # The model keeps the vectors it learned, and is not served over others.
+    saved = S.read_items(str(models / "walk"))
+    assert list(saved) == list(out["vectors"]) and all(max(abs(a - b) for a, b in zip(saved[k], v)) < 1e-6 for k, v in out["vectors"].items())
+    history = "(SELECT item, action, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200)"
+    sql = f"SELECT id, score() FROM items ORDER BY similarity(emb, encode('walk', {history}, now => :t)) DESC LIMIT 5"
+    with pytest.raises(strata.StrataError, match="not those sequence model walk was trained with"):
+        db.query(sql, {"u": "u0", "t": iso(1_800_000_000)})
+    assert strata.train.write_vectors(db, "walk", models=models) == 30
+    # Only the field changed.
+    assert db.query("SELECT id, tag FROM items WHERE id = 'i4'").rows == [["i4", "t1"]]
 
     model, cfg = S.load(str(models / "walk"))
     keys = list(out["vectors"])
     index = {k: i for i, k in enumerate(keys)}
     E = torch.tensor([out["vectors"][k] for k in keys])
-    history = "(SELECT item, action, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200)"
-    sql = f"SELECT id, score() FROM items ORDER BY similarity(emb, encode('walk', {history}, now => :t)) DESC LIMIT 5"
     learned = 0
     for u in range(20):
         mine = [x for x in events if x["usr"] == f"u{u}"]

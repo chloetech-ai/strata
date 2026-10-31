@@ -17,6 +17,7 @@ use strata::storage::{CheckpointOptions, Database, DbOptions, Layout, LogRead};
 use strata::{Field, FieldType, Schema};
 use strata::value::Value;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::coord::Coordinator;
 use strata_server::replication::{self, Acks, Digests, Follow, Primary, PrimaryOptions};
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Replication, Service, SqlAnswer};
@@ -205,11 +206,11 @@ async fn replicas_hold_what_their_primary_wrote() {
     assert_eq!((w.rows, w.seq_no), (4, Some(1)));
     holds(1);
     // SQL, a conditional write, and an import.
-    let (n, seq) = written(p.sql("UPDATE products SET sold = sold + 1 WHERE category = 'kitchen'", &Params::new(), After::Any, 0).await.unwrap());
+    let (n, seq) = written(p.sql(&Principal::open(), "UPDATE products SET sold = sold + 1 WHERE category = 'kitchen'", &Params::new(), After::Any, 0).await.unwrap());
     assert!(n > 0);
     holds(seq.unwrap());
-    written(p.sql("INSERT OR REPLACE INTO products (id, title, price, tags, reviews) VALUES ('n2', 'Steel kettle', 25.0, ARRAY['steel'], 9)", &Params::new(), After::Any, 0).await.unwrap());
-    written(p.sql("DELETE FROM products WHERE price > 300", &Params::new(), After::Any, 0).await.unwrap());
+    written(p.sql(&Principal::open(), "INSERT OR REPLACE INTO products (id, title, price, tags, reviews) VALUES ('n2', 'Steel kettle', 25.0, ARRAY['steel'], 9)", &Params::new(), After::Any, 0).await.unwrap());
+    written(p.sql(&Principal::open(), "DELETE FROM products WHERE price > 300", &Params::new(), After::Any, 0).await.unwrap());
     let seq3 = pdb.storage().seq_of(None, &Value::Str("p0000003".into())).unwrap().unwrap();
     let w = p.write_ops(vec![json!({"op": "add", "key": "p0000003", "field": "sold", "value": 1, "if_seq_no": seq3})], None).await.unwrap();
     holds(w.seq_no.unwrap());
@@ -271,7 +272,7 @@ async fn replicas_hold_what_their_primary_wrote() {
     // one a primary's.
     let e = r1.write_ops(vec![set("p0000003", "price", json!(1.0))], None).await.unwrap_err();
     assert!(e.status == 409 && e.message.contains("this server is a replica"), "{}", e.message);
-    let e = r1.sql("UPDATE products SET sold = 0", &Params::new(), After::Any, 0).await.err().unwrap();
+    let e = r1.sql(&Principal::open(), "UPDATE products SET sold = 0", &Params::new(), After::Any, 0).await.err().unwrap();
     assert_eq!(e.status, 409, "{}", e.message);
     let e = r1.import(None, axum::body::Bytes::from("id,title\nc3,x\n"), strata::ingest::Format::Csv).await.unwrap_err();
     assert_eq!(e.status, 409, "{}", e.message);
@@ -713,7 +714,7 @@ async fn a_coordinator_writes_to_each_shards_primary() {
     let coord = Arc::new(Service::new(Backend::Cluster(Arc::new(c)), schema, agent(), 16, Duration::from_secs(10)));
     let ops: Vec<Json> = (0..20).map(|i| set(&format!("p{i:07}"), "sold", json!(100 + i))).collect();
     assert_eq!(coord.write_ops(ops, None).await.unwrap().rows, 20);
-    written(coord.sql("UPDATE products SET reviews = reviews + 1 WHERE category = 'kitchen'", &Params::new(), After::Any, 0).await.unwrap());
+    written(coord.sql(&Principal::open(), "UPDATE products SET reviews = reviews + 1 WHERE category = 'kitchen'", &Params::new(), After::Any, 0).await.unwrap());
     for (pdb, rdb) in &copies {
         assert!((1..=2).contains(&last(pdb)), "each primary took the writes once: {}", last(pdb));
         assert_eq!(rows(rdb), rows(pdb), "each replica holds its primary's rows");
@@ -826,18 +827,18 @@ async fn a_replica_serves_reads_once_caught_up_and_waits_for_a_write() {
     let compound = "SELECT id FROM products WHERE id IN (SELECT id FROM products WHERE sold > 1000)";
     assert_eq!(p.query(QueryReq { sql: compound.into(), after: past.clone(), ..Default::default() }).await.err().unwrap().status, 409);
     let plan = strata::query::ir::Plan::bind("SELECT sold FROM products WHERE id = 'p0000003'", &p.schema, &Params::new()).unwrap();
-    assert!(matches!(p.run_plan(plan.clone(), past.clone(), 0).await, Err(e) if e.status == 409));
-    assert!(matches!(p.sql("SELECT sold FROM products WHERE id = 'p0000003'", &Params::new(), past.clone(), 0).await, Err(e) if e.status == 409));
-    match r.run_plan(plan, After::Seq(m), 0).await.unwrap() {
+    assert!(matches!(p.run_plan(&Principal::open(), plan.clone(), past.clone(), 0).await, Err(e) if e.status == 409));
+    assert!(matches!(p.sql(&Principal::open(), "SELECT sold FROM products WHERE id = 'p0000003'", &Params::new(), past.clone(), 0).await, Err(e) if e.status == 409));
+    match r.run_plan(&Principal::open(), plan, After::Seq(m), 0).await.unwrap() {
         SqlAnswer::Rows(a) => assert_eq!(a.rs.rows[0][0], Value::Int(1002)),
         SqlAnswer::Written { .. } => panic!("a read"),
     }
     // A write sees every write before it, as SQL or as a plan.
     let update = "UPDATE products SET sold = 0 WHERE id = 'p0000003'";
-    let e = p.sql(update, &Params::new(), After::Seq(m), 0).await.err().unwrap();
+    let e = p.sql(&Principal::open(), update, &Params::new(), After::Seq(m), 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("are for reads"), "{}", e.message);
     let strata::query::Command::Write { write, .. } = strata::query::bind_command(update, &[&p.schema], &Params::new()).unwrap() else { panic!() };
-    let e = p.run_plan(strata::query::ir::Plan::of_write(&p.schema, &write), After::Seq(m), 0).await.err().unwrap();
+    let e = p.run_plan(&Principal::open(), strata::query::ir::Plan::of_write(&p.schema, &write), After::Seq(m), 0).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("are for reads"), "{}", e.message);
     // A lease keeps the version it pinned.
     let (lease, _) = r.lease().unwrap();
@@ -966,7 +967,7 @@ async fn a_read_through_a_coordinator_sees_the_write_it_names() {
     }
     drop(holds);
     // An UPDATE goes to every shard, and answers each shard's number.
-    let w = written_all(coord.sql("UPDATE products SET sold = 900003 WHERE id = 'p0000003' OR id = 'p0000004'", &Params::new(), After::Any, 0).await.unwrap());
+    let w = written_all(coord.sql(&Principal::open(), "UPDATE products SET sold = 900003 WHERE id = 'p0000003' OR id = 'p0000004'", &Params::new(), After::Any, 0).await.unwrap());
     assert!(w.seq_nos.len() == 2 && w.rows == 2, "{w:?}");
     assert_eq!(read(After::Shards(w.seq_nos), 900_003).await.unwrap(), ["p0000003", "p0000004"]);
 
@@ -1303,8 +1304,11 @@ async fn the_server_starts_as_a_primary_or_a_replica() {
 
     let e = server::service(&server::Options { replica: true, seq_no: false, ..opts("plain.strata") }).await.err().unwrap();
     assert!(e.contains("does not number its writes, which replication ships by: pass --seq-no"), "{e}");
-    let e = server::service(&server::Options { replica: true, replicas: vec!["http://127.0.0.1:1".into()], ..opts("both.strata") }).await.err().unwrap();
-    assert!(e.contains("not both"), "{e}");
+    // A replica's --replicas are the shard's other copies: where it ships
+    // once promoted, and the only ones a key's promotion may name.
+    let k = server::service(&server::Options { replica: true, replicas: vec!["http://127.0.0.1:1".into()], ..opts("both.strata") }).await.unwrap();
+    assert_eq!(k.role(), pb::Role::Replica);
+    assert_eq!(k.known_copies(), ["http://127.0.0.1:1"]);
     let e = server::service(&server::Options { replica: true, shards: vec!["http://127.0.0.1:1".into()], db: None, ..opts("x.strata") }).await.err().unwrap();
     assert!(e.contains("not the coordinator"), "{e}");
 }
@@ -1316,6 +1320,51 @@ fn kept(dir: &Path, name: &str) -> Json {
 
 /// A replica is made the primary of a new term by hand. It refuses while a
 /// copy it is to ship to holds a transaction it does not, or a newer term.
+/// A promotion asked for with an API key calls only the shard's copies the
+/// replica knows (its --replicas), never URLs from the request: promotion
+/// sends each copy the cluster's token (OPS-N2 of the review of 31
+/// October).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_s_promotion_calls_only_the_shard_s_known_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = |name: &str| server::Options { db: Some(dir.path().join(name)), demo: Some(20), seq_no: true, timeout_ms: 5000, ..Default::default() };
+    // A peer that would take the token and claim to be ahead: it counts
+    // the connections it is sent.
+    let fake = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake_url = format!("http://{}", fake.local_addr().unwrap());
+    let called = Arc::new(AtomicU32::new(0));
+    let c = called.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = fake.accept().await {
+            c.fetch_add(1, Ordering::SeqCst);
+            drop(s);
+        }
+    });
+    let x = grpc(server::service(&server::Options { replica: true, ..opts("x.strata") }).await.unwrap()).await;
+    let r = server::service(&server::Options { replica: true, replicas: vec![x.clone()], ..opts("r.strata") }).await.unwrap();
+    assert_eq!(r.known_copies(), vec![x.clone()]);
+    let key = |scope| Principal { name: "ops".into(), key: Some("0a1b2c3d".into()), scope, root: false };
+    let admin = key(strata_server::keys::Scope::Admin);
+    for asked in [vec![fake_url.clone()], vec![x.clone(), fake_url.clone()]] {
+        let e = r.promote(&admin, asked, Acks::All, false).await.unwrap_err();
+        assert_eq!(e.status, 403, "{}", e.message);
+        assert!(e.message.contains(&format!("{fake_url} is not among this shard's copies")) && e.message.contains(&format!("known copies: {x}")), "{}", e.message);
+    }
+    let e = r.promote(&key(strata_server::keys::Scope::Write), Vec::new(), Acks::All, false).await.unwrap_err();
+    assert_eq!(e.status, 403, "{}", e.message);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(called.load(Ordering::SeqCst), 0, "the fake peer was never called");
+    assert_eq!(r.role(), pb::Role::Replica);
+    // A replica with no known copies says how to name them.
+    let lone = server::service(&server::Options { replica: true, ..opts("lone.strata") }).await.unwrap();
+    let e = lone.promote(&admin, vec![x.clone()], Acks::All, false).await.unwrap_err();
+    assert!(e.status == 403 && e.message.contains("start the replica with --replicas"), "{}", e.message);
+    // No URLs: the known copies.
+    let a = r.promote(&admin, Vec::new(), Acks::All, false).await.unwrap();
+    assert_eq!(a["replicas"][0]["url"], json!(x), "{a}");
+    assert_eq!(r.role(), pb::Role::Primary);
+}
+
 /// Once promoted, the other replica follows it, a call of the old primary's
 /// term is answered with the new one, and the old primary, started again
 /// as a replica with a transaction no copy got, is sent a copy of the new
@@ -1342,7 +1391,7 @@ async fn a_replica_is_promoted_and_the_old_primary_follows_it() {
 
     // Only a replica is promoted.
     let standalone = Arc::new(service(create(dir.path(), "s.strata"), Duration::from_secs(5)));
-    let e = standalone.promote(Vec::new(), Acks::All, false).await.unwrap_err();
+    let e = standalone.promote(&Principal::open(), Vec::new(), Acks::All, false).await.unwrap_err();
     assert!(e.status == 409 && e.message.contains("only a replica is promoted"), "{}", e.message);
     // A copy it would ship to holds a later transaction, or a newer term:
     // refused, and nothing changes.
@@ -1355,7 +1404,7 @@ async fn a_replica_is_promoted_and_the_old_primary_follows_it() {
     ndb.storage().begin_term(3).unwrap();
     let un = grpc(Arc::new(service(ndb, Duration::from_secs(5)))).await;
     for (u, holds) in [(&ua, "up to 6 (term 1)"), (&un, "up to 0 (term 3)")] {
-        let e = r1.promote(vec![u2.clone(), u.clone()], Acks::All, false).await.unwrap_err();
+        let e = r1.promote(&Principal::open(), vec![u2.clone(), u.clone()], Acks::All, false).await.unwrap_err();
         assert!(e.status == 409 && e.message.contains(&format!("{u} holds transactions {holds}, past this replica's last (5 of term 1)")), "{}", e.message);
     }
     assert_eq!(r1.role(), pb::Role::Replica);
@@ -1365,7 +1414,8 @@ async fn a_replica_is_promoted_and_the_old_primary_follows_it() {
     // down: it is said so, and not checked.
     // Asked twice at once, it is promoted once.
     let (old_url, old_addr) = nobody().await;
-    let (a, b) = tokio::join!(r1.promote(vec![u2.clone(), old_url.clone()], Acks::All, false), r1.promote(vec![u2.clone()], Acks::All, false));
+    let root = Principal::open();
+    let (a, b) = tokio::join!(r1.promote(&root, vec![u2.clone(), old_url.clone()], Acks::All, false), r1.promote(&root, vec![u2.clone()], Acks::All, false));
     let (a, e) = match (a, b) {
         (Ok(a), Err(e)) => (a, e),
         (a, b) => panic!("one promotion: {a:?} {b:?}"),
@@ -1377,7 +1427,7 @@ async fn a_replica_is_promoted_and_the_old_primary_follows_it() {
     assert_eq!(r1.role(), pb::Role::Primary);
     let new_id = kept(dir.path(), "r1.strata")["id"].as_str().unwrap().to_string();
     assert!(kept(dir.path(), "r1.strata").get("follows").is_none(), "a primary follows no one");
-    assert_eq!(r1.promote(Vec::new(), Acks::All, false).await.unwrap_err().status, 409, "promoted once");
+    assert_eq!(r1.promote(&Principal::open(), Vec::new(), Acks::All, false).await.unwrap_err().status, 409, "promoted once");
     // It takes writes, numbered in term 2, which the other replica follows.
     let w = r1.write_ops(vec![set("p0000003", "sold", json!(7))], None).await.unwrap();
     assert_eq!(w.seq_no, Some(6));
@@ -1501,8 +1551,8 @@ async fn a_replaced_primary_is_fenced_and_starts_again_only_when_promoted() {
     let adb = create(dir.path(), "ahead.strata");
     set_on(&adb, "p0000001", "sold", 1);
     let ua = grpc(Arc::new(service(adb, Duration::from_secs(5)))).await;
-    assert_eq!(e.promote(vec![ua.clone()], Acks::All, false).await.unwrap_err().status, 409);
-    let a = e.promote(vec![ua.clone()], Acks::All, true).await.unwrap();
+    assert_eq!(e.promote(&Principal::open(), vec![ua.clone()], Acks::All, false).await.unwrap_err().status, 409);
+    let a = e.promote(&Principal::open(), vec![ua.clone()], Acks::All, true).await.unwrap();
     assert_eq!((&a["term"], &a["replicas"][0]["seq_no"]), (&json!(2), &json!(1)), "{a}");
     assert_eq!(e.role(), pb::Role::Primary);
 }

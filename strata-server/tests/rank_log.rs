@@ -15,6 +15,7 @@ use strata::rank_log::Export;
 use strata::storage::DbOptions;
 use strata::Schema;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::coord::Coordinator;
 use strata_server::service::{After, AgentConfig, Backend, QueryReq, Service};
 use strata_server::{json as js, server};
@@ -64,7 +65,7 @@ async fn load(svc: &Arc<Service>) {
         .map(|i| json!({"op": "upsert", "doc": {"id": format!("i{i}"), "title": format!("{} {} {}", WORDS[i % 12], WORDS[i * 7 % 12], WORDS[i * 5 % 11]), "cat": format!("c{}", i % 5), "price": (i * 37 % 97) as f64 + 0.5}}))
         .collect();
     svc.write_ops(ops, None).await.unwrap();
-    svc.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, action KEYWORD, ts INT) OPTIONS(shard_by = 'usr')", &Params::new(), After::Any, 0).await.unwrap();
+    svc.sql(&Principal::open(), "CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, action KEYWORD, ts INT) OPTIONS(shard_by = 'usr')", &Params::new(), After::Any, 0).await.unwrap();
     let ops: Vec<Json> = (0..600)
         .map(|e| json!({"op": "insert", "table": "events", "doc": {"id": e, "usr": format!("u{}", e % 20), "item": format!("i{}", e * 13 % ITEMS), "action": (["view", "click"][e % 2]), "ts": e * 10}}))
         .collect();
@@ -114,7 +115,7 @@ async fn three_shards_log_what_one_database_logs() {
         let mut answers = Vec::new();
         for svc in [&whole, &coord] {
             let plain = svc.query(QueryReq { sql: sql.into(), params: params(k), ..Default::default() }).await.unwrap();
-            let (a, request, w) = svc.query_logged(QueryReq { sql: sql.into(), params: params(k), ..Default::default() }, log.clone()).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+            let (a, request, w) = svc.query_logged(&Principal::open(), QueryReq { sql: sql.into(), params: params(k), ..Default::default() }, log.clone()).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
             assert_eq!(request, format!("r{k}"));
             assert_eq!((&a.rs.columns, &a.rs.rows, &a.rs.keys), (&plain.rs.columns, &plain.rs.rows, &plain.rs.keys), "{sql}");
             let rows = logged_rows(svc, &request).await;
