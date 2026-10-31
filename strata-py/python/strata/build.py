@@ -186,13 +186,22 @@ class Expr:
         """`lo <= expr <= hi`; a bound of None is open."""
         return _Between(self, lo, hi)
 
-    def startswith(self, prefix: str) -> Expr:
+    def startswith(self, prefix: str, fuzzy: int | str = 0) -> Expr:
         """The text starts with `prefix` (a multi-valued field: one of its
         values does); on a KEYWORD field, one run of its index, as SQL's
-        `LIKE 'p%'` and `PREFIX(field, 'p')` are."""
+        `LIKE 'p%'` and `PREFIX(field, 'p')` are. `fuzzy` (1, 2 or
+        "auto", by the prefix's length as MATCH does: none up to 2
+        letters, 1 up to 5, else 2) also takes a prefix that many edits
+        away whose first letter is the same, as `PREFIX(field, 'p', fuzzy
+        => 1)` does."""
         if not isinstance(prefix, str):
             raise TypeError("startswith takes a str")
-        return _Prefix(self, prefix)
+        if isinstance(fuzzy, str) and fuzzy.lower() == "auto":
+            n = len(prefix)
+            fuzzy = 0 if n <= 2 else 1 if n <= 5 else 2
+        if fuzzy not in (0, 1, 2) or isinstance(fuzzy, bool):
+            raise StrataError("fuzzy is 0, 1, 2 or 'auto'")
+        return _Prefix(self, prefix, int(fuzzy))
 
     def is_null(self) -> Expr:
         """The expression has no value (a multi-valued field: holds none)."""
@@ -396,11 +405,14 @@ class _IsNull(Expr):
 
 
 class _Prefix(Expr):
-    def __init__(self, e: Expr, prefix: str):
-        self.e, self.prefix = e, prefix
+    def __init__(self, e: Expr, prefix: str, edits: int = 0):
+        self.e, self.prefix, self.edits = e, prefix, edits
 
     def _ir(self, ctx: _Ctx) -> Any:
-        return {"prefix": {"expr": self.e._ir(ctx), "prefix": _operand(self.prefix, ctx, _field_of(self.e, ctx))}}
+        ir = {"expr": self.e._ir(ctx), "prefix": _operand(self.prefix, ctx, _field_of(self.e, ctx))}
+        if self.edits:
+            ir["edits"] = self.edits
+        return {"prefix": ir}
 
 
 class _In(Expr):

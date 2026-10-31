@@ -483,6 +483,9 @@ struct Expanded {
     /// Indexed terms near a term: (term, documents, edits), by field, term
     /// and edits.
     near: HashMap<(usize, String, u8), Arc<Vec<(String, u64, u8)>>>,
+    /// A prefix's runs of codes with typos, by segment, field, prefix and
+    /// edits (the planner and the filter both need them).
+    runs: HashMap<(usize, usize, String, u8), Arc<Vec<std::ops::Range<u32>>>>,
 }
 
 fn err(m: impl Into<String>) -> Error {
@@ -1073,7 +1076,10 @@ impl<'a> Executor<'a> {
                 _ => self.keyword(s, *field)?.present(),
             },
             Pred::In { field, values } => self.materialize_in(s, *field, values)?,
-            Pred::Prefix { field, prefix } => self.keyword(s, *field)?.docs_prefix(prefix),
+            Pred::Prefix { field, prefix, edits } => {
+                let runs = self.prefix_runs(s, *field, prefix, *edits)?;
+                self.keyword(s, *field)?.docs_prefix(&runs)
+            }
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
@@ -1145,7 +1151,10 @@ impl<'a> Executor<'a> {
             }
             Pred::Present { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             Pred::Prefix { field, .. } if self.schema.fields[*field].multi => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
-            Pred::Prefix { field, prefix } => ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_prefix(prefix))),
+            Pred::Prefix { field, prefix, edits } => {
+                let runs = self.prefix_runs(s, *field, prefix, *edits)?;
+                ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_prefix(&runs)))
+            }
             Pred::Range { field, lo, hi } => ProbeNode::Leaf(Box::new(self.numeric(s, *field)?.col().filter(*lo, *hi))),
             Pred::IntRange { field, lo, hi } => {
                 let col = self.numeric(s, *field)?.col();
@@ -1750,6 +1759,23 @@ impl<'a> Executor<'a> {
         self.opts.synonyms.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
             err("synonyms => 1, but no synonym list is loaded (strata-server --synonyms FILE, or PUT /v1/synonyms)")
         })
+    }
+
+    /// The runs of segment `s`'s codes of `field` whose values a
+    /// [`Pred::Prefix`] selects: one run for an exact prefix, the runs of a
+    /// walk of the dictionary with typos (kept for the query).
+    fn prefix_runs(&self, s: &Seg<'a>, field: usize, prefix: &str, edits: u8) -> Result<Arc<Vec<std::ops::Range<u32>>>> {
+        let kw = self.keyword(s, field)?;
+        if edits == 0 {
+            return Ok(Arc::new(kw.prefix_runs(prefix, 0)));
+        }
+        let key = (s.ord, field, prefix.to_string(), edits);
+        if let Some(v) = self.expanded.lock().unwrap_or_else(|e| e.into_inner()).runs.get(&key) {
+            return Ok(v.clone());
+        }
+        let v = Arc::new(kw.prefix_runs(prefix, edits));
+        self.expanded.lock().unwrap_or_else(|e| e.into_inner()).runs.insert(key, v.clone());
+        Ok(v)
     }
 
     /// The indexed terms of `field` within `edits` edits of `term` in any
@@ -3051,15 +3077,17 @@ impl Estimator for SegEst<'_, '_> {
         }
         self.s.r.numeric(field).ok().flatten().map_or(self.n_docs(), |n| n.col().n_present() as f64)
     }
-    fn prefix_count(&self, field: usize, prefix: &str) -> f64 {
-        self.s.r.keyword(field).ok().flatten().map_or(0.0, |kw| kw.count_prefix(prefix) as f64)
+    fn prefix_count(&self, field: usize, prefix: &str, edits: u8) -> f64 {
+        let (Ok(Some(kw)), Ok(runs)) = (self.s.r.keyword(field), self.ex.prefix_runs(self.s, field, prefix, edits)) else { return 0.0 };
+        kw.count_prefix(&runs) as f64
     }
-    fn prefix_cost(&self, field: usize, prefix: &str) -> Option<f64> {
-        // A long run of a single-valued field scans the code column.
+    fn prefix_cost(&self, field: usize, prefix: &str, edits: u8) -> Option<f64> {
+        // Each long run of a single-valued field scans the code column.
         let kw = self.s.r.keyword(field).ok().flatten()?;
+        let runs = self.ex.prefix_runs(self.s, field, prefix, edits).ok()?;
+        let scans = runs.iter().filter(|r| r.len() > forward::PREFIX_LISTS).count();
         let c = &self.ex.opts.costs;
-        (!self.ex.schema.fields[field].multi && kw.prefix_codes(prefix).len() > forward::PREFIX_LISTS)
-            .then(|| self.n_docs() * c.column_scan + kw.count_prefix(prefix) as f64 * c.emit)
+        (!self.ex.schema.fields[field].multi && scans > 0).then(|| scans as f64 * self.n_docs() * c.column_scan + kw.count_prefix(&runs) as f64 * c.emit)
     }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {
