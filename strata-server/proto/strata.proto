@@ -136,6 +136,15 @@ service Strata {
   // the other servers'. FailedPrecondition when the server keeps none
   // (--log-store off). Needs the admin scope.
   rpc Logs(QueryRequest) returns (QueryResponse);
+  // Protocol 9: a copy of a shard asks the shard's other copies to make it
+  // the primary of a new term. Each copy grants one vote a term, kept
+  // beside its database, and only to a copy that holds every transaction
+  // it holds (last term, then last number); a copy that voted refuses a
+  // primary of an older term from then. A vote asked `pre` (would you?)
+  // is answered unkept. A replica whose primary called recently refuses,
+  // and so does a primary, unless the vote is a `handover`: a promotion
+  // asked by hand, which a primary grants by stepping down.
+  rpc Vote(VoteRequest) returns (VoteResponse);
   // A profile of this server, as its HTTP routes /v1/profile/<kind> take
   // one: a coordinator asks it for one of its shards' servers
   // (/v1/profile/...?node=). It needs an admin key or the cluster's token.
@@ -149,6 +158,29 @@ service Strata {
   // refuses it (FailedPrecondition), since keys would close it to the
   // servers that gave them.
   rpc Keys(KeysRequest) returns (KeysResponse);
+}
+
+message VoteRequest {
+  // The term asked for, and the candidate's replication id.
+  uint64 term = 1;
+  string candidate = 2;
+  // The candidate's last transaction, and its term.
+  uint64 last_seq = 3;
+  uint64 last_term = 4;
+  bool pre = 5;
+  bool handover = 6;
+}
+
+message VoteResponse {
+  bool granted = 1;
+  // The newest term the copy knows, and its last transaction.
+  uint64 term = 2;
+  uint64 last_seq = 3;
+  uint64 last_term = 4;
+  // Why not, when not granted.
+  string reason = 5;
+  // The copy asked is the candidate itself.
+  bool candidate = 6;
 }
 
 message ProfileRequest {
@@ -205,6 +237,10 @@ message ReplicateRequest {
   // Keep the version this call leaves, at the last of `txns` (or the
   // replica's last, for none), for the Verify that follows.
   bool pin = 8;
+  // Protocol 9: the primary counts the replica among the copies a
+  // majority is counted of: it has caught up once since it joined. A
+  // replica grants votes (Vote) once a call says so, and keeps that.
+  bool member = 9;
 }
 
 message VerifyRequest {
@@ -268,6 +304,10 @@ message ConfigureRequest {
   // PRIMARY: all, majority or primary ("": as now, or all).
   string write_acks = 3;
   bool force = 4;
+  // Protocol 9, PRIMARY on a replica: promote it, once a majority of its
+  // shard's copies vote for it (with `force`, asking none), shipping to
+  // `replicas` (none: the shard's other copies).
+  bool promote = 5;
 }
 
 message ConfigureResponse {

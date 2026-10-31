@@ -383,10 +383,13 @@ async fn a_replica_follows_one_primary_a_term_and_fences_an_older_one() {
 
     // A second primary in the same term is refused: the two would ship
     // different histories.
-    let p2 = primary(create(dir.path(), "p2.strata"), None, ships_to(&[&ur], Acks::All), Duration::from_secs(5));
+    // (It acknowledges writes alone: with `all`, a write needs a majority
+    // of the copies, and the replica refuses it.)
+    let p2 = primary(create(dir.path(), "p2.strata"), None, ships_to(&[&ur], Acks::Primary), Duration::from_secs(5));
     p2.write_ops(vec![set("p0000002", "sold", json!(2))], None).await.unwrap();
+    until("the replica refuses the second primary", || async { follower(&p2, 0).await["in_sync"] == false }).await;
     let f = follower(&p2, 0).await;
-    assert!(f["in_sync"] == false && f["error"].as_str().unwrap().contains(&format!("follows primary {id1} in term 1")), "{f}");
+    assert!(f["error"].as_str().unwrap().contains(&format!("follows primary {id1} in term 1")), "{f}");
     assert_eq!(last(&rdb), 1);
     // The replica keeps whom it follows: opened again, it still refuses.
     let again = Follow::open(rdb.clone(), Some(&file)).unwrap();
@@ -439,7 +442,7 @@ async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
         [nobody().await, nobody().await, nobody().await, nobody().await, nobody().await];
     // A ship log of a few transactions, and copies sent in chunks of 64 KiB.
     let pdb = create_with(dir.path(), "p.strata", 2000, |_| true);
-    let opts = PrimaryOptions { copy_chunk_bytes: 64 << 10, copy_retry: Duration::from_millis(300), ..ships_to(&[&fresh, &dir_layout, &other, &restored, &ahead], Acks::All) };
+    let opts = PrimaryOptions { copy_chunk_bytes: 64 << 10, copy_retry: Duration::from_millis(300), ..ships_to(&[&fresh, &dir_layout, &other, &restored, &ahead], Acks::Primary) };
     let p = primary(pdb.clone(), None, opts, Duration::from_secs(5));
     let pu = grpc(p.clone()).await;
     for i in 0..100 {
@@ -489,7 +492,7 @@ async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
     assert!(p.prometheus().await.contains(&format!("strata_replica_copies_total{{replica=\"{fresh}\"}} 1")));
     // Then shipped to as any replica.
     p.write_ops(vec![set("p0000001", "sold", json!(-1))], None).await.unwrap();
-    assert_eq!(last(&fdb), last(&pdb));
+    until("both apply the next write", || async { last(&fdb) == last(&pdb) && last(&ddb) == last(&pdb) }).await;
     assert_eq!(rows(&ddb), rows(&pdb));
 
     // One whose tables are not the primary's is not changed by the copy.
@@ -608,7 +611,7 @@ async fn a_copy_is_followed_by_what_was_written_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
     let ((near, near_at), (far, far_at)) = (nobody().await, nobody().await);
     let pdb = create_with(dir.path(), "p.strata", 2000, |_| true);
-    let p = primary(pdb.clone(), None, ships_to(&[&near, &far], Acks::All), Duration::from_secs(5));
+    let p = primary(pdb.clone(), None, ships_to(&[&near, &far], Acks::Primary), Duration::from_secs(5));
     let write = |from: usize, n: usize| {
         let p = p.clone();
         async move {
@@ -663,7 +666,7 @@ async fn a_replica_whose_last_transaction_is_not_the_primarys() {
     let pdb = create(dir.path(), "p.strata");
     let (old, old_at) = nobody().await;
     let (same, same_at) = nobody().await;
-    let p = primary(pdb.clone(), None, ships_to(&[&old, &same], Acks::All), Duration::from_secs(5));
+    let p = primary(pdb.clone(), None, ships_to(&[&old, &same], Acks::Primary), Duration::from_secs(5));
     // Two transactions of term 1, and three of term 2.
     for i in 0..5 {
         if i == 2 {
@@ -1287,7 +1290,11 @@ async fn the_server_starts_as_a_primary_or_a_replica() {
     assert!(e.contains("409 Conflict") && e.contains("holds transactions up to 2 (term 1)") && e.contains("pass force"), "{e}");
     let a = server::promote(&r2, &[ux.clone()], "primary", true, None).await.unwrap();
     assert_eq!((&a["term"], &a["replicas"][0]["seq_no"]), (&json!(2), &json!(2)), "{a}");
-    let a = server::promote(&format!("{ru}/"), &[], "majority", false, None).await.unwrap();
+    // With no copy named and no cluster map, it has none to ask for votes:
+    // promoted only when forced.
+    let e = server::promote(&format!("{ru}/"), &[], "majority", false, None).await.unwrap_err();
+    assert!(e.contains("409 Conflict") && e.contains("knows no other copy of its shard"), "{e}");
+    let a = server::promote(&format!("{ru}/"), &[], "majority", true, None).await.unwrap();
     assert_eq!((&a["term"], &a["seq_no"], &a["replicas"]), (&json!(2), &json!(1), &json!([])), "{a}");
     assert_eq!(r.role(), pb::Role::Primary);
     assert_eq!(r.health().await["replication"]["write_acks"], "majority");
@@ -1321,9 +1328,9 @@ fn kept(dir: &Path, name: &str) -> Json {
 /// A replica is made the primary of a new term by hand. It refuses while a
 /// copy it is to ship to holds a transaction it does not, or a newer term.
 /// A promotion asked for with an API key calls only the shard's copies the
-/// replica knows (its --replicas), never URLs from the request: promotion
-/// sends each copy the cluster's token (OPS-N2 of the review of 31
-/// October).
+/// replica knows (its --replicas, and the servers its cluster map names
+/// for its shard), never URLs from the request: promotion sends each copy
+/// the cluster's token (OPS-N2 of the review of 31 October).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_s_promotion_calls_only_the_shard_s_known_copies() {
     let dir = tempfile::tempdir().unwrap();
@@ -1359,8 +1366,17 @@ async fn a_key_s_promotion_calls_only_the_shard_s_known_copies() {
     let lone = server::service(&server::Options { replica: true, ..opts("lone.strata") }).await.unwrap();
     let e = lone.promote(&admin, vec![x.clone()], Acks::All, false).await.unwrap_err();
     assert!(e.status == 403 && e.message.contains("start the replica with --replicas"), "{}", e.message);
-    // No URLs: the known copies.
-    let a = r.promote(&admin, Vec::new(), Acks::All, false).await.unwrap();
+    // The servers its cluster map names for its shard are known copies.
+    let map = slots::SlotMap::even(1, 1).with_replicas(vec![vec!["http://127.0.0.1:2".into(), x.clone()]]).unwrap();
+    lone.set_slots(map, 0).await.unwrap();
+    assert_eq!(lone.known_copies(), vec!["http://127.0.0.1:2".to_string(), x.clone()]);
+    // No URLs: the known copies, which are asked for their votes (x, a
+    // replica that never caught up with a primary, grants none), and
+    // shipped to once the promotion is forced.
+    let e = r.promote(&admin, Vec::new(), Acks::All, false).await.unwrap_err();
+    assert!(e.status == 409 && e.message.contains(&x) && e.message.contains("grants no votes"), "{}", e.message);
+    assert_eq!(r.role(), pb::Role::Replica);
+    let a = r.promote(&admin, Vec::new(), Acks::All, true).await.unwrap();
     assert_eq!(a["replicas"][0]["url"], json!(x), "{a}");
     assert_eq!(r.role(), pb::Role::Primary);
 }
@@ -1460,7 +1476,8 @@ async fn a_replica_is_promoted_and_the_old_primary_follows_it() {
     assert_eq!(rows(&pdb), rows(&r1db), "the transaction no copy got is dropped");
     let n = pdb.storage().numbering().unwrap();
     assert_eq!((n.term, n.seq, n.term_at(6)), (2, 6, 2));
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": old_id, "follows": {"primary": new_id, "term": 2}, "role": "replica"}));
+    // (A copy that was a primary votes: it held every transaction.)
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": old_id, "follows": {"primary": new_id, "term": 2}, "member": true, "role": "replica"}));
     // And follows it from there.
     let w = r1.write_ops(vec![set("p0000004", "sold", json!(8))], None).await.unwrap();
     until("the old primary applies the new one's writes", || async { last(&pdb) == w.seq_no.unwrap() }).await;
@@ -1526,11 +1543,11 @@ async fn a_replaced_primary_is_fenced_and_starts_again_only_when_promoted() {
     // replaced once it follows.
     assert_eq!(p.shipped_to("q", 5).unwrap_err().status, 409);
     // It keeps the part it has to take up: a replica of the new primary.
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "replaced_by": 5, "role": "replica"}));
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "member": true, "replaced_by": 5, "role": "replica"}));
     drop(p);
     let f = Follow::open(pdb.clone(), Some(&file("p.strata"))).unwrap();
     assert!(f.replicate(pb::ReplicateRequest { term: 5, prev_term: 1, prev_seq: 2, primary: "q".into(), ..Default::default() }).await.unwrap().matched);
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "follows": {"primary": "q", "term": 5}, "role": "replica"}));
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "follows": {"primary": "q", "term": 5}, "member": true, "role": "replica"}));
 
     // So does a database that followed a primary as a replica.
     // Its primary's term is 3, though no transaction of that term reached
@@ -1555,4 +1572,93 @@ async fn a_replaced_primary_is_fenced_and_starts_again_only_when_promoted() {
     let a = e.promote(&Principal::open(), vec![ua.clone()], Acks::All, true).await.unwrap();
     assert_eq!((&a["term"], &a["replicas"][0]["seq_no"]), (&json!(2), &json!(1)), "{a}");
     assert_eq!(e.role(), pb::Role::Primary);
+}
+
+fn ask(term: u64, candidate: &str, last: (u64, u64), pre: bool) -> pb::VoteRequest {
+    pb::VoteRequest { term, candidate: candidate.into(), last_term: last.0, last_seq: last.1, pre, handover: false }
+}
+
+/// A copy grants one vote a term, kept beside its database, to a copy
+/// holding every transaction it holds, and only once it caught up with a
+/// primary and that primary went quiet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_votes_once_a_term_for_a_copy_up_to_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = replication::file_of(&dir.path().join("r.strata"));
+    let rdb = create(dir.path(), "r.strata");
+    let r = {
+        let mut svc = service(rdb.clone(), Duration::from_secs(10));
+        svc.set_replication(Replication::Replica(Arc::new(Follow::open(rdb.clone(), Some(&file)).unwrap())));
+        svc.failover_after = Duration::from_millis(300);
+        Arc::new(svc)
+    };
+    let ur = grpc(r.clone()).await;
+    let a = r.vote(ask(2, "x", (1, 9), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("has not caught up with a primary"), "{a:?}");
+
+    // Shipped to, it votes; but not while its primary calls.
+    let p = primary(create(dir.path(), "p.strata"), None, ships_to(&[&ur], Acks::All), Duration::from_secs(5));
+    p.write_ops(vec![set("p0000001", "sold", json!(1))], None).await.unwrap();
+    let a = r.vote(ask(2, "x", (1, 9), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("its primary called"), "{a:?}");
+    drop(p);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // One vote a term; asked again by the same copy, the same answer.
+    let a = r.vote(ask(2, "x", (1, 1), false)).await.unwrap();
+    assert!(a.granted && a.term == 2, "{a:?}");
+    let a = r.vote(ask(2, "y", (1, 1), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("it voted for x in term 2"), "{a:?}");
+    assert!(r.vote(ask(2, "x", (1, 1), false)).await.unwrap().granted);
+    // Whether it would vote is answered, and kept by none.
+    assert!(r.vote(ask(3, "y", (1, 1), true)).await.unwrap().granted);
+    assert!(r.vote(ask(3, "z", (1, 1), false)).await.unwrap().granted);
+    // Not for a copy behind it, nor in a term it knows.
+    let a = r.vote(ask(4, "w", (1, 0), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("past the candidate's last"), "{a:?}");
+    let a = r.vote(ask(3, "y", (1, 1), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("it voted for z in term 3"), "{a:?}");
+    // Its vote is kept: opened again, it holds to it.
+    let f = Follow::open(rdb.clone(), Some(&file)).unwrap();
+    let a = f.vote(&ask(3, "y", (1, 1), false), Duration::ZERO).await.unwrap();
+    assert!(!a.granted && a.reason.contains("it voted for z in term 3"), "{a:?}");
+    assert_eq!(kept(dir.path(), "r.strata")["voted"], json!({"term": 3, "for": "z"}));
+
+    // A primary that serves refuses, but for a handover by hand, which
+    // replaces it: it takes no more writes.
+    let pdb = create(dir.path(), "q.strata");
+    let q = Primary::start(pdb.clone(), None, PrimaryOptions::default()).unwrap();
+    let a = q.vote(&ask(5, "x", (9, 9), false));
+    assert!(!a.granted && a.reason.contains("is the shard's primary"), "{a:?}");
+    let a = q.vote(&pb::VoteRequest { handover: true, ..ask(5, "x", (9, 9), false) });
+    assert!(a.granted, "{a:?}");
+    assert_eq!(q.replaced_by(), 5);
+    assert_eq!(q.admit().unwrap_err().status, 409);
+}
+
+/// With `all`, a write is answered once every replica in sync holds it,
+/// and never with fewer than a majority of the copies: one the copies
+/// cannot acknowledge is not applied. A primary with a lease serves reads
+/// only while a majority answered it lately.
+#[tokio::test(flavor = "multi_thread")]
+async fn all_acks_need_a_majority_and_reads_need_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let ((u1, at1), (u2, _)) = (nobody().await, nobody().await);
+    let pdb = create(dir.path(), "p.strata");
+    let opts = PrimaryOptions { lease: Duration::from_millis(300), ..ships_to(&[&u1, &u2], Acks::All) };
+    let p = primary(pdb.clone(), None, opts, Duration::from_millis(500));
+    until("both replicas drop out of sync", || async { follower(&p, 0).await["in_sync"] == false && follower(&p, 1).await["in_sync"] == false }).await;
+    let e = p.write_ops(vec![set("p0000001", "sold", json!(1))], None).await.unwrap_err();
+    assert!(e.status == 503 && e.message.contains("1 of 3 copies are in sync, and --write-acks all needs 2: the write was not applied"), "{}", e.message);
+    assert_eq!(last(&pdb), 0);
+    let e = p.query(QueryReq { sql: "SELECT id FROM products LIMIT 1".into(), ..Default::default() }).await.err().unwrap();
+    assert!(e.status == 503 && e.message.contains("fewer than a majority"), "{}", e.message);
+
+    // One replica up makes a majority of three: writes and reads again.
+    let r1db = create(dir.path(), "r1.strata");
+    let _r1 = replica_on(r1db.clone(), None, Some(TcpListener::bind(at1).await.unwrap())).await;
+    until("the replica is in sync", || async { follower(&p, 0).await["in_sync"] == true }).await;
+    let w = p.write_ops(vec![set("p0000001", "sold", json!(1))], None).await.unwrap();
+    assert_eq!(last(&r1db), w.seq_no.unwrap(), "the write was answered once a majority held it");
+    until("the primary serves reads", || async { p.query(QueryReq { sql: "SELECT id FROM products LIMIT 1".into(), ..Default::default() }).await.is_ok() }).await;
 }

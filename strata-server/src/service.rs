@@ -39,7 +39,10 @@ use crate::keys::{self, Audit, Keys, Principal, Scope};
 use crate::telemetry::{self, LiveQueries, QueryLog, Sample, Series};
 use crate::{json as js, obs, pb, ApiError};
 
+mod failover;
 mod moving;
+
+pub use failover::tuned as failover_tuned;
 pub(crate) use moving::Moving;
 pub use moving::FREEZE_TTL;
 
@@ -269,6 +272,10 @@ pub struct Service {
     promoting: tokio::sync::Mutex<()>,
     /// Where its part in replication is kept (`<db>.replication`).
     replication_file: Option<PathBuf>,
+    /// How long a replica hears nothing from its primary before it asks
+    /// its shard's other copies to elect it (`--failover-after-ms`; zero:
+    /// never), as [`Self::start_failover`] does.
+    pub failover_after: Duration,
 }
 
 /// A server's part in replication.
@@ -354,6 +361,7 @@ impl Service {
             promote_options: None,
             promoting: tokio::sync::Mutex::new(()),
             replication_file: None,
+            failover_after: Duration::ZERO,
         }
     }
 
@@ -457,53 +465,78 @@ impl Service {
         }
     }
 
-    /// The shard's other copies, as this replica knows them (its
-    /// `--replicas`): the only servers a promotion asked for with a key
-    /// calls, and so sends the cluster's token to.
+    /// The shard's copies, as this replica knows them: its `--replicas`,
+    /// and the servers its cluster map names for its shard (which only the
+    /// cluster's token sets). The only servers a promotion asked for with
+    /// a key calls, and so sends the cluster's token to.
     pub fn known_copies(&self) -> Vec<String> {
-        self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default()
+        let mut known = self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default();
+        if let Some((m, shard)) = self.slots() {
+            for url in m.replicas().get(shard).into_iter().flatten() {
+                if !known.contains(url) {
+                    known.push(url.clone());
+                }
+            }
+        }
+        known
     }
 
     /// Makes this replica the primary of a new term, shipping to
-    /// `replicas` under `acks` ([`Follow::promote`]); with `force`, even
-    /// when one of them holds transactions this replica does not. No
-    /// `replicas`: its [`Self::known_copies`]. Promotion calls each copy
-    /// with the cluster's token, so a key's promotion may name only known
-    /// copies; the token's holder, who could send the token anywhere
-    /// anyway, may name others.
+    /// `replicas` under `acks` ([`Follow::promote`]), once a majority of
+    /// its shard's copies voted for it: the servers its cluster map names
+    /// for its shard, or else `replicas`. With no `replicas`, it ships to
+    /// the shard's other copies, or without a cluster map to its
+    /// `--replicas`. With `force`, it asks for no votes, and is promoted
+    /// even when a copy holds transactions it does not. Promotion calls
+    /// each copy with the cluster's token, so a key's promotion may name
+    /// only [`Self::known_copies`]; the token's holder, who could send the
+    /// token anywhere anyway, may name others.
     pub async fn promote(&self, who: &Principal, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
         who.may(Scope::Admin, "a promotion")?;
         let known = self.known_copies();
-        let replicas = match replicas.is_empty() {
-            true => known,
-            false => {
-                let unknown: Vec<&String> = replicas.iter().filter(|u| !known.contains(u)).collect();
-                if !who.root && !unknown.is_empty() {
-                    let known = match known.is_empty() {
-                        true => "none: start the replica with --replicas naming them".to_string(),
-                        false => known.join(", "),
-                    };
-                    return Err(ApiError {
-                        status: 403,
-                        message: format!(
-                            "{} {} not among this shard's copies, which promotion calls with the cluster's token; known copies: {known}",
-                            unknown.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(", "),
-                            if unknown.len() == 1 { "is" } else { "are" }
-                        ),
-                    });
-                }
-                replicas
-            }
-        };
-        keys::note(format!("promote, shipping to {}", if replicas.is_empty() { "no replica".to_string() } else { replicas.join(", ") }));
+        let unknown: Vec<&String> = replicas.iter().filter(|u| !known.contains(u)).collect();
+        if !who.root && !unknown.is_empty() {
+            let known = match known.is_empty() {
+                true => "none: start the replica with --replicas naming them, or add it to a cluster".to_string(),
+                false => known.join(", "),
+            };
+            return Err(ApiError {
+                status: 403,
+                message: format!(
+                    "{} {} not among this shard's copies, which promotion calls with the cluster's token; known copies: {known}",
+                    unknown.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(", "),
+                    if unknown.len() == 1 { "is" } else { "are" }
+                ),
+            });
+        }
         let _one = self.promoting.lock().await;
         let Replication::Replica(f) = self.replication() else {
             return Err(conflict("this server is not a replica (--replica): only a replica is promoted".into()));
         };
-        let opts = PrimaryOptions { replicas, acks, ..self.promote_options.clone().unwrap_or_default() };
-        let (p, answer) = f.promote(opts, force).await?;
+        let voters = self.slots().and_then(|(m, shard)| m.replicas().get(shard).cloned()).filter(|v| v.len() > 1);
+        // None named, and no cluster map: the copies it was started with.
+        let replicas = match (replicas.is_empty(), &voters) {
+            (true, None) => self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default(),
+            _ => replicas,
+        };
+        keys::note(format!(
+            "promote, shipping to {}",
+            match (replicas.is_empty(), &voters) {
+                (false, _) => replicas.join(", "),
+                (true, Some(_)) => "the shard's other copies".to_string(),
+                (true, None) => "no replica".to_string(),
+            }
+        ));
+        let opts = PrimaryOptions { replicas, acks, ..self.primary_options() };
+        let (p, answer) = f.promote(opts, voters, force).await?;
         *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::Primary(p);
         Ok(answer)
+    }
+
+    /// How this server ships once promoted ([`Self::promote_options`]),
+    /// with the lease on reads automatic failover needs.
+    fn primary_options(&self) -> PrimaryOptions {
+        failover::tuned(self.promote_options.clone().unwrap_or_default(), self.failover_after)
     }
 
     /// Sets this server's part in replication while it serves
@@ -533,7 +566,7 @@ impl Service {
                 if db.storage().numbering().is_none() {
                     return Err(ApiError::bad("a primary numbers its writes, and this server's database does not: start it with --seq-no"));
                 }
-                let opts = PrimaryOptions { replicas, acks: acks.unwrap_or_default(), joining: true, ..self.promote_options.clone().unwrap_or_default() };
+                let opts = PrimaryOptions { replicas, acks: acks.unwrap_or_default(), joining: true, ..self.primary_options() };
                 let p = Primary::start(db.clone(), file.as_deref(), opts).map_err(|e| conflict(e))?;
                 tracing::info!(replicas = %p.replicas().join(", "), write_acks = p.acks().name(), "configured: the primary of its shard");
                 Some(Replication::Primary(p))
@@ -570,12 +603,17 @@ impl Service {
         if let Some(r) = next {
             *self.replication.write().unwrap_or_else(|e| e.into_inner()) = r;
         }
-        let n = db.storage().numbering().unwrap_or_default();
+        Ok(self.configured())
+    }
+
+    /// Its part in replication, as `Configure` answers it.
+    pub fn configured(&self) -> pb::ConfigureResponse {
+        let n = self.local().and_then(|db| db.storage().numbering()).unwrap_or_default();
         let (replicas, write_acks) = match &self.replication() {
             Replication::Primary(p) => (p.replicas().to_vec(), p.acks().name().to_string()),
             _ => (Vec::new(), String::new()),
         };
-        Ok(pb::ConfigureResponse { role: self.role() as i32, term: n.term, seq_no: n.seq, replicas, write_acks })
+        pb::ConfigureResponse { role: self.role() as i32, term: n.term, seq_no: n.seq, replicas, write_acks }
     }
 
     /// Keeps its part in replication in `path` (`<db>.replication`), for

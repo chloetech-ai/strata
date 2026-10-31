@@ -156,6 +156,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/shards/:i", axum::routing::delete(remove_shard))
         .route("/v1/admin/shards/:i/replicas", post(add_replica).merge(axum::routing::delete(remove_replica)))
         .route("/v1/admin/shards/:i/drain", post(drain_shard))
+        .route("/v1/admin/shards/:i/promote", post(promote_in_shard))
         .route("/v1/admin/rebalance", post(rebalance))
         .route("/v1/admin/moves", get(moves).merge(post(move_slots)))
         .route("/v1/admin/moves/stop", post(stop_moves))
@@ -1094,6 +1095,14 @@ async fn add_replica(State(app): State<App>, axum::extract::Path(i): axum::extra
     let url = body_str(&b, "url")?.to_string();
     let j = app.svc.coordinator()?.add_replica(i, &url, body_bool(&b, "force")?).await?;
     Ok(audited(j, format!("added {url} to shard {i}")))
+}
+
+/// `POST /v1/admin/shards/:i/promote {"url", "force"?}`: makes that
+/// replica shard `i`'s primary, by a majority of the shard's votes.
+async fn promote_in_shard(State(app): State<App>, axum::extract::Path(i): axum::extract::Path<usize>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let url = body_str(&b, "url")?.to_string();
+    let j = app.svc.coordinator()?.promote(i, &url, body_bool(&b, "force")?).await?;
+    Ok(audited(j, format!("promoted {url} in shard {i}")))
 }
 
 /// `DELETE /v1/admin/shards/:i/replicas?url=`: one server fewer for shard
