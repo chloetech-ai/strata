@@ -973,6 +973,22 @@ impl<'a> Planner<'a> {
             }
         };
         let per = cap.as_ref().map_or(1, |(k, _)| *k);
+        // `SELECT DISTINCT a, b` is `GROUP BY a, b`, as over one table, so
+        // a multi-valued column gives a row per value there and here.
+        let grouping;
+        let plain = |s: &sql::Select| {
+            matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty())
+                && !has_aggregate(s)
+                && s.projection.iter().all(|i| matches!(i, SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }))
+        };
+        let s = if matches!(s.distinct, Some(sql::Distinct::Distinct)) && plain(s) {
+            let mut g = s.clone();
+            distinct_to_group(&mut g)?;
+            grouping = g;
+            &grouping
+        } else {
+            s
+        };
 
         // The tables.
         let twj = &s.from[0];

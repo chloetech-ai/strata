@@ -691,7 +691,7 @@ GROUP BY category, topic HAVING n > 20 ORDER BY AVG(rating) DESC LIMIT 10;
 SELECT COUNT(*), SUM(clicks), AVG(rating) FROM docs WHERE MATCH(body, 'india');
 ```
 
-- **`GROUP BY`** takes one or more indexed `KEYWORD`, `INT` or `FLOAT` columns, by name, position or alias. A multi-valued column puts a row in one group per value. The rows without a value form the group `NULL`, as in SQL, and `SELECT DISTINCT` lists `NULL` once.
+- **`GROUP BY`** takes one or more indexed `KEYWORD`, `INT` or `FLOAT` columns, by name, position or alias. A multi-valued column puts a row in one group per value, over one table, joined rows or derived rows alike, and so does `SELECT DISTINCT`, which is `GROUP BY` its columns. The rows without a value form the group `NULL`, as in SQL, and `SELECT DISTINCT` lists `NULL` once.
 - **Aggregates** are `COUNT(*)`, `COUNT(f)`, `COUNT(DISTINCT f)`, `SUM(f)` and `AVG(f)` over numeric columns, and `MIN(f)` and `MAX(f)` over numeric or keyword columns. Every selected column is a group column or inside an aggregate. Without `GROUP BY` they summarize every row that passes `WHERE`, in one row (`COUNT(*)` 0 and the others `NULL` when none does).
 - **`HAVING`** filters groups by their aggregates, written out or by alias, with comparisons, `BETWEEN`, `AND`, `OR` and `NOT`, in three-valued logic: an aggregate of no values (`AVG(rating)` of a group without ratings) is `NULL`, so neither `AVG(rating) < 3` nor `NOT (AVG(rating) < 3)` keeps that group.
 - **`ORDER BY`** a group column, an aggregate or a position, with a tie-break; without one, the largest groups come first. `LIMIT` and `OFFSET` apply to groups.
