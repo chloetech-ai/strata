@@ -192,3 +192,43 @@ fn a_backup_opens_with_the_same_records() {
     assert!(call(&d, json!({"op": "backup", "dest": dest})).get("error").is_some());
     assert!(call(&d, json!({"op": "backup", "dest": "relative/path"})).get("error").is_some());
 }
+
+/// With `next_files` on, an edit of a file brings the files that earlier
+/// sessions edited after it, each with its newest note; once per session.
+#[test]
+fn next_files_before_an_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    for f in ["src/ledger.rs", "tests/ledger.rs", "src/report.rs"] {
+        let p = proj.path().join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "").unwrap();
+    }
+    let p = |f: &str| proj.path().join(f).to_string_lossy().to_string();
+    std::fs::write(dir.path().join("config.json"), r#"{"embedder": "hash:64", "sync": false, "distill": {"enabled": false}, "next_files": true}"#).unwrap();
+    let d = Arc::new(Daemon::open(dir.path(), &proj.path().to_string_lossy()).unwrap());
+    let edit = |sid: &str, f: &str| hook(&d, "PostToolUse", json!({"session_id": sid, "tool_name": "Edit", "tool_input": {"file_path": p(f), "old_string": "a", "new_string": "b"}, "tool_response": {}}));
+
+    hook(&d, "SessionStart", json!({"session_id": "s1", "source": "startup"}));
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s1", "prompt": "Add overdraft checks to the ledger"}));
+    edit("s1", "src/ledger.rs");
+    edit("s1", "src/ledger.rs");
+    edit("s1", "tests/ledger.rs");
+    call(&d, json!({"op": "remember", "kind": "fact", "text": "The ledger tests compare balances against the fixtures in tests/fixtures.", "files": ["tests/ledger.rs"]}));
+    // A newer error about the test file: the fact is still the note shown.
+    hook(&d, "PostToolUse", json!({"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "cargo test --test ledger"},
+        "tool_response": {"stdout": "error: test failed in tests/ledger.rs: overdraft_is_refused", "stderr": ""}}));
+    hook(&d, "Stop", json!({"session_id": "s1", "last_assistant_message": "Added the overdraft check and its test."}));
+
+    hook(&d, "SessionStart", json!({"session_id": "s2", "source": "startup"}));
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s2", "prompt": "Round balances to cents"}));
+    let before = |f: &str| hook(&d, "PreToolUse", json!({"session_id": "s2", "tool_name": "Edit", "tool_input": {"file_path": p(f)}}));
+    let text = before("src/ledger.rs");
+    assert!(text.contains("edits of src/ledger.rs were usually followed by edits of: tests/ledger.rs."), "{text}");
+    assert!(text.contains("Engram note on tests/ledger.rs") && text.contains("fixtures"), "{text}");
+    assert_eq!(before("src/ledger.rs"), "");
+    let log = std::fs::read_to_string(dir.path().join("events.log")).unwrap();
+    assert_eq!(log.matches(r#""event":"next_files""#).count(), 1, "{log}");
+    // Nothing was edited after the report module.
+    assert_eq!(before("src/report.rs"), "");
+}
