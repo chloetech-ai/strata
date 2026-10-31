@@ -29,6 +29,7 @@ use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::{Agg, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, Plan, SortKey};
 use crate::query::logical::Direction;
 use crate::query::memory::Charge;
+use crate::query::steps::{self, Clock, Step};
 use crate::query::Projection;
 use crate::schema::{FieldType, Schema};
 use crate::value::Value;
@@ -52,7 +53,7 @@ pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions
 
 /// [`run`] of a plan whose leaves read any tables of `catalog`.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new(), encoded: Vec::new() };
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, plan: Vec::new(), encoded: Vec::new(), clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -61,7 +62,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
         keys: keys.unwrap_or_default(),
         scores: rows.scores.unwrap_or_default(),
         parts: None,
-        stats: ExecStats { plan: ops.plan, filter_docs: 0, scored: 0, reranked: 0 },
+        stats: ExecStats { plan: ops.plan, steps: ops.prof, steps_dropped: ops.dropped, ..ExecStats::default() },
     })
 }
 
@@ -107,6 +108,31 @@ struct Ops<'a, 'r> {
     /// results in scope then: a column and the ORDER BY that names it
     /// run it once.
     encoded: Vec<(Expr, usize, Option<std::sync::Arc<[f32]>>)>,
+    /// The operators' steps, each leaf's executor steps inside its own
+    /// ([`steps`]), and those the cap dropped.
+    clock: Clock,
+    prof: Vec<Step>,
+    dropped: u64,
+}
+
+/// What an operator's step is called, and what it works on.
+fn label(n: &Node) -> (&'static str, String) {
+    match n {
+        Node::Join { kind, keys, .. } => ("join", format!("{} on {} key{}", if *kind == JoinKind::Left { "left" } else { "inner" }, keys.len(), if keys.len() == 1 { "" } else { "s" })),
+        Node::With { ctes, .. } => ("with", ctes.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")),
+        Node::Limit { offset, limit, .. } => ("limit", match limit {
+            Some(l) => format!("{l} after {offset}"),
+            None => format!("after {offset}"),
+        }),
+        Node::Sort { keys, .. } => ("sort", format!("{} key{}", keys.len(), if keys.len() == 1 { "" } else { "s" })),
+        Node::Filter { .. } => ("filter", String::new()),
+        Node::Project { columns, .. } => ("project", format!("{} column{}", columns.len(), if columns.len() == 1 { "" } else { "s" })),
+        Node::Distinct { .. } => ("distinct", String::new()),
+        Node::DistinctOn { per, .. } => ("distinct on", format!("{per} per value")),
+        Node::KeyOrder { .. } => ("key order", String::new()),
+        Node::Aggregate { keys, aggs, .. } => ("aggregate", format!("{} key{}, {} aggregate{}", keys.len(), if keys.len() == 1 { "" } else { "s" }, aggs.len(), if aggs.len() == 1 { "" } else { "s" })),
+        _ => ("node", String::new()),
+    }
 }
 
 impl<'a> Ops<'a, '_> {
@@ -126,10 +152,24 @@ impl<'a> Ops<'a, '_> {
         self.opts.check()
     }
 
+    /// The rows of `n`, its run a step ([`steps`]).
     fn node(&mut self, n: &Node, what: &str) -> Result<Rows> {
         if n.is_leaf() {
             return self.leaf(n, what, Vec::new());
         }
+        if matches!(n, Node::Ref { .. }) {
+            return self.node_untimed(n, what);
+        }
+        let m = self.clock.mark(&self.prof);
+        let rows = self.node_untimed(n, what)?;
+        let (op, detail) = label(n);
+        if self.clock.wrap(&mut self.prof, m, op, detail, Some(rows.rows.len() as u64)).is_none() {
+            self.dropped += 1;
+        }
+        Ok(rows)
+    }
+
+    fn node_untimed(&mut self, n: &Node, what: &str) -> Result<Rows> {
         match n {
             Node::Join { .. } => self.join(n),
             Node::With { ctes, input } => {
@@ -234,6 +274,16 @@ impl<'a> Ops<'a, '_> {
     /// Runs a leaf with the executor, once its subqueries ran, with
     /// `restrict` added to its Search's filter.
     fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<(Expr, usize)>) -> Result<Rows> {
+        let m = self.clock.mark(&self.prof);
+        let rows = self.leaf_untimed(n, what, restrict)?;
+        let table = n.search().map(|s| s.table.as_str()).unwrap_or_default();
+        if self.clock.wrap(&mut self.prof, m, "leaf", format!("{what}: {table}"), Some(rows.rows.len() as u64)).is_none() {
+            self.dropped += 1;
+        }
+        Ok(rows)
+    }
+
+    fn leaf_untimed(&mut self, n: &Node, what: &str, restrict: Vec<(Expr, usize)>) -> Result<Rows> {
         self.opts.check()?;
         let schema = self.table(n)?;
         let mut leaf = n.clone();
@@ -282,6 +332,7 @@ impl<'a> Ops<'a, '_> {
         }
         self.plan.push(line);
         self.plan.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
+        self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
         for r in &rs.rows {
             self.charge.row(r)?;
         }

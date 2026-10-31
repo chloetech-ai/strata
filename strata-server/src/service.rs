@@ -17,7 +17,7 @@ use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
 use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
-use strata::query::{bind_command, compound, ops, profile, Command, Params, Select};
+use strata::query::{bind_command, compound, ops, profile, steps, Command, Params, Select};
 use strata::rank_log::{self, Log};
 use strata::schema::Schema;
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
@@ -76,6 +76,9 @@ pub struct QueryReq {
     pub release: bool,
     /// The writes the query must see ([`After`]).
     pub after: After,
+    /// Measure each step's CPU time ([`ExecOptions::profile`]); a
+    /// coordinator asks its shards to.
+    pub profile: bool,
 }
 
 /// The writes a read must see, so that a client reads its own writes
@@ -178,8 +181,12 @@ pub struct Service {
     /// The longest deadline a request may ask for (`timeout_ms`).
     pub max_timeout: Duration,
     /// Queries and writes that take this long or longer are logged as
-    /// slow (`None`: none are).
+    /// slow (`None`: none are), unless changed while the server runs
+    /// ([`Self::slow_after`]).
     pub slow: Option<Duration>,
+    /// Profiling settings changed at run time: the slow threshold, and
+    /// whether every query's CPU time is measured.
+    pub profiling: telemetry::Profiling,
     /// The most rows a query may reach, OFFSET included
     /// ([`ExecOptions::max_rows`]; `None`: no limit).
     pub max_rows: Option<usize>,
@@ -247,6 +254,9 @@ pub enum Replication {
 
 impl Service {
     pub fn new(backend: Backend, schema: Schema, agent: AgentConfig, max_concurrent: usize, timeout: Duration) -> Service {
+        // Steps count from this moment, which must come before any
+        // request's start for them to line up with its trace.
+        steps::epoch();
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let idempotency = Arc::new(idem::Keys::default());
         let writer_state = Arc::new(WriterState::default());
@@ -277,6 +287,7 @@ impl Service {
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
             slow: None,
+            profiling: telemetry::Profiling::default(),
             max_rows: None,
             max_rerank: None,
             max_groups: None,
@@ -1184,6 +1195,7 @@ impl Service {
         let timeout = self.timeout_of(req.timeout_ms);
         // Bound against every table: a query of one table is the
         // executor's, any other a compound plan.
+        let tp = Instant::now();
         let plan = match &req.plan {
             Some(p) => Ok(p.clone()),
             None => self.bound(|tables| compound::plan_read(&req.sql, tables, &req.params, &|t, n| self.rank_profile(t, n))).await.map(Arc::new),
@@ -1195,6 +1207,7 @@ impl Service {
             (p, _) => p,
         };
         let plan = plan.and_then(|p| self.open_ranking_models(p, req.shard));
+        telemetry::record("plan", tp, if plan.is_ok() { "ok" } else { "error" });
         let bound = match plan {
             Ok(plan) if plan.root.uses_operators() => {
                 // A compound query runs as its plan; a coordinator sends the
@@ -1284,6 +1297,8 @@ impl Service {
     async fn select(self: &Arc<Self>, mut req: QueryReq, schema: Arc<Schema>, select: Select, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = metrics::kind(&select);
         let mut lease = 0;
+        req.profile |= self.profiling.cpu_all.load(Ordering::Relaxed);
+        let profiled = req.profile;
         let live = self.live.start(&req.sql, kind, req.shard);
         let res = match &self.backend {
             Backend::Local(db) => {
@@ -1318,6 +1333,7 @@ impl Service {
                         max_rows: if req.shard { self.max_rows.map(|m| m.max(compound::MAX_ROWS + 1)) } else { self.max_rows },
                         max_groups: self.max_groups,
                         memory: self.query_memory.clone(),
+                        profile: req.profile,
                         ..db.exec.clone()
                     };
                     let db = db.clone();
@@ -1326,13 +1342,21 @@ impl Service {
                     let te = Instant::now();
                     let r = tokio::task::spawn_blocking(move || {
                         let _held = (permit, running);
-                        db.execute(&view, &select, &opts)
+                        let started = Instant::now();
+                        let r = db.execute(&view, &select, &opts);
+                        (r, started, Instant::now())
                     })
                     .await;
+                    let back = Instant::now();
                     drop(cancel);
-                    telemetry::record("execute", te, if matches!(r, Ok(Ok(_))) { "ok" } else { "error" });
+                    telemetry::record("execute", te, if matches!(r, Ok((Ok(_), ..))) { "ok" } else { "error" });
                     match r {
-                        Ok(r) => r.map(|rs| (rs, Vec::new())).map_err(ApiError::from),
+                        Ok((r, started, ended)) => r
+                            .map(|mut rs| {
+                                steps::around(&mut rs.stats.steps, te, started, ended, back);
+                                (rs, Vec::new())
+                            })
+                            .map_err(ApiError::from),
                         Err(e) => Err(ApiError::internal(e)),
                     }
                 })
@@ -1357,7 +1381,7 @@ impl Service {
         };
         drop(live);
         // A shard's answer to a coordinator is not a client's.
-        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, res);
+        let a = self.done(&req.sql, kind, t0, self.max_rows.filter(|_| !req.shard), req.shard, profiled, res);
         // A lease made for a query that failed holds nothing to fetch.
         let made = (lease != req.snapshot).then_some(lease).filter(|_| a.is_err());
         if let Some(l) = (req.release && req.snapshot != 0).then_some(req.snapshot).or(made) {
@@ -1369,11 +1393,18 @@ impl Service {
     /// Counts a query's outcome, logs it if it was slow, and makes its
     /// answer. One with more rows than `window` (a compound query's, or a
     /// coordinator's without a LIMIT) fails.
-    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
-        let res = match (res, window) {
+    #[allow(clippy::too_many_arguments)]
+    fn done(&self, sql: &str, kind: &'static str, t0: Instant, window: Option<usize>, shard: bool, profiled: bool, res: Result<(ResultSet, Vec<String>), ApiError>) -> Result<Answer, ApiError> {
+        let mut res = match (res, window) {
             (Ok((rs, _)), Some(m)) if rs.rows.len() > m => Err(ApiError::bad(format!("query error: the query matches more than {m} rows, the most a query returns; add a LIMIT"))),
             (r, _) => r,
         };
+        // The steps count from the request's start, as its trace does: a
+        // shard's, from the start of the call the coordinator made.
+        if let Ok((rs, _)) = &mut res {
+            let start = telemetry::trace().map_or(t0, |t| t.t0());
+            steps::rebase(&mut rs.stats.steps, steps::us_at(start));
+        }
         let secs = t0.elapsed().as_secs_f64();
         let outcome = match &res {
             Ok((_, missing)) if !missing.is_empty() => "partial",
@@ -1386,20 +1417,22 @@ impl Service {
         };
         self.metrics.query(kind, outcome, secs);
         let rows = res.as_ref().map_or(0, |(rs, _)| rs.rows.len());
-        let slow = self.slow.is_some_and(|s| t0.elapsed() >= s);
+        let slow = self.slow_after().is_some_and(|s| t0.elapsed() >= s);
         if slow {
             self.metrics.slow("query");
             tracing::warn!(kind, outcome, secs, rows, sql = %obs::truncate(sql, 2000), "slow query");
         }
-        self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow);
+        self.query_log.add(sql, kind, outcome, secs, rows, shard, res.as_ref().err().map(|e| e.message.as_str()), slow, res.as_ref().ok().map(|(rs, _)| &rs.stats), profiled);
         res.map(|(rs, missing)| Answer { rs, took_ms: secs * 1e3, kind, missing, lease: 0 })
     }
 
     /// A compound query ([`compound`]): its plan's leaves run on one
     /// snapshot here, or each through the coordinator, and its operators
     /// here.
-    async fn compound(self: &Arc<Self>, req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
+    async fn compound(self: &Arc<Self>, mut req: QueryReq, plan: Arc<Plan>, t0: Instant, timeout: Duration) -> Result<Answer, ApiError> {
         let kind = "compound";
+        req.profile |= self.profiling.cpu_all.load(Ordering::Relaxed);
+        let profiled = req.profile;
         let catalog = self.catalog();
         let deadline = t0 + timeout;
         let req_sql = req.sql.clone();
@@ -1410,7 +1443,7 @@ impl Service {
             Err(_) if Instant::now() > deadline => Err(ApiError { status: 504, message: format!("the query ran past its {} ms deadline", timeout.as_millis()) }),
             r => r,
         };
-        self.done(&req_sql, kind, t0, self.max_rows, false, res)
+        self.done(&req_sql, kind, t0, self.max_rows, false, profiled, res)
     }
 
     /// The work of [`Self::compound`]; [`Self::done`] counts it.
@@ -1434,13 +1467,16 @@ impl Service {
                     synonyms: self.synonyms().or_else(|| db.exec.synonyms.clone()),
                     max_groups: self.max_groups,
                     memory: self.query_memory.clone(),
+                    profile: req.profile,
                     ..db.exec.clone()
                 };
                 let db = db.clone();
+                let te = Instant::now();
                 let r = tokio::task::spawn_blocking(move || {
                     let _held = (permit, running);
+                    let started = Instant::now();
                     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
-                    ops::run_in(
+                    let r = ops::run_in(
                         &plan,
                         &tables,
                         &mut |leaf| {
@@ -1448,10 +1484,17 @@ impl Service {
                             db.execute(&view, &leaf.to_select(view.schema())?, &opts)
                         },
                         &opts,
-                    )
+                    );
+                    (r, started, Instant::now())
                 })
                 .await;
-                r.map(|r| r.map(|rs| (rs, Vec::new())))
+                let back = Instant::now();
+                r.map(|(r, started, ended)| {
+                    r.map(|mut rs| {
+                        steps::around(&mut rs.stats.steps, te, started, ended, back);
+                        (rs, Vec::new())
+                    })
+                })
             }
             Backend::Cluster(c) => {
                 let Some(permit) = self.admit(timeout).await else { return Err(too_many()) };
@@ -1466,7 +1509,7 @@ impl Service {
                     let _held = permit;
                     // Shards any leaf was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
-                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, ..ExecOptions::default() };
+                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, profile: req.profile, ..ExecOptions::default() };
                     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
                     let rs = ops::run_in(&plan, &tables, &mut |leaf| {
                         checks.check()?;
@@ -1474,7 +1517,7 @@ impl Service {
                         let select = leaf.to_select(schema)?;
                         // The shards run the leaf's plan; its text names it in their logs.
                         let sql = leaf.explain(&tables).join(" / ");
-                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), ..Default::default() };
+                        let step = QueryReq { sql, plan: Some(Arc::new(leaf.clone())), partial: req.partial, after: req.after.clone(), profile: req.profile, ..Default::default() };
                         let m = rt.block_on(telemetry::within(trace.clone(), obs::scope(id.clone(), c.query(&step, schema, &select, deadline)))).map_err(|e| strata::Error::Query(e.message))?;
                         for s in m.missing {
                             if !missing.contains(&s) {
@@ -1515,6 +1558,11 @@ impl Service {
                 None
             }
         }
+    }
+
+    /// The slow threshold now: as set while running, else as started.
+    pub fn slow_after(&self) -> Option<Duration> {
+        self.profiling.slow(self.slow)
     }
 
     /// Queries running now, including those whose callers stopped waiting
@@ -1877,7 +1925,7 @@ impl Service {
             Ok(w) => self.metrics.write(w.rows, secs),
             Err(e) => self.metrics.write_error(e.status),
         }
-        if self.slow.is_some_and(|s| t0.elapsed() >= s) {
+        if self.slow_after().is_some_and(|s| t0.elapsed() >= s) {
             self.metrics.slow("write");
             let (rows, status) = (r.as_ref().map_or(0, |w| w.rows), r.as_ref().map_or_else(|e| e.status, |_| 200));
             match sql {
@@ -2218,7 +2266,7 @@ impl Service {
                 "timeout_ms": self.timeout.as_millis() as u64, "max_timeout_ms": self.max_timeout.as_millis() as u64,
                 "max_concurrent": self.max_concurrent, "max_rows": self.max_rows, "max_groups": self.max_groups,
                 "query_memory_bytes": self.query_memory.as_ref().map(|b| b.limit()), "max_queued_writes": self.max_queued_writes,
-                "max_body_bytes": self.max_body, "slow_ms": self.slow.map(|d| d.as_millis() as u64), "lease_ttl_s": self.lease_ttl.as_secs(),
+                "max_body_bytes": self.max_body, "slow_ms": self.slow_after().map(|d| d.as_millis() as u64), "lease_ttl_s": self.lease_ttl.as_secs(),
             },
             "features": {
                 "synonyms": self.synonyms().map_or(0, |s| s.rules()), "backup_dir": self.backup_dir.as_ref().map(|p| p.display().to_string()),
