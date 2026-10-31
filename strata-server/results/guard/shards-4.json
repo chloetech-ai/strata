@@ -1,0 +1,86 @@
+{
+  "at_least": [
+    {
+      "conditions": 4,
+      "max_rows": 10000,
+      "runs": [
+        {
+          "fixed_ms_p50": 0.494042,
+          "guard": "guard: AT_LEAST 4 of 4 (4: 1625, 3: 27307, 2: 179927, 1: 590663; max_rows 10000)",
+          "guarded_ms_p50": 2.270038,
+          "level": 4,
+          "setup": "one database"
+        },
+        {
+          "fixed_ms_p50": 1.551947,
+          "guard": "guard: AT_LEAST 4 of 4 (4: 1625, 3: 27307, 2: 179927, 1: 590663; max_rows 10000)",
+          "guarded_ms_p50": 4.2699,
+          "level": 4,
+          "setup": "coordinator"
+        }
+      ]
+    },
+    {
+      "conditions": 8,
+      "max_rows": 10000,
+      "runs": [
+        {
+          "fixed_ms_p50": 0.94529,
+          "guard": "guard: AT_LEAST 6 of 8 (8: 3, 7: 87, 6: 1314, 5: 10587, 4: 56650, 3: 202487, 2: 495976, 1: 832351; max_rows 10000)",
+          "guarded_ms_p50": 3.9292499999999997,
+          "level": 6,
+          "setup": "one database"
+        },
+        {
+          "fixed_ms_p50": 2.60502,
+          "guard": "guard: AT_LEAST 6 of 8 (8: 3, 7: 87, 6: 1314, 5: 10587, 4: 56650, 3: 202487, 2: 495976, 1: 832351; max_rows 10000)",
+          "guarded_ms_p50": 7.382751,
+          "level": 6,
+          "setup": "coordinator"
+        }
+      ]
+    },
+    {
+      "conditions": 16,
+      "max_rows": 10000,
+      "runs": [
+        {
+          "fixed_ms_p50": 1.679679,
+          "guard": "guard: AT_LEAST 8 of 16 (16: 0, 15: 0, 14: 0, 13: 0, 12: 1, 11: 33, 10: 264, 9: 1418, 8: 6973, 7: 26736, 6: 81685, 5: 202048, 4: 401953, 3: 648422, 2: 859379, 1: 972120; max_rows 10000)",
+          "guarded_ms_p50": 7.654059,
+          "level": 8,
+          "setup": "one database"
+        },
+        {
+          "fixed_ms_p50": 1.782681,
+          "guard": "guard: AT_LEAST 8 of 16 (16: 0, 15: 0, 14: 0, 13: 0, 12: 1, 11: 33, 10: 264, 9: 1418, 8: 6973, 7: 26736, 6: 81685, 5: 202048, 4: 401953, 3: 648422, 2: 859379, 1: 972120; max_rows 10000)",
+          "guarded_ms_p50": 12.599255,
+          "level": 8,
+          "setup": "coordinator"
+        }
+      ]
+    }
+  ],
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "queries": 50,
+  "reps": 9,
+  "rows": 1000000,
+  "shards": 4,
+  "text": [
+    {
+      "bm25_fixed_ms_p50": 1.008257,
+      "bm25_guarded_ms_p50": 1.691494,
+      "setup": "one database"
+    },
+    {
+      "bm25_fixed_ms_p50": 2.5713749999999997,
+      "bm25_guarded_ms_p50": 4.2685070000000005,
+      "setup": "coordinator"
+    }
+  ]
+}

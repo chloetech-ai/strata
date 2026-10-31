@@ -1122,6 +1122,18 @@ impl Db {
         Executor::new(snap, &readers, opts).term_stats(select)
     }
 
+    /// The loosest level of `select`'s guard (`min_rows`, `max_rows`) and
+    /// each level's rows on snapshot `snap`, from it to the strictest
+    /// ([`Executor::guard_counts`]): what a coordinator sums over its
+    /// shards to choose the level ([`crate::query::logical::Guard::level`]).
+    pub fn guard_counts(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<(usize, Vec<u64>)> {
+        if select.guard.is_none() {
+            return Err(Error::Query("the query has no guard (min_rows, max_rows) to count the levels of".into()));
+        }
+        let readers = self.readers(snap)?;
+        Executor::new(snap, &readers, opts).guard_counts(select)
+    }
+
     /// The codes that can follow each of `prefixes` in semantic-ID field
     /// `field` of table `table`, among the rows that SQL condition `filter`
     /// (with `params`) matches, or all rows: per prefix, each code one

@@ -198,8 +198,10 @@ progress { width: 100%; accent-color: var(--accent); }
         <div class="row small" id="bTextOpts" style="margin-top:6px">
           <label title="Also find words a letter or two away: 'nueral' finds 'neural'"><input type="checkbox" id="bFuzzy"> allow typos</label>
           <label id="bSynBox" title="Also find the words a synonym list says are the same"><input type="checkbox" id="bSyn"> use synonyms</label>
+          <label title="Only rows with at least this many of the search words (min =>)">match <select id="bMin"><option value="">any word</option><option value="2">2 words</option><option value="3">3 words</option><option value="'50%'">half the words</option><option value="'75%'">3 in 4 words</option></select></label>
+          <label title="Ask for every word first, and for fewer, down to the match choice, while the rows stay this many or fewer (max_rows =>)">but as many as fit in <input type="number" id="bMaxRows" min="1" placeholder="rows" style="width:6em" disabled> rows</label>
           <button class="btn link small hidden" id="bSynSetup">set up synonyms</button>
-          <span class="hint" id="bTextHint">Matching understands <code>AND</code>, <code>OR</code>, <code>-word</code>, <code>"a phrase"</code>, <code>prefix*</code> and <code>typo~</code>. <button class="btn link small" data-help="text">More</button></span>
+          <span class="hint" id="bTextHint">Matching understands <code>AND</code>, <code>OR</code>, <code>-word</code>, <code>"a phrase"</code>, <code>prefix*</code>, <code>typo~</code> and <code>(a b c)@2</code>. <button class="btn link small" data-help="text">More</button></span>
         </div>
         <div class="row" id="bVecRow">
           <div style="width:170px"><label class="lbl" for="bVecMode">Similar to</label>
@@ -525,8 +527,11 @@ function vecFieldChanged() {
     : e.loaded ? `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}; a description is embedded by the same model.`
     : `${f} is ${e.model}'s embedding of ${e.from.join(" + ")}, which this server cannot run: search by a row.`;
 }
-// Conditions are a tree of groups: all of (AND), any of (OR), none of (NOT).
-const newGroup = (op = "AND") => ({ group: true, op, items: [] });
+// Conditions are a tree of groups: all of (AND), any of (OR), none of (NOT),
+// at least n of (AT_LEAST).
+const newGroup = (op = "AND") => ({ group: true, op, items: [], n: "2" });
+// A group's n as AT_LEAST takes it: a count, or a share such as '75%'.
+const needSql = (g) => /^\d+$/.test(g.n.trim()) ? g.n.trim() : /^\d+%$/.test(g.n.trim()) ? lit(g.n.trim()) : "2";
 const B = { where: newGroup("AND"), fuse: "rrf", cols: null, joinCols: null, groupBy: [], metrics: [] };
 function opt(v, t) { return el("option", { value: v, text: t ?? v }); }
 function setupBuilder() {
@@ -550,7 +555,9 @@ function setupBuilder() {
     return el("label", {}, cb, f.name);
   }));
   for (const id of ["bText", "bTextField", "bMatchAll", "bVecValue", "bVecField", "bSort", "bDir", "bFacet", "bLimit"]) $(id).addEventListener("input", updateSql);
-  for (const id of ["bFuzzy", "bSyn", "bJoinLeft", "bJoinWhere", "bHaving", "bAggOrder"]) $(id).addEventListener("input", updateSql);
+  // The row limit relaxes a "match" choice, so it waits for one.
+  $("bMin").addEventListener("input", () => { $("bMaxRows").disabled = !$("bMin").value; });
+  for (const id of ["bFuzzy", "bSyn", "bMin", "bMaxRows", "bJoinLeft", "bJoinWhere", "bHaving", "bAggOrder"]) $(id).addEventListener("input", updateSql);
   $("bVecMode").addEventListener("input", () => {
     const m = $("bVecMode").value; $("bVecValue").disabled = !m;
     $("bVecValue").placeholder = m === "row" ? `a ${S.pk}, e.g. one from the results` : m === "text" ? "describe what you want" : "";
@@ -580,10 +587,11 @@ const filterable = () => S.fields.filter((f) => f.kind !== "vector" && f.kind !=
 const changed = () => { renderFilters(); updateSql(); };
 function renderFilters() { $("bFilters").replaceChildren(renderGroup(B.where, null)); }
 function renderGroup(g, parent) {
-  const seg = el("span", { class: "seg" }, [["AND", "all of", "every condition holds (AND)"], ["OR", "any of", "at least one holds (OR)"], ["NOT", "none of", "no condition holds (NOT)"]].map(([v, t, title]) =>
+  const seg = el("span", { class: "seg" }, [["AND", "all of", "every condition holds (AND)"], ["OR", "any of", "at least one holds (OR)"], ["NOT", "none of", "no condition holds (NOT)"], ["ATLEAST", "at least n of", "at least n of the conditions hold (AT_LEAST)"]].map(([v, t, title]) =>
     el("button", { "aria-pressed": String(g.op === v), title, onclick: () => { g.op = v; changed(); } }, t)));
+  const n = g.op !== "ATLEAST" ? null : el("input", { type: "text", value: g.n, style: "width:4.5em", title: "How many of the conditions: a count (2) or a share (75%)", oninput: (e) => { g.n = e.target.value; updateSql(); } });
   const head = el("div", { class: "group-head" },
-    el("span", { class: "small muted", text: parent ? "a group: rows matching" : "Rows matching" }), seg, el("span", { class: "spacer" }),
+    el("span", { class: "small muted", text: parent ? "a group: rows matching" : "Rows matching" }), seg, n ? el("span", { class: "small muted", text: "n =" }) : null, n, el("span", { class: "spacer" }),
     el("button", { class: "btn small", onclick: () => addFilter(filterable()[0].name, null, null, g) }, "+ condition"),
     el("button", { class: "btn small", title: "A nested group, e.g. (a OR b) inside all of", onclick: () => { g.items.push(newGroup(g.op === "OR" ? "AND" : "OR")); changed(); } }, "+ group"),
     el("button", { class: "btn small", title: "Keep rows whose value is among another query's results (IN (SELECT ...))", onclick: () => { g.items.push(newSub()); changed(); } }, "+ in another query's results"),
@@ -636,6 +644,7 @@ function groupSql(g, q) {
   const parts = g.items.map((it) => itemSql(it, q)).filter(Boolean);
   if (!parts.length) return null;
   if (g.op === "NOT") return `NOT (${parts.join(" OR ")})`;
+  if (g.op === "ATLEAST") return `AT_LEAST(${needSql(g)}, ${parts.join(", ")})`;
   return parts.length === 1 ? parts[0] : `(${parts.join(g.op === "OR" ? " OR " : " AND ")})`;
 }
 // The top group's conditions, each its own line when they are ANDed.
@@ -644,6 +653,7 @@ function whereParts(q) {
   if (!parts.length) return [];
   if (g.op === "AND") return parts;
   if (g.op === "OR") return [parts.length > 1 ? `(${parts.join("\n    OR ")})` : parts[0]];
+  if (g.op === "ATLEAST") return [`AT_LEAST(${needSql(g)},\n    ${parts.join(",\n    ")})`];
   return [`NOT (${parts.join(" OR ")})`];
 }
 // Prefixes this table's column names in a condition with `alias.`.
@@ -732,7 +742,10 @@ function summarySpec(joined) {
   if (!groups.length && !metrics.length) return null;
   return { groups, metrics: metrics.length ? metrics : ["COUNT(*)"] };
 }
-const textOpts = () => ($("bFuzzy").checked ? ", fuzzy => 'auto'" : "") + ($("bSyn").checked && !$("bSyn").disabled ? ", synonyms => 1" : "");
+const textOpts = () => ($("bFuzzy").checked ? ", fuzzy => 'auto'" : "") + ($("bSyn").checked && !$("bSyn").disabled ? ", synonyms => 1" : "") + ($("bMin").value ? `, min => ${$("bMin").value}` : "");
+// A guard on the words: as many of them as keep the rows within the
+// count, down to the "match" choice (it needs one).
+const maxRows = () => { const v = $("bMaxRows").value.trim(); return $("bMin").value && /^\d+$/.test(v) && Number(v) > 0 ? `, max_rows => ${v}` : ""; };
 
 function literal(f, v) {
   v = v.trim();
@@ -764,10 +777,13 @@ function builderQuery() {
   const vm = $("bVecMode").value, vv = $("bVecValue").value.trim(), vf = ident($("bVecField").value || "");
   const where = [];
   // A summary has no ranking, so the search text filters.
-  if (text && ($("bMatchAll").checked || agg)) where.push(`MATCH(${tf}, ${sqlStr(text)}${to})`);
+  // The guard goes on the MATCH when the text filters, else on its bm25;
+  // a join's rows are not one table's to count.
+  const filtering = text && ($("bMatchAll").checked || agg), mr = J ? "" : maxRows();
+  if (filtering) where.push(`MATCH(${tf}, ${sqlStr(text)}${to}${mr})`);
   where.push(...whereParts(A));
   const params = {};
-  const textScore = text && !agg ? `bm25(${tf}, ${sqlStr(text)}${to})` : null;
+  const textScore = text && !agg ? `bm25(${tf}, ${sqlStr(text)}${to}${filtering ? "" : mr})` : null;
   let vecScore = null;
   if (vm && vv) { vecScore = `similarity(${vf}, :q)`; params.q = vm === "row" ? { vector_of: vv, field: $("bVecField").value } : { embed: vv, field: $("bVecField").value }; }
   if (vecScore && J) vecScore = vecScore.replace(/^similarity\(/, "similarity(a.");
@@ -1276,6 +1292,8 @@ function helpSections(x) {
     { t: "Phrases and prefixes", d: `"Quoted words" must appear together; pre* matches every word that starts with pre.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '"${x.phrase}" OR ${w2.slice(0, 4)}*')\nLIMIT 20` },
     { t: "Typos", d: `word~ also matches words an edit or two away (word~1, word~2 to choose). fuzzy => 'auto' does it for every word, in MATCH and bm25: 1 edit for words of 3 to 5 letters, 2 for longer ones.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${x.typo}', fuzzy => 'auto') DESC\nLIMIT 10` },
     { t: "Synonyms", d: `synonyms => 1 also searches what the synonym list (below) says is the same: "laptop, notebook" or "tv => television".`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1}', synonyms => 1) DESC\nLIMIT 10`, needs: "synonyms" },
+    { t: "Some of the words", d: `(a b c)@2 matches rows with at least 2 of a, b and c; min => 2 (or '75%') asks that of a whole MATCH or bm25 text.`, sql: `SELECT ${show}, score() FROM ${T}\nWHERE MATCH(${tf}, '(${w1} ${w2} ${w3})@2')\nORDER BY bm25(${tf}, '${w1} ${w2} ${w3}', min => 2) DESC\nLIMIT 10` },
+    { t: "As many words as fit", d: `With max_rows, bm25 (or MATCH, or AT_LEAST) asks for all its words first and for fewer, down to min, while the rows stay within max_rows; min_rows asks for fewer while there are too few. The plan says which level ran.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '${w1} ${w2} ${w3}', min => 1, max_rows => 50) DESC\nLIMIT 10` },
     { t: "Weights, required and excluded words", d: `In bm25, word^2 weighs a word twice, +word must appear and -word must not; the other words rank. syntax => 'plain' reads the text as words alone.`, sql: `SELECT ${show}, score() FROM ${T}\nORDER BY bm25(${tf}, '+${w1} ${w2}^2 -${w3}') DESC\nLIMIT 10` },
     { t: "Ranked search with filters", d: `bm25 ranks; score() shows the score. Filters decide which rows compete.`, sql: `SELECT ${show}${num ? ", " + num : ""}, score() FROM ${T}${num ? `\nWHERE ${num} >= ${x.avg}` : ""}\nORDER BY bm25(${tf}, '${w1} ${w2}') DESC\nLIMIT 10` },
   ] });
@@ -1283,7 +1301,8 @@ function helpSections(x) {
   if (kw) fl.push({ t: "AND, OR and NOT", d: `Parentheses group conditions; NOT negates one or a group.`, sql: `SELECT ${show}${num ? ", " + num : ""} FROM ${T}\nWHERE (${kw} = ${lit(v1)} OR ${kw} = ${lit(v2)})${num ? `\n  AND NOT ${num} < ${x.avg}` : ""}\nLIMIT 20` });
   if (kw && num) fl.push({ t: "IN and BETWEEN", d: `A list of values, a range, and either negated.`, sql: `SELECT ${show}, ${kw}, ${num} FROM ${T}\nWHERE ${kw} IN (${lit(v1)}, ${lit(v2)}) AND ${num} NOT BETWEEN ${x.min} AND ${x.avg}\nLIMIT 20` });
   if (tf && kw) fl.push({ t: "Text OR a filter", d: `A text match is a condition like any other.`, sql: `SELECT ${show} FROM ${T}\nWHERE MATCH(${tf}, '${w1}') OR ${kw} = ${lit(v1)}\nLIMIT 20` });
-  if (fl.length) sec.push({ id: "filters", title: "Conditions", intro: "WHERE takes =, !=, <, <=, >, >=, IN, BETWEEN, MATCH and the graph predicates, combined with AND, OR, NOT and parentheses.", ex: fl });
+  if (tf && kw && num) fl.push({ t: "At least n of", d: `AT_LEAST(n, ...) keeps rows where n of the conditions hold (or a share: '75%'); count_true(...) counts them, to rank by.`, sql: `SELECT ${show}, score() FROM ${T}\nWHERE AT_LEAST(2, MATCH(${tf}, '${w1}'), ${kw} = ${lit(v1)}, ${num} >= ${x.avg})\nORDER BY bm25(${tf}, '${w1} ${w2}') * (1 + 0.1 * count_true(${kw} = ${lit(v1)}, ${num} >= ${x.avg})) DESC\nLIMIT 10` });
+  if (fl.length) sec.push({ id: "filters", title: "Conditions", intro: "WHERE takes =, !=, <, <=, >, >=, IN, BETWEEN, MATCH and the graph predicates, combined with AND, OR, NOT, AT_LEAST and parentheses.", ex: fl });
   const ag = [];
   if (kw) ag.push({ t: "Count, average, minimum, maximum", d: `GROUP BY KEYWORD, INT or FLOAT fields; COUNT(*), COUNT(f), COUNT(DISTINCT f), SUM, AVG, MIN and MAX per group.`, sql: `SELECT ${kw}, COUNT(*)${num ? `, AVG(${num}), MIN(${num}), MAX(${num})` : ""} FROM ${T}\nGROUP BY ${kw}\nORDER BY COUNT(*) DESC\nLIMIT 10` });
   if (kw && num) ag.push({ t: "HAVING", d: `Keep groups by their aggregates, named by alias or written out, and order by any of them.`, sql: `SELECT ${kw}, COUNT(*) AS n, AVG(${num}) AS avg_${numF.name} FROM ${T}\nGROUP BY ${kw}\nHAVING n >= 5\nORDER BY avg_${numF.name} DESC\nLIMIT 10` });

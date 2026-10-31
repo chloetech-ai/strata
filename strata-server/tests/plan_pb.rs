@@ -80,6 +80,8 @@ const SELECTS: &[&str] = &[
     "SELECT id FROM papers WHERE year > 2000 ORDER BY maxsim(emb, :vs, rerank => 50, max_vectors => 8) * (1 + coalesce(rating, 0)) DESC LIMIT 5",
     "SELECT category, COUNT(*) AS n, AVG(rating), MAX(published), MIN(year), SUM(rating) FROM papers WHERE year > 2000 GROUP BY category HAVING COUNT(*) >= 2 AND AVG(rating) < 3 ORDER BY n DESC LIMIT 5",
     "SELECT COUNT(*), COUNT(DISTINCT category), COUNT(rating) FROM papers WHERE MATCH(body, 'graph')",
+    // Some of the conditions, and how many hold.
+    "SELECT id, count_true(year > 2000, tags = 'x', MATCH(body, 'net')) AS k FROM papers WHERE AT_LEAST(2, MATCH(body, 'graph'), year >= 2019, NOT AT_LEAST('50%', rating > 1, category IN ('a', 'b'))) ORDER BY bm25(body, 'graph') * (1 + count_true(done, rating IS NULL)) DESC LIMIT 5",
     "SELECT id FROM papers WHERE category LIKE 'm%' OR (PREFIX(id, 'p1') AND id NOT LIKE 'p1!_%' ESCAPE '!') ORDER BY year DESC LIMIT 5",
     "SELECT id FROM papers WHERE PREFIX(category, 'mtah', fuzzy => 'auto') OR PREFIX(id, 'p2', fuzzy => 1) ORDER BY year DESC LIMIT 5",
 ];
@@ -105,6 +107,7 @@ const COMPOUND: &[&str] = &[
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), maxsim(emb, (SELECT emb FROM papers WHERE category = 'ml' LIMIT 4))) DESC LIMIT 5",
     "SELECT DISTINCT ON (category, year % 3) id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC LIMIT 3",
     "SELECT DISTINCT ON (category) category, year, COUNT(*) AS n FROM papers GROUP BY category, year ORDER BY category, n DESC",
+    "SELECT id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC MAX 2 PER category LIMIT 5",
     "SELECT d.id FROM (SELECT id, title FROM papers) AS d WHERE PREFIX(d.title, upper('gr'))",
     // A correlated subquery, which names the row it ranks.
     "WITH a AS (SELECT * FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 50) SELECT id FROM a ORDER BY bm25(body, 'graph') + (SELECT COUNT(*) FROM papers p WHERE p.category = a.category AND p.year < a.year) DESC LIMIT 5",
@@ -266,7 +269,7 @@ fn every_plan_round_trips() {
     // Every kind of node and expression was among them.
     let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
     let exprs = [
-        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim", "prefix", "outer", "by_key",
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim", "prefix", "outer", "by_key", "at_least",
     ];
     let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
     let missing: Vec<&String> = want.difference(&seen).collect();
@@ -279,7 +282,7 @@ fn plan(root: Node) -> pb::Plan {
 }
 
 fn search(filter: Expr) -> Node {
-    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new(), profile: None })
+    Node::Search(ir::Search { table: "papers".into(), filter, order: Vec::new(), phases: Vec::new(), profile: None, guard: None })
 }
 
 fn refused(p: pb::Plan, says: &str) {
