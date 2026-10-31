@@ -54,7 +54,7 @@ One Strata table, `memory`. Each record is one key–value pair with attributes.
 | `kind` | KEYWORD | `prompt`, `answer`, `tool_call`, `tool_result`, `error`, `episode`, `summary`, `decision`, `preference`, `fact`, `todo`, `note` |
 | `tag` | KEYWORD | tool name, summary section, `distilled`, `planned`, `superseded`, … |
 | `turn`, `seq`, `ts` | INT | user turn, project-wide sequence number, Unix seconds |
-| `importance` | FLOAT | salience prior in [0, 1] |
+| `importance` | FLOAT | salience prior in [0, 1]; for an entity, how many records link to it |
 | `files` | TEXT | paths the record touches (path components are terms) |
 | `text` | TEXT, stored | the value: one chunk of at most 400 bytes, injected as is |
 | `ctx` | TEXT, stored | the turn's request (≤ 200 characters); for notes also the situations they matter in (`When:`) and the code they were written against (`Anchor:`); part of the lexical key, never shown |

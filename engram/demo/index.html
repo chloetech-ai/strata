@@ -42,6 +42,15 @@ header .meta b { color: var(--text); font-weight: 600; }
 header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; margin-right: 5px; }
 header .dot.busy { background: var(--warn); animation: pulse 1s infinite; }
 @keyframes pulse { 50% { opacity: .3; } }
+.find { position: relative; margin-left: auto; }
+.find input { width: 260px; }
+.sugg { position: absolute; top: calc(100% + 4px); left: 0; min-width: 100%; max-width: 480px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.12); z-index: 20; display: none; padding: 3px 0; }
+.sugg.on { display: block; }
+.sugg div { display: flex; gap: 8px; align-items: baseline; padding: 4px 10px; cursor: pointer; white-space: nowrap; }
+.sugg div.sel, .sugg div:hover { background: var(--accent-bg); }
+.sugg .name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sugg .n { margin-left: auto; color: var(--faint); font-size: 11.5px; }
+.sugg .typo { color: var(--warn); font-size: 11px; }
 
 main { display: grid; grid-template-columns: minmax(360px, 40%) 1fr; height: calc(100% - 47px); }
 #chat { display: flex; flex-direction: column; border-right: 1px solid var(--line); min-width: 0; }
@@ -196,6 +205,7 @@ main { flex: 1; min-height: 0; height: auto; grid-template-rows: minmax(0, 1fr);
 <header>
   <h1>Engram Inspector</h1>
   <div class="meta" id="meta"></div>
+  <div class="find"><input id="find" class="mono" placeholder="Find an entity or file" autocomplete="off" spellcheck="false" title="Completes the names of entities and the paths of files that records link to, most linked first"></div>
 </header>
 <main>
   <section id="chat">
@@ -963,7 +973,7 @@ async function openRecord(id) {
         <dt>session</dt><dd class="mono">${esc(x.session)}</dd>
         <dt>turn · seq</dt><dd>${x.turn} · ${x.seq}</dd>
         <dt>time</dt><dd>${new Date(x.ts * 1000).toLocaleString()}</dd>
-        <dt>importance</dt><dd>${x.importance}</dd>
+        <dt>${x.kind === "entity" ? "linked from" : "importance"}</dt><dd>${x.kind === "entity" ? `${x.importance} records` : x.importance}</dd>
         ${x.files ? `<dt>files</dt><dd class="mono">${esc(x.files)}</dd>` : ""}
       </dl>
       <h3>text</h3><div class="box">${esc(x.text)}</div>
@@ -986,6 +996,64 @@ async function openRecord(id) {
   } catch (e) { body.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
 }
 function wireOpen(el) { $$("[data-open]", el).forEach(c => c.onclick = e => { e.stopPropagation(); openRecord(c.dataset.open); }); }
+
+// ------------------------------------------------------------------ completion
+// Entities and files are rows of the memory table (`e:<name>`, `f:<path>`)
+// that count the records linking to them, so completing a name is a prefix
+// of the id, most linked first. Names one or two typos away fill what the
+// exact prefix leaves of the list.
+async function complete(text, limit = 10) {
+  const t = text.trim();
+  if (!t) return [];
+  // A whole id (`e:…`, `f:…`) is completed as it stands.
+  const params = /^e:/.test(t) ? {e: t.toLowerCase(), f: t.toLowerCase()} : /^f:/.test(t) ? {e: t, f: t} : {e: "e:" + t.toLowerCase(), f: "f:" + t};
+  const q = edits => sql(`SELECT id, text, importance FROM memory WHERE kind = 'entity' AND (PREFIX(id, :e${edits}) OR PREFIX(id, :f${edits})) ORDER BY importance DESC, id LIMIT ${limit}`, {params}).then(rowsAsObjects);
+  const exact = await q("");
+  // The typos MATCH's fuzzy => 'auto' allows for a word this long.
+  const edits = t.length <= 2 ? 0 : t.length <= 5 ? 1 : 2;
+  if (exact.length >= limit || !edits) return exact;
+  const seen = new Set(exact.map(x => x.id));
+  const near = (await q(`, fuzzy => ${edits}`)).filter(x => !seen.has(x.id)).map(x => ({...x, typo: true}));
+  return exact.concat(near).slice(0, limit);
+}
+
+// Completes `input` as it is typed; `pick(id)` takes the chosen id.
+function completer(input, pick) {
+  const box = document.createElement("div");
+  box.className = "sugg";
+  input.parentElement.style.position = "relative";
+  input.after(box);
+  let items = [], sel = -1, asked = 0, timer = 0;
+  const show = () => {
+    box.innerHTML = items.map((x, i) => `<div data-i="${i}" class="${i === sel ? "sel" : ""}"><span class="kind" style="color:${kc("entity")}">${x.id.startsWith("f:") ? "file" : "entity"}</span><span class="name mono">${esc(x.id.startsWith("f:") ? x.id.slice(2) : x.text)}</span>${x.typo ? `<span class="typo">typo</span>` : ""}<span class="n">${x.importance}</span></div>`).join("");
+    box.classList.toggle("on", items.length > 0);
+    $$("[data-i]", box).forEach(el => el.onmousedown = e => { e.preventDefault(); choose(+el.dataset.i); });
+  };
+  const choose = i => { const x = items[i]; if (!x) return; items = []; show(); pick(x.id); };
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const n = ++asked;
+      try {
+        const got = await complete(input.value);
+        if (n === asked) { items = got; sel = -1; show(); }
+      } catch (e) { if (n === asked) { items = []; show(); } }
+    }, 60);
+  });
+  input.addEventListener("keydown", e => {
+    if (!items.length) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      sel = e.key === "ArrowDown" ? (sel + 1) % items.length : sel <= 0 ? items.length - 1 : sel - 1;
+      show();
+    } else if (e.key === "Enter" && sel >= 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      choose(sel);
+    } else if (e.key === "Escape") { items = []; show(); }
+  }, true);  // before the input's own Enter handler
+  input.addEventListener("blur", () => setTimeout(() => { items = []; show(); }, 100));
+}
 
 // ------------------------------------------------------------------ graph
 const G = {nodes: [], edges: [], byId: new Map(), view: {x: 0, y: 0, k: 1}, sim: null};
@@ -1368,6 +1436,8 @@ $("#g-fit").onclick = fitGraph;
 wirePanZoom($("#graphsvg"), G, () => drawGraph());
 $("#g-reach").onclick = reach;
 $("#g-seed").onkeydown = e => { if (e.key === "Enter") reach(); };
+completer($("#g-seed"), id => { $("#g-seed").value = id; reach(); });
+completer($("#find"), id => { $("#find").value = ""; openRecord(id); });
 $("#v-load").onclick = loadVectors;
 $("#v-go").onclick = vecSearch;
 $("#v-q").onkeydown = e => { if (e.key === "Enter") vecSearch(); };
