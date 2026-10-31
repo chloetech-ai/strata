@@ -25,6 +25,7 @@ use crate::query::ir::Plan;
 use crate::query::model::Models;
 use crate::query::stats::TermStats;
 use crate::query::{bind_command, compound, ops, profile, sql as qsql, Assign, Command, Conflict, Params, Select, Write};
+use crate::rank_log::{self, Export, Log, Logged};
 use crate::schema::{Derive, Embed, FieldType, Schema};
 use crate::segment::{DocId, SegmentFile};
 use crate::storage::{Database, DbOptions, DocumentSource, DropOptions, Snapshot, TableTxn, SOURCES};
@@ -452,8 +453,14 @@ impl Db {
         if e.dim() != *dim {
             return Err(Error::Schema(format!("model {} makes {}-dimension vectors; field {field} holds {dim}", spec.model, e.dim())));
         }
-        if let Some(m) = schema.embeds_media(i).filter(|_| !e.modalities().contains(&Modality::Image)) {
-            return Err(Error::Schema(format!("model {} does not embed images, and field {field} is the embedding of the images of {}", spec.model, schema.fields[m].name)));
+        if let Some(m) = schema.embeds_media(i) {
+            let (wants, what) = match schema.fields[m].media {
+                Some(crate::media::MediaKind::Audio) => (Modality::Audio, "sound"),
+                _ => (Modality::Image, "images"),
+            };
+            if !e.modalities().contains(&wants) {
+                return Err(Error::Schema(format!("model {} does not embed {what}, and field {field} is the embedding of the {what} of {}", spec.model, schema.fields[m].name)));
+            }
         }
         let mut all = self.embedders.write().unwrap_or_else(|e| e.into_inner());
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
@@ -497,8 +504,20 @@ impl Db {
         let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
         let Some(spec) = &f.derive else { return Err(Error::Schema(format!("field {field} is not a derived TEXT field"))) };
         let kind = schema.field(&spec.from).and_then(|m| m.media).expect("checked by the schema");
-        if d.modality() == Modality::Image && kind != crate::media::MediaKind::Image {
-            return Err(Error::Schema(format!("model {} makes text of images, and {} is a MEDIA field of kind {}: declare kind = 'image'", spec.model, spec.from, kind.as_str())));
+        let wants = match d.modality() {
+            Modality::Image => crate::media::MediaKind::Image,
+            Modality::Audio => crate::media::MediaKind::Audio,
+            Modality::Text => return Err(Error::Schema(format!("model {} makes text of text, not of media", spec.model))),
+        };
+        if kind != wants {
+            return Err(Error::Schema(format!(
+                "model {} makes text of {}, and {} is a MEDIA field of kind {}: declare kind = '{}'",
+                spec.model,
+                if wants == crate::media::MediaKind::Image { "images" } else { "audio" },
+                spec.from,
+                kind.as_str(),
+                wants.as_str()
+            )));
         }
         let mut all = self.derivers.write().unwrap_or_else(|e| e.into_inner());
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
@@ -707,6 +726,43 @@ impl Db {
         let q = qsql::parse_query(sql)?;
         let plan = plan_of(snap, &q, params)?;
         self.run_on(snap, &plan, opts)
+    }
+
+    /// Runs a query ([`Db::query`]) and logs what it served to a log table
+    /// ([`crate::rank_log`]), made by the first query logged to it: one row
+    /// per row answered, or per candidate ([`Log::candidates`]), with the
+    /// values its ranking read. The answer has the columns the query asked
+    /// for. The query reads one snapshot and the log is written after it in
+    /// one transaction, as [`Db::sql`] writes.
+    pub fn query_logged(&self, sql: &str, params: &Params, log: &Log) -> Result<Logged> {
+        if self.storage.table(&log.table).is_none() {
+            self.sql(&rank_log::create_sql(&log.table)?, &Params::new())?;
+        }
+        let schema = self.table(&log.table)?;
+        rank_log::check(&schema)?;
+        let p = rank_log::prepare(sql, params, log)?;
+        let served = rank_log::serve(self.query(&p.sql, params)?, &p, log)?;
+        let now = crate::timestamp::now();
+        let mut t = self.storage.begin()?;
+        {
+            let mut tt = t.table(&schema.table)?;
+            for e in &served.entries {
+                tt.upsert(crate::ingest::document_at(&schema, &e.to_json(), now)?)?;
+            }
+        }
+        let seq_no = t.commit_seq()?;
+        Ok(Logged { rs: served.rs, request: served.request, seq_no })
+    }
+
+    /// Exports a log table ([`rank_log::export`]) from one snapshot: one
+    /// record per logged row, with its features as served and, from an
+    /// events table, its history and label as of its time. Returns the
+    /// records given to `out`.
+    pub fn export_rank_log(&self, x: &Export, mut out: impl FnMut(serde_json::Value) -> Result<()>) -> Result<u64> {
+        let snap = self.snapshot();
+        let tables: Vec<&Schema> = snap.schemas().collect();
+        let opts = ExecOptions { max_rows: None, ..self.exec.clone() };
+        rank_log::export(&mut |sql, params| self.query_at(&snap, sql, params, &opts), &tables, x, &mut out)
     }
 
     /// Runs a read plan on `snap`'s version: a leaf on the executor, any
@@ -1308,10 +1364,13 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
 }
 
 /// The vectors of field `f` of `schema` for `sources` (as
-/// [`Schema::embed_text`] gives them): of the texts, or of the images
-/// that the MEDIA values name, decoded a batch at a time.
+/// [`Schema::embed_text`] gives them): of the texts, or of the images or
+/// sounds that the MEDIA values name, decoded a batch at a time.
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
     let Some(m) = schema.embeds_media(f) else { return Ok(embed_all(e, sources)) };
+    if schema.fields[m].media == Some(crate::media::MediaKind::Audio) {
+        return in_sound_batches(&schema.fields[m].name, sources, files, |inputs| e.embed_inputs(inputs));
+    }
     let mut out = Vec::with_capacity(sources.len());
     for batch in sources.chunks(16) {
         let images = images_of(&schema.fields[m].name, batch, files)?;
@@ -1386,15 +1445,50 @@ fn derived_of(derivers: &[Option<Arc<dyn Deriver>>], schema: &Schema, docs: &[Do
 }
 
 /// The text `d` makes of the files that `values` of MEDIA field `m` name,
-/// decoded a batch at a time.
+/// decoded a batch at a time: 16 images, or up to 4 sounds of 2 minutes
+/// together (a sound can be an hour long).
 fn derive_sources(d: &dyn Deriver, schema: &Schema, m: usize, values: &[String], files: &Files) -> Result<Vec<String>> {
+    let field = &schema.fields[m].name;
+    if d.modality() == Modality::Audio {
+        return in_sound_batches(field, values, files, |inputs| d.derive(inputs));
+    }
     let mut out = Vec::with_capacity(values.len());
     for batch in values.chunks(16) {
-        let images = images_of(&schema.fields[m].name, batch, files)?;
+        let images = images_of(field, batch, files)?;
         let inputs: Vec<Input> = images.iter().map(Input::Image).collect();
         out.extend(d.derive(&inputs)?);
     }
     Ok(out)
+}
+
+/// What `f` makes of the sounds that MEDIA values of field `field` name,
+/// decoded and given to it up to 4 at a time, or 2 minutes of sound
+/// together (a sound can be an hour long).
+fn in_sound_batches<T>(field: &str, values: &[String], files: &Files, mut f: impl FnMut(&[Input<'_>]) -> Result<Vec<T>>) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(values.len());
+    let mut batch: Vec<crate::embed::Audio> = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        batch.extend(sounds_of(field, std::slice::from_ref(v), files)?);
+        let seconds: f64 = batch.iter().map(|a| a.samples.len() as f64 / a.rate.max(1) as f64).sum();
+        if batch.len() == 4 || seconds >= 120.0 || i + 1 == values.len() {
+            out.extend(f(&batch.iter().map(Input::Audio).collect::<Vec<_>>())?);
+            batch.clear();
+        }
+    }
+    Ok(out)
+}
+
+/// The sounds MEDIA values of field `field` name, decoded.
+fn sounds_of(field: &str, values: &[String], files: &Files) -> Result<Vec<crate::embed::Audio>> {
+    values
+        .iter()
+        .map(|t| {
+            let m = Media::parse(t).map_err(Error::Schema)?;
+            let data = files.bytes(&m)?;
+            crate::media::decode_audio(&data).map_err(|e| Error::Schema(format!("{}: {e}", m.uri)))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map_err(|e| media_error(field, e))
 }
 
 /// What setting fields of live rows writes ([`plan_sets`]).
@@ -1612,8 +1706,9 @@ impl DocumentSource for StoredSource {
                 None => vec![Value::Null; schema.fields.len()],
             };
             for (i, v) in &vectors {
-                if v.has_vector(d) {
-                    doc[*i] = Value::Vector(v.vector(d).into());
+                match v.row_value(d) {
+                    Value::Null => {}
+                    x => doc[*i] = x,
                 }
             }
             for (i, c) in &numeric {

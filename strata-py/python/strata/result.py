@@ -15,19 +15,21 @@ class Result:
     row i as a dict, and `len(result)` the number of rows.
     """
 
-    __slots__ = ("columns", "rows", "keys", "scores", "took_ms", "_stats")
+    __slots__ = ("columns", "rows", "keys", "scores", "took_ms", "request", "_stats")
 
-    def __init__(self, columns: list[str], rows: list[list[Any]], keys: list[Any] | None = None, scores: list[float] | None = None, stats: Any = None, took_ms: float | None = None):
+    def __init__(self, columns: list[str], rows: list[list[Any]], keys: list[Any] | None = None, scores: list[float] | None = None, stats: Any = None, took_ms: float | None = None, request: str | None = None):
         self.columns = columns
         self.rows = rows
         self.keys = keys or []
         self.scores = scores or []
         self.took_ms = took_ms
+        # The request's id in the rank log (`query_logged`); else None.
+        self.request = request
         self._stats = stats
 
     @classmethod
     def _of(cls, d: dict) -> "Result":
-        return cls(d["columns"], d["rows"], d.get("keys"), d.get("scores"), d.get("stats"), d.get("took_ms"))
+        return cls(d["columns"], d["rows"], d.get("keys"), d.get("scores"), d.get("stats"), d.get("took_ms"), d.get("request"))
 
     @property
     def stats(self) -> dict:

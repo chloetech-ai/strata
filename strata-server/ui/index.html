@@ -347,6 +347,27 @@ progress { width: 100%; accent-color: var(--accent); }
         <div id="dOut" style="margin-top:10px"></div>
       </div>
       <div class="card">
+        <h2 style="margin:0">SQLite</h2>
+        <p class="small muted" style="margin:6px 0 10px">Import a SQLite database: each of its tables goes into the table of its name here, which is created from SQLite's declarations and values when this database lacks it (types, the key, references, NOT NULL and DEFAULT), and its rows replace the rows with their keys. <b>Preview</b> shows each table's schema and what does not carry over, and writes nothing. Up to 256 MB a file; for more, use <code>strata-server import</code> while the server is stopped.</p>
+        <div class="row">
+          <div class="grow"><label class="lbl" for="qFile">SQLite file</label><input id="qFile" type="file" accept=".sqlite,.sqlite3,.db,.db3,.s3db,.sl3"></div>
+          <div style="width:200px"><label class="lbl" for="qTables">tables <span class="muted">(empty: all)</span></label><input id="qTables" type="text" spellcheck="false" placeholder="orders, customers"></div>
+          <div><label class="lbl">&nbsp;</label><span class="row" style="gap:6px"><button class="btn" id="qPlan" disabled>Preview</button><button class="btn primary" id="qImport" disabled>Import</button></span></div>
+        </div>
+        <div class="row"><label class="small" title="SQLite BLOB columns are left out otherwise: Strata keeps no bytes"><input type="checkbox" id="qBlobs"> keep BLOB columns, as base64 text</label></div>
+        <div id="qOut" style="margin-top:10px"></div>
+        <p class="small muted" style="margin:16px 0 10px">Export writes this database to a SQLite file that any SQLite program reads: the rows, keys, references, an index on each filterable field, an FTS5 index over each table's text, and the Strata schemas, which an import here restores. Vector indexes, analyzers and Strata's ranking have no SQLite form and stay behind; the vectors go as <code>F32_BLOB</code> columns.</p>
+        <div class="row">
+          <div style="width:200px"><label class="lbl" for="xTables">tables <span class="muted">(empty: all)</span></label><input id="xTables" type="text" spellcheck="false"></div>
+          <div><label class="lbl">&nbsp;</label><span class="row" style="gap:12px">
+            <label class="small"><input type="checkbox" id="xFts" checked> FTS5 index</label>
+            <label class="small"><input type="checkbox" id="xIndexes" checked> indexes</label>
+            <label class="small"><input type="checkbox" id="xSchemas" checked> Strata schemas</label></span></div>
+          <div><label class="lbl">&nbsp;</label><button class="btn" id="xExport">Download as SQLite</button></div>
+        </div>
+        <div id="xOut" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
         <div class="row" style="justify-content:space-between;margin-bottom:6px"><h2 style="margin:0">This table's schema</h2><button class="btn small" id="dCopySchema">Copy</button></div>
         <p class="small muted" style="margin:0 0 8px">In the short form that <code>--schema</code> takes. A database's schema is set when it is created. To change it, design a new one below and copy this database's rows into it with <code>--copy-from</code>, which also embeds again the vectors whose model or source fields changed.</p>
         <pre class="sql" id="dSchema"></pre>
@@ -1520,6 +1541,91 @@ $("dPasteImport").onclick = () => {
   const t = $("dPaste").value.trim(); if (!t) return;
   const format = t.startsWith("[") ? "json" : t.startsWith("{") ? "jsonl" : t.split("\n")[0].includes("\t") ? "tsv" : "csv";
   importRows(t, format, "The pasted rows");
+};
+
+// ---- SQLite in and out -------------------------------------------------------
+const tablesParam = (id) => $(id).value.split(",").map((t) => t.trim()).filter(Boolean).join(",");
+// What a plan says of a field: its type, and the options that matter here.
+function planField(f, key) {
+  const what = [f.type + (f.multi ? " list" : "") + (f.dim ? ` ${f.dim}` : "")];
+  if (f.name === key) what.push("key");
+  if (f.references) what.push("→ " + f.references);
+  if (f.not_null) what.push("not null");
+  if (f.default !== undefined) what.push("default " + JSON.stringify(f.default));
+  if (f.analyzer) what.push(f.analyzer);
+  return el("tr", {}, el("td", { class: "key", style: "width:35%", text: f.name }), el("td", { text: what.join(", ") }));
+}
+function renderPlan(j) {
+  const kids = [];
+  for (const t of j.tables) {
+    const head = el("div", { class: "row", style: "gap:6px;margin:10px 0 4px" }, el("b", { text: t.table }), t.source !== t.table ? el("span", { class: "small muted", text: "from " + t.source }) : null,
+      el("span", { class: "badge" + (t.exists ? "" : " pk"), text: t.exists ? "exists: its schema is kept" : "new" }));
+    const fields = t.exists ? Object.entries(t.columns).map(([c, f]) => el("tr", {}, el("td", { class: "key", style: "width:35%", text: c }), el("td", { text: "→ " + f })))
+      : t.fields.map((f) => planField(f, t.key));
+    kids.push(head, el("div", { class: "table-wrap", style: "max-height:240px" }, el("table", {}, el("tbody", {}, ...fields))));
+    if (t.notes && t.notes.length) kids.push(el("div", { class: "note", style: "margin-top:6px" }, ...t.notes.map((n) => el("div", { text: n }))));
+  }
+  const skipped = Object.entries(j.skipped || {});
+  if (skipped.length) kids.push(el("div", { class: "small muted", style: "margin-top:8px" }, "Left out: ", ...skipped.map(([n, why], i) => el("span", {}, i ? "; " : "", el("code", { text: n }), ", " + why))));
+  return kids;
+}
+// Sends the SQLite file to /v1/import, for its plan or to import it.
+function sendSqlite(plan) {
+  const f = $("qFile").files[0]; if (!f) return;
+  const out = $("qOut"), bar = el("progress", { max: 1, value: 0 }), what = el("div", { class: "small muted", text: `Sending ${f.name}…` });
+  out.replaceChildren(what, bar);
+  $("qPlan").disabled = $("qImport").disabled = true;
+  const finish = (kids) => { out.replaceChildren(...kids); $("qPlan").disabled = $("qImport").disabled = !$("qFile").files.length; };
+  const q = new URLSearchParams({ format: "sqlite" });
+  if (plan) q.set("plan", "true");
+  if (tablesParam("qTables")) q.set("tables", tablesParam("qTables"));
+  if ($("qBlobs").checked) q.set("blobs_base64", "true");
+  const x = new XMLHttpRequest();
+  x.open("POST", "/v1/import?" + q);
+  x.setRequestHeader("content-type", "application/vnd.sqlite3");
+  if (token) x.setRequestHeader("authorization", "Bearer " + token);
+  x.upload.onprogress = (e) => { if (e.lengthComputable) { bar.max = e.total; bar.value = e.loaded; } };
+  x.upload.onload = () => { what.textContent = plan ? `Reading ${f.name}…` : `Writing ${f.name}…`; bar.removeAttribute("value"); };
+  x.onload = () => {
+    let j = {}; try { j = JSON.parse(x.responseText); } catch {}
+    if (x.status === 401) $("tokenBox").classList.remove("hidden");
+    if (x.status < 200 || x.status >= 300) {
+      const why = j.error || (x.status === 413 ? "The file is over the server's 256 MB limit: load it with strata-server import." : `HTTP ${x.status}`);
+      return finish([el("div", { class: "error", text: why })]);
+    }
+    if (plan) return finish([el("div", { class: "small muted", text: `What importing ${f.name} would do (nothing is written yet):` }), ...renderPlan(j)]);
+    const kids = [el("div", { class: "ok-msg", text: `${f.name}: ${plural(j.written, "row")} written in ${(j.took_ms / 1000).toFixed(1)} s.` })];
+    for (const t of j.tables) {
+      kids.push(el("div", { class: "small", style: "margin-top:6px" }, el("b", { text: t.table }), `: ${plural(t.rows, "row")}${t.created ? ", a new table" : ""}`));
+      if (t.notes.length) kids.push(el("div", { class: "note", style: "margin-top:4px" }, ...t.notes.map((n) => el("div", { text: n }))));
+    }
+    finish(kids);
+    refreshHealth();
+  };
+  x.onerror = () => finish([el("div", { class: "error", text: "The upload failed: the connection closed." })]);
+  x.send(f);
+}
+$("qFile").onchange = () => { $("qPlan").disabled = $("qImport").disabled = !$("qFile").files.length; $("qOut").replaceChildren(); };
+$("qPlan").onclick = () => sendSqlite(true);
+$("qImport").onclick = () => sendSqlite(false);
+$("xExport").onclick = async () => {
+  const out = $("xOut"), btn = $("xExport");
+  const q = new URLSearchParams();
+  if (tablesParam("xTables")) q.set("tables", tablesParam("xTables"));
+  for (const [id, k] of [["xFts", "fts"], ["xIndexes", "indexes"], ["xSchemas", "schemas"]]) if (!$(id).checked) q.set(k, "false");
+  btn.disabled = true; out.replaceChildren(el("div", { class: "small muted", text: "Writing the SQLite file…" }));
+  try {
+    const r = await fetch("/v1/export?" + q, { headers: token ? { authorization: "Bearer " + token } : {} });
+    if (r.status === 401) $("tokenBox").classList.remove("hidden");
+    if (!r.ok) { let j = {}; try { j = await r.json(); } catch {} throw new Error(j.error || "HTTP " + r.status); }
+    const blob = await r.blob();
+    const name = (/filename="([^"]+)"/.exec(r.headers.get("content-disposition") || "") || [])[1] || "strata.sqlite";
+    const a = el("a", { href: URL.createObjectURL(blob), download: name });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    out.replaceChildren(el("div", { class: "ok-msg", text: `${name}, ${(blob.size / 1048576).toFixed(1)} MB: ${(r.headers.get("x-strata-tables") || "").split(",").join(", ")}.` }));
+  } catch (e) { out.replaceChildren(el("div", { class: "error", text: e.message })); }
+  finally { btn.disabled = false; }
 };
 
 // The schema being designed, in the short form: {table, key, fields: [{name, type, ...options}]}.

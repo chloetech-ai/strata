@@ -1,9 +1,10 @@
 import json
+import sqlite3
 
 import pytest
 
 import strata
-from conftest import BOOKS, book
+from conftest import BOOKS, book, tone_wav
 
 
 @pytest.fixture
@@ -102,6 +103,9 @@ def test_client_builder_and_embed(client, tmp_path):
     assert near.rows == client.query("SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 3", v={"embed": "dragon ship"}).rows
     with pytest.raises(strata.StrataError, match="HTTP 400"):
         client.embed("x", "title")
+    # A sound file's vector is a model of sound's: the books' reads text.
+    with pytest.raises(strata.StrataError, match="does not embed sound"):
+        client.embed(audio=tone_wav())
     a = client.search("dragon", limit=5, where=col("year") >= 1950)
     b = client.search("dragon", limit=5, where="year >= 1950")
     assert a.keys == b.keys and len(a) == 5
@@ -191,3 +195,49 @@ def test_client_streams_events_once(client):
         client.stream(twice)
     assert e.value.answer["lines"] == 1
     assert client.source("views/0") == 4000
+
+
+def test_client_sqlite_in_and_out(client, tmp_path):
+    src = tmp_path / "shop.sqlite"
+    c = sqlite3.connect(src)
+    c.executescript(
+        """
+        CREATE TABLE reviews (id INTEGER PRIMARY KEY, book TEXT NOT NULL REFERENCES books (id), stars INTEGER, said TEXT, at DATETIME);
+        INSERT INTO reviews VALUES (1, 'b0001', 5, 'a river runs through every page of it', '2026-10-01 12:00:00'),
+                                   (2, 'b0002', 3, 'slow in the middle but the ending is worth the wait', '2026-10-02 08:30:00');
+        CREATE TABLE books (id TEXT PRIMARY KEY, title TEXT, year INTEGER);
+        INSERT INTO books VALUES ('b0001', 'River of stars', 1999);
+        """
+    )
+    c.commit()
+    c.close()
+    plan = client.plan_sqlite(src)
+    assert [(t["table"], t["exists"]) for t in plan["tables"]] == [("books", True), ("reviews", False)]
+    assert [t["table"] for t in client.tables()] == ["books"]
+    r = client.import_sqlite(src)
+    assert r["written"] == 3
+    assert [(t["table"], t["rows"], t["created"]) for t in r["tables"]] == [("books", 1, False), ("reviews", 2, True)]
+    assert client.query("SELECT title FROM books WHERE id = 'b0001'").scalar() == "River of stars"
+    assert client.query("SELECT r.stars FROM reviews r JOIN books b ON r.book = b.id WHERE MATCH(r.said, 'ending')").scalar() == 3
+    with pytest.raises(strata.StrataError, match="no table nope"):
+        client.import_sqlite(src, tables="nope")
+
+    out = tmp_path / "out.sqlite"
+    assert client.export_sqlite(out, tables=["reviews"], fts=False) == ["reviews"]
+    with pytest.raises(FileExistsError):
+        client.export_sqlite(out)
+    c = sqlite3.connect(out)
+    assert c.execute("SELECT id, book, stars, at FROM reviews ORDER BY id").fetchall() == [(1, "b0001", 5, "2026-10-01 12:00:00"), (2, "b0002", 3, "2026-10-02 08:30:00")]
+    c.close()
+
+
+def test_client_rank_log(client):
+    sql = "SELECT id FROM books ORDER BY bm25(title, :q) + 0.1 * rating DESC LIMIT 4"
+    served = client.query("SELECT id, score(), features() FROM books ORDER BY bm25(title, :q) + 0.1 * rating DESC LIMIT 4", q="river")
+    r = client.query_logged(sql, {"q": "river"}, context="u7", request="req-1")
+    assert r.request == "req-1" and r.keys == served.keys and r.columns == ["id"]
+    records = client.export_rank_log()
+    assert [x["row_key"] for x in records] == served.keys and [x["id"] for x in records] == [f"req-1#{i}" for i in range(4)]
+    assert [x["features"] for x in records] == [dict(zip(served.columns[2:], row[2:])) for row in served.rows]
+    with pytest.raises(strata.StrataError, match="not a log table"):
+        client.export_rank_log(table="books")

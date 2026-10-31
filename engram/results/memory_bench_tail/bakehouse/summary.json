@@ -1,0 +1,332 @@
+{
+ "scenario": "bakehouse",
+ "lanes": {
+  "engram": {
+   "runs": 72,
+   "solved": 68,
+   "solved_rate": 0.9444444444444444,
+   "score": 0.980324074074074,
+   "cost_usd": 0.010313197083333333,
+   "memory_cost_usd": 0.003899690277777778,
+   "steps": 6.930555555555555,
+   "wall_s": 24.019444444444446,
+   "memory_tool_calls": 0.05555555555555555,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.20344244,
+    "memory_cost_usd": 0.1148469,
+    "wall_s": 872.7,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 12,
+     "score": 0.9114583333333334
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 16,
+     "score": 1.0
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {}
+  },
+  "engram+tail": {
+   "runs": 72,
+   "solved": 69,
+   "solved_rate": 0.9583333333333334,
+   "score": 0.9895833333333334,
+   "cost_usd": 0.010251856805555556,
+   "memory_cost_usd": 0.003912826388888889,
+   "steps": 6.847222222222222,
+   "wall_s": 24.179166666666667,
+   "memory_tool_calls": 0.09722222222222222,
+   "errors": 0,
+   "history": {
+    "cost_usd": 0.20344244,
+    "memory_cost_usd": 0.1148469,
+    "wall_s": 872.7,
+    "errors": 0
+   },
+   "by_kind": {
+    "control": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    },
+    "inference": {
+     "runs": 16,
+     "solved": 13,
+     "score": 0.953125
+    },
+    "recall": {
+     "runs": 4,
+     "solved": 4,
+     "score": 1.0
+    },
+    "revised": {
+     "runs": 16,
+     "solved": 16,
+     "score": 1.0
+    },
+    "stale": {
+     "runs": 20,
+     "solved": 20,
+     "score": 1.0
+    },
+    "where_why": {
+     "runs": 8,
+     "solved": 8,
+     "score": 1.0
+    }
+   },
+   "vs": {
+    "engram": {
+     "all": {
+      "tasks": 18,
+      "runs": [
+       72,
+       72
+      ],
+      "solved": [
+       69,
+       68
+      ],
+      "fisher_solved_p": 0.9999999999999607,
+      "score_diff": 0.009259259259259411,
+      "perm_score_p": 0.7852214778522147,
+      "solved_diff": 0.01388888888888895,
+      "perm_solved_p": 1.0
+     },
+     "control": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "inference": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       13,
+       12
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.04166666666666663,
+      "perm_score_p": 0.7877212278772123,
+      "solved_diff": 0.0625,
+      "perm_solved_p": 1.0
+     },
+     "recall": {
+      "tasks": 1,
+      "runs": [
+       4,
+       4
+      ],
+      "solved": [
+       4,
+       4
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "revised": {
+      "tasks": 4,
+      "runs": [
+       16,
+       16
+      ],
+      "solved": [
+       16,
+       16
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "stale": {
+      "tasks": 5,
+      "runs": [
+       20,
+       20
+      ],
+      "solved": [
+       20,
+       20
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     },
+     "where_why": {
+      "tasks": 2,
+      "runs": [
+       8,
+       8
+      ],
+      "solved": [
+       8,
+       8
+      ],
+      "fisher_solved_p": 1.0,
+      "score_diff": 0.0,
+      "perm_score_p": 1.0,
+      "solved_diff": 0.0,
+      "perm_solved_p": 1.0
+     }
+    }
+   }
+  }
+ },
+ "tasks": {
+  "delivery_charge": {
+   "kind": "revised",
+   "needs": "the delivery charge as revised in block 6 (4.50 under 40.00, St Aidan's exempt), not block 2's 3.00 under 25.00",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "price_rise": {
+   "kind": "revised",
+   "needs": "the January price rise as revised in block 7 (5%, rounded up to the next 5p), not block 4's 4% to the nearest penny",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "bake_sheet": {
+   "kind": "revised",
+   "needs": "bake sheet order (hottest oven first, block 1) and dough weights in whole grams (block 5, revising block 4's kilos with one decimal)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "crate_labels": {
+   "kind": "revised",
+   "needs": "label printer facts: 48 characters per line (block 6, revising block 2's 32), still ASCII only, layout and allergens in capitals (block 2)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "extend_cutoff": {
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "next_delivery_day": {
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "relief_baker_note": {
+   "kind": "stale",
+   "needs": "the current plan command (python -m bakehouse plan --day, Sam's commit after block 6), not block 3's scripts/print_plan.py",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "cutoff_quick": {
+   "kind": "stale",
+   "needs": "the current cutoff (13:00 in config.py since Sam's commit after block 4), not the 14:00 said in block 2; a quick question that does not ask to look at the code",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "closed_day_quick": {
+   "kind": "stale",
+   "needs": "the current closed day (Monday since Sam's commit after block 7), not the Sunday said in block 2; a quick question that does not ask to look at the code",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "owner_weekly_file": {
+   "kind": "inference",
+   "needs": "owner = Greta (block 1); Greta's Excel is German, so semicolons and decimal commas (block 3)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "vat_export": {
+   "kind": "inference",
+   "needs": "the VAT return is Priya's (block 1); her Ledgerly import format: commas, header, DD/MM/YYYY, pounds with two decimals (block 3)",
+   "engram": 0.8333333333333334,
+   "engram+tail": 1.0
+  },
+  "van_list": {
+   "kind": "inference",
+   "needs": "the van is Dev's (block 1); his Stopwise app needs header Name,Address,Postcode,Notes in driving order (block 3); Greenway is always the first drop (block 1)",
+   "engram": 0.8125,
+   "engram+tail": 0.8125
+  },
+  "school_order": {
+   "kind": "inference",
+   "needs": "St Aidan's is nut-free (block 1) and the Bakewell slice contains nuts (catalog), so that line must not be entered",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "returns_credit": {
+   "kind": "recall",
+   "needs": "Greenway's sale-or-return terms (block 2, confirmed unchanged in block 6): half price, at most 10% of the delivery, sandwich loaves and Greenway only",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "pence_why": {
+   "kind": "where_why",
+   "needs": "location: Invoice.total in invoice.py; reason (block 5): the old spreadsheet's floats put the VAT return 1.37 off and Priya had to file a correction with HMRC",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "unknown_code_why": {
+   "kind": "where_why",
+   "needs": "location: OrderBook.add in orders.py; reason (block 6): a mistyped code silently dropped Greenway's sandwich-loaf order and Greta had to buy loaves at the cash-and-carry",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "easter_sunday": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  },
+  "baker_percentages": {
+   "kind": "control",
+   "needs": "nothing (control)",
+   "engram": 1.0,
+   "engram+tail": 1.0
+  }
+ }
+}

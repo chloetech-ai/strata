@@ -8,11 +8,14 @@
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
 //! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
 //! | `GET /metrics` | | Prometheus text |
-//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?}` | rows |
-//! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | rows, or `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?}` | rows; with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?}`) also `request` and `logged` ([`strata::rank_log`]) |
+//! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/rank_log/export` | `{table?, since?, until?, events?, history?, window?, grades?}` | NDJSON: one record per logged row ([`strata::rank_log::export`]) |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/import?format=jsonl&table=name` | rows as JSON Lines, JSON, CSV or TSV (of the first table without `table`) | `{written, skipped_fields}` |
+//! | `POST /v1/import?format=sqlite&tables=a,b&plan=true` | a SQLite file (`application/vnd.sqlite3`; recognised by its first bytes too) | `{tables, skipped, written}`, or with `plan` the plan ([`strata::sqlite`]) |
+//! | `GET /v1/export?tables=a,b&fts=false&indexes=false&schemas=false` | | the database as a SQLite file |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
 //! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
@@ -20,6 +23,15 @@
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
+//! | `GET /v1/queries` | | `{queries, running}`: the queries running now, the longest first, each with its trace so far |
+//! | `DELETE /v1/queries/:id` | | `{cancelled}`: the query stops at its next check and answers 499 |
+//! | `GET /v1/queries/recent?since=ms&limit=n`, `/v1/queries/slow?limit=n` | | `{queries}`: the latest that ended (or the slow ones), the newest first, each with its trace |
+//! | `GET /v1/queries/request/:id` | | `{queries}`: those a request (its `x-request-id`) ran |
+//! | `GET /v1/queries/stats?limit=n`, `POST /v1/queries/stats/reset` | | statistics per statement shape, by time spent ([`crate::telemetry::Statements`]) |
+//! | `GET /v1/timeseries?since=ms` | | `{interval_ms, points}`: rates and gauges every few seconds, the last hour ([`crate::telemetry::Series`]) |
+//! | `GET /v1/logs?after=seq&level=warn&request=id&q=text&limit=n` | | `{lines, last, filter}`: the latest log lines ([`crate::obs::ring`]) |
+//! | `PUT /v1/logs/filter` | `{filter}` (as `--log`) | `{filter}`: what is logged from now on |
+//! | `GET /v1/system`, `/v1/cluster`, `/v1/routes` | | the process and its limits; the cluster's copies; requests by route and queries by kind |
 //!
 //! Every answer carries the request's id in `x-request-id`: the one the
 //! client sent, if it is 1 to 64 letters, digits, '-', '_', '.' or ':', or
@@ -51,7 +63,7 @@ use strata::storage::Layout;
 use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
-use crate::{agent, json as js, obs, ApiError};
+use crate::{agent, json as js, obs, telemetry, ApiError};
 
 const UI: &str = include_str!("../ui/index.html");
 
@@ -99,6 +111,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/write", post(write).layer(rows.clone()))
         .route("/v1/plan", post(run_plan).layer(rows.clone()))
         .route("/v1/import", post(import).layer(rows))
+        .route("/v1/export", get(export))
         // A stream's body has no end set.
         .route("/v1/stream", post(stream).layer(DefaultBodyLimit::disable()))
         .route("/v1/sources", get(sources))
@@ -109,6 +122,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/sid/next", post(sid_next))
+        .route("/v1/rank_log/export", post(export_rank_log))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/admin/checkpoint", post(admin_checkpoint))
         .route("/v1/admin/check", post(admin_check))
@@ -116,6 +130,19 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/verify", post(admin_verify))
         .route("/v1/admin/promote", post(admin_promote))
         .route("/v1/agent", post(agent_run))
+        .route("/v1/queries", get(live_queries))
+        .route("/v1/queries/:id", axum::routing::delete(cancel_query))
+        .route("/v1/queries/recent", get(recent_queries))
+        .route("/v1/queries/slow", get(slow_queries))
+        .route("/v1/queries/request/:id", get(request_queries))
+        .route("/v1/queries/stats", get(query_stats))
+        .route("/v1/queries/stats/reset", post(reset_query_stats))
+        .route("/v1/timeseries", get(timeseries))
+        .route("/v1/logs", get(logs))
+        .route("/v1/logs/filter", put(log_filter))
+        .route("/v1/system", get(system))
+        .route("/v1/cluster", get(cluster))
+        .route("/v1/routes", get(routes))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .route("/", get(|| async { Html(UI) }))
@@ -137,7 +164,7 @@ async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
     let route = req.extensions().get::<MatchedPath>().map_or("other", |p| p.as_str()).to_string();
     let span = tracing::info_span!("request", id = %id, method = %req.method(), route = %route);
     let t0 = Instant::now();
-    let mut res = obs::scope(Some(id.clone()), next.run(req)).instrument(span.clone()).await;
+    let mut res = telemetry::traced(telemetry::Trace::new(), obs::scope(Some(id.clone()), next.run(req))).instrument(span.clone()).await;
     let secs = t0.elapsed().as_secs_f64();
     let status = res.status().as_u16();
     app.svc.metrics.http(&route, status, secs);
@@ -289,8 +316,61 @@ async fn query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
         after: after(&b)?,
         ..Default::default()
     };
+    if let Some(log) = b.get("log") {
+        if req.shard {
+            return Err(ApiError::bad("a shard's query is not logged: log through the coordinator"));
+        }
+        return logged(&app, req, log).await;
+    }
     let a = app.svc.query(req).await?;
-    Ok(AxJson(answer(&a)))
+    let mut j = answer(&a);
+    // `"trace": true`: the timed steps the query took.
+    if b.get("trace").and_then(|v| v.as_bool()) == Some(true) {
+        j["trace"] = json!(telemetry::trace().map(|t| t.spans()).unwrap_or_default());
+    }
+    Ok(AxJson(j))
+}
+
+/// A query run and logged ([`Service::query_logged`]): its answer, with
+/// the request's id (`"request"`) and the log's write (`"logged"`: the
+/// rows, and the write's sequence numbers as a write's answer gives them).
+async fn logged(app: &App, req: QueryReq, log: &Json) -> Res {
+    let log = strata::rank_log::Log::from_json(log)?;
+    let (a, request, w) = app.svc.query_logged(req, log).await?;
+    let mut j = answer(&a);
+    j["request"] = json!(request);
+    let mut l = json!({"rows": w.rows});
+    if let Some(s) = w.seq_no {
+        l["seq_no"] = json!(s);
+    }
+    if !w.seq_nos.is_empty() {
+        l["seq_nos"] = json!(w.seq_nos);
+    }
+    j["logged"] = l;
+    Ok(AxJson(j))
+}
+
+/// The records of a log table ([`strata::rank_log::export`]) as NDJSON,
+/// read from one snapshot of a local database as they are sent. A failure
+/// after the first record ends the answer with `{"error": ..., "status":
+/// ..}`. A coordinator refuses it: each shard's server exports its own
+/// rows, which hold every row of a context when the log and the events
+/// are placed by it (`shard_by`).
+async fn export_rank_log(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let x = strata::rank_log::Export::from_json(&b)?;
+    let db = app.svc.local_db().cloned().ok_or_else(|| ApiError::bad("a coordinator does not export a rank log: export from each shard's server"))?;
+    // Refused before the answer starts.
+    strata::rank_log::check(&*app.svc.table(&x.table).await?)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Json>(1024);
+    tokio::task::spawn_blocking(move || {
+        let r = db.export_rank_log(&x, |r| tx.blocking_send(r).map_err(|_| strata::Error::Query("the export's client left".into())));
+        if let Err(e) = r {
+            let e = ApiError::from(e);
+            let _ = tx.blocking_send(json!({"error": e.message, "status": e.status}));
+        }
+    });
+    let lines = tokio_stream::wrappers::ReceiverStream::new(rx).map(|j| Ok::<_, std::convert::Infallible>(Bytes::from(format!("{j}\n"))));
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], axum::body::Body::from_stream(lines)).into_response())
 }
 
 /// A query's answer; one a coordinator gave without some shards says
@@ -305,6 +385,10 @@ fn answer(a: &crate::service::Answer) -> Json {
 
 async fn sql(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(b.get("params")).await?;
+    if let Some(log) = b.get("log") {
+        let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params, timeout_ms: body_u64(&b, "timeout_ms"), after: after(&b)?, ..Default::default() };
+        return logged(&app, req, log).await;
+    }
     match app.svc.sql(body_str(&b, "sql")?, &params, after(&b)?, body_u64(&b, "timeout_ms")).await? {
         SqlAnswer::Rows(a) => Ok(AxJson(answer(&a))),
         SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
@@ -365,11 +449,19 @@ async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMa
     if auth::simple_content_type(header_str(&headers, header::CONTENT_TYPE)) {
         return Err(ApiError {
             status: 415,
-            message: "send the rows with their content type (text/csv, text/tab-separated-values, application/x-ndjson, application/json or application/octet-stream), not text/plain or a form".into(),
+            message: "send the rows with their content type (text/csv, text/tab-separated-values, application/x-ndjson, application/json, application/vnd.sqlite3 or application/octet-stream), not text/plain or a form".into(),
         });
     }
+    let ct = header_str(&headers, header::CONTENT_TYPE).unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let sqlite = match q.get("format") {
+        Some(f) => f.eq_ignore_ascii_case("sqlite"),
+        None => matches!(ct.as_str(), "application/vnd.sqlite3" | "application/x-sqlite3") || body.starts_with(strata::sqlite::MAGIC),
+    };
+    if sqlite {
+        return import_sqlite(&app, &q, body).await;
+    }
     let format = match q.get("format") {
-        Some(f) => Some(Format::parse(f).ok_or_else(|| ApiError::bad(format!("unknown format {f:?}: jsonl, json, csv or tsv")))?),
+        Some(f) => Some(Format::parse(f).ok_or_else(|| ApiError::bad(format!("unknown format {f:?}: jsonl, json, csv, tsv or sqlite")))?),
         None => {
             let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
             let ct = ct.split(';').next().unwrap_or("").trim();
@@ -382,10 +474,88 @@ async fn import(State(app): State<App>, Query(q): Query<std::collections::HashMa
             }
         }
     };
-    let format = format.ok_or_else(|| ApiError::bad("name the rows' format: ?format=jsonl, json, csv or tsv"))?;
+    let format = format.ok_or_else(|| ApiError::bad("name the rows' format: ?format=jsonl, json, csv, tsv or sqlite"))?;
     let t0 = std::time::Instant::now();
     let (n, skipped) = app.svc.import(q.get("table").map(String::as_str), body, format).await?;
     Ok(AxJson(json!({"written": n, "skipped_fields": skipped, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
+}
+
+/// A query parameter that is true or false (`1`, `0`, `yes`, `no`), or
+/// `default` when it is missing.
+fn flag(q: &std::collections::HashMap<String, String>, k: &str, default: bool) -> Result<bool, ApiError> {
+    match q.get(k).map(|v| v.to_ascii_lowercase()) {
+        None => Ok(default),
+        Some(v) => match v.as_str() {
+            "" | "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(ApiError::bad(format!("{k} is true or false, not {v:?}"))),
+        },
+    }
+}
+
+/// `?tables=a,b`: the tables named, or none for every table.
+fn tables_param(q: &std::collections::HashMap<String, String>) -> Vec<String> {
+    q.get("tables").map(|t| t.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()).unwrap_or_default()
+}
+
+/// A SQLite file's tables ([`Service::import_sqlite`]): `?tables=a,b`
+/// imports only those, `?blobs_base64=true` keeps BLOB columns as base64
+/// text, and `?plan=true` answers what the import would do and writes
+/// nothing.
+async fn import_sqlite(app: &App, q: &std::collections::HashMap<String, String>, body: Bytes) -> Res {
+    if q.contains_key("table") {
+        return Err(ApiError::bad("table is for rows: a SQLite file's tables go to the tables of their names (?tables= picks them)"));
+    }
+    let opts = strata::sqlite::ImportOptions { tables: tables_param(q), schemas: Vec::new(), blobs_base64: flag(q, "blobs_base64", false)? };
+    let plan = flag(q, "plan", false)?;
+    let t0 = std::time::Instant::now();
+    let mut j = app.svc.import_sqlite(body, opts, plan, 0).await?;
+    if !plan {
+        let written: u64 = j["tables"].as_array().map_or(0, |t| t.iter().filter_map(|t| t["rows"].as_u64()).sum());
+        j["written"] = json!(written);
+        j["took_ms"] = json!(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok(AxJson(j))
+}
+
+/// The database as a new SQLite file ([`Service::export_sqlite`]), sent
+/// as it is read from disk: `?tables=a,b` for only those tables,
+/// `?fts=false`, `?indexes=false` and `?schemas=false` to leave out the
+/// FTS5 indexes, the B-tree indexes and the kept Strata schemas.
+async fn export(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<Response, ApiError> {
+    if let Some(f) = q.get("format").filter(|f| !f.eq_ignore_ascii_case("sqlite")) {
+        return Err(ApiError::bad(format!("unknown format {f:?}: the export is a SQLite file (format=sqlite)")));
+    }
+    let opts = strata::sqlite::ExportOptions { tables: tables_param(&q), fts: flag(&q, "fts", true)?, indexes: flag(&q, "indexes", true)?, meta: flag(&q, "schemas", true)? };
+    let (dir, path, done) = app.svc.export_sqlite(opts).await?;
+    let file = tokio::fs::File::open(&path).await.map_err(ApiError::internal)?;
+    let len = file.metadata().await.map_err(ApiError::internal)?.len();
+    // The directory goes when the last chunk is sent.
+    let chunks = futures::stream::unfold((file, Some(dir)), |(mut file, dir)| async move {
+        use tokio::io::AsyncReadExt;
+        dir.as_ref()?;
+        let mut buf = vec![0u8; 1 << 16];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(Bytes::from(buf)), (file, dir)))
+            }
+            Err(e) => Some((Err(e), (file, None))),
+        }
+    });
+    let name = done.tables.first().map_or("strata".into(), |t| t.table.clone());
+    let tables: Vec<&str> = done.tables.iter().map(|t| t.table.as_str()).collect();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/vnd.sqlite3".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.sqlite\"")),
+            (header::HeaderName::from_static("x-strata-tables"), tables.join(",")),
+        ],
+        axum::body::Body::from_stream(chunks),
+    )
+        .into_response())
 }
 
 /// Write operations as NDJSON: one a line, or one event's several as
@@ -576,12 +746,13 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
     Ok(AxJson(json!({"schema": s, "short": s.to_short_json()})))
 }
 
-/// The vector of a text, or of an image file (`"image"`, base64), as
-/// `{"embed": ...}` gives a query's parameter: for a plan, whose vectors
-/// are values.
+/// The vector of a text, or of an image or sound file (`"image"` or
+/// `"audio"`, base64), as `{"embed": ...}` gives a query's parameter: for
+/// a plan, whose vectors are values.
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
-    let what = match b.get("image") {
-        Some(i) => json!({ "image": i.as_str().ok_or_else(|| ApiError::bad("image is an image file in base64"))? }),
+    let file = ["image", "audio"].into_iter().find_map(|k| b.get(k).map(|v| (k, v)));
+    let what = match file {
+        Some((k, v)) => json!({ k: v.as_str().ok_or_else(|| ApiError::bad(format!("{k} is a file in base64")))? }),
         None => json!(body_str(&b, "text")?),
     };
     let name = |k: &str| match b.get(k) {
@@ -761,4 +932,81 @@ async fn agent_run(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     app.svc.metrics.agent_run();
     Ok(AxJson(agent::run(&app.svc, req).await?))
+}
+
+type Params = Query<std::collections::HashMap<String, String>>;
+
+fn param_u64(q: &std::collections::HashMap<String, String>, k: &str, default: u64) -> Result<u64, ApiError> {
+    q.get(k).map_or(Ok(default), |v| v.parse().map_err(|_| ApiError::bad(format!("{k} is a whole number, not {v:?}"))))
+}
+
+async fn live_queries(State(app): State<App>) -> AxJson<Json> {
+    AxJson(json!({"queries": app.svc.live.list(), "running": app.svc.running()}))
+}
+
+async fn cancel_query(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<u64>) -> Res {
+    match app.svc.live.cancel(id) {
+        true => {
+            tracing::info!(query = id, "query cancelled by an operator");
+            Ok(AxJson(json!({"cancelled": true, "id": id})))
+        }
+        false => Err(ApiError { status: 404, message: format!("query {id} is not running") }),
+    }
+}
+
+async fn recent_queries(State(app): State<App>, Query(q): Params) -> Res {
+    let (since, limit) = (param_u64(&q, "since", 0)?, param_u64(&q, "limit", 100)? as usize);
+    Ok(AxJson(json!({"queries": app.svc.query_log.recent(since, limit.min(telemetry::RECENT)), "now_ms": telemetry::now_ms()})))
+}
+
+async fn slow_queries(State(app): State<App>, Query(q): Params) -> Res {
+    let limit = param_u64(&q, "limit", 100)? as usize;
+    Ok(AxJson(json!({"queries": app.svc.query_log.slow(limit.min(telemetry::SLOW)), "slow_ms": app.svc.slow.map(|d| d.as_millis() as u64)})))
+}
+
+async fn request_queries(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> AxJson<Json> {
+    AxJson(json!({"queries": app.svc.query_log.by_request(&id)}))
+}
+
+async fn query_stats(State(app): State<App>, Query(q): Params) -> Res {
+    Ok(AxJson(app.svc.query_log.statements.list(param_u64(&q, "limit", 200)? as usize)))
+}
+
+async fn reset_query_stats(State(app): State<App>) -> AxJson<Json> {
+    app.svc.query_log.statements.reset();
+    AxJson(json!({"reset": true}))
+}
+
+async fn timeseries(State(app): State<App>, Query(q): Params) -> Res {
+    let since = param_u64(&q, "since", 0)?;
+    Ok(AxJson(json!({"interval_ms": app.svc.series.interval.as_millis() as u64, "points": app.svc.series.since(since), "now_ms": telemetry::now_ms()})))
+}
+
+async fn logs(Query(q): Params) -> Res {
+    let (after, limit) = (param_u64(&q, "after", 0)?, param_u64(&q, "limit", 500)?.min(obs::RING_LINES as u64) as usize);
+    let ring = obs::ring();
+    let lines = ring.lines(after, q.get("level").map(String::as_str), q.get("request").map(String::as_str), q.get("q").map(String::as_str).filter(|t| !t.is_empty()), limit);
+    Ok(AxJson(json!({"lines": lines, "last": ring.last(), "filter": obs::log_filter()})))
+}
+
+async fn log_filter(AxJson(b): AxJson<Json>) -> Res {
+    let filter = body_str(&b, "filter")?;
+    obs::set_log_filter(filter).map_err(ApiError::bad)?;
+    tracing::info!(filter, "log filter changed");
+    Ok(AxJson(json!({"filter": filter})))
+}
+
+async fn system(State(app): State<App>) -> AxJson<Json> {
+    let mut j = app.svc.system();
+    j["auth"] = json!({"token": app.token.is_some()});
+    j["logs"] = json!({"filter": obs::log_filter()});
+    AxJson(j)
+}
+
+async fn cluster(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.cluster().await)
+}
+
+async fn routes(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.metrics.routes())
 }

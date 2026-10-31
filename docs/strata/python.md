@@ -79,6 +79,10 @@ Rows are dicts of field name to value: `str`, `int`, `float`, `None`, `bool` for
 | `delete(keys)` | deletes the rows with a key or keys; returns how many there were |
 | `sql("UPDATE ...")` | `INSERT`, `UPDATE` and `DELETE` statements; returns the rows written. It also runs `CREATE TABLE` and `DROP TABLE` ([tables](query-language.md#tables)) and `CREATE` and `DROP RANK PROFILE` ([rank profiles](query-language.md#rank-profiles-a-ranking-kept-with-its-table)), which return 0, and writes any table |
 | `import_file(path, format=None)` | loads a JSON Lines, JSON, CSV or TSV file ([how files are read](server.md#loading-rows)); returns `{rows, bulk, skipped_fields}` |
+| `import_sqlite(path, tables=None, schemas=None)` | imports a SQLite database's tables, each into the table of its name, created when missing ([SQLite in and out](sqlite.md)); returns what it did and what did not carry over |
+| `export_sqlite(path, tables=None, fts=True, indexes=True)` | writes the tables to a new SQLite file, with indexes, an FTS5 index over the text and the Strata schemas |
+
+`strata.from_sqlite("shop.sqlite", "shop.strata")` creates a database from a SQLite file's tables, and `strata.plan_sqlite("shop.sqlite")` says what it would make of them without writing; edit the plan and pass it to either as `schemas`.
 
 `insert`, `upsert`, `delete` and `import_file` write the database's first table, the one `schema` describes, or the one `table=` names (`db.insert(rows, table="events")`); `sql` names the table it writes, and `tables()` lists every table's schema. Through a coordinator, `delete` on a table placed by a column takes that column's value as `routing=` ([tables on shards](server.md#tables-on-shards)). A key a row leaves out gets its field's `default`, and a field with `not_null` refuses a row without a value ([schema options](server.md#schemas)); a `timestamp` defaulting to `"now"` takes one time for all the rows of a call.
 
@@ -114,7 +118,7 @@ db.search("dragon", where=col("year") >= 1990, columns=["id", "title"])
 db.search("dragon", where="year >= :y", params={"y": 1990})
 ```
 
-`embed(text, field=None)` returns the query vector of a text (`embed(image=data, field="emb")` of an image file's bytes, by a [model of images](server.md#vectors-of-images), with the package built with `--features vision`), and `len(db)` the number of rows.
+`embed(text, field=None)` returns the query vector of a text (`embed(image=data, field="emb")` of an image file's bytes, by a [model of images](server.md#vectors-of-images), with the package built with `--features vision`, and `embed(audio=data)` of a sound file's, by a [model of sound](server.md#vectors-of-sound), built with `--features audio`), and `len(db)` the number of rows.
 
 `plan(sql, params)` returns a statement's [plan](query-language.md#explain) as a dict without running it, and `run(plan)` runs a plan: a read's `Result`, or the number of rows a write wrote.
 
@@ -163,6 +167,20 @@ db.table().select("video", "id", score()).distinct_on("video").order_by(bm25("tr
 
 `select(...)` names the columns (without it, the stored fields but vectors, as `SELECT *`), `where(...)` keeps rows, `order_by(...)` ranks by a score best first or orders by fields ascending, `rerank(expr, count)` ranks its top `count` rows again ([rerank phases](query-language.md#rerank-phases)), `group_by(...)` and `having(...)` group, `distinct_on(...)` keeps the [first row of each group](query-language.md#the-first-row-of-each-group-distinct-on) in the query's order, and `limit(n)` and `offset(n)` page (groups, after `distinct_on`). A query is a [plan](query-language.md#explain), the same JSON that `plan(sql)` gives: `q.plan()` shows it, and a `Client` runs it on a server the same way.
 
+## The rank log
+
+`query_logged(sql, params, context=..., variant=..., candidates=...)` runs a ranked query and writes what it served to a [rank log](query-language.md#the-rank-log-what-each-query-served): a row per row answered, with its position, its score and the values its ranking read, as they were computed. `candidates` logs that many rows from the query's `OFFSET`, those past its `LIMIT` as not shown, and `ts` (a `datetime` or microseconds) says when it was served, now by default. The `Result` is the query's, with `result.request`, the id its log rows carry, for labelling them later. `export_rank_log(...)` reads the log back as a list of dicts for training, each with its context's history and its label as of the row's time, from a table of events:
+
+```python
+r = db.query_logged("SELECT id, title FROM books ORDER BY bm25(title, :q) DESC LIMIT 10",
+                    {"q": "dragon"}, context="u42", variant="b", candidates=50)
+db.sql("UPDATE rank_log SET label = 3 WHERE request = :r AND row_key = :k", {"r": r.request, "k": r.keys[0]})
+
+rows = db.export_rank_log(events={"table": "events", "user": "usr", "item": "item", "time": "ts", "action": "action"},
+                          history=20, window="30 minutes", grades={"click": 1, "buy": 3})
+rows[0]["features"], rows[0]["label"], rows[0]["history_items"]
+```
+
 ## Semantic-ID codebooks
 
 A [semantic-ID field](server.md#semantic-ids) gives each row a code from its vector by a codebook, which `strata.train.codebook` trains and saves in the models directory before a table names it:
@@ -188,7 +206,7 @@ It returns the SHA-256 of the file, which the table records. The options are `le
 
 ## A server from Python
 
-`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api), or `embed(image=data)` an image's), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
+`strata.connect(url, token=None)` returns a `Client` of a running strata-server, using only the standard library. It has `schema`, `tables`, `query`, `sql`, `search`, `insert`, `upsert`, `delete`, `import_file` (an upload to [`/v1/import`](server.md#loading-rows), up to the server's `--max-body-mb`, 256 MiB unless set), `import_sqlite(path, tables=None)` and `plan_sqlite(path)` (a SQLite file's tables, uploaded the same way; [SQLite in and out](sqlite.md#over-http-and-in-the-ui)), `export_sqlite(path, tables=None)` (the server's tables downloaded as a SQLite file) and `len()`, as above, plus `write(ops)` for raw [write operations](server.md#http-api), `explain`, `run(plan)` (a plan from `explain(...)["ir"]` or a `table()` query, run by [`/v1/plan`](server.md#http-api)), `table()` ([queries built in Python](#queries-built-in-python)), `embed(text, field=None)` (a text's vector by the server's model, from [`/v1/embed`](server.md#http-api), or `embed(image=data)` an image's and `embed(audio=data)` a sound's), `query_logged` and `export_rank_log` ([the rank log](#the-rank-log)), `health`, `stats` and `ask(question)` for the [agent](server.md#the-agent).
 
 ```python
 client = strata.connect("http://127.0.0.1:7700")   # token= or $STRATA_TOKEN for a server with --token

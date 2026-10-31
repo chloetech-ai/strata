@@ -272,7 +272,7 @@ pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Para
 
 /// [`plan_in`] of a parsed query.
 pub(crate) fn plan_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
-    let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()) };
+    let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()), outer: RefCell::new(None) };
     Ok(ir::Plan::new(p.query(q)?.node))
 }
 
@@ -312,6 +312,63 @@ struct Planner<'a> {
     params: &'a Params,
     /// The `WITH` results in scope, the innermost last.
     ctes: RefCell<Vec<Cte>>,
+    /// The row of the Search being bound, which a subquery in its ranking
+    /// may name ([`Planner::correlate`]).
+    outer: RefCell<Option<Outer>>,
+}
+
+/// The row a correlated subquery names: what it may call it (a table's
+/// name, its alias, the `WITH` results whose rows it is), and its fields.
+#[derive(Clone, Debug)]
+struct Outer {
+    names: Vec<String>,
+    fields: Vec<String>,
+}
+
+/// The function a column of the outer row becomes in a correlated
+/// subquery's syntax tree: `__outer(n)`, field `n` ([`ir::Expr::Outer`]).
+pub(crate) const OUTER: &str = "__outer";
+
+/// The field `__outer(n)` names ([`OUTER`]).
+pub(crate) fn outer_field(e: &Expr) -> Option<u32> {
+    let Expr::Function(f) = e else { return None };
+    if fname(f) != OUTER {
+        return None;
+    }
+    match func_args(f).as_slice() {
+        [Expr::Value(v)] => v.value.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// `__outer(i)` ([`OUTER`]).
+fn outer_call(i: usize) -> Expr {
+    let q = super::sql::parse_query(&format!("SELECT {OUTER}({i})")).expect("a SELECT");
+    let sql::SetExpr::Select(s) = *q.body else { unreachable!("a SELECT") };
+    match s.projection.into_iter().next() {
+        Some(SelectItem::UnnamedExpr(e)) => e,
+        _ => unreachable!("one column"),
+    }
+}
+
+/// The names a SELECT's FROM gives its tables (each table's name and
+/// alias, lowercase).
+fn from_names(q: &sql::Query) -> Vec<String> {
+    let sql::SetExpr::Select(s) = q.body.as_ref() else { return Vec::new() };
+    let mut out = Vec::new();
+    for t in &s.from {
+        for r in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+            match r {
+                TableFactor::Table { name, alias, .. } => {
+                    out.push(super::sql::table_name(name).to_ascii_lowercase());
+                    out.extend(alias.iter().map(|a| a.name.value.to_ascii_lowercase()));
+                }
+                TableFactor::Derived { alias, .. } => out.extend(alias.iter().map(|a| a.name.value.to_ascii_lowercase())),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// One table of a join.
@@ -380,7 +437,16 @@ impl<'a> Planner<'a> {
             if w.recursive {
                 return Err(err("WITH RECURSIVE is not supported: REACHABLE and PATH traverse links"));
             }
-            for cte in &w.cte_tables {
+            for (i, cte) in w.cte_tables.iter().enumerate() {
+                // Rerank phases over the `WITH` results from this one on,
+                // which may read those before (a user's history).
+                if i > 0 {
+                    let mut rest = q.clone();
+                    rest.with.as_mut().expect("WITH").cte_tables.drain(..i);
+                    if let Some(p) = self.phased(&rest)? {
+                        return Ok(Planned { node: ir::Node::With { ctes: defs, input: Box::new(p.node) }, ..p });
+                    }
+                }
                 let mut p = self.query(&cte.query)?;
                 if !cte.alias.columns.is_empty() {
                     if cte.alias.columns.len() != p.columns.len() {
@@ -452,7 +518,8 @@ impl<'a> Planner<'a> {
                 exprs.extend(es.iter().map(|o| &o.expr));
             }
             for e in exprs {
-                walk(e, &mut |x| subquery |= matches!(x, Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }));
+                // A scalar subquery is a number of each row ranked.
+                walk(e, &mut |x| subquery |= matches!(x, Expr::InSubquery { .. } | Expr::Exists { .. }));
             }
             let order = match &r.order_by {
                 Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) if es.len() == 1 => &es[0],
@@ -493,8 +560,26 @@ impl<'a> Planner<'a> {
         // and cut, so that its graphs and parameters line up; the last with
         // the rankings before it.
         let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
+        // A correlated subquery calls the row by the table's name, its
+        // alias, or a `WITH` result's.
+        let mut names = from_names(first);
+        for (i, r) in reads.iter().enumerate() {
+            names.push(w.cte_tables[i].alias.name.value.to_ascii_lowercase());
+            names.extend(from_names(r));
+        }
+        let fields = schema.fields.iter().map(|f| f.name.clone()).collect();
+        let outer = self.outer.replace(Some(Outer { names, fields }));
+        let r = self.phases_of(first, schema, steps, orders, &subs);
+        *self.outer.borrow_mut() = outer;
+        r
+    }
+
+    /// The Search of [`Planner::phased`]: the first `WITH`, then each step
+    /// as a phase.
+    #[allow(clippy::type_complexity)]
+    fn phases_of(&self, first: &sql::Query, schema: &'a Schema, steps: Vec<(Vec<SelectItem>, sql::OrderByExpr, Option<sql::LimitClause>)>, orders: Vec<Expr>, subs: &dyn Fn(&sql::Query, Sub) -> Result<Option<ir::Expr>>) -> Result<Option<Planned>> {
         let bind = |projection: Option<Vec<SelectItem>>, order: Option<sql::OrderByExpr>, cut: Option<sql::LimitClause>, earlier: &[Expr]| -> Option<Select> {
-            let mut q = first.as_ref().clone();
+            let mut q = first.clone();
             let sql::SetExpr::Select(s) = q.body.as_mut() else { return None };
             if let Some(p) = projection {
                 s.projection = p;
@@ -503,7 +588,7 @@ impl<'a> Planner<'a> {
                 *es = vec![o];
             }
             q.limit_clause = cut;
-            super::sql::bind_phase_with(&q, schema, self.catalog, self.params, &subs as &Subs, earlier).ok()
+            super::sql::bind_phase_with(&q, schema, self.catalog, self.params, subs as &Subs, earlier).ok()
         };
         let keyed = |s: &Select| {
             s.group_by.is_empty()
@@ -598,7 +683,10 @@ impl<'a> Planner<'a> {
             e => e,
         };
         let subs = |sq: &sql::Query, kind: Sub| self.subquery(sq, kind, Some(schema));
-        let select = super::sql::bind_query_with(q, schema, self.catalog, self.params, &subs as &Subs).map_err(at)?;
+        let outer = self.outer.replace(Some(Outer { names: from_names(q), fields: schema.fields.iter().map(|f| f.name.clone()).collect() }));
+        let select = super::sql::bind_query_with(q, schema, self.catalog, self.params, &subs as &Subs);
+        *self.outer.borrow_mut() = outer;
+        let select = select.map_err(at)?;
         if select.projection.iter().any(|(_, p)| *p == Projection::SeqNo) {
             return Err(at(err("seq_no() is a column of a SELECT on one table, not of a compound query")));
         }
@@ -622,7 +710,19 @@ impl<'a> Planner<'a> {
         if kind == Sub::Seeds && scanned.is_some_and(|s| !needs(q, s)) {
             return Ok(None);
         }
-        let p = self.query(q)?;
+        let correlated = match kind {
+            Sub::Score => self.correlate(q)?,
+            _ if self.correlate(q)?.is_some() => {
+                return Err(err("a subquery that names the outer row computes a number of each row it ranks: it works in ORDER BY, rerank phases and the columns of ranked rows, not in WHERE, IN or EXISTS"));
+            }
+            _ => None,
+        };
+        let q = correlated.as_ref().unwrap_or(q);
+        // The subquery's own Searches name their own rows.
+        let outer = self.outer.borrow_mut().take();
+        let p = self.query(q);
+        *self.outer.borrow_mut() = outer;
+        let p = p?;
         let one = |what: &str| match p.columns.len() {
             1 => Ok(()),
             n => Err(err(format!("{what} returns one column, not {n}"))),
@@ -642,6 +742,10 @@ impl<'a> Planner<'a> {
                 one("a scalar subquery")?;
                 ir::Expr::Scalar(node)
             }
+            Sub::Score => {
+                one("a subquery in a ranking expression")?;
+                ir::Expr::Scalar(node)
+            }
             // Rows of the scanned table seed by their keys. Rows of another
             // table seed by the values of their one column: `(SELECT item
             // FROM events ...)` starts from the items, not from the events.
@@ -651,6 +755,38 @@ impl<'a> Planner<'a> {
                 ir::Expr::Values(node)
             }
         }))
+    }
+
+    /// `q` with each column of the outer row it names (`first.cat`, where
+    /// `first` names the row of the Search being ranked and not a table of
+    /// `q`'s own FROM) as [`OUTER`], or `None` when it names none: a
+    /// correlated subquery, which runs once for each distinct value of
+    /// those columns among the rows ranked.
+    fn correlate(&self, q: &sql::Query) -> Result<Option<sql::Query>> {
+        let Some(outer) = self.outer.borrow().clone() else { return Ok(None) };
+        let own = from_names(q);
+        let names: Vec<&String> = outer.names.iter().filter(|n| !own.contains(n)).collect();
+        let mut q = q.clone();
+        let mut named = false;
+        let mut failed = None;
+        query_mut(&mut q, &mut |e| {
+            let Expr::CompoundIdentifier(ids) = e else { return };
+            let [a, c] = ids.as_slice() else { return };
+            if !names.iter().any(|n| a.value.eq_ignore_ascii_case(n)) {
+                return;
+            }
+            match outer.fields.iter().position(|f| f.eq_ignore_ascii_case(&c.value)) {
+                Some(i) => {
+                    *e = outer_call(i);
+                    named = true;
+                }
+                None => failed = Some(err(format!("{a}.{c}: {a} has no column {c}"))),
+            }
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        Ok(named.then_some(q))
     }
 
     /// A subquery of an expression over rows in memory.
@@ -664,7 +800,11 @@ impl<'a> Planner<'a> {
         let pk = pk(schema)?;
         let mut q = q.clone();
         let mut s = s.clone();
-        let TableFactor::Table { name, .. } = &mut s.from[0].relation else { unreachable!("a table") };
+        let TableFactor::Table { name, alias, .. } = &mut s.from[0].relation else { unreachable!("a table") };
+        // A correlated subquery still calls the rows by the `WITH` result's name.
+        if alias.is_none() {
+            *alias = Some(sql::TableAlias { name: sql::Ident::new(cte.name.clone()), columns: Vec::new() });
+        }
         *name = sql::ObjectName::from(vec![sql::Ident::new(schema.table.clone())]);
         let grouped = !matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty()) || has_aggregate(&s) || s.distinct.is_some();
         // Without an ORDER BY, rows keep the WITH result's order, so the
@@ -1318,7 +1458,8 @@ fn distinct_to_group(s: &mut sql::Select) -> Result<()> {
     Ok(())
 }
 
-fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Option<usize>)> {
+/// A query's OFFSET and LIMIT, its parameters bound.
+pub(crate) fn limits(l: &Option<sql::LimitClause>, params: &Params) -> Result<(usize, Option<usize>)> {
     let n = |e: &Expr| -> Result<usize> {
         match value(&compile(e, params, &|_| None, &[])?)? {
             Value::Int(x) if x >= 0 => Ok(x as usize),
@@ -1477,6 +1618,11 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             whens: conditions.iter().map(|c| Ok(When { when: go(&c.condition)?, then: go(&c.result)? })).collect::<Result<_>>()?,
             otherwise: else_result.as_deref().map(bx).transpose()?,
         },
+        Expr::Function(_) if outer_field(e).is_some() => ir::Expr::Outer(outer_field(e).expect("a field")),
+        Expr::Function(f) if fname(f) == "prefix" => {
+            let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
+            ir::Expr::Prefix { expr: bx(x)?, prefix: bx(p)? }
+        }
         Expr::Function(f) if fname(f) == "at_least" => {
             let usage = "AT_LEAST(n, condition, ...): n a count (2) or a percentage ('75%') of the conditions";
             let args = func_args(f);

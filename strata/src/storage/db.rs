@@ -760,37 +760,56 @@ impl SealedMem {
 impl Database {
     /// Creates a new database (the path must not exist) in the layout
     /// `opts.layout` names, and its WAL.
+    ///
+    /// The database is written under a temporary name beside `path` and
+    /// then given its name whole, so a crash leaves a database at `path` or
+    /// nothing (and a hidden `.<name>.creating-…` beside it, which can be
+    /// deleted): `path` can be created again.
     pub fn create(path: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
         if let Some(f) = schema.fields.iter().find(|f| f.references.as_ref().is_some_and(|r| !r.eq_ignore_ascii_case(&schema.table))) {
             let r = f.references.as_deref().unwrap_or_default();
             return Err(Error::Schema(format!("field {}: references {r}, and a new database has no table but {}", f.name, schema.table)));
         }
-        if opts.layout == Layout::Directory {
-            return Database::create_dir(path, schema, opts);
+        if path.exists() {
+            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists", path.display()))));
         }
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
-        lock_exclusive(&file)?;
+        let tmp = beside(path, "creating")?;
+        if opts.layout == Layout::Directory {
+            return Database::create_dir(path, &tmp, schema, opts);
+        }
         let db_id: u64 = rand::random();
-        let manifest = Manifest::new(schema);
-        let mut fl = FreeList::new(META_PAGES);
-        let mbytes = manifest.encode();
-        let mext = Extent { page: fl.alloc(pages_for(mbytes.len())), len: mbytes.len() as u64 };
-        let (fext, fbytes) = place_freelist(&mut fl, &[]);
-        io::set_len(&file, fl.page_count() * PAGE)?;
-        io::write_at(&file, &mbytes, mext.page * PAGE)?;
-        io::write_at(&file, &fbytes, fext.page * PAGE)?;
-        let meta = Meta {
-            format: manifest.format(),
-            db_id,
-            txn: 1,
-            manifest: mext,
-            manifest_crc: crc32fast::hash(&mbytes),
-            freelist: fext,
-            freelist_crc: crc32fast::hash(&fbytes),
-            page_count: fl.page_count(),
-        };
-        pager::write_meta(&file, 0, &meta)?;
-        io::sync_all(&file)?;
+        let built = (|| -> Result<File> {
+            let file = OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+            lock_exclusive(&file)?;
+            let manifest = Manifest::new(schema);
+            let mut fl = FreeList::new(META_PAGES);
+            let mbytes = manifest.encode();
+            let mext = Extent { page: fl.alloc(pages_for(mbytes.len())), len: mbytes.len() as u64 };
+            let (fext, fbytes) = place_freelist(&mut fl, &[]);
+            io::set_len(&file, fl.page_count() * PAGE)?;
+            io::write_at(&file, &mbytes, mext.page * PAGE)?;
+            io::write_at(&file, &fbytes, fext.page * PAGE)?;
+            let meta = Meta {
+                format: manifest.format(),
+                db_id,
+                txn: 1,
+                manifest: mext,
+                manifest_crc: crc32fast::hash(&mbytes),
+                freelist: fext,
+                freelist_crc: crc32fast::hash(&fbytes),
+                page_count: fl.page_count(),
+            };
+            pager::write_meta(&file, 0, &meta)?;
+            io::sync_all(&file)?;
+            // A link, unlike a rename, fails if `path` appeared meanwhile.
+            std::fs::hard_link(&tmp, path)?;
+            Ok(file)
+        })();
+        let _ = io::remove_file(&tmp);
+        let file = built?;
+        // After the link, so that a create that fails leaves another
+        // database's log alone. A log that is missing, or is another
+        // database's (a crash before this), opens empty.
         Wal::create(&wal_path(path), db_id, false, true)?;
         let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         io::sync_dir(dir)?;
@@ -811,18 +830,31 @@ impl Database {
         Database::load(path, file, opts)
     }
 
-    fn create_dir(path: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
-        std::fs::create_dir(path)?;
-        let lockf = OpenOptions::new().read(true).write(true).create_new(true).open(path.join(dir::LOCK))?;
-        lock_exclusive(&lockf)?;
-        let db_id: u64 = rand::random();
-        let manifest = Manifest::new(schema);
-        let mbytes = manifest.encode();
-        let name = dir::manifest_name(1);
-        dir::write_file(path, &name, &mbytes, true)?;
-        dir::write_current(path, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes), format: manifest.format() }, true)?;
-        Wal::create(&path.join(dir::WAL), db_id, false, true)?;
-        dir::sync_dir(path)?;
+    /// [`Database::create`] in the directory layout, built in `tmp`.
+    fn create_dir(path: &Path, tmp: &Path, schema: Schema, opts: DbOptions) -> Result<Database> {
+        std::fs::create_dir(tmp)?;
+        let built = (|| -> Result<File> {
+            let lockf = OpenOptions::new().read(true).write(true).create_new(true).open(tmp.join(dir::LOCK))?;
+            lock_exclusive(&lockf)?;
+            let db_id: u64 = rand::random();
+            let manifest = Manifest::new(schema);
+            let mbytes = manifest.encode();
+            let name = dir::manifest_name(1);
+            dir::write_file(tmp, &name, &mbytes, true)?;
+            dir::write_current(tmp, &Current { db_id, txn: 1, manifest: name, crc: crc32fast::hash(&mbytes), format: manifest.format() }, true)?;
+            Wal::create(&tmp.join(dir::WAL), db_id, false, true)?;
+            dir::sync_dir(tmp)?;
+            // Fails if `path` appeared meanwhile and holds files.
+            std::fs::rename(tmp, path)?;
+            Ok(lockf)
+        })();
+        let lockf = match built {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(tmp);
+                return Err(e);
+            }
+        };
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         io::sync_dir(parent)?;
         Database::load_dir(path, lockf, opts)
@@ -2460,7 +2492,9 @@ impl Database {
         }
         if let Some((_, seg, base)) = largest {
             for (i, f) in schema.fields.iter().enumerate() {
-                if matches!(f.ty, FieldType::Vector { .. }) {
+                // A multi-vector field numbers its vectors apart from the
+                // rows, so its graph is built anew.
+                if matches!(f.ty, FieldType::Vector { .. }) && !f.multi {
                     starts.push(GraphStart { field: i, segment: seg.clone(), base });
                 }
             }
@@ -2747,8 +2781,7 @@ impl Database {
             }
             (snap, manifest, st.handles().cloned().collect::<Vec<_>>())
         };
-        let name = dest.file_name().ok_or_else(|| Error::Schema(format!("{} names no file", dest.display())))?.to_string_lossy();
-        let tmp = dest.with_file_name(format!(".{name}.checkpoint-{:016x}", rand::random::<u64>()));
+        let tmp = beside(dest, "checkpoint")?;
         let r = self.write_checkpoint(&tmp, opts.layout, &manifest, &handles, link);
         let mut stats = match r {
             Ok(stats) => stats,
@@ -4465,6 +4498,13 @@ fn read_sealed_wals(
         }
     }
     Ok((kept, txns, cut))
+}
+
+/// A hidden temporary name beside `path` to write it under:
+/// `.<name>.<what>-<random>`.
+fn beside(path: &Path, what: &str) -> Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| Error::Schema(format!("{} names no file", path.display())))?.to_string_lossy();
+    Ok(path.with_file_name(format!(".{name}.{what}-{:016x}", rand::random::<u64>())))
 }
 
 fn wal_path(path: &Path) -> PathBuf {

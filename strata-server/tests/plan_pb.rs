@@ -82,6 +82,7 @@ const SELECTS: &[&str] = &[
     "SELECT COUNT(*), COUNT(DISTINCT category), COUNT(rating) FROM papers WHERE MATCH(body, 'graph')",
     // Some of the conditions, and how many hold.
     "SELECT id, count_true(year > 2000, tags = 'x', MATCH(body, 'net')) AS k FROM papers WHERE AT_LEAST(2, MATCH(body, 'graph'), year >= 2019, NOT AT_LEAST('50%', rating > 1, category IN ('a', 'b'))) ORDER BY bm25(body, 'graph') * (1 + count_true(done, rating IS NULL)) DESC LIMIT 5",
+    "SELECT id FROM papers WHERE category LIKE 'm%' OR (PREFIX(id, 'p1') AND id NOT LIKE 'p1!_%' ESCAPE '!') ORDER BY year DESC LIMIT 5",
 ];
 
 /// Compound queries: operators over single-table queries.
@@ -105,6 +106,9 @@ const COMPOUND: &[&str] = &[
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), maxsim(emb, (SELECT emb FROM papers WHERE category = 'ml' LIMIT 4))) DESC LIMIT 5",
     "SELECT DISTINCT ON (category, year % 3) id, category FROM papers WHERE year > 1990 ORDER BY bm25(body, 'graph') DESC LIMIT 3",
     "SELECT DISTINCT ON (category) category, year, COUNT(*) AS n FROM papers GROUP BY category, year ORDER BY category, n DESC",
+    "SELECT d.id FROM (SELECT id, title FROM papers) AS d WHERE PREFIX(d.title, upper('gr'))",
+    // A correlated subquery, which names the row it ranks.
+    "WITH a AS (SELECT * FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 50) SELECT id FROM a ORDER BY bm25(body, 'graph') + (SELECT COUNT(*) FROM papers p WHERE p.category = a.category AND p.year < a.year) DESC LIMIT 5",
 ];
 
 /// Writes of each kind.
@@ -214,6 +218,16 @@ fn every_plan_round_trips() {
         let Command::Write { write, .. } = bind_command(sql, &[&schema], &params()).unwrap_or_else(|e| panic!("{sql}: {e}")) else { panic!("{sql}") };
         check(Plan::of_write(&schema, &write));
     }
+    // The values a correlated subquery took, by key, as operators send
+    // them to a shard.
+    let sql = "SELECT id FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 5";
+    let mut plan = Plan::of_select(&schema, &bind(sql, &schema, &params()).unwrap());
+    let Some(s) = plan.root.search_mut() else { panic!("a leaf") };
+    let values = vec![ir::KeyValue { key: Value::Str("p1".into()), value: Some(2.5) }, ir::KeyValue { key: Value::Str("p2".into()), value: None }];
+    s.order[0].expr = Expr::Arith { op: ir::ArithOp::Add, left: Box::new(s.order[0].expr.clone()), right: Box::new(Expr::ByKey(values)) };
+    let plan = Plan::new(plan.root);
+    assert!(plan.features.iter().any(|f| f == ir::CORRELATED), "{:?}", plan.features);
+    check(plan);
     // Ranked by a rank profile: the plan names it.
     let profile = RankProfile {
         name: "recent".into(),
@@ -253,7 +267,7 @@ fn every_plan_round_trips() {
     // Every kind of node and expression was among them.
     let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order"];
     let exprs = [
-        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim", "at_least",
+        "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "maxsim", "prefix", "outer", "by_key", "at_least",
     ];
     let want: BTreeSet<String> = nodes.iter().map(|n| format!("node {n}")).chain(exprs.iter().map(|e| format!("expr {e}"))).collect();
     let missing: Vec<&String> = want.difference(&seen).collect();

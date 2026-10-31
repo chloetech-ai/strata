@@ -33,8 +33,8 @@ mod numeric;
 mod range;
 mod store;
 
-pub use blocks::{KeyRange, BLOCK};
-pub use keyword::{int_key, int_of_key, key_of, CodeSetFilter, FacetStrategy, KeywordColumn, KeywordFilter, KeywordSizes, DEFAULT_RARE};
+pub use blocks::{KeyRange, BLOCK, SUPER};
+pub use keyword::{int_key, int_of_key, key_of, CodeSetFilter, PREFIX_LISTS, FacetStrategy, KeywordColumn, KeywordFilter, KeywordSizes, DEFAULT_RARE};
 pub use numeric::{float_key, ColumnRangeFilter, Histogram, NumericColumn, NumericKind, DEFAULT_BUCKETS, MAX_SCALE};
 pub use range::{choose_range_strategy, count_keys, count_range, eval_keys, eval_range, range_costs, range_costs_keys, RangeIndex, RangePlan, RangeStrategy};
 pub use store::{DocStore, StoreBuilder, DEFAULT_BLOCK};

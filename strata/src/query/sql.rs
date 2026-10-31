@@ -30,7 +30,8 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
-use crate::query::ir::{ArithOp, Func, NormKind};
+use crate::query::compound::outer_field;
+use crate::query::ir::{ArithOp, CmpOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::rank::Rank;
 use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
@@ -451,6 +452,11 @@ pub fn quoted(n: &str) -> String {
     format!("\"{}\"", n.replace('"', "\"\""))
 }
 
+/// Why `similarity` refuses a multi-vector field.
+pub(crate) fn multi_similarity(field: &str) -> String {
+    format!("{field} is a multi-vector field: rank it with maxsim({field}, vectors), the sum of each query vector's best match")
+}
+
 /// A value coerced to `field`'s type, in the form its column holds
 /// ([`crate::schema::Field::store`]).
 fn coerce(field: &Field, v: Value) -> Result<Value> {
@@ -504,6 +510,7 @@ pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
     };
     Ok(match (&field.ty, v) {
         (_, Value::Null) => Value::Null,
+        (FieldType::Vector { .. }, v) if field.multi => crate::vector::multi::normalize(field, v)?,
         (FieldType::Vector { .. }, v @ Value::Vector(_)) => v,
         (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
         (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: SET gives it a URI or a JSON object's text, not {v:?}", field.name))),
@@ -569,6 +576,9 @@ pub(crate) enum Sub {
     Seeds,
     /// `maxsim`'s query vectors: its one column's values, in order.
     Vectors,
+    /// A number in a ranking expression: its one value, for each row
+    /// ranked when it names the row (a correlated subquery).
+    Score,
 }
 
 /// Plans a subquery for the binder ([`bind_query_with`]): the expression
@@ -593,18 +603,27 @@ pub(crate) fn bind_phase_with(q: &sql::Query, schema: &Schema, tables: &[&Schema
 /// with `score()` and `features()` added to its columns: the values each
 /// row was ranked by, which `/v1/explain` shows for the top rows.
 pub fn with_features(sql_text: &str) -> Result<String> {
-    let one = || err("hits explain the rows of one SELECT ranked by an ORDER BY");
-    let mut stmts = super::parse::parse(sql_text)?;
-    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return Err(one()) };
-    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(one()) };
-    if q.order_by.is_none() {
-        return Err(one());
-    }
-    let mut extra = super::parse::parse("SELECT score(), features()")?;
-    let Some(sql::Statement::Query(x)) = extra.pop() else { return Err(one()) };
-    let sql::SetExpr::Select(x) = *x.body else { return Err(one()) };
-    s.projection.extend(x.projection);
+    let mut q = ranked_query(sql_text).ok_or_else(|| err("hits explain the rows of one SELECT ranked by an ORDER BY"))?;
+    add_features(&mut q)?;
     Ok(q.to_string())
+}
+
+/// `sql_text` when it is one SELECT ranked by an ORDER BY.
+pub(crate) fn ranked_query(sql_text: &str) -> Option<sql::Query> {
+    let mut stmts = super::parse::parse(sql_text).ok()?;
+    let [sql::Statement::Query(q)] = stmts.as_mut_slice() else { return None };
+    (matches!(q.body.as_ref(), sql::SetExpr::Select(_)) && q.order_by.is_some()).then(|| (**q).clone())
+}
+
+/// Adds `score()` and `features()` to the columns of a query from
+/// [`ranked_query`].
+pub(crate) fn add_features(q: &mut sql::Query) -> Result<()> {
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Err(err("not a SELECT")) };
+    let mut extra = super::parse::parse("SELECT score(), features()")?;
+    let Some(sql::Statement::Query(x)) = extra.pop() else { unreachable!("a SELECT") };
+    let sql::SetExpr::Select(x) = *x.body else { unreachable!("a SELECT") };
+    s.projection.extend(x.projection);
+    Ok(())
 }
 
 /// The query of `(SELECT ...)`, in parentheses or not.
@@ -835,6 +854,9 @@ impl<'a> Binder<'a> {
         if vector && name == "ppr" {
             return Err(err("ppr() needs an EDGES field"));
         }
+        if vector && self.schema.fields[field].multi {
+            return Err(err(format!("{name}() follows one vector per row: {} is a multi-vector field", self.schema.fields[field].name)));
+        }
         let seeds = self.seeds(args[1])?;
         let mut opts = Opts::new();
         let mut through = None;
@@ -1042,6 +1064,8 @@ impl<'a> Binder<'a> {
                 _ => self.feature(e),
             },
             Expr::Nested(_) | Expr::UnaryOp { .. } | Expr::BinaryOp { .. } | Expr::Case { .. } => self.feature(e),
+            // A number of each row, from the rows it names.
+            Expr::Subquery(_) if self.subs.is_some() => self.feature(e),
             _ => Err(err(format!("unsupported select expression: {e}"))),
         }
     }
@@ -1299,6 +1323,8 @@ impl<'a> Binder<'a> {
         let bx = |e: &Expr| self.rank(e).map(Box::new);
         match e {
             Expr::Nested(inner) => self.rank(inner),
+            // A number of each row ranked, from the rows it names.
+            Expr::Subquery(q) => Ok(Score::Sub(Box::new(self.sub(q, Sub::Score)?))),
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 let f = self.field_of(e)?;
                 if self.schema.fields[f].multi {
@@ -1435,6 +1461,9 @@ impl<'a> Binder<'a> {
             return Ok(Score::Sparse { field, terms, opts: without_norm(opts) });
         }
         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!() };
+        if self.schema.fields[field].multi {
+            return Err(err(multi_similarity(&self.schema.fields[field].name)));
+        }
         let vector = self.vector(v)?;
         if vector.len() != dim {
             return Err(err(format!("vector has {} dimensions, field has {dim}", vector.len())));
@@ -1449,8 +1478,10 @@ impl<'a> Binder<'a> {
         let [field, vs] = args else { return Err(err("maxsim(field, vectors)")) };
         let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. }), "VECTOR")?;
         let FieldType::Vector { dim, .. } = self.schema.fields[field].ty else { unreachable!("a VECTOR field") };
-        if let Some(v) = opts.get("max_vectors") {
-            v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err("max_vectors => a whole number, at least 1"))?;
+        for k in ["max_vectors", "depth", "candidates"] {
+            if let Some(v) = opts.get(k) {
+                v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err(format!("{k} => a whole number, at least 1")))?;
+            }
         }
         if let Some(q) = subquery_of(vs) {
             return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
@@ -1526,6 +1557,7 @@ impl<'a> Binder<'a> {
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => Pred::Or(vec![self.pred(left)?, self.pred(right)?]),
             Expr::UnaryOp { op: sql::UnaryOperator::Not, expr } => Pred::Not(Box::new(self.pred(expr)?)),
             Expr::BinaryOp { left, op, right } if self.subs.is_some() && (subquery_of(left).is_some() || subquery_of(right).is_some()) => self.sub_comparison(left, op, right)?,
+            Expr::BinaryOp { left, op, right } if outer_field(left).is_some() || outer_field(right).is_some() => self.outer_comparison(left, op, right)?,
             Expr::BinaryOp { left, op, right } => self.comparison(left, op, right)?,
             Expr::Between { expr, negated, low, high } if self.subs.is_some() && (subquery_of(low).is_some() || subquery_of(high).is_some()) => {
                 let f = self.numeric_field(expr)?;
@@ -1619,6 +1651,36 @@ impl<'a> Binder<'a> {
                 let need = crate::query::exec::need_of(&self.literal(n)?, "AT_LEAST's n is")?.of(conds.len());
                 Pred::AtLeast { need, items: conds.iter().map(|c| self.pred(c)).collect::<Result<_>>()? }
             }
+            Expr::Like { negated, any: false, expr, pattern, escape_char } => {
+                let f = self.prefix_field(expr)?;
+                let escape = match escape_char {
+                    None => None,
+                    Some(sql::Value::SingleQuotedString(c)) if c.chars().count() == 1 => c.chars().next(),
+                    Some(c) => return Err(err(format!("LIKE's ESCAPE takes one character, not {c}"))),
+                };
+                let pattern = self.literal(pattern)?;
+                let pattern = pattern.as_str().ok_or_else(|| err("LIKE's pattern must be text"))?;
+                let p = match like_prefix(pattern, escape)? {
+                    LikePrefix::Exact(v) => Pred::In { field: f, values: vec![Value::Str(v)] },
+                    LikePrefix::Prefix(p) if p.is_empty() => Pred::Present { field: f },
+                    LikePrefix::Prefix(p) => Pred::Prefix { field: f, prefix: p },
+                };
+                if *negated { Pred::Not(Box::new(p)) } else { p }
+            }
+            Expr::ILike { .. } => return Err(err("ILIKE cannot use a KEYWORD field's index: store the value lowercased and use LIKE")),
+            Expr::Function(func) if fname(func) == "prefix" => {
+                let (args, opts) = self.args(func)?;
+                let [field, p] = args.as_slice() else { return Err(err("PREFIX(field, prefix)")) };
+                if let Some(k) = opts.keys().next() {
+                    return Err(err(format!("unknown option {k} for PREFIX")));
+                }
+                let f = self.prefix_field(field)?;
+                match self.literal(p)? {
+                    Value::Str(p) if p.is_empty() => Pred::Present { field: f },
+                    Value::Str(p) => Pred::Prefix { field: f, prefix: p },
+                    v => return Err(err(format!("PREFIX takes text, not {v:?}"))),
+                }
+            }
             Expr::Function(func) if matches!(fname(func).as_str(), "reachable" | "path") => Pred::Graph { id: self.graph(func, &fname(func))? },
             Expr::Value(v) if matches!(v.value, sql::Value::Boolean(_)) => {
                 if matches!(v.value, sql::Value::Boolean(true)) { Pred::True } else { Pred::False }
@@ -1638,6 +1700,31 @@ impl<'a> Binder<'a> {
     }
 
     /// `field op (SELECT ...)`, or the other way round.
+    /// A comparison of a field with a column of the row a correlated
+    /// subquery is computed for (`cat = first.cat`), which takes its value
+    /// for each distinct one ([`ir::Expr::Outer`]).
+    fn outer_comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
+        let (field, outer, flipped) = match (outer_field(left), outer_field(right)) {
+            (None, Some(o)) => (left, o, false),
+            (Some(o), None) => (right, o, true),
+            _ => return Err(err(format!("{left} {op} {right}: a correlated subquery compares its own columns with the outer row's"))),
+        };
+        let f = self.field_of(field).map_err(|_| err(format!("{left} {op} {right}: a correlated subquery of a table compares a column of the table with one of the outer row (cat = first.cat)")))?;
+        if matches!(self.schema.fields[f].ty, FieldType::Edges | FieldType::Text { .. } | FieldType::Vector { .. } | FieldType::Sparse) {
+            return Err(err(format!("{left} {op} {right}: a correlated subquery compares KEYWORD, INT, FLOAT, BOOL or TIMESTAMP fields")));
+        }
+        let op = match (op, flipped) {
+            (BinaryOperator::Eq, _) => CmpOp::Eq,
+            (BinaryOperator::NotEq, _) => CmpOp::Ne,
+            (BinaryOperator::Lt, false) | (BinaryOperator::Gt, true) => CmpOp::Lt,
+            (BinaryOperator::LtEq, false) | (BinaryOperator::GtEq, true) => CmpOp::Le,
+            (BinaryOperator::Gt, false) | (BinaryOperator::Lt, true) => CmpOp::Gt,
+            (BinaryOperator::GtEq, false) | (BinaryOperator::LtEq, true) => CmpOp::Ge,
+            (o, _) => return Err(err(format!("a correlated subquery compares with =, !=, <, <=, > or >=, not {o}"))),
+        };
+        Ok(Pred::Sub(Box::new(ir::Expr::Cmp { op, left: Box::new(ir::Expr::Field(f as u32)), right: Box::new(ir::Expr::Outer(outer)) })))
+    }
+
     fn sub_comparison(&self, left: &Expr, op: &BinaryOperator, right: &Expr) -> Result<Pred> {
         use BinaryOperator::*;
         let (field_e, q, op) = match (subquery_of(left), subquery_of(right)) {
@@ -1773,6 +1860,15 @@ impl<'a> Binder<'a> {
         if ok(&self.schema.fields[f].ty) { Ok(f) } else { Err(err(format!("{} is not a {what} field", self.schema.fields[f].name))) }
     }
 
+    /// The field of `LIKE` and `PREFIX()`: an indexed KEYWORD field.
+    fn prefix_field(&self, e: &Expr) -> Result<usize> {
+        let f = self.typed_field(e, |t| *t == FieldType::Keyword, "KEYWORD")?;
+        if !self.schema.fields[f].indexed {
+            return Err(err(format!("{} is not indexed", self.schema.fields[f].name)));
+        }
+        Ok(f)
+    }
+
     fn numeric_field(&self, e: &Expr) -> Result<usize> {
         self.typed_field(e, |t| matches!(t, FieldType::Int | FieldType::Float), "numeric")
     }
@@ -1875,6 +1971,18 @@ impl<'a> Binder<'a> {
         }
         if let Expr::Array(a) = e {
             return match &field.ty {
+                // ARRAY[ARRAY[...], ...], or ARRAY[:v1, :v2] of vector parameters.
+                FieldType::Vector { .. } if field.multi => {
+                    let rows = a
+                        .elem
+                        .iter()
+                        .map(|x| match x {
+                            Expr::Array(r) => Ok(Value::Vector(r.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<Vec<f32>>>()?.into())),
+                            x => Ok(Value::Vector(self.vector(x)?)),
+                        })
+                        .collect::<Result<Vec<Value>>>()?;
+                    Ok(crate::vector::multi::normalize(field, Value::List(rows))?)
+                }
                 FieldType::Vector { .. } => {
                     let xs: Vec<f32> = a.elem.iter().map(|x| self.num_lit(x).map(|v| v as f32)).collect::<Result<_>>()?;
                     Ok(Value::Vector(xs.into()))
@@ -1886,6 +1994,7 @@ impl<'a> Binder<'a> {
         let v = self.literal(e)?;
         Ok(match (&field.ty, v) {
             (_, Value::Null) => Value::Null,
+            (FieldType::Vector { .. }, v) if field.multi => crate::vector::multi::normalize(field, v)?,
             (FieldType::Vector { .. }, _) => Value::Vector(self.vector(e)?),
             (_, Value::Str(t)) if field.media.is_some() => media_input(field, t)?,
             (_, v) if field.media.is_some() => return Err(err(format!("{} is a MEDIA field: give it a URI or a JSON object's text, not {v:?}", field.name))),
@@ -2159,6 +2268,35 @@ fn as_list(v: Value) -> std::result::Result<Vec<Value>, Value> {
         Value::Vector(xs) if xs.iter().all(|x| x.fract() == 0.0 && x.abs() < 16_777_216.0) => Ok(xs.iter().map(|&x| Value::Int(x as i64)).collect()),
         v => Err(v),
     }
+}
+
+/// A `LIKE` pattern a KEYWORD field's index answers.
+#[derive(Debug, PartialEq)]
+enum LikePrefix {
+    /// No wildcard: equality with the value.
+    Exact(String),
+    /// Text, then `%` (one or more) at the end: a prefix.
+    Prefix(String),
+}
+
+/// `pattern` as an exact value or a prefix, with `escape` (if any) making
+/// the character after it literal; `_`, or `%` before the end, is refused.
+fn like_prefix(pattern: &str, escape: Option<char>) -> Result<LikePrefix> {
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if Some(c) == escape => out.push(chars.next().ok_or_else(|| err("LIKE pattern ends with its escape character"))?),
+            '%' if chars.all(|c| c == '%') => return Ok(LikePrefix::Prefix(out)),
+            '%' | '_' => {
+                return Err(err(format!(
+                    "LIKE on a table's KEYWORD field takes a value or a prefix ('abc%'), not {pattern:?}: '_', or '%' before the end, is not indexed"
+                )))
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(LikePrefix::Exact(out))
 }
 
 #[cfg(test)]

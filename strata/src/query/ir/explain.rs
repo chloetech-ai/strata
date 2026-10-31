@@ -305,6 +305,7 @@ impl<'a> Text<'a> {
             Expr::Like { expr, pattern, case_insensitive } => {
                 format!("{} {} {}", self.operand(expr, names), if *case_insensitive { "ILIKE" } else { "LIKE" }, self.operand(pattern, names))
             }
+            Expr::Prefix { expr, prefix } => format!("PREFIX({}, {})", self.expr(expr, names), self.expr(prefix, names)),
             Expr::Case { operand, whens, otherwise } => {
                 let mut s = "CASE".to_string();
                 if let Some(o) = operand {
@@ -398,6 +399,8 @@ impl<'a> Text<'a> {
             Expr::Keys(n) => format!("keys of {}", self.subquery(n)),
             Expr::Exists(n) => format!("EXISTS {}", self.subquery(n)),
             Expr::Scalar(n) => self.subquery(n),
+            Expr::Outer(n) => format!("outer ${n}"),
+            Expr::ByKey(vs) => format!("by key ({} rows)", vs.len()),
         }
     }
 

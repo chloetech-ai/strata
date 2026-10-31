@@ -42,6 +42,13 @@ place).
   python3 scripts/memory_bench.py history --scenario stockroom --lanes claude-mem
   python3 scripts/memory_bench.py run --scenario bakehouse --lanes engram+tool --lane-env engram+tool=ENGRAM_DEEP=tool
   python3 scripts/memory_bench.py report --scenario stockroom
+  python3 scripts/memory_bench.py run --scenario kestrel --lanes engram --variant engram+tail=ENGRAM_SESSION_CONTEXT=1 --lead-in "..."
+
+A --variant runs in its base lane's thread on the base lane's recorded
+history, with its variables added for the runs: two settings compared on the
+same snapshot, without the noise of recording the history twice. --lead-in
+starts each run's session with that prompt and gives the task as its second
+turn, so that what the session itself did is there when the task is asked.
 
 `run` records the history first where it is missing; `all` is `run` then
 `report`. Results go to --results (default results/memory_bench/<scenario>/):
@@ -424,9 +431,9 @@ class Lane:
         self.bin = os.path.join(self.dir, "bin")
         self.engram_home = os.path.join(self.home, "engram")
         self.hist_path = os.path.join(args.results, f"history_{slug(name)}.json")
-        self.patches = os.path.join(args.results, "patches", slug(name))
         self.meta_path = os.path.join(self.dir, "lane.json")
         self.meta = json.load(open(self.meta_path)) if os.path.exists(self.meta_path) else {}
+        self.run_extra_env = {}
 
     # -- environment
 
@@ -444,6 +451,8 @@ class Lane:
         env.update(self.meta.get("env", {}))
         env.update(self.d.get("env", {}))
         env.update(self.d.get(f"{phase}_env", {}))
+        if phase == "run":
+            env.update(self.run_extra_env)
         return env
 
     def claude_args(self, phase):
@@ -814,27 +823,37 @@ class Lane:
 
     # -- runs
 
-    def save_patch(self, task, rep):
-        os.makedirs(self.patches, exist_ok=True)
+    def save_patch(self, task, rep, name):
+        patches = os.path.join(self.args.results, "patches", slug(name))
+        os.makedirs(patches, exist_ok=True)
         snap = os.path.join(self.snap, "repo")
         p = subprocess.run(["git", "diff", "--no-index", "--", snap, self.repo], capture_output=True, text=True, errors="replace")
         keep = [b for b in re.split(r"(?m)^(?=diff --git )", p.stdout) if "/.git/" not in b.split("\n", 1)[0] and "__pycache__" not in b.split("\n", 1)[0]]
-        with open(os.path.join(self.patches, f"{task}_{rep}.patch"), "w", encoding="utf-8") as f:
+        with open(os.path.join(patches, f"{task}_{rep}.patch"), "w", encoding="utf-8") as f:
             f.write("".join(keep).replace(snap, "").replace(self.repo, ""))
 
-    def run(self, task, rep, hist, lock):
+    def run(self, task, rep, hist, lock, name=None):
+        """One run of `task`; `name` is this lane or one of its --variant lanes."""
+        name = name or self.name
+        self.run_extra_env = variants(self.args, self.name).get(name, {})
         if home_procs(self.home):
             kill_home_procs(self.home)
         self.restore()
         offs = self.memory_offsets()
-        label = f"run_{task['id']}_{rep}"
+        label = f"run_{task['id']}_{rep}" if name == self.name else f"run_{slug(name)}_{task['id']}_{rep}"
+        lead_in = self.args.lead_in and self.kind != "full"
         if self.kind == "full":
             out = self.claude(task["prompt"], "run", label, resume=hist["session"], fork=True)
+        elif lead_in:
+            # The task is the session's second turn; total_cost_usd counts both.
+            session = str(uuid.uuid4())
+            self.claude(self.args.lead_in, "run", f"{label}_lead_in", session=session)
+            out = self.claude(task["prompt"], "run", label, resume=session)
         else:
             out = self.claude(task["prompt"], "run", label, session=str(uuid.uuid4()))
         settle = self.settle("run")
         score, detail = task["grade"](self.repo, out.get("result") or "")
-        self.save_patch(task["id"], rep)
+        self.save_patch(task["id"], rep, name)
         sid = out.get("session_id")
         events = transcript_events(self.home, sid, since=out["t0"] - 5 if self.kind == "full" else None)
         ts = transcript_stats(events, self.memory_paths())
@@ -850,7 +869,7 @@ class Lane:
             # A fork's total_cost_usd includes everything its parent session spent.
             cost = max(0.0, raw_cost - (hist.get("final_session_cost_usd") or 0.0))
         row = {
-            "scenario": self.sc["name"], "lane": self.name, "task": task["id"], "kind": task.get("kind"), "repeat": rep,
+            "scenario": self.sc["name"], "lane": name, "task": task["id"], "kind": task.get("kind"), "repeat": rep, "lead_in": bool(lead_in),
             "score": score, "solved": score >= 1.0, "checks": detail,
             "cost_usd": cost, "cost_usd_reported": raw_cost, "steps": out.get("num_turns"), "wall_s": round(out["wall_s"], 1),
             "input_tokens": u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0),
@@ -866,6 +885,17 @@ class Lane:
             with open(os.path.join(self.args.results, "runs.jsonl"), "a") as f:
                 f.write(json.dumps(row) + "\n")
         return row
+
+
+def variants(args, base):
+    """The --variant lanes of lane `base`: {name: the variables they add}."""
+    out = {}
+    for spec in args.variant or []:
+        name, kv = spec.split("=", 1)
+        if name.rsplit("+", 1)[0] == base:
+            k, v = kv.split("=", 1)
+            out.setdefault(name, {})[k] = v
+    return out
 
 
 def lane_main(args, sc, name, lock, do_runs):
@@ -885,15 +915,16 @@ def lane_main(args, sc, name, lock, do_runs):
             r = json.loads(line)
             done.add((r["lane"], r["task"], r["repeat"]))
     tasks = [t for t in sc["tasks"] if not args.tasks or t["id"] in args.tasks]
-    jobs = [(t, r) for r in range(args.repeats) for t in tasks if (name, t["id"], r) not in done]
+    names = [name, *variants(args, name)]
+    jobs = [(t, r, n) for r in range(args.repeats) for t in tasks for n in names if (n, t["id"], r) not in done]
     random.Random(zlib.crc32(name.encode())).shuffle(jobs)
-    for i, (t, r) in enumerate(jobs, 1):
+    for i, (t, r, n) in enumerate(jobs, 1):
         try:
-            row = lane.run(t, r, hist, lock)
-            log(name, f"{i}/{len(jobs)} {t['id']:<22} score {row['score']:.2f} ${row['cost_usd'] or 0:.3f} (+${row['memory_cost_usd']:.3f} memory) "
+            row = lane.run(t, r, hist, lock, n)
+            log(n, f"{i}/{len(jobs)} {t['id']:<22} score {row['score']:.2f} ${row['cost_usd'] or 0:.3f} (+${row['memory_cost_usd']:.3f} memory) "
                       f"{row['steps']} steps {row['wall_s']:.0f} s, {row['memory_tool_calls']} memory tool calls")
         except Exception as e:  # noqa: BLE001 - reported; a rerun picks it up
-            log(name, f"{t['id']} repeat {r} failed: {type(e).__name__}: {e}")
+            log(n, f"{t['id']} repeat {r} failed: {type(e).__name__}: {e}")
             kill_home_procs(lane.home)
 
 
@@ -964,6 +995,9 @@ def cmd_report(args, sc):
     for lane in lanes:
         rs = [r for r in rows if r["lane"] == lane]
         hp = os.path.join(args.results, f"history_{slug(lane)}.json")
+        if not os.path.exists(hp) and "+" in lane:
+            # A --variant lane ran on its base lane's history.
+            hp = os.path.join(args.results, f"history_{slug(lane.rsplit('+', 1)[0])}.json")
         h = json.load(open(hp)) if os.path.exists(hp) else {}
         d = {"runs": len(rs), "solved": sum(r["solved"] for r in rs), "solved_rate": mean([r["solved"] for r in rs]), "score": mean([r["score"] for r in rs]),
              "cost_usd": mean([r["cost_usd"] or 0 for r in rs]), "memory_cost_usd": mean([r.get("memory_cost_usd") or 0 for r in rs]),
@@ -974,7 +1008,7 @@ def cmd_report(args, sc):
         for k in kinds:
             ks = [r for r in rs if (r.get("kind") or "?") == k]
             d["by_kind"][k] = {"runs": len(ks), "solved": sum(r["solved"] for r in ks), "score": mean([r["score"] for r in ks])}
-        for ref in ("none", "engram@main"):
+        for ref in dict.fromkeys(["none", "engram@main", lane.rsplit("+", 1)[0]]):
             if ref != lane and ref in lanes:
                 d["vs"][ref] = {"all": compare(rows, lane, ref, args.iters, rng)}
                 for k in kinds:
@@ -998,6 +1032,13 @@ def cmd_report(args, sc):
                   + " | ".join(f"{d['by_kind'][k]['solved']}/{d['by_kind'][k]['runs']}" for k in kinds)
                   + f" | {f2(d['cost_usd'], 3)} | {f2(d['memory_cost_usd'], 3)} | {f2(d['steps'], 1)} | {f2(d['wall_s'], 0)} | {f2(d['memory_tool_calls'], 1)} | "
                   f"{f2(hist['cost_usd'])} + {f2(hist['memory_cost_usd'])} | {pv(vn, 'fisher_solved_p')} / {pv(vn, 'perm_score_p')} | {pv(ve, 'fisher_solved_p')} / {pv(ve, 'perm_score_p')} |")
+    bases = [(lane, lane.rsplit("+", 1)[0]) for lane in out["lanes"] if "+" in lane and lane.rsplit("+", 1)[0] not in ("none", "engram@main", lane)]
+    bases = [(l, b) for l, b in bases if b in out["lanes"][l]["vs"]]
+    if bases:
+        md += ["", "Against the base lane (paired when the lane is a --variant):", "", "| lane | base | solved | base solved | p (Fisher / perm) |", "|---|---|---|---|---|"]
+        for l, b in bases:
+            c = out["lanes"][l]["vs"][b]["all"]
+            md.append(f"| {l} | {b} | {c['solved'][0]}/{c['runs'][0]} | {c['solved'][1]}/{c['runs'][1]} | {pv(c, 'fisher_solved_p')} / {pv(c, 'perm_score_p')} |")
     md += ["", "Per task (mean score):", "", "| task | kind | " + " | ".join(lanes) + " |", "|" + "---|" * (2 + len(lanes))]
     for tid, t in out["tasks"].items():
         md.append(f"| {tid} | {t['kind']} | " + " | ".join(f2(t.get(l)) for l in lanes) + " |")
@@ -1039,6 +1080,8 @@ def main():
     ap.add_argument("--engram-models", default="/home/claude/data/models")
     ap.add_argument("--lane-env", action="append", metavar="LANE=K=V", help="extra environment for a lane (repeatable)")
     ap.add_argument("--lane-bin", action="append", metavar="LANE=PATH", help="Engram binary for a lane")
+    ap.add_argument("--variant", action="append", metavar="LANE+SUFFIX=K=V", help="runs LANE's tasks again on its history with K=V (repeatable)")
+    ap.add_argument("--lead-in", default=None, help="a first prompt in each run's session; the task is its second turn")
     ap.add_argument("--budget", type=float, default=3.0, help="--max-budget-usd per claude call")
     ap.add_argument("--timeout", type=int, default=1500, help="seconds per claude call")
     ap.add_argument("--settle-timeout", type=int, default=600, help="seconds to wait for a memory system after a history session")

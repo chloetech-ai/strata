@@ -26,6 +26,9 @@ pub enum Pred {
     IntRange { field: usize, lo: i64, hi: i64 },
     /// Keyword (or numeric) equality with any of `values`.
     In { field: usize, values: Vec<Value> },
+    /// KEYWORD values starting with `prefix` (`LIKE 'p%'`, `PREFIX(f, 'p')`):
+    /// one run of the field's sorted dictionary.
+    Prefix { field: usize, prefix: String },
     /// Rows with a value of the field (`IS NOT NULL`; a multi-valued field
     /// needs at least one).
     Present { field: usize },
@@ -207,7 +210,7 @@ impl Pred {
             p if !negated => p,
             Pred::True => Pred::False,
             Pred::False => Pred::True,
-            p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. }) if !multi(field) => {
+            p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. } | Pred::Prefix { field, .. }) if !multi(field) => {
                 Pred::And(vec![Pred::Present { field }, Pred::Not(Box::new(p))])
             }
             p => Pred::Not(Box::new(p)),
@@ -346,6 +349,40 @@ pub enum Score {
     /// `CASE WHEN c THEN x ... ELSE y END`, each `c` a [`Score::Cond`]; NULL
     /// without an `ELSE`.
     Case { whens: Vec<(Score, Score)>, otherwise: Option<Box<Score>> },
+    /// A compound query's scalar subquery, which runs first: an
+    /// [`crate::query::ir::Expr::Scalar`], correlated or not; like
+    /// [`Pred::Sub`], never the executor's.
+    Sub(Box<crate::query::ir::Expr>),
+    /// The value each row has by its primary key, NULL for a row not
+    /// listed: what a correlated subquery took for the rows a Search
+    /// ranks ([`crate::query::ir::Expr::ByKey`]).
+    ByKey(Arc<ByKey>),
+}
+
+/// Numbers by primary key ([`Score::ByKey`]).
+#[derive(Debug)]
+pub struct ByKey {
+    pub values: Vec<crate::query::ir::KeyValue>,
+    index: std::collections::HashMap<crate::query::agg::Part, f64>,
+}
+
+impl ByKey {
+    pub fn new(values: Vec<crate::query::ir::KeyValue>) -> ByKey {
+        let index = values.iter().map(|kv| (crate::query::agg::Part::of(&kv.key), kv.value.unwrap_or(f64::NAN))).collect();
+        ByKey { values, index }
+    }
+
+    /// The value of the row whose key is `key`: NaN for NULL, or a row not
+    /// listed.
+    pub fn get(&self, key: &Value) -> f64 {
+        self.index.get(&crate::query::agg::Part::of(key)).copied().unwrap_or(f64::NAN)
+    }
+}
+
+impl PartialEq for ByKey {
+    fn eq(&self, other: &ByKey) -> bool {
+        self.values == other.values
+    }
 }
 
 impl Score {

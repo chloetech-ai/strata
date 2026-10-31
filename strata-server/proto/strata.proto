@@ -510,6 +510,13 @@ message Expr {
     Gbdt gbdt = 37;
     // AT_LEAST(need, conds...); plan feature "at_least".
     AtLeast at_least = 39;
+    // The values a correlated subquery took, by the primary key of each
+    // row it ranks; plan feature "correlated". Numbered from 60, the
+    // range of the ranking-context work.
+    ByKey by_key = 60;
+    // A column of the outer row inside a correlated subquery; plan
+    // feature "correlated".
+    uint32 outer = 61;
     // A ranking given as primary keys, best first (ranked(:keys)); plan
     // feature "ranked". Numbered from 70, the range of the semantic-ID
     // work.
@@ -518,6 +525,9 @@ message Expr {
     // range of the multi-vector work, so lanes building at once do not
     // collide.
     MaxSim maxsim = 80;
+    // PREFIX(x, p), and a table's kw LIKE 'p%'; plan feature "prefix".
+    // Numbered from 100, the range of the autocomplete work.
+    Prefix prefix = 100;
   }
 }
 
@@ -542,6 +552,16 @@ message Norm {
 
 message Ranked {
   repeated Value keys = 1;
+}
+
+message ByKey {
+  repeated KeyValue v = 1;
+}
+
+// A row's primary key and its value: none for NULL.
+message KeyValue {
+  Value key = 1;
+  optional double value = 2;
 }
 
 enum NormKind {
@@ -602,6 +622,11 @@ message Like {
   Expr expr = 1;
   Expr pattern = 2;
   bool case_insensitive = 3;
+}
+
+message Prefix {
+  Expr expr = 1;
+  Expr prefix = 2;
 }
 
 message Case {
@@ -878,4 +903,7 @@ message HealthResponse {
   uint64 docs = 2;
   uint64 segments = 3;
   uint64 txn = 4;
+  // The server's health, its latest point of rates and gauges, and its
+  // version, as JSON (`/v1/cluster` on a coordinator shows each copy's).
+  string detail = 5;
 }

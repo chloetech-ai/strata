@@ -7,7 +7,7 @@
 //!
 //! * [`schema`], [`value`]: tables, field types, documents; [`ingest`]:
 //!   rows from JSON, CSV and files; [`timestamp`]: TIMESTAMP values as
-//!   text.
+//!   text; `sqlite` (feature `sqlite`): SQLite databases in and out.
 //! * [`embed`]: the models that fill VECTOR fields declared with `embed`;
 //!   [`media`]: MEDIA values, and the files they name.
 //! * [`segment`]: the immutable unit of storage, a directory of aligned,
@@ -27,9 +27,13 @@
 //!   measurement harness; [`baselines`] (feature `baselines`): SQLite and
 //!   Tantivy behind the same interface.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 #[cfg(feature = "baselines")]
 pub mod baselines;
 pub mod beir;
+#[cfg(feature = "audio")]
+pub mod clap;
 pub mod cluster;
 pub mod data;
 pub mod db;
@@ -44,10 +48,13 @@ pub mod media;
 pub mod metrics;
 pub mod postings;
 pub mod query;
+pub mod rank_log;
 pub mod schema;
 pub mod segment;
 pub mod sid;
 pub mod simd;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod storage;
 pub mod text;
 pub mod timestamp;

@@ -162,6 +162,21 @@ The data is synthetic because the container could not download embeddings. How m
 
 Recall is against the exact answer, each row's best dot product with the query vectors over every row. Each added query vector costs about one more search: 0.22 ms with HNSW and 3.85 ms with the flat scan of 8-bit codes (the slope of mean latency over the number of vectors), against 0.19 ms and 4.0 ms for one `similarity` search; scoring the union exactly adds little. With one vector `maxsim` is `similarity`. `strata-maxsim-bench` measures it; the numbers are in `strata/results/vector/maxsim-200000x384.json`.
 
+## Multi-vector fields
+
+A `VECTOR(d)[]` field holds several vectors per row, and `maxsim(field, vectors)` ranks rows by the sum over query vectors of each one's best match among the row's vectors (ColBERT's and ColPali's late interaction). Measured on ViDoRe's DocVQA subset (`vidore/docvqa_test_subsampled_tesseract`: 500 pages, 500 questions, one page answering each), with pages and questions encoded by `vidore/colSmol-256M` (128 dimensions; 1,060 patch vectors per page and 20 per question on average; encoded on the CPU in bfloat16), `LIMIT 5`, one query thread, on the 4-core cloud container (Intel Xeon at 2.10 GHz, AVX-512 VNNI), not the M2:
+
+| layout | vectors a page | bytes a page | NDCG@5, cap 25 | p50 | NDCG@5, cap 200 (default) | p50 | p99 | NDCG@5, every page scored |
+|---|---|---|---|---|---|---|---|---|
+| binary codes searched, 8-bit codes scored (default) | 1,060 | 297 KB | 0.505 | 7.9 ms | 0.505 | 26.3 ms | 55.5 ms | 0.506 |
+| the same, float32 kept to score with (`keep_f32`) | 1,060 | 704 KB | 0.507 | 11.7 ms | 0.506 | 46.2 ms | 94.3 ms | 0.507 |
+| pooled at write, cosine ≥ 0.95 (`pool = 0.95`) | 666 | 187 KB | 0.503 | 7.5 ms | 0.503 | 18.9 ms | 38.5 ms | 0.503 |
+| pooled at write, cosine ≥ 0.9 (`pool = 0.9`) | 410 | 115 KB | 0.497 | 7.3 ms | 0.497 | 14.3 ms | 28.6 ms | 0.497 |
+
+The reference is the model's own float32 scores over every page: NDCG@5 0.507. BM25 over the pages' OCR text (the dataset's Tesseract output) scores 0.361 in 0.01 ms, and `rrf(bm25, maxsim)` 0.437: fusing with the weaker OCR ranking costs more than it adds here. Each query vector searches the field's binary codes (HNSW, 64 nearest vectors), a page's score from those searches picks the candidates, and the candidates are scored exactly with 8-bit codes; the cap is the number of candidates (`candidates =>`, at least `LIMIT`). Scoring every page exactly instead takes 1.4 s a question with 8-bit codes and 2.1 s with float32.
+
+Most of the default's 297 KB a page is the 8-bit codes (128 bytes a vector) and the HNSW graph over the vectors (128 bytes a vector at `m = 16`); the binary codes are 16 bytes a vector, against 512 for float32. On 500 pages a cap of 25 already finds what 200 does, at a third of the time; the default stays at 200 for larger collections, where the right page is more often outside the first candidates. Pooling at write merges a page's vectors whose cosine similarity is at least the threshold into their mean: 0.9 keeps 39% of the vectors for 0.008 NDCG@5 and halves the time at the default cap. `strata-multivector-bench` measures it from what `strata/scripts/vidore_encode.py` writes; the numbers are in `strata/results/vector/multivector-docvqa_test_subsampled_tesseract.json`.
+
 ## Filtered vector search and the planner
 
 Filtered vector search is where one fixed strategy cannot win:
@@ -197,7 +212,7 @@ Ten statements combine the workload's shapes: phrases with negation, prefixes, `
 - **Read your writes.** Committed documents are searchable at once. The first query after a write rebuilds the memtable's last 1,024-document chunk with every index of the evaluation table, which takes 17–20 ms; an unchunked memtable of 10,000 documents took 169 ms.
 - **Open.** Cold, opening takes 6.8 ms for 10 segments, 40 ms for 100 and 279 ms for 994 (6 ms warm). Replaying 10,000 WAL documents takes 34 ms at open, plus 207 ms to index them at the first query.
 - **Merges.** A tiered merge of eight 5,000-document segments, 10% deleted, rebuilds every index in 0.75 s, about 48,000 documents a second. After a delete-heavy workload the file is 1.22× its compacted size until `vacuum`.
-- **Recovery.** A crash test kills a writer with `SIGKILL` at a random moment during inserts, deletes, commits and flushes, then reopens. Every restart recovered a committed prefix: 20 runs by default, and 60 and 80 in longer runs. A damaged meta slot falls back to the other one, and so does a damaged newest version, after every commit of a workload of flushes, merges and a vacuum (`tests/storage_recovery.rs`). A simulated power loss at each of a workload's several hundred writes, truncations and syncs, with unsynced data kept or lost sector by sector, reopens to every acknowledged transaction with `sync`, and to the state after some transaction since the last flush without it; a full disk or a failing sync at each call leaves what was committed (`tests/storage_faults.rs`).
+- **Recovery.** A crash test kills a writer with `SIGKILL` at a random moment during inserts, deletes, commits and flushes, then reopens. Every restart recovered a committed prefix: 20 runs by default, and 60 and 80 in longer runs. A process killed while it creates databases, one after another, leaves each path a whole database or nothing. A damaged meta slot falls back to the other one, and so does a damaged newest version, after every commit of a workload of flushes, merges and a vacuum (`tests/storage_recovery.rs`). A simulated power loss at each of a workload's several hundred writes, truncations and syncs, with unsynced data kept or lost sector by sector, reopens to every acknowledged transaction with `sync`, and to the state after some transaction since the last flush without it; a full disk or a failing sync at each call leaves what was committed (`tests/storage_faults.rs`).
 
 ## Limitations
 

@@ -827,6 +827,19 @@ pub fn decode_image(_data: &[u8]) -> Result<crate::embed::Image> {
     Err(Error::Schema("decoding images needs Strata built with the `vision` feature".into()))
 }
 
+/// The sound of an audio file (WAV, FLAC, MP3, Ogg Vorbis, AAC in MP4) as
+/// one channel at its own rate (feature `audio`, [`crate::audio::decode`]).
+#[cfg(feature = "audio")]
+pub fn decode_audio(data: &[u8]) -> Result<crate::embed::Audio> {
+    crate::audio::decode(data)
+}
+
+/// Without the `audio` feature, audio is not decoded.
+#[cfg(not(feature = "audio"))]
+pub fn decode_audio(_data: &[u8]) -> Result<crate::embed::Audio> {
+    Err(Error::Schema("decoding audio needs Strata built with the `audio` feature".into()))
+}
+
 /// The bytes of base64 text, in the standard alphabet or the URL-safe
 /// one, padded or not, with any whitespace.
 pub fn base64_bytes(text: &str) -> std::result::Result<Vec<u8>, String> {
