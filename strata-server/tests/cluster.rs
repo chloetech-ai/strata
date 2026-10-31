@@ -308,7 +308,7 @@ async fn configure_refuses_what_would_lose_writes() {
     let d = dir.path();
     let (_, u) = serve(create(d, "a.strata", |i| i < 10), d, "a.strata").await;
     let mut c = pb::strata_client::StrataClient::connect(u.clone()).await.unwrap();
-    let ask = |role: pb::Role, replicas: Vec<String>, force: bool| pb::ConfigureRequest { role: role as i32, replicas, write_acks: String::new(), force };
+    let ask = |role: pb::Role, replicas: Vec<String>, force: bool| pb::ConfigureRequest { role: role as i32, replicas, write_acks: String::new(), force, promote: false };
     let e = c.configure(ask(pb::Role::Replica, vec![], false)).await.unwrap_err();
     assert!(e.message().contains("holds 10 rows"), "{}", e.message());
     let (_, r) = serve(create(d, "b.strata", |_| false), d, "b.strata").await;

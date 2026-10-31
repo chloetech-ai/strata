@@ -2092,10 +2092,18 @@ impl Coordinator {
 
     pub async fn health(&self) -> Json {
         let t = &self.topo();
+        // Each copy's health, and its part in replication said again: a
+        // copy failover changed may not have been asked since.
         let calls = t.replicas.iter().map(|rs| {
             join_all(rs.iter().map(|r| {
-                let mut c = r.client.clone();
-                async move { tokio::time::timeout(Duration::from_secs(2), c.health(pb::Empty {})).await }
+                let (mut c, mut h) = (r.client.clone(), r.client.clone());
+                async move {
+                    let (a, said) = tokio::join!(tokio::time::timeout(Duration::from_secs(2), c.health(pb::Empty {})), tokio::time::timeout(Duration::from_secs(2), hello(&mut h)));
+                    if let Ok(Ok(said)) = said {
+                        r.heard(&said);
+                    }
+                    a
+                }
             }))
         });
         let now = self.now_ms();
@@ -2125,6 +2133,7 @@ impl Coordinator {
                 }
                 if r.role() != pb::Role::Standalone {
                     j["role"] = json!(r.role().as_str_name().to_lowercase());
+                    j["term"] = json!(r.term.load(Ordering::Relaxed));
                 }
                 replicas.push(j);
             }
@@ -2135,6 +2144,14 @@ impl Coordinator {
             segments += s;
             let status = if counted.is_none() { "down" } else { "ok" };
             let mut shard = json!({"url": t.shards[i], "status": status, "docs": d, "segments": s});
+            // Two copies taking writes, each in its own term: the older
+            // has not heard of the newer yet.
+            let primaries: Vec<&str> = t.replicas[i].iter().filter(|r| r.takes_writes()).map(|r| r.url.as_str()).collect();
+            if primaries.len() > 1 {
+                all_up = false;
+                shard["primaries"] = json!(primaries);
+                shard["warning"] = json!(format!("{} copies say they are the shard's primary: the one of the older term has not heard of the newer yet, and takes no write a majority must acknowledge", primaries.len()));
+            }
             if t.replicas[i].len() > 1 {
                 shard["replicas"] = json!(replicas);
             } else if let Some(err) = replicas[0].get("error") {
@@ -2472,6 +2489,29 @@ impl Coordinator {
         Ok(json!({"epoch": map.epoch, "shard": i, "url": url, "primary": primary.url, "replicas": said.replicas, "write_acks": said.write_acks, "missed": missed}))
     }
 
+    /// Makes the replica `url` of shard `i` the shard's primary, once a
+    /// majority of the shard's copies vote for it (with `force`, asking
+    /// none): a primary that serves steps down and follows it. Every copy
+    /// is asked its part again, so that writes go to the new primary at
+    /// once.
+    pub async fn promote(&self, i: usize, url: &str, force: bool) -> Result<Json, ApiError> {
+        let t = self.topo();
+        let rs = t.replicas.get(i).ok_or_else(|| ApiError::bad(format!("there is no shard {i} of {}", t.replicas.len())))?;
+        let k = rs.iter().position(|r| r.url == url).ok_or_else(|| ApiError::bad(format!("{url} is not one of shard {i}'s servers")))?;
+        let mut c = rs[k].client.clone();
+        let r = pb::ConfigureRequest { role: pb::Role::Primary as i32, force, promote: true, ..Default::default() };
+        let said = configure_with(&mut c, url, r).await?;
+        let asks = rs.iter().enumerate().map(|(k, rep)| {
+            let mut c = rep.client.clone();
+            rep.protocol.store(0, Ordering::Relaxed);
+            let t = &t;
+            async move { self.speak(t, i, k, &mut c, PROTOCOL).await }
+        });
+        join_all(asks).await;
+        let primary = self.primary(&t, i).await?.map(|k| rs[k].url.clone());
+        Ok(json!({"shard": i, "url": url, "term": said.term, "seq_no": said.seq_no, "replicas": said.replicas, "write_acks": said.write_acks, "primary": primary}))
+    }
+
     /// Removes `url` from shard `i`'s servers: the coordinators stop
     /// reading from it, then its primary stops shipping to it. A shard's
     /// primary is not removed while other servers serve the shard
@@ -2504,7 +2544,11 @@ impl Coordinator {
 
 /// Sets the part in replication of the server at `url` (`Configure`).
 async fn configure(c: &mut Client, url: &str, role: pb::Role, replicas: Vec<String>, acks: Option<Acks>) -> Result<pb::ConfigureResponse, ApiError> {
-    let r = pb::ConfigureRequest { role: role as i32, replicas, write_acks: acks.map(|a| a.name().to_string()).unwrap_or_default(), force: false };
+    let r = pb::ConfigureRequest { role: role as i32, replicas, write_acks: acks.map(|a| a.name().to_string()).unwrap_or_default(), force: false, promote: false };
+    configure_with(c, url, r).await
+}
+
+async fn configure_with(c: &mut Client, url: &str, r: pb::ConfigureRequest) -> Result<pb::ConfigureResponse, ApiError> {
     match tokio::time::timeout(Duration::from_secs(30), c.configure(r)).await {
         Ok(Ok(a)) => Ok(a.into_inner()),
         Ok(Err(s)) => Err(ApiError { status: ApiError::from(s.clone()).status, message: format!("{url}: {}", s.message()) }),
