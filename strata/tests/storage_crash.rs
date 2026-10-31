@@ -11,6 +11,9 @@
 //! The same runs on a table with `cluster_by` and `retain`, whose flushes
 //! and merges reorder rows and drop expired ones: a tenth of the keys get
 //! a time a day past the retention, and may be there or not.
+//!
+//! A child that only creates databases, one after another, is killed too:
+//! each path must then hold a whole database or nothing.
 
 mod storage_util;
 
@@ -30,6 +33,7 @@ use strata::value::Document;
 use strata::Value;
 
 const CHILD_ENV: &str = "STRATA_CRASH_CHILD";
+const CREATE_ENV: &str = "STRATA_CREATE_CHILD";
 
 fn id_of(k: &str) -> u64 {
     k[1..].parse().unwrap()
@@ -250,6 +254,11 @@ fn killed_writer_recovers(name: &str, clustered: bool) {
         child.wait().unwrap();
 
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if !db_path.exists() {
+            // Killed before its database was created: nothing committed.
+            assert!(iter == 0 && !log.contains("C "), "iteration {iter}: the database is gone");
+            continue;
+        }
         // Keys that expire may be there or not.
         let kept = |s: &BTreeSet<u64>| s.iter().copied().filter(|&i| !(clustered && expires(i))).collect::<BTreeSet<u64>>();
         let cands: Vec<BTreeSet<u64>> = candidates(&state, &log).iter().map(kept).collect();
@@ -274,6 +283,60 @@ fn killed_writer_recovers(name: &str, clustered: bool) {
         db.check().unwrap();
         eprintln!("iteration {iter}: {txns} commits acknowledged, recovered {} keys", got.len());
         state = kept(&got);
+    }
+}
+
+/// A database's name in the layout `dir` names, as [`open_or_create`]
+/// reads it.
+fn db_name(n: u64, dir: bool) -> String {
+    format!("db-{n}.{}", if dir { "dir" } else { "strata" })
+}
+
+/// The creating child: creates `db-0`, `db-1`, ... in a folder until it is
+/// killed. Not a real test unless `CREATE_ENV` is set.
+#[test]
+fn create_child() {
+    let Ok(spec) = std::env::var(CREATE_ENV) else { return };
+    let (folder, dir) = spec.split_once('|').unwrap();
+    let layout = if dir == "dir" { strata::storage::Layout::Directory } else { strata::storage::Layout::SingleFile };
+    let src = Arc::new(MapSource::default());
+    let mut n = 0;
+    loop {
+        let path = Path::new(folder).join(db_name(n, layout == strata::storage::Layout::Directory));
+        drop(Database::create(&path, schema(), DbOptions { layout, sync: true, ..opts(&src) }).unwrap());
+        n += 1;
+    }
+}
+
+/// A create a kill interrupts leaves a database or nothing at its path:
+/// every path there opens, and the one it was creating can be created.
+#[test]
+fn killed_create_leaves_a_database_or_nothing() {
+    for dir in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let src = Arc::new(MapSource::default());
+        for iter in 0..20 {
+            let folder = tmp.path().join(format!("iter{iter}"));
+            std::fs::create_dir(&folder).unwrap();
+            let spec = format!("{}|{}", folder.display(), if dir { "dir" } else { "file" });
+            let mut child = Command::new(&exe).args(["create_child", "--exact", "--test-threads=1"]).env(CREATE_ENV, spec).stdout(Stdio::null()).spawn().unwrap();
+            std::thread::sleep(Duration::from_millis(rng.gen_range(2..40)));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let mut n = 0;
+            while folder.join(db_name(n, dir)).exists() {
+                let db = Database::open(&folder.join(db_name(n, dir)), opts(&src)).unwrap_or_else(|e| panic!("iteration {iter}: {} does not open: {e}", db_name(n, dir)));
+                assert_eq!(db.snapshot().n_live_docs(), 0);
+                db.check().unwrap();
+                n += 1;
+            }
+            assert!(!folder.join(db_name(n + 1, dir)).exists(), "iteration {iter}: {} is there without {}", db_name(n + 1, dir), db_name(n, dir));
+            let layout = if dir { strata::storage::Layout::Directory } else { strata::storage::Layout::SingleFile };
+            let db = Database::create(&folder.join(db_name(n, dir)), schema(), DbOptions { layout, ..opts(&src) }).unwrap_or_else(|e| panic!("iteration {iter}: {} cannot be created: {e}", db_name(n, dir)));
+            db.check().unwrap();
+        }
     }
 }
 
