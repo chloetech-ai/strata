@@ -151,22 +151,10 @@ impl TextFieldReader {
     }
 
     /// The indexed terms within `edits` edits of `term` (itself included),
-    /// with their entries and distances, in dictionary order.
+    /// with their entries and distances, in dictionary order
+    /// ([`Dict::fuzzy`]).
     pub fn fuzzy_terms(&self, term: &str, edits: u8) -> Vec<(String, TermInfo, u8)> {
-        let q: Vec<char> = term.chars().collect();
-        let (lo, hi) = (q.len().saturating_sub(edits as usize), q.len() + edits as usize);
-        let mut out = Vec::new();
-        self.dict.for_each(|t, info| {
-            // Bytes bound letters from above, and from below by a factor of 4.
-            if t.len() < lo || t.len() > 4 * hi {
-                return;
-            }
-            let Ok(t) = std::str::from_utf8(t) else { return };
-            if let Some(d) = super::fuzzy::within(&q, t, edits) {
-                out.push((t.to_string(), info, d));
-            }
-        });
-        out
+        self.dict.fuzzy(term, edits)
     }
 
     fn fuzzy_infos(&self, term: &str, edits: u8) -> Vec<TermInfo> {

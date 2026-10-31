@@ -355,6 +355,137 @@ impl Dict {
             && matches!(self.firsts, Slice::Shared { .. })
             && matches!(self.blocks, Slice::Shared { .. })
     }
+
+    /// The terms within `edits` edits of `term` (itself included), with
+    /// their entries and distances, in order: a walk of the dictionary as a
+    /// trie ([`super::fuzzy::walk`]), which reads the terms near the word
+    /// rather than every term.
+    pub fn fuzzy(&self, term: &str, edits: u8) -> Vec<(String, TermInfo, u8)> {
+        use super::fuzzy::Sorted;
+        let q: Vec<char> = term.chars().collect();
+        let mut out = Vec::new();
+        super::fuzzy::walk(&q, edits, super::fuzzy::Match::Whole, &mut self.cursor(), |c, _, d| {
+            out.push((String::from_utf8_lossy(c.term().unwrap_or_default()).into_owned(), c.info(), d));
+        });
+        out
+    }
+
+    /// [`Self::fuzzy`] by a test of every term, as Strata found them before
+    /// the walk; for comparisons.
+    pub fn fuzzy_scan(&self, term: &str, edits: u8) -> Vec<(String, TermInfo, u8)> {
+        let q: Vec<char> = term.chars().collect();
+        let (lo, hi) = (q.len().saturating_sub(edits as usize), q.len() + edits as usize);
+        let mut out = Vec::new();
+        self.for_each(|t, info| {
+            // Bytes bound letters from above, and from below by a factor of 4.
+            if t.len() < lo || t.len() > 4 * hi {
+                return;
+            }
+            let Ok(t) = std::str::from_utf8(t) else { return };
+            if let Some(d) = super::fuzzy::within(&q, t, edits) {
+                out.push((t.to_string(), info, d));
+            }
+        });
+        out
+    }
+
+    /// A cursor on the first term, for walks that jump ahead
+    /// ([`super::fuzzy::walk`]).
+    pub fn cursor(&self) -> DictCursor<'_> {
+        let mut c = DictCursor { dict: self, ord: 0, at: 0, end: 0, term: Vec::new(), info: TermInfo::default() };
+        if self.n_blocks > 0 {
+            c.load(0);
+        }
+        c
+    }
+}
+
+/// The terms of a [`Dict`] in order, decoded one at a time, that can jump
+/// ahead by the index.
+pub struct DictCursor<'d> {
+    dict: &'d Dict,
+    /// The current term's rank (`n_terms` past the last).
+    ord: usize,
+    /// Where the current block's next entry starts, and where it ends.
+    at: usize,
+    end: usize,
+    term: Vec<u8>,
+    info: TermInfo,
+}
+
+impl DictCursor<'_> {
+    /// The current term's entry.
+    pub fn info(&self) -> TermInfo {
+        self.info
+    }
+
+    /// Moves to block `b`'s first term.
+    fn load(&mut self, b: usize) {
+        let d = self.dict;
+        self.ord = b * DICT_BLOCK;
+        (self.at, self.end) = (d.block_off(b), d.block_off(b + 1));
+        self.term.clear();
+        self.term.extend_from_slice(d.first(b));
+        self.info.post_off = d.index[REC * b + 2];
+        self.info.pos_off = d.index[REC * b + 3];
+        self.lengths();
+    }
+
+    /// Reads the current entry's lengths, after its term.
+    fn lengths(&mut self) {
+        let data = &self.dict.blocks[..self.end];
+        self.info.ord = self.ord as u32;
+        self.info.df = get_varint(data, &mut self.at) as u32;
+        self.info.post_len = get_varint(data, &mut self.at);
+        self.info.pos_len = get_varint(data, &mut self.at);
+    }
+}
+
+impl super::fuzzy::Sorted for DictCursor<'_> {
+    fn term(&self) -> Option<&[u8]> {
+        (self.ord < self.dict.n_terms as usize).then_some(&self.term[..])
+    }
+
+    fn pos(&self) -> usize {
+        self.ord
+    }
+
+    fn next(&mut self) {
+        let n = self.dict.n_terms as usize;
+        if self.ord >= n {
+            return;
+        }
+        self.ord += 1;
+        if self.ord == n {
+            return;
+        }
+        if self.ord.is_multiple_of(DICT_BLOCK) {
+            self.load(self.ord / DICT_BLOCK);
+            return;
+        }
+        let data = &self.dict.blocks[..self.end];
+        let prefix = get_varint(data, &mut self.at) as usize;
+        let len = get_varint(data, &mut self.at) as usize;
+        let suffix = data.get(self.at..self.at + len).unwrap_or(&[]);
+        self.term.truncate(prefix);
+        self.term.extend_from_slice(suffix);
+        self.at += len;
+        self.info.post_off += self.info.post_len;
+        self.info.pos_off += self.info.pos_len;
+        self.lengths();
+    }
+
+    fn seek(&mut self, t: &[u8]) {
+        // The first term at or after `t` is in the last block whose first
+        // term is below `t`, or starts the next one.
+        let b = self.dict.blocks_below(t, false).saturating_sub(1);
+        if b * DICT_BLOCK > self.ord {
+            self.load(b);
+        }
+        while super::fuzzy::Sorted::term(self).is_some_and(|cur| cur < t) {
+            super::fuzzy::Sorted::next(self);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +526,63 @@ mod tests {
             n += 1;
         });
         assert_eq!(n, terms.len());
+    }
+
+    /// The cursor reads every term with its entry, seeks land on the first
+    /// term at or after the target, and a typo walk over it finds what a
+    /// scan of every term finds, across blocks and index pages.
+    #[test]
+    fn cursor_seeks_and_walks() {
+        use super::super::fuzzy::{walk, within, Match, Sorted};
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let letters = ['a', 'b', 'c', 'd', 'n', 'o', 'é'];
+        let mut terms: Vec<String> = (0..12_000).map(|_| (0..1 + next() % 9).map(|_| letters[(next() % 7) as usize]).collect()).collect();
+        terms.sort();
+        terms.dedup();
+        let mut b = DictBuilder::new();
+        for (i, t) in terms.iter().enumerate() {
+            b.add(t.as_bytes(), i as u32 + 1, 3, 1);
+        }
+        let d = Dict::open(OwnedBytes::new(b.finish())).unwrap();
+        let mut all = Vec::new();
+        d.for_each(|t, info| all.push((t.to_vec(), info)));
+        let mut c = d.cursor();
+        for (t, info) in &all {
+            assert_eq!((c.term(), c.info()), (Some(&t[..]), *info));
+            c.next();
+        }
+        assert_eq!(c.term(), None);
+        for _ in 0..300 {
+            let mut c = d.cursor();
+            let mut at = 0;
+            for _ in 0..4 {
+                let target: String = (0..next() % 5).map(|_| letters[(next() % 7) as usize]).collect();
+                let want = terms.partition_point(|t| t.as_str() < target.as_str()).max(at);
+                c.seek(target.as_bytes());
+                assert_eq!(c.pos(), want, "seek {target:?}");
+                assert_eq!(c.term(), terms.get(want).map(|t| t.as_bytes()));
+                if let Some(t) = c.term() {
+                    assert_eq!(c.info(), d.get(std::str::from_utf8(t).unwrap()).unwrap());
+                }
+                at = want;
+            }
+        }
+        for q in ["", "a", "nod", "abcd", "ééa", "donabc", "oooooooooo"] {
+            let q: Vec<char> = q.chars().collect();
+            for k in 0..=2 {
+                let want: Vec<(TermInfo, u8)> = all.iter().filter_map(|(t, i)| within(&q, std::str::from_utf8(t).unwrap(), k).map(|e| (*i, e))).collect();
+                let mut got = Vec::new();
+                walk(&q, k, Match::Whole, &mut d.cursor(), |c, _, e| got.push((c.info(), e)));
+                assert_eq!(got, want, "{q:?} within {k}");
+                let w: String = q.iter().collect();
+                assert_eq!(d.fuzzy(&w, k), d.fuzzy_scan(&w, k), "{q:?} within {k}");
+            }
+        }
     }
 }

@@ -39,6 +39,10 @@ def test_builder_runs_as_its_sql(db):
     r = same(db, t.select("id").where(col("id").startswith("b000") & ~col("genres").startswith("cl")).order_by(col("year")),
              "SELECT id FROM books WHERE PREFIX(id, 'b000') AND NOT PREFIX(genres, 'cl') ORDER BY year")
     assert len(r) > 0
+    # With typos: 'calssic' is a swap away from 'classic'.
+    r = same(db, t.select("id").where(col("genres").startswith("calssic", fuzzy="auto")).order_by(col("year")),
+             "SELECT id FROM books WHERE PREFIX(genres, 'calssic', fuzzy => 'auto') ORDER BY year")
+    assert len(r) > 0 and r.rows == db.query("SELECT id FROM books WHERE genres IN ('classic') ORDER BY year").rows
     # Without select: the stored fields but vectors, as SELECT * gives.
     same(db, t.where(col("id") == "b0007"), "SELECT * FROM books WHERE id = 'b0007'")
 

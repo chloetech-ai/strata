@@ -10,11 +10,14 @@
 //!   query the table.
 //! * [`replication`]: a primary shipping its writes to its replicas.
 //! * [`media`]: fetching the files MEDIA fields name over HTTP(S).
+//! * [`keys`]: API keys with scopes, and the audit log; [`alerts`]: alert
+//!   rules over the series.
 //! * [`obs`]: logs and request ids; [`metrics`]: what `/metrics` serves;
 //!   [`telemetry`]: the running and latest queries, their traces, and the
 //!   series of rates and gauges the UI draws.
 
 pub mod agent;
+pub mod alerts;
 pub mod auth;
 pub mod coord;
 pub mod demo;
@@ -22,6 +25,7 @@ pub mod grpc;
 pub mod http;
 pub mod idem;
 pub mod json;
+pub mod keys;
 pub mod media;
 pub mod metrics;
 pub mod obs;

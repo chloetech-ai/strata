@@ -62,8 +62,8 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 16] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, MIN_MATCH];
+pub const FEATURES: [&str; 17] =
+    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -128,6 +128,10 @@ pub const PREFIX: &str = "prefix";
 /// The feature of a plan with a correlated subquery ([`Expr::Outer`]), or
 /// the values one took for a Search's rows ([`Expr::ByKey`]).
 pub const CORRELATED: &str = "correlated";
+
+/// The feature of a plan with a prefix that allows typos ([`Expr::Prefix`]
+/// with `edits`), which a Strata from before them would read as exact.
+pub const PREFIX_EDITS: &str = "prefix_edits";
 
 /// The feature of a plan whose text a row must match some of: a `MATCH`
 /// group `(a b c)@2`, or `bm25`'s `min` option. A Strata from before them
@@ -604,8 +608,15 @@ pub enum Expr {
     /// Whether text `expr` starts with text `prefix` (`PREFIX(x, p)`, and a
     /// table's `kw LIKE 'p%'`): NULL unless both are text. A Search's
     /// filter reads it as a run of a KEYWORD field's dictionary (feature
-    /// [`PREFIX`]).
-    Prefix { expr: Box<Expr>, prefix: Box<Expr> },
+    /// [`PREFIX`]). With `edits`, whether it starts with a prefix within
+    /// that many edits of `prefix` whose first letter is its own
+    /// (`PREFIX(x, p, fuzzy => 1)`, feature [`PREFIX_EDITS`]).
+    Prefix {
+        expr: Box<Expr>,
+        prefix: Box<Expr>,
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        edits: u8,
+    },
     /// `CASE [operand] WHEN .. THEN .. [ELSE ..] END`: the first branch
     /// whose `when` is TRUE (or equals the operand), else `otherwise`, else
     /// NULL.
@@ -1400,7 +1411,7 @@ impl Expr {
                 expr.visit(f);
                 list.iter().for_each(|x| x.visit(f));
             }
-            Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern } => {
+            Expr::Like { expr, pattern, .. } | Expr::Prefix { expr, prefix: pattern, .. } => {
                 expr.visit(f);
                 pattern.visit(f);
             }
@@ -1430,7 +1441,7 @@ impl Expr {
             Expr::Not(x) | Expr::IsNull(x) | Expr::Neg(x) | Expr::Norm { input: x, .. } | Expr::MaxSim { vectors: x, .. } => within.push(x),
             Expr::And(xs) | Expr::Or(xs) | Expr::Concat(xs) | Expr::Product(xs) | Expr::Call { args: xs, .. } | Expr::Gbdt { args: xs, .. } | Expr::Rrf { inputs: xs, .. } => within.extend(xs.iter_mut()),
             Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } | Expr::Like { expr: left, pattern: right, .. }
-            | Expr::Prefix { expr: left, prefix: right } => within.extend([&mut **left, &mut **right]),
+            | Expr::Prefix { expr: left, prefix: right, .. } => within.extend([&mut **left, &mut **right]),
             Expr::Between { expr, lo, hi } => {
                 within.push(expr);
                 within.extend(lo.iter_mut().chain(hi.iter_mut()).map(|x| &mut **x));
@@ -1465,6 +1476,10 @@ impl Expr {
 }
 
 fn is_zero(x: &u64) -> bool {
+    *x == 0
+}
+
+fn is_zero_u8(x: &u8) -> bool {
     *x == 0
 }
 
@@ -1513,10 +1528,17 @@ impl Plan {
         if root.has_models() {
             features.push(RANK_MODELS.to_string());
         }
-        let mut prefix = false;
-        root.visit_exprs(&mut |e| prefix |= matches!(e, Expr::Prefix { .. }));
+        let (mut prefix, mut edits) = (false, false);
+        root.visit_exprs(&mut |e| {
+            if let Expr::Prefix { edits: k, .. } = e {
+                (prefix, edits) = (true, edits || *k > 0);
+            }
+        });
         if prefix {
             features.push(PREFIX.to_string());
+        }
+        if edits {
+            features.push(PREFIX_EDITS.to_string());
         }
         let mut distinct_on = root.keeps_firsts();
         root.visit_exprs(&mut |e| {

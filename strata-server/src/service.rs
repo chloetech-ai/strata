@@ -34,6 +34,8 @@ use crate::idem;
 use crate::replication::{Acks, Follow, Primary, PrimaryOptions, READ_WAIT};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
+use crate::alerts::Alerts;
+use crate::keys::{Audit, Keys, Scope};
 use crate::telemetry::{self, LiveQueries, QueryLog, Sample, Series};
 use crate::{json as js, obs, pb, ApiError};
 
@@ -157,6 +159,11 @@ pub struct Service {
     pub series: Series,
     /// When the server started.
     pub started: std::time::SystemTime,
+    /// The API keys ([`crate::keys`]), the audit log, and the alert rules
+    /// the sampler checks.
+    pub keys: Arc<Keys>,
+    pub audit: Audit,
+    pub alerts: Alerts,
     /// The embedded VECTOR fields' models, of every table
     /// ([`Service::open_models`], [`Service::models`]).
     models: RwLock<Arc<Vec<FieldModel>>>,
@@ -258,6 +265,9 @@ impl Service {
             query_log: QueryLog::default(),
             series: Series::default(),
             started: std::time::SystemTime::now(),
+            keys: Arc::new(Keys::memory()),
+            audit: Audit::new(None).expect("an audit log in memory"),
+            alerts: Alerts::new(None, None).expect("the default alert rules"),
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
             ranking: Models::default(),
@@ -1564,6 +1574,16 @@ impl Service {
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
+    /// The scope a SQL statement needs ([`crate::keys`]): a query read, a
+    /// write write, and a table's or rank profile's statement admin.
+    pub async fn statement_scope(&self, sql: &str, params: &Params) -> Result<Scope, ApiError> {
+        Ok(match self.bound(|tables| bind_command(sql, tables, params)).await? {
+            Command::Query | Command::Explain { .. } => Scope::Read,
+            Command::Write { .. } => Scope::Write,
+            Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
+        })
+    }
+
     /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
     /// PROFILE`: on a local database, once no write holds the writer;
     /// through a coordinator, on every shard ([`Coordinator::ddl`]). A
@@ -2031,6 +2051,9 @@ impl Service {
         if let Some(b) = &self.query_memory {
             g.insert("query_memory_bytes", b.used() as f64);
             g.insert("query_memory_limit_bytes", b.limit() as f64);
+            if b.limit() > 0 {
+                g.insert("query_memory_ratio", b.used() as f64 / b.limit() as f64);
+            }
         }
         if let Backend::Local(db) = &self.backend {
             let snap = db.snapshot();
@@ -2059,6 +2082,9 @@ impl Service {
             if let Some((total, _, avail)) = telemetry::disk(db.storage().path()) {
                 g.insert("disk_total_bytes", total as f64);
                 g.insert("disk_free_bytes", avail as f64);
+                if total > 0 {
+                    g.insert("disk_used_ratio", 1.0 - avail as f64 / total as f64);
+                }
             }
             match &self.replication() {
                 Replication::None => {}
@@ -2066,7 +2092,9 @@ impl Service {
                     let h = p.health();
                     let rs = h["replicas"].as_array().cloned().unwrap_or_default();
                     g.insert("replicas", rs.len() as f64);
-                    g.insert("replicas_in_sync", rs.iter().filter(|r| r["in_sync"] == true).count() as f64);
+                    let in_sync = rs.iter().filter(|r| r["in_sync"] == true).count();
+                    g.insert("replicas_in_sync", in_sync as f64);
+                    g.insert("replicas_out_of_sync", (rs.len() - in_sync) as f64);
                     g.insert("replica_behind_max", rs.iter().filter_map(|r| r["behind"].as_f64()).fold(0.0, f64::max));
                     g.insert("seq_no", h["seq_no"].as_f64().unwrap_or(0.0));
                 }
@@ -2141,7 +2169,11 @@ impl Service {
     /// (each serves its own); it shows how its calls to them went.
     pub async fn prometheus(self: &Arc<Self>) -> String {
         let one = Family::one;
-        let mut more = vec![one("strata_queries_running", "gauge", "Queries running now, those whose callers stopped waiting included.", self.running() as f64)];
+        let mut more = vec![
+            one("strata_queries_running", "gauge", "Queries running now, those whose callers stopped waiting included.", self.running() as f64),
+            Family { name: "strata_alerts_firing", ty: "gauge", help: "Alerts firing now, by severity (GET /v1/alerts).", values: self.alerts.firing() },
+            one("strata_api_keys", "gauge", "API keys the server holds (GET /v1/admin/keys).", self.keys.list().len() as f64),
+        ];
         if let Some(b) = &self.query_memory {
             more.extend([
                 one("strata_query_memory_bytes", "gauge", "Memory the running queries hold, as counted against their budget.", b.used() as f64),

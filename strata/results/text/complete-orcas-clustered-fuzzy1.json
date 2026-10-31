@@ -1,0 +1,384 @@
+{
+  "data": {
+    "clicks": 18823591,
+    "name": "orcas-clustered-fuzzy1",
+    "queries": 10405341
+  },
+  "machine": {
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz"
+  },
+  "params": {
+    "cluster_by": "id",
+    "load_s": 40.342516885,
+    "samples": 2000,
+    "sql": "SELECT id, n FROM queries WHERE PREFIX(id, :p, fuzzy => 1) ORDER BY n DESC, id LIMIT 10",
+    "threads_query": 1
+  },
+  "states": [
+    {
+      "method": "rows",
+      "runs": [
+        {
+          "chars": 1,
+          "checked": 5,
+          "max_ms": 44.582768,
+          "max_rows": 1015589.0,
+          "mean_ms": 14.134353968499996,
+          "median_rows": 560354.0,
+          "p50_ms": 13.457876,
+          "p90_ms": 22.403569,
+          "p99_ms": 37.550523000000005,
+          "prefixes": 2000
+        },
+        {
+          "chars": 2,
+          "checked": 5,
+          "max_ms": 40.445689,
+          "max_rows": 1015589.0,
+          "mean_ms": 14.17778951625813,
+          "median_rows": 560354.0,
+          "p50_ms": 13.702539,
+          "p90_ms": 22.37455,
+          "p99_ms": 34.619638,
+          "prefixes": 1999
+        },
+        {
+          "chars": 3,
+          "checked": 5,
+          "max_ms": 39.935295,
+          "max_rows": 664876.0,
+          "mean_ms": 11.439184078078124,
+          "median_rows": 115982.0,
+          "p50_ms": 10.767506,
+          "p90_ms": 17.943256,
+          "p99_ms": 26.747291,
+          "prefixes": 1998
+        },
+        {
+          "chars": 4,
+          "checked": 5,
+          "max_ms": 31.091694,
+          "max_rows": 495934.0,
+          "mean_ms": 10.137235986452584,
+          "median_rows": 20049.0,
+          "p50_ms": 9.635605,
+          "p90_ms": 15.899884,
+          "p99_ms": 23.536014,
+          "prefixes": 1993
+        },
+        {
+          "chars": 6,
+          "checked": 5,
+          "max_ms": 26.072392999999998,
+          "max_rows": 370346.0,
+          "mean_ms": 9.704411011764696,
+          "median_rows": 1685.0,
+          "p50_ms": 9.198878,
+          "p90_ms": 14.336952,
+          "p99_ms": 18.718474999999998,
+          "prefixes": 1955
+        },
+        {
+          "chars": 8,
+          "checked": 5,
+          "max_ms": 31.213034,
+          "max_rows": 231777.0,
+          "mean_ms": 10.668978107822403,
+          "median_rows": 318.0,
+          "p50_ms": 10.422373,
+          "p90_ms": 15.46224,
+          "p99_ms": 20.022297000000002,
+          "prefixes": 1892
+        },
+        {
+          "chars": 12,
+          "checked": 5,
+          "max_ms": 45.028437999999994,
+          "max_rows": 32634.0,
+          "mean_ms": 11.89021498150358,
+          "median_rows": 19.0,
+          "p50_ms": 11.534694,
+          "p90_ms": 17.090268,
+          "p99_ms": 23.231239000000002,
+          "prefixes": 1676
+        }
+      ],
+      "segments": 105,
+      "state": "loaded"
+    },
+    {
+      "method": "blocks",
+      "runs": [
+        {
+          "chars": 1,
+          "checked": 5,
+          "max_ms": 1.836237,
+          "max_rows": 1015589.0,
+          "mean_ms": 0.6694552305000001,
+          "median_rows": 560354.0,
+          "p50_ms": 0.657204,
+          "p90_ms": 0.802857,
+          "p99_ms": 1.246108,
+          "prefixes": 2000
+        },
+        {
+          "chars": 2,
+          "checked": 5,
+          "max_ms": 5.792096,
+          "max_rows": 1015589.0,
+          "mean_ms": 0.7483533856928472,
+          "median_rows": 560354.0,
+          "p50_ms": 0.7085509999999999,
+          "p90_ms": 0.8670760000000001,
+          "p99_ms": 1.5616199999999998,
+          "prefixes": 1999
+        },
+        {
+          "chars": 3,
+          "checked": 5,
+          "max_ms": 15.514818,
+          "max_rows": 664876.0,
+          "mean_ms": 7.13220682182182,
+          "median_rows": 115982.0,
+          "p50_ms": 6.931337,
+          "p90_ms": 10.304412000000001,
+          "p99_ms": 13.452743,
+          "prefixes": 1998
+        },
+        {
+          "chars": 4,
+          "checked": 5,
+          "max_ms": 26.264464,
+          "max_rows": 495934.0,
+          "mean_ms": 8.375375834420474,
+          "median_rows": 20049.0,
+          "p50_ms": 7.931914999999999,
+          "p90_ms": 11.845947,
+          "p99_ms": 15.764070000000002,
+          "prefixes": 1993
+        },
+        {
+          "chars": 6,
+          "checked": 5,
+          "max_ms": 23.113439,
+          "max_rows": 370346.0,
+          "mean_ms": 9.775757417391299,
+          "median_rows": 1685.0,
+          "p50_ms": 9.542258,
+          "p90_ms": 13.843732,
+          "p99_ms": 18.171314000000002,
+          "prefixes": 1955
+        },
+        {
+          "chars": 8,
+          "checked": 5,
+          "max_ms": 24.277311,
+          "max_rows": 231777.0,
+          "mean_ms": 10.184310614164911,
+          "median_rows": 318.0,
+          "p50_ms": 10.036235,
+          "p90_ms": 14.273381,
+          "p99_ms": 18.444775,
+          "prefixes": 1892
+        },
+        {
+          "chars": 12,
+          "checked": 5,
+          "max_ms": 34.462013999999996,
+          "max_rows": 32634.0,
+          "mean_ms": 12.339988460620528,
+          "median_rows": 19.0,
+          "p50_ms": 12.017399,
+          "p90_ms": 18.143319,
+          "p99_ms": 25.280269,
+          "prefixes": 1676
+        }
+      ],
+      "segments": 105,
+      "state": "loaded"
+    },
+    {
+      "method": "rows",
+      "runs": [
+        {
+          "chars": 1,
+          "checked": 5,
+          "max_ms": 51.309299,
+          "max_rows": 1015589.0,
+          "mean_ms": 13.267955464000007,
+          "median_rows": 560354.0,
+          "p50_ms": 12.8606,
+          "p90_ms": 21.210816,
+          "p99_ms": 33.485148,
+          "prefixes": 2000
+        },
+        {
+          "chars": 2,
+          "checked": 5,
+          "max_ms": 44.414719999999996,
+          "max_rows": 1015589.0,
+          "mean_ms": 13.293853437218614,
+          "median_rows": 560354.0,
+          "p50_ms": 12.724901000000001,
+          "p90_ms": 21.014568,
+          "p99_ms": 32.931996999999996,
+          "prefixes": 1999
+        },
+        {
+          "chars": 3,
+          "checked": 5,
+          "max_ms": 29.786047999999997,
+          "max_rows": 664876.0,
+          "mean_ms": 6.83399387487488,
+          "median_rows": 115982.0,
+          "p50_ms": 5.59647,
+          "p90_ms": 13.046019000000001,
+          "p99_ms": 22.359501,
+          "prefixes": 1998
+        },
+        {
+          "chars": 4,
+          "checked": 5,
+          "max_ms": 22.250075000000002,
+          "max_rows": 495934.0,
+          "mean_ms": 4.672211312092323,
+          "median_rows": 20049.0,
+          "p50_ms": 3.830572,
+          "p90_ms": 7.613741999999999,
+          "p99_ms": 18.44519,
+          "prefixes": 1993
+        },
+        {
+          "chars": 6,
+          "checked": 5,
+          "max_ms": 18.816005,
+          "max_rows": 370346.0,
+          "mean_ms": 3.886719557544757,
+          "median_rows": 1685.0,
+          "p50_ms": 3.379254,
+          "p90_ms": 5.51963,
+          "p99_ms": 14.28201,
+          "prefixes": 1955
+        },
+        {
+          "chars": 8,
+          "checked": 5,
+          "max_ms": 15.070977,
+          "max_rows": 231777.0,
+          "mean_ms": 3.561595610993649,
+          "median_rows": 318.0,
+          "p50_ms": 3.374342,
+          "p90_ms": 4.8752960000000005,
+          "p99_ms": 8.863062999999999,
+          "prefixes": 1892
+        },
+        {
+          "chars": 12,
+          "checked": 5,
+          "max_ms": 13.540992,
+          "max_rows": 32634.0,
+          "mean_ms": 3.9848507857995212,
+          "median_rows": 19.0,
+          "p50_ms": 3.807125,
+          "p90_ms": 5.883094,
+          "p99_ms": 8.569258,
+          "prefixes": 1676
+        }
+      ],
+      "segments": 11,
+      "state": "merged"
+    },
+    {
+      "method": "blocks",
+      "runs": [
+        {
+          "chars": 1,
+          "checked": 5,
+          "max_ms": 0.633977,
+          "max_rows": 1015589.0,
+          "mean_ms": 0.1996849665,
+          "median_rows": 560354.0,
+          "p50_ms": 0.188008,
+          "p90_ms": 0.262997,
+          "p99_ms": 0.347266,
+          "prefixes": 2000
+        },
+        {
+          "chars": 2,
+          "checked": 5,
+          "max_ms": 0.854013,
+          "max_rows": 1015589.0,
+          "mean_ms": 0.19430848124062025,
+          "median_rows": 560354.0,
+          "p50_ms": 0.18970700000000001,
+          "p90_ms": 0.22598400000000002,
+          "p99_ms": 0.274461,
+          "prefixes": 1999
+        },
+        {
+          "chars": 3,
+          "checked": 5,
+          "max_ms": 6.465248,
+          "max_rows": 664876.0,
+          "mean_ms": 2.039909327827829,
+          "median_rows": 115982.0,
+          "p50_ms": 1.994001,
+          "p90_ms": 2.8682410000000003,
+          "p99_ms": 3.785116,
+          "prefixes": 1998
+        },
+        {
+          "chars": 4,
+          "checked": 5,
+          "max_ms": 8.673604999999998,
+          "max_rows": 495934.0,
+          "mean_ms": 2.8624460426492715,
+          "median_rows": 20049.0,
+          "p50_ms": 2.747953,
+          "p90_ms": 4.065049,
+          "p99_ms": 5.506114,
+          "prefixes": 1993
+        },
+        {
+          "chars": 6,
+          "checked": 5,
+          "max_ms": 7.636385,
+          "max_rows": 370346.0,
+          "mean_ms": 3.1857267145780064,
+          "median_rows": 1685.0,
+          "p50_ms": 3.093227,
+          "p90_ms": 4.399967999999999,
+          "p99_ms": 5.869906,
+          "prefixes": 1955
+        },
+        {
+          "chars": 8,
+          "checked": 5,
+          "max_ms": 9.014787,
+          "max_rows": 231777.0,
+          "mean_ms": 3.314223169661733,
+          "median_rows": 318.0,
+          "p50_ms": 3.254206,
+          "p90_ms": 4.684804,
+          "p99_ms": 6.302271,
+          "prefixes": 1892
+        },
+        {
+          "chars": 12,
+          "checked": 5,
+          "max_ms": 10.2884,
+          "max_rows": 32634.0,
+          "mean_ms": 3.6726108741050143,
+          "median_rows": 19.0,
+          "p50_ms": 3.597458,
+          "p90_ms": 5.0318309999999995,
+          "p99_ms": 6.863748,
+          "prefixes": 1676
+        }
+      ],
+      "segments": 11,
+      "state": "merged"
+    }
+  ]
+}

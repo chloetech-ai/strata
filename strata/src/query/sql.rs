@@ -1641,21 +1641,24 @@ impl<'a> Binder<'a> {
                 let p = match like_prefix(pattern, escape)? {
                     LikePrefix::Exact(v) => Pred::In { field: f, values: vec![Value::Str(v)] },
                     LikePrefix::Prefix(p) if p.is_empty() => Pred::Present { field: f },
-                    LikePrefix::Prefix(p) => Pred::Prefix { field: f, prefix: p },
+                    LikePrefix::Prefix(p) => Pred::Prefix { field: f, prefix: p, edits: 0 },
                 };
                 if *negated { Pred::Not(Box::new(p)) } else { p }
             }
             Expr::ILike { .. } => return Err(err("ILIKE cannot use a KEYWORD field's index: store the value lowercased and use LIKE")),
             Expr::Function(func) if fname(func) == "prefix" => {
                 let (args, opts) = self.args(func)?;
-                let [field, p] = args.as_slice() else { return Err(err("PREFIX(field, prefix)")) };
-                if let Some(k) = opts.keys().next() {
+                let [field, p] = args.as_slice() else { return Err(err("PREFIX(field, prefix [, fuzzy => 0 | 1 | 2 | 'auto'])")) };
+                if let Some(k) = opts.keys().find(|k| k.as_str() != "fuzzy") {
                     return Err(err(format!("unknown option {k} for PREFIX")));
                 }
+                let fuzzy = Expand::from_opts(&opts).map_err(err)?.fuzzy;
                 let f = self.prefix_field(field)?;
                 match self.literal(p)? {
                     Value::Str(p) if p.is_empty() => Pred::Present { field: f },
-                    Value::Str(p) => Pred::Prefix { field: f, prefix: p },
+                    // 'auto' by the typed prefix's length, as MATCH does
+                    // by a word's.
+                    Value::Str(p) => Pred::Prefix { edits: fuzzy.map_or(0, |z| z.edits(p.chars().count())), field: f, prefix: p },
                     v => return Err(err(format!("PREFIX takes text, not {v:?}"))),
                 }
             }
