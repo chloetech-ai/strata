@@ -3,7 +3,7 @@
 //! * [`service`]: the operations, over a local database or, as a
 //!   coordinator ([`coord`]), over shard servers.
 //! * [`http`]: the JSON API (`/v1/...`), Prometheus metrics (`/metrics`)
-//!   and the query UI (`/`).
+//!   and the command center ([`ui`], at `/`).
 //! * [`grpc`]: the same operations over gRPC (`proto/strata.proto`), which
 //!   a coordinator uses to reach its shards; [`plan_pb`]: plans as protobuf.
 //! * [`agent`]: answers a question in words by letting a Claude model
@@ -35,6 +35,7 @@ pub mod server;
 pub mod service;
 pub mod slots;
 pub mod telemetry;
+pub mod ui;
 
 pub mod pb {
     tonic::include_proto!("strata.v1");

@@ -105,7 +105,7 @@ curl -s -X POST 'localhost:7700/v1/import?format=sqlite&tables=orders,customers'
 curl -s 'localhost:7700/v1/export?tables=orders' -o orders.sqlite
 ```
 
-In the UI, the **Schema and import** tab has both: a SQLite file to preview (the plan, table by table) and import, and a button that downloads the database as SQLite. The Python `Client` has `import_sqlite`, `plan_sqlite` and `export_sqlite` ([Python](python.md#a-server-from-python)).
+In the query console (`/classic`), the **Schema and import** tab has both: a SQLite file to preview (the plan, table by table) and import, and a button that downloads the database as SQLite. The Python `Client` has `import_sqlite`, `plan_sqlite` and `export_sqlite` ([Python](python.md#a-server-from-python)).
 
 ## Export
 
