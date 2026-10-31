@@ -13,6 +13,7 @@ use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::Schema;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::coord::Coordinator;
 use strata_server::service::{After, AgentConfig, Backend, QueryReq, Service};
 use strata_server::{json as js, server};
@@ -57,7 +58,7 @@ async fn load(svc: &Arc<Service>) {
         })
         .collect();
     svc.write_ops(ops, None).await.unwrap();
-    svc.sql("CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, action KEYWORD, ts INT) OPTIONS(shard_by = 'usr')", &Params::new(), After::Any, 0).await.unwrap();
+    svc.sql(&Principal::open(), "CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD, action KEYWORD, ts INT) OPTIONS(shard_by = 'usr')", &Params::new(), After::Any, 0).await.unwrap();
     let ops: Vec<Json> = (0..300)
         .map(|e| json!({"op": "insert", "table": "events", "doc": {"id": e, "usr": format!("u{}", e % 10), "item": format!("i{}", e * 13 % 60), "action": ACTIONS[e % 3], "ts": (1_700_000_000 + e * 37) * 1_000_000}}))
         .collect();

@@ -13,6 +13,7 @@ use strata::query::{compound, Params};
 use strata::storage::DbOptions;
 use strata::value::Value;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::coord::Coordinator;
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Service};
 use strata_server::{demo, server};
@@ -106,7 +107,7 @@ async fn shards_rank_by_a_model_like_one_database() {
     assert!(opened.explain(&tables).contains(&format!("ranking model: m (hash {hash})")));
     let xgb = models(dir.path(), "xgb", "xgb_rank");
     let other = service(dir.path(), "other.strata", &xgb, |i| shard_of(&key(i), 3) == 0);
-    let e = other.run_plan((*opened).clone(), After::Any, 0).await.err().unwrap().message;
+    let e = other.run_plan(&Principal::open(), (*opened).clone(), After::Any, 0).await.err().unwrap().message;
     assert!(e.contains("ranking model m here is not the one the plan was made with"), "{e}");
     let mixed = coordinator(&[grpc(other.clone()).await, urls[1].clone(), urls[2].clone()], &lgb).await;
     let e = query(&mixed, &queries[0]).await.err().unwrap();
@@ -116,8 +117,8 @@ async fn shards_rank_by_a_model_like_one_database() {
     let e = query(&none, &queries[0]).await.err().unwrap();
     assert!(e.contains("no ranking model named m"), "{e}");
     // A plan without a hash runs with each server's model.
-    let a = whole.run_plan(plan.clone(), After::Any, 0).await.unwrap();
-    let b = coord.run_plan(plan, After::Any, 0).await.unwrap();
+    let a = whole.run_plan(&Principal::open(), plan.clone(), After::Any, 0).await.unwrap();
+    let b = coord.run_plan(&Principal::open(), plan, After::Any, 0).await.unwrap();
     let rows = |a: strata_server::service::SqlAnswer| match a {
         strata_server::service::SqlAnswer::Rows(r) => r.rs.rows,
         _ => panic!("rows"),

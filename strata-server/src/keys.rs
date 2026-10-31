@@ -14,11 +14,22 @@
 //! No key, admin ones included, may call the internal gRPC methods: only
 //! the token, which the servers of a cluster share, may.
 //!
+//! A route or method says the least scope it needs; what a request then
+//! does is checked again by the service ([`crate::service`]), the same
+//! for HTTP and gRPC: a statement by its kind (a query read, `INSERT`,
+//! `UPDATE` and `DELETE` write, `CREATE` and `DROP` of tables and rank
+//! profiles admin), a logged query write (and admin when it creates its
+//! log's table), a write plan write, an import that creates tables admin.
+//! The audit log keeps the admin's statements and every refusal, over
+//! both.
+//!
 //! A key is `sk_<id>_<secret>`; the server keeps its id, name, scope and
 //! the SHA-256 of its secret (never the secret) in its keys file, and
 //! compares in constant time. A server with no token and no key is open:
 //! every request is the root's. Its first key, which must be an admin
-//! key, closes it.
+//! key, closes it. Such a server keeps an admin key that never expires:
+//! it refuses to make or revoke a key that would leave it none, since once
+//! its last admin key expired no one could manage it.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -198,14 +209,16 @@ impl Keys {
     }
 
     /// A new key; its secret, which is not kept, is in the answer only.
-    /// The first key of an open server must be an admin key.
-    pub fn create(&self, name: &str, scope: Scope, expires_ms: Option<u64>, open: bool) -> Result<(Key, String), ApiError> {
+    /// On a server without a token (`token` false), the first key must be
+    /// an admin key, and the keys must keep one admin key that never
+    /// expires ([`managed`]).
+    pub fn create(&self, name: &str, scope: Scope, expires_ms: Option<u64>, token: bool) -> Result<(Key, String), ApiError> {
         let name = name.trim();
         if name.is_empty() || name.len() > 64 {
             return Err(ApiError::bad("a key's name has 1 to 64 characters"));
         }
         let mut keys = self.lock();
-        if open && keys.is_empty() && scope != Scope::Admin {
+        if !token && keys.is_empty() && scope != Scope::Admin {
             return Err(ApiError::bad("this server has no token and no key: its first key turns on authentication, so it must be an admin key"));
         }
         if keys.iter().any(|k| k.name == name) {
@@ -217,26 +230,42 @@ impl Keys {
         let key = Key { id, name: name.to_string(), scope, created_ms: now_ms(), expires_ms, sha256: sha256(&secret), last_used_ms: 0 };
         let mut next = keys.clone();
         next.push(key.clone());
+        if !token && !managed(&next) {
+            return Err(ApiError::bad(
+                "this server has no token, so one of its admin keys must never expire: once the last one expired, no one could manage the server. Make an admin key without expires_days first",
+            ));
+        }
         self.save(&next)?;
         *keys = next;
         Ok((key, full))
     }
 
     /// Revokes key `id`; false if there is none. On a server without a
-    /// token (`token` false), its last admin key is not revoked: that
-    /// would open the server, or leave no one to manage it.
+    /// token (`token` false), its last admin key that never expires is not
+    /// revoked: that would open the server, or leave it to be locked out
+    /// when the others expire.
     pub fn revoke(&self, id: &str, token: bool) -> Result<bool, ApiError> {
         let mut keys = self.lock();
         let next: Vec<Key> = keys.iter().filter(|k| k.id != id).cloned().collect();
         if next.len() == keys.len() {
             return Ok(false);
         }
-        if !token && !next.iter().any(|k| k.scope == Scope::Admin) {
-            return Err(ApiError { status: 409, message: "this is the last admin key of a server without a token: revoking it would leave no one to manage the server (or open it). Make another admin key first".into() });
+        if !token && !managed(&next) {
+            return Err(ApiError {
+                status: 409,
+                message: "this is the last admin key that never expires on a server without a token: revoking it would leave no one to manage the server once the others expire (or open it). Make another admin key without expires_days first".into(),
+            });
         }
         self.save(&next)?;
         *keys = next;
         Ok(true)
+    }
+
+    /// Whether an admin key that never expires is among these keys: on a
+    /// server without a token, the credential sure to manage it
+    /// ([`managed`]).
+    pub fn managed(&self) -> bool {
+        managed(&self.lock())
     }
 
     /// The key a bearer credential names, if it is one of these, not
@@ -268,6 +297,32 @@ impl Keys {
         let given = authorization.and_then(|v| v.strip_prefix("Bearer "))?;
         self.find(given)
     }
+}
+
+/// Whether `keys` hold an admin key that never expires.
+fn managed(keys: &[Key]) -> bool {
+    keys.iter().any(|k| k.scope == Scope::Admin && k.expires_ms.is_none())
+}
+
+tokio::task_local! {
+    static NOTE: std::cell::RefCell<Option<String>>;
+}
+
+/// Runs `f`, a request, with room for what the audit log is to say of it
+/// ([`note`]): its output, and that note.
+pub async fn noting<F: std::future::Future>(f: F) -> (F::Output, Option<String>) {
+    NOTE.scope(std::cell::RefCell::new(None), async move {
+        let out = f.await;
+        (out, NOTE.with(|n| n.borrow_mut().take()))
+    })
+    .await
+}
+
+/// Says what the audit log keeps of the request being served (a table's
+/// statement, the tables an import creates), which audits it whatever its
+/// route or method. Outside a request ([`noting`]), nothing.
+pub fn note(detail: impl Into<String>) {
+    let _ = NOTE.try_with(|n| *n.borrow_mut() = Some(detail.into()));
 }
 
 /// What the audit log keeps of a request.
@@ -345,10 +400,10 @@ mod tests {
         let keys = Keys::open(dir.path().join("keys.json")).unwrap();
         // Open: anyone; the first key of an open server is an admin key.
         assert_eq!(keys.resolve(None, None), Some(Principal::open()));
-        assert!(keys.create("reader", Scope::Read, None, true).is_err());
-        let (admin, admin_secret) = keys.create("ops", Scope::Admin, None, true).unwrap();
-        let (reader, secret) = keys.create("reader", Scope::Read, None, true).unwrap();
-        assert_eq!(keys.create("reader", Scope::Read, None, true).unwrap_err().status, 409);
+        assert!(keys.create("reader", Scope::Read, None, false).is_err());
+        let (admin, admin_secret) = keys.create("ops", Scope::Admin, None, false).unwrap();
+        let (reader, secret) = keys.create("reader", Scope::Read, None, false).unwrap();
+        assert_eq!(keys.create("reader", Scope::Read, None, false).unwrap_err().status, 409);
         // Closed now.
         assert_eq!(keys.resolve(None, None), None);
         let p = keys.resolve(None, Some(&format!("Bearer {secret}"))).unwrap();
@@ -375,6 +430,33 @@ mod tests {
         // Expired.
         let (_, old) = again.create("old", Scope::Read, Some(now_ms() - 1), false).unwrap();
         assert_eq!(again.resolve(None, Some(&format!("Bearer {old}"))), None);
+    }
+
+    /// A server without a token keeps an admin key that never expires: its
+    /// last admin key expiring would lock everyone out (BUG-N5).
+    #[test]
+    fn a_server_without_a_token_keeps_an_admin_key_that_never_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Keys::open(dir.path().join("keys.json")).unwrap();
+        let soon = Some(now_ms() + 60_000);
+        // Its first admin key may not expire...
+        let e = keys.create("ops", Scope::Admin, soon, false).unwrap_err();
+        assert!(e.status == 400 && e.message.contains("never expire"), "{}", e.message);
+        assert!(keys.list().is_empty() && !dir.path().join("keys.json").exists());
+        let (forever, _) = keys.create("ops", Scope::Admin, None, false).unwrap();
+        assert!(keys.managed());
+        // ...others may, once one does not.
+        let (brief, _) = keys.create("ops-brief", Scope::Admin, soon, false).unwrap();
+        keys.create("reader", Scope::Read, soon, false).unwrap();
+        // The one that never expires is not revoked while it is the only
+        // one; the expiring one is.
+        let e = keys.revoke(&forever.id, false).unwrap_err();
+        assert!(e.status == 409 && e.message.contains("never expires"), "{}", e.message);
+        assert!(keys.revoke(&brief.id, false).unwrap());
+        // With a token, the token manages the server: keys may all expire.
+        let with = Keys::open(dir.path().join("with-token.json")).unwrap();
+        let (only, _) = with.create("ops", Scope::Admin, soon, true).unwrap();
+        assert!(with.revoke(&only.id, true).unwrap());
     }
 
     #[test]
