@@ -1,0 +1,28 @@
+# Dependabot's version updates, grouped so that each ecosystem and crate
+# gets at most one pull request per run. Security updates (repository
+# settings, "Dependabot security updates") come as soon as an advisory is
+# published, whatever this schedule says.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directories: [/strata, /engram, /strata-server, /strata-py]
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 4
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: pip
+    directory: /strata-py
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]

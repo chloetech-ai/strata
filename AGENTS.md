@@ -95,7 +95,8 @@ editing their settings by hand.
 | `strata/fuzz/` | cargo-fuzz targets (nightly: `cargo +nightly fuzz run <target>` there) feeding Strata damaged files and arbitrary SQL; `strata/tests/corrupt_input.rs` runs the same targets on stable |
 | `strata-server/` | Strata over HTTP JSON and gRPC, a coordinator over shards, and the UI: the command center (`ui/index.html` and the modules under `ui/app/`, listed in `src/ui.rs`) and the query console (`ui/classic.html`), compiled in with `include_str!`; `STRATA_UI_DIR=strata-server/ui` serves them from disk without a rebuild |
 | `strata-py/` | Strata from Python (`import strata`): a PyO3 extension built with maturin, and an HTTP client of strata-server; tests in `strata-py/tests` |
-| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, Strata's fault-injection tests (`--features fault-injection`), a relevance gate (BM25 on three BEIR collections), Miri over Strata's byte views (nightly; tests sized for it are named `miri_*`), the Python package's tests, and a server smoke test |
+| `.github/workflows/ci.yml` | CI: tests and clippy for the three crates on Linux and macOS, Strata's fault-injection tests (`--features fault-injection`), a relevance gate (BM25 on three BEIR collections), Miri over Strata's byte views (nightly; tests sized for it are named `miri_*`), the Python package's tests, and a server smoke test; one job, `CI result`, sums them up and is the check main requires |
+| `.github/CODEOWNERS`, `.github/pull_request_template.md` | the one-way doors (on-disk format, shard protocol, replication, auth), which wait for a human review; a pull request says whether it touches one |
 | `docs/` | the documentation site (Jekyll, just-the-docs); `docs/demo/inspector.html` is a separate static copy of the inspector |
 | `install.sh` | the installer described above |
 

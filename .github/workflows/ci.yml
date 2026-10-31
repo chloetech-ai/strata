@@ -2,16 +2,33 @@ name: CI
 
 # A change to the documentation site or to Markdown files alone builds and
 # tests nothing.
+#
+# Main is protected by one required check, "CI result", which every run
+# reports: the jobs below run when a change touches more than the
+# documentation (job `changes`), and are skipped otherwise, which a
+# required check counts as passing. A workflow skipped by a path filter
+# would report nothing, and the pull request would wait for its check
+# forever.
 on:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "**.md"]
   pull_request:
-    paths-ignore: ["docs/**", "**.md"]
+  # The merge queue tests each pull request merged onto the main it will
+  # land on, as a pull request is tested.
+  merge_group:
+  # Every night, main's whole matrix, macOS included, whether or not
+  # anything merged: flaky tests show up there before they block a merge.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
+# A new push to a pull request cancels its older run. Runs on main and in
+# the merge queue are never cancelled: each commit of main gets its whole
+# run (a group per commit, since a group holds one waiting run and would
+# drop the others).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,15 +40,55 @@ env:
 # billed by the minute even for a public repository, so no job uses them.
 #
 # macOS jobs are the scarcest (the account runs few at once), so a pull
-# request runs only Strata's tests on macOS, where its NEON kernels and
-# syncs differ from Linux; a push to main runs every macOS job.
+# request (and the merge queue) runs only Strata's tests on macOS, where
+# its NEON kernels and syncs differ from Linux; a push to main, the nightly
+# run and a run started by hand run every macOS job.
 jobs:
+  # Whether the change touches more than the documentation site and
+  # Markdown files: if not, every other job is skipped.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Changed files
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            merge_group) base="$QUEUE_BASE" ;;
+            *) base="$BEFORE" ;;
+          esac
+          # A diff needs only the two commits' trees, not the history
+          # between them. No base (a new branch) or one that cannot be
+          # fetched (a force push): test everything.
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ] || ! git fetch --no-tags --depth=1 origin "$base"; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$base" HEAD | tee "$RUNNER_TEMP/changed"
+          if grep -qvE '^docs/|\.md$' "$RUNNER_TEMP/changed"; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
     name: ${{ matrix.crate }} on ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
         crate: [strata, engram, strata-server]
         # On a pull request, a job of its own; on main, already in the matrix.
         include:
@@ -78,6 +135,8 @@ jobs:
   # that it runs beside the strata tests rather than after them.
   kernels:
     name: strata kernels on a generic build
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -104,6 +163,8 @@ jobs:
   # scores of the small models in strata/tests/models run here too.
   vision:
     name: images (feature vision)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -136,6 +197,8 @@ jobs:
   # the server.
   audio:
     name: sound (feature audio)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -167,10 +230,12 @@ jobs:
   # the strata tests, it took the macOS job past its hour.
   faults:
     name: fault injection on ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -193,6 +258,8 @@ jobs:
   # with its new numbers.
   relevance-gate:
     name: relevance gate (BEIR)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -221,6 +288,8 @@ jobs:
   # the model scores 12,000 pairs, about ten minutes on four cores.
   relevance-gate-cross-encoder:
     name: relevance gate (cross-encoder)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -259,6 +328,8 @@ jobs:
   # pinned to the one the tests were run with.
   miri:
     name: miri (${{ matrix.part }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -290,6 +361,8 @@ jobs:
 
   server-smoke:
     name: strata-server smoke test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -339,10 +412,12 @@ jobs:
 
   python:
     name: Python package on ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -393,3 +468,25 @@ jobs:
       - name: Clippy
         working-directory: strata-py
         run: cargo clippy --release --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
+  # The one check main requires: every job above passed, or was skipped
+  # because the change touches only the documentation. A failed or
+  # cancelled job fails it.
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [changes, test, kernels, vision, audio, faults, relevance-gate, relevance-gate-cross-encoder, miri, server-smoke, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c '
+          import json, sys
+          bad = {k: v["result"] for k, v in json.load(sys.stdin).items() if v["result"] not in ("success", "skipped")}
+          for k, r in sorted(bad.items()):
+              print(f"{k}: {r}")
+          sys.exit(1 if bad else 0)
+          '
