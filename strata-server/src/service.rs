@@ -35,7 +35,7 @@ use crate::replication::{Acks, Follow, Primary, PrimaryOptions, READ_WAIT};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
 use crate::alerts::Alerts;
-use crate::keys::{Audit, Keys, Scope};
+use crate::keys::{self, Audit, Keys, Principal, Scope};
 use crate::telemetry::{self, LiveQueries, QueryLog, Sample, Series};
 use crate::{json as js, obs, pb, ApiError};
 
@@ -405,10 +405,45 @@ impl Service {
         }
     }
 
+    /// The shard's other copies, as this replica knows them (its
+    /// `--replicas`): the only servers a promotion asked for with a key
+    /// calls, and so sends the cluster's token to.
+    pub fn known_copies(&self) -> Vec<String> {
+        self.promote_options.as_ref().map(|o| o.replicas.clone()).unwrap_or_default()
+    }
+
     /// Makes this replica the primary of a new term, shipping to
     /// `replicas` under `acks` ([`Follow::promote`]); with `force`, even
-    /// when one of them holds transactions this replica does not.
-    pub async fn promote(&self, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
+    /// when one of them holds transactions this replica does not. No
+    /// `replicas`: its [`Self::known_copies`]. Promotion calls each copy
+    /// with the cluster's token, so a key's promotion may name only known
+    /// copies; the token's holder, who could send the token anywhere
+    /// anyway, may name others.
+    pub async fn promote(&self, who: &Principal, replicas: Vec<String>, acks: Acks, force: bool) -> Result<Json, ApiError> {
+        who.may(Scope::Admin, "a promotion")?;
+        let known = self.known_copies();
+        let replicas = match replicas.is_empty() {
+            true => known,
+            false => {
+                let unknown: Vec<&String> = replicas.iter().filter(|u| !known.contains(u)).collect();
+                if !who.root && !unknown.is_empty() {
+                    let known = match known.is_empty() {
+                        true => "none: start the replica with --replicas naming them".to_string(),
+                        false => known.join(", "),
+                    };
+                    return Err(ApiError {
+                        status: 403,
+                        message: format!(
+                            "{} {} not among this shard's copies, which promotion calls with the cluster's token; known copies: {known}",
+                            unknown.iter().map(|u| u.as_str()).collect::<Vec<_>>().join(", "),
+                            if unknown.len() == 1 { "is" } else { "are" }
+                        ),
+                    });
+                }
+                replicas
+            }
+        };
+        keys::note(format!("promote, shipping to {}", if replicas.is_empty() { "no replica".to_string() } else { replicas.join(", ") }));
         let _one = self.promoting.lock().await;
         let Replication::Replica(f) = self.replication() else {
             return Err(conflict("this server is not a replica (--replica): only a replica is promoted".into()));
@@ -1231,12 +1266,17 @@ impl Service {
     /// their keys place them on. The first query logged to a table makes
     /// it, on every shard through a coordinator. A replica refuses it, the
     /// log being a write. Returns the request's id and the log's write.
-    pub async fn query_logged(self: &Arc<Self>, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+    /// A logged query needs a write key, and the first one to a table,
+    /// which creates it, an admin key.
+    pub async fn query_logged(self: &Arc<Self>, who: &Principal, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+        who.may(Scope::Write, "a logged query (it writes the rank log)")?;
         self.takes_writes()?;
         let schema = match self.table(&log.table).await {
             Ok(s) => s,
             Err(_) => {
-                self.sql(&rank_log::create_sql(&log.table)?, &Params::new(), After::Any, req.timeout_ms).await?;
+                let what = format!("the first query logged to {} (it creates the table; log once with an admin key, or create it with CREATE TABLE)", log.table);
+                who.may(Scope::Admin, &what)?;
+                self.sql(who, &rank_log::create_sql(&log.table)?, &Params::new(), After::Any, req.timeout_ms).await?;
                 self.table(&log.table).await?
             }
         };
@@ -1259,7 +1299,13 @@ impl Service {
     /// [`Service::query`] does, and a write as [`Service::sql`] does (on any
     /// table). A coordinator takes writes as SQL until its shards take write
     /// plans. A read sees the writes `after` names.
-    pub async fn run_plan(self: &Arc<Self>, plan: Plan, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+    pub async fn run_plan(self: &Arc<Self>, who: &Principal, plan: Plan, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        if plan.writes() {
+            who.may(Scope::Write, "a write plan")?;
+            if !plan.is_write() {
+                return Err(ApiError::bad("a plan writes at its root only: an INSERT, UPDATE or DELETE inside a read is not run"));
+            }
+        }
         let t0 = Instant::now();
         // What the slow-query log shows of the plan.
         let catalog = self.catalog();
@@ -1633,8 +1679,16 @@ impl Service {
     /// writes `after` names; the documents an INSERT, UPDATE or DELETE
     /// wrote; none for `CREATE TABLE`, `DROP TABLE` and the `RANK PROFILE`
     /// statements ([`Self::ddl`]).
-    pub async fn sql(self: &Arc<Self>, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
-        let ddl = match self.bound(|tables| bind_command(sql, tables, params)).await? {
+    /// The statement needs the scope of its kind ([`command_scope`]), which
+    /// `who` must have; a table's or rank profile's statement is audited.
+    pub async fn sql(self: &Arc<Self>, who: &Principal, sql: &str, params: &Params, after: After, timeout_ms: u64) -> Result<SqlAnswer, ApiError> {
+        let command = self.bound(|tables| bind_command(sql, tables, params)).await?;
+        let need = command_scope(&command);
+        who.may(need, &format!("a {} statement", match need { Scope::Read => "query", Scope::Write => "write", Scope::Admin => "table or rank profile" }))?;
+        if need == Scope::Admin {
+            keys::note(obs::truncate(sql, 500).into_owned());
+        }
+        let ddl = match command {
             Command::Query => {
                 let a = self.query(QueryReq { sql: sql.into(), params: params.clone(), timeout_ms, after, ..Default::default() }).await?;
                 return Ok(SqlAnswer::Rows(a));
@@ -1658,16 +1712,6 @@ impl Service {
         };
         let w = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
-    }
-
-    /// The scope a SQL statement needs ([`crate::keys`]): a query read, a
-    /// write write, and a table's or rank profile's statement admin.
-    pub async fn statement_scope(&self, sql: &str, params: &Params) -> Result<Scope, ApiError> {
-        Ok(match self.bound(|tables| bind_command(sql, tables, params)).await? {
-            Command::Query | Command::Explain { .. } => Scope::Read,
-            Command::Write { .. } => Scope::Write,
-            Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
-        })
     }
 
     /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
@@ -1945,7 +1989,10 @@ impl Service {
     /// `plan_only`, returns the plan ([`strata::sqlite::Plan::to_json`])
     /// and writes nothing; otherwise what was written
     /// ([`strata::sqlite::Imported::to_json`]).
-    pub async fn import_sqlite(self: &Arc<Self>, body: axum::body::Bytes, opts: strata::sqlite::ImportOptions, plan_only: bool, timeout_ms: u64) -> Result<Json, ApiError> {
+    /// Rows need a write key, and an import that creates tables an admin
+    /// key, refused before anything is written.
+    pub async fn import_sqlite(self: &Arc<Self>, who: &Principal, body: axum::body::Bytes, opts: strata::sqlite::ImportOptions, plan_only: bool, timeout_ms: u64) -> Result<Json, ApiError> {
+        who.may(Scope::Write, "an import")?;
         let catalog = self.catalog();
         let checked = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             let dir = tempfile::tempdir().map_err(ApiError::internal)?;
@@ -1970,6 +2017,11 @@ impl Service {
         let (dir, src, plan) = checked;
         if plan_only {
             return Ok(plan.to_json());
+        }
+        let creates: Vec<&str> = plan.tables.iter().filter(|t| !t.exists).map(|t| t.schema.table.as_str()).collect();
+        if !creates.is_empty() {
+            who.may(Scope::Admin, &format!("an import that creates tables ({})", creates.join(", ")))?;
+            keys::note(format!("SQLite import created tables {}", creates.join(", ")));
         }
         enum Step {
             Table(usize),
@@ -2761,6 +2813,17 @@ const SOURCE_NAME: usize = 256;
 
 pub fn has_source(op: &Json) -> bool {
     op.get("source").is_some_and(|s| !s.is_null())
+}
+
+/// The scope a SQL statement needs ([`crate::keys`]): a query read, a
+/// write write, and a table's or rank profile's statement admin. Every
+/// kind is named, so that a new one must say what it needs.
+pub fn command_scope(c: &Command) -> Scope {
+    match c {
+        Command::Query | Command::Explain { .. } => Scope::Read,
+        Command::Write { .. } => Scope::Write,
+        Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
+    }
 }
 
 /// Whether an operation only marks a source's offset (`"op": "source"`),

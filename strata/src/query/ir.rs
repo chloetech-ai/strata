@@ -1756,6 +1756,15 @@ impl Plan {
         self.root.is_write()
     }
 
+    /// Whether any node of the plan writes, at its root or below it: what
+    /// a server's authorization asks.
+    pub fn writes(&self) -> bool {
+        fn any(n: &Node) -> bool {
+            n.is_write() || n.inputs().into_iter().any(any)
+        }
+        any(&self.root)
+    }
+
     pub fn to_json(&self) -> Result<serde_json::Value> {
         serde_json::to_value(self).map_err(|e| err(format!("the plan cannot be written as JSON: {e}")))
     }

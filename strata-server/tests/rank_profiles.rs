@@ -13,6 +13,7 @@ use strata::query::{compound, Params};
 use strata::storage::DbOptions;
 use strata::value::Value;
 use strata_server::auth::Access;
+use strata_server::keys::Principal;
 use strata_server::coord::Coordinator;
 use strata_server::replication::{Acks, Follow, Primary, PrimaryOptions};
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Replication, Service, SqlAnswer};
@@ -57,7 +58,7 @@ async fn coordinator(urls: &[String]) -> Arc<Service> {
 }
 
 async fn sql(svc: &Arc<Service>, s: &str) -> Result<SqlAnswer, String> {
-    svc.sql(s, &Params::new(), After::Any, 0).await.map_err(|e| e.message)
+    svc.sql(&Principal::open(), s, &Params::new(), After::Any, 0).await.map_err(|e| e.message)
 }
 
 /// Ids and scores, as one database or a coordinator answers.
@@ -162,15 +163,15 @@ async fn shards_rank_by_a_profile_like_one_database() {
     let catalog = shards[0].catalog();
     let tables: Vec<&strata::Schema> = catalog.iter().map(|t| &**t).collect();
     let plan = compound::plan_read(BY_CHEAP[0].0, &tables, &Params::new(), &|_, _| Some(stale.clone())).unwrap();
-    let e = shards[0].run_plan(plan, After::Any, 0).await.err().unwrap().message;
+    let e = shards[0].run_plan(&Principal::open(), plan, After::Any, 0).await.err().unwrap().message;
     assert!(e.contains("rank profile cheap of products is not the one the plan was made with"), "{e}");
     let mut gone = stale.clone();
     gone.name = "gone".into();
     let plan = compound::plan_read(&BY_CHEAP[0].0.replace("cheap", "gone"), &tables, &Params::new(), &|_, _| Some(gone.clone())).unwrap();
-    let e = shards[1].run_plan(plan.clone(), After::Any, 0).await.err().unwrap().message;
+    let e = shards[1].run_plan(&Principal::open(), plan.clone(), After::Any, 0).await.err().unwrap().message;
     assert!(e.contains("products has no rank profile gone, which the plan ranks as"), "{e}");
     // So does a coordinator's shards, for a plan sent as is.
-    let e = coord.run_plan(plan, After::Any, 0).await.err().unwrap().message;
+    let e = coord.run_plan(&Principal::open(), plan, After::Any, 0).await.err().unwrap().message;
     assert!(e.contains("which the plan ranks as"), "{e}");
 
     // Dropped through a coordinator: from every shard.

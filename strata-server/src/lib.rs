@@ -98,6 +98,9 @@ impl From<ApiError> for tonic::Status {
         use tonic::Code;
         let code = match e.status {
             400 => Code::InvalidArgument,
+            401 => Code::Unauthenticated,
+            // A credential's scope does not allow what the call does.
+            403 => Code::PermissionDenied,
             // Refused in the state the server is in: an older slot map, a
             // write with the same idempotency key still running.
             409 => Code::FailedPrecondition,
