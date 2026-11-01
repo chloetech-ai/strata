@@ -10,6 +10,8 @@
 //! | `vec.<f>.sq8p` | per-dimension SQ8 minimum and scale |
 //! | `vec.<f>.bin` | binary codes instead of SQ8 ones, when the field asks for them (rows padded to 8 bytes) |
 //! | `vec.<f>.binp` | per-dimension threshold and spread of the binary codes |
+//! | `vec.<f>.rq` | RaBitQ codes instead, when the field asks for them: `n × stride` ([`rabitq`]) |
+//! | `vec.<f>.rqp` | the RaBitQ codes' centre (the segment's mean) and rotation seed |
 //! | `vec.<f>.present` | bitset of documents with a vector (only if some lack one) |
 //!
 //! plus the sections of its index: IVF (`ivf_centroids`, `ivf_dir`, `ivf`) or
@@ -22,7 +24,9 @@
 //! NEON `usdot`), keeps the best `rerank` candidates and re-ranks them with
 //! float32. A field with binary codes ([`crate::schema::VectorCodes`]) is
 //! searched the same way over a bit per dimension ([`bits`]) and keeps
-//! [`codes::BINARY_RERANK`]` × rerank` candidates. Only the codes (and the
+//! [`codes::BINARY_RERANK`]` × rerank` candidates; one with RaBitQ codes
+//! ([`rabitq`]) estimates each row's dot product from its bits and a
+//! correction factor, and keeps [`codes::oversample`]` × rerank`. Only the codes (and the
 //! index) need to stay in memory: the float32 rows are read for the
 //! candidates alone, so they can stay on disk. The [`Strategy`] decides which
 //! codes are scored:
@@ -43,6 +47,7 @@ pub mod cost;
 pub mod exact;
 pub mod kernels;
 pub mod multi;
+pub mod rabitq;
 pub mod sq8;
 
 mod build;
@@ -68,7 +73,8 @@ pub use ivf::{default_nlist, filtered_probe_weight, filtered_probes};
 use hnsw::HnswView;
 use ivf::IvfView;
 use bits::Bits;
-use codes::{Quantiser, QueryCode, BINARY_RERANK};
+use codes::{Quantiser, QueryCode};
+use rabitq::Rabitq;
 use kernels::{dot_f32, prefetch};
 use sq8::Sq8;
 use topk::{Members, TopK};
@@ -85,6 +91,15 @@ pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn Field
 /// joined to it.
 pub fn field_builder_from(field: &Field, opts: &BuildOptions, segs: Vec<(SegmentFile, u32)>) -> Result<Box<dyn FieldIndexBuilder>> {
     Ok(Box::new(build::VectorBuilder::new(field, opts)?.start_from(segs)))
+}
+
+/// The sections of a field's codes and of their parameters.
+pub(crate) fn parts(codes: VectorCodes) -> (&'static str, &'static str) {
+    match codes {
+        VectorCodes::Sq8 => ("sq8", "sq8p"),
+        VectorCodes::Binary => ("bin", "binp"),
+        VectorCodes::Rabitq1 | VectorCodes::Rabitq2 | VectorCodes::Rabitq4 => ("rq", "rqp"),
+    }
 }
 
 /// Name of section `part` of vector field `field`.
@@ -185,7 +200,8 @@ impl Strategy {
 }
 
 /// Search knobs. `rerank` is the number of candidates re-ranked with
-/// float32 (at least `k`; times [`BINARY_RERANK`] over binary codes); HNSW
+/// float32 (at least `k`; times [`codes::oversample`] over binary and
+/// RaBitQ codes); HNSW
 /// searches with `max(ef, rerank)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchParams {
@@ -217,6 +233,10 @@ pub struct SearchStats {
     pub centroids: usize,
     /// Candidates handed to the float32 re-ranking.
     pub candidates: usize,
+    /// Of those, the ones not rescored: RaBitQ codes bounded their dot
+    /// product below the `k`-th exact score already found
+    /// ([`rabitq::RabitqQuery::upper`]).
+    pub pruned: usize,
     pub clusters_probed: usize,
     /// HNSW nodes expanded on layer 0.
     pub nodes_visited: usize,
@@ -361,29 +381,38 @@ impl VectorReader {
         if info.rows.is_none() && info.missing == n && !seg.has(&section(field, "f32")) {
             return Ok(Self::absent(info));
         }
-        let (codes_part, params_part) = match info.codes {
-            VectorCodes::Sq8 => ("sq8", "sq8p"),
-            VectorCodes::Binary => ("bin", "binp"),
-        };
+        let (codes_part, params_part) = parts(info.codes);
         let vectors: Slice<f32> = if info.f32 { Slice::view(seg.require(&section(field, "f32"))?).map_err(corrupt)? } else { Slice::Owned(Vec::new()) };
         let codes: Slice<u8> = Slice::view(seg.require(&section(field, codes_part))?).map_err(corrupt)?;
         if (info.f32 && vectors.len() != n * info.stride_f32) || codes.len() != n * info.stride_u8 {
             return Err(corrupt(format!("vector field {field}: sections have the wrong size")));
         }
         let mut r = ByteReader::new(seg.require(&section(field, params_part))?);
-        let (a, b): (Slice<f32>, Slice<f32>) = (r.array().map_err(corrupt)?, r.array().map_err(corrupt)?);
-        if a.len() != dim || b.len() != dim {
-            return Err(corrupt(format!("vector field {field}: bad code parameters")));
-        }
-        let quant = match info.codes {
-            VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: a, scale: b }),
-            VectorCodes::Binary => Quantiser::Bits(Bits { mean: a, spread: b }),
+        let bad = || corrupt(format!("vector field {field}: bad code parameters"));
+        let quant = match info.codes.rabitq_bits() {
+            Some(bits) => {
+                let centre: Slice<f32> = r.array().map_err(corrupt)?;
+                if centre.len() != dim || r.u64().map_err(corrupt)? != rabitq::SEED {
+                    return Err(bad());
+                }
+                Quantiser::Rabitq(Rabitq::new(bits, centre))
+            }
+            None => {
+                let (a, b): (Slice<f32>, Slice<f32>) = (r.array().map_err(corrupt)?, r.array().map_err(corrupt)?);
+                if a.len() != dim || b.len() != dim {
+                    return Err(bad());
+                }
+                match info.codes {
+                    VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: a, scale: b }),
+                    _ => Quantiser::Bits(Bits { mean: a, spread: b }),
+                }
+            }
         };
         let multi = info.rows.map(|r| multi::Rows::open(seg, field, r, n)).transpose()?;
         let rescore = match (&quant, info.f32) {
             (_, true) => None,
             (Quantiser::Sq8(sq), false) => Some((codes.clone(), sq.clone())),
-            (Quantiser::Bits(_), false) => {
+            (Quantiser::Bits(_) | Quantiser::Rabitq(_), false) => {
                 let c: Slice<u8> = Slice::view(seg.require(&section(field, "rescore"))?).map_err(corrupt)?;
                 let mut r = ByteReader::new(seg.require(&section(field, "rescorep"))?);
                 let (min, scale): (Slice<f32>, Slice<f32>) = (r.array().map_err(corrupt)?, r.array().map_err(corrupt)?);
@@ -433,6 +462,7 @@ impl VectorReader {
         let quant = match info.codes {
             VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: zeros(), scale: zeros() }),
             VectorCodes::Binary => Quantiser::Bits(Bits { mean: zeros(), spread: zeros() }),
+            c => Quantiser::Rabitq(Rabitq::new(c.rabitq_bits().expect("rabitq"), zeros())),
         };
         let shape = IndexShape { n: 0, kind: info.index.clone(), nlist: 1, hnsw_m: 16 };
         VectorReader {
@@ -592,7 +622,7 @@ impl VectorReader {
     pub fn sq8(&self) -> Option<&Sq8> {
         match &self.quant {
             Quantiser::Sq8(s) => Some(s),
-            Quantiser::Bits(_) => None,
+            Quantiser::Bits(_) | Quantiser::Rabitq(_) => None,
         }
     }
 
@@ -614,6 +644,7 @@ impl VectorReader {
             && match &self.quant {
                 Quantiser::Sq8(s) => matches!(s.min, Slice::Shared { .. }),
                 Quantiser::Bits(b) => matches!(b.mean, Slice::Shared { .. }),
+                Quantiser::Rabitq(r) => matches!(r.centre, Slice::Shared { .. }),
             }
             && self.present.as_ref().is_none_or(|p| matches!(p, Slice::Shared { .. }))
             && self.ivf.as_ref().is_none_or(|v| v.is_shared())
@@ -686,7 +717,7 @@ impl VectorReader {
             Strategy::Auto => unreachable!("planned"),
         };
         stats.candidates = cands.len();
-        let hits = self.rerank(query, &cands, k, &mut stats);
+        let hits = self.rerank(query, &qc, &cands, k, &mut stats);
         SearchOutput { hits, stats }
     }
 
@@ -703,13 +734,10 @@ impl VectorReader {
         all
     }
 
-    /// How many times more candidates the codes need rescored: 1 for SQ8,
-    /// [`BINARY_RERANK`] for binary codes.
+    /// How many times more candidates the codes need rescored
+    /// ([`codes::oversample`]).
     fn oversample(&self) -> usize {
-        match self.info.codes {
-            VectorCodes::Sq8 => 1,
-            VectorCodes::Binary => BINARY_RERANK,
-        }
+        codes::oversample(self.info.codes)
     }
 
     fn code_rows(&self) -> Codes<'_> {
@@ -817,8 +845,9 @@ impl VectorReader {
     }
 
     /// Float32 scores of the candidates (best code score first), best `k`
-    /// kept.
-    fn rerank(&self, query: &[f32], cands: &[(i32, DocId)], k: usize, stats: &mut SearchStats) -> Vec<Hit> {
+    /// kept. Over RaBitQ codes, a candidate whose bound is below the `k`-th
+    /// exact score so far is passed over unread.
+    fn rerank(&self, query: &[f32], qc: &QueryCode, cands: &[(i32, DocId)], k: usize, stats: &mut SearchStats) -> Vec<Hit> {
         if !self.info.f32 {
             // A multi-vector field's SQ8 codes stand for its vectors.
             let q = self.prepare_exact(query);
@@ -829,15 +858,44 @@ impl VectorReader {
             return hits;
         }
         let row_bytes = self.info.stride_f32 * 4;
-        if self.io_hints {
-            io::will_need(&mut cands.iter().map(|&(_, d)| (self.vector(d).as_ptr() as usize, row_bytes)).collect::<Vec<_>>());
-        }
+        let hint = |rows: &mut dyn Iterator<Item = DocId>| {
+            if self.io_hints {
+                io::will_need(&mut rows.map(|d| (self.vector(d).as_ptr() as usize, row_bytes)).collect::<Vec<_>>());
+            }
+        };
         let mut hits: Vec<Hit> = Vec::with_capacity(cands.len());
-        for (i, &(_, d)) in cands.iter().enumerate() {
+        let bounded = match qc {
+            QueryCode::Rabitq(q) if k > 0 => Some(q),
+            _ => None,
+        };
+        // Over RaBitQ codes the first k rows are read ahead, and once their
+        // scores set a bar, only the rest that can still pass it.
+        let first = if bounded.is_some() { k.min(cands.len()) } else { cands.len() };
+        hint(&mut cands[..first].iter().map(|&(_, d)| d));
+        // The k best exact scores so far, the k-th on top.
+        let mut best: std::collections::BinaryHeap<std::cmp::Reverse<i32>> = std::collections::BinaryHeap::with_capacity(k + 1);
+        for (i, &(s, d)) in cands.iter().enumerate() {
+            if let Some(q) = bounded {
+                if i == first {
+                    let bar = rabitq::unordered(best.peek().expect("k scores").0);
+                    hint(&mut cands[first..].iter().filter(|&&(s, d)| q.upper(s, self.codes(d)) >= bar).map(|&(_, d)| d));
+                }
+                if best.len() == k && q.upper(s, self.codes(d)) < rabitq::unordered(best.peek().expect("k scores").0) {
+                    stats.pruned += 1;
+                    continue;
+                }
+            }
             if let Some(&(_, next)) = cands.get(i + 1) {
                 prefetch(self.vector(next).as_ptr() as *const u8, row_bytes);
             }
-            hits.push(Hit { doc: d, score: self.similarity(d, query) });
+            let score = self.similarity(d, query);
+            hits.push(Hit { doc: d, score });
+            if bounded.is_some() {
+                best.push(std::cmp::Reverse(rabitq::ordered(score)));
+                if best.len() > k {
+                    best.pop();
+                }
+            }
         }
         stats.f32_distances += hits.len();
         sort_hits(&mut hits);

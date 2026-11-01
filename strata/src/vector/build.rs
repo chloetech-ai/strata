@@ -5,7 +5,7 @@
 //! | key | default | meaning |
 //! |---|---|---|
 //! | `vector.index` | schema's kind | `flat`, `ivf` or `hnsw` |
-//! | `vector.codes` | schema's codes (`sq8`) | `sq8` or `binary` |
+//! | `vector.codes` | schema's codes (`sq8`) | `sq8`, `binary`, `rabitq1`, `rabitq2` or `rabitq4` |
 //! | `vector.ivf.nlist` | schema's `nlist`, else ≈ 4·√n | number of clusters |
 //! | `vector.ivf.iters` | 10 | k-means iterations |
 //! | `vector.ivf.sample` | 64 | k-means training points per cluster |
@@ -30,6 +30,7 @@ use crate::vector::hnsw::{self, HnswConfig, HnswView};
 use crate::vector::ivf::{self, IvfConfig};
 use crate::vector::bits::Bits;
 use crate::vector::codes::Quantiser;
+use crate::vector::rabitq::{self, Rabitq};
 use crate::vector::sq8::Sq8;
 use crate::vector::{section, VectorInfo};
 
@@ -295,12 +296,10 @@ impl FieldIndexBuilder for VectorBuilder {
         let quant = match code_kind {
             VectorCodes::Sq8 => Quantiser::Sq8(Sq8::fit(dim, present_rows)),
             VectorCodes::Binary => Quantiser::Bits(Bits::fit(dim, present_rows)),
+            c => Quantiser::Rabitq(Rabitq::fit(dim, c.rabitq_bits().expect("rabitq"), present_rows)),
         };
         let mut codes = vec![0u8; n * code_stride];
-        for &d in &ids {
-            let d = d as usize;
-            quant.encode(&view.row(d)[..dim], &mut codes[d * code_stride..(d + 1) * code_stride]);
-        }
+        encode_rows(&quant, &view, &is_present, &mut codes, code_stride, threads);
 
         let mut info = VectorInfo {
             dim,
@@ -353,18 +352,21 @@ impl FieldIndexBuilder for VectorBuilder {
         }
 
         let mut p = ByteWriter::new();
-        let (codes_part, params_part) = match &quant {
+        match &quant {
             Quantiser::Sq8(sq) => {
                 p.array(&sq.min);
                 p.array(&sq.scale);
-                ("sq8", "sq8p")
             }
             Quantiser::Bits(b) => {
                 p.array(&b.mean);
                 p.array(&b.spread);
-                ("bin", "binp")
             }
-        };
+            Quantiser::Rabitq(r) => {
+                p.array(&r.centre);
+                p.u64(rabitq::SEED);
+            }
+        }
+        let (codes_part, params_part) = crate::vector::parts(code_kind);
         out.put(section(&field, "meta"), serde_json::to_vec(&info).expect("serialisable"));
         out.put(section(&field, params_part), p.finish());
         if missing > 0 {
@@ -383,9 +385,9 @@ impl FieldIndexBuilder for VectorBuilder {
             }
             out.put(section(&field, "rows"), offsets.iter().flat_map(|o| o.to_le_bytes()).collect());
             out.put(section(&field, "owner"), owner);
-            // Rows are scored exactly with SQ8 codes when binary codes are
-            // searched and the float32 vectors are not kept.
-            if !info.f32 && code_kind == VectorCodes::Binary {
+            // Rows are scored exactly with SQ8 codes when binary or RaBitQ
+            // codes are searched and the float32 vectors are not kept.
+            if !info.f32 && code_kind != VectorCodes::Sq8 {
                 let sq = Sq8::fit(dim, (0..n).map(|d| &view.row(d)[..dim]));
                 let s = strides(dim).1;
                 let mut c = vec![0u8; n * s];
@@ -411,4 +413,30 @@ impl FieldIndexBuilder for VectorBuilder {
         }
         Ok(())
     }
+}
+
+/// The codes of the rows with a vector, into `codes` (`code_stride` bytes
+/// a row), on up to `threads` threads: RaBitQ's rotation and grid make
+/// encoding a large part of a flat or IVF build.
+fn encode_rows(quant: &Quantiser, view: &Rows, is_present: &(dyn Fn(u32) -> bool + Sync), codes: &mut [u8], code_stride: usize, threads: usize) {
+    let n = view.n;
+    let encode = |lo: usize, out: &mut [u8]| {
+        for (i, row) in out.chunks_exact_mut(code_stride).enumerate() {
+            let d = lo + i;
+            if is_present(d as u32) {
+                quant.encode(&view.row(d)[..view.dim], row);
+            }
+        }
+    };
+    let threads = threads.clamp(1, n.div_ceil(4096).max(1));
+    if threads == 1 {
+        return encode(0, codes);
+    }
+    let per = n.div_ceil(threads);
+    std::thread::scope(|s| {
+        for (t, out) in codes.chunks_mut(per * code_stride).enumerate() {
+            let encode = &encode;
+            s.spawn(move || encode(t * per, out));
+        }
+    });
 }
