@@ -50,13 +50,14 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [roles, rolebindings]
     verbs: [get, create, patch]
-  # Which copies are ready, and the volumes of a shard that left.
+  # Which copies are ready, restarting one with new settings, growing
+  # volumes, and deleting the volumes of a shard that left.
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list]
+    verbs: [get, list, delete]
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
-    verbs: [list, delete]
+    verbs: [list, delete, patch]
   # A cluster's tokenSecret, to call its coordinators.
   - apiGroups: [""]
     resources: [secrets]
