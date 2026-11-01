@@ -15,8 +15,13 @@ its facets, a hybrid search, similar items and the home feed. Each runs for
 50 probes, the same at every stage (a seeded choice from the file's rows,
 kept in DIR/probes.json). A stage writes DIR/c_<label>.json: per query the
 p50 and p99 of a request, its errors, and a SHA-256 of the answers (rows as
-JSON, floats to 6 digits); `compare` says, per stage and query, whether the
-answers are those of stage 1 row by row.
+JSON, floats to 6 digits). In the app, similar items are also ranked
+exactly (every row its filter keeps, by its similarity), the truth each
+stage's answers are scored against.
+`compare` says, per stage and query, whether the answers are those of
+stage 1 row by row and, where not, how: the same rows in another order, or
+scores apart by how much, the overlap of each top 10 with stage 1's, recall
+of the exact top 10, or the stage's refusal.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import argparse
 import hashlib
 import json
 import random
+import signal
 import sys
 import time
 from pathlib import Path
@@ -74,7 +80,7 @@ QUERIES = {
     "join_top": "SELECT p.id, p.title, COUNT(*) AS n FROM reviews r JOIN products p ON r.product_id = p.id GROUP BY p.id, p.title ORDER BY n DESC, p.id LIMIT 10",
     "join_user": "SELECT p.id, p.title, r.rating, r.ts FROM reviews r JOIN products p ON p.id = r.product_id WHERE r.user_id = :u ORDER BY r.ts DESC, p.id LIMIT 50",
     "search": "SELECT id, score() FROM products ORDER BY bm25(body, :q, syntax => 'plain') DESC LIMIT 10",
-    "facet": "SELECT category, COUNT(*) AS n FROM products WHERE MATCH(body, :q, syntax => 'plain') GROUP BY category ORDER BY n DESC, category LIMIT 5",
+    "facet": "SELECT category, COUNT(*) AS n FROM products WHERE MATCH(body, :q) GROUP BY category ORDER BY n DESC, category LIMIT 5",
     "hybrid": "SELECT id FROM products ORDER BY rrf(bm25(body, :q, syntax => 'plain'), similarity(emb, :v), depth => 100) DESC LIMIT 10",
     "similar": (
         "SELECT id FROM products WHERE stock > 0 AND price BETWEEN :lo AND :hi "
@@ -87,6 +93,34 @@ QUERIES = {
         "MAX 2 PER brand LIMIT 20"
     ),
 }
+# The exact answer similar items are scored against (in the app only): every
+# row that passes the filter, ranked here by cosine similarity. (`exact => 1`
+# on a lone similarity leaf still ranks the index's candidates only.)
+SIMILAR_ROWS = (
+    "SELECT id, emb FROM products WHERE stock > 0 AND price BETWEEN :lo AND :hi "
+    "AND NOT id IN (SELECT product_id FROM reviews WHERE user_id = :u) ORDER BY id LIMIT 10000 OFFSET :off"
+)
+
+
+def exact_similar(t: "Target", prm: dict, item: str) -> list:
+    q = np.asarray(t.query("SELECT emb FROM products WHERE id = :id", {"id": item})[0][0], dtype=np.float32)
+    q /= np.linalg.norm(q)
+    ids, vecs, off = [], [], 0
+    while True:
+        page = t.query(SIMILAR_ROWS, {k: v for k, v in prm.items() if k != "v"} | {"off": off})
+        ids += [r[0] for r in page]
+        vecs += [r[1] for r in page]
+        if len(page) < 10_000:
+            break
+        off += 10_000
+    if not ids:
+        return []
+    m = np.asarray(vecs, dtype=np.float32)
+    sims = (m @ q) / np.linalg.norm(m, axis=1)
+    order = sorted(range(len(ids)), key=lambda i: (-float(sims[i]), ids[i]))
+    return [[ids[i]] for i in order[:10]]
+
+
 PARAMS = {
     "get": ["id"],
     "user_reviews": ["u"],
@@ -174,7 +208,7 @@ def make_probes(db, seed: int = 11) -> dict[str, list[dict]]:
         ps = []
         for i in range(PROBES if PARAMS[name] else 1):
             pid, title, cat, price = pick[i]
-            words = [w for w in title.split() if w.isalpha()][:3] or ["game"]
+            words = [w.lower() for w in title.split() if w.isalpha()][:3] or ["game"]  # lower case: MATCH reads AND, OR, NOT as operators
             ps.append(
                 {
                     "id": pid,
@@ -204,7 +238,11 @@ class Target:
         self.local = db_path is not None
 
     def query(self, sql: str, params: dict) -> list:
-        return self.db.query(sql, params).rows
+        if self.local:
+            return self.db.query(sql, params).rows
+        # The server's longest deadline (--max-timeout-ms), not its 5 s default:
+        # the app in-process has none.
+        return self.db.query(sql, params, timeout_ms=60_000).rows
 
 
 
@@ -237,18 +275,23 @@ def run(t: Target, probes: dict[str, list[dict]], repeats: int) -> dict:
             answers.append(canon(got) if got is not None else None)
         digest = hashlib.sha256(json.dumps(answers, sort_keys=True).encode()).hexdigest()
         rep[name] = {"p50_ms": percentile(ms, 50), "p99_ms": percentile(ms, 99), "requests": len(ms), "errors": len(errors), "first_error": errors[0] if errors else None, "sha256": digest, "answers": answers}
+        if t.local and name == "similar":
+            rep[name]["exact"] = [exact_similar(t, params_of(name, p), p["item"]) for p in probes[name]]
         print(f"  {name:13} p50 {rep[name]['p50_ms']:8.2f} ms  errors {len(errors)}  {digest[:12]}", file=sys.stderr)
     return rep
 
 
 def loop(t: Target, probes: dict[str, list[dict]], seconds: float) -> dict:
-    """Queries round-robin for `seconds`, as a client during a change: latency and errors per second."""
+    """Queries round-robin for `seconds`, or until SIGTERM, as a client during a change: latency and errors per second."""
     names = list(QUERIES)
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     t_end = time.perf_counter() + seconds
     per_s: dict[int, dict[str, Any]] = {}
+    by_query = {n: {"requests": 0, "errors": 0, "first_error": None} for n in names}
     t_start = time.perf_counter()
     i = 0
-    while time.perf_counter() < t_end:
+    while time.perf_counter() < t_end and not stop:
         name = names[i % len(names)]
         p = probes[name][(i // len(names)) % len(probes[name])]
         t0 = time.perf_counter()
@@ -262,13 +305,17 @@ def loop(t: Target, probes: dict[str, list[dict]], seconds: float) -> dict:
         b = per_s.setdefault(sec, {"n": 0, "errors": 0, "ms": [], "first_error": None})
         b["n"] += 1
         b["ms"].append(dt)
+        q = by_query[name]
+        q["requests"] += 1
         if err:
             b["errors"] += 1
-            b["first_error"] = b["first_error"] or err
+            b["first_error"] = b["first_error"] or f"{name}: {err}"
+            q["errors"] += 1
+            q["first_error"] = q["first_error"] or err
         i += 1
     seconds_out = [{"second": s, "requests": b["n"], "errors": b["errors"], "p50_ms": percentile(b["ms"], 50), "p99_ms": percentile(b["ms"], 99), "first_error": b["first_error"]} for s, b in sorted(per_s.items())]
     all_ms = [x for b in per_s.values() for x in b["ms"]]
-    return {"seconds": seconds_out, "requests": len(all_ms), "errors": sum(b["errors"] for b in per_s.values()), "p50_ms": percentile(all_ms, 50), "p99_ms": percentile(all_ms, 99)}
+    return {"seconds": seconds_out, "by_query": by_query, "requests": len(all_ms), "errors": sum(b["errors"] for b in per_s.values()), "p50_ms": percentile(all_ms, 50), "p99_ms": percentile(all_ms, 99)}
 
 
 def main() -> None:
@@ -314,23 +361,49 @@ def main() -> None:
         return
     # compare
     stages = sorted(out.glob("c_*.json"))
-    stages = [p for p in stages if not p.name.endswith("-loop.json")]
-    reps = {json.loads(p.read_text())["stage"]: json.loads(p.read_text()) for p in stages}
+    stages = [p for p in stages if not p.name.endswith("-loop.json") and p.name != "c_compare.json"]
+    reps = {r["stage"]: r for r in (json.loads(p.read_text()) for p in stages)}
     first = reps.get("app") or next(iter(reps.values()))
     table = {}
     for stage, r in reps.items():
-        row = {}
-        for q, v in r["queries"].items():
-            same = v["sha256"] == first["queries"][q]["sha256"]
-            if not same:
-                a_, b_ = first["queries"][q]["answers"], v["answers"]
-                differ = sum(1 for x, y in zip(a_, b_) if x != y)
-                row[q] = f"differs on {differ} of {len(a_)} probes"
-            else:
-                row[q] = "same"
-        table[stage] = row
-    print(json.dumps(table, indent=1))
+        table[stage] = {q: judge(first["queries"][q], v) for q, v in r["queries"].items()}
+    for stage, row in table.items():
+        print(stage)
+        for q, v in row.items():
+            print(f"  {q:13} {v['verdict']}" + "".join(f", {k} {v[k]}" for k in ("probes_differ", "max_score_diff_pct", "overlap10", "recall10_exact") if k in v))
     write_report(out / "c_compare.json", {"against": first["stage"], "table": table})
+
+
+def judge(first: dict, v: dict) -> dict:
+    """How a stage's answers to one query stand against stage 1's (`first`)."""
+    a_, b_ = first["answers"], v["answers"]
+    out: dict[str, Any] = {}
+    if "exact" in first:
+        def recall(ans: list) -> float:
+            rs = [len({r[0] for r in g} & {r[0] for r in t}) / max(1, len(t)) for g, t in zip(ans, first["exact"]) if g is not None]
+            return round(sum(rs) / len(rs), 3) if rs else 0.0
+        out["recall10_exact"] = recall(b_)
+        out["recall10_exact_stage1"] = recall(a_)
+    if v["errors"]:
+        return {"verdict": f"refused: {v['first_error']}", "errors": v["errors"], **out}
+    if v["sha256"] == first["sha256"]:
+        return {"verdict": "same", **out}
+    differ = [(x, y) for x, y in zip(a_, b_) if x != y]
+    out["probes_differ"] = f"{len(differ)} of {len(a_)}"
+    ids = lambda rows: [r[0] for r in rows]  # noqa: E731
+    if all(ids(x) == ids(y) for x, y in differ):
+        verdict = "same rows in the same order, scores apart"
+    elif all(sorted(map(str, ids(x))) == sorted(map(str, ids(y))) for x, y in differ):
+        verdict = "same rows, order apart"
+    else:
+        verdict = "rows apart"
+    scored = [(r, t) for x, y in differ for r, t in zip(x, y) if len(r) > 1 and isinstance(r[-1], float) and isinstance(t[-1], float) and r[0] == t[0] and r[-1]]
+    if scored:
+        out["max_score_diff_pct"] = round(100 * max(abs(r[-1] - t[-1]) / abs(r[-1]) for r, t in scored), 2)
+    if verdict == "rows apart":
+        ov = [len(set(map(str, ids(x))) & set(map(str, ids(y)))) / max(1, len(x)) for x, y in zip(a_, b_)]
+        out["overlap10"] = round(sum(ov) / len(ov), 3)
+    return {"verdict": verdict, **out}
 
 
 if __name__ == "__main__":
