@@ -35,3 +35,11 @@ audio = ["strata/audio"]
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# CI's tests (maturin develop --profile ci): release's optimisation without
+# its link-time optimisation and single codegen unit, which take most of the
+# time of building the extension.
+[profile.ci]
+inherits = "release"
+codegen-units = 16
+lto = false
