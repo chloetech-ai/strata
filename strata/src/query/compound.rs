@@ -74,6 +74,19 @@ fn fname(f: &sql::Function) -> String {
     f.name.to_string().to_ascii_lowercase()
 }
 
+/// Whether `f` is an aggregate's call (`SUM(x)`), not a window function's
+/// (`SUM(x) OVER (..)`).
+fn is_aggregate(f: &sql::Function) -> bool {
+    AGGREGATES.contains(&fname(f).as_str()) && f.over.is_none()
+}
+
+/// Whether `e` (outside subqueries) calls a window function.
+fn has_window(e: &Expr) -> bool {
+    let mut found = false;
+    walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if f.over.is_some()));
+    found
+}
+
 fn parse(sql_text: &str) -> Result<Box<sql::Query>> {
     let stmts = super::parse::parse(sql_text)?;
     match stmts.into_iter().collect::<Vec<_>>().as_mut_slice() {
@@ -103,7 +116,7 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         return true;
     }
     let sql::SetExpr::Select(s) = q.body.as_ref() else { return true };
-    if s.from.len() != 1 || !s.from[0].joins.is_empty() || s.distinct.is_some() || per_capped(q) || computes_columns(q, s) || reads_paths(q, s) {
+    if s.from.len() != 1 || !s.from[0].joins.is_empty() || s.distinct.is_some() || per_capped(q) || computes_columns(q, s) || reads_paths(q, s) || windowed(q, s) {
         return true;
     }
     match &s.from[0].relation {
@@ -257,6 +270,121 @@ fn joins_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
     }
 }
 
+/// Writes each `OVER w` and `OVER (w ORDER BY ..)` of `q`, and of the
+/// queries inside it, out as the window it names (`WINDOW w AS (..)`), as
+/// PostgreSQL does: `OVER (w ..)` takes `w`'s partition and adds an order
+/// or a frame, and `w` names a window without a frame when it adds one.
+pub(crate) fn inline_windows(q: &mut sql::Query) -> Result<()> {
+    // The queries inside first, each with its own WINDOW clause.
+    if let Some(w) = &mut q.with {
+        for cte in &mut w.cte_tables {
+            inline_windows(&mut cte.query)?;
+        }
+    }
+    let mut failed = None;
+    if let sql::SetExpr::Select(s) = q.body.as_mut() {
+        for t in &mut s.from {
+            let relations = std::iter::once(&mut t.relation).chain(t.joins.iter_mut().map(|j| &mut j.relation));
+            for r in relations {
+                if let TableFactor::Derived { subquery, .. } = r {
+                    inline_windows(subquery)?;
+                }
+            }
+        }
+    }
+    query_mut(q, &mut |e| match e {
+        Expr::Subquery(sq) | Expr::Exists { subquery: sq, .. } | Expr::InSubquery { subquery: sq, .. } if failed.is_none() => {
+            if let Err(x) = inline_windows(sq) {
+                failed = Some(x);
+            }
+        }
+        _ => {}
+    });
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Ok(()) };
+    if s.named_window.is_empty() {
+        // Windows written out already; a name with none to name is an
+        // error below.
+        let mut named = false;
+        query_mut(q, &mut |e| named |= matches!(e, Expr::Function(f) if matches!(&f.over, Some(sql::WindowType::NamedWindow(_))) || matches!(&f.over, Some(sql::WindowType::WindowSpec(w)) if w.window_name.is_some())));
+        if !named {
+            return Ok(());
+        }
+    }
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return Ok(()) };
+    // A column the query names is named as the query wrote it (`RANK()
+    // OVER w`), not by the window it becomes.
+    for item in s.projection.iter_mut() {
+        let SelectItem::UnnamedExpr(e) = item else { continue };
+        if has_window(e) {
+            let alias = sql::Ident::with_quote('"', super::sql::name_of(e));
+            *item = SelectItem::ExprWithAlias { expr: e.clone(), alias };
+        }
+    }
+    // The named windows, each written out over the ones before.
+    let mut named: Vec<(String, sql::WindowSpec)> = Vec::new();
+    for sql::NamedWindowDefinition(name, def) in std::mem::take(&mut s.named_window) {
+        let spec = match def {
+            sql::NamedWindowExpr::NamedWindow(other) => spec_of(&sql::WindowType::NamedWindow(other), &named)?,
+            sql::NamedWindowExpr::WindowSpec(w) => spec_of(&sql::WindowType::WindowSpec(w), &named)?,
+        };
+        if named.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name.value)) {
+            return Err(err(format!("WINDOW {name} is named twice")));
+        }
+        named.push((name.value, spec));
+    }
+    query_mut(q, &mut |e| {
+        let Expr::Function(f) = e else { return };
+        let Some(over) = &mut f.over else { return };
+        if failed.is_some() {
+            return;
+        }
+        match spec_of(over, &named) {
+            Ok(spec) => *over = sql::WindowType::WindowSpec(spec),
+            Err(x) => failed = Some(x),
+        }
+    });
+    failed.map_or(Ok(()), Err)
+}
+
+/// The window `over` is, written out over the `named` windows.
+fn spec_of(over: &sql::WindowType, named: &[(String, sql::WindowSpec)]) -> Result<sql::WindowSpec> {
+    let find = |n: &sql::Ident| named.iter().find(|(x, _)| x.eq_ignore_ascii_case(&n.value)).map(|(_, w)| w.clone()).ok_or_else(|| err(format!("no window named {n}: name it in a WINDOW clause, WINDOW {n} AS (PARTITION BY .. ORDER BY ..)")));
+    match over {
+        sql::WindowType::NamedWindow(n) => find(n),
+        sql::WindowType::WindowSpec(w) => {
+            let Some(n) = &w.window_name else { return Ok(w.clone()) };
+            let base = find(n)?;
+            if !w.partition_by.is_empty() {
+                return Err(err(format!("OVER ({n} PARTITION BY ..): a window over {n} keeps its partition; partition in WINDOW {n} AS (..)")));
+            }
+            if !base.order_by.is_empty() && !w.order_by.is_empty() {
+                return Err(err(format!("OVER ({n} ORDER BY ..): {n} has an order already")));
+            }
+            if base.window_frame.is_some() {
+                return Err(err(format!("OVER ({n} ..): {n} has a frame, which a window over it cannot change; write OVER {n}")));
+            }
+            Ok(sql::WindowSpec {
+                window_name: None,
+                partition_by: base.partition_by,
+                order_by: if w.order_by.is_empty() { base.order_by } else { w.order_by.clone() },
+                window_frame: w.window_frame.clone(),
+            })
+        }
+    }
+}
+
+/// Whether a SELECT calls window functions (in its columns, ORDER BY or
+/// QUALIFY) or names windows: operators compute them over its rows.
+fn windowed(q: &sql::Query, s: &sql::Select) -> bool {
+    !s.named_window.is_empty()
+        || s.qualify.is_some()
+        || select_exprs(s).into_iter().any(has_window)
+        || q.order_by.as_ref().is_some_and(|ob| matches!(&ob.kind, sql::OrderByKind::Expressions(es) if es.iter().any(|e| has_window(&e.expr))))
+}
+
 /// Whether `e` (outside subqueries) computes a value of rows that a scan
 /// does not: a semantic ID's prefix, `sid_at(..)`, or a dot product of
 /// vectors, `dot(..)`, which operators compute over the rows the scan
@@ -307,7 +435,7 @@ fn computes_columns(q: &sql::Query, s: &sql::Select) -> bool {
     let plain = |e: &Expr| match e {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
         Expr::Function(f) if fname(f) == "score" && func_args(f).is_empty() => true,
-        Expr::Function(f) if AGGREGATES.contains(&fname(f).as_str()) => {
+        Expr::Function(f) if is_aggregate(f) => {
             func_args(f).iter().all(|a| matches!(a, Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) | Expr::Wildcard(_)))
         }
         _ => false,
@@ -349,6 +477,7 @@ fn select_exprs(s: &sql::Select) -> Vec<&Expr> {
     }
     out.extend(s.selection.iter());
     out.extend(s.having.iter());
+    out.extend(s.qualify.iter());
     if let sql::GroupByExpr::Expressions(es, _) = &s.group_by {
         out.extend(es.iter());
     }
@@ -381,6 +510,10 @@ pub(crate) fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         Expr::Function(func) => {
             for a in func_args(func) {
                 walk(a, f);
+            }
+            if let Some(sql::WindowType::WindowSpec(w)) = &func.over {
+                w.partition_by.iter().for_each(|x| walk(x, f));
+                w.order_by.iter().for_each(|o| walk(&o.expr, f));
             }
         }
         Expr::Case { operand, conditions, else_result, .. } => {
@@ -478,6 +611,7 @@ pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Para
 pub(crate) fn plan_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
     let mut q = q.clone();
     json_paths(&mut q, catalog)?;
+    inline_windows(&mut q)?;
     let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()), outer: RefCell::new(None) };
     Ok(ir::Plan::new(p.query(&q)?.node))
 }
@@ -712,7 +846,7 @@ impl<'a> Planner<'a> {
         let Some((s0, name)) = one_table(first) else { return Ok(None) };
         let Some(schema) = self.table(&name).filter(|_| self.cte(&name).is_none()) else { return Ok(None) };
         let simple = |s: &sql::Select| s.distinct.is_none() && s.having.is_none() && matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty());
-        if first.with.is_some() || !simple(s0) {
+        if first.with.is_some() || !simple(s0) || windowed(first, s0) {
             return Ok(None);
         }
         // Each later step: what it projects, ranks by and cuts, its
@@ -743,7 +877,7 @@ impl<'a> Planner<'a> {
                 && order.options.nulls_first.is_none()
                 && !matches!(&order.expr, Expr::Value(_))
                 && !matches!(&order.expr, Expr::Function(f) if matches!(fname(f).as_str(), "hops" | "distance"));
-            if !from.eq_ignore_ascii_case(read) || r.with.is_some() || !simple(s) || s.selection.is_some() || subquery || !ranks {
+            if !from.eq_ignore_ascii_case(read) || r.with.is_some() || !simple(s) || windowed(r, s) || s.selection.is_some() || subquery || !ranks {
                 return Ok(None);
             }
             let plain = |e: &Expr| {
@@ -858,7 +992,7 @@ impl<'a> Planner<'a> {
             TableFactor::Table { name, .. } if self.cte(&super::sql::table_name(name)).is_some() => {
                 let cte = self.cte(&super::sql::table_name(name)).expect("in scope");
                 match cte.keyed.as_deref().and_then(|t| self.table(t)) {
-                    Some(schema) if !rows_of(q, s) => self.over_rows(q, s, &cte, schema),
+                    Some(schema) if !rows_of(q, s) && !windowed(q, s) => self.over_rows(q, s, &cte, schema),
                     _ => self.join(q, s),
                 }
             }
@@ -881,7 +1015,8 @@ impl<'a> Planner<'a> {
             _ if per_capped(&q) => return self.join(&q, &s),
             // Columns computed from the rows' values, and an order by
             // text, by the row evaluator.
-            _ if computes_columns(&q, &s) || orders_by_text(&q, &s, schema) || reads_paths(&q, &s) => return self.join(&q, &s),
+            // Window functions, by operators over the rows.
+            _ if computes_columns(&q, &s) || orders_by_text(&q, &s, schema) || reads_paths(&q, &s) || windowed(&q, &s) => return self.join(&q, &s),
             Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
             None => {}
         }
@@ -1085,6 +1220,28 @@ impl<'a> Planner<'a> {
 
     /// Joins (and any SELECT over rows held in memory).
     fn join(&self, q: &sql::Query, s: &sql::Select) -> Result<Planned> {
+        // Windows are computed over the rows WHERE, GROUP BY and HAVING
+        // give, so they are not part of those.
+        let mut before: Vec<&Expr> = s.selection.iter().chain(s.having.iter()).collect();
+        if let sql::GroupByExpr::Expressions(es, _) = &s.group_by {
+            before.extend(es.iter());
+        }
+        for j in s.from.iter().flat_map(|t| &t.joins) {
+            if let sql::JoinOperator::Join(sql::JoinConstraint::On(on)) | sql::JoinOperator::Inner(sql::JoinConstraint::On(on)) | sql::JoinOperator::Left(sql::JoinConstraint::On(on)) | sql::JoinOperator::LeftOuter(sql::JoinConstraint::On(on)) = &j.join_operator {
+                before.push(on);
+            }
+        }
+        for e in before {
+            let mut call = None;
+            walk(e, &mut |x| {
+                if matches!(x, Expr::Function(f) if f.over.is_some()) && call.is_none() {
+                    call = Some(x.to_string());
+                }
+            });
+            if let Some(c) = call {
+                return Err(err(format!("{c}: a window function is a column of SELECT, ORDER BY or QUALIFY, not part of WHERE, ON, GROUP BY or HAVING")));
+            }
+        }
         let mut order: Vec<sql::OrderByExpr> = match &q.order_by {
             None => Vec::new(),
             Some(ob) => match &ob.kind {
@@ -1112,6 +1269,7 @@ impl<'a> Planner<'a> {
             matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty())
                 && !has_aggregate(s)
                 && s.projection.iter().all(|i| matches!(i, SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }))
+                && !select_exprs(s).into_iter().any(has_window)
         };
         let s = if matches!(s.distinct, Some(sql::Distinct::Distinct)) && plain(s) {
             let mut g = s.clone();
@@ -1252,7 +1410,10 @@ impl<'a> Planner<'a> {
         // The first table drives: when the order is its own, its rows come
         // in that order and keep it through the joins, so a cut needs only
         // as many of them as join into enough rows ([`ops`] grows its scan).
+        // A window reads all the rows, so none drive (and its order is
+        // its own).
         let driver_order = !grouped
+            && !windowed(q, s)
             && !matches!(s.distinct, Some(sql::Distinct::Distinct))
             && match order.first() {
                 None => true,
@@ -1629,6 +1790,7 @@ pub(crate) fn query_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
         }
         s.selection.iter_mut().for_each(|e| walk_mut(e, f));
         s.having.iter_mut().for_each(|e| walk_mut(e, f));
+        s.qualify.iter_mut().for_each(|e| walk_mut(e, f));
         if let sql::GroupByExpr::Expressions(es, _) = &mut s.group_by {
             es.iter_mut().for_each(|e| walk_mut(e, f));
         }
@@ -1669,6 +1831,10 @@ fn walk_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
             for a in func_args_mut(func) {
                 walk_mut(a, f);
             }
+            if let Some(sql::WindowType::WindowSpec(w)) = &mut func.over {
+                w.partition_by.iter_mut().for_each(|x| walk_mut(x, f));
+                w.order_by.iter_mut().for_each(|o| walk_mut(&mut o.expr, f));
+            }
         }
         Expr::Case { operand, conditions, else_result, .. } => {
             operand.iter_mut().for_each(|x| walk_mut(x, f));
@@ -1704,7 +1870,7 @@ fn has_aggregate(s: &sql::Select) -> bool {
     let mut found = false;
     for item in &s.projection {
         if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
-            walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if AGGREGATES.contains(&fname(f).as_str())));
+            walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if is_aggregate(f)));
         }
     }
     found
@@ -2006,6 +2172,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             };
             super::sql::encode_call(f, &lit, &|q| sub(q, Sub::Rows))?
         }
+        Expr::Function(f) if f.over.is_some() => return Err(err(format!("{e}: a window function is a column of SELECT, ORDER BY or QUALIFY, not part of WHERE, ON, GROUP BY or HAVING"))),
         Expr::Function(f) => {
             let func = match fname(f).as_str() {
                 "lower" => Func::Lower,
@@ -2048,7 +2215,7 @@ fn agg_calls(exprs: &[&Expr]) -> Result<Vec<AggCall>> {
         walk(e, &mut |x| {
             let Expr::Function(f) = x else { return };
             let name = fname(f);
-            if !AGGREGATES.contains(&name.as_str()) || out.iter().any(|a| a.text == x.to_string()) {
+            if !is_aggregate(f) || out.iter().any(|a| a.text == x.to_string()) {
                 return;
             }
             let distinct = matches!(&f.args, FunctionArguments::List(l) if l.duplicate_treatment == Some(sql::DuplicateTreatment::Distinct));
@@ -2069,6 +2236,195 @@ fn agg_calls(exprs: &[&Expr]) -> Result<Vec<AggCall>> {
         });
     }
     Ok(out)
+}
+
+/// A window function's call: its text (how other expressions name it) and
+/// the call.
+struct WindowCall {
+    text: String,
+    call: sql::Function,
+}
+
+/// The window functions' calls in `exprs`, each once. A window function
+/// reads rows, not other windows' values.
+fn window_calls(exprs: &[&Expr]) -> Result<Vec<WindowCall>> {
+    let mut out: Vec<WindowCall> = Vec::new();
+    let mut failed = None;
+    for e in exprs {
+        walk(e, &mut |x| {
+            let Expr::Function(f) = x else { return };
+            let Some(sql::WindowType::WindowSpec(w)) = &f.over else { return };
+            let inner = func_args(f).into_iter().any(has_window) || w.partition_by.iter().any(has_window) || w.order_by.iter().any(|o| has_window(&o.expr));
+            if inner && failed.is_none() {
+                failed = Some(err(format!("{x}: a window function's argument, partition or order holds another; compute that one in a subquery in FROM")));
+            }
+            let text = x.to_string();
+            if !out.iter().any(|c| c.text == text) {
+                out.push(WindowCall { text, call: f.clone() });
+            }
+        });
+    }
+    failed.map_or(Ok(out), Err)
+}
+
+/// A whole number of a window function's call (`NTILE(4)`, `LAG(x, 2)`,
+/// `NTH_VALUE(x, 3)`) at least `min`: a constant.
+fn count_arg(e: &ir::Expr, what: &str, min: i64) -> Result<u64> {
+    match value(e) {
+        Ok(Value::Int(n)) if n >= min => Ok(n as u64),
+        _ => Err(err(format!("{what} takes a whole number of at least {min}, not {e:?}"))),
+    }
+}
+
+/// The plan's window function of a call: `compile` compiles an expression
+/// over the rows the window reads.
+fn window_fn(f: &sql::Function, params: &Params, compile: &dyn Fn(&Expr) -> Result<ir::Expr>) -> Result<ir::WindowFn> {
+    let name = fname(f);
+    let Some(sql::WindowType::WindowSpec(w)) = &f.over else { return Err(err(format!("{name}: OVER names no window"))) };
+    if f.filter.is_some() {
+        return Err(err(format!("{name}(..) FILTER (WHERE ..) OVER: a window aggregate takes no FILTER; aggregate a CASE (SUM(CASE WHEN .. THEN x END))")));
+    }
+    if f.null_treatment == Some(sql::NullTreatment::IgnoreNulls) || matches!(&f.args, FunctionArguments::List(l) if l.clauses.iter().any(|c| matches!(c, sql::FunctionArgumentClause::IgnoreOrRespectNulls(sql::NullTreatment::IgnoreNulls)))) {
+        return Err(err(format!("{name}(..) IGNORE NULLS is not supported")));
+    }
+    if !f.within_group.is_empty() || matches!(&f.args, FunctionArguments::List(l) if !l.clauses.iter().all(|c| matches!(c, sql::FunctionArgumentClause::IgnoreOrRespectNulls(_)))) {
+        return Err(err(format!("{name}(..): a window function's arguments are expressions")));
+    }
+    if matches!(&f.args, FunctionArguments::List(l) if l.duplicate_treatment == Some(sql::DuplicateTreatment::Distinct)) {
+        return Err(err(format!("{name}(DISTINCT ..) OVER is not supported")));
+    }
+    let args = func_args(f);
+    let arity = |lo: usize, hi: usize, usage: &str| -> Result<()> {
+        match (lo..=hi).contains(&args.len()) {
+            true => Ok(()),
+            false => Err(err(format!("{name} is {usage}"))),
+        }
+    };
+    let func = match name.as_str() {
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
+            arity(0, 0, &format!("{}() OVER (..), of no arguments", name.to_ascii_uppercase()))?;
+            match name.as_str() {
+                "row_number" => ir::WindowFunc::RowNumber,
+                "rank" => ir::WindowFunc::Rank,
+                "dense_rank" => ir::WindowFunc::DenseRank,
+                "percent_rank" => ir::WindowFunc::PercentRank,
+                _ => ir::WindowFunc::CumeDist,
+            }
+        }
+        "ntile" => {
+            arity(1, 1, "NTILE(buckets) OVER (..)")?;
+            ir::WindowFunc::Ntile(count_arg(&compile(args[0])?, "NTILE", 1)?)
+        }
+        "lag" | "lead" => {
+            arity(1, 3, &format!("{}(x [, offset [, default]]) OVER (..)", name.to_ascii_uppercase()))?;
+            let arg = compile(args[0])?;
+            let offset = match args.get(1) {
+                None => 1,
+                Some(o) => count_arg(&compile(o)?, &name.to_ascii_uppercase(), 0)?,
+            };
+            // A constant default as its value (`-1.5`, not `-(1.5)`).
+            let default = args.get(2).map(|d| compile(d).map(|e| value(&e).map_or(e, ir::Expr::Lit))).transpose()?;
+            match name.as_str() {
+                "lag" => ir::WindowFunc::Lag { arg, offset, default },
+                _ => ir::WindowFunc::Lead { arg, offset, default },
+            }
+        }
+        "first_value" | "last_value" => {
+            arity(1, 1, &format!("{}(x) OVER (..)", name.to_ascii_uppercase()))?;
+            let arg = compile(args[0])?;
+            if name == "first_value" { ir::WindowFunc::FirstValue(arg) } else { ir::WindowFunc::LastValue(arg) }
+        }
+        "nth_value" => {
+            arity(2, 2, "NTH_VALUE(x, n) OVER (..)")?;
+            ir::WindowFunc::NthValue { arg: compile(args[0])?, n: count_arg(&compile(args[1])?, "NTH_VALUE", 1)? }
+        }
+        "count" | "sum" | "avg" | "min" | "max" => {
+            let func = match name.as_str() {
+                "count" => AggFn::Count,
+                "sum" => AggFn::Sum,
+                "avg" => AggFn::Avg,
+                "min" => AggFn::Min,
+                _ => AggFn::Max,
+            };
+            let arg = match (name.as_str(), is_star(f)) {
+                ("count", true) => None,
+                (_, true) => return Err(err(format!("{}(x) OVER (..) takes a column or an expression", name.to_ascii_uppercase()))),
+                _ => {
+                    arity(1, 1, &format!("{}(x) OVER (..)", name.to_ascii_uppercase()))?;
+                    Some(compile(args[0])?)
+                }
+            };
+            ir::WindowFunc::Agg(ir::Agg { func, arg })
+        }
+        _ => {
+            return Err(err(format!(
+                "{name} is not a window function: ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, COUNT, SUM, AVG, MIN and MAX are"
+            )))
+        }
+    };
+    let partition = w.partition_by.iter().map(compile).collect::<Result<Vec<_>>>()?;
+    let order = w
+        .order_by
+        .iter()
+        .map(|o| Ok(ir::SortKey { expr: compile(&o.expr)?, desc: o.options.asc == Some(false), nulls_first: o.options.nulls_first == Some(true) }))
+        .collect::<Result<Vec<_>>>()?;
+    // A frame matters to the functions that read one; the others read the
+    // partition in order whatever it says, as in SQL.
+    let frame = match &w.window_frame {
+        Some(fr) if func.framed() => Some(frame_of(fr, order.len(), params)?),
+        _ => None,
+    };
+    Ok(ir::WindowFn { func, partition, order, frame })
+}
+
+/// A window's frame: ROWS or RANGE, between literal offsets.
+fn frame_of(fr: &sql::WindowFrame, keys: usize, params: &Params) -> Result<ir::Frame> {
+    let units = match fr.units {
+        sql::WindowFrameUnits::Rows => ir::FrameUnits::Rows,
+        sql::WindowFrameUnits::Range => ir::FrameUnits::Range,
+        sql::WindowFrameUnits::Groups => return Err(err("GROUPS frames are not supported: count ROWS or a RANGE of the order's values")),
+    };
+    let offset = |x: &Expr| -> Result<ir::Expr> {
+        let v = value(&compile(x, params, &|_| None, &[]).map_err(|_| err(format!("{x}: a frame's offset is a number, not an expression of the row")))?)?;
+        match (units, &v) {
+            (ir::FrameUnits::Rows, Value::Int(n)) if *n >= 0 => {}
+            (ir::FrameUnits::Rows, _) => return Err(err(format!("ROWS {x} PRECEDING/FOLLOWING: a ROWS offset is a whole number of rows, 0 or more"))),
+            (ir::FrameUnits::Range, Value::Int(n)) if *n >= 0 => {}
+            (ir::FrameUnits::Range, Value::Float(n)) if *n >= 0.0 => {}
+            (ir::FrameUnits::Range, _) => return Err(err(format!("RANGE {x} PRECEDING/FOLLOWING: a RANGE offset is a number, 0 or more"))),
+        }
+        if units == ir::FrameUnits::Range && keys != 1 {
+            return Err(err(format!("RANGE {x} PRECEDING/FOLLOWING measures from the value of the window's one ORDER BY key, and it has {keys}")));
+        }
+        Ok(ir::Expr::Lit(v))
+    };
+    let bound = |b: &sql::WindowFrameBound| -> Result<ir::Bound> {
+        Ok(match b {
+            sql::WindowFrameBound::CurrentRow => ir::Bound::CurrentRow,
+            sql::WindowFrameBound::Preceding(None) => ir::Bound::UnboundedPreceding,
+            sql::WindowFrameBound::Preceding(Some(x)) => ir::Bound::Preceding(offset(x)?),
+            sql::WindowFrameBound::Following(None) => ir::Bound::UnboundedFollowing,
+            sql::WindowFrameBound::Following(Some(x)) => ir::Bound::Following(offset(x)?),
+        })
+    };
+    let start = bound(&fr.start_bound)?;
+    let end = fr.end_bound.as_ref().map(bound).transpose()?.unwrap_or(ir::Bound::CurrentRow);
+    // As SQL: a frame starts no later than it ends, by its kinds of bound.
+    let rank = |b: &ir::Bound| match b {
+        ir::Bound::UnboundedPreceding => 0,
+        ir::Bound::Preceding(_) => 1,
+        ir::Bound::CurrentRow => 2,
+        ir::Bound::Following(_) => 3,
+        ir::Bound::UnboundedFollowing => 4,
+    };
+    if matches!(start, ir::Bound::UnboundedFollowing) || matches!(end, ir::Bound::UnboundedPreceding) || rank(&start) > rank(&end) {
+        let shown = match &fr.end_bound {
+            Some(e) => format!("{} BETWEEN {} AND {e}", fr.units, fr.start_bound),
+            None => format!("{} {}", fr.units, fr.start_bound),
+        };
+        return Err(err(format!("{shown}: a frame starts no later than it ends, in the order UNBOUNDED PRECEDING, n PRECEDING, CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING")));
+    }
+    Ok(ir::Frame { units, start, end })
 }
 
 impl Planner<'_> {
@@ -2124,11 +2480,33 @@ impl Planner<'_> {
                 .collect::<Result<_>>()?,
             _ => return Err(err("GROUP BY ALL is not supported")),
         };
+        // QUALIFY, which may name selected window functions by their alias.
+        let qualify = s.qualify.as_ref().map(|q| having_with_aliases(q, &items));
         let mut item_exprs: Vec<&Expr> = items.iter().map(|i| &i.1).collect();
         item_exprs.extend(s.having.iter());
         item_exprs.extend(order.iter().map(|o| &o.0));
+        item_exprs.extend(qualify.iter());
         let calls = agg_calls(&item_exprs)?;
+        let windows = window_calls(&item_exprs)?;
         let grouped = !group_exprs.is_empty() || !calls.is_empty();
+        // The window functions over the rows (or the groups) as `slot`
+        // names their columns, then QUALIFY: the rows with a column per
+        // function after their own `width`.
+        let window = |node: ir::Node, width: usize, slot: &dyn Fn(&Expr) -> Option<Result<ir::Expr>>, multi: &[bool]| -> Result<ir::Node> {
+            let mut node = node;
+            if !windows.is_empty() {
+                let compile = |e: &Expr| compile_with(e, params, slot, multi, Some(&subs));
+                let funcs = windows.iter().map(|c| window_fn(&c.call, params, &compile)).collect::<Result<Vec<_>>>()?;
+                node = ir::Node::Window { input: Box::new(node), funcs };
+            }
+            if let Some(q) = &qualify {
+                let wslot = |e: &Expr| windows.iter().position(|c| c.text == e.to_string()).map(|j| Ok(ir::Expr::Output((width + j) as u32))).or_else(|| slot(e));
+                let cond = compile_with(q, params, &wslot, multi, Some(&subs))?;
+                node = ir::Node::Filter { input: Box::new(node), cond };
+            }
+            Ok(node)
+        };
+        let window_slot = |e: &Expr, width: usize| windows.iter().position(|c| c.text == e.to_string()).map(|j| Ok(ir::Expr::Output((width + j) as u32)));
         // ORDER BY an output column's name or number, or an expression over
         // the input row.
         // A number is a position (`ORDER BY 2`), and one past the columns
@@ -2199,6 +2577,10 @@ impl Planner<'_> {
                 let cond = compile_with(&having_with_aliases(h, &items), params, &group_slot, &[], Some(&subs))?;
                 node = ir::Node::Filter { input: Box::new(node), cond };
             }
+            // The Aggregate's columns, its count of rows the last.
+            let width = k + calls.len() + 1;
+            node = window(node, width, &group_slot, &[])?;
+            let group_slot = |e: &Expr| window_slot(e, width).or_else(|| group_slot(e));
             let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_with(e, params, &group_slot, &[], Some(&subs))).collect::<Result<_>>()?;
             let keys = match order.is_empty() {
                 false => sort_keys(&items_at, &group_slot, &[])?,
@@ -2211,12 +2593,14 @@ impl Planner<'_> {
             node = first_of(node, &items_at, &group_slot, &[])?;
             items_at
         } else {
-            let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_row(e, cols, multi, params, &subs)).collect::<Result<_>>()?;
+            node = window(node, cols.len(), &|e| at(slot(e, cols)), multi)?;
+            let row_slot = |e: &Expr| window_slot(e, cols.len()).or_else(|| at(slot(e, cols)));
+            let items_at: Vec<ir::Expr> = items.iter().map(|(_, e)| compile_with(e, params, &row_slot, multi, Some(&subs))).collect::<Result<_>>()?;
             if !order.is_empty() && !driver {
-                let keys = sort_keys(&items_at, &|e| at(slot(e, cols)), multi)?;
+                let keys = sort_keys(&items_at, &row_slot, multi)?;
                 node = ir::Node::Sort { input: Box::new(node), keys };
             }
-            node = first_of(node, &items_at, &|e| at(slot(e, cols)), multi)?;
+            node = first_of(node, &items_at, &row_slot, multi)?;
             items_at
         };
         let columns: Vec<String> = items.into_iter().map(|i| i.0).collect();

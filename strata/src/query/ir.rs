@@ -64,15 +64,18 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 23] = [
+pub const FEATURES: [&str; 24] = [
     OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE,
-    SCORE_NORMS, JSON,
+    SCORE_NORMS, JSON, WINDOW,
 ];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
 /// Search's ([module docs](self)).
 pub const OPERATORS: &str = "operators";
+
+/// The feature of a plan with window functions ([`Node::Window`]).
+pub const WINDOW: &str = "window";
 
 /// The feature of a plan with a column of rows' sequence numbers
 /// ([`Expr::SeqNo`]).
@@ -253,6 +256,12 @@ pub enum Node {
     /// The input's rows (rows of one table) in the order of the rows of
     /// `by` with the same primary key.
     KeyOrder { input: Box<Node>, by: Box<Node> },
+    /// The input's rows, in their order, each with a column per function
+    /// of `funcs` after its own: the function's value for the row over the
+    /// rows of its partition (`f(..) OVER (PARTITION BY .. ORDER BY ..
+    /// frame)`). Expressions above refer to the input's columns, then the
+    /// functions', with [`Expr::Output`]. Needs [`WINDOW`].
+    Window { input: Box<Node>, funcs: Vec<WindowFn> },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +422,189 @@ pub struct Agg {
     pub func: AggFn,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arg: Option<Expr>,
+}
+
+/// A window function of a [`Node::Window`]: `func`, for each row, over the
+/// rows with the row's values of `partition` (NULL equal to NULL), in the
+/// order of `order` (rows that tie in the input's order).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowFn {
+    pub func: WindowFunc,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition: Vec<Expr>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<SortKey>,
+    /// The rows of the partition an aggregate or a value function
+    /// ([`WindowFunc::FirstValue`], [`WindowFunc::LastValue`],
+    /// [`WindowFunc::NthValue`]) reads for a row. Without one: with an
+    /// order, the rows up to the row's last peer (`RANGE BETWEEN UNBOUNDED
+    /// PRECEDING AND CURRENT ROW`), and without, the whole partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Frame>,
+}
+
+/// What a [`WindowFn`] computes for a row. Rows tie (are peers) when their
+/// values of the order's keys are equal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowFunc {
+    /// The row's position in its partition, from 1.
+    RowNumber,
+    /// 1 plus the rows before the row's first peer.
+    Rank,
+    /// 1 plus the distinct values of the order before the row's.
+    DenseRank,
+    /// `(rank - 1) / (rows - 1)`, 0 in a partition of one row: a FLOAT.
+    PercentRank,
+    /// The rows up to the row's last peer over the partition's rows: a
+    /// FLOAT.
+    CumeDist,
+    /// The bucket from 1 to `n` of `n` buckets as even as can be, the
+    /// first ones larger by a row.
+    Ntile(u64),
+    /// `arg` of the row `offset` rows before (lag) or after (lead) in the
+    /// partition, or `default` (NULL without one) past its ends.
+    Lag {
+        arg: Expr,
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        offset: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<Expr>,
+    },
+    Lead {
+        arg: Expr,
+        #[serde(default = "one", skip_serializing_if = "is_one")]
+        offset: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<Expr>,
+    },
+    /// `arg` of the first, the last, or the `n`-th (from 1) row of the
+    /// row's frame; NULL when the frame has no such row.
+    FirstValue(Expr),
+    LastValue(Expr),
+    NthValue { arg: Expr, n: u64 },
+    /// An aggregate of the row's frame (`COUNT(*)` without an argument;
+    /// not `COUNT(DISTINCT ..)`).
+    Agg(Agg),
+}
+
+/// The rows of a [`WindowFn`]'s partition its function reads for a row,
+/// from `start` to `end`: rows counted from the row (`ROWS`), or rows whose
+/// value of the order's one key lies within the offsets of the row's
+/// (`RANGE`, where `CURRENT ROW` is the row's peers and an offset needs
+/// one numeric key).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    pub units: FrameUnits,
+    pub start: Bound,
+    pub end: Bound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameUnits {
+    Rows,
+    Range,
+}
+
+/// An end of a [`Frame`]. An offset is a literal, a non-negative INT for
+/// `ROWS` and a non-negative number for `RANGE`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bound {
+    UnboundedPreceding,
+    Preceding(Expr),
+    CurrentRow,
+    Following(Expr),
+    UnboundedFollowing,
+}
+
+impl WindowFunc {
+    /// The expressions the function reads of a row (its argument, and a
+    /// lag's or lead's default).
+    pub fn args(&self) -> Vec<&Expr> {
+        match self {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::PercentRank | WindowFunc::CumeDist | WindowFunc::Ntile(_) => Vec::new(),
+            WindowFunc::Lag { arg, default, .. } | WindowFunc::Lead { arg, default, .. } => std::iter::once(arg).chain(default.iter()).collect(),
+            WindowFunc::FirstValue(arg) | WindowFunc::LastValue(arg) | WindowFunc::NthValue { arg, .. } => vec![arg],
+            WindowFunc::Agg(a) => a.arg.iter().collect(),
+        }
+    }
+
+    /// [`WindowFunc::args`], to change.
+    pub fn args_mut(&mut self) -> Vec<&mut Expr> {
+        match self {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::PercentRank | WindowFunc::CumeDist | WindowFunc::Ntile(_) => Vec::new(),
+            WindowFunc::Lag { arg, default, .. } | WindowFunc::Lead { arg, default, .. } => std::iter::once(arg).chain(default.iter_mut()).collect(),
+            WindowFunc::FirstValue(arg) | WindowFunc::LastValue(arg) | WindowFunc::NthValue { arg, .. } => vec![arg],
+            WindowFunc::Agg(a) => a.arg.iter_mut().collect(),
+        }
+    }
+
+    /// Whether the function reads a frame ([`WindowFn::frame`]).
+    pub fn framed(&self) -> bool {
+        matches!(self, WindowFunc::FirstValue(_) | WindowFunc::LastValue(_) | WindowFunc::NthValue { .. } | WindowFunc::Agg(_))
+    }
+
+    /// The function's name in SQL.
+    pub fn name(&self) -> String {
+        match self {
+            WindowFunc::RowNumber => "row_number".into(),
+            WindowFunc::Rank => "rank".into(),
+            WindowFunc::DenseRank => "dense_rank".into(),
+            WindowFunc::PercentRank => "percent_rank".into(),
+            WindowFunc::CumeDist => "cume_dist".into(),
+            WindowFunc::Ntile(_) => "ntile".into(),
+            WindowFunc::Lag { .. } => "lag".into(),
+            WindowFunc::Lead { .. } => "lead".into(),
+            WindowFunc::FirstValue(_) => "first_value".into(),
+            WindowFunc::LastValue(_) => "last_value".into(),
+            WindowFunc::NthValue { .. } => "nth_value".into(),
+            WindowFunc::Agg(a) => format!("{:?}", a.func).to_ascii_lowercase(),
+        }
+    }
+}
+
+impl WindowFn {
+    /// Every expression of the function: its arguments, partition and
+    /// order, and its frame's offsets.
+    pub fn exprs(&self) -> Vec<&Expr> {
+        let mut out = self.func.args();
+        out.extend(self.partition.iter());
+        out.extend(self.order.iter().map(|k| &k.expr));
+        if let Some(f) = &self.frame {
+            for b in [&f.start, &f.end] {
+                if let Bound::Preceding(x) | Bound::Following(x) = b {
+                    out.push(x);
+                }
+            }
+        }
+        out
+    }
+
+    /// [`WindowFn::exprs`], to change.
+    pub fn exprs_mut(&mut self) -> Vec<&mut Expr> {
+        let mut out = self.func.args_mut();
+        out.extend(self.partition.iter_mut());
+        out.extend(self.order.iter_mut().map(|k| &mut k.expr));
+        if let Some(f) = &mut self.frame {
+            for b in [&mut f.start, &mut f.end] {
+                if let Bound::Preceding(x) | Bound::Following(x) = b {
+                    out.push(x);
+                }
+            }
+        }
+        out
+    }
+
+    /// The frame the function reads ([`WindowFn::frame`], or its
+    /// default).
+    pub fn frame(&self) -> Frame {
+        self.frame.clone().unwrap_or(match self.order.is_empty() {
+            true => Frame { units: FrameUnits::Rows, start: Bound::UnboundedPreceding, end: Bound::UnboundedFollowing },
+            false => Frame { units: FrameUnits::Range, start: Bound::UnboundedPreceding, end: Bound::CurrentRow },
+        })
+    }
 }
 
 /// `SET field = value`.
@@ -982,7 +1174,8 @@ impl Node {
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
             | Node::Distinct { input }
-            | Node::DistinctOn { input, .. } => vec![input],
+            | Node::DistinctOn { input, .. }
+            | Node::Window { input, .. } => vec![input],
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
             Node::With { ctes, input } => ctes.iter().map(|c| &c.input).chain([&**input]).collect(),
         }
@@ -1000,7 +1193,8 @@ impl Node {
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
             | Node::Distinct { input }
-            | Node::DistinctOn { input, .. } => vec![input],
+            | Node::DistinctOn { input, .. }
+            | Node::Window { input, .. } => vec![input],
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
             Node::With { ctes, input } => ctes.iter_mut().map(|c| &mut c.input).chain([&mut **input]).collect(),
         }
@@ -1010,6 +1204,12 @@ impl Node {
     /// [`Node::DistinctOn`].
     fn keeps_firsts(&self) -> bool {
         matches!(self, Node::DistinctOn { .. }) || self.inputs().into_iter().any(Node::keeps_firsts)
+    }
+
+    /// Whether the node or one below it (outside subqueries) is a
+    /// [`Node::Window`].
+    fn has_windows(&self) -> bool {
+        matches!(self, Node::Window { .. }) || self.inputs().into_iter().any(Node::has_windows)
     }
 
     /// Whether the node or one below it (outside subqueries) keeps more
@@ -1080,7 +1280,8 @@ impl Node {
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
             | Node::Distinct { input }
-            | Node::DistinctOn { input, .. } => input.has_phases(),
+            | Node::DistinctOn { input, .. }
+            | Node::Window { input, .. } => input.has_phases(),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_phases() || b.has_phases(),
             Node::With { ctes, input } => input.has_phases() || ctes.iter().any(|c| c.input.has_phases()),
             Node::Insert { .. } | Node::Ref { .. } => false,
@@ -1113,7 +1314,8 @@ impl Node {
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
             | Node::Distinct { input }
-            | Node::DistinctOn { input, .. } => input.each_search(f),
+            | Node::DistinctOn { input, .. }
+            | Node::Window { input, .. } => input.each_search(f),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => {
                 a.each_search(f);
                 b.each_search(f);
@@ -1166,7 +1368,8 @@ impl Node {
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
             | Node::Distinct { input }
-            | Node::DistinctOn { input, .. } => input.has_features(),
+            | Node::DistinctOn { input, .. }
+            | Node::Window { input, .. } => input.has_features(),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_features() || b.has_features(),
             Node::With { ctes, input } => input.has_features() || ctes.iter().any(|c| c.input.has_features()),
             Node::Insert { .. } | Node::Ref { .. } => false,
@@ -1282,6 +1485,10 @@ impl Node {
                 keys.iter().for_each(&mut each);
                 input.visit_exprs(f);
             }
+            Node::Window { input, funcs } => {
+                funcs.iter().flat_map(WindowFn::exprs).for_each(&mut each);
+                input.visit_exprs(f);
+            }
             Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs(f),
             Node::Ref { .. } => {}
         }
@@ -1377,6 +1584,12 @@ impl Node {
                 }
                 input.visit_exprs_mut(f)
             }
+            Node::Window { input, funcs } => {
+                for x in funcs.iter_mut().flat_map(WindowFn::exprs_mut) {
+                    each(x)?;
+                }
+                input.visit_exprs_mut(f)
+            }
             Node::Limit { input, .. } | Node::Delete { input, .. } | Node::Distinct { input } => input.visit_exprs_mut(f),
             Node::Ref { .. } => Ok(()),
         }
@@ -1404,7 +1617,8 @@ impl Node {
             | Node::Update { input, .. }
             | Node::Delete { input, .. }
             | Node::Distinct { input }
-            | Node::DistinctOn { input, .. } => input.ranks_by_expression(),
+            | Node::DistinctOn { input, .. }
+            | Node::Window { input, .. } => input.ranks_by_expression(),
             Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.ranks_by_expression() || b.ranks_by_expression(),
             Node::With { ctes, input } => input.ranks_by_expression() || ctes.iter().any(|c| c.input.ranks_by_expression()),
             Node::Insert { .. } | Node::Ref { .. } => false,
@@ -1768,6 +1982,15 @@ impl Plan {
         if per_cap {
             features.push(PER_CAP.to_string());
         }
+        let mut window = root.has_windows();
+        root.visit_exprs(&mut |e| {
+            if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = e {
+                window |= n.has_windows();
+            }
+        });
+        if window {
+            features.push(WINDOW.to_string());
+        }
         if root.walks_edge_tables() {
             features.push(EDGE_TABLE.to_string());
         }
@@ -1822,7 +2045,8 @@ impl Plan {
                 | Node::Project { input, .. }
                 | Node::Distinct { input }
                 | Node::DistinctOn { input, .. }
-                | Node::KeyOrder { input, .. } => of(input),
+                | Node::KeyOrder { input, .. }
+                | Node::Window { input, .. } => of(input),
                 Node::Join { left, right, .. } => of(left).or_else(|| of(right)),
                 Node::With { ctes, input } => of(input).or_else(|| ctes.iter().find_map(|c| of(&c.input))),
                 Node::Ref { .. } => None,

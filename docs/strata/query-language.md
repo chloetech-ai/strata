@@ -54,10 +54,12 @@ WHERE a.year >= 2020 ORDER BY bm25(a.body, 'mrna vaccine') DESC LIMIT 20;
 
 ```text
 [WITH name AS (SELECT ...), ...]
-SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
+SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates | window functions>
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
+[QUALIFY <predicate over window functions>]
+[WINDOW name AS (<window>), ...]
 [ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]] [MAX k PER <field>]]
 [LIMIT n [OFFSET m]]
 ```
@@ -65,7 +67,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 - **Tables by name.** A database holds one or more [tables](#tables), and a query reads the tables it names (in any case): one, or several joined, read by subqueries or named in `WITH` ([below](#subqueries-with-and-joins)).
 - **Quoted names.** A table or column name in double quotes is the name inside them, so any name can be written: `"order"` (a word SQL reserves), `"doc no"`, `"say ""hi"""` (a quote doubled), and `FROM "papers"` reads papers. Python's [`table()`](python.md#queries-built-in-python) builds queries with no quoting at all.
 - **Strings** are single-quoted, `'sale'`. Where a value goes, a double-quoted `"sale"` is a string too, as SQLite and MySQL read it, and a bare name is an error rather than a string: `WHERE tag = sale` says `no such column: sale`.
-- **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `WINDOW`, `QUALIFY`, `GROUP BY ... WITH ROLLUP` and the like.
+- **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `GROUP BY ... WITH ROLLUP` and the like.
 - **`SELECT *`** returns every stored, non-vector column.
 - **`score()`** is the value of the `ORDER BY` score for each row (over a `WITH` result read without an `ORDER BY`, the score the `WITH` ranked its rows by); **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by. A [ranking expression](#features-the-values-a-ranking-read) that scores each row by itself is a column too (`bm25(title, :q) AS t`), and **`features()`** stands for the inputs of the query's ranking.
 - **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; a `KEYWORD` or stored `TEXT` column first sorts the rows by its text, `NULL` last either way, which the row evaluator does after reading every row the `WHERE` keeps; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`. `MAX k PER field` at its end keeps at most k rows of each value ([below](#at-most-k-rows-of-a-value-max-k-per)).
@@ -829,9 +831,49 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
   - `datafusion-only`: a query DataFusion does not run fails, to find what it lacks.
 
   The operators run what DataFusion does not run yet, and the plan's first line says why. Today that is joins along links, multi-valued columns as join keys, groups or sort keys, correlated subqueries, and `maxsim` or `encode` over a subquery.
-- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `UNION`, `INTERSECT`, `EXCEPT`, window functions, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
+- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `UNION`, `INTERSECT`, `EXCEPT`, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
+
+## Window functions
+
+A window function gives each row a value computed over other rows, its *partition*, without folding them into one as `GROUP BY` does: a row's rank among its category's, the value of the row before, a running total, a moving average.
+
+```sql
+-- each paper's rank in its category by citations, and its category's average
+SELECT id, category, cites,
+       RANK() OVER (PARTITION BY category ORDER BY cites DESC) AS r,
+       AVG(cites) OVER (PARTITION BY category) AS avg_cites
+FROM papers WHERE year >= 2020;
+
+-- the three most cited of each category: QUALIFY filters by a window
+SELECT id, category, cites FROM papers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY category ORDER BY cites DESC, id) <= 3;
+
+-- a running total and a moving average of the day before, the day and the day after
+SELECT day, clicks,
+       SUM(clicks) OVER (ORDER BY day) AS total,
+       AVG(clicks) OVER (ORDER BY day ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS smooth,
+       clicks - LAG(clicks) OVER (ORDER BY day) AS change
+FROM daily ORDER BY day;
+
+-- over groups: categories ranked by size, and each one's share
+SELECT category, COUNT(*) AS n, RANK() OVER (ORDER BY COUNT(*) DESC), COUNT(*) / SUM(COUNT(*)) OVER () AS share
+FROM papers GROUP BY category;
+
+-- one window, named once
+SELECT id, ROW_NUMBER() OVER w, LAG(year) OVER w, SUM(cites) OVER (w ROWS 2 PRECEDING)
+FROM papers WINDOW w AS (PARTITION BY category ORDER BY year);
+```
+
+- **Functions.** `ROW_NUMBER()`; `RANK()` and `DENSE_RANK()`; `PERCENT_RANK()` and `CUME_DIST()`, `FLOAT`s; `NTILE(n)`, buckets 1 to n as even as they can be, the first ones a row larger (as SQL says, and PostgreSQL and SQLite do); `LAG(x [, offset [, default]])` and `LEAD(..)`, `x` of the row `offset` rows before or after (1 by default), or `default` (`NULL` without one) past the partition's ends; `FIRST_VALUE(x)`, `LAST_VALUE(x)` and `NTH_VALUE(x, n)` of the row's frame; and the aggregates `COUNT(*)`, `COUNT(x)`, `SUM`, `AVG`, `MIN` and `MAX` of the frame. `NTILE`'s, `NTH_VALUE`'s and `LAG`'s numbers are constants. `COUNT(DISTINCT ..)`, `FILTER (WHERE ..)` and `IGNORE NULLS` are errors.
+- **`OVER (PARTITION BY .. ORDER BY ..)`.** The partition is the rows with equal values of its expressions (`NULL` equal to `NULL`); without `PARTITION BY` it is every row. The window's `ORDER BY` orders the partition, its `NULL`s last unless `NULLS FIRST` as elsewhere; rows whose order keys are all equal are *peers*, and rows that tie keep the order they came in. Both take expressions of the rows (`PARTITION BY year % 10`, `ORDER BY lower(title)`), or over groups of the groups' values and aggregates.
+- **Frames.** `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` and the aggregates read the rows of the row's frame: `ROWS BETWEEN start AND end` counts rows from the row, and `RANGE BETWEEN start AND end` takes the rows whose value of the window's one `ORDER BY` key is within the offsets of the row's (a row without a value has its peers, the other rows without one). The ends are `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW` (in `RANGE`, the row's first or last peer), `n FOLLOWING` and `UNBOUNDED FOLLOWING`, in that order; `ROWS 2 PRECEDING` is `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`. Without a frame, a window with an `ORDER BY` reads from the partition's first row to the row's last peer, so `SUM(x) OVER (ORDER BY day)` is a running total that counts a day's rows together, and a window without one reads the whole partition. The other functions read the partition whatever the frame says. `GROUPS` frames are errors.
+- **Where they go.** A window function is a column of `SELECT`, a key of `ORDER BY`, or part of a condition of **`QUALIFY`**, which filters the rows after the windows are computed and may name a selected window by its alias (`QUALIFY r <= 3`). It is not part of `WHERE`, `GROUP BY` or `HAVING`, which come before, and a window function's argument, partition or order holds no other: compute that one in a subquery in `FROM`. In a grouped query the windows are computed over the groups `HAVING` keeps; `SELECT DISTINCT`, `ORDER BY` and `LIMIT` come after them, so `COUNT(*) OVER () ... LIMIT 5` counts every row.
+- **`WINDOW w AS (..)`** names a window that `OVER w` uses as it is, and that `OVER (w ORDER BY ..)` or `OVER (w ROWS ..)` extends with an order or a frame it lacks; a window may name one before it (`WINDOW w AS (PARTITION BY a), v AS (w ORDER BY b)`).
+- **Engines.** The operators sort each partition in memory; DataFusion runs windows on column batches, sorting and spilling within the query's memory budget, and both answer alike. The operators run a window DataFusion does not lower yet: a `LAG` or `LEAD` whose default is not a constant of the value's type, `FIRST_VALUE` and `LAST_VALUE` over a `RANGE` frame with an offset, `NTH_VALUE` over a `RANGE` frame that starts after the partition's first row, a `RANGE` offset of another type than its key (`0.5` over an `INT`), and windows over multi-valued columns.
+
+The plan's node is `Window` (`Window: RANK() OVER (PARTITION BY category ORDER BY cites DESC)` in `EXPLAIN`, the functions computed after the rows' own columns), and its JSON needs the plan feature `window`; a version of Strata from before it refuses the plan by that name.
 
 ## The first row of each group: DISTINCT ON
 

@@ -47,6 +47,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::functions_aggregate::expr_fn as agg_fn;
+use datafusion::functions_window::expr_fn as win_fn;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::{
@@ -58,7 +59,7 @@ use datafusion::prelude::SessionConfig;
 use crate::error::{Error, Result};
 use crate::query::arrow::{self, Columns, Mixed};
 use crate::query::exec::{Engine, ExecOptions, ExecStats, Leaf, ResultSet};
-use crate::query::ir::{Agg, ArithOp, CmpOp, Expr, Func, JoinKind, Node, Plan, SortKey};
+use crate::query::ir::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Func, JoinKind, Node, Plan, SortKey, WindowFn, WindowFunc};
 use crate::query::memory::Charge;
 use crate::query::ops;
 use crate::query::steps::{self, Clock, Step};
@@ -702,6 +703,10 @@ impl<'a> Lower<'a, '_> {
                 let b = self.node(by, what)?;
                 self.key_order(r, b)
             }
+            Node::Window { input, funcs } => {
+                let r = self.node(input, what)?;
+                self.window(r, funcs)
+            }
             Node::Search(_) => no("a Search outside a leaf"),
             Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. } => no("a write"),
         }
@@ -1123,6 +1128,231 @@ impl<'a> Lower<'a, '_> {
         let plan = LogicalPlanBuilder::from(r.plan).aggregate(group, parts)?.project(project)?.build()?;
         let names = (0..out_cols.len()).map(|i| format!("#{i}")).collect();
         Ok(Rel { plan, cols: out_cols, names, key: None, score: Score::None, ord: vec![Ord { col: first, desc: false, nulls_first: false }] })
+    }
+
+    /// `r`'s rows with a column per window function after their own, in
+    /// `r`'s order. Rows that tie in a function's order take `r`'s order
+    /// where the function's value depends on it (a row number, a lag, a
+    /// `ROWS` frame's rows), as the operators order them; the functions
+    /// whose value would depend on how DataFusion breaks ties (the last
+    /// row of a `RANGE` frame's peers but by these patterns) fall back.
+    fn window(&mut self, r: Rel, funcs: &[WindowFn]) -> R<Rel> {
+        use datafusion::logical_expr::{WindowFrame, WindowFrameBound as WB, WindowFrameUnits as WU};
+        let (r, pos) = self.position(r)?;
+        let schema = r.plan.schema().clone();
+        let unbounded = || ScalarValue::UInt64(None);
+        let mut parts: Vec<DExpr> = Vec::new();
+        let mut finals: Vec<DExpr> = Vec::new();
+        for w in funcs {
+            let partition: Vec<DExpr> = w.partition.iter().map(|k| self.top(k, &r.cols, &schema)).collect::<R<_>>()?;
+            let mut order: Vec<SortExpr> = Vec::with_capacity(w.order.len() + 1);
+            let mut order_types = Vec::new();
+            for k in &w.order {
+                let e = self.top(&k.expr, &r.cols, &schema)?;
+                let t = e.get_type(&schema)?;
+                if matches!(t, DataType::List(_)) {
+                    return no("a window ordered by a multi-valued column");
+                }
+                order_types.push(t);
+                order.push(e.sort(!k.desc, k.nulls_first));
+            }
+            // The order with the rows' own as the last key: no ties.
+            let mut total = order.clone();
+            total.push(col(&pos).sort(true, false));
+            let arg = |l: &mut Self, e: &Expr| -> R<(DExpr, DataType)> {
+                let x = l.top(e, &r.cols, &schema)?;
+                let t = x.get_type(&schema)?;
+                if matches!(t, DataType::List(_)) {
+                    return no("a window function of a multi-valued column");
+                }
+                Ok((x, t))
+            };
+            let mut part = |l: &mut Self, e: DExpr| -> R<DExpr> {
+                let n = l.fresh("w");
+                parts.push(e.alias(&n));
+                Ok(col(&n))
+            };
+            let whole = WindowFrame::new_bounds(WU::Rows, WB::Preceding(unbounded()), WB::Following(unbounded()));
+            let out = match &w.func {
+                WindowFunc::RowNumber => cast(part(self, row_number().partition_by(partition).order_by(total).build()?)?, DataType::Int64),
+                // Without an order every row is its partition's peer.
+                WindowFunc::Rank | WindowFunc::DenseRank if order.is_empty() => lit(1i64),
+                WindowFunc::PercentRank if order.is_empty() => lit(0.0f64),
+                WindowFunc::CumeDist if order.is_empty() => lit(1.0f64),
+                WindowFunc::Rank => cast(part(self, win_fn::rank().partition_by(partition).order_by(order).build()?)?, DataType::Int64),
+                WindowFunc::DenseRank => cast(part(self, win_fn::dense_rank().partition_by(partition).order_by(order).build()?)?, DataType::Int64),
+                WindowFunc::PercentRank => cast(part(self, win_fn::percent_rank().partition_by(partition).order_by(order).build()?)?, DataType::Float64),
+                WindowFunc::CumeDist => cast(part(self, win_fn::cume_dist().partition_by(partition).order_by(order).build()?)?, DataType::Float64),
+                WindowFunc::Ntile(0) => return no("NTILE(0)"),
+                WindowFunc::Ntile(b) => {
+                    // As the operators: buckets as even as can be, the
+                    // first ones a row larger.
+                    let rn = part(self, row_number().partition_by(partition.clone()).order_by(total).build()?)?;
+                    let m = part(self, over_rows(agg_fn::count(lit(1i64))).partition_by(partition).window_frame(whole).build()?)?;
+                    let (i, m, b) = (cast(rn, DataType::Int64) - lit(1i64), cast(m, DataType::Int64), lit(*b as i64));
+                    let (q, rest) = (m.clone() / b.clone(), m % b);
+                    let big = rest.clone() * (q.clone() + lit(1i64));
+                    let q1 = when(q.clone().eq(lit(0i64)), lit(1i64)).otherwise(q.clone())?;
+                    when(i.clone().lt(big.clone()), i.clone() / (q + lit(1i64)) + lit(1i64)).otherwise((i - big) / q1 + rest + lit(1i64))?
+                }
+                WindowFunc::Lag { arg: a, offset, default } | WindowFunc::Lead { arg: a, offset, default } => {
+                    let (x, t) = arg(self, a)?;
+                    let d = match default {
+                        None => None,
+                        Some(Expr::Lit(v)) => match (scalar(v)?, &t) {
+                            (ScalarValue::Null, _) => None,
+                            (d, t) if d.data_type() == *t => Some(d),
+                            _ => return no("a lag's or lead's default of another type than its value"),
+                        },
+                        Some(_) => return no("a lag's or lead's default that is not a literal"),
+                    };
+                    let offset = i64::try_from(*offset).map_err(|_| Fail::No("a lag's offset".into()))?;
+                    let f = match w.func {
+                        WindowFunc::Lag { .. } => win_fn::lag(x, Some(offset), d),
+                        _ => win_fn::lead(x, Some(offset), d),
+                    };
+                    part(self, f.partition_by(partition).order_by(total).build()?)?
+                }
+                f @ (WindowFunc::FirstValue(_) | WindowFunc::LastValue(_) | WindowFunc::NthValue { .. } | WindowFunc::Agg(_)) => {
+                    let frame = w.frame();
+                    // A frame and the order it is taken in.
+                    let bound = |b: &Bound, start: bool| -> R<WB> {
+                        let off = |e: &Expr| -> R<ScalarValue> {
+                            let Expr::Lit(v) = e else { return no("a frame's offset that is not a literal") };
+                            Ok(match (frame.units, v, order_types.first()) {
+                                (FrameUnits::Rows, Value::Int(k), _) if *k >= 0 => ScalarValue::UInt64(Some(*k as u64)),
+                                (FrameUnits::Range, Value::Int(k), Some(t)) if *k >= 0 && is_int(t) => ScalarValue::Int64(Some(*k)),
+                                (FrameUnits::Range, Value::Int(_) | Value::Float(_), Some(t)) if is_float(t) && v.as_f64().is_some_and(|x| x >= 0.0) => ScalarValue::Float64(v.as_f64()),
+                                _ => return no(format!("a frame's offset {v:?}")),
+                            })
+                        };
+                        Ok(match b {
+                            Bound::UnboundedPreceding if start => WB::Preceding(unbounded()),
+                            Bound::UnboundedFollowing if !start => WB::Following(unbounded()),
+                            Bound::UnboundedPreceding | Bound::UnboundedFollowing => return no("a frame that starts at its partition's end or ends at its start"),
+                            Bound::Preceding(e) => WB::Preceding(off(e)?),
+                            Bound::CurrentRow => WB::CurrentRow,
+                            Bound::Following(e) => WB::Following(off(e)?),
+                        })
+                    };
+                    let units = match frame.units {
+                        FrameUnits::Rows => WU::Rows,
+                        FrameUnits::Range => WU::Range,
+                    };
+                    let df_frame = WindowFrame::new_bounds(units, bound(&frame.start, true)?, bound(&frame.end, false)?);
+                    let rows = frame.units == FrameUnits::Rows;
+                    match f {
+                        WindowFunc::Agg(a) => {
+                            let x = a.arg.as_ref().map(|e| arg(self, e)).transpose()?;
+                            // A RANGE frame holds whole groups of peers,
+                            // whatever their order; ROWS count rows.
+                            let ord = if rows { total } else { order };
+                            let mut over = |l: &mut Self, e: DExpr| -> R<DExpr> { part(l, over_rows(e).partition_by(partition.clone()).order_by(ord.clone()).window_frame(df_frame.clone()).build()?) };
+                            match (a.func, x) {
+                                (AggFn::Count, None) => over(self, agg_fn::count(lit(1i64)))?,
+                                (AggFn::Count, Some((x, _))) => over(self, agg_fn::count(x))?,
+                                (AggFn::Min, Some((x, _))) => over(self, agg_fn::min(x))?,
+                                (AggFn::Max, Some((x, _))) => over(self, agg_fn::max(x))?,
+                                (AggFn::Sum, Some((x, t))) if is_whole(&t) => over(self, agg_fn::sum(cast(x, DataType::Decimal128(38, 0))))?,
+                                (AggFn::Sum, Some((x, t))) if is_float(&t) => over(self, agg_fn::sum(x))?,
+                                (AggFn::Sum | AggFn::Avg, Some((_, DataType::Null))) => lit(ScalarValue::Float64(None)),
+                                (AggFn::Avg, Some((x, t))) if is_whole(&t) => {
+                                    let s = over(self, agg_fn::sum(cast(x.clone(), DataType::Decimal128(38, 0))))?;
+                                    let c = over(self, agg_fn::count(x))?;
+                                    when(c.clone().eq(lit(0i64)), lit(ScalarValue::Float64(None))).otherwise(cast(s, DataType::Float64) / cast(c, DataType::Float64))?
+                                }
+                                (AggFn::Avg, Some((x, t))) if is_float(&t) => over(self, agg_fn::avg(x))?,
+                                (f, x) => return no(format!("a window aggregate {f:?} of {:?}", x.map(|x| x.1))),
+                            }
+                        }
+                        f => {
+                            let (a, _) = arg(self, match f {
+                                WindowFunc::FirstValue(a) | WindowFunc::LastValue(a) | WindowFunc::NthValue { arg: a, .. } => a,
+                                _ => unreachable!("a value function"),
+                            })?;
+                            let last = matches!(f, WindowFunc::LastValue(_));
+                            // NTH_VALUE over RANGE frames from the
+                            // partition's first row: the partition's n-th
+                            // row in the total order, while the frame
+                            // (to the row's last peer) holds n rows.
+                            if let (WindowFunc::NthValue { n, .. }, false) = (f, rows) {
+                                let n = i64::try_from(*n).map_err(|_| Fail::No("NTH_VALUE's n".into()))?;
+                                let v = part(self, win_fn::nth_value(a, n).partition_by(partition.clone()).order_by(total).window_frame(whole.clone()).build()?)?;
+                                let out = match (&frame.start, &frame.end) {
+                                    (Bound::UnboundedPreceding, Bound::UnboundedFollowing) => v,
+                                    (Bound::UnboundedPreceding, Bound::CurrentRow) => {
+                                        let to_peers = WindowFrame::new_bounds(WU::Range, WB::Preceding(unbounded()), WB::CurrentRow);
+                                        let c = part(self, over_rows(agg_fn::count(lit(1i64))).partition_by(partition).order_by(order).window_frame(to_peers).build()?)?;
+                                        when(cast(c, DataType::Int64).gt_eq(lit(n)), v).end()?
+                                    }
+                                    _ => return no("NTH_VALUE over a RANGE frame that starts after the partition's first row"),
+                                };
+                                finals.push(out);
+                                continue;
+                            }
+                            // ROWS frames take the rows in the total order;
+                            // a RANGE frame's first row or last row, the
+                            // partition's or the row's peers', is the
+                            // first or last of those in the total order.
+                            let (partition, ord, df_frame) = match (rows, last, &frame.start, &frame.end) {
+                                (true, _, _, _) => (partition, total, df_frame),
+                                (false, false, Bound::UnboundedPreceding, Bound::CurrentRow | Bound::UnboundedFollowing) | (false, true, Bound::UnboundedPreceding | Bound::CurrentRow, Bound::UnboundedFollowing) => {
+                                    (partition, total, whole.clone())
+                                }
+                                (false, false, Bound::CurrentRow, Bound::CurrentRow | Bound::UnboundedFollowing) | (false, true, Bound::UnboundedPreceding | Bound::CurrentRow, Bound::CurrentRow) => {
+                                    // Over the row's peers: the partition
+                                    // and the order's keys.
+                                    let mut peers = partition;
+                                    peers.extend(order.iter().map(|o| o.expr.clone()));
+                                    (peers, vec![col(&pos).sort(true, false)], whole.clone())
+                                }
+                                _ => return no("a value function over a RANGE frame of this shape"),
+                            };
+                            let e = match f {
+                                WindowFunc::FirstValue(_) => win_fn::first_value(a),
+                                WindowFunc::LastValue(_) => win_fn::last_value(a),
+                                WindowFunc::NthValue { n, .. } => win_fn::nth_value(a, i64::try_from(*n).map_err(|_| Fail::No("NTH_VALUE's n".into()))?),
+                                _ => unreachable!("a value function"),
+                            };
+                            part(self, e.partition_by(partition).order_by(ord).window_frame(df_frame).build()?)?
+                        }
+                    }
+                }
+            };
+            finals.push(out);
+        }
+        // A Window node per partition and order: DataFusion's physical
+        // plan sorts a node's rows once, by its first function's keys, for
+        // every function of it.
+        let mut groups: Vec<(Vec<DExpr>, Vec<SortExpr>, Vec<DExpr>)> = Vec::new();
+        for e in parts {
+            let (partition, order) = match &e {
+                DExpr::Alias(a) => match a.expr.as_ref() {
+                    DExpr::WindowFunction(w) => (w.params.partition_by.clone(), w.params.order_by.clone()),
+                    e => return no(format!("not a window function: {e}")),
+                },
+                e => return no(format!("not a named window function: {e}")),
+            };
+            match groups.iter_mut().find(|g| g.0 == partition && g.1 == order) {
+                Some(g) => g.2.push(e),
+                None => groups.push((partition, order, vec![e])),
+            }
+        }
+        let mut plan = r.plan.clone();
+        for (_, _, es) in groups {
+            plan = LogicalPlanBuilder::from(plan).window(es)?.build()?;
+        }
+        let mut cols = r.cols.clone();
+        let mut names = r.names.clone();
+        let mut project = r.all();
+        for f in finals {
+            let n = self.fresh("c");
+            project.push(f.alias(&n));
+            names.push(format!("#{}", cols.len()));
+            cols.push(n);
+        }
+        let plan = LogicalPlanBuilder::from(plan).project(project)?.build()?;
+        Ok(Rel { plan, cols, names, ..r })
     }
 
     fn join(&mut self, left: &Node, right: &Node, kind: JoinKind, keys: &[crate::query::ir::JoinKey], on: Option<&Expr>) -> R<Rel> {
@@ -1606,6 +1836,20 @@ fn int_arith(op: ArithOp, a: DExpr, b: DExpr) -> DExpr {
 fn what(e: &Expr) -> String {
     let d = format!("{e:?}");
     d.split(['(', ' ', '{']).next().unwrap_or("").to_string()
+}
+
+/// An aggregate's call as a window function, which takes a partition, an
+/// order and a frame ([`ExprFunctionExt`] does not for an aggregate's).
+fn over_rows(e: DExpr) -> DExpr {
+    match e {
+        DExpr::AggregateFunction(a) => DExpr::WindowFunction(Box::new(datafusion::logical_expr::expr::WindowFunction::new(a.func, a.params.args))),
+        e => e,
+    }
+}
+
+/// An INT, or a sum of INTs (a decimal of no fraction).
+fn is_whole(t: &DataType) -> bool {
+    is_int(t) || matches!(t, DataType::Decimal128(_, 0))
 }
 
 fn is_int(t: &DataType) -> bool {
