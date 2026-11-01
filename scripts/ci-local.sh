@@ -406,7 +406,10 @@ crate_tests() {
         # The test binaries, for prune_job (listing builds them).
         cargo nextest list --cargo-profile ci "$@" --message-format json \
             | python3 -c 'import json, sys; [print(s["binary-path"]) for s in json.load(sys.stdin)["rust-suites"].values()]' >"$JOB_LOG.binaries"
-        cargo nextest run --cargo-profile ci --no-fail-fast "$@"
+        # Each test in a process of its own, and every binary's at once,
+        # exposes tests that take a free port and bind it later: they get a
+        # second try, and the log says FLAKY.
+        cargo nextest run --cargo-profile ci --no-fail-fast --retries 2 "$@"
         cargo test --profile ci --doc "$@"
     else
         cargo test --profile ci "$@"
@@ -677,6 +680,7 @@ run_job() {
     if [ "$LANES" = 1 ] && [ "$VERBOSE" = 0 ]; then echo "$result"; else printf '  %-42s %s\n' "$name" "$result"; fi
     printf '  %-42s %s%s\n' "$name" "$result" "$([ -n "$RAM_DEV" ] && df -Pk "$TMPDIR" | awk 'NR == 2 { printf "  (RAM disk: %d MB used)", $3 / 1024 }')" >>"$RUN_DIR/run.log"
     [ "$rc" = 0 ] || [ "$VERBOSE" = 1 ] || tail -n 40 "$log" | sed 's/^/      | /'
+    grep -E '^ +FLAKY ' "$log" 2>/dev/null | sort -u | sed "s/^ */      flaky: /" | tee -a "$RUN_DIR/run.log"
     [ "$KEEP_BINARIES" = 1 ] || prune_job "$log"
 }
 
