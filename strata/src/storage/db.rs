@@ -2507,7 +2507,7 @@ impl Database {
     pub fn spawn_merger(self: &Arc<Self>, opts: MergerOptions) {
         let m = Arc::new(Merger {
             policy: opts.policy,
-            budget: opts.memory_budget.or_else(|| memory_limit().map(|l| l / 4)),
+            budget: opts.memory_budget.or_else(|| memory_limit().map(|l| l / 2)),
             pacer: opts.write_bytes_per_sec.map(|r| Arc::new(Pacer::new(r))),
             wake: Mutex::new(MergerWake::default()),
             cv: Condvar::new(),

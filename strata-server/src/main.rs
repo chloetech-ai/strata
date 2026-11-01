@@ -265,8 +265,8 @@ struct Args {
     /// Merges that may run at once (default: half the cores, 1 to 4).
     #[arg(long)]
     merge_threads: Option<usize>,
-    /// Memory the running merges may use together, in MiB (default: a
-    /// quarter of the cgroup memory limit, or of RAM).
+    /// Memory the running merges may use together, in MiB (default: half
+    /// of the cgroup memory limit, or of RAM).
     #[arg(long)]
     merge_memory_mb: Option<u64>,
     /// How fast merges may write, in MiB/s (default: no limit).

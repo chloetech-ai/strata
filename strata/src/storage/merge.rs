@@ -81,7 +81,7 @@ pub struct MergerOptions {
     /// Merges that may run at once, each on a thread of its own.
     pub threads: usize,
     /// Memory the running merges may use together, as [`merge_memory`]
-    /// estimates it; `None`: a quarter of [`memory_limit`]. A merge that
+    /// estimates it; `None`: half of [`memory_limit`]. A merge that
     /// would not fit is made smaller (fewer inputs), or waits for running
     /// ones to finish.
     pub memory_budget: Option<u64>,
