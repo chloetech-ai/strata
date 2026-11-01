@@ -136,7 +136,9 @@ SELECT <fields | * | score() | aggregates> FROM {table} [WHERE <predicate>] [GRO
 - Aggregates: COUNT(*), COUNT(f), COUNT(DISTINCT f), SUM, AVG, MIN, MAX, grouped by one or more KEYWORD, INT or FLOAT fields or over all rows, with HAVING (SELECT f, COUNT(*) AS n, AVG(x) FROM {table} GROUP BY f HAVING n > 5 ORDER BY AVG(x) DESC).
 - Subqueries and WITH: f IN (SELECT f FROM {table} WHERE ...), x > (SELECT AVG(x) FROM {table}), WITH top AS (SELECT ... LIMIT 50) SELECT ... FROM top.
 - Joins of the table with itself (name the sides a and b): JOIN or LEFT JOIN ... ON a.f = b.f; text and score functions name one side, MATCH(a.body, '...').
-- Not supported: UNION, window functions, joins with other tables, ORDER BY two scores (combine them in one expression).
+- Window functions: ROW_NUMBER() OVER (PARTITION BY f ORDER BY x DESC), RANK(), LAG(x) OVER (ORDER BY t), SUM(x) OVER (ORDER BY t ROWS 2 PRECEDING); QUALIFY filters by them (SELECT ... QUALIFY ROW_NUMBER() OVER (PARTITION BY f ORDER BY x DESC) <= 3).
+- UNION [ALL], INTERSECT and EXCEPT combine two SELECTs of as many columns; ORDER BY and LIMIT at the end apply to the whole.
+- Not supported: joins with other tables, ORDER BY two scores (combine them in one expression).
 
 How to work:
 - Query before you answer, and base every claim on rows you saw. Never invent rows or values.

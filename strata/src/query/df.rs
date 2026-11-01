@@ -59,7 +59,7 @@ use datafusion::prelude::SessionConfig;
 use crate::error::{Error, Result};
 use crate::query::arrow::{self, Columns, Mixed};
 use crate::query::exec::{Engine, ExecOptions, ExecStats, Leaf, ResultSet};
-use crate::query::ir::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Func, JoinKind, Node, Plan, SortKey, WindowFn, WindowFunc};
+use crate::query::ir::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Func, JoinKind, Node, Plan, SetOp, SortKey, WindowFn, WindowFunc};
 use crate::query::memory::Charge;
 use crate::query::ops;
 use crate::query::steps::{self, Clock, Step};
@@ -703,6 +703,11 @@ impl<'a> Lower<'a, '_> {
                 let b = self.node(by, what)?;
                 self.key_order(r, b)
             }
+            Node::SetOp { op, all, left, right } => {
+                let l = self.node(left, what)?;
+                let r = self.node(right, what)?;
+                self.set_op(*op, *all, l, r)
+            }
             Node::Window { input, funcs } => {
                 let r = self.node(input, what)?;
                 self.window(r, funcs)
@@ -1053,6 +1058,83 @@ impl<'a> Lower<'a, '_> {
         let plan = LogicalPlanBuilder::from(r.plan.clone()).window(vec![w])?.build()?;
         let ord = vec![Ord { col: name.clone(), desc: false, nulls_first: false }];
         Ok((Rel { plan, ord, ..r }, name))
+    }
+
+    /// `l`'s and `r`'s rows taken together, as the operators do
+    /// ([`Node::SetOp`]): both sides' columns under one set of names, and
+    /// the rows ordered by side, then by their place in it.
+    fn set_op(&mut self, op: SetOp, all: bool, l: Rel, r: Rel) -> R<Rel> {
+        if l.cols.len() != r.cols.len() {
+            return Err(Fail::Err(Error::Query(format!("{}: one side has {} columns and the other {}", op.name(), l.cols.len(), r.cols.len()))));
+        }
+        let (side, pos) = (self.fresh("side"), self.fresh("pos"));
+        let names: Vec<String> = l.cols.iter().map(|_| self.fresh("c")).collect();
+        let mut sides = Vec::new();
+        for (i, rel) in [l, r].into_iter().enumerate() {
+            let p = self.fresh("pos");
+            let w = row_number().order_by(rel.sort_exprs()).build()?.alias(&p);
+            let plan = LogicalPlanBuilder::from(rel.plan.clone()).window(vec![w])?.build()?;
+            sides.push((rel, plan, p, i as i64));
+        }
+        let (ls, rs) = (sides[0].1.schema().clone(), sides[1].1.schema().clone());
+        let mut exprs: [Vec<DExpr>; 2] = [Vec::new(), Vec::new()];
+        for (i, n) in names.iter().enumerate() {
+            let (a, b) = (col(&sides[0].0.cols[i]), col(&sides[1].0.cols[i]));
+            let (ta, tb) = (a.get_type(&ls)?, b.get_type(&rs)?);
+            if matches!(ta, DataType::List(_)) && !(op == SetOp::Union && all) {
+                return no(format!("{} of a multi-valued column", op.name()));
+            }
+            let (a, b) = match (&ta, &tb) {
+                _ if ta == tb => (a, b),
+                (DataType::Null, t) => (cast(a, t.clone()), b),
+                (t, DataType::Null) => (a, cast(b, t.clone())),
+                _ => return no(format!("{} of {ta} and {tb}", op.name())),
+            };
+            exprs[0].push(a.alias(n));
+            exprs[1].push(b.alias(n));
+        }
+        let mut plans = Vec::new();
+        for ((_, plan, p, i), mut e) in sides.into_iter().zip(exprs) {
+            e.push(lit(i).alias(&side));
+            e.push(cast(col(&p), DataType::Int64).alias(&pos));
+            plans.push(LogicalPlanBuilder::from(plan).project(e)?.build()?);
+        }
+        let right = plans.pop().expect("two sides");
+        let plan = LogicalPlanBuilder::from(plans.pop().expect("two sides")).union(right)?.build()?;
+        let names_out = (0..names.len()).map(|i| format!("#{i}")).collect();
+        let ord = vec![Ord { col: side.clone(), desc: false, nulls_first: false }, Ord { col: pos.clone(), desc: false, nulls_first: false }];
+        let rel = Rel { plan, cols: names.clone(), names: names_out, key: None, score: Score::None, ord };
+        let keys: Vec<DExpr> = names.iter().map(|c| col(c)).collect();
+        if op == SetOp::Union {
+            return match all {
+                true => Ok(rel),
+                false => self.first_per(rel, keys, 1),
+            };
+        }
+        // Each row's place among the rows equal to it, how many of them
+        // the right side has, and how many in all.
+        let (nth, theirs, total) = (self.fresh("nth"), self.fresh("theirs"), self.fresh("total"));
+        use datafusion::logical_expr::{WindowFrame, WindowFrameBound as WB, WindowFrameUnits as WU};
+        let whole = WindowFrame::new_bounds(WU::Rows, WB::Preceding(ScalarValue::UInt64(None)), WB::Following(ScalarValue::UInt64(None)));
+        let n = row_number().partition_by(keys.clone()).order_by(rel.sort_exprs()).build()?.alias(&nth);
+        let t = over_rows(agg_fn::sum(col(&side))).partition_by(keys.clone()).window_frame(whole.clone()).build()?.alias(&theirs);
+        let m = over_rows(agg_fn::count(lit(1i64))).partition_by(keys).window_frame(whole).build()?.alias(&total);
+        let (n_, t_) = (cast(col(&nth), DataType::Int64), cast(col(&theirs), DataType::Int64));
+        let ours = cast(col(&total), DataType::Int64) - t_.clone();
+        let keep = match (op, all) {
+            (SetOp::Intersect, true) => n_.lt_eq(t_),
+            (SetOp::Intersect, false) => n_.eq(lit(1i64)).and(t_.gt(lit(0i64))),
+            (_, true) => (n_ + t_).lt_eq(ours),
+            (_, false) => n_.eq(lit(1i64)).and(t_.eq(lit(0i64))),
+        };
+        let all_cols = rel.all();
+        let plan = LogicalPlanBuilder::from(rel.plan.clone())
+            .window(vec![n])?
+            .window(vec![t, m])?
+            .filter(col(&side).eq(lit(0i64)).and(keep))?
+            .project(all_cols)?
+            .build()?;
+        Ok(Rel { plan, ..rel })
     }
 
     /// The first `per` rows of `r` with equal `keys`, in `r`'s order.

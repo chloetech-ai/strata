@@ -76,6 +76,7 @@ fn name(n: &Node) -> &'static str {
         Node::DistinctOn { .. } => "DistinctOn",
         Node::KeyOrder { .. } => "KeyOrder",
         Node::Window { .. } => "Window",
+        Node::SetOp { .. } => "SetOp",
     }
 }
 

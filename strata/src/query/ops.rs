@@ -26,7 +26,7 @@ use crate::query::agg::{self, Acc, Part};
 use crate::query::compound::MAX_ROWS;
 use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
 use crate::query::ir::eval::{self, Ref};
-use crate::query::ir::{Agg, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, Plan, SortKey};
+use crate::query::ir::{Agg, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, Plan, SetOp, SortKey};
 use crate::query::logical::Direction;
 use crate::query::memory::Charge;
 use crate::query::steps::{self, Clock, Step};
@@ -136,6 +136,7 @@ fn label(n: &Node) -> (&'static str, String) {
         Node::Distinct { .. } => ("distinct", String::new()),
         Node::DistinctOn { per, .. } => ("distinct on", format!("{per} per value")),
         Node::KeyOrder { .. } => ("key order", String::new()),
+        Node::SetOp { op, all, .. } => ("set operation", format!("{}{}", op.name(), if *all { " ALL" } else { "" })),
         Node::Window { funcs, .. } => ("window", funcs.iter().map(|w| w.func.name()).collect::<Vec<_>>().join(", ")),
         Node::Aggregate { keys, aggs, .. } => ("aggregate", format!("{} key{}, {} aggregate{}", keys.len(), if keys.len() == 1 { "" } else { "s" }, aggs.len(), if aggs.len() == 1 { "" } else { "s" })),
         _ => ("node", String::new()),
@@ -273,6 +274,56 @@ impl<'a> Ops<'a, '_> {
                 Ok(rows.pick(&idx))
             }
             Node::Aggregate { input, keys, aggs } => self.aggregate(input, keys, aggs, what),
+            Node::SetOp { op, all, left, right } => {
+                let l = self.node(left, what)?;
+                let r = self.node(right, what)?;
+                if l.columns.len() != r.columns.len() {
+                    return Err(err(format!("{}: one side has {} columns and the other {}", op.name(), l.columns.len(), r.columns.len())));
+                }
+                let rows = match op {
+                    SetOp::Union => {
+                        let mut rows = l.rows;
+                        rows.extend(r.rows);
+                        if !*all {
+                            let mut seen = HashSet::new();
+                            rows.retain(|row| seen.insert(set_key(row)));
+                        }
+                        rows
+                    }
+                    SetOp::Intersect | SetOp::Except => {
+                        let mut right: HashMap<Vec<String>, u64> = HashMap::new();
+                        for row in &r.rows {
+                            self.tick()?;
+                            *right.entry(set_key(row)).or_default() += 1;
+                        }
+                        let keys: Vec<Vec<String>> = l.rows.iter().map(|row| set_key(row)).collect();
+                        let mut left: HashMap<&[String], u64> = HashMap::new();
+                        if *op == SetOp::Except && *all {
+                            for k in &keys {
+                                *left.entry(k.as_slice()).or_default() += 1;
+                            }
+                        }
+                        // Each row's place among the rows of `left` equal to it.
+                        let mut nth: HashMap<&[String], u64> = HashMap::new();
+                        let mut keep = Vec::with_capacity(keys.len());
+                        for k in &keys {
+                            self.tick()?;
+                            let n = nth.entry(k.as_slice()).or_default();
+                            *n += 1;
+                            let theirs = right.get(k).copied().unwrap_or(0);
+                            let kept = match (op, all) {
+                                (SetOp::Intersect, true) => *n <= theirs,
+                                (SetOp::Intersect, false) => *n == 1 && theirs > 0,
+                                (_, true) => *n + theirs <= left[k.as_slice()],
+                                (_, false) => *n == 1 && theirs == 0,
+                            };
+                            keep.push(kept);
+                        }
+                        l.rows.into_iter().zip(keep).filter_map(|(row, k)| k.then_some(row)).collect()
+                    }
+                };
+                Ok(Rows { columns: l.columns, rows, keys: None, scores: None })
+            }
             Node::Window { input, funcs } => {
                 let mut rows = self.node(input, what)?;
                 let mut funcs = funcs.clone();
@@ -1263,6 +1314,7 @@ impl<'a> Ops<'a, '_> {
             Node::Join { left, right, .. } => [self.columns(left), self.columns(right)].concat(),
             Node::Ref { name } => self.ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name)).map_or_else(Vec::new, |(_, r)| r.columns.clone()),
             Node::Aggregate { keys, aggs, .. } => (0..keys.len() + aggs.len()).map(|i| format!("#{i}")).collect(),
+            Node::SetOp { left, .. } => self.columns(left),
             Node::Window { input, funcs } => {
                 let mut c = self.columns(input);
                 let w = c.len();
@@ -1396,6 +1448,17 @@ pub(crate) fn part(v: &Value) -> Part {
         Value::Float(x) if x.fract() == 0.0 && x.abs() < 9e15 => Part::Int(*x as i64),
         v => Part::of(v),
     }
+}
+
+/// A row's values as a [`Node::SetOp`] compares them: a whole FLOAT as
+/// the INT it equals, NULL as NULL.
+fn set_key(row: &[Value]) -> Vec<String> {
+    row.iter()
+        .map(|v| match v {
+            Value::Float(x) if x.fract() == 0.0 && x.abs() < 9e15 => format!("{:?}", Value::Int(*x as i64)),
+            v => format!("{v:?}"),
+        })
+        .collect()
 }
 
 /// A row key as an error names it.

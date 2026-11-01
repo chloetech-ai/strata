@@ -64,9 +64,9 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 24] = [
+pub const FEATURES: [&str; 25] = [
     OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE,
-    SCORE_NORMS, JSON, WINDOW,
+    SCORE_NORMS, JSON, WINDOW, SET_OPS,
 ];
 
 /// The feature of a plan with operators over rows in memory: a join,
@@ -76,6 +76,10 @@ pub const OPERATORS: &str = "operators";
 
 /// The feature of a plan with window functions ([`Node::Window`]).
 pub const WINDOW: &str = "window";
+
+/// The feature of a plan that takes two queries' rows together
+/// ([`Node::SetOp`]: `UNION`, `INTERSECT`, `EXCEPT`).
+pub const SET_OPS: &str = "set_ops";
 
 /// The feature of a plan with a column of rows' sequence numbers
 /// ([`Expr::SeqNo`]).
@@ -262,6 +266,44 @@ pub enum Node {
     /// frame)`). Expressions above refer to the input's columns, then the
     /// functions', with [`Expr::Output`]. Needs [`WINDOW`].
     Window { input: Box<Node>, funcs: Vec<WindowFn> },
+    /// The rows of `left` and `right`, which have as many columns, taken
+    /// together (`UNION`, `INTERSECT`, `EXCEPT`), the columns named as
+    /// `left`'s. Rows are equal when each of their values is (NULL equal
+    /// to NULL, numbers by value, a list to the same list). `UNION ALL`
+    /// gives `left`'s rows, then `right`'s, each in its order; `UNION`
+    /// those rows each once, where it comes first. `INTERSECT` and
+    /// `EXCEPT` give rows of `left`, in its order: with `all`, of the rows
+    /// of `left` equal to one another, the first as many as `right` has
+    /// (`INTERSECT ALL`), or as many fewer (`EXCEPT ALL`); without, each
+    /// row once, at its first, that `right` has (`INTERSECT`) or has not
+    /// (`EXCEPT`). Needs [`SET_OPS`].
+    SetOp {
+        op: SetOp,
+        #[serde(default, skip_serializing_if = "is_false")]
+        all: bool,
+        left: Box<Node>,
+        right: Box<Node>,
+    },
+}
+
+/// How a [`Node::SetOp`] takes its sides' rows together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl SetOp {
+    /// Its name in SQL.
+    pub fn name(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1176,7 +1218,7 @@ impl Node {
             | Node::Distinct { input }
             | Node::DistinctOn { input, .. }
             | Node::Window { input, .. } => vec![input],
-            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => vec![a, b],
             Node::With { ctes, input } => ctes.iter().map(|c| &c.input).chain([&**input]).collect(),
         }
     }
@@ -1195,7 +1237,7 @@ impl Node {
             | Node::Distinct { input }
             | Node::DistinctOn { input, .. }
             | Node::Window { input, .. } => vec![input],
-            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => vec![a, b],
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => vec![a, b],
             Node::With { ctes, input } => ctes.iter_mut().map(|c| &mut c.input).chain([&mut **input]).collect(),
         }
     }
@@ -1210,6 +1252,12 @@ impl Node {
     /// [`Node::Window`].
     fn has_windows(&self) -> bool {
         matches!(self, Node::Window { .. }) || self.inputs().into_iter().any(Node::has_windows)
+    }
+
+    /// Whether the node or one below it (outside subqueries) is a
+    /// [`Node::SetOp`].
+    fn has_set_ops(&self) -> bool {
+        matches!(self, Node::SetOp { .. }) || self.inputs().into_iter().any(Node::has_set_ops)
     }
 
     /// Whether the node or one below it (outside subqueries) keeps more
@@ -1282,7 +1330,7 @@ impl Node {
             | Node::Distinct { input }
             | Node::DistinctOn { input, .. }
             | Node::Window { input, .. } => input.has_phases(),
-            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_phases() || b.has_phases(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => a.has_phases() || b.has_phases(),
             Node::With { ctes, input } => input.has_phases() || ctes.iter().any(|c| c.input.has_phases()),
             Node::Insert { .. } | Node::Ref { .. } => false,
         }
@@ -1316,7 +1364,7 @@ impl Node {
             | Node::Distinct { input }
             | Node::DistinctOn { input, .. }
             | Node::Window { input, .. } => input.each_search(f),
-            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => {
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => {
                 a.each_search(f);
                 b.each_search(f);
             }
@@ -1370,7 +1418,7 @@ impl Node {
             | Node::Distinct { input }
             | Node::DistinctOn { input, .. }
             | Node::Window { input, .. } => input.has_features(),
-            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.has_features() || b.has_features(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => a.has_features() || b.has_features(),
             Node::With { ctes, input } => input.has_features() || ctes.iter().any(|c| c.input.has_features()),
             Node::Insert { .. } | Node::Ref { .. } => false,
         }
@@ -1477,9 +1525,9 @@ impl Node {
                 ctes.iter().for_each(|c| c.input.visit_exprs(f));
                 input.visit_exprs(f);
             }
-            Node::KeyOrder { input, by } => {
-                input.visit_exprs(f);
-                by.visit_exprs(f);
+            Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => {
+                a.visit_exprs(f);
+                b.visit_exprs(f);
             }
             Node::DistinctOn { input, keys, .. } => {
                 keys.iter().for_each(&mut each);
@@ -1574,9 +1622,9 @@ impl Node {
                 }
                 input.visit_exprs_mut(f)
             }
-            Node::KeyOrder { input, by } => {
-                input.visit_exprs_mut(f)?;
-                by.visit_exprs_mut(f)
+            Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => {
+                a.visit_exprs_mut(f)?;
+                b.visit_exprs_mut(f)
             }
             Node::DistinctOn { input, keys, .. } => {
                 for k in keys {
@@ -1619,7 +1667,7 @@ impl Node {
             | Node::Distinct { input }
             | Node::DistinctOn { input, .. }
             | Node::Window { input, .. } => input.ranks_by_expression(),
-            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } => a.ranks_by_expression() || b.ranks_by_expression(),
+            Node::Join { left: a, right: b, .. } | Node::KeyOrder { input: a, by: b } | Node::SetOp { left: a, right: b, .. } => a.ranks_by_expression() || b.ranks_by_expression(),
             Node::With { ctes, input } => input.ranks_by_expression() || ctes.iter().any(|c| c.input.ranks_by_expression()),
             Node::Insert { .. } | Node::Ref { .. } => false,
         }
@@ -1991,6 +2039,15 @@ impl Plan {
         if window {
             features.push(WINDOW.to_string());
         }
+        let mut set_ops = root.has_set_ops();
+        root.visit_exprs(&mut |e| {
+            if let Expr::Subquery(n) | Expr::Values(n) | Expr::Keys(n) | Expr::Exists(n) | Expr::Scalar(n) | Expr::Encode { rows: n, .. } = e {
+                set_ops |= n.has_set_ops();
+            }
+        });
+        if set_ops {
+            features.push(SET_OPS.to_string());
+        }
         if root.walks_edge_tables() {
             features.push(EDGE_TABLE.to_string());
         }
@@ -2047,7 +2104,7 @@ impl Plan {
                 | Node::DistinctOn { input, .. }
                 | Node::KeyOrder { input, .. }
                 | Node::Window { input, .. } => of(input),
-                Node::Join { left, right, .. } => of(left).or_else(|| of(right)),
+                Node::Join { left, right, .. } | Node::SetOp { left, right, .. } => of(left).or_else(|| of(right)),
                 Node::With { ctes, input } => of(input).or_else(|| ctes.iter().find_map(|c| of(&c.input))),
                 Node::Ref { .. } => None,
             }

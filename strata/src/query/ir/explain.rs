@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use super::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Graph, GraphKind, GuardSite, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, SortKey, WindowFn, WindowFunc};
+use super::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Graph, GraphKind, GuardSite, JoinKey, JoinKind, Node, NormKind, OnConflict, Plan, SetOp, SortKey, WindowFn, WindowFunc};
 use crate::query::logical::{AggFn, DecayShape, Direction, Expand, Fuzzy, Opts};
 use crate::query::sql::ident;
 use crate::schema::{FieldType, Logical, Schema};
@@ -147,6 +147,19 @@ impl<'a> Text<'a> {
                     head += &format!(" on {}", conds.join(" AND "));
                 }
                 (std::iter::once(head).chain(indent(l)).chain(indent(r)).collect(), names)
+            }
+            Node::SetOp { op, all, left, right } => {
+                let (l, ln) = self.node(left);
+                let (r, _) = self.node(right);
+                let head = match (op, all) {
+                    (SetOp::Union, true) => "Union all",
+                    (SetOp::Union, false) => "Union",
+                    (SetOp::Intersect, true) => "Intersect all",
+                    (SetOp::Intersect, false) => "Intersect",
+                    (SetOp::Except, true) => "Except all",
+                    (SetOp::Except, false) => "Except",
+                };
+                (std::iter::once(head.to_string()).chain(indent(l)).chain(indent(r)).collect(), Names { schema: None, outputs: ln.outputs })
             }
             Node::With { ctes, input } => {
                 let mut lines = vec!["With".to_string()];

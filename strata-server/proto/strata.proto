@@ -518,6 +518,9 @@ message Node {
     // The input's rows, each with a column per window function after its
     // own (plan feature window).
     Window window = 20;
+    // Two queries' rows taken together: UNION, INTERSECT, EXCEPT (plan
+    // feature set_ops).
+    SetOp set_op = 21;
     // 90 to 99: media, sequences and semantic IDs, lane M.
     // The first row of each group (DISTINCT ON); plan feature distinct_on.
     DistinctOn distinct_on = 90;
@@ -721,6 +724,26 @@ message DistinctOn {
 message Window {
   Node input = 1;
   repeated WindowFn funcs = 2;
+}
+
+// The rows of `left` and `right`, which have as many columns, taken
+// together, the columns named as left's; rows are equal when each value
+// is (NULL equal to NULL). UNION ALL gives left's rows, then right's;
+// UNION those each once, where it comes first. INTERSECT and EXCEPT give
+// rows of left in its order: with `all`, of left's rows equal to one
+// another the first as many as right has (INTERSECT) or as many fewer
+// (EXCEPT); without, each once, at its first, that right has (INTERSECT)
+// or has not (EXCEPT).
+message SetOp {
+  enum Kind {
+    UNION = 0;
+    INTERSECT = 1;
+    EXCEPT = 2;
+  }
+  Kind kind = 1;
+  bool all = 2;
+  Node left = 3;
+  Node right = 4;
 }
 
 // A window function: over the rows with the row's values of `partition`,

@@ -128,6 +128,8 @@ const COMPOUND: &[&str] = &[
     "SELECT id, LAG(year) OVER (ORDER BY id), LEAD(rating, 2, 0.5) OVER (PARTITION BY category ORDER BY id), FIRST_VALUE(title) OVER (ORDER BY year ROWS BETWEEN UNBOUNDED PRECEDING AND 2 FOLLOWING), LAST_VALUE(year) OVER (ORDER BY year RANGE BETWEEN 1.5 PRECEDING AND UNBOUNDED FOLLOWING), NTH_VALUE(id, 2) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) FROM papers",
     "SELECT id, COUNT(*) OVER (PARTITION BY category), SUM(year) OVER (ORDER BY year RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING), AVG(rating) OVER w, MIN(year) OVER (w ROWS 1 PRECEDING), MAX(rating) OVER () FROM papers WHERE year > 2000 QUALIFY ROW_NUMBER() OVER w <= 3 WINDOW w AS (PARTITION BY category ORDER BY year)",
     "SELECT category, COUNT(*) AS n, RANK() OVER (ORDER BY COUNT(*) DESC) AS r FROM papers GROUP BY category QUALIFY r <= 2 ORDER BY n DESC",
+    "SELECT category FROM papers WHERE year > 2000 UNION SELECT category FROM papers WHERE rating > 4 INTERSECT ALL SELECT category FROM papers EXCEPT SELECT title FROM papers ORDER BY category LIMIT 3",
+    "SELECT id FROM papers WHERE id IN (SELECT id FROM papers WHERE year = 2001 UNION ALL SELECT id FROM papers WHERE rating > 4)",
 ];
 
 /// Writes of each kind.
@@ -294,7 +296,7 @@ fn every_plan_round_trips() {
     assert_eq!((model.as_str(), fields.len(), query.as_str()), ("ce", 2, "graph search"));
     seen.extend(kinds(&plan));
     // Every kind of node and expression was among them.
-    let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order", "window"];
+    let nodes = ["search", "aggregate", "filter", "sort", "limit", "project", "insert", "update", "delete", "join", "with", "ref", "distinct", "key_order", "window", "set_op"];
     let exprs = [
         "field", "score", "hops", "output", "excluded", "lit", "not", "and", "or", "is_null", "cmp", "between", "in", "arith", "neg", "concat", "like", "case", "call", "match", "graph", "bm25", "similarity", "sparse", "decay", "rrf", "weighted", "product", "ppr", "subquery", "values", "keys", "exists", "scalar", "seq_no", "norm", "gbdt", "cross_encoder", "maxsim", "prefix", "outer", "by_key", "at_least", "encode",
     ];
