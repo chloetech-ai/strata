@@ -114,6 +114,7 @@ Options:
   --fast           --nextest, --lanes 2, and only the jobs the change can affect (main tested the rest)
   --lanes N        run the jobs in N lanes at once (1 or 2; default 1)
   --nextest        run the three crates' test suites with cargo-nextest (built once): every binary's tests at once
+  --no-ramdisk     on a Mac, leave the tests' temporary files on the disk (default: a RAM disk)
   --keep-binaries  keep the test executables after each job (default: delete them, as they are most of the disk used)
   --list           list the jobs
   --ci-hashes      print the hashes of ci.yml's jobs, for CI_JOBS
@@ -171,7 +172,7 @@ job_names() { printf '%s\n' "$JOBS" | awk -F'|' 'NF { print $1 }'; }
 # --- options ---------------------------------------------------------------
 
 ARGS=("$@")
-PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 NEXTEST=0 LANES=1 ONLY_AFFECTED=0 SELECTED=""
+PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 NEXTEST=0 LANES=1 ONLY_AFFECTED=0 RAMDISK=1 SELECTED=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --pr) PR=${2:?--pr needs a number}; shift ;;
@@ -184,6 +185,7 @@ while [ $# -gt 0 ]; do
         --fail-fast) FAIL_FAST=1 ;;
         --verbose|-v) VERBOSE=1 ;;
         --keep-binaries) KEEP_BINARIES=1 ;;
+        --no-ramdisk) RAMDISK=0 ;;
         --nextest) NEXTEST=1 ;;
         --lanes) LANES=${2:?--lanes needs 1 or 2}; shift ;;
         --fast) NEXTEST=1 LANES=2 ONLY_AFFECTED=1 ;;
@@ -233,11 +235,12 @@ post_status() {
         || echo "ci-local: could not post the status to $SLUG@${HEAD_SHA:0:7}" >&2
 }
 
-FINISHED=0 HEAD_SHA=""
+FINISHED=0 HEAD_SHA="" RAM_DEV=""
 cleanup() {
     local p
     for p in $MIRI_PIDS $LANE_PIDS; do signal_tree CONT "$p"; signal_tree TERM "$p"; done
     [ "$FINISHED" = 1 ] || post_status error "Interrupted"
+    [ -n "$RAM_DEV" ] && hdiutil detach -force "$RAM_DEV" >/dev/null 2>&1
     rm -f "$CI_HOME/running" "$CI_HOME/paused"
 }
 
@@ -361,6 +364,28 @@ setup_rust() {
 
 # Python 3.12, as CI's setup-python, in a virtualenv kept between runs.
 PY_VENV=$CI_HOME/venv-py312
+# On a Mac the tests' temporary files go to a RAM disk: a durable sync there
+# (F_FULLFSYNC, which Rust's sync_all is on macOS) takes 0.2 ms rather than
+# the 20 ms it takes on this Mac's SSD, and Strata's tests sync at every
+# commit: the fault-injection tests alone took half an hour on the SSD.
+# Builds stay on the disk. Detached when the run ends.
+RAMDISK_GB=${STRATA_CI_RAMDISK_GB:-6}
+RAM_VOL=strata-ci-ram
+setup_ramdisk() {
+    [ "$RAMDISK" = 1 ] && [ "$(uname -s)" = Darwin ] || return 0
+    # A run that was killed left its disk.
+    [ -d "/Volumes/$RAM_VOL" ] && hdiutil detach -force "/Volumes/$RAM_VOL" >/dev/null 2>&1
+    RAM_DEV=$(hdiutil attach -nobrowse -nomount "ram://$((RAMDISK_GB * 2097152))" | awk 'NR == 1 { print $1 }')
+    [ -n "$RAM_DEV" ] || { echo "ci-local: no RAM disk; temporary files stay on the disk" >&2; return 0; }
+    if diskutil erasevolume APFS "$RAM_VOL" "$RAM_DEV" >/dev/null 2>&1 && [ -d "/Volumes/$RAM_VOL" ]; then
+        export TMPDIR=/Volumes/$RAM_VOL/
+    else
+        hdiutil detach -force "$RAM_DEV" >/dev/null 2>&1
+        RAM_DEV=""
+        echo "ci-local: no RAM disk; temporary files stay on the disk" >&2
+    fi
+}
+
 setup_python() {
     local py
     py=$(command -v python3.12 || command -v python3) || die "no Python 3"
@@ -650,7 +675,7 @@ run_job() {
         record "$name" failure "$secs"
     fi
     if [ "$LANES" = 1 ] && [ "$VERBOSE" = 0 ]; then echo "$result"; else printf '  %-42s %s\n' "$name" "$result"; fi
-    printf '  %-42s %s\n' "$name" "$result" >>"$RUN_DIR/run.log"
+    printf '  %-42s %s%s\n' "$name" "$result" "$([ -n "$RAM_DEV" ] && df -Pk "$TMPDIR" | awk 'NR == 2 { printf "  (RAM disk: %d MB used)", $3 / 1024 }')" >>"$RUN_DIR/run.log"
     [ "$rc" = 0 ] || [ "$VERBOSE" = 1 ] || tail -n 40 "$log" | sed 's/^/      | /'
     [ "$KEEP_BINARIES" = 1 ] || prune_job "$log"
 }
@@ -775,13 +800,14 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 setup_rust
 setup_python
+setup_ramdisk
 
 RUN_DIR=$CI_HOME/runs/$(date +%Y%m%d-%H%M%S)-${HEAD_SHA:0:7}
 mkdir -p "$RUN_DIR"
 RUN_START=$(now)
 
 say "ci-local: ${HEAD_SHA:0:7}$([ "$MERGE" = 1 ] && echo " merged into $BASE ${BASE_SHA:0:7}")$([ -n "$PR" ] && echo " (pull request #$PR)")"
-say "  on $MACHINE, $OS $(uname -m), Rust $RUST_VERSION, logs in $RUN_DIR"
+say "  on $MACHINE, $OS $(uname -m), Rust $RUST_VERSION$([ "$LANES" = 2 ] && echo ", 2 lanes")$([ "$NEXTEST" = 1 ] && echo ", nextest")$([ -n "$RAM_DEV" ] && echo ", temporary files on a ${RAMDISK_GB} GB RAM disk"), logs in $RUN_DIR"
 
 DRIFT=$(ci_drift "$CI_YML")
 if [ -n "$DRIFT" ]; then
