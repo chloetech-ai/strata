@@ -47,6 +47,17 @@ fn check(db: &Db, docs: &[Document]) {
     assert_eq!(ids(db, &format!("{q} WHERE rating BETWEEN 1 AND 2")), want(docs, |d| rating(d).is_some_and(|r| (1.0..=2.0).contains(&r))));
     assert_eq!(ids(db, &format!("{q} WHERE year = 2010")), want(docs, |d| year(d) == Some(2010)));
     assert_eq!(ids(db, &format!("{q} WHERE year IN (2001, 2030)")), want(docs, |d| matches!(year(d), Some(2001 | 2030))));
+    // IN lists long enough to be read in one pass over the column.
+    let years: Vec<i64> = (1990..2040).filter(|y| y % 3 != 0).collect();
+    let list = years.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+    assert_eq!(ids(db, &format!("{q} WHERE year IN ({list})")), want(docs, |d| year(d).is_some_and(|y| years.contains(&y))));
+    assert_eq!(
+        ids(db, &format!("{q} WHERE category = 'c00' AND year IN ({list})")),
+        want(docs, |d| d[col::CATEGORY].as_str() == Some("c00") && year(d).is_some_and(|y| years.contains(&y)))
+    );
+    let ratings: Vec<f64> = (0..500).filter(|r| r % 7 == 0).map(|r| r as f64 / 100.0).collect();
+    let list = ratings.iter().map(f64::to_string).collect::<Vec<_>>().join(", ");
+    assert_eq!(ids(db, &format!("{q} WHERE rating IN ({list})")), want(docs, |d| rating(d).is_some_and(|r| ratings.contains(&r))));
     assert_eq!(
         ids(db, &format!("{q} WHERE category = 'c00' AND rating < 1")),
         want(docs, |d| d[col::CATEGORY].as_str() == Some("c00") && rating(d).is_some_and(|r| r < 1.0))

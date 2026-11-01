@@ -1527,10 +1527,15 @@ impl<'a> Executor<'a> {
             }
             _ => {
                 let num = self.numeric(s, field)?;
-                let mut acc = DocSet::empty(s.r.n_docs);
-                for v in values {
-                    acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
-                }
+                let acc = if values.len() > MANY_VALUES {
+                    num.col().scan_key_set(&key_set(num.col(), values))
+                } else {
+                    let mut acc = DocSet::empty(s.r.n_docs);
+                    for v in values {
+                        acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
+                    }
+                    acc
+                };
                 Ok(self.patch(s, field, acc, |v| values.iter().any(|x| num_eq(v, x))))
             }
         }
@@ -1563,6 +1568,10 @@ impl<'a> Executor<'a> {
                 FieldType::Keyword => {
                     let vs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
                     ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_in(&vs)))
+                }
+                _ if values.len() > MANY_VALUES => {
+                    let col = self.numeric(s, *field)?.col();
+                    ProbeNode::Leaf(Box::new(col.filter_key_set(key_set(col, values))))
                 }
                 _ => {
                     let col = self.numeric(s, *field)?.col();
@@ -3708,6 +3717,18 @@ fn num_eq(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         _ => a.as_f64().zip(b.as_f64()).is_some_and(|(x, y)| x == y),
     }
+}
+
+/// Above this many values a numeric `IN` reads the column once and checks
+/// each key against them all ([`forward::KeySet`]), rather than looking
+/// each value up: a lookup reads or unions a set of the segment's size, so
+/// a value at a time is quadratic (a join restricted to a million keys
+/// took two minutes).
+const MANY_VALUES: usize = 32;
+
+/// The keys of `values` in `col`.
+fn key_set(col: &NumericColumn, values: &[Value]) -> forward::KeySet {
+    forward::KeySet::new(values.iter().filter_map(|v| value_keys(col, v)))
 }
 
 /// The keys of column `col` equal to the number `v`.
