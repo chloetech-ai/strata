@@ -396,7 +396,7 @@ fn no_clauses(q: &sql::Query) -> Option<String> {
 }
 
 /// The clauses of a query that no statement here takes, by name.
-fn unsupported_query_clause(
+pub(crate) fn unsupported_query_clause(
     fetch: &Option<sql::Fetch>,
     locks: &[sql::LockClause],
     for_clause: &Option<sql::ForClause>,

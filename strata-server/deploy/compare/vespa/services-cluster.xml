@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- The cluster of compare.sh: vespa-0 runs the config server, the cluster
+     controller and the stateless container (queries and feeding), as
+     Strata's coordinator does; vespa-1 and vespa-2 are the two content
+     nodes, one on each data worker, holding one copy of the documents
+     between them. hosts.xml names the pods. -->
+<services version="1.0">
+    <admin version="2.0">
+        <configservers>
+            <configserver hostalias="config"/>
+        </configservers>
+        <cluster-controllers>
+            <cluster-controller hostalias="config" jvm-options="-Xms64m -Xmx128m"/>
+        </cluster-controllers>
+        <slobroks>
+            <slobrok hostalias="config"/>
+        </slobroks>
+        <adminserver hostalias="config"/>
+    </admin>
+    <container id="default" version="1.0">
+        <component id="linguistics" class="com.yahoo.language.lucene.LuceneLinguistics" bundle="lucene-linguistics">
+            <config name="com.yahoo.language.lucene.lucene-analysis">
+                <configDir>linguistics</configDir>
+                <analysis>
+                    <item key="profile=strata;language=en">
+                        <tokenizer>
+                            <name>pattern</name>
+                            <conf><item key="pattern">[^\p{L}\p{N}\p{M}]+</item></conf>
+                        </tokenizer>
+                        <tokenFilters>
+                            <item><name>lowercase</name></item>
+                            <item><name>asciiFolding</name></item>
+                            <item><name>stop</name><conf><item key="words">classic-stopwords.txt</item></conf></item>
+                            <item><name>snowballPorter</name><conf><item key="language">English</item></conf></item>
+                        </tokenFilters>
+                    </item>
+                    <item key="profile=strata_query;language=en">
+                        <tokenizer>
+                            <name>pattern</name>
+                            <conf><item key="pattern">[^\p{L}\p{N}\p{M}]+</item></conf>
+                        </tokenizer>
+                        <tokenFilters>
+                            <item><name>lowercase</name></item>
+                            <item><name>asciiFolding</name></item>
+                            <item><name>stop</name><conf><item key="words">query-stopwords.txt</item></conf></item>
+                            <item><name>stop</name><conf><item key="words">classic-stopwords.txt</item></conf></item>
+                            <item><name>snowballPorter</name><conf><item key="language">English</item></conf></item>
+                        </tokenFilters>
+                    </item>
+                </analysis>
+            </config>
+        </component>
+        <search/>
+        <document-api/>
+        <document-processing/>
+        <nodes>
+            <jvm options="-Xms__CONTAINER_HEAP__ -Xmx__CONTAINER_HEAP__"/>
+            <node hostalias="config"/>
+        </nodes>
+    </container>
+    <content id="docs" version="1.0">
+        <min-redundancy>__REDUNDANCY__</min-redundancy>
+        <tuning>
+            <!-- The laptop's disk is fuller than Vespa's default 75% feed block. -->
+            <resource-limits>
+                <disk>0.98</disk>
+                <memory>0.9</memory>
+            </resource-limits>
+        </tuning>
+        <documents>
+            <document type="doc" mode="index"/>
+        </documents>
+        <nodes>
+__CONTENT_NODES__        </nodes>
+    </content>
+</services>

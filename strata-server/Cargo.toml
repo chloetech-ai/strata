@@ -40,6 +40,8 @@ base64 = "0.23"
 sha2 = "0.10"
 # AWS answers in XML (EC2: instance types, regions, spot prices; `aws`).
 roxmltree = "0.20"
+# Kafka (Redpanda) topics for engine-compare's stream test: a client in Rust alone.
+rskafka = { version = "0.6", default-features = false }
 
 # CPU profiles (`profiler`): every thread's stack, sampled on SIGPROF.
 [target.'cfg(unix)'.dependencies]

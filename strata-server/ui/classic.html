@@ -1745,7 +1745,7 @@ function fieldRow(f) {
     index.value = typeof f.index === "string" ? f.index : "hnsw";
     index.disabled = typeof f.index === "object" && f.index !== null;
     index.onchange = () => { f.index = index.value; designChanged(false); };
-    const codes = el("select", {}, el("option", { value: "sq8", text: "a byte a dimension" }), el("option", { value: "binary", text: "a bit a dimension" }));
+    const codes = el("select", {}, el("option", { value: "sq8", text: "a byte a dimension" }), el("option", { value: "rabitq4", text: "4 bits a dimension (RaBitQ)" }), el("option", { value: "rabitq2", text: "2 bits a dimension (RaBitQ)" }), el("option", { value: "rabitq1", text: "a bit a dimension (RaBitQ)" }), el("option", { value: "binary", text: "a bit a dimension (signs)" }));
     codes.value = f.codes || "sq8";
     codes.onchange = () => { f.codes = codes.value; designChanged(false); };
     opts.append(el("label", { title: "How nearest rows are found" }, "index", index), el("label", { title: "How the vectors are compressed for search; the full vectors rescore the best" }, "codes", codes));

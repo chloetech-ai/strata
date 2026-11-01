@@ -133,11 +133,28 @@ impl Bits {
             qt += q[j] as f64 * self.mean[j] as f64;
             wsum += w[j] as f64;
         }
+        let Weights { u, v, planes, alpha } = Weights::quantise(&w, words);
+        BitsQuery { u, v, planes, alpha, bias: (qt - wsum) as f32 }
+    }
+}
+
+/// Weights a bit each for [`kernels::dot_bits_u8`]: `w` quantised to int8
+/// `v_j` with `w_j ≈ alpha·v_j`, in the three layouts of
+/// [`kernels::BitsWeights`], padded to 64 a code word.
+pub(crate) struct Weights {
+    pub u: Vec<u8>,
+    pub v: Vec<i8>,
+    pub planes: Vec<u64>,
+    pub alpha: f32,
+}
+
+impl Weights {
+    pub fn quantise(w: &[f32], words: usize) -> Weights {
         let max = w.iter().fold(0f32, |m, &x| m.max(x.abs()));
         let alpha = max / 127.0;
         let mut u = vec![128u8; words * 64];
-        for j in 0..dim {
-            let v = if alpha > 0.0 { (w[j] / alpha).round().clamp(-127.0, 127.0) } else { 0.0 };
+        for (j, &x) in w.iter().enumerate() {
+            let v = if alpha > 0.0 { (x / alpha).round().clamp(-127.0, 127.0) } else { 0.0 };
             u[j] = (v as i32 + 128) as u8;
         }
         let mut planes = vec![0u64; words * 8];
@@ -147,7 +164,7 @@ impl Bits {
             }
         }
         let v = u.iter().map(|&x| (x as i32 - 128) as i8).collect();
-        BitsQuery { u, v, planes, alpha, bias: (qt - wsum) as f32 }
+        Weights { u, v, planes, alpha }
     }
 }
 

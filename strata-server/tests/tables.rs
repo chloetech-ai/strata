@@ -132,7 +132,7 @@ async fn query(svc: &Arc<Service>, s: &str) -> Json {
 
 /// Queries of every table, and across them: those whose order is total
 /// (`true`) answer in the same order, the others with the same rows.
-const QUERIES: [(&str, bool); 23] = [
+const QUERIES: [(&str, bool); 27] = [
     ("SELECT item, action, ts FROM events WHERE usr = 'u3' ORDER BY ts DESC, id LIMIT 50", true),
     ("SELECT COUNT(*) FROM events", true),
     ("SELECT usr, COUNT(*) FROM events GROUP BY usr LIMIT 100", false),
@@ -160,6 +160,11 @@ const QUERIES: [(&str, bool); 23] = [
     ("SELECT id, ts, SUM(ts) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), LAG(item) OVER (ORDER BY id) FROM events WHERE usr = 'u4' ORDER BY id", true),
     ("SELECT usr, COUNT(*) AS n, RANK() OVER (ORDER BY COUNT(*) DESC) AS r, SUM(COUNT(*)) OVER () FROM events GROUP BY usr ORDER BY r, usr LIMIT 10", true),
     ("SELECT e.id, i.cat, DENSE_RANK() OVER (PARTITION BY i.cat ORDER BY e.ts) FROM events e JOIN items i ON e.item = i.id WHERE e.action = 'buy' ORDER BY e.id LIMIT 40", true),
+    // Set operations over the shards' rows, groups and tables.
+    ("SELECT usr FROM events WHERE action = 'buy' UNION SELECT usr FROM events WHERE action = 'view' ORDER BY usr", true),
+    ("SELECT item FROM events WHERE usr = 'u1' INTERSECT SELECT id FROM items WHERE cat = 'c1' ORDER BY item", true),
+    ("SELECT usr, action FROM events EXCEPT ALL SELECT usr, action FROM events WHERE ts > 1000 ORDER BY usr, action", true),
+    ("(SELECT id, ts FROM events ORDER BY ts DESC, id LIMIT 5) UNION ALL SELECT n_events, n_events FROM users WHERE n_events > 60 ORDER BY ts DESC, id LIMIT 8", true),
 ];
 
 /// The same rows: in the same order when `ordered`, but for rows tied on

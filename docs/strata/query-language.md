@@ -60,6 +60,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
 [QUALIFY <predicate over window functions>]
 [WINDOW name AS (<window>), ...]
+[{UNION | INTERSECT | EXCEPT} [ALL] SELECT ...]
 [ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]] [MAX k PER <field>]]
 [LIMIT n [OFFSET m]]
 ```
@@ -83,7 +84,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | `BOOL` | an `INT` column of 1 and 0 | the field alone (`WHERE done`, `NOT done`), `=`, `!=`, `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] NULL`; `GROUP BY` |
 | `TIMESTAMP` | an `INT` column of microseconds since 1970-01-01 UTC | as `INT`, with times written as text: `at >= '2026-10-01'` |
 | `TEXT` | inverted index (optionally with positions); may be generated from other text fields | `MATCH` |
-| `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`), with HNSW, IVF or flat search; may be declared as a model's embedding of other fields ([embedded vector fields](server.md#embedded-vector-fields)) | ordering by `similarity` / `distance`; a similarity graph |
+| `VECTOR(d)` | float32 rows plus 8-bit codes (or 1-bit codes, `"codes": "binary"`, or RaBitQ codes of 1, 2 or 4 bits, `"rabitq1"`, `"rabitq2"`, `"rabitq4"`), with HNSW, IVF or flat search; may be declared as a model's embedding of other fields ([embedded vector fields](server.md#embedded-vector-fields)) | ordering by `similarity` / `distance`; a similarity graph |
 | `VECTOR(d)[]` | several vectors per row (a page's patches, a song's frames): 1-bit codes searched, 8-bit codes to score (float32 too with `keep_f32`), and maps from rows to their vectors and back | ordering by `maxsim` |
 | `SPARSE` | inverted index of learned term weights (SPLADE and similar) | ordering by `similarity` |
 | `MEDIA` | a file by reference: URI, SHA-256, type, size; a `KEYWORD` index of the hashes | `=`, `IN` on the hash; `GROUP BY` |
@@ -333,6 +334,8 @@ The dot product (cosine for unit vectors) and the distance between a row's vecto
 | `rerank` | how many candidates are re-scored in float32 |
 
 A `VECTOR` field keeps, besides its float32 rows, a compact code per row that the search scans: 8 bits per dimension by default, or 1 bit per dimension with `"codes": "binary"` in the field's schema (or the build option `vector.codes = 'binary'`). Binary codes are 32 times smaller than the vectors and 8 times smaller than 8-bit codes; to make up for the coarser scores, the search re-scores 8 times as many candidates in float32. On synthetic 768-dimensional data that kept recall@10 at 0.985–0.994 with flat, IVF and HNSW search, at an eighth of the memory ([results](results.md#compressed-vectors)); check recall on your own embeddings before choosing them, since some models lose more to one-bit codes than others.
+
+RaBitQ codes (`"codes": "rabitq1"`, `"rabitq2"` or `"rabitq4"`, or `codes = 'rabitq4'` in `OPTIONS`) keep 1, 2 or 4 bits per dimension of the vector after a fixed random rotation, and two numbers per row that give each estimated score an error bound. The search keeps 8, 4 or 2 times as many candidates, and skips the float32 row of any candidate whose bound shows it cannot reach the top results found so far. On FiQA's Cohere embeddings, at recall@10 1.000 with a flat scan, 1-bit RaBitQ codes read 91 float32 rows a query where binary codes read 320, 2-bit codes 28 and 4-bit codes 13, against SQ8's 40 ([results](results.md#compressed-vectors)). Their scan is slower per row than binary or SQ8 codes of the same field: 4-bit codes take half the memory of SQ8 and scan about 1.5 times slower. They pay off when reading the float32 rows is the cost, as with a table larger than memory. A database with RaBitQ codes is written in [file format 3](index.md#wal-memtable-and-snapshots) with the feature `rabitq`, which versions of Strata from before them refuse by name.
 
 ### `similarity(field, weights)` on a `SPARSE` field
 
@@ -833,7 +836,7 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
   - `datafusion-only`: a query DataFusion does not run fails, to find what it lacks.
 
   The operators run what DataFusion does not run yet, and the plan's first line says why. Today that is joins along links, multi-valued columns as join keys, groups or sort keys, correlated subqueries, and `maxsim` or `encode` over a subquery.
-- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `UNION`, `INTERSECT`, `EXCEPT`, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
+- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `RIGHT`, `FULL` and `CROSS` joins are not supported.
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
 
@@ -876,6 +879,35 @@ FROM papers WINDOW w AS (PARTITION BY category ORDER BY year);
 - **Engines.** The operators sort each partition in memory; DataFusion runs windows on column batches, sorting and spilling within the query's memory budget, and both answer alike. The operators run a window DataFusion does not lower yet: a `LAG` or `LEAD` whose default is not a constant of the value's type, `FIRST_VALUE` and `LAST_VALUE` over a `RANGE` frame with an offset, `NTH_VALUE` over a `RANGE` frame that starts after the partition's first row, a `RANGE` offset of another type than its key (`0.5` over an `INT`), and windows over multi-valued columns.
 
 The plan's node is `Window` (`Window: RANK() OVER (PARTITION BY category ORDER BY cites DESC)` in `EXPLAIN`, the functions computed after the rows' own columns), and its JSON needs the plan feature `window`; a version of Strata from before it refuses the plan by that name.
+
+## UNION, INTERSECT and EXCEPT
+
+A set operation takes the rows of two queries together: `UNION` the rows of either, `INTERSECT` those of both, `EXCEPT` those of the first that the second lacks.
+
+```sql
+-- the categories of 2024's papers and of the reviews' papers, each once
+SELECT category FROM papers WHERE year = 2024 UNION SELECT category FROM reviews;
+
+-- every row of both, repeats kept, ranked together
+SELECT id, cites AS n FROM papers WHERE cites > 100
+UNION ALL
+SELECT id, downloads FROM preprints WHERE downloads > 1000
+ORDER BY n DESC LIMIT 10;
+
+-- the venues 2023 had and 2024 lost
+SELECT venue FROM papers WHERE year = 2023 EXCEPT SELECT venue FROM papers WHERE year = 2024;
+
+-- a side ordered and cut on its own, in parentheses
+(SELECT id FROM papers ORDER BY cites DESC LIMIT 5) UNION ALL (SELECT id FROM preprints ORDER BY downloads DESC LIMIT 5);
+```
+
+- **Columns.** Both sides select as many columns, matched by place, and the answer's columns are named as the first side's. Rows are equal when each of their values is, `NULL` equal to `NULL` and an `INT` equal to the `FLOAT` of its value.
+- **`ALL`.** Without it each row comes once. With it, `UNION ALL` keeps every row of both sides; `INTERSECT ALL` keeps a row as many times as both sides have it, the fewer of the two counts; `EXCEPT ALL` as many times as the first side has it more than the second.
+- **Order.** `INTERSECT` comes before `UNION` and `EXCEPT`, which go left to right, and parentheses group sides: `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`. `ORDER BY`, `LIMIT` and `OFFSET` at the end apply to the whole and name its columns; a side in parentheses takes its own. Without an `ORDER BY` the rows come in the sides' order: `UNION ALL` the first side's rows, then the second's; `UNION` those rows each where it first comes; `INTERSECT` and `EXCEPT` rows of the first side in its order, the first ones of rows equal to one another.
+- **Anywhere a query goes**: a `WITH` result, a derived table `FROM (SELECT .. UNION ..) d`, or a subquery `x IN (SELECT .. UNION ..)`, and each side may group, join, rank, or compute windows. `UNION BY NAME` is an error.
+- **Engines.** Both answer alike. The operators run a set operation DataFusion does not lower: one whose sides give a column different types (an `INT` and a `FLOAT`), and `INTERSECT`, `EXCEPT` or `UNION` without `ALL` of a multi-valued column.
+
+The plan's node is `SetOp` (`Union`, `Intersect all` and so on in `EXPLAIN`, the sides below it), and its JSON needs the plan feature `set_ops`; a version of Strata from before it refuses the plan by that name.
 
 ## The first row of each group: DISTINCT ON
 
@@ -1056,7 +1088,7 @@ DROP TABLE IF EXISTS wrote, authors;
 ```
 
 - **Types** are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (or `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE`, `DATETIME`; a `DATE` is a `TIMESTAMP` at midnight UTC), `VECTOR(dimensions)`, `SPARSE`, `MEDIA` and `EDGES`; `KEYWORD[]` and `INT[]` hold lists, and `VECTOR(dimensions)[]` several vectors per row ([multi-vector fields](#maxsimfield-vectors-several-query-vectors)). A `BOOL` or `TIMESTAMP` column holds one value and is neither the primary key nor a reference.
-- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'` or `'binary'`; a multi-vector field searches `'binary'` by default), `keep_f32` (a multi-vector field keeps its float32 vectors to score with, four times the bytes of its 8-bit codes), `pool` (a multi-vector field merges a row's vectors whose cosine similarity is at least this, such as `0.9`, into their mean when it is written), `pool_factor` (a multi-vector field clusters a row's vectors into one group for every this many, such as `2`, by Ward's linkage, and keeps each group's mean when it is written; exclusive with `pool`), `kind` of a `MEDIA` field, `derive` (a `MEDIA` field) with `model` for [text made from media](server.md#text-from-media), `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
+- **`OPTIONS(...)`** takes the options of the [JSON schema](server.md#schemas): `positions`, `stored` and `indexed` (true or false; an indexed `TEXT` or `SPARSE` field is stored unless generated, since merges rebuild its index from the stored values), `from` (the fields a generated `TEXT` field joins), `analyzer` (`'english'`, the default: stopwords dropped and words stemmed, so `running` finds `run`; or `'simple'`: every word kept as written, for names, codes and other languages), `index` (`'hnsw'` with `m` and `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'`, `'binary'`, `'rabitq1'`, `'rabitq2'` or `'rabitq4'`; a multi-vector field searches `'binary'` by default), `keep_f32` (a multi-vector field keeps its float32 vectors to score with, four times the bytes of its 8-bit codes), `pool` (a multi-vector field merges a row's vectors whose cosine similarity is at least this, such as `0.9`, into their mean when it is written), `pool_factor` (a multi-vector field clusters a row's vectors into one group for every this many, such as `2`, by Ward's linkage, and keeps each group's mean when it is written; exclusive with `pool`), `kind` of a `MEDIA` field, `derive` (a `MEDIA` field) with `model` for [text made from media](server.md#text-from-media), `embed` with `model` for an [embedded vector field](server.md#embedded-vector-fields), which may leave out its dimensions when Strata knows the model's (`VECTOR` alone), and on a `KEYWORD[]` `semantic_id` (the vector field) with `codebook` for a [semantic-ID field](server.md#semantic-ids): `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`. Field lists are a string, `'name, bio'`, or `ARRAY['name', 'bio']`.
 - **The primary key** is one column: `PRIMARY KEY` on it, or a `PRIMARY KEY (column)` constraint. A table without one only takes plain `INSERT`.
 - **`REFERENCES table`**, or `FOREIGN KEY (column) REFERENCES table`, records that a `KEYWORD` or `INT` column holds primary keys of that table, which must exist (or be the table being created) and have a primary key of the column's type. References are not enforced: a row may name a key that is not there, and an inner join along the reference leaves that row out (`LEFT JOIN` keeps it). Joins along them are [ordinary joins](#subqueries-with-and-joins) (`FROM wrote w JOIN authors a ON w.author = a.id`).
 - **`NOT NULL`** refuses a row without a value in that column, from any write: SQL, JSON, a file or the Rust API. **`DEFAULT value`** is the value a write that leaves the column out gets: a constant of the column's type on a single-valued `TEXT`, `KEYWORD`, `INT`, `FLOAT`, `BOOL` or `TIMESTAMP` column that is not the key, or `CURRENT_TIMESTAMP` (or `now()`) on a `TIMESTAMP`, the time of the statement, the same in all its rows. An `INSERT` that leaves a column out, a JSON row without its key and a CSV file without its column give it the default; a `NULL` that a write gives stays `NULL`, and a column with `NOT NULL` refuses it. In SQL the keyword `DEFAULT` stands for a column's default, in `VALUES` and in `SET`, and `CURRENT_TIMESTAMP` (or `now()`, `LOCALTIMESTAMP`) is the time of the statement there and in conditions (`SET seen = CURRENT_TIMESTAMP`, also in `ON CONFLICT ... DO UPDATE`). The Rust API writes a row as it is given; `Schema::defaults` returns a row of the defaults to start from. The JSON schema's options are `"not_null": true` and `"default"` (`"now"` for the time of the write).

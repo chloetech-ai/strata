@@ -31,6 +31,15 @@ pub enum VectorCodes {
     /// A bit per dimension: 1/32 of the float32 vectors. Searches rescore
     /// [`crate::vector::codes::BINARY_RERANK`] times more candidates.
     Binary,
+    /// RaBitQ codes ([`crate::vector::rabitq`]): the vectors rotated at
+    /// random, a bit per dimension and a correction factor per row.
+    /// Searches rescore [`crate::vector::codes::oversample`] times more
+    /// candidates.
+    Rabitq1,
+    /// RaBitQ codes of two bits per dimension.
+    Rabitq2,
+    /// RaBitQ codes of four bits per dimension: half the bytes of SQ8.
+    Rabitq4,
 }
 
 impl VectorCodes {
@@ -38,19 +47,36 @@ impl VectorCodes {
         match self {
             VectorCodes::Sq8 => "sq8",
             VectorCodes::Binary => "binary",
+            VectorCodes::Rabitq1 => "rabitq1",
+            VectorCodes::Rabitq2 => "rabitq2",
+            VectorCodes::Rabitq4 => "rabitq4",
         }
     }
 
+    pub const ALL: [VectorCodes; 5] = [VectorCodes::Sq8, VectorCodes::Binary, VectorCodes::Rabitq1, VectorCodes::Rabitq2, VectorCodes::Rabitq4];
+
     pub fn parse(s: &str) -> Option<VectorCodes> {
-        [VectorCodes::Sq8, VectorCodes::Binary].into_iter().find(|k| k.as_str().eq_ignore_ascii_case(s))
+        VectorCodes::ALL.into_iter().find(|k| k.as_str().eq_ignore_ascii_case(s))
+    }
+
+    /// The bits per dimension of RaBitQ codes.
+    pub fn rabitq_bits(&self) -> Option<usize> {
+        match self {
+            VectorCodes::Rabitq1 => Some(1),
+            VectorCodes::Rabitq2 => Some(2),
+            VectorCodes::Rabitq4 => Some(4),
+            VectorCodes::Sq8 | VectorCodes::Binary => None,
+        }
     }
 
     /// Bytes per code row of `dim` dimensions: SQ8 rows are padded to 64
-    /// bytes, binary rows to 8.
+    /// bytes, binary rows to 8; RaBitQ rows hold their bit planes of
+    /// `⌈dim/64⌉·64` dimensions and 8 bytes of factors.
     pub fn stride(&self, dim: usize) -> usize {
         match self {
             VectorCodes::Sq8 => dim.next_multiple_of(64),
             VectorCodes::Binary => crate::vector::bits::stride(dim),
+            c => crate::vector::rabitq::stride(dim, c.rabitq_bits().expect("rabitq")),
         }
     }
 
@@ -91,6 +117,12 @@ pub const JSON: &str = "json";
 /// as text too ([`Field::text`]): its segments hold a text index beside
 /// the field's terms.
 pub const JSON_TEXT: &str = "json_text";
+
+/// The feature of a database with a VECTOR field searched by RaBitQ codes
+/// ([`VectorCodes::Rabitq1`], [`crate::vector::rabitq`]): versions of
+/// Strata from before them refuse it by name rather than misread its
+/// segments.
+pub const RABITQ: &str = "rabitq";
 
 /// What an INT column's integers stand for (format 3; a database is
 /// written in format 3 only while a table has such a field). Queries and
@@ -1300,8 +1332,8 @@ impl Schema {
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
     /// `multi_vector`, `semantic_id`, [`Analyzer::feature`], `media`
-    /// ([`Field::media`]), `derive` ([`Field::derive`]), [`JSON`] and
-    /// [`JSON_TEXT`], and
+    /// ([`Field::media`]), `derive` ([`Field::derive`]), [`JSON`],
+    /// [`JSON_TEXT`] and [`RABITQ`], and
     /// its options `shard_by`, `cluster_by`, `retain` and `edge_table`
     /// ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
     /// [`Schema::with_retain`], [`Schema::with_edges`]).
@@ -1318,6 +1350,7 @@ impl Schema {
                 f.added.as_ref().map(|_| ADDED_FIELDS),
                 (f.ty == FieldType::Json).then_some(JSON),
                 (f.ty == FieldType::Json && f.text).then_some(JSON_TEXT),
+                f.codes.rabitq_bits().map(|_| RABITQ),
             ];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
@@ -1882,7 +1915,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
         Some(p) => Some(p.as_f64().ok_or_else(|| bad("pool_factor is a number above 1, such as 2"))? as f32),
     };
     if let Some(c) = j.get("codes").filter(|c| !c.is_null()) {
-        f.codes = c.as_str().and_then(VectorCodes::parse).ok_or_else(|| bad("codes is \"sq8\" or \"binary\""))?;
+        f.codes = c.as_str().and_then(VectorCodes::parse).ok_or_else(|| bad("codes is \"sq8\", \"binary\", \"rabitq1\", \"rabitq2\" or \"rabitq4\""))?;
     }
     match j.get("references") {
         None | Some(J::Null) => {}

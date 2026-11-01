@@ -48,6 +48,7 @@ import os
 import platform
 import random
 import re
+import subprocess
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -104,8 +105,12 @@ def texts(path, want):
 
 
 def machine():
-    cpu = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.processor())
-    mem = next((int(l.split()[1]) / 1e6 for l in open("/proc/meminfo") if l.startswith("MemTotal")), None)
+    if platform.system() == "Darwin":
+        q = lambda k: subprocess.run(["sysctl", "-n", k], capture_output=True, text=True).stdout.strip()  # noqa: E731
+        cpu, mem = f"{q('machdep.cpu.brand_string')} ({q('hw.model')})", int(q("hw.memsize") or 0) / 1e9
+    else:
+        cpu = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.processor())
+        mem = next((int(l.split()[1]) / 1e6 for l in open("/proc/meminfo") if l.startswith("MemTotal")), None)
     return {"cpu": cpu, "cores": os.cpu_count(), "memory_gb": round(mem, 1) if mem else None, "os": f"{platform.system()} {platform.release()}", "torch": torch.__version__}
 
 
@@ -444,10 +449,13 @@ def evaluate(a, seqs, work, models):
     c = json.load(open(os.path.join(work, "codes.json")))
     codes = {k: parse(v) for k, v in c["codes"].items()}
     by_code = {tuple(v): k for k, v in codes.items()}
-    saved = torch.load(os.path.join(work, "tiger.pt"))
-    model = Tiger(**saved["config"], dropout=0.1)
-    model.load_state_dict(saved["state"])
-    model.eval()
+    # --no-decoder: the queries alone, without the trained decoder (as on the
+    # laptop, where the decoder is not run).
+    saved = None if a.no_decoder else torch.load(os.path.join(work, "tiger.pt"))
+    if saved is not None:
+        model = Tiger(**saved["config"], dropout=0.1)
+        model.load_state_dict(saved["state"])
+        model.eval()
     torch.set_num_threads(a.threads)
     db = strata.Database.open(os.path.join(work, "db"), models=models)
     trie = Trie(codes)
@@ -457,7 +465,7 @@ def evaluate(a, seqs, work, models):
 
     # Each part's answers are kept in the work directory, so that a run
     # stopped part way (by a time limit) resumes where it stopped.
-    trained = [os.path.getmtime(os.path.join(work, f)) for f in ("tiger.pt", "a8.json")]
+    trained = [os.path.getmtime(os.path.join(work, f)) for f in (("a8.json",) if a.no_decoder else ("tiger.pt", "a8.json"))]
     key = {"users": a.users, "seed": a.seed, "beam": a.beam, "trained": trained}
 
     def cached(name, key, compute):
@@ -524,8 +532,8 @@ def evaluate(a, seqs, work, models):
             model_ms.append(total - sum(spent) * 1e3)
         return {"generated": generated, "checked": checked, "same_next": same_next, "ms": gen_ms, "model_ms": model_ms, "next_ms": next_ms}
 
-    dec = cached("generated", key, decode)
-    generated = dec["generated"]
+    dec = None if a.no_decoder else cached("generated", key, decode)
+    generated = {} if dec is None else dec["generated"]
 
     name = f"{a.data}-seq"
     hist_sql = "(SELECT item FROM events WHERE usr = :u AND seq < :n ORDER BY seq DESC LIMIT 50)"
@@ -539,7 +547,9 @@ def evaluate(a, seqs, work, models):
         "A8 + walk, rrf": f"SELECT id FROM items WHERE {not_own} ORDER BY rrf({seq_score}, {walk_score}) DESC LIMIT 10",
         "generated + A8 + walk, rrf": f"SELECT id FROM items WHERE {not_own} ORDER BY rrf({seq_score}, {walk_score}, ranked(:gen)) DESC LIMIT 10",
     }
-    params = lambda u: {"u": u, "n": len(seqs[u]) - 1, "gen": generated[u]}  # noqa: E731
+    if dec is None:
+        queries = {k: v for k, v in queries.items() if ":gen" not in v}
+    params = lambda u: {"u": u, "n": len(seqs[u]) - 1, **({} if dec is None else {"gen": generated[u]})}  # noqa: E731
 
     def answers(sql):
         """Every user's top 10 by `sql`, on every core (a query runs
@@ -558,28 +568,28 @@ def evaluate(a, seqs, work, models):
             got = dict(zip(users, ex.map(one, users)))
         return {"ranked": got, "ms": ms}
 
-    results = {"generated (TIGER)": {"metrics": mean_metrics([metrics(generated[u][:10], seqs[u][-1]) for u in users]),
+    results = {} if dec is None else {"generated (TIGER)": {"metrics": mean_metrics([metrics(generated[u][:10], seqs[u][-1]) for u in users]),
                                     "ms": {"p50": pct(dec["ms"], 50), "p99": pct(dec["ms"], 99), "model_p50": pct(dec["model_ms"], 50), "sid_next_call_p50": pct(dec["next_ms"], 50)}}}
     for i, (label, sql) in enumerate(queries.items()):
         r = cached(f"query-{i}", {**key, "sql": sql}, lambda sql=sql: answers(sql))
         results[label] = {"metrics": mean_metrics([metrics(r["ranked"][u], seqs[u][-1]) for u in users]), "ms": {"p50": pct(r["ms"], 50), "p99": pct(r["ms"], 99)}, "sql": sql}
         print(label, json.dumps(results[label]["metrics"]), flush=True)
     db.close()
-    invalid = sum(len(generated[u]) < 10 for u in users)
+    invalid = None if dec is None else sum(len(generated[u]) < 10 for u in users)
     out = {
         "data": {"name": a.data, "users": len(seqs), "items": len(codes), "events": sum(len(s) for s in seqs.values()), "evaluated_users": len(users)},
         "codes": c["info"],
         "machine": machine(),
-        "tiger": {"config": saved["config"], "epochs": len(saved["history"]), "best_epoch": max(saved["history"], key=lambda h: h["recall@10"])["epoch"], "seconds": saved["history"][-1]["seconds"], "history": saved["history"], "beam": a.beam},
+        "tiger": None if saved is None else {"config": saved["config"], "epochs": len(saved["history"]), "best_epoch": max(saved["history"], key=lambda h: h["recall@10"])["epoch"], "seconds": saved["history"][-1]["seconds"], "history": saved["history"], "beam": a.beam},
         "a8": json.load(open(os.path.join(work, "a8.json"))),
         "users_with_fewer_than_10_generated": invalid,
-        "sid_next_equal_to_trie": f"{dec['same_next']}/{dec['checked']}",
+        "sid_next_equal_to_trie": None if dec is None else f"{dec['same_next']}/{dec['checked']}",
         "timed_users": len(timed_users),
         "results": results,
     }
     print(json.dumps({k: v for k, v in out.items() if k in ("results", "sid_next_equal_to_trie", "users_with_fewer_than_10_generated")}, indent=1), flush=True)
     os.makedirs(a.out, exist_ok=True)
-    json.dump(out, open(os.path.join(a.out, f"{a.data}.json"), "w"), indent=1)
+    json.dump(out, open(os.path.join(a.out, f"{a.data}{a.tag}.json"), "w"), indent=1)
 
 
 def main():
@@ -607,6 +617,8 @@ def main():
     ap.add_argument("--threads", type=int, default=os.cpu_count())
     ap.add_argument("--users", type=int, default=None, help="evaluate this many users (all by default)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-decoder", action="store_true", help="eval: the queries without the decoder (no tiger stage needed)")
+    ap.add_argument("--tag", default="", help="eval: appended to the output's name (<data><tag>.json)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     os.makedirs(a.work, exist_ok=True)

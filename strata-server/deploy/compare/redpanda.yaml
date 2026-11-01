@@ -1,0 +1,43 @@
+# Redpanda, one broker, for compare.sh stream: on the clients' node with
+# the producer and the consumers, outside the engines' budget.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: compare
+spec:
+  clusterIP: None
+  selector: {app: redpanda}
+  ports:
+    - {name: kafka, port: 9092}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redpanda
+  namespace: compare
+  labels: {app: redpanda}
+spec:
+  hostname: redpanda
+  subdomain: redpanda
+  nodeName: __NODE__
+  containers:
+    - name: redpanda
+      image: redpandadata/redpanda:v25.2.9
+      imagePullPolicy: IfNotPresent
+      args: [redpanda, start, --mode, dev-container, --smp, "1", --memory, 768M, --overprovisioned,
+             --kafka-addr, "0.0.0.0:9092", --advertise-kafka-addr, "redpanda.redpanda.compare.svc.cluster.local:9092"]
+      ports:
+        - {name: kafka, containerPort: 9092}
+      resources:
+        requests: {cpu: __CPU__, memory: __MEM__}
+        limits: {cpu: __CPU__, memory: __MEM__}
+      readinessProbe:
+        exec: {command: [rpk, cluster, health, --exit-when-healthy]}
+        periodSeconds: 2
+        timeoutSeconds: 10
+      volumeMounts:
+        - {name: data, mountPath: /var/lib/redpanda/data}
+  volumes:
+    - name: data
+      emptyDir: {}

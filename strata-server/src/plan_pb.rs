@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use strata::query::ir::{Agg, ArithOp, Bound, CmpOp, Column, Cte, Expr, Frame, FrameUnits, Func, Graph, GraphKind, Guard, GuardSite, JoinKey, JoinKind, KeyValue, Node, NormKind, OnConflict, Phase, Plan, ProfileRef, Search, Set, SortKey, When, WindowFn, WindowFunc};
+use strata::query::ir::{Agg, ArithOp, Bound, CmpOp, Column, Cte, Expr, Frame, FrameUnits, Func, Graph, GraphKind, Guard, GuardSite, JoinKey, JoinKind, KeyValue, Node, NormKind, OnConflict, Phase, Plan, ProfileRef, Search, Set, SetOp, SortKey, When, WindowFn, WindowFunc};
 use strata::query::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy};
 use strata::text::query::Need;
 use strata::value::Value;
@@ -139,6 +139,15 @@ fn node(n: &Node) -> pb::Node {
         Node::KeyOrder { input, by } => N::KeyOrder(Box::new(pb::KeyOrder { input: boxed(input), by: boxed(by) })),
         Node::DistinctOn { input, keys, per } => N::DistinctOn(Box::new(pb::DistinctOn { input: boxed(input), keys: keys.iter().map(ex).collect(), per: *per })),
         Node::Window { input, funcs } => N::Window(Box::new(pb::Window { input: boxed(input), funcs: funcs.iter().map(window_fn).collect() })),
+        Node::SetOp { op, all, left, right } => {
+            use pb::set_op::Kind;
+            let kind = match op {
+                SetOp::Union => Kind::Union,
+                SetOp::Intersect => Kind::Intersect,
+                SetOp::Except => Kind::Except,
+            };
+            N::SetOp(Box::new(pb::SetOp { kind: kind as i32, all: *all, left: boxed(left), right: boxed(right) }))
+        }
     };
     pb::Node { node: Some(n) }
 }
@@ -580,6 +589,16 @@ fn from_node_in(n: pb::Node) -> Result<Node, ApiError> {
         N::Window(w) => {
             let w = *w;
             Node::Window { input: from_bnode(w.input)?, funcs: w.funcs.into_iter().map(from_window_fn).collect::<Result<_, _>>()? }
+        }
+        N::SetOp(o) => {
+            use pb::set_op::Kind;
+            let o = *o;
+            let op = match en::<Kind>(o.kind, "set operation")? {
+                Kind::Union => SetOp::Union,
+                Kind::Intersect => SetOp::Intersect,
+                Kind::Except => SetOp::Except,
+            };
+            Node::SetOp { op, all: o.all, left: from_bnode(o.left)?, right: from_bnode(o.right)? }
         }
     })
 }
