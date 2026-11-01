@@ -445,6 +445,10 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows for a `SELECT` (`log` as for `/v1/query`); `{written, seq_no?, seq_nos?}` for `INSERT`, `UPDATE`, `DELETE` |
 | `POST /v1/rank_log/export` | `{table?, since?, until?, events?: {table, user, item, time, action?}, history?, window?, grades?}` | NDJSON: one record per logged row, with its context's history and its label as of its time ([exporting the log](query-language.md#exporting-the-log-for-training)), or `{error, status}` at a failure; a coordinator refuses it (400) |
 | `POST /v1/rank_log/interleaving` | the export's body | `{pairs: [{variants, requests, acted, wins, ties, delta, p}], took_ms}`: which of two [interleaved rankings](query-language.md#interleaving-two-rankings) the users preferred; a coordinator refuses it (400) |
+| `GET /v1/kv/TABLE/KEY?min_seq_no=n` | | `{table, key, found, row, seq_no}`: the row with that primary key, read without SQL ([rows by key](#rows-by-key)); 404 with `found: false` when no live row has it |
+| `POST /v1/kv/get` | `{keys, table?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{table, columns, rows, seq_nos, took_ms}`: per key, in their order, its row as an object (`null` for none) and its sequence number |
+| `PUT /v1/kv/TABLE/KEY?if_seq_no=n` | the row's fields as an object (the key may be left out) | `{written, seq_no?}`: the row, written in place of any with that key |
+| `DELETE /v1/kv/TABLE/KEY?if_seq_no=n&routing=v` | | `{deleted, written, seq_no?}` |
 | `POST /v1/write` | `{ops: [...], idempotency_key?}` | `{written, skipped?, seq_no?, seq_nos?}` ([conditional writes](#conditional-writes); `skipped` for [stream events](#streams) written already; `seq_nos` from a coordinator) |
 | `POST /v1/stream` | operations as NDJSON, one a line, or one event's several as `{ops, source}` ([streams](#streams)) | NDJSON: a line per batch once it commits, `{batch, ops, written, skipped, lines}`, then `{done, batches, lines, written, skipped}`, or `{error, status, lines}` at the first failure |
 | `GET /v1/sources`, `GET /v1/sources/NAME` | | `{sources: [{name, offset, updated}]}`: each stream source's last offset written ([streams](#streams)); for one, `{name, offset, updated}`, `offset` null for a source not written from |
@@ -510,6 +514,23 @@ An `add` with a `"doc"` creates the row when no row has its key: the row is the 
 An answer of 200 means the batch is durable, and an error that nothing of it was written, so a client can retry on an error. When an answer is lost (a timeout, a dropped connection, a coordinator whose other replica failed), send the retry with the same `idempotency_key` (or an `Idempotency-Key` header), 1 to 256 characters: a server that already applied that batch answers with its first `written` instead of applying it again, so an `add` counts once and an `insert` does not fail as a duplicate of itself. The same key with other operations is refused (422), and while the first attempt still runs a retry gets 409. A server remembers keys for an hour, the latest 100,000, in memory, so a restart forgets them. A coordinator passes the key to each shard as `key/shard`. Over gRPC, `WriteRequest.idempotency_key` does the same.
 
 With `--token`, `--cluster-token` or an API key, every route except the UI's (`/`, `/classic`, `/ui/*`), `/v1/health`, `/livez` and `/readyz` needs `Authorization: Bearer <token or key>`; the UI asks for it.
+
+### Rows by key
+
+A table with a primary key is also a key-value store. `GET /v1/kv/TABLE/KEY` reads one row by its key without SQL, `POST /v1/kv/get` reads up to 10,000 at once (an MGET), and `PUT` and `DELETE` on `/v1/kv/TABLE/KEY` write and delete one; gRPC has `Get` for the reads. A row comes back as `SELECT *` gives it (the stored columns but vectors, typed as a query types them), with the sequence number of the write that last changed it on a server started with `--seq-no`, which a `PUT` or `DELETE` can pass back as `if_seq_no` ([conditional writes](#conditional-writes)). An `INT` key in a path is its digits.
+
+```bash
+curl -s -X PUT localhost:7700/v1/kv/sessions/s1 -d '{"usr": "u7", "until": "2026-11-02T12:00:00Z"}'
+# {"written": 1, "seq_no": 41, "took_ms": 0.9}
+curl -s localhost:7700/v1/kv/sessions/s1
+# {"table": "sessions", "key": "s1", "found": true, "row": {"id": "s1", "usr": "u7", "until": "2026-11-02T12:00:00Z"}, "seq_no": 41, "took_ms": 0.1}
+curl -s localhost:7700/v1/kv/get -d '{"table": "sessions", "keys": ["s1", "s2"]}'
+# {"table": "sessions", "columns": ["id", "usr", "until"], "rows": [{"id": "s1", ...}, null], "seq_nos": [41, null], "took_ms": 0.1}
+```
+
+A read by key probes each segment's key index, newest first, and reads the rows the memtable holds as they were written: it parses no SQL and builds nothing, so a read after each write costs what any read does. Segments of more than 4,096 keys keep a Bloom filter of their keys in memory (built from the key index on the first lookup; nothing on disk changes), so a segment that lacks the key mostly answers from one cache line. A write commits without indexing the memtable's newest chunk, which a query that needs its indexes builds first, once per change. A row whose [`expire_by`](query-language.md#tables) time has passed is none.
+
+Through a coordinator, each key is asked of the shard its slot is on, all of a shard's keys in one call (every shard for a table placed by `shard_by`). A query whose condition pins the key, or the `shard_by` column, to values (`WHERE id = 'u7'`, `id IN (...)`, `usr = 'u3' AND ts > ...`) asks only the shards those values are on, as writes are routed, and says so in its plan (`routed by key: 1 of 4 shards`); a query ranked by BM25 still asks every shard, for the collection's statistics.
 
 ### Conditional writes
 

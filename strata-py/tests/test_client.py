@@ -257,3 +257,17 @@ def test_client_rank_log(client):
     assert [x["features"] for x in records] == [dict(zip(served.columns[2:], row[2:])) for row in served.rows]
     with pytest.raises(strata.StrataError, match="not a log table"):
         client.export_rank_log(table="books")
+
+
+def test_client_rows_by_key(client):
+    got = client.get("b0007")
+    assert got["id"] == "b0007" and got["year"] == book(7)["year"]
+    assert client.get("nope") is None
+    assert [r and r["id"] for r in client.get_many(["b0001", "missing", "b0002"])] == ["b0001", None, "b0002"]
+    assert client.put("b0001", {"title": "Put", "year": 2001}) == 1
+    got = client.get("b0001")
+    assert got["title"] == "Put" and got["year"] == 2001 and got["description"] is None
+    assert client.put("new", {"title": "New"}) == 1
+    assert client.get("new")["title"] == "New"
+    client.delete("new")
+    assert client.get("new") is None

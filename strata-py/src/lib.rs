@@ -441,6 +441,46 @@ impl Database {
         .map_err(err)
     }
 
+    /// The rows with these keys of the first table or `table`, read by
+    /// key without SQL ([`Db::get_many`]): per key, in their order, a dict
+    /// of the columns `SELECT *` answers, or None for a key no live row
+    /// has (or whose row has expired).
+    #[pyo3(signature = (keys, table = None))]
+    fn get_many<'py>(&self, py: Python<'py>, keys: &Bound<'py, PyAny>, table: Option<&str>) -> PyResult<Bound<'py, PyList>> {
+        let db = self.get()?;
+        let keys = rows_json(keys)?;
+        let (columns, rows) = py
+            .detach(|| -> strata::Result<_> {
+                let s = table_of(&db, table)?;
+                let pk = s.primary_key.ok_or_else(|| strata::Error::Query(format!("{} has no primary key: rows are read by key only from a table with one", s.table)))?;
+                let keys = keys.iter().map(|k| ingest::value(&s, pk, k)).collect::<strata::Result<Vec<_>>>()?;
+                Ok((Db::get_columns(&s), db.get_many(&s.table, &keys)?))
+            })
+            .map_err(err)?;
+        let out = rows
+            .iter()
+            .map(|r| match r {
+                None => Ok(py.None().into_bound(py)),
+                Some(row) => {
+                    let d = PyDict::new(py);
+                    for (c, v) in columns.iter().zip(row) {
+                        d.set_item(c, to_py(py, v)?)?;
+                    }
+                    Ok(d.into_any())
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        PyList::new(py, out)
+    }
+
+    /// Deletes the rows whose `expire_by` time has passed, in every table
+    /// that has one ([`Db::expire`]); returns how many. Queries and reads
+    /// by key leave such rows out before this deletes them.
+    fn expire(&self, py: Python<'_>) -> PyResult<u64> {
+        let db = self.get()?;
+        py.detach(|| db.expire(strata::timestamp::now(), 10_000)).map_err(err)
+    }
+
     /// Applies write operations as strata-server's /v1/write takes them, in
     /// one transaction: insert, upsert and delete, and set and add of a
     /// numeric field in place (an add with a "doc" inserts it when no row

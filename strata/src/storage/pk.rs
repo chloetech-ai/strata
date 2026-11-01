@@ -15,6 +15,14 @@
 //! stored key) where a binary search over the entries touches about
 //! `log2(n) - 9`. Hash collisions are resolved by comparing the stored key.
 //! (hash, docID) pairs are interleaved so that a probe reads one cache line.
+//!
+//! A segment of more than [`BLOOM_MIN_KEYS`] keys also gets a Bloom filter
+//! of its key hashes, in memory only: built from the section's hashes on
+//! its first lookup (nothing on disk changes), it answers most lookups of
+//! a key the segment lacks from one cache line of memory, without reading
+//! the directory or the entries, which may be pages not in memory. A read
+//! by key probes every segment newest first until one holds the key, so
+//! most probes are misses.
 
 use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 
@@ -222,6 +230,68 @@ impl KeyList {
     }
 }
 
+/// Segments with more keys than this get a Bloom filter ([`Bloom`]);
+/// smaller ones, such as the memtable's, are probed in their directory.
+pub const BLOOM_MIN_KEYS: usize = 4096;
+
+/// Bits of filter per key: with eight bits set per key, about one probe in
+/// a hundred of a missing key passes.
+const BLOOM_BITS_PER_KEY: usize = 12;
+
+/// The salts of a split-block Bloom filter (Parquet's): each sets one bit
+/// in its 32-bit word of a key's block.
+const SALT: [u32; 8] = [0x47b6_137b, 0x4497_4d91, 0x8824_ad5b, 0xa2b7_289d, 0x7054_95c7, 0x2df1_424b, 0x9efc_4947, 0x5c6b_fb31];
+
+/// A split-block Bloom filter of key hashes: 256-bit blocks, a key's block
+/// chosen by its hash and eight of the block's bits, one in each word,
+/// set for it; a probe reads one block.
+pub struct Bloom {
+    blocks: Box<[[u32; 8]]>,
+}
+
+impl Bloom {
+    /// The filter of these hashes, sized for `n` of them.
+    pub fn of(hashes: impl Iterator<Item = u64>, n: usize) -> Bloom {
+        let nb = (n * BLOOM_BITS_PER_KEY / 256 + 1).next_power_of_two();
+        let mut blocks = vec![[0u32; 8]; nb].into_boxed_slice();
+        for h in hashes {
+            let (b, m) = Bloom::at(h, nb);
+            for (w, m) in blocks[b].iter_mut().zip(m) {
+                *w |= m;
+            }
+        }
+        Bloom { blocks }
+    }
+
+    #[inline]
+    fn at(h: u64, nb: usize) -> (usize, [u32; 8]) {
+        // The low bits pick the block (the directory buckets by the top
+        // ones); the high half, salted, the bits.
+        let b = h as usize & (nb - 1);
+        let x = (h >> 32) as u32;
+        (b, SALT.map(|s| 1u32 << (x.wrapping_mul(s) >> 27)))
+    }
+
+    /// False when no hash given had `h`; true for those, and rarely for
+    /// others.
+    #[inline]
+    pub fn may_contain(&self, h: u64) -> bool {
+        let (b, m) = Bloom::at(h, self.blocks.len());
+        self.blocks[b].iter().zip(m).all(|(w, m)| w & m == m)
+    }
+
+    /// Bytes of memory it holds.
+    pub fn bytes(&self) -> usize {
+        self.blocks.len() * 32
+    }
+}
+
+impl std::fmt::Debug for Bloom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bloom({} blocks)", self.blocks.len())
+    }
+}
+
 /// Zero-copy reader of a `pk` section.
 #[derive(Clone, Debug)]
 pub struct PkIndex {
@@ -237,6 +307,10 @@ pub struct PkIndex {
     /// `hash` is [`key_hash`], whose integer hash is a bijection, so an
     /// integer key with an equal hash needs no comparison.
     bijective_ints: bool,
+    /// The filter of the keys' hashes, built on the first lookup of an
+    /// index of more than [`BLOOM_MIN_KEYS`] keys, shared by the copies
+    /// of the index that snapshots hold.
+    bloom: std::sync::Arc<std::sync::OnceLock<Bloom>>,
 }
 
 impl PkIndex {
@@ -277,7 +351,7 @@ impl PkIndex {
                 return Err(corrupt("pk key array size"));
             }
         }
-        Ok(PkIndex { str_keys: kind == KIND_STR, n, bits, dir, entries, offsets, bytes, ints, hash, bijective_ints: false })
+        Ok(PkIndex { str_keys: kind == KIND_STR, n, bits, dir, entries, offsets, bytes, ints, hash, bijective_ints: false, bloom: Default::default() })
     }
 
     /// Number of documents (keys) in the segment.
@@ -313,6 +387,7 @@ impl PkIndex {
     pub fn lookup_hashed<'a>(&'a self, k: Option<KeyRef<'a>>, h: u64) -> impl Iterator<Item = DocId> + 'a {
         let k = k.filter(|k| matches!(k, KeyRef::Str(_)) == self.str_keys);
         let range = match k {
+            Some(_) if self.bloom().is_some_and(|b| !b.may_contain(h)) => 0..0,
             Some(_) => {
                 let b = bucket(h, self.bits);
                 self.dir[b] as usize..self.dir[b + 1] as usize
@@ -327,6 +402,12 @@ impl PkIndex {
             .take_while(move |&(eh, _)| eh == h)
             .filter(move |&(_, d)| !verify || Some(self.key_ref(d)) == k)
             .map(|(_, d)| d)
+    }
+
+    /// The Bloom filter of the keys, built now if this is its first use;
+    /// `None` for an index of at most [`BLOOM_MIN_KEYS`] keys.
+    pub fn bloom(&self) -> Option<&Bloom> {
+        (self.n > BLOOM_MIN_KEYS).then(|| self.bloom.get_or_init(|| Bloom::of((0..self.n).map(|i| self.entries[2 * i]), self.n)))
     }
 
     /// The key of document `doc`.
@@ -384,6 +465,29 @@ mod tests {
             }
             assert_eq!(pk.lookup(&Value::Str("1".into())), None);
         }
+    }
+
+    #[test]
+    fn bloom_filters_answer_most_misses() {
+        let n = 3 * BLOOM_MIN_KEYS;
+        let keys: Vec<Value> = (0..n).map(|i| Value::Str(format!("user:{i}"))).collect();
+        let pk = index(FieldType::Keyword, &keys, key_hash);
+        let bloom = pk.bloom().expect("a filter for a large segment");
+        assert!(bloom.bytes() * 8 >= n * BLOOM_BITS_PER_KEY);
+        for (d, k) in keys.iter().enumerate() {
+            assert!(bloom.may_contain(key_hash(KeyRef::of(k).unwrap())));
+            assert_eq!(pk.lookup(k), Some(d as u32));
+        }
+        let passed = (0..20_000).filter(|i| bloom.may_contain(key_hash(KeyRef::Str(format!("other:{i}").as_bytes())))).count();
+        assert!(passed < 400, "{passed} of 20000 missing keys pass the filter");
+        assert_eq!(pk.lookup(&Value::Str("other:1".into())), None);
+        let ints: Vec<Value> = (0..n as i64).map(|i| Value::Int(i * 7)).collect();
+        let pk = index(FieldType::Int, &ints, key_hash);
+        assert!((0..n as i64).all(|i| pk.lookup(&Value::Int(i * 7)) == Some(i as u32)));
+        let passed = (0..20_000i64).filter(|i| pk.bloom().unwrap().may_contain(key_hash(KeyRef::Int(i * 7 + 3)))).count();
+        assert!(passed < 400, "{passed} of 20000 missing integer keys pass the filter");
+        // Small segments are probed without one.
+        assert!(index(FieldType::Keyword, &keys[..100], key_hash).bloom().is_none());
     }
 
     #[test]

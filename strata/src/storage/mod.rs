@@ -41,7 +41,7 @@ pub use manifest::{sources_schema, Numbering, RankProfile, SeqNo, SOURCES, SOURC
 pub use merge::{memory_limit, merge_memory, MergePolicy, MergeStats, MergeStatus, MergerOptions, SegmentInfo};
 pub use ship::{Applied, LogRead, Shipped};
 pub use pk::{build_pk_index, build_pk_index_of, key_hash, KeyList, KeyRef, PkIndex};
-pub use snapshot::{Mask, SegmentView, Snapshot};
+pub use snapshot::{Found, Mask, SegmentView, Snapshot};
 pub(crate) use snapshot::page_aligned;
 pub use updates::Updates;
 

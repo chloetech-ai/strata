@@ -89,7 +89,7 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb, CLUSTER_PROTOCOL, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
+use crate::grpc::{params_to_pb, result_from_pb, CLUSTER_PROTOCOL, GET_PROTOCOL, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
@@ -624,6 +624,32 @@ async fn timed<T>(sent: &Sent, i: usize, r: usize, call: impl Future<Output = Re
 }
 
 /// A step of the coordinator's own that began at `t0` and ends now.
+/// The most values a query may pin its placement field to and still be
+/// routed by them ([`Coordinator::pinned_shards`]).
+const MAX_ROUTED: usize = 4096;
+
+/// The values of field `f` that every row `p` matches has one of, when
+/// `p` says: `f = v`, `f IN (...)`, a conjunction with such a condition
+/// (the fewest values of its parts), or a disjunction of them. `None`
+/// when the rows may hold any value of `f`.
+fn pinned_values(p: &strata::query::logical::Pred, f: usize) -> Option<Vec<strata::value::Value>> {
+    use strata::query::logical::Pred;
+    match p {
+        Pred::In { field, values } if *field == f => Some(values.clone()),
+        Pred::IntRange { field, lo, hi } if *field == f && lo == hi => Some(vec![strata::value::Value::Int(*lo)]),
+        Pred::False => Some(Vec::new()),
+        Pred::And(ps) => ps.iter().filter_map(|p| pinned_values(p, f)).min_by_key(Vec::len),
+        Pred::Or(ps) => {
+            let mut all = Vec::new();
+            for p in ps {
+                all.extend(pinned_values(p, f)?);
+            }
+            Some(all)
+        }
+        _ => None,
+    }
+}
+
 fn leaf_step(op: &str, detail: String, t0: Instant, rows: Option<u64>) -> Step {
     Step { op: op.into(), detail, start_us: steps::us_at(t0), us: steps::tenth(t0.elapsed().as_nanos() as f64 / 1e3), rows, ..Step::default() }
 }
@@ -1191,6 +1217,61 @@ impl Coordinator {
         Ok(sums.into_iter().map(|m| m.into_values().collect()).collect())
     }
 
+    /// Rows of table `schema` by primary key ([`GET_PROTOCOL`]): each
+    /// key asked of the shard its slot is on, all of a shard's keys in one
+    /// call, or of every shard for a table placed by shard_by, whose key
+    /// does not say where its row is. Per key, in their order, the row and
+    /// its number, or none.
+    pub async fn get(&self, schema: &Schema, keys: &[strata::value::Value], after: &After, deadline: Instant) -> Result<Vec<Option<(Vec<strata::value::Value>, u64)>>, ApiError> {
+        self.routed(|| self.get_once(schema, keys, after, deadline)).await
+    }
+
+    async fn get_once(&self, schema: &Schema, keys: &[strata::value::Value], after: &After, deadline: Instant) -> Result<Vec<Option<(Vec<strata::value::Value>, u64)>>, ApiError> {
+        let t = &self.topo();
+        let start = self.turn.fetch_add(1, Ordering::Relaxed);
+        let after = &self.after(t, after)?;
+        let n = t.replicas.len();
+        // Each shard's keys, by their positions.
+        let mut asked: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (j, k) in keys.iter().enumerate() {
+            match schema.shard_by {
+                Some(_) => asked.iter_mut().for_each(|a| a.push(j)),
+                None => asked[self.shard_of(t, k)].push(j),
+            }
+        }
+        let calls = asked.iter().enumerate().filter(|(_, a)| !a.is_empty()).map(|(i, a)| async move {
+            let pb_keys: Vec<pb::Value> = a.iter().map(|&j| crate::grpc::to_pb(&keys[j])).collect();
+            let got = self
+                .call(t, i, start, None, deadline, |r, mut c| {
+                    let pb_keys = pb_keys.clone();
+                    async move {
+                        let p = self.speak(t, i, r, &mut c, PROTOCOL).await?;
+                        if p < GET_PROTOCOL {
+                            return Err(tonic::Status::unimplemented(format!("it speaks protocol {p}, and reads by key need {GET_PROTOCOL}: upgrade it")));
+                        }
+                        let min_seq_no = after.get(i).copied().unwrap_or(0);
+                        self.reads_after(t, i, r, min_seq_no)?;
+                        c.get(pb::GetRequest { table: schema.table.clone(), keys: pb_keys, timeout_ms: ms_left(deadline), protocol: p, epoch: t.epoch(), min_seq_no, ..Default::default() }).await
+                    }
+                })
+                .await?;
+            Ok::<_, ApiError>((a, crate::grpc::rows_from_pb(got.1)))
+        });
+        let mut out = vec![None; keys.len()];
+        for r in join_all(calls).await {
+            let (a, rows) = r?;
+            if rows.len() != a.len() {
+                return Err(ApiError::internal(format!("a shard answered {} rows for {} keys", rows.len(), a.len())));
+            }
+            for (&j, row) in a.iter().zip(rows) {
+                if row.is_some() {
+                    out[j] = row;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The paths listing `call` asks for ([`strata::query::paths`]) over
     /// every shard, summed ([`Paths::merge`]). It travels as the SQL that
     /// asks for it, which each shard answers from its own rows: no plan
@@ -1327,6 +1408,12 @@ impl Coordinator {
         let partial = req.partial.unwrap_or(self.opts.partial);
         let protocol = t.protocol();
         let n = t.replicas.len();
+        let ranked_text = strata::cluster::scores_bm25(select);
+        // A query that pins its table's key (or shard_by field) to values
+        // asks only the shards those are on, as a write by key does: a
+        // read by key asks one. BM25 scores need every shard's statistics.
+        let asked = if ranked_text || n == 1 { None } else { self.pinned_shards(t, schema, select) };
+        let ask = |i: usize| asked.as_ref().is_none_or(|a| a.contains(&i));
         // A cross-encoder scores here, over the text of its phase's rows,
         // which the fetch round reads.
         let model = select.model_phase().is_some();
@@ -1334,7 +1421,7 @@ impl Coordinator {
             return Err(ApiError::bad("a cross-encoder over shards needs shards that fetch rows (protocol 3)"));
         }
         // Query then fetch: the query round answers the keys alone.
-        let ids = match model || (protocol >= 3 && self.opts.fetch && n > 1 && strata::cluster::fetches(select, schema) && self.fetch_pays(t, select)) {
+        let ids = match model || (protocol >= 3 && self.opts.fetch && asked.as_ref().map_or(n, |a| a.len()) > 1 && strata::cluster::fetches(select, schema) && self.fetch_pays(t, select)) {
             true => Some(strata::cluster::ids(select, schema)?),
             false => None,
         };
@@ -1346,7 +1433,6 @@ impl Coordinator {
         };
         let read = &Read::new(&req.sql, params, given, protocol, t.epoch(), || Ok(Plan::of_select(schema, select)))?.after(self.after(t, &req.after)?).profiled(req.profile);
         let start = self.turn.fetch_add(1, Ordering::Relaxed);
-        let ranked_text = strata::cluster::scores_bm25(select);
         // Per shard: the replica holding a lease for this query, and the lease.
         let mut leased: Vec<Option<(usize, u64)>> = vec![None; n];
         let mut failed = self.skipped(t, partial);
@@ -1378,7 +1464,7 @@ impl Coordinator {
         let leased = &leased;
         let hold = ids.is_some();
         let sent = &Sent::default();
-        let calls = (0..n).filter(|&i| failed[i].is_none()).map(|i| {
+        let calls = (0..n).filter(|&i| failed[i].is_none() && ask(i)).map(|i| {
             let stats_json = stats_json.clone();
             let first = leased[i].map(|(r, _)| r);
             async move {
@@ -1462,7 +1548,28 @@ impl Coordinator {
         // calls, inside it) last.
         rs.stats.steps.extend(merge_step);
         rs.stats.steps.splice(0..0, own);
+        if let Some(a) = &asked {
+            rs.stats.plan.insert(0, format!("routed by key: {} of {n} shards", a.len()));
+        }
         Ok(Merged { rs, missing })
+    }
+
+    /// The shards that can hold the rows `select` matches, when its filter
+    /// pins the field that places its table's rows (the key, or shard_by)
+    /// to values: each value's shard, as writes are routed by it (one
+    /// shard at least, to answer an empty query). `None` when the filter
+    /// does not pin it, or pins more values than [`MAX_ROUTED`].
+    fn pinned_shards(&self, t: &Topology, schema: &Schema, select: &Select) -> Option<std::collections::BTreeSet<usize>> {
+        let place = schema.shard_by_field().or(schema.primary_key)?;
+        let values = pinned_values(&select.filter, place)?;
+        if values.len() > MAX_ROUTED {
+            return None;
+        }
+        let mut shards: std::collections::BTreeSet<usize> = values.iter().map(|v| self.shard_of(t, v)).collect();
+        if shards.is_empty() {
+            shards.insert(0);
+        }
+        (shards.len() < t.replicas.len()).then_some(shards)
     }
 
     /// Shard `i`'s answer `a` from replica `r`, its steps moved onto this

@@ -124,6 +124,11 @@ pub const JSON_TEXT: &str = "json_text";
 /// segments.
 pub const RABITQ: &str = "rabitq";
 
+/// The feature of a database with a table whose rows expire at a time
+/// they hold ([`Schema::with_expire_by`]): versions of Strata from before
+/// it would show expired rows, so they refuse the database by name.
+pub const EXPIRE_BY: &str = "expire_by";
+
 /// What an INT column's integers stand for (format 3; a database is
 /// written in format 3 only while a table has such a field). Queries and
 /// writes see [`Value::Bool`](crate::value::Value::Bool) and
@@ -642,6 +647,10 @@ pub struct Schema {
     /// How long rows are kept ([`Schema::with_retain`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain: Option<Retain>,
+    /// The TIMESTAMP field that holds when each row expires
+    /// ([`Schema::with_expire_by`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_by: Option<String>,
     /// The fields that make each row an edge of a graph
     /// ([`Schema::with_edges`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -725,7 +734,7 @@ pub enum Alter {
     /// Drops the column of this name (any case): its id leaves the table
     /// for good, and segments keep its data until a merge rewrites them.
     /// Not the key, nor a column that another one or the table's options
-    /// name (`shard_by`, `cluster_by`, `retain_by`, `edges`).
+    /// name (`shard_by`, `cluster_by`, `retain_by`, `expire_by`, `edges`).
     DropField(String),
     /// Renames a column, which keeps its id and everything written of it;
     /// the table's options and fields that name it name it anew.
@@ -755,7 +764,7 @@ impl Schema {
         }
         let find = |name: &str| self.field_index(name).ok_or_else(|| Error::Schema(format!("table {} has no column {name}", self.table)));
         let mut fields = self.fields.clone();
-        let mut options = (self.shard_by.clone(), self.cluster_by.clone(), self.retain.clone(), self.edges.clone());
+        let mut options = (self.shard_by.clone(), self.cluster_by.clone(), self.retain.clone(), self.edges.clone(), self.expire_by.clone());
         match alter {
             Alter::AddField(f) => {
                 let mut f = f.clone();
@@ -818,8 +827,8 @@ impl Schema {
                     }
                 }
                 fields[i].name = to.clone();
-                let (shard_by, cluster_by, retain, edges) = &mut options;
-                shard_by.iter_mut().chain(cluster_by.iter_mut()).for_each(rename);
+                let (shard_by, cluster_by, retain, edges, expire_by) = &mut options;
+                shard_by.iter_mut().chain(cluster_by.iter_mut()).chain(expire_by.iter_mut()).for_each(rename);
                 if let Some(r) = retain {
                     rename(&mut r.by);
                 }
@@ -832,9 +841,12 @@ impl Schema {
         }
         let key = self.primary_key.map(|k| self.fields[k].id).and_then(|id| fields.iter().find(|f| f.id == id)).map(|f| f.name.clone());
         let mut s = Schema::with_next_id(&self.table, fields, key.as_deref(), self.next_field_id)?;
-        let (shard_by, cluster_by, retain, edges) = options;
+        let (shard_by, cluster_by, retain, edges, expire_by) = options;
         if let Some(f) = shard_by {
             s = s.with_shard_by(&f)?;
+        }
+        if let Some(f) = expire_by {
+            s = s.with_expire_by(&f)?;
         }
         if let Some(f) = cluster_by {
             s = s.with_cluster_by(&f)?;
@@ -904,7 +916,7 @@ impl Schema {
                 return Some(format!("column {}", f.name));
             }
         }
-        let options = [("shard_by", self.shard_by.as_deref()), ("cluster_by", self.cluster_by.as_deref()), ("retain_by", self.retain.as_ref().map(|r| r.by.as_str()))];
+        let options = [("shard_by", self.shard_by.as_deref()), ("cluster_by", self.cluster_by.as_deref()), ("retain_by", self.retain.as_ref().map(|r| r.by.as_str())), ("expire_by", self.expire_by.as_deref())];
         if let Some((o, _)) = options.iter().find(|(_, n)| n.is_some_and(same)) {
             return Some(format!("its option {o}"));
         }
@@ -922,7 +934,7 @@ impl Schema {
     /// `next_field_id`: a field without one gets the next, never an id a
     /// field it had before held.
     fn with_next_id(table: &str, fields: Vec<Field>, primary_key: Option<&str>, next_field_id: u32) -> Result<Self> {
-        let mut s = Schema { table: table.to_string(), fields, next_field_id, primary_key: None, shard_by: None, cluster_by: None, retain: None, edges: None };
+        let mut s = Schema { table: table.to_string(), fields, next_field_id, primary_key: None, shard_by: None, cluster_by: None, retain: None, expire_by: None, edges: None };
         s.give_ids()?;
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
@@ -1169,6 +1181,41 @@ impl Schema {
         Ok(self)
     }
 
+    /// Expires each row at the time its TIMESTAMP field `by` holds: from
+    /// then on queries, counts and reads by key leave it out, and a write
+    /// by its key finds no row there (an `INSERT` of the key succeeds).
+    /// Expired rows are deleted soon after by [`crate::db::Db::expire`],
+    /// whose deletes are logged as any delete is, so that replicas, which
+    /// apply them, hold the same rows. Rows without a time never expire.
+    /// `by` is an indexed, single-valued TIMESTAMP field other than the
+    /// key, and the table has a primary key. It makes the database format
+    /// 3 (feature [`EXPIRE_BY`]).
+    pub fn with_expire_by(mut self, by: &str) -> Result<Schema> {
+        let i = self.field_index(by).ok_or_else(|| Error::Schema(format!("expire_by names {by}, which is not a field of {}", self.table)))?;
+        let f = &self.fields[i];
+        if f.logical != Some(Logical::Timestamp) || !f.indexed || f.multi {
+            return Err(Error::Schema(format!("expire_by {}: rows expire at the time in an indexed, single-valued TIMESTAMP field", f.name)));
+        }
+        if self.primary_key.is_none() {
+            return Err(Error::Schema(format!("expire_by: table {} needs a primary key, by which expired rows are deleted", self.table)));
+        }
+        self.expire_by = Some(f.name.clone());
+        Ok(self)
+    }
+
+    /// The position of the field holding when rows expire
+    /// ([`Schema::with_expire_by`]).
+    pub fn expire_field(&self) -> Option<usize> {
+        self.expire_by.as_deref().and_then(|f| self.field_index(f))
+    }
+
+    /// Whether `doc`, a row of this table, has expired at `now`
+    /// (microseconds since the epoch, [`crate::timestamp::now`]).
+    pub fn is_expired(&self, doc: &[crate::value::Value], now: i64) -> bool {
+        use crate::value::Value;
+        self.expire_field().and_then(|f| doc.get(f)).is_some_and(|v| matches!(v, Value::Timestamp(t) | Value::Int(t) if *t <= now))
+    }
+
     /// The position of the retention's TIMESTAMP field, and the time
     /// (microseconds since the epoch) before which rows expire at `now`
     /// ([`Schema::with_retain`]).
@@ -1354,7 +1401,13 @@ impl Schema {
             ];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
-        let options = [self.shard_by.as_ref().map(|_| "shard_by"), self.cluster_by.as_ref().map(|_| "cluster_by"), self.retain.as_ref().map(|_| "retain"), self.edges.as_ref().map(|_| "edge_table")];
+        let options = [
+            self.shard_by.as_ref().map(|_| "shard_by"),
+            self.cluster_by.as_ref().map(|_| "cluster_by"),
+            self.retain.as_ref().map(|_| "retain"),
+            self.edges.as_ref().map(|_| "edge_table"),
+            self.expire_by.as_ref().map(|_| EXPIRE_BY),
+        ];
         fields.chain(options.into_iter().flatten().map(String::from))
     }
 
@@ -1586,8 +1639,9 @@ impl Schema {
     /// each segment's rows by it ([`Schema::with_cluster_by`]), and
     /// `"retain": "400 days"` keeps rows for that long after the time in
     /// `"retain_by"` (default: the table's only TIMESTAMP field;
-    /// [`Schema::with_retain`]). `"edges": "src, dst, w"` makes each row an
-    /// edge ([`Schema::with_edges`]).
+    /// [`Schema::with_retain`]). `"expire_by": "until"` expires each row at
+    /// the time in that field ([`Schema::with_expire_by`]). `"edges": "src,
+    /// dst, w"` makes each row an edge ([`Schema::with_edges`]).
     /// A text field may be made from a media field's file by a model,
     /// `"derive": {"from": "image", "model": "blip-image-captioning-base"}`,
     /// which makes the database format 3 ([`Field::derive`]).
@@ -1660,6 +1714,9 @@ impl Schema {
                 schema = schema.with_retain(&r.by, r.seconds)?;
             }
             Some(other) => return Err(bad(format!("retain is a period, as \"400 days\", not {other}"))),
+        }
+        if let Some(f) = name("expire_by")? {
+            schema = schema.with_expire_by(f)?;
         }
         match obj.get("edges") {
             None | Some(J::Null) => {}
@@ -1798,6 +1855,9 @@ impl Schema {
         if let Some(r) = &self.retain {
             out.insert("retain".into(), json!(r.period()));
             out.insert("retain_by".into(), json!(r.by));
+        }
+        if let Some(f) = &self.expire_by {
+            out.insert("expire_by".into(), json!(f));
         }
         if let Some(e) = &self.edges {
             out.insert("edges".into(), json!(e.text()));

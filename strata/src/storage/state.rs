@@ -3,7 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::postings::bytes::OwnedBytes;
 
@@ -180,6 +181,76 @@ impl SegHandle {
     }
 }
 
+fn lock_tail(m: &Mutex<Option<MemSeg>>) -> std::sync::MutexGuard<'_, Option<MemSeg>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Blocks of a [`Chunk`]: block `b` holds `64 << b` documents, so 40 of
+/// them hold more documents than a chunk may have.
+const CHUNK_BLOCKS: usize = 40;
+
+/// The documents of one memtable chunk, appended by the writer and read
+/// by snapshots: each document is written once, in order, into blocks that
+/// never move, so a snapshot shares the chunk as it grows and an append
+/// never copies what a snapshot holds. A snapshot reads the documents
+/// below the length it captured.
+pub(crate) struct Chunk {
+    blocks: [OnceLock<Box<[OnceLock<Document>]>>; CHUNK_BLOCKS],
+    len: AtomicUsize,
+}
+
+impl Chunk {
+    pub fn new() -> Chunk {
+        Chunk { blocks: std::array::from_fn(|_| OnceLock::new()), len: AtomicUsize::new(0) }
+    }
+
+    /// The block and offset of document `i`.
+    fn at(i: usize) -> (usize, usize) {
+        let x = i / 64 + 1;
+        let b = (usize::BITS - 1 - x.leading_zeros()) as usize;
+        (b, i - 64 * ((1 << b) - 1))
+    }
+
+    /// Documents appended so far.
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// Document `i`, which must have been appended.
+    pub fn get(&self, i: usize) -> &Document {
+        let (b, o) = Chunk::at(i);
+        self.blocks[b].get().and_then(|blk| blk[o].get()).expect("a memtable document that was appended")
+    }
+
+    /// Appends `doc` (the writer, under the state lock).
+    pub fn push(&self, doc: Document) {
+        let i = self.len.load(Ordering::Relaxed);
+        let (b, o) = Chunk::at(i);
+        let blk = self.blocks[b].get_or_init(|| (0..64usize << b).map(|_| OnceLock::new()).collect());
+        if blk[o].set(doc).is_err() {
+            unreachable!("memtable document {i} appended twice");
+        }
+        self.len.store(i + 1, Ordering::Release);
+    }
+
+    /// The documents appended so far, in order.
+    pub fn iter(&self) -> impl Iterator<Item = &Document> + '_ {
+        (0..self.len()).map(|i| self.get(i))
+    }
+
+    /// The first `n` documents, copied.
+    pub fn to_vec(&self, n: usize) -> Vec<Document> {
+        (0..n).map(|i| self.get(i).clone()).collect()
+    }
+}
+
+impl std::ops::Index<usize> for Chunk {
+    type Output = Document;
+    fn index(&self, i: usize) -> &Document {
+        self.get(i)
+    }
+}
+
 /// Committed documents not yet flushed to a segment, append-only between
 /// flushes. Documents are kept in chunks of `chunk` documents; each chunk
 /// is one in-memory segment of a snapshot, so a write invalidates only the
@@ -190,8 +261,8 @@ pub(crate) struct Memtable {
     /// Documents per chunk, a multiple of 64 so that a chunk's slice of
     /// `deleted` starts on a word.
     pub chunk: usize,
-    /// Shared with snapshot builders, which index a prefix of a chunk.
-    pub chunks: Vec<Arc<Vec<Document>>>,
+    /// Shared with snapshots, which read or index a prefix of a chunk.
+    pub chunks: Vec<Arc<Chunk>>,
     pub len: usize,
     /// Deleted documents by memtable position.
     pub deleted: Vec<u64>,
@@ -238,11 +309,11 @@ impl Memtable {
             self.seqs.push(seq);
         }
         if i.is_multiple_of(self.chunk) {
-            self.chunks.push(Arc::new(Vec::new()));
+            self.chunks.push(Arc::new(Chunk::new()));
             self.chunk_deleted.push(0);
         }
-        // Copies the chunk only if a snapshot is being built from it.
-        Arc::make_mut(self.chunks.last_mut().unwrap()).push(doc);
+        // Appends in place, whatever snapshots share the chunk.
+        self.chunks.last().unwrap().push(doc);
         self.len += 1;
         self.deleted.resize(words_for(self.len as u32), 0);
         i as u32
@@ -295,6 +366,10 @@ pub(crate) struct TableState {
     pub mem_live: Vec<Option<(usize, usize, Arc<LiveDocs>)>>,
     /// The latest segment built for each memtable chunk (emptied by a flush).
     pub memsegs: Vec<Option<MemSeg>>,
+    /// The latest segment a snapshot built of the memtable's last chunk,
+    /// which snapshots build only when a query needs its indexes
+    /// ([`crate::storage::snapshot`]); shared with them.
+    pub tail: Arc<Mutex<Option<MemSeg>>>,
     /// Its rank profiles, sorted by name: those of the manifest and those
     /// logged since, which the next version writes
     /// ([`crate::storage::manifest::TableMeta::profiles`]).
@@ -306,11 +381,12 @@ pub(crate) struct TableState {
 
 impl TableState {
     pub fn new(id: u32, schema: Arc<Schema>, handles: Vec<Arc<SegHandle>>, chunk: usize, gen: u64) -> TableState {
-        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new(), profiles: Arc::default(), ties: None }
+        TableState { id, schema, handles, mem: Memtable::new(chunk, gen), mem_live: Vec::new(), memsegs: Vec::new(), tail: Arc::default(), profiles: Arc::default(), ties: None }
     }
 
     /// Empties the memtable (after a flush).
     pub fn clear_mem(&mut self) {
+        *lock_tail(&self.tail) = None;
         self.mem.clear();
         self.mem_live.clear();
         self.memsegs.clear();
@@ -345,6 +421,14 @@ impl TableState {
                 })
                 .collect();
             self.mem_live = self.mem_live.drain(..).skip(k).collect();
+            let mut tail = lock_tail(&self.tail);
+            match tail.as_mut() {
+                Some(s) if s.gen == old.gen && s.chunk >= k => {
+                    s.gen = gen;
+                    s.chunk -= k;
+                }
+                _ => *tail = None,
+            }
         } else {
             for p in n..old.len {
                 let i = mem.push(old.chunks[p / old.chunk][p % old.chunk].clone(), 0);

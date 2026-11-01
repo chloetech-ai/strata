@@ -699,6 +699,9 @@ impl pb::strata_server::Strata for Stuck {
     async fn vote(&self, _: tonic::Request<pb::VoteRequest>) -> Result<tonic::Response<pb::VoteResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
+    async fn get(&self, _: tonic::Request<pb::GetRequest>) -> Result<tonic::Response<pb::GetResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
 }
 
 /// A shard server that refuses every query because too many are running.
@@ -775,6 +778,9 @@ impl pb::strata_server::Strata for Overloaded {
         Err(tonic::Status::unimplemented("a test shard"))
     }
     async fn vote(&self, _: tonic::Request<pb::VoteRequest>) -> Result<tonic::Response<pb::VoteResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("a test shard"))
+    }
+    async fn get(&self, _: tonic::Request<pb::GetRequest>) -> Result<tonic::Response<pb::GetResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("a test shard"))
     }
 }
@@ -1078,6 +1084,10 @@ impl pb::strata_server::Strata for Recording {
     async fn vote(&self, r: tonic::Request<pb::VoteRequest>) -> Result<tonic::Response<pb::VoteResponse>, tonic::Status> {
         self.up()?;
         self.inner.vote(r).await
+    }
+    async fn get(&self, r: tonic::Request<pb::GetRequest>) -> Result<tonic::Response<pb::GetResponse>, tonic::Status> {
+        self.up()?;
+        self.inner.get(r).await
     }
 }
 
@@ -1558,8 +1568,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let svc = service(db, "http://unused");
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
-    let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: 10 }).await.unwrap().into_inner();
-    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, 9, strata::query::ir::VERSION, 0));
+    let newest = strata_server::grpc::PROTOCOL;
+    let h = c.hello(pb::HelloRequest { min_protocol: 1, max_protocol: newest + 1 }).await.unwrap().into_inner();
+    assert_eq!((h.min_protocol, h.max_protocol, h.plan_version, h.slot_epoch), (1, newest, strata::query::ir::VERSION, 0));
     assert!(h.plan_features.iter().any(|f| f == "operators") && h.server.starts_with("strata-server "), "{h:?}");
 
     let sql = "SELECT id, price FROM products WHERE year >= 2020 AND MATCH(body, 'waterproof') ORDER BY price DESC, id LIMIT 7";
@@ -1585,9 +1596,9 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     c.release(pb::ReleaseRequest { snapshots: vec![unused, 12345] }).await.unwrap();
     assert_eq!(svc.sweep_leases(), 0);
 
-    let e = c.query(pb::QueryRequest { protocol: 10, ..typed.clone() }).await.unwrap_err();
+    let e = c.query(pb::QueryRequest { protocol: newest + 1, ..typed.clone() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);
-    assert!(e.message().contains("protocol 10"), "{}", e.message());
+    assert!(e.message().contains(&format!("protocol {}", newest + 1)), "{}", e.message());
     let newer = pb::Plan { features: vec!["teleport".into()], ..plan };
     let e = c.term_stats(pb::QueryRequest { plan: Some(newer), ..typed }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument);

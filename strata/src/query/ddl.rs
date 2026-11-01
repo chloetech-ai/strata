@@ -57,7 +57,10 @@
 //! ([`crate::schema::Schema::with_shard_by`]); `cluster_by`, the column
 //! that orders each segment's rows ([`crate::schema::Schema::with_cluster_by`]);
 //! and `retain`, how long rows are kept after the time in `retain_by`
-//! (default: the table's only TIMESTAMP; [`crate::schema::Schema::with_retain`]):
+//! (default: the table's only TIMESTAMP; [`crate::schema::Schema::with_retain`]);
+//! and `expire_by`, a TIMESTAMP column holding when each row expires
+//! ([`crate::schema::Schema::with_expire_by`]): from then on the row is
+//! left out of every read, and deleted soon after:
 //!
 //! ```sql
 //! CREATE TABLE events (
@@ -84,9 +87,9 @@ fn err(m: impl Into<String>) -> Error {
 }
 
 /// The forms this module binds, for error messages.
-const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column', edges = 'src, dst, w')]";
+const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column', expire_by = 'column', edges = 'src, dst, w')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
-const TABLE_OPTIONS: [&str; 5] = ["shard_by", "cluster_by", "retain", "retain_by", "edges"];
+const TABLE_OPTIONS: [&str; 6] = ["shard_by", "cluster_by", "retain", "retain_by", "expire_by", "edges"];
 const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES, JSON or MEDIA, KEYWORD[] or INT[] for lists, and VECTOR(dimensions)[] for several vectors per row";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT

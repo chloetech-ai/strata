@@ -29,7 +29,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -50,16 +50,14 @@ use crate::storage::manifest::{sources_schema, Manifest, Numbering, RankProfile,
 use crate::storage::merge::{memory_limit, merge_memory, MergeEntry, MERGE_BATCH_BYTES, MERGE_BATCH_DOCS, MergePolicy, MergeRecord, MergeStats, MergeStatus, MergerOptions, Pacer, SegmentInfo};
 use crate::storage::pager::{self, Extent, Meta, META_PAGES, PAGE};
 use crate::postings::bytes::OwnedBytes;
-use crate::storage::snapshot::{build_memseg, Pins, SegmentView, Snapshot};
+use crate::storage::snapshot::{build_memseg, next_mem_id, Pins, SegmentView, Snapshot};
 use crate::storage::rowseq::{self, Seqs};
-use crate::storage::state::{mem_seq, Check, Key, Loc, SegHandle, State, TableState};
+use crate::storage::state::{mem_seq, Check, Chunk, Key, Loc, SegHandle, State, TableState};
 use crate::storage::updates::{Updates, SEQ};
 use crate::storage::ship::{Applied, LogRead, ShipLog, Shipped};
 use crate::storage::wal::{self, Op, Wal, WalTxn};
 use crate::value::{conform, conform_as, validate, Document, Pooling, Value};
 
-/// Ids of in-memory segments have this bit set.
-const MEM_ID: u64 = 1 << 63;
 
 /// Rebuilds full documents from a segment, for merges. Provided by the
 /// layer that owns the doc store and vector sections.
@@ -287,7 +285,9 @@ pub struct Database {
     merger: OnceLock<Arc<Merger>>,
     merger_threads: Mutex<Vec<JoinHandle<()>>>,
     pins: Arc<Pins>,
-    mem_ids: AtomicU64,
+    /// The options memtable segments are built with (`mem_build`, else
+    /// `build`).
+    mem_opts: Arc<BuildOptions>,
     /// Set when a write failed in a way that leaves memory and disk out of
     /// step; every later write fails until the database is reopened.
     poisoned: AtomicBool,
@@ -724,7 +724,7 @@ struct SealedMem {
     schema: Arc<Schema>,
     gen: u64,
     len: usize,
-    chunks: Vec<Arc<Vec<Document>>>,
+    chunks: Vec<Arc<Chunk>>,
     deleted: Vec<u64>,
     updates: Updates,
     seqs: Vec<u64>,
@@ -1094,6 +1094,7 @@ impl Database {
         record.store(&merge_record_path)?;
         let (spill_dir, spill_prefix) = spill_place(path, dir.as_deref());
         crate::segment::spill::remove_leftovers(spill_dir, &spill_prefix);
+        let mem_opts = Arc::new(opts.mem_build.clone().unwrap_or_else(|| opts.build.clone()));
         let db = Database {
             path: path.to_path_buf(),
             wal_path,
@@ -1110,7 +1111,7 @@ impl Database {
             merger: OnceLock::new(),
             merger_threads: Mutex::new(Vec::new()),
             pins: Arc::new(Pins::default()),
-            mem_ids: AtomicU64::new(0),
+            mem_opts,
             poisoned: AtomicBool::new(false),
             flush_error: Mutex::new(None),
             damaged: wal_dropped,
@@ -1636,7 +1637,9 @@ impl Database {
                 at = s;
                 continue;
             }
-            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() };
+            // A primary's deletes of expired rows are in its log: rows do
+            // not expire here by this machine's clock.
+            let mut txn = WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new(), now: None };
             let replayed = txn.replay(ops);
             let WriteTxn { wal: w, ops, .. } = txn;
             wal = w;
@@ -1943,7 +1946,7 @@ impl Database {
         self.wait_for_flusher();
         let wal = self.try_writer()?;
         self.check_poisoned()?;
-        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new() })
+        Ok(WriteTxn { db: self, wal, ops: Vec::new(), keys: Vec::new(), ties: Vec::new(), now: Some(crate::timestamp::now()) })
     }
 
     /// The current version. Never waits for a writer; the first snapshot
@@ -1975,16 +1978,16 @@ impl Database {
             }
             st.capture(&self.pins, with_mem)
         };
-        if cap.tables.iter().any(|t| t.mem.iter().any(|p| p.seg.is_none())) {
+        // Full chunks are built here, once each; the last chunk, which every
+        // write changes, when a query needs it (`snapshot::Tail`).
+        if cap.tables.iter().any(|t| t.mem.iter().any(|p| p.seg.is_none() && !p.last)) {
             let _b = lock(&self.build_lock);
-            let opts = self.opts.mem_build.as_ref().unwrap_or(&self.opts.build);
             for t in &mut cap.tables {
-                for part in t.mem.iter_mut().filter(|p| p.seg.is_none()) {
+                for part in t.mem.iter_mut().filter(|p| p.seg.is_none() && !p.last) {
                     // Another reader may have built it while we waited.
                     let built = lock(&self.state).memseg(part.table, part.gen, part.chunk, part.len);
                     part.seg = Some(built.unwrap_or_else(|| {
-                        let id = MEM_ID | self.mem_ids.fetch_add(1, Ordering::Relaxed);
-                        let seg = build_memseg(&t.schema, opts, part, id);
+                        let seg = build_memseg(&t.schema, &self.mem_opts, part, next_mem_id());
                         lock(&self.state).keep_memseg(part.table, &seg);
                         seg
                     }));
@@ -1992,7 +1995,7 @@ impl Database {
             }
         }
         let version = cap.version;
-        let inner = Arc::new(cap.assemble(self.path.clone()));
+        let inner = Arc::new(cap.assemble(self.path.clone(), &self.mem_opts));
         if with_mem {
             let mut st = lock(&self.state);
             if st.version == version {
@@ -3767,6 +3770,12 @@ pub struct WriteTxn<'a> {
     keys: Vec<(u32, TxnKeys)>,
     /// The semantic-ID ties the transaction gave, by table id.
     ties: Vec<(u32, Ties)>,
+    /// The time at which rows of a table with `expire_by` have expired
+    /// for this transaction ([`crate::schema::Schema::with_expire_by`]):
+    /// a write by the key of such a row finds none, the row deleted first
+    /// by a logged delete. `None` for a replica's replay, which applies
+    /// the primary's deletes instead.
+    now: Option<i64>,
 }
 
 /// What a transaction did to one table's keys.
@@ -4007,6 +4016,7 @@ impl<'a> WriteTxn<'a> {
         self.fill_sids(t, &mut doc, false)?;
         if let Some(pk) = t.schema.primary_key {
             let key = Key::of(&doc[pk]).expect("validated key");
+            self.drop_expired(t, &key, &doc[pk])?;
             if self.is_live(t, &key, &doc[pk]) {
                 return Err(Error::Schema(format!("duplicate primary key {:?}", doc[pk])));
             }
@@ -4048,6 +4058,7 @@ impl<'a> WriteTxn<'a> {
         }
         let new = doc[vf].as_i64().ok_or_else(|| Error::Schema(format!("document has no {version}")))?;
         let key = Key::of(&doc[pk]).expect("validated key");
+        self.drop_expired(t, &key, &doc[pk])?;
         let k = self.keys(t.id);
         let old = match (k.touched.get(&key), k.written.get(&key)) {
             (Some(true), Some(d)) => d[vf].as_i64(),
@@ -4066,7 +4077,7 @@ impl<'a> WriteTxn<'a> {
 
     fn delete_in(&mut self, t: &TableRef, key: &Value) -> Result<bool> {
         let k = t.key_of(key)?;
-        if !self.is_live(t, &k, key) {
+        if self.drop_expired(t, &k, key)? || !self.is_live(t, &k, key) {
             return Ok(false);
         }
         let keys = self.keys(t.id);
@@ -4093,7 +4104,7 @@ impl<'a> WriteTxn<'a> {
             (FieldType::Int | FieldType::Float, v) => return Err(Error::Schema(format!("bad value for {field}: {v:?}"))),
             _ => return Err(Error::Schema(format!("{field} is not a numeric field; only INT and FLOAT are set in place"))),
         };
-        if !self.is_live(t, &k, key) {
+        if self.drop_expired(t, &k, key)? || !self.is_live(t, &k, key) {
             return Ok(false);
         }
         let keys = self.keys(t.id);
@@ -4143,6 +4154,14 @@ impl<'a> WriteTxn<'a> {
     }
 
     fn value_of(&mut self, t: &TableRef, k: &Key, key: &Value, i: usize) -> Result<Option<Value>> {
+        if self.drop_expired(t, k, key)? {
+            return Ok(None);
+        }
+        self.current_value(t, k, key, i)
+    }
+
+    /// [`WriteTxn::value_of`], an expired row's too.
+    fn current_value(&mut self, t: &TableRef, k: &Key, key: &Value, i: usize) -> Result<Option<Value>> {
         if !self.is_live(t, k, key) {
             return Ok(None);
         }
@@ -4252,6 +4271,45 @@ impl<'a> WriteTxn<'a> {
             }
         };
         &mut self.keys[i].1
+    }
+
+    /// Deletes the live row with this key if it has expired at the
+    /// transaction's time ([`WriteTxn::now`]), by a logged delete; true if
+    /// it did. The write that asked then finds no row.
+    fn drop_expired(&mut self, t: &TableRef, k: &Key, key: &Value) -> Result<bool> {
+        let (Some(f), Some(now)) = (t.schema.expire_field(), self.now) else { return Ok(false) };
+        match self.current_value(t, k, key, f)? {
+            Some(Value::Int(at) | Value::Timestamp(at)) if at <= now => {}
+            _ => return Ok(false),
+        }
+        let keys = self.keys(t.id);
+        keys.touched.insert(k.clone(), false);
+        keys.written.remove(k);
+        self.ops.push((t.id, Op::Delete(key.clone())));
+        Ok(true)
+    }
+
+    /// Deletes the rows with these keys of table `table` that have expired
+    /// at `now` ([`crate::schema::Schema::with_expire_by`]), by logged
+    /// deletes as [`WriteTxn::delete`] makes; returns how many it deleted.
+    /// What a primary's expirer runs ([`crate::db::Db::expire`]).
+    pub fn delete_expired(&mut self, table: &str, keys: &[Value], now: i64) -> Result<usize> {
+        let t = self.db.table_ref(Some(table))?;
+        let was = self.now.replace(now);
+        let mut n = 0;
+        for key in keys {
+            let k = t.key_of(key)?;
+            match self.drop_expired(&t, &k, key) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    self.now = was;
+                    return Err(e);
+                }
+            }
+        }
+        self.now = was;
+        Ok(n)
     }
 
     fn is_live(&self, t: &TableRef, k: &Key, v: &Value) -> bool {
