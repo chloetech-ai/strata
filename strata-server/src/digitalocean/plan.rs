@@ -10,7 +10,7 @@ use serde_json::{json, Value as Json};
 
 use super::{Catalog, HOURS_A_MONTH, MAX_PODS};
 use crate::aws::catalog::Machine;
-use crate::cloud::{check_name, cluster_yaml, fit, operator_yaml, Node, IMAGE};
+use crate::cloud::{check_name, cluster_objects, cluster_yaml, fit, operator_yaml, Node, IMAGE};
 
 /// The storage class DOKS makes: block storage volumes that grow in place
 /// and are deleted with their claims.
@@ -165,6 +165,7 @@ pub fn plan(p: &Plan, cat: &Catalog) -> Result<Json, String> {
     // The volumes are the CSI driver's: deleted with their claims, or with
     // the cluster's `--dangerous`.
     let teardown = [format!("kubectl delete -f {name}-cluster.yaml"), "kubectl -n strata delete pvc --all --wait".to_string(), format!("doctl kubernetes cluster delete {name} --dangerous --force")];
+    let objects = cluster_objects(&p.name, &f.cluster, None);
     Ok(json!({
         "provider": "digitalocean",
         "stack": name,
@@ -176,7 +177,8 @@ pub fn plan(p: &Plan, cat: &Catalog) -> Result<Json, String> {
         "quota": {"droplets": cat.droplet_limit, "running": cat.droplets, "needs": p.nodes},
         "cost": cost,
         "warnings": warnings,
-        "manifests": {"operator": operator_yaml(&image)?, "cluster": cluster_yaml("a Strata cluster on DOKS, from strata-server's cloud view", &p.name, &f.cluster, None)},
+        "manifests": {"operator": operator_yaml(&image)?, "cluster": cluster_yaml("A Strata cluster on DOKS, from strata-server's cloud view", &objects)},
+        "objects": objects,
         "commands": commands,
         "teardown": teardown,
         "cluster": f.cluster,

@@ -204,6 +204,9 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/digitalocean/machines", get(do_machines))
         .route("/v1/admin/digitalocean/plan", post(do_plan))
         .route("/v1/admin/digitalocean/validate", post(do_validate))
+        .route("/v1/admin/cloud/clusters", get(cloud_list).post(cloud_create))
+        .route("/v1/admin/cloud/clusters/:id", get(cloud_one).merge(axum::routing::delete(cloud_forget)))
+        .route("/v1/admin/cloud/clusters/:id/delete", post(cloud_delete))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -1620,7 +1623,7 @@ async fn aws_regions(State(app): State<App>) -> Result<AxJson<Json>, ApiError> {
 async fn aws_machines(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<AxJson<Json>, ApiError> {
     let region = match q.get("region").filter(|r| !r.is_empty()) {
         Some(r) => r.clone(),
-        None => app.svc.aws.creds().map(|(c, _)| c.region).ok_or_else(|| aws_error("no AWS credentials: save an access key in the AWS view (PUT /v1/admin/aws/credentials)".into()))?,
+        None => app.svc.aws.creds().map(|(c, _)| c.region).ok_or_else(|| aws_error("no AWS credentials: save an access key in the Cloud view (PUT /v1/admin/aws/credentials)".into()))?,
     };
     let fresh = q.get("fresh").is_some_and(|v| v != "0" && v != "false");
     let cat = app.svc.aws.catalog(&region, fresh).await.map_err(aws_error)?;
@@ -1654,6 +1657,127 @@ async fn aws_validate(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result
         Err(e) => json!({"ok": false, "error": e}),
     };
     Ok(AxJson(j))
+}
+
+/// The clusters the cloud view made ([`crate::cloud::clusters`]), the
+/// newest first, each with where it is, what it has cost so far and how
+/// to reach it.
+async fn cloud_list(State(app): State<App>) -> AxJson<Json> {
+    let list: Vec<Json> = app.svc.clouds.list().iter().map(crate::cloud::clusters::Made::view).collect();
+    AxJson(json!({"clusters": list, "file": app.svc.clouds.file().map(|f| f.display().to_string())}))
+}
+
+async fn cloud_one(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<AxJson<Json>, ApiError> {
+    let m = app.svc.clouds.get(&id).ok_or_else(|| ApiError { status: 404, message: format!("no cluster {id}") })?;
+    Ok(AxJson(m.view()))
+}
+
+/// `{"provider", "plan", "confirm"}`: makes the plan's cluster, which bills
+/// the account until it is deleted. `confirm` is the cluster's name, typed
+/// again. Refused when the account's limit would not start the nodes, or
+/// when the cloud already has a cluster of that name. 202: the cluster is
+/// on its way; `GET` it to follow.
+async fn cloud_create(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    use crate::cloud::clusters::{Made, Phase};
+    let provider = b["provider"].as_str().unwrap_or_default().to_string();
+    let plan = b["plan"].clone();
+    let refuse = |m: String| ApiError { status: 409, message: m };
+    let (j, nodes) = match provider.as_str() {
+        "aws" => {
+            let (p, j) = aws_planned(&app, plan).await?;
+            let (needs, may) = (j["quota"]["needs"].as_f64().unwrap_or(0.0), j["quota"]["vcpus"].as_f64());
+            if may.is_some_and(|q| needs > q) {
+                return Err(refuse(format!("the nodes need {needs} vCPUs of {} instances and the account may run {} in {}: ask AWS for more first (Service Quotas)", j["quota"]["kind"].as_str().unwrap_or("standard"), may.unwrap_or(0.0), p.region)));
+            }
+            if let Some(s) = app.svc.aws.stack(&p.region, j["stack"].as_str().unwrap_or_default()).await.map_err(aws_error)? {
+                if s.status != "DELETE_COMPLETE" {
+                    return Err(refuse(format!("{} already has a stack named {} ({}): pick another name", p.region, j["stack"].as_str().unwrap_or_default(), s.status)));
+                }
+            }
+            (j, p.nodes)
+        }
+        "digitalocean" => {
+            let p: crate::digitalocean::plan::Plan = serde_json::from_value(plan).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+            let cat = app.svc.digitalocean.catalog(&p.region, true).await.map_err(do_error)?;
+            let j = crate::digitalocean::plan::plan(&p, &cat).map_err(ApiError::bad)?;
+            let q = &j["quota"];
+            if let (Some(limit), Some(running)) = (q["droplets"].as_u64(), q["running"].as_u64()) {
+                if running + u64::from(p.nodes) > limit {
+                    return Err(refuse(format!("the nodes need {} droplets and the account runs {running} of its {limit}: ask DigitalOcean for more first", p.nodes)));
+                }
+            }
+            if app.svc.digitalocean.cluster_named(j["cluster_name"].as_str().unwrap_or_default()).await.map_err(do_error)?.is_some() {
+                return Err(refuse(format!("the account already has a cluster named {}: pick another name", j["cluster_name"].as_str().unwrap_or_default())));
+            }
+            (j, p.nodes)
+        }
+        _ => return Err(ApiError::bad("provider is aws or digitalocean")),
+    };
+    let cluster = j["cluster_name"].as_str().unwrap_or_default().to_string();
+    if b["confirm"].as_str() != Some(cluster.as_str()) {
+        return Err(ApiError::bad(format!("confirm is the cluster's name, {cluster}, typed again: making it bills the account until it is deleted")));
+    }
+    let who = who(w);
+    let now = crate::operator::now_ms();
+    let m = Made {
+        id: format!("{provider}-{cluster}-{now}"),
+        provider: provider.clone(),
+        name: j["cluster"]["name"].as_str().map(str::to_string).unwrap_or_else(|| cluster.trim_start_matches("strata-").to_string()),
+        cluster: cluster.clone(),
+        region: j["region"].as_str().unwrap_or_default().to_string(),
+        machine: j["machine"]["type"].as_str().or(j["machine"]["name"].as_str()).unwrap_or_default().to_string(),
+        nodes,
+        cost_hour: j["cost"]["hour"].as_f64().unwrap_or(0.0),
+        by: who.name.clone(),
+        created_ms: now,
+        phase: Phase::Creating,
+        cloud_id: None,
+        request: if provider == "aws" { j["template"].clone() } else { j["request"].clone() },
+        image: j["cluster"]["image"].as_str().unwrap_or(crate::cloud::IMAGE).to_string(),
+        objects: j["objects"].as_array().cloned().unwrap_or_default(),
+        steps: Vec::new(),
+        error: None,
+        strata: Json::Null,
+        progress: None,
+        ready_ms: None,
+        ended_ms: None,
+        generation: 0,
+        tries: 0,
+        checked_ms: 0,
+        deleting_since_ms: None,
+        volumes_gone: false,
+        delete_asked: false,
+    };
+    let m = app.svc.clouds.add(m).map_err(refuse)?;
+    app.svc.clouds.start(app.svc.aws.clone(), app.svc.digitalocean.clone());
+    let what = if provider == "aws" { "AWS" } else { "DigitalOcean" };
+    let detail = format!("asked {what} for the cluster {cluster} in {}: {} × {}, ${:.3} an hour", m.region, m.nodes, m.machine, m.cost_hour);
+    let mut r = audited(m.view(), detail);
+    *r.status_mut() = axum::http::StatusCode::ACCEPTED;
+    Ok(r)
+}
+
+/// `{"confirm"}`: deletes a cluster made here: the StrataCluster and its
+/// volumes, then the cloud's cluster. `confirm` is its name.
+async fn cloud_delete(State(app): State<App>, w: Option<axum::Extension<Principal>>, axum::extract::Path(id): axum::extract::Path<String>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let m = app.svc.clouds.get(&id).ok_or_else(|| ApiError { status: 404, message: format!("no cluster {id}") })?;
+    if b["confirm"].as_str() != Some(m.cluster.as_str()) {
+        return Err(ApiError::bad(format!("confirm is the cluster's name, {}, typed again: deleting it deletes its data", m.cluster)));
+    }
+    let who = who(w);
+    let m = app.svc.clouds.delete(&id, &who.name).map_err(|e| ApiError { status: 409, message: e })?;
+    app.svc.clouds.start(app.svc.aws.clone(), app.svc.digitalocean.clone());
+    let detail = format!("deleting the cluster {} on {} in {}", m.cluster, if m.provider == "aws" { "AWS" } else { "DigitalOcean" }, m.region);
+    let mut r = audited(m.view(), detail);
+    *r.status_mut() = axum::http::StatusCode::ACCEPTED;
+    Ok(r)
+}
+
+/// Forgets a cluster that is deleted, or that failed before the cloud
+/// made anything; 409 while it may still bill.
+async fn cloud_forget(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
+    let m = app.svc.clouds.forget(&id).map_err(|e| ApiError { status: if e.starts_with("no cluster") { 404 } else { 409 }, message: e })?;
+    Ok(audited(json!({"forgot": m.view()}), format!("forgot the cluster {} ({:?})", m.cluster, m.phase)))
 }
 
 /// A DigitalOcean failure: 400 without a token or for a region that is no

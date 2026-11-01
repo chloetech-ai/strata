@@ -311,15 +311,71 @@ impl DigitalOcean {
 
     /// One `GET` of the API.
     async fn get(&self, token: &str, path: &str) -> Result<Json, String> {
+        self.send(reqwest::Method::GET, token, path, None).await?.ok_or_else(|| format!("GET {path}: 404 Not Found"))
+    }
+
+    /// One call; `None` for a 404, `Json::Null` for an empty answer.
+    async fn send(&self, method: reqwest::Method, token: &str, path: &str, body: Option<&Json>) -> Result<Option<Json>, String> {
         let base = self.endpoint.as_deref().unwrap_or(API);
-        self.calls.lock().unwrap_or_else(|e| e.into_inner()).push(format!("GET {}", path.split('?').next().unwrap_or(path)));
-        let res = self.http.get(format!("{base}{path}")).bearer_auth(token).send().await.map_err(|e| format!("GET {path}: {e}"))?;
-        let status = res.status();
-        let text = res.text().await.map_err(|e| format!("GET {path}: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("GET {path}: {status}: {}", error_text(&text)));
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{method} {}", path.split('?').next().unwrap_or(path)));
+        let mut r = self.http.request(method.clone(), format!("{base}{path}")).bearer_auth(token);
+        if let Some(b) = body {
+            r = r.header("content-type", "application/json").body(b.to_string());
         }
-        serde_json::from_str(&text).map_err(|e| format!("GET {path}: {e}"))
+        let res = r.send().await.map_err(|e| format!("{method} {path}: {e}"))?;
+        let status = res.status();
+        let text = res.text().await.map_err(|e| format!("{method} {path}: {e}"))?;
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("{method} {path}: {status}: {}", error_text(&text)));
+        }
+        if text.trim().is_empty() {
+            return Ok(Some(Json::Null));
+        }
+        serde_json::from_str(&text).map(Some).map_err(|e| format!("{method} {path}: {e}"))
+    }
+
+    /// Makes a DOKS cluster from `request` (the body a plan gives). This
+    /// bills the account. Answers its id.
+    pub async fn create_cluster(&self, request: &Json) -> Result<String, String> {
+        let t = self.need()?;
+        let j = self.send(reqwest::Method::POST, &t, "/v2/kubernetes/clusters", Some(request)).await?.unwrap_or_default();
+        j["kubernetes_cluster"]["id"].as_str().map(str::to_string).ok_or_else(|| format!("POST /v2/kubernetes/clusters: no id in {j}"))
+    }
+
+    /// The DOKS cluster `id` now (`kubernetes_cluster`), `None` once it is
+    /// gone.
+    pub async fn cluster(&self, id: &str) -> Result<Option<Json>, String> {
+        let t = self.need()?;
+        Ok(self.send(reqwest::Method::GET, &t, &format!("/v2/kubernetes/clusters/{id}"), None).await?.map(|j| j["kubernetes_cluster"].clone()))
+    }
+
+    /// The account's DOKS cluster named `name`, if there is one.
+    pub async fn cluster_named(&self, name: &str) -> Result<Option<Json>, String> {
+        let t = self.need()?;
+        let j = self.get(&t, "/v2/kubernetes/clusters?per_page=200").await?;
+        Ok(j["kubernetes_clusters"].as_array().and_then(|a| a.iter().find(|c| c["name"] == name).cloned()))
+    }
+
+    /// The API of the DOKS cluster `id`: its endpoint, CA (PEM) and a
+    /// bearer token (DigitalOcean's, for this account).
+    pub async fn credentials(&self, id: &str) -> Result<(String, Vec<u8>, String), String> {
+        use base64::Engine;
+        let t = self.need()?;
+        let j = self.get(&t, &format!("/v2/kubernetes/clusters/{id}/credentials")).await?;
+        let server = j["server"].as_str().filter(|s| !s.is_empty()).ok_or("the cluster's credentials name no server")?;
+        let token = j["token"].as_str().filter(|s| !s.is_empty()).ok_or("the cluster's credentials have no token")?;
+        let ca = base64::engine::general_purpose::STANDARD.decode(j["certificate_authority_data"].as_str().unwrap_or_default().trim()).map_err(|e| format!("the cluster's CA: {e}"))?;
+        Ok((server.to_string(), ca, token.to_string()))
+    }
+
+    /// Deletes the DOKS cluster `id` with what it made (its volumes and
+    /// load balancers), which would otherwise stay and bill.
+    pub async fn delete_cluster(&self, id: &str) -> Result<(), String> {
+        let t = self.need()?;
+        self.send(reqwest::Method::DELETE, &t, &format!("/v2/kubernetes/clusters/{id}/destroy_with_associated_resources/dangerous"), None).await.map(|_| ())
     }
 
     /// Whose `token` is.

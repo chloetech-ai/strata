@@ -1267,3 +1267,15 @@ button.rx-node:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--
 .cloud-warn .i { color: var(--warn-ink, var(--s4)); flex: none; margin-top: 1px; }
 .cloud-cmds { display: flex; flex-direction: column; gap: 4px; }
 .cloud-cmds code { background: var(--sunken); padding: 3px 8px; border-radius: 4px; overflow-x: auto; white-space: pre; flex: 1; min-width: 0; }
+/* Clusters made from the Cloud view */
+.cloud-made { margin-bottom: 14px; }
+.cloud-made-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
+.cloud-made-row details summary { cursor: pointer; color: var(--text-2); }
+.cloud-track { display: flex; gap: 4px; }
+.cloud-stage { flex: 1; text-align: center; font-size: 11px; font-weight: 600; padding: 3px 4px; border-radius: 4px; background: var(--surface-3); color: var(--muted); border-bottom: 3px solid transparent; }
+.cloud-stage.done { background: var(--good-soft); color: var(--good-ink); border-bottom-color: var(--good); }
+.cloud-stage.now { background: var(--accent-soft); color: var(--accent); border-bottom-color: var(--accent); animation: cloud-now 1.6s ease-in-out infinite; }
+@keyframes cloud-now { 50% { border-bottom-color: transparent; } }
+@media (prefers-reduced-motion: reduce) { .cloud-stage.now { animation: none; } }
+.cloud-steps { max-height: 220px; overflow-y: auto; gap: 3px; margin-top: 6px; }
+.cloud-steps .num { flex: none; }

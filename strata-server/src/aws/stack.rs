@@ -10,7 +10,7 @@ use serde_json::{json, Value as Json};
 
 use super::catalog::Machine;
 use super::Catalog;
-use crate::cloud::{check_name, cluster_yaml, fit, operator_yaml, Node};
+use crate::cloud::{check_name, cluster_objects, cluster_yaml, fit, operator_yaml, Node};
 pub use crate::cloud::IMAGE;
 
 /// Hours in a month, as AWS prices them.
@@ -136,6 +136,7 @@ pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String
         format!("aws cloudformation delete-stack --region {r} --stack-name {stack}"),
         format!("aws cloudformation wait stack-delete-complete --region {r} --stack-name {stack}"),
     ];
+    let objects = cluster_objects(&p.name, &f.cluster, Some(gp3_class()));
     Ok(json!({
         "provider": "aws",
         "stack": p.stack(),
@@ -146,7 +147,8 @@ pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String
         "quota": {"vcpus": quota, "needs": need, "kind": kind},
         "cost": cost,
         "warnings": warnings,
-        "manifests": {"operator": operator_yaml(&image)?, "cluster": cluster_yaml("A Strata cluster on EKS, from strata-server's cloud view", &p.name, &f.cluster, Some(gp3_class()))},
+        "manifests": {"operator": operator_yaml(&image)?, "cluster": cluster_yaml("A Strata cluster on EKS, from strata-server's cloud view", &objects)},
+        "objects": objects,
         "commands": commands,
         "teardown": teardown,
         "cluster": f.cluster,

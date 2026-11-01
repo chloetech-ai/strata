@@ -165,9 +165,13 @@ as `setup-envtest` downloads them).
 
 The command center's **Cloud** view (an admin key; see
 [the server's docs](../../docs/strata/server.md#in-the-cloud)) plans a cluster
-on Amazon EKS or DigitalOcean Kubernetes and writes the files that make it.
-It creates nothing: the commands it gives make the cluster with your own
-tools.
+on Amazon EKS or DigitalOcean Kubernetes and writes the files that make it,
+with the commands that make the cluster with your own tools. Its **Create
+it** button makes the cluster from the server instead, once its name is typed
+again: the server asks the cloud for it, installs the operator and the
+StrataCluster through the new cluster's API, follows the copies until they
+answer, and on **Delete** deletes the StrataCluster and its volumes before
+the cluster ([what it needs](../../docs/strata/server.md#making-it-from-the-view)).
 
 ### On AWS
 
