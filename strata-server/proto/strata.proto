@@ -158,6 +158,45 @@ service Strata {
   // refuses it (FailedPrecondition), since keys would close it to the
   // servers that gave them.
   rpc Keys(KeysRequest) returns (KeysResponse);
+  // Protocol 10: rows of a table by primary key, without SQL: each key's
+  // live row as `SELECT *` answers it, with the number of the write that
+  // last changed it. A row whose expire_by time has passed is none. A
+  // coordinator asks each key's shard (every shard for a table placed by
+  // shard_by) and answers the rows in the keys' order.
+  rpc Get(GetRequest) returns (GetResponse);
+}
+
+message GetRequest {
+  // The table; empty for the first.
+  string table = 1;
+  // KEYWORD keys as str, INT keys as int (or str of digits).
+  repeated Value keys = 2;
+  // 0: the server's default.
+  uint32 timeout_ms = 3;
+  // The protocol version of the request.
+  uint32 protocol = 4;
+  // The epoch of the coordinator's slot map; 0 for none.
+  uint64 epoch = 5;
+  // The sequence number of a write the read must see, as for a query.
+  uint64 min_seq_no = 6;
+  // To a coordinator: the numbers its write answered, one per shard.
+  repeated uint64 min_seq_nos = 7;
+}
+
+message GetResponse {
+  // The columns of each row, as `SELECT *` names them.
+  repeated string columns = 1;
+  // One per key, in their order.
+  repeated KeyRow rows = 2;
+}
+
+message KeyRow {
+  // False for a key no live row has; the rest is then empty.
+  bool found = 1;
+  repeated Value v = 2;
+  // The number of the write that last changed the row (0 in a database
+  // that does not number its writes).
+  uint64 seq_no = 3;
 }
 
 message VoteRequest {

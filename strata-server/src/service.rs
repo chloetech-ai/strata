@@ -71,6 +71,23 @@ pub enum Backend {
     Cluster(Arc<Coordinator>),
 }
 
+/// The most expired rows one transaction of the expirer deletes
+/// ([`Service::expire_due`]).
+pub const EXPIRE_BATCH: usize = 10_000;
+
+/// The most keys one read by key takes ([`Service::get_rows`]).
+pub const MAX_GET_KEYS: usize = 10_000;
+
+/// Rows read by key ([`Service::get_rows`]): per key, in their order, the
+/// row's values (of `columns`, as `SELECT *` names them) and the number
+/// of the write that last changed it, or `None` for a key no live row has.
+#[derive(Clone, Debug)]
+pub struct KeyRows {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Option<(Vec<Value>, u64)>>,
+}
+
 /// A SELECT to run.
 #[derive(Clone, Default)]
 pub struct QueryReq {
@@ -2206,6 +2223,64 @@ impl Service {
             }
             Backend::Cluster(c) => c.sid_next(sql, &schema, plan, params, field, prefixes, after, deadline).await,
         }
+    }
+
+    /// Deletes the rows whose `expire_by` time has passed
+    /// ([`Db::expire`]), as a server that takes writes does every few
+    /// seconds ([`crate::server::spawn_expirer`]): not a replica, which
+    /// applies its primary's deletes, nor a server that cannot write, nor
+    /// one that holds rows of slots moving here or away, which the move
+    /// copies or cleans up. Reads leave expired rows out either way; this
+    /// frees their space. Returns how many it deleted.
+    pub fn expire_due(&self) -> strata::Result<u64> {
+        let Backend::Local(db) = &self.backend else { return Ok(0) };
+        if matches!(self.replication(), Replication::Replica(_)) || self.failing().is_some() || self.moving.mask().is_some() {
+            return Ok(0);
+        }
+        if !db.catalog().iter().any(|t| t.expire_by.is_some()) {
+            return Ok(0);
+        }
+        db.expire(strata::timestamp::now(), EXPIRE_BATCH)
+    }
+
+    /// Rows of table `table` (the first without one) by primary key,
+    /// read without SQL ([`Db::get_many_at`]): per key, its live row as
+    /// `SELECT *` answers it and the number of the write that last changed
+    /// it, or none. A coordinator asks each key's shard. At most
+    /// [`MAX_GET_KEYS`] keys.
+    pub async fn get_rows(self: &Arc<Self>, table: Option<&str>, keys: Vec<Value>, after: &After, timeout_ms: u64) -> Result<KeyRows, ApiError> {
+        let t0 = Instant::now();
+        if keys.len() > MAX_GET_KEYS {
+            return Err(ApiError::bad(format!("a read by key takes at most {MAX_GET_KEYS} keys, not {}", keys.len())));
+        }
+        let schema = match table {
+            Some(t) => self.table(t).await?,
+            None => self.first_table(),
+        };
+        let pk = schema.primary_key.ok_or_else(|| ApiError::bad(format!("{} has no primary key: rows are read by key only from a table with one", schema.table)))?;
+        let keys: Vec<Value> = keys.iter().map(|k| strata::db::key_value(&schema, pk, k)).collect::<strata::Result<_>>()?;
+        let timeout = self.timeout_of(timeout_ms);
+        let deadline = t0 + timeout;
+        let r = match &self.backend {
+            Backend::Local(db) => {
+                let snap = self.read_snapshot(db, 0, after, deadline).await?;
+                let view = snap.table(&schema.table).ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", schema.table)))?;
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected("get", t0)) };
+                let db = db.clone();
+                let opts = ExecOptions { deadline: Some(deadline), ..db.exec.clone() };
+                let r = tokio::task::spawn_blocking(move || {
+                    let columns = Db::get_columns(view.schema());
+                    db.get_many_at(&view, &keys, &opts).map(|rows| KeyRows { table: view.schema().table.clone(), columns, rows: rows.into_iter().map(|r| r.map(|r| (r.row, r.seq_no))).collect() })
+                })
+                .await
+                .map_err(ApiError::internal)?;
+                drop(permit);
+                r.map_err(ApiError::from)
+            }
+            Backend::Cluster(c) => c.get(&schema, &keys, after, deadline).await.map(|rows| KeyRows { table: schema.table.clone(), columns: Db::get_columns(&schema), rows }),
+        };
+        telemetry::record("get", t0, if r.is_ok() { "ok" } else { "error" });
+        r
     }
 
     /// The paths listing `call` asks for ([`strata::query::paths`]): of

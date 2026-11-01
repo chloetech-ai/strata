@@ -14,6 +14,10 @@
 //! | `POST /v1/rank_log/export` | `{table?, since?, until?, events?, history?, window?, grades?}` | NDJSON: one record per logged row ([`strata::rank_log::export`]) |
 //! | `POST /v1/rank_log/interleaving` | the export's body | `{pairs: [{variants, requests, acted, wins, ties, delta, p}], took_ms}`: which of two interleaved rankings the users preferred ([`strata::rank_log::Credit`]) |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
+//! | `GET /v1/kv/:table/:key?min_seq_no=n` | | `{table, key, found, row?, seq_no?}`: the row with that primary key, read without SQL, as `SELECT *` answers it ([`Service::get_rows`]); 404 when no live row has it (or it has expired) |
+//! | `POST /v1/kv/get` | `{keys, table?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{table, columns, rows, seq_nos, took_ms}`: per key, in their order, its row as an object (null for none) and its number; a coordinator asks each key's shard |
+//! | `PUT /v1/kv/:table/:key?if_seq_no=n` | the row's fields as an object (the key may be left out) | `{written, seq_no?}`: the row written in place of any with the key (an upsert; with `if_seq_no`, only while the row's number is that) |
+//! | `DELETE /v1/kv/:table/:key?if_seq_no=n&routing=v` | | `{deleted, written, seq_no?}` |
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/import?format=jsonl&table=name` | rows as JSON Lines, JSON, CSV or TSV (of the first table without `table`) | `{written, skipped_fields}` |
 //! | `POST /v1/import?format=sqlite&tables=a,b&plan=true` | a SQLite file (`application/vnd.sqlite3`; recognised by its first bytes too) | `{tables, skipped, written}`, or with `plan` the plan ([`strata::sqlite`]) |
@@ -136,6 +140,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/query", post(query))
         .route("/v1/sql", post(sql))
         .route("/v1/write", post(write).layer(rows.clone()))
+        .route("/v1/kv/get", post(kv_get))
+        .route("/v1/kv/:table/:key", get(kv_one).merge(put(kv_put)).merge(axum::routing::delete(kv_delete)).layer(rows.clone()))
         .route("/v1/plan", post(run_plan).layer(rows.clone()))
         .route("/v1/import", post(import).layer(rows))
         .route("/v1/export", get(export))
@@ -326,6 +332,7 @@ fn route_scope(method: &axum::http::Method, route: &str) -> Scope {
     use axum::http::Method;
     match route {
         "/v1/write" | "/v1/import" | "/v1/stream" | "/v1/agent" | "/v1/judge" => Scope::Write,
+        "/v1/kv/:table/:key" if method == Method::PUT || method == Method::DELETE => Scope::Write,
         "/v1/export" => Scope::Admin,
         "/v1/synonyms" if method == Method::PUT => Scope::Admin,
         "/v1/alerts/rules" => Scope::Admin,
@@ -635,6 +642,128 @@ async fn write(State(app): State<App>, headers: HeaderMap, AxJson(mut b): AxJson
     let t0 = std::time::Instant::now();
     let w = app.svc.write_ops(ops, key).await?;
     Ok(AxJson(written(w, t0.elapsed().as_secs_f64() * 1e3)))
+}
+
+/// The writes a read by key must see, from its query string
+/// (`min_seq_no=n`, or `min_seq_nos=a,b,c`).
+fn after_of_query(q: &std::collections::HashMap<String, String>) -> Result<After, ApiError> {
+    let mut b = json!({});
+    if let Some(v) = q.get("min_seq_no") {
+        b["min_seq_no"] = json!(v.parse::<u64>().map_err(|_| ApiError::bad("min_seq_no is a sequence number: a whole number from 0"))?);
+    }
+    if let Some(v) = q.get("min_seq_nos") {
+        let ns: Vec<u64> = v.split(',').map(|x| x.trim().parse::<u64>()).collect::<Result<_, _>>().map_err(|_| ApiError::bad("min_seq_nos is sequence numbers joined by commas, one per shard"))?;
+        b["min_seq_nos"] = json!(ns);
+    }
+    after(&b)
+}
+
+/// A row read by key as JSON: an object of its columns.
+fn key_row(columns: &[String], row: &[strata::value::Value]) -> Json {
+    Json::Object(columns.iter().zip(row).map(|(c, v)| (c.clone(), js::to_json(v))).collect())
+}
+
+/// The key in a path as the table's key: an INT key's digits a number.
+fn path_key(schema: &strata::schema::Schema, key: &str) -> Result<Json, ApiError> {
+    let pk = schema.primary_key.ok_or_else(|| ApiError::bad(format!("{} has no primary key: rows are read and written by key only in a table with one", schema.table)))?;
+    Ok(match schema.fields[pk].ty {
+        strata::schema::FieldType::Int => json!(key.parse::<i64>().map_err(|_| ApiError::bad(format!("{key:?} is not a key of {}: its key {} is an INT", schema.table, schema.fields[pk].name)))?),
+        _ => json!(key),
+    })
+}
+
+/// `GET /v1/kv/:table/:key`: one row by its key, without SQL.
+async fn kv_one(State(app): State<App>, axum::extract::Path((table, key)): axum::extract::Path<(String, String)>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<Response, ApiError> {
+    let t0 = Instant::now();
+    let timeout_ms = q.get("timeout_ms").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let got = app.svc.get_rows(Some(&table), vec![strata::value::Value::Str(key.clone())], &after_of_query(&q)?, timeout_ms).await?;
+    let took_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Ok(match got.rows.into_iter().next().flatten() {
+        Some((row, seq_no)) => AxJson(json!({"table": got.table, "key": key, "found": true, "row": key_row(&got.columns, &row), "seq_no": seq_no, "took_ms": took_ms})).into_response(),
+        None => (StatusCode::NOT_FOUND, AxJson(json!({"table": got.table, "key": key, "found": false, "took_ms": took_ms}))).into_response(),
+    })
+}
+
+/// `POST /v1/kv/get`: rows by their keys (MGET), without SQL.
+async fn kv_get(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let t0 = Instant::now();
+    let keys = match b.get("keys") {
+        Some(Json::Array(k)) => k.iter().map(js::param).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(ApiError::bad("the body needs an array \"keys\"")),
+    };
+    let table = match b.get("table") {
+        None | Some(Json::Null) => None,
+        Some(Json::String(t)) => Some(t.as_str()),
+        Some(_) => return Err(ApiError::bad("table is a table's name")),
+    };
+    let got = app.svc.get_rows(table, keys, &after(&b)?, body_u64(&b, "timeout_ms")).await?;
+    let seq_nos: Vec<Json> = got.rows.iter().map(|r| r.as_ref().map_or(Json::Null, |(_, s)| json!(s))).collect();
+    let rows: Vec<Json> = got.rows.iter().map(|r| r.as_ref().map_or(Json::Null, |(row, _)| key_row(&got.columns, row))).collect();
+    Ok(AxJson(json!({"table": got.table, "columns": got.columns, "rows": rows, "seq_nos": seq_nos, "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
+}
+
+/// The idempotency key of a write: the `Idempotency-Key` header.
+fn idempotency(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let key = headers.get("idempotency-key").map(|h| h.to_str().map(str::to_string).map_err(|_| ApiError::bad("the Idempotency-Key header is not text"))).transpose()?;
+    if key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
+        return Err(ApiError::bad("an idempotency key has 1 to 256 characters"));
+    }
+    Ok(key)
+}
+
+/// `if_seq_no` from a query string, for a write by key.
+fn if_seq_no(op: &mut Json, q: &std::collections::HashMap<String, String>) -> Result<(), ApiError> {
+    if let Some(v) = q.get("if_seq_no") {
+        op["if_seq_no"] = json!(v.parse::<u64>().map_err(|_| ApiError::bad("if_seq_no is a sequence number: a whole number from 0"))?);
+    }
+    Ok(())
+}
+
+/// `PUT /v1/kv/:table/:key`: writes the row with that key (an upsert),
+/// without SQL.
+async fn kv_put(
+    State(app): State<App>,
+    axum::extract::Path((table, key)): axum::extract::Path<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    AxJson(mut doc): AxJson<Json>,
+) -> Res {
+    let t0 = Instant::now();
+    let schema = app.svc.table(&table).await?;
+    let k = path_key(&schema, &key)?;
+    let pk = schema.fields[schema.primary_key.expect("path_key checked it")].name.clone();
+    let Json::Object(m) = &mut doc else { return Err(ApiError::bad("the body is the row's fields, as an object")) };
+    match m.iter().find(|(f, _)| f.eq_ignore_ascii_case(&pk)) {
+        Some((_, v)) if *v != k => return Err(ApiError::bad(format!("the body's {pk} is {v}, and the path's key {k}"))),
+        Some(_) => {}
+        None => {
+            m.insert(pk, k);
+        }
+    }
+    let mut op = json!({"op": "upsert", "table": schema.table, "doc": doc});
+    if_seq_no(&mut op, &q)?;
+    let w = app.svc.write_ops(vec![op], idempotency(&headers)?).await?;
+    Ok(AxJson(written(w, t0.elapsed().as_secs_f64() * 1e3)))
+}
+
+/// `DELETE /v1/kv/:table/:key`: deletes the row with that key.
+async fn kv_delete(
+    State(app): State<App>,
+    axum::extract::Path((table, key)): axum::extract::Path<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Res {
+    let t0 = Instant::now();
+    let schema = app.svc.table(&table).await?;
+    let mut op = json!({"op": "delete", "table": schema.table, "key": path_key(&schema, &key)?});
+    if_seq_no(&mut op, &q)?;
+    if let Some(r) = q.get("routing") {
+        op["routing"] = json!(r);
+    }
+    let w = app.svc.write_ops(vec![op], idempotency(&headers)?).await?;
+    let mut j = written(w, t0.elapsed().as_secs_f64() * 1e3);
+    j["deleted"] = json!(j["written"].as_u64().unwrap_or(0) > 0);
+    Ok(AxJson(j))
 }
 
 /// Rows in the body, in the format `?format=` names or the content type

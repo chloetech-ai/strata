@@ -89,7 +89,7 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb, CLUSTER_PROTOCOL, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
+use crate::grpc::{params_to_pb, result_from_pb, CLUSTER_PROTOCOL, GET_PROTOCOL, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
@@ -1189,6 +1189,61 @@ impl Coordinator {
             }
         }
         Ok(sums.into_iter().map(|m| m.into_values().collect()).collect())
+    }
+
+    /// Rows of table `schema` by primary key ([`GET_PROTOCOL`]): each
+    /// key asked of the shard its slot is on, all of a shard's keys in one
+    /// call, or of every shard for a table placed by shard_by, whose key
+    /// does not say where its row is. Per key, in their order, the row and
+    /// its number, or none.
+    pub async fn get(&self, schema: &Schema, keys: &[strata::value::Value], after: &After, deadline: Instant) -> Result<Vec<Option<(Vec<strata::value::Value>, u64)>>, ApiError> {
+        self.routed(|| self.get_once(schema, keys, after, deadline)).await
+    }
+
+    async fn get_once(&self, schema: &Schema, keys: &[strata::value::Value], after: &After, deadline: Instant) -> Result<Vec<Option<(Vec<strata::value::Value>, u64)>>, ApiError> {
+        let t = &self.topo();
+        let start = self.turn.fetch_add(1, Ordering::Relaxed);
+        let after = &self.after(t, after)?;
+        let n = t.replicas.len();
+        // Each shard's keys, by their positions.
+        let mut asked: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (j, k) in keys.iter().enumerate() {
+            match schema.shard_by {
+                Some(_) => asked.iter_mut().for_each(|a| a.push(j)),
+                None => asked[self.shard_of(t, k)].push(j),
+            }
+        }
+        let calls = asked.iter().enumerate().filter(|(_, a)| !a.is_empty()).map(|(i, a)| async move {
+            let pb_keys: Vec<pb::Value> = a.iter().map(|&j| crate::grpc::to_pb(&keys[j])).collect();
+            let got = self
+                .call(t, i, start, None, deadline, |r, mut c| {
+                    let pb_keys = pb_keys.clone();
+                    async move {
+                        let p = self.speak(t, i, r, &mut c, PROTOCOL).await?;
+                        if p < GET_PROTOCOL {
+                            return Err(tonic::Status::unimplemented(format!("it speaks protocol {p}, and reads by key need {GET_PROTOCOL}: upgrade it")));
+                        }
+                        let min_seq_no = after.get(i).copied().unwrap_or(0);
+                        self.reads_after(t, i, r, min_seq_no)?;
+                        c.get(pb::GetRequest { table: schema.table.clone(), keys: pb_keys, timeout_ms: ms_left(deadline), protocol: p, epoch: t.epoch(), min_seq_no, ..Default::default() }).await
+                    }
+                })
+                .await?;
+            Ok::<_, ApiError>((a, crate::grpc::rows_from_pb(got.1)))
+        });
+        let mut out = vec![None; keys.len()];
+        for r in join_all(calls).await {
+            let (a, rows) = r?;
+            if rows.len() != a.len() {
+                return Err(ApiError::internal(format!("a shard answered {} rows for {} keys", rows.len(), a.len())));
+            }
+            for (&j, row) in a.iter().zip(rows) {
+                if row.is_some() {
+                    out[j] = row;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The paths listing `call` asks for ([`strata::query::paths`]) over

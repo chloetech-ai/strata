@@ -438,6 +438,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     open_log_store(&mut svc, o)?;
     let svc = Arc::new(svc);
     spawn_maintenance(&svc);
+    spawn_expirer(&svc, Duration::from_secs(5));
     spawn_sampler(&svc);
     tokio::spawn(svc.clone().keep_models());
     svc.start_failover();
@@ -694,6 +695,38 @@ pub fn spawn_maintenance(svc: &Arc<Service>) {
                 tracing::error!(error = why.as_deref().unwrap_or_default(), "the database cannot merge");
             }
             reported = why;
+        }
+    });
+}
+
+/// Deletes rows whose `expire_by` time has passed, every `every`
+/// ([`Service::expire_due`]), until the service is dropped.
+pub fn spawn_expirer(svc: &Arc<Service>, every: Duration) {
+    if svc.local_db().is_none() {
+        return;
+    }
+    let svc = Arc::downgrade(svc);
+    tokio::spawn(async move {
+        let mut reported = None;
+        loop {
+            tokio::time::sleep(every).await;
+            let Some(svc) = svc.upgrade() else { return };
+            let r = tokio::task::spawn_blocking(move || svc.expire_due()).await;
+            match r {
+                Ok(Ok(0)) => reported = None,
+                Ok(Ok(n)) => {
+                    reported = None;
+                    tracing::debug!(rows = n, "deleted expired rows");
+                }
+                Ok(Err(e)) => {
+                    let why = e.to_string();
+                    if reported.as_ref() != Some(&why) {
+                        tracing::warn!(error = %why, "could not delete expired rows; reads leave them out meanwhile");
+                    }
+                    reported = Some(why);
+                }
+                Err(e) => tracing::error!(error = %e, "the expirer stopped"),
+            }
         }
     });
 }
