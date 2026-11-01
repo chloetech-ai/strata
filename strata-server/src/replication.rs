@@ -676,8 +676,11 @@ impl Primary {
             return Err("a primary keeps a log of its transactions to ship (DbOptions::ship_log_bytes)".into());
         }
         let role = Some(KeptRole::Primary { replicas: opts.replicas.clone(), acks: opts.acks });
-        if kept.role != role || file.is_some_and(|f| !f.exists()) {
+        // A primary counts among its shard's copies, as a replica once it
+        // steps down or starts again (`cores::shard::Primary::new`).
+        if kept.role != role || !kept.member || file.is_some_and(|f| !f.exists()) {
             kept.role = role;
+            kept.member = true;
             kept.save(file).map_err(|e| format!("keep the replication id and role: {e}"))?;
         }
         let gen = GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -1496,12 +1499,30 @@ impl Follow {
     /// A replica of `db`, keeping its id and the primary it follows in
     /// `file` (none: in memory).
     pub fn open(db: Arc<Db>, file: Option<&Path>) -> Result<Follow, String> {
+        Follow::open_as(db, file, false)
+    }
+
+    /// A replica started with `--replica`, as [`Self::open`]: on a database
+    /// that had no part in replication yet, it is one of its shard's first
+    /// copies, which count among the copies a majority is counted of from
+    /// the start, as Raft's first members do
+    /// (`cores::shard::Replica::open`). The primary started with them
+    /// counts them so, and if it stopped before any of them heard from it,
+    /// they could otherwise never elect another. A server made a replica
+    /// of a serving shard (`Configure`) counts once it caught up.
+    pub fn open_first(db: Arc<Db>, file: Option<&Path>) -> Result<Follow, String> {
+        Follow::open_as(db, file, true)
+    }
+
+    fn open_as(db: Arc<Db>, file: Option<&Path>, flags: bool) -> Result<Follow, String> {
         if db.storage().numbering().is_none() {
             return Err("a replica numbers its writes as its primary does: start it with --seq-no".into());
         }
         let mut kept = Kept::open(file)?;
-        if kept.role != Some(KeptRole::Replica) {
+        let first = flags && kept.role.is_none() && kept.follows.is_none() && kept.replaced_by.is_none();
+        if kept.role != Some(KeptRole::Replica) || (first && !kept.member) {
             kept.role = Some(KeptRole::Replica);
+            kept.member |= first;
             kept.save(file).map_err(|e| format!("keep the replication role: {e}"))?;
         }
         let committed = Arc::new(watch::channel(db.storage().numbering().map_or(0, |n| n.seq)).0);

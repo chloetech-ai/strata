@@ -48,6 +48,13 @@ impl Kept {
         Kept { id, ..Kept::default() }
     }
 
+    /// Whether it has had no part in replication yet: a copy started so,
+    /// as its shard's primary (`--replicas`) or a replica (`--replica`), is
+    /// one of the shard's first copies.
+    pub fn first(&self) -> bool {
+        self.role.is_none() && self.follows.is_none() && self.replaced_by.is_none()
+    }
+
     /// The newest term it knows of, besides the database's `term`: of the
     /// primary it follows, of the one that replaced it, and the term it
     /// voted in.
@@ -197,9 +204,17 @@ pub struct Replica {
 
 impl Replica {
     /// A replica keeping `kept`, from `now`, and what to keep when its
-    /// part changes.
-    pub fn open(kept: Kept, now: Instant) -> (Replica, Option<Kept>) {
-        let save = (kept.role != Some(KeptRole::Replica)).then(|| Kept { role: Some(KeptRole::Replica), ..kept.clone() });
+    /// part changes. Started with `--replica` (`flags`) on a database that
+    /// had no part yet ([`Kept::first`]), it is one of its shard's first
+    /// copies, which count among the copies a majority is counted of from
+    /// the start, as Raft's first members do: the primary started with
+    /// them counts them so, and if it stopped before any of them heard from
+    /// it, they could otherwise never elect another. A replica that joins a
+    /// serving shard counts once it caught up ([`Self::take`]).
+    pub fn open(kept: Kept, now: Instant, flags: bool) -> (Replica, Option<Kept>) {
+        let member = kept.member || (flags && kept.first());
+        let next = Kept { role: Some(KeptRole::Replica), member, ..kept.clone() };
+        let save = (next != kept).then_some(next);
         let kept = save.clone().unwrap_or(kept);
         (Replica { kept, called_at: None, serves_reads: false, opened: now, global_checkpoint: 0, heard: 0 }, save)
     }
@@ -754,8 +769,10 @@ impl Primary {
     /// replicas that are there, but those `joining`, which are sent a copy
     /// of the primary first.
     pub fn new(kept: Kept, replicas: &[String], opts: Opts, joining: bool) -> (Primary, Option<Kept>) {
-        let role = Some(KeptRole::Primary { replicas: replicas.to_vec(), acks: opts.acks });
-        let save = (kept.role != role).then(|| Kept { role: role.clone(), ..kept.clone() });
+        // A primary counts among its shard's copies, as a replica once it
+        // steps down or starts again.
+        let next = Kept { role: Some(KeptRole::Primary { replicas: replicas.to_vec(), acks: opts.acks }), member: true, ..kept.clone() };
+        let save = (next != kept).then_some(next);
         let kept = save.clone().unwrap_or(kept);
         let mut p = Primary { id: kept.id.clone(), opts, peers: replicas.iter().map(|u| Peer::new(u, joining)).collect(), fenced: 0, kept, progress: 0, writes_from: None, gen: 0 };
         p.gen = 1;
@@ -1226,7 +1243,7 @@ mod tests {
     #[test]
     fn a_replica_follows_one_primary_a_term() {
         let t0 = Instant::now();
-        let (mut r, save) = Replica::open(Kept::new("r".into()), t0);
+        let (mut r, save) = Replica::open(Kept::new("r".into()), t0, false);
         assert_eq!(save.unwrap().role, Some(KeptRole::Replica));
         let at = n(2, 4, &[(1, 1), (2, 3)]);
         let Ok(Take::Apply { kept }) = r.take(2, "p", true, &at) else { panic!() };
@@ -1243,6 +1260,27 @@ mod tests {
         assert!(v.granted && save.is_some_and(|k| k.voted == Some((3, "x".into()))));
     }
 
+    #[test]
+    fn a_shards_first_copies_vote_from_the_start() {
+        let t0 = Instant::now();
+        let at = n(1, 0, &[]);
+        let long_ago = t0 + Duration::from_secs(60);
+        // Started with --replica on a database that had no part yet.
+        let (r, save) = Replica::open(Kept::new("r".into()), t0, true);
+        assert!(save.is_some_and(|k| k.member && k.role == Some(KeptRole::Replica)));
+        assert!(r.vote(&ask(2, "x", (1, 0), false), &at, long_ago, Duration::from_secs(1)).0.granted, "a first copy");
+        // A server made a replica of a serving shard (Configure), or one
+        // that was a replica before: none until a primary says it caught up.
+        for (kept, flags) in [(Kept::new("r".into()), false), (Kept { follows: Some(("p".into(), 1)), role: Some(KeptRole::Replica), ..Kept::new("r".into()) }, true)] {
+            let (r, save) = Replica::open(kept, t0, flags);
+            assert!(!save.is_some_and(|k| k.member) && !r.kept.member);
+            assert!(!r.vote(&ask(2, "x", (1, 0), false), &at, long_ago, Duration::from_secs(1)).0.granted, "a copy that joined");
+        }
+        // The primary counts itself one, as a replica once it starts again.
+        let (p, save) = Primary::new(Kept::new("p".into()), &["r".into()], Opts::of(&PrimaryOptions::default()), true);
+        assert!(save.is_some_and(|k| k.member) && p.kept.member);
+    }
+
     fn said(term: u64, granted: bool) -> Result<pb::VoteResponse, String> {
         Ok(pb::VoteResponse { granted, term, last_seq: 4, last_term: 2, reason: String::new(), candidate: false })
     }
@@ -1250,7 +1288,7 @@ mod tests {
     #[test]
     fn a_replica_asks_above_the_newest_term_a_copy_told_it() {
         let t0 = Instant::now();
-        let (mut r, _) = Replica::open(Kept::new("r".into()), t0);
+        let (mut r, _) = Replica::open(Kept::new("r".into()), t0, false);
         let at = n(2, 4, &[(1, 1), (2, 3)]);
         let c = r.campaign(&at, false);
         assert_eq!(c.term, 3);

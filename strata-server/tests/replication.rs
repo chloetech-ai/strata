@@ -1327,6 +1327,36 @@ fn kept(dir: &Path, name: &str) -> Json {
     serde_json::from_slice(&std::fs::read(replication::file_of(&dir.join(name))).unwrap()).unwrap()
 }
 
+/// A shard's first copies count among its copies from the start, as Raft's
+/// first members do: its primary started with --replicas, and each replica
+/// started with --replica on a database that had no part in replication
+/// yet. So if the first primary stops before any replica heard from it,
+/// the replicas still elect another (the simulator's
+/// `waits-for-a-first-call`). A server made a replica to join a serving
+/// shard (Configure) grants no vote until it caught up with a primary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shards_first_copies_vote_from_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = |name: &str| server::Options { db: Some(dir.path().join(name)), demo: Some(20), seq_no: true, timeout_ms: 5000, ..Default::default() };
+    let r = server::service(&server::Options { replica: true, ..opts("r.strata") }).await.unwrap();
+    assert_eq!(kept(dir.path(), "r.strata")["member"], json!(true));
+    let a = r.vote(ask(2, "x", (9, 9), false)).await.unwrap();
+    assert!(a.granted, "{a:?}");
+    let p = server::service(&server::Options { replicas: vec!["http://127.0.0.1:1".into()], ..opts("p.strata") }).await.unwrap();
+    assert_eq!(p.role(), pb::Role::Primary);
+    assert_eq!(kept(dir.path(), "p.strata")["member"], json!(true), "a primary counts itself, as a replica once it starts again");
+
+    let j = server::service(&opts("j.strata")).await.unwrap();
+    j.configure(pb::Role::Replica, Vec::new(), None, true).await.unwrap();
+    let a = j.vote(ask(2, "x", (9, 9), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("has not caught up with a primary"), "{a:?}");
+    // Nor once started again with --replica: it had a part already.
+    let again = Follow::open_first(j.local_db().unwrap().clone(), Some(&replication::file_of(&dir.path().join("j.strata")))).unwrap();
+    let a = again.vote(&ask(2, "x", (9, 9), false), Duration::ZERO).await.unwrap();
+    assert!(!a.granted && a.reason.contains("has not caught up with a primary"), "{a:?}");
+    assert_eq!(kept(dir.path(), "j.strata")["member"], Json::Null);
+}
+
 /// A replica is made the primary of a new term by hand. It refuses while a
 /// copy it is to ship to holds a transaction it does not, or a newer term.
 /// A promotion asked for with an API key calls only the shard's copies the
@@ -1349,7 +1379,10 @@ async fn a_key_s_promotion_calls_only_the_shard_s_known_copies() {
             drop(s);
         }
     });
-    let x = grpc(server::service(&server::Options { replica: true, ..opts("x.strata") }).await.unwrap()).await;
+    // x joined a serving shard (Configure): it votes once it caught up.
+    let xs = server::service(&opts("x.strata")).await.unwrap();
+    xs.configure(pb::Role::Replica, Vec::new(), None, true).await.unwrap();
+    let x = grpc(xs).await;
     let r = server::service(&server::Options { replica: true, replicas: vec![x.clone()], ..opts("r.strata") }).await.unwrap();
     assert_eq!(r.known_copies(), vec![x.clone()]);
     let key = |scope| Principal { name: "ops".into(), key: Some("0a1b2c3d".into()), scope, root: false };
@@ -1373,8 +1406,8 @@ async fn a_key_s_promotion_calls_only_the_shard_s_known_copies() {
     lone.set_slots(map, 0).await.unwrap();
     assert_eq!(lone.known_copies(), vec!["http://127.0.0.1:2".to_string(), x.clone()]);
     // No URLs: the known copies, which are asked for their votes (x, a
-    // replica that never caught up with a primary, grants none), and
-    // shipped to once the promotion is forced.
+    // replica that joined and never caught up with a primary, grants
+    // none), and shipped to once the promotion is forced.
     let e = r.promote(&admin, Vec::new(), Acks::All, false).await.unwrap_err();
     assert!(e.status == 409 && e.message.contains(&x) && e.message.contains("grants no votes"), "{}", e.message);
     assert_eq!(r.role(), pb::Role::Replica);
@@ -1540,7 +1573,7 @@ async fn a_replaced_primary_is_fenced_and_starts_again_only_when_promoted() {
     assert!(e.contains("a primary of term 3 replaced this one: start it with --replica"), "{e}");
     let p = Primary::start(pdb.clone(), Some(&file("p.strata")), PrimaryOptions { promote: true, ..Default::default() }).unwrap();
     assert_eq!(pdb.storage().numbering().unwrap().term, 4);
-    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "role": "primary", "replicas": [], "write_acks": "all"}));
+    assert_eq!(kept(dir.path(), "p.strata"), json!({"id": id, "member": true, "role": "primary", "replicas": [], "write_acks": "all"}));
     // Replaced again, and started as a replica: it no longer counts as
     // replaced once it follows.
     assert_eq!(p.shipped_to("q", 5).unwrap_err().status, 409);

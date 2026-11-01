@@ -409,7 +409,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
             svc.set_replication(Replication::Primary(p));
         } else if o.replica {
-            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open_first(db.clone(), Some(file))?)));
             // Its --replicas: the shard's other copies, the ones a
             // promotion ships to (Service::known_copies).
             svc.promote_options = Some(PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, ..ships });
