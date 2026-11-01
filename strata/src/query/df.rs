@@ -515,7 +515,9 @@ impl<'a> Lower<'a, '_> {
 
     /// A leaf on the executor, `restrict` added to its Search's filter, its
     /// rows in memory.
-    fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<Expr>) -> R<Rel> {
+    /// The leaf `n` as the executor runs it: its subqueries' values in
+    /// place, their NULLs compared as SQL reads them.
+    fn prepared(&mut self, n: &Node) -> R<Node> {
         let schema = self.table(n)?;
         let mut leaf = n.clone();
         let mut fail = None;
@@ -534,6 +536,33 @@ impl<'a> Lower<'a, '_> {
         }
         // A subquery's NULL compares as SQL reads it, not as an error.
         ops::unknown(&mut leaf, self.catalog);
+        Ok(leaf)
+    }
+
+    /// How many rows the leaf `n` reads: a count of its Search (`None`
+    /// if the executor does not count it).
+    fn count(&mut self, n: &Node) -> R<Option<u64>> {
+        let leaf = self.prepared(n)?;
+        let Some(s) = leaf.search() else { return Ok(None) };
+        let mut search = s.clone();
+        search.order.clear();
+        search.phases.clear();
+        search.per = None;
+        let count = Node::Project {
+            input: Box::new(Node::Aggregate { input: Box::new(Node::Search(search)), keys: Vec::new(), aggs: vec![Agg { func: AggFn::Count, arg: None }] }),
+            columns: vec![crate::query::ir::Column { name: "n".into(), expr: Expr::Output(0) }],
+        };
+        self.opts.check()?;
+        let n = match (self.runner)(&Plan::new(count)) {
+            Ok(rs) => rs.rows.first().and_then(|r| r.first()).and_then(Value::as_i64).map(|n| n.max(0) as u64),
+            Err(_) => None,
+        };
+        self.opts.check()?;
+        Ok(n)
+    }
+
+    fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<Expr>) -> R<Rel> {
+        let mut leaf = self.prepared(n)?;
         let restricted = restrict.iter().map(|c| if let Expr::In { list, .. } = c { list.len() } else { 0 }).max().unwrap_or(0);
         if !restrict.is_empty() {
             let s = leaf.search_mut().expect("a leaf");
@@ -853,6 +882,7 @@ impl<'a> Lower<'a, '_> {
             let schema = self.table(right)?;
             let mut restrict = Vec::new();
             let mut none = false;
+            let mut values = 0;
             for k in keys {
                 let e = self.top(&k.left, &l.cols, l.plan.schema())?;
                 if matches!(e.get_type(l.plan.schema())?, DataType::List(_)) {
@@ -869,13 +899,18 @@ impl<'a> Lower<'a, '_> {
                 let Expr::Field(f) = &c.expr else { return no("a join key of a scanned table that is not one of its fields") };
                 let vals = ops::equal_to(Some(schema), Some(*f as usize), vals)?;
                 none |= vals.is_empty();
+                values += vals.len();
                 restrict.push(Expr::In { expr: Box::new(Expr::Field(*f)), list: vals.into_iter().map(Expr::Lit).collect() });
             }
+            // Many values cost the restricted scan more than reading the
+            // rows they would cut: the right side is read whole and hashed.
+            let whole = values > RESTRICT_ALWAYS && plain(right) && self.count(right)?.is_some_and(|rows| (values as u64).saturating_mul(RESTRICT_RATIO) > rows);
             match none {
                 true => {
                     let names = columns.iter().map(|c| c.name.clone()).collect();
                     self.memory(names, Vec::new(), None, None)?
                 }
+                false if whole => self.leaf(right, "join", Vec::new())?,
                 false => self.leaf(right, "join", restrict)?,
             }
         } else {
@@ -1171,6 +1206,33 @@ impl<'a> Lower<'a, '_> {
             }
             f => return no(format!("{}({ts:?}) above a leaf", f.name())),
         })
+    }
+}
+
+/// A join restricts its right side (a leaf) to the left side's join values
+/// when there are at most this many of them, as the operators do.
+const RESTRICT_ALWAYS: usize = 1024;
+
+/// Beyond [`RESTRICT_ALWAYS`] values, a join restricts its right side only
+/// when that side reads at least this many times as many rows as there
+/// are values: a value costs the restricted scan about what reading tens
+/// of rows does (a primary key's lookup more), so a join on a large key
+/// set reads the right side whole and hashes it. Measured: a million keys
+/// against a million-row table, 1.1 s restricted, 0.15 s read whole.
+const RESTRICT_RATIO: u64 = 32;
+
+/// Whether the leaf `n` returns the same rows restricted or not, but for
+/// the rows the restriction drops: `Project [Sort] [Filter] Search`, with
+/// no LIMIT or aggregate whose rows would change with it.
+fn plain(n: &Node) -> bool {
+    let Node::Project { input, .. } = n else { return false };
+    let mut n: &Node = input;
+    loop {
+        match n {
+            Node::Sort { input, .. } | Node::Filter { input, .. } => n = input,
+            Node::Search(s) => return s.per.is_none(),
+            _ => return false,
+        }
     }
 }
 

@@ -199,3 +199,33 @@ fn a_join_past_the_operators_row_cap() {
     assert!(on_datafusion(&got));
     assert_eq!(got.rows, vec![vec![Value::Int(1_210_000), Value::Int(1_100 * (1_099 * 1_100 / 2))]]);
 }
+
+#[test]
+fn a_join_on_many_keys_reads_its_right_side_whole() {
+    // 3,000 left keys against 4,000 right rows: restricting the right
+    // side to the keys would cost more than reading it, so it is read
+    // whole and hashed; the rows are the operators' all the same. Few keys
+    // still restrict it, and a right side under a LIMIT (whose rows depend
+    // on it) is restricted where the operators restrict it.
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::new("l", vec![Field::new("id", FieldType::Int), Field::new("g", FieldType::Keyword)], Some("id")).unwrap();
+    let db = Db::create(&dir.path().join("keys.strata"), schema, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    db.load((0..3_000).map(|i| vec![Value::Int(i), Value::Str(format!("g{}", i % 7))])).unwrap();
+    db.sql("CREATE TABLE r (id INT PRIMARY KEY, l_id INT, x FLOAT)", &Params::new()).unwrap();
+    db.load_into("r", (0..4_000).map(|i| vec![Value::Int(i), if i % 9 == 0 { Value::Null } else { Value::Int((i * 7) % 3_500) }, Value::Float(i as f64 / 4.0)])).unwrap();
+    let plan_line = |rs: &ResultSet| rs.stats.plan.iter().find(|l| l.starts_with("join:")).cloned().unwrap_or_default();
+    for (sql, restricted) in [
+        ("SELECT l.g, COUNT(*), SUM(r.x) FROM l JOIN r ON r.l_id = l.id GROUP BY l.g", false),
+        ("SELECT l.id, r.id FROM l LEFT JOIN r ON r.l_id = l.id WHERE l.id < 2900", false),
+        ("SELECT l.id, r.x FROM l JOIN r ON r.l_id = l.id WHERE r.x > 100 ORDER BY r.x DESC, l.id", false),
+        ("SELECT l.id, t.x FROM l JOIN (SELECT l_id, x FROM r ORDER BY x DESC LIMIT 50) t ON t.l_id = l.id", true),
+        ("SELECT l.id, r.x FROM l JOIN r ON r.l_id = l.id WHERE l.id < 40", true),
+    ] {
+        let want = run(&db, sql, Engine::Operators);
+        let got = run(&db, sql, Engine::DataFusion);
+        same(sql, &want, &got);
+        assert!(on_datafusion(&got), "{sql}: {:?}", got.stats.plan.first());
+        let restricted = restricted && plan_line(&want).contains("restricted to");
+        assert_eq!(plan_line(&got).contains("restricted to"), restricted, "{sql}: {}", plan_line(&got));
+    }
+}
