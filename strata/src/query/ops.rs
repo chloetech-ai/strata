@@ -136,6 +136,7 @@ fn label(n: &Node) -> (&'static str, String) {
         Node::Distinct { .. } => ("distinct", String::new()),
         Node::DistinctOn { per, .. } => ("distinct on", format!("{per} per value")),
         Node::KeyOrder { .. } => ("key order", String::new()),
+        Node::Window { funcs, .. } => ("window", funcs.iter().map(|w| w.func.name()).collect::<Vec<_>>().join(", ")),
         Node::Aggregate { keys, aggs, .. } => ("aggregate", format!("{} key{}, {} aggregate{}", keys.len(), if keys.len() == 1 { "" } else { "s" }, aggs.len(), if aggs.len() == 1 { "" } else { "s" })),
         _ => ("node", String::new()),
     }
@@ -272,6 +273,33 @@ impl<'a> Ops<'a, '_> {
                 Ok(rows.pick(&idx))
             }
             Node::Aggregate { input, keys, aggs } => self.aggregate(input, keys, aggs, what),
+            Node::Window { input, funcs } => {
+                let mut rows = self.node(input, what)?;
+                let mut funcs = funcs.clone();
+                for x in funcs.iter_mut().flat_map(super::ir::WindowFn::exprs_mut) {
+                    *x = self.resolved(x)?;
+                }
+                let opts = self.opts;
+                let mut steps = self.steps;
+                let mut tick = || {
+                    steps += 1;
+                    if steps < 1024 {
+                        return Ok(());
+                    }
+                    steps = 0;
+                    opts.check()
+                };
+                let cols = super::window::evaluate(&rows.rows, &funcs, &mut tick)?;
+                self.steps = steps;
+                let w = rows.columns.len();
+                for (i, r) in rows.rows.iter_mut().enumerate() {
+                    let added: Vec<Value> = cols.iter().map(|c| c[i].clone()).collect();
+                    self.charge.row(&added)?;
+                    r.extend(added);
+                }
+                rows.columns.extend((0..funcs.len()).map(|i| format!("#{}", w + i)));
+                Ok(rows)
+            }
             Node::Search(_) => Err(err("a Search runs under a Project, which names its columns")),
             Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. } => Err(err("a write runs on its own, not inside a query's plan")),
         }
@@ -1224,6 +1252,7 @@ impl<'a> Ops<'a, '_> {
                 _ => None,
             },
             Node::Filter { input, .. } | Node::Sort { input, .. } | Node::Limit { input, .. } | Node::Distinct { input } | Node::DistinctOn { input, .. } | Node::KeyOrder { input, .. } => self.source(input, i),
+            Node::Window { input, .. } if i < self.columns(input).len() => self.source(input, i),
             _ => None,
         }
     }
@@ -1234,6 +1263,12 @@ impl<'a> Ops<'a, '_> {
             Node::Join { left, right, .. } => [self.columns(left), self.columns(right)].concat(),
             Node::Ref { name } => self.ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name)).map_or_else(Vec::new, |(_, r)| r.columns.clone()),
             Node::Aggregate { keys, aggs, .. } => (0..keys.len() + aggs.len()).map(|i| format!("#{i}")).collect(),
+            Node::Window { input, funcs } => {
+                let mut c = self.columns(input);
+                let w = c.len();
+                c.extend((0..funcs.len()).map(|i| format!("#{}", w + i)));
+                c
+            }
             Node::Filter { input, .. }
             | Node::Sort { input, .. }
             | Node::Limit { input, .. }

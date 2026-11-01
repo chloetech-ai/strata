@@ -197,7 +197,6 @@ fn clauses_the_binder_does_not_run_are_errors() {
         ("SELECT id FROM items FOR UPDATE", "FOR UPDATE"),
         ("SELECT TOP 1 id FROM items", "TOP"),
         ("SELECT id INTO items_copy FROM items", "INTO"),
-        ("SELECT id FROM items WINDOW w AS (ORDER BY price)", "WINDOW"),
     ] {
         match db.sql(bad, &Params::new()) {
             Ok(r) => panic!("{bad}: ran, {r:?}"),
