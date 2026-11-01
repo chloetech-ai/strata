@@ -457,9 +457,13 @@ commits later.
   API requires; a caller wanting to wait must retry. Fix: write merged
   extents into reserved pages before taking the lock. That needs the
   persisted freelist to treat reservations as free.
-* **Merge memory.** All input documents of a merge are in memory at once
-  (bounded by `max_merged_docs`). With 1024-d vectors that is about 4 KB
-  per document plus text. A streaming `build_segment` would remove it.
+* **Merge memory** (resolved 2026-11-01). A merge decodes its inputs in
+  batches of about 32 MB of image, and one of more than
+  `merge_spill_bytes` (64 MB) writes its vectors' float32 rows, its doc
+  store and every finished section to unnamed temporary files as it goes
+  (`segment/spill.rs`), so it holds its builders' working state only. The
+  scale probe's 2M merge peaks at 3.8-3.9 GiB of heap
+  ([`notes/scale.md`](scale.md)).
 * **Space** is returned only by `vacuum` (and tail truncation). Running
   vacuum after a merge would be easy (auto-vacuum).
 * **Long-held snapshots** pin every page freed after them, as in LMDB, so

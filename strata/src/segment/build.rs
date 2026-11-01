@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::schema::{FieldType, Schema};
-use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
+use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter, Spill};
 use crate::forward::StoreBuilder;
 use crate::graph::{EdgeTableBuilder, GraphBuilder};
 use crate::storage::KeyList;
@@ -160,6 +160,8 @@ pub struct SegmentBuild<'a> {
     /// Every document's primary key so far, for the key index and EDGES
     /// fields.
     keys: KeyList,
+    /// Where the sections go as they are finished ([`SegmentBuild::spill_to`]).
+    spill: Option<Arc<Spill>>,
 }
 
 impl<'a> SegmentBuild<'a> {
@@ -207,7 +209,35 @@ impl<'a> SegmentBuild<'a> {
             Some(pk) => KeyList::new(&schema.fields[pk].ty)?,
             None => KeyList::of(false),
         };
-        Ok(SegmentBuild { schema, opts, threads, n_docs, added: 0, fields, slots, store, keys })
+        Ok(SegmentBuild { schema, opts, threads, n_docs, added: 0, fields, slots, store, keys, spill: None })
+    }
+
+    /// Writes each section to `spill` as it is finished, and what grows
+    /// with every document where its builder can (a vector field's float32
+    /// rows, the doc store's blocks), instead of holding them until the
+    /// image is written ([`crate::segment::spill`]): the same image, with
+    /// the build's output on disk rather than in memory. Called before the
+    /// first document.
+    pub fn spill_to(&mut self, spill: Arc<Spill>) -> Result<()> {
+        assert_eq!(self.added, 0, "a build spills from its first document");
+        for slot in &mut self.slots {
+            if let Some(Slot::Index(b)) = slot.get_mut().unwrap_or_else(|e| e.into_inner()) {
+                b.spill_to(&spill)?;
+            }
+        }
+        if let Some(store) = self.store.get_mut().unwrap_or_else(|e| e.into_inner()) {
+            store.spill_to(&spill)?;
+        }
+        self.spill = Some(spill);
+        Ok(())
+    }
+
+    /// A writer for sections, spilling when the build does.
+    fn writer(spill: &Option<Arc<Spill>>, n_docs: usize) -> SegmentWriter {
+        match spill {
+            Some(s) => SegmentWriter::spilling(n_docs, s.clone()),
+            None => SegmentWriter::new(n_docs),
+        }
     }
 
     /// Adds the next documents.
@@ -224,7 +254,7 @@ impl<'a> SegmentBuild<'a> {
         let built = self.batch(docs, true)?;
         // A TEXT field's runs are adjacent tasks, so its sections, written
         // by one of them, land where the field's go.
-        let mut out = SegmentWriter::new(self.n_docs);
+        let mut out = Self::writer(&self.spill, self.n_docs);
         for s in built.into_iter().flatten() {
             out.append(s);
         }
@@ -272,10 +302,10 @@ impl<'a> SegmentBuild<'a> {
         if last {
             tasks.push(Task::Keys);
         }
-        let (fields, slots, store, keys) = (&self.fields, &self.slots, &self.store, &self.keys);
+        let (fields, slots, store, keys, spill) = (&self.fields, &self.slots, &self.store, &self.keys, &self.spill);
         let run = |task: Task| -> Result<Option<SegmentWriter>> {
             let t = Instant::now();
-            let mut out = SegmentWriter::new(n_docs);
+            let mut out = Self::writer(spill, n_docs);
             let name = match task {
                 Task::Slot(j) => {
                     let i = fields[j];

@@ -94,6 +94,11 @@ built on its own. Peak RSS was 1.0-1.3 GiB.
   builder and the segment image. Peak heap was 5.8 GiB for 789K passages and
   8.7 GiB for 1.05M, about 7.9-8.9 KB per passage. A merge at the default 2M
   cap would need about 16-18 GB, more than this machine has.
+  *2026-11-01:* no longer. Merges now decode their inputs in batches and,
+  past 64 MB, write the float32 rows, the doc store and every finished
+  section to temporary files as they go. Merging 2M of these passages
+  (eight 250K segments) at the default cap peaks at 3.8-3.9 GiB of heap, measured
+  ([results](../results/scale/README.md#2m-merge-at-the-default-cap-2026-11-01)).
 * **The file grows past the live data.** Pages a commit frees can be reused
   only two commits later, and a segment needs one contiguous extent. After
   the 2M growth merge the file was 7.54 GiB for 4.19 GiB of live data
@@ -230,7 +235,9 @@ merge memory and throughput.
 * **Vector-index work is where the build cost and the memory are.** HNSW
   construction is 62-66% of load time and 67-76% of merge time. The graph
   is rebuilt from scratch at every merge. Merges need 7.9-8.9 KB of heap
-  per passage, so the default 2M cap needs about 16-18 GB per merge.
+  per passage, so the default 2M cap needs about 16-18 GB per merge
+  (*2026-11-01:* 3.8-3.9 GiB measured since merges batch their inputs and spill
+  their output; items 1 and 2 below are done).
   Vectors are 63% of the bytes on disk. In priority order, the measured
   costs point to:
   1. merges that keep the largest input's graph and insert the other
@@ -255,7 +262,8 @@ measurements.
   segments rewrites every passage about twice, at 2,500-3,400 passages/s,
   which is 19-25 h. On a 32-vCPU machine, divide by the speed-up of the
   HNSW build, which was not measured above 4 threads.
-* Merge memory at the 2M cap: about 16-18 GB per concurrent merge.
+* Merge memory at the 2M cap: about 16-18 GB per concurrent merge
+  (*2026-11-01:* 3.8-3.9 GiB measured).
 
 ## Reproduce
 

@@ -131,3 +131,31 @@ Peak RSS counts the table's file pages that the step read through its mapping; p
 | text body (dict) | 7 | 0.03 |
 | vector emb (hnsw_upper) | 5 | 0.02 |
 | text body (norms) | 1 | 0.00 |
+
+## 2M merge at the default cap (2026-11-01)
+
+Raw steps: [`merge-2m-2026-11-01.jsonl`](merge-2m-2026-11-01.jsonl), from
+`strata-scale` (`load`, then `merge --merge-factor 8 --floor-docs 2000000
+--max-merged-docs 2000000`, 4 threads). The first 2M passages of the table
+above, loaded into eight segments of 250,000 (4.5 GB of image, 64% of it
+float32 rows and doc store), merged into one, once with main before merges
+spilled (`5ca9864`) and once with merges that spill, from the same copy of
+the loaded file. Run 2026-11-01, 05:15-06:05 UTC; the table was loaded
+twice, and the first spilling merge ran while a `cargo` build used the
+cores for about 110 of its seconds.
+
+Machine: Intel(R) Xeon(R) Processor @ 2.10GHz, 4 cores, 15.7 GiB RAM, cloud container (Claude Code on the web).
+
+| step | seconds | HNSW s | text s | peak heap MiB | peak RSS MiB |
+|---|---|---|---|---|---|
+| main, run 1 | 231 | 191 | 119 | 7,281 | 11,585 |
+| main, run 2 | 277 | 195 | 115 | 7,217 | 11,536 |
+| spilling, run 1 (build beside it) | 328 | 246 | 114 | 3,957 | 10,230 |
+| spilling, run 2 | 240 | 196 | 112 | 3,862 | 10,086 |
+
+Peak RSS counts the input file's pages read through its mapping (and, when
+spilling, the mapped float32 rows); peak heap is anonymous memory only. The
+October runs above put a merge at the 2M cap at 16-18 GB of heap, from
+7.9-8.9 KB per passage measured at 0.8M-1.05M, before merges decoded their
+inputs in batches. The merger estimates this merge at 6.95 GB with merges
+that spill (14.2 GB without).

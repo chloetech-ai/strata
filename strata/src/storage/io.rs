@@ -31,6 +31,16 @@ pub fn write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     imp::write_at(f, buf, off)
 }
 
+/// Writes all of `buf` at `off` in a scratch file: one whose name is
+/// removed when it is created and that holds nothing a reopen reads (a
+/// merge's spill, [`crate::segment::spill`]). The call counts, and fails,
+/// as any other; the recorder does not keep the file, whose inode the
+/// next file created may take once it is closed.
+pub fn scratch_write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+    imp::call()?;
+    std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+}
+
 /// Sets the file's length.
 pub fn set_len(f: &File, len: u64) -> io::Result<()> {
     imp::set_len(f, len)

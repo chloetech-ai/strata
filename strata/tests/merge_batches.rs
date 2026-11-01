@@ -1,6 +1,7 @@
 //! A segment built from batches of documents is the same bytes as one built
-//! from all of them at once, and a merge decodes its inputs' documents a
-//! batch at a time, not a whole segment.
+//! from all of them at once, also when the build spills its sections and
+//! growing buffers to disk as it goes, and a merge decodes its inputs'
+//! documents a batch at a time, not a whole segment.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use strata::db::{Db, StoredSource};
 use strata::graph::{edges_value, Edge};
 use strata::query::Params;
 use strata::segment::build::{build_segment, build_segment_from, BuildOptions, GraphStart, SegmentBuild};
-use strata::segment::{DocId, SegmentFile};
+use strata::segment::{DocId, SegmentFile, Spill};
 use strata::storage::{DbOptions, DocumentSource, MergePolicy};
 use strata::text::sparse::to_value;
 use strata::value::{Document, Value};
@@ -31,6 +32,7 @@ fn schema() -> Schema {
             Field::new("emb", FieldType::Vector { dim: 8, index: VectorIndexKind::Hnsw { m: 8, ef_construction: 40 } }),
             Field::new("sp", FieldType::Sparse),
             Field::new("links", FieldType::Edges),
+            Field::new("attrs", FieldType::Json),
         ],
         Some("id"),
     )
@@ -57,6 +59,10 @@ fn docs(n: usize) -> Vec<Document> {
                 Value::Vector(emb.into()),
                 to_value(&sp),
                 edges_value(&links),
+                match i % 9 {
+                    0 => Value::Null,
+                    k => Value::Str(format!(r#"{{"color":"c{}","n":{},"k{k}":{{"w":"{}"}},"tags":["t{}","t{}"]}}"#, rng.gen_range(0..20), rng.gen_range(0..1000), word(&mut rng), rng.gen_range(0..5), rng.gen_range(0..5))),
+                },
             ]
         })
         .collect()
@@ -95,6 +101,127 @@ fn batches_build_the_same_segment() {
     let mut b = SegmentBuild::new(&schema, &opts, 10).unwrap();
     assert!(b.add(&docs[..11]).is_err());
     assert!(SegmentBuild::new(&schema, &opts, 10).unwrap().finish(&docs[..9]).is_err());
+}
+
+/// The vector fields whose builders spill what they hold: rows without a
+/// vector, IVF and flat indexes, binary codes, and multi-vector fields with
+/// and without their float32 vectors.
+fn vector_schema() -> Schema {
+    let hnsw = VectorIndexKind::Hnsw { m: 8, ef_construction: 40 };
+    Schema::new(
+        "v",
+        vec![
+            Field::new("id", FieldType::Int),
+            Field::new("gappy", FieldType::Vector { dim: 24, index: hnsw.clone() }),
+            Field::new("ivf", FieldType::Vector { dim: 16, index: VectorIndexKind::Ivf { nlist: 8 } }),
+            Field::new("flat", FieldType::Vector { dim: 12, index: hnsw.clone() }).stored_only(),
+            Field::new("bits", FieldType::Vector { dim: 64, index: hnsw.clone() }).codes(strata::schema::VectorCodes::Binary),
+            Field::new("patches", FieldType::Vector { dim: 8, index: hnsw.clone() }).multi(),
+            Field::new("kept", FieldType::Vector { dim: 8, index: hnsw }).multi().keep_f32(),
+        ],
+        Some("id"),
+    )
+    .unwrap()
+}
+
+fn vector_docs(n: usize) -> Vec<Document> {
+    fn v(rng: &mut StdRng, dim: usize) -> Value {
+        Value::Vector((0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect::<Vec<f32>>().into())
+    }
+    fn patches(rng: &mut StdRng) -> Value {
+        let k = rng.gen_range(0..4);
+        Value::List((0..k).map(|_| v(rng, 8)).collect())
+    }
+    let mut rng = StdRng::seed_from_u64(5);
+    (0..n)
+        .map(|i| {
+            vec![
+                Value::Int(i as i64),
+                if i % 7 == 3 { Value::Null } else { v(&mut rng, 24) },
+                v(&mut rng, 16),
+                v(&mut rng, 12),
+                v(&mut rng, 64),
+                patches(&mut rng),
+                patches(&mut rng),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn spilled_builds_are_the_same_segment() {
+    for (schema, docs) in [(schema(), docs(12_000)), (vector_schema(), vector_docs(6000))] {
+        let n = docs.len();
+        for threads in [1, 4] {
+            let opts = BuildOptions::default().set("build.threads", threads);
+            let whole = build_segment(&schema, &docs, &opts).unwrap();
+            for sizes in [vec![n], vec![1, n - 1], vec![n / 4; 4], vec![4096, n - 4096, 0]] {
+                let dir = tempfile::tempdir().unwrap();
+                let spill = Spill::new(dir.path(), "t.", None).unwrap();
+                let mut b = SegmentBuild::new(&schema, &opts, n).unwrap();
+                b.spill_to(spill.clone()).unwrap();
+                let mut at = 0;
+                for &k in &sizes[..sizes.len() - 1] {
+                    b.add(&docs[at..at + k]).unwrap();
+                    at += k;
+                }
+                let sections = b.finish(&docs[at..]).unwrap();
+                let mut image = Vec::new();
+                sections.write_to(&mut image).unwrap();
+                let what = format!("{} {threads} threads, batches of {sizes:?}", schema.table);
+                assert!(image == whole, "{what}");
+                // Most of the image went through the spill, whose files
+                // were never in the directory.
+                assert!(spill.written() as usize > whole.len() / 2, "{what}: {} of {} bytes spilled", spill.written(), whole.len());
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "{what}");
+            }
+        }
+    }
+    // A vector graph started from an input's graph, as merges do.
+    let (schema, docs) = (schema(), docs(12_000));
+    let opts = BuildOptions::default().set("build.threads", 2);
+    let input = SegmentFile::from_vec(build_segment(&schema, &docs[2000..7000], &opts).unwrap()).unwrap();
+    let starts = [GraphStart { field: 6, segment: input, base: 2000 }];
+    let whole = build_segment_from(&schema, &docs, &opts, &starts).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = SegmentBuild::with_starts(&schema, &opts, docs.len(), &starts).unwrap();
+    b.spill_to(Spill::new(dir.path(), "t.", None).unwrap()).unwrap();
+    for c in docs[..9000].chunks(3000) {
+        b.add(c).unwrap();
+    }
+    let mut image = Vec::new();
+    b.finish(&docs[9000..]).unwrap().write_to(&mut image).unwrap();
+    assert!(image == whole, "spilled batches with a graph start");
+}
+
+#[test]
+fn merges_that_spill_write_the_same_segment() {
+    let docs = docs(12_000);
+    let mut images = Vec::new();
+    for spill in [0, u64::MAX] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.strata");
+        // A name a process that died while creating a spill file left:
+        // opening removes it.
+        std::fs::write(dir.path().join("m.strata.spill-1-1"), b"left").unwrap();
+        let opts = DbOptions { segment_max_docs: 3000, sync: false, doc_source: Some(Arc::new(StoredSource)), merge_spill_bytes: spill, ..DbOptions::default() };
+        let db = Db::create(&path, schema(), opts).unwrap();
+        db.load(docs.iter().cloned()).unwrap();
+        assert_eq!(db.snapshot().segments().len(), 4);
+        db.storage().merge(&MergePolicy { merge_factor: 4, ..MergePolicy::default() }).unwrap();
+        let snap = db.snapshot();
+        assert_eq!(snap.segments().len(), 1);
+        images.push(snap.segments()[0].file.image().to_vec());
+        let mut names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["m.strata", "m.strata-wal"], "merge_spill_bytes {spill}");
+        // The merged segment answers as it did.
+        let r = db.query("SELECT id FROM t WHERE MATCH(body, 'w1') ORDER BY id LIMIT 3", &Params::new()).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        let r = db.query("SELECT id FROM t WHERE attrs.color = 'c3' AND attrs.tags = 't1' ORDER BY id LIMIT 3", &Params::new()).unwrap();
+        assert_eq!(r.rows.len(), 3);
+    }
+    assert!(images[0] == images[1], "a merge that spills writes the same image as one that does not");
 }
 
 /// The stored-field source, counting what merges ask it for.
