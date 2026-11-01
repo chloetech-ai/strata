@@ -213,6 +213,28 @@ class Database(Search):
         """Every table's schema in its short form, the first first."""
         return [ordered_schema(json.loads(t)) for t in self._db.tables_json()]
 
+    def add_column(self, name: str, type: str, *, table: str | None = None, **options: Any) -> None:
+        """Adds a column to the first table or `table`, as `ALTER TABLE ...
+        ADD COLUMN` does: `options` are the field's, in the short form of a
+        schema (`default`, `not_null`, `indexed`, `embed` and `model`, ...).
+        Rows written before it read it as its default, or None.
+
+            db.add_column("price", "float", default=0.0)
+            db.add_column("emb", "vector", embed=["title"], model="potion-retrieval-32M")
+        """
+        self._db.alter_table_json(json.dumps([{"add": {"name": name, "type": type, **options}}]), table)
+
+    def drop_column(self, name: str, *, table: str | None = None) -> None:
+        """Drops a column of the first table or `table`, with its values,
+        as `ALTER TABLE ... DROP COLUMN` does. The key, and a column another
+        field or the table's options name, stay."""
+        self._db.alter_table_json(json.dumps([{"drop": name}]), table)
+
+    def rename_column(self, old: str, new: str, *, table: str | None = None) -> None:
+        """Renames a column of the first table or `table`, keeping its
+        values; the fields and options that name it follow."""
+        self._db.alter_table_json(json.dumps([{"rename": [old, new]}]), table)
+
     @property
     def embed_errors(self) -> dict[str, str]:
         """Embedded fields whose model did not open, with the reason: rows

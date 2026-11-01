@@ -507,6 +507,16 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a cross-encoder's name that is not a directory's name, or two
+/// of them (`cohere/rerank-v3.5`, a provider's model).
+fn check_path(name: &str) -> Result<()> {
+    let parts: Vec<&str> = name.split('/').collect();
+    if parts.len() > 2 || parts.iter().any(|p| check_name(p).is_err()) {
+        return Err(Error::Query(format!("a ranking model's name is letters, digits, _, - and . (a cross-encoder's may be two such names joined by /, as a provider's model is), not {name:?}")));
+    }
+    Ok(())
+}
+
 impl Models {
     /// The GBDT model `name` of the directory `dir`: its file
     /// `<dir>/<name>/gbdt.json`, read again if it changed since.
@@ -527,17 +537,17 @@ impl Models {
     }
 
     /// The cross-encoder `name` of the directory `dir` (its files under
-    /// `<dir>/<name>`, opened again if one changed since), or the built-in
-    /// one ([`cross_encoder::OVERLAP`]).
+    /// `<dir>/<name>`, opened again if one changed since, or a provider's
+    /// model), or the built-in one ([`cross_encoder::OVERLAP`]).
     pub fn cross_encoder(&self, dir: &Path, name: &str) -> Result<Arc<CrossEncoder>> {
         if name == cross_encoder::OVERLAP {
             return Ok(Arc::new(CrossEncoder::open(name, dir)?));
         }
-        check_name(name)?;
+        check_path(name)?;
         let path = dir.join(name);
-        let stamp: Vec<(SystemTime, u64)> = cross_encoder::FILES
+        let stamp: Vec<(SystemTime, u64)> = cross_encoder::files(name, &path)
             .iter()
-            .map(|f| std::fs::metadata(path.join(f)).map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len())).unwrap_or((SystemTime::UNIX_EPOCH, 0)))
+            .map(|f| std::fs::metadata(f).map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len())).unwrap_or((SystemTime::UNIX_EPOCH, 0)))
             .collect();
         let cached = || -> Option<Arc<CrossEncoder>> {
             let cross = self.cross.lock().unwrap_or_else(|e| e.into_inner());

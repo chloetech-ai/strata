@@ -54,7 +54,7 @@ fn create_unnumbered(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Ar
 /// and ships quickly when it becomes a primary.
 async fn serve(db: Arc<Db>, dir: &Path, name: &str) -> (Arc<Service>, String) {
     let path = dir.join(name);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10));
     svc.keep_slots_in(slots::file_of(&path)).unwrap();
     svc.keep_replication_in(replication::file_of(&path));
@@ -191,6 +191,52 @@ async fn shards_join_and_leave_a_serving_cluster() {
     assert_eq!(cluster["shards"][0]["slots_held"].as_u64().unwrap() + cluster["shards"][1]["slots_held"].as_u64().unwrap(), slots::SLOTS as u64);
 }
 
+/// The rows `sql` reads through `svc`.
+async fn select(svc: &Arc<Service>, sql: &str) -> Vec<Vec<Value>> {
+    svc.query(QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message)).rs.rows
+}
+
+/// ALTER TABLE through a coordinator runs on every shard, and the
+/// coordinator serves the columns it added or renamed, of the first table
+/// and of others; a shard added after is given the altered tables. DROP
+/// COLUMN is refused: the coordinator's plans name columns by place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tables_altered_through_a_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut urls = Vec::new();
+    for s in 0..2 {
+        let name = format!("s{s}.strata");
+        urls.push(serve(create(d, &name, |i| shard_of(&key(i), 2) == s), d, &name).await.1);
+    }
+    let (a, svc) = coordinator(&urls).await;
+    sql(&svc, "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT)").await.unwrap();
+    sql(&svc, "INSERT INTO notes (id, body) VALUES (1, 'one'), (2, 'two'), (3, 'three')").await.unwrap();
+    sql(&svc, "ALTER TABLE notes ADD COLUMN pinned INT DEFAULT 0, RENAME COLUMN body TO text").await.unwrap();
+    sql(&svc, "ALTER TABLE products ADD COLUMN stock INT DEFAULT 5").await.unwrap();
+    sql(&svc, "INSERT INTO notes (id, text, pinned) VALUES (4, 'four', 1)").await.unwrap();
+    let notes = "SELECT id, text, pinned FROM notes ORDER BY id";
+    let want: Vec<Vec<Value>> = [(1, "one", 0), (2, "two", 0), (3, "three", 0), (4, "four", 1)].iter().map(|&(i, t, p)| vec![Value::Int(i), Value::Str(t.into()), Value::Int(p)]).collect();
+    assert_eq!(select(&svc, notes).await, want);
+    assert_eq!(select(&svc, "SELECT COUNT(*) FROM products WHERE stock = 5").await, [[Value::Int(N as i64)]]);
+    assert!(svc.first_table().field("stock").is_some(), "the coordinator serves the first table as altered");
+
+    let e = sql(&svc, "ALTER TABLE notes DROP COLUMN pinned").await.unwrap_err();
+    assert!(e.contains("does not run through a coordinator"), "{e}");
+
+    // A new shard holds the first table as the cluster does, and is given
+    // the others by CREATE TABLE.
+    let db2 = create(d, "s2.strata", |_| false);
+    let (svc2, u2) = serve(db2.clone(), d, "s2.strata").await;
+    let e = a.add_shard(vec![u2.clone()], Acks::All).await.unwrap_err();
+    assert!(e.message.contains("another schema"), "{}", e.message);
+    sql(&svc2, "ALTER TABLE products ADD COLUMN stock INT DEFAULT 5").await.unwrap();
+    a.add_shard(vec![u2], Acks::All).await.unwrap();
+    assert!(db2.catalog().iter().any(|t| t.table == "notes" && t.field("pinned").is_some()));
+    a.refresh(true).await;
+    assert_eq!(select(&svc, notes).await, want, "the coordinator serves the table its shards made differently");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replicas_join_and_leave_a_shard() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,7 +282,7 @@ async fn replicas_join_and_leave_a_shard() {
 
     // A second replica, added to a shard that replicates already.
     let r1db = create(d, "r1.strata", |_| false);
-    let (_, u_r1) = serve(r1db.clone(), d, "r1.strata").await;
+    let (r1, u_r1) = serve(r1db.clone(), d, "r1.strata").await;
     let j = a.add_replica(0, &u_r1, false).await.unwrap();
     assert_eq!(j["replicas"], serde_json::json!([u_r0.clone(), u_r1.clone()]));
     until("the second replica catches up", || async { r1db.snapshot().n_live_docs() == mine.len() as u64 - 1 }).await;
@@ -269,6 +315,33 @@ async fn replicas_join_and_leave_a_shard() {
     assert_eq!((r2.role(), shards[1].role()), (pb::Role::Primary, pb::Role::Replica));
     sql(&svc_a, &format!("DELETE FROM products WHERE id = '{}'", all.iter().find(|id| !mine.contains(id)).unwrap())).await.unwrap();
     assert_eq!(ids(&svc_a).await.len(), N - 2);
+
+    // A table made through the coordinator reaches each shard's replica,
+    // in order with the rows written to it (shard 1's primary is the one
+    // just handed over); a replica that joins later gets it with its copy
+    // of the primary. (No notes while a replica catching up refuses
+    // reads.)
+    let notes = |svc: Arc<Service>| async move {
+        let Ok(a) = svc.query(QueryReq { sql: "SELECT id FROM notes LIMIT 1000".into(), ..Default::default() }).await else { return Vec::new() };
+        let mut v: Vec<String> = a.rs.rows.iter().map(|r| r[0].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    sql(&svc_a, "CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT)").await.unwrap();
+    let values: Vec<String> = (0..20).map(|i| format!("('n{i:02}', 'note {i}')")).collect();
+    sql(&svc_a, &format!("INSERT INTO notes (id, body) VALUES {}", values.join(", "))).await.unwrap();
+    assert_eq!(notes(svc_a.clone()).await.len(), 20);
+    for (primary, replica, rdb) in [(&shards[0], &r1, &r1db), (&r2, &shards[1], &r2db)] {
+        assert_eq!(rdb.catalog(), primary.catalog(), "the replica made the table");
+        until("the replica holds its shard's notes", || async { notes(replica.clone()).await == notes(primary.clone()).await }).await;
+    }
+    let r3db = create(d, "r3.strata", |_| false);
+    let (r3, u_r3) = serve(r3db.clone(), d, "r3.strata").await;
+    a.add_replica(1, &u_r3, false).await.unwrap();
+    until("the third replica holds the notes", || async { notes(r3.clone()).await == notes(r2.clone()).await }).await;
+    assert_eq!(r3db.catalog(), r2.catalog(), "its copy brought the table");
+    sql(&svc_a, "DROP TABLE notes").await.unwrap();
+    until("the replicas drop it too", || async { [&r1db, &r3db].iter().all(|db| db.storage().table("notes").is_none()) }).await;
 }
 
 /// `Configure` refuses the changes of part that would lose writes.

@@ -468,3 +468,48 @@ def test_the_rank_log(db):
     assert len(db.export_rank_log(since=t0 + dt.timedelta(seconds=1))) == 0
     with pytest.raises(strata.StrataError, match="ORDER BY"):
         db.query_logged("SELECT id FROM books WHERE year > 2000")
+
+
+def test_two_rankings_interleaved(db):
+    a = "SELECT id, title FROM books ORDER BY bm25(title, :q) DESC LIMIT 6"
+    b = "SELECT id, title FROM books ORDER BY bm25(title, :q) * (1 + rating) DESC LIMIT 6"
+    ka, kb = db.query(a, q="dragon").keys, db.query(b, q="dragon").keys
+    r = db.query_logged(a, {"q": "dragon"}, context="u1", request="r1", interleave=b, variants=["plain", "rated"])
+    assert r.columns == ["id", "title"] and len(r.keys) == 6 and len(set(r.keys)) == 6
+    assert set(r.teams) <= {"plain", "rated"} and abs(r.teams.count("plain") - r.teams.count("rated")) <= 1
+    # Each row is its team's best row not shown before it.
+    for i, (k, t) in enumerate(zip(r.keys, r.teams)):
+        assert next(x for x in (ka if t == "plain" else kb) if x not in r.keys[:i]) == k
+    # The same request draws the same list.
+    assert db.query_logged(a, {"q": "dragon"}, request="r1", interleave=b, variants=["plain", "rated"]).keys == r.keys
+    records = sorted((x for x in db.export_rank_log() if x["request"] == "r1"), key=lambda x: x["position"])
+    assert [x["row_key"] for x in records] == r.keys and [x["variant"] for x in records] == r.teams
+    assert db.query(a, q="dragon").teams is None
+
+
+def test_columns_added_dropped_and_renamed(tmp_path):
+    schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "title", "type": "text"}, {"name": "n", "type": "int"}]}
+    path = tmp_path / "items.strata"
+    with strata.Database.create(path, schema) as db:
+        db.insert([{"id": "a", "title": "red apple", "n": 1}, {"id": "b", "title": "green pear", "n": 2}])
+        with pytest.raises(strata.StrataError, match="price"):
+            db.insert({"id": "c", "price": 3.0})
+        db.add_column("price", "float", default=1.5)
+        db.add_column("tag", "keyword", table="items")
+        db.insert({"id": "c", "title": "ripe plum", "n": 3, "price": 3.0, "tag": "x"})
+        r = db.query("SELECT id, price, tag FROM items ORDER BY id")
+        assert [list(row.values()) for row in r] == [["a", 1.5, None], ["b", 1.5, None], ["c", 3.0, "x"]]
+        assert [f["name"] for f in db.schema["fields"]] == ["id", "title", "n", "price", "tag"]
+
+        db.rename_column("title", "headline")
+        assert [row["id"] for row in db.query("SELECT id FROM items WHERE MATCH(headline, 'pear')")] == ["b"]
+        db.drop_column("n")
+        with pytest.raises(strata.StrataError, match="no such column"):
+            db.query("SELECT n FROM items")
+        with pytest.raises(strata.StrataError, match="primary key"):
+            db.drop_column("id")
+        # SQL does the same.
+        assert db.sql("ALTER TABLE items ADD COLUMN stock INT NOT NULL DEFAULT 0, DROP COLUMN tag") == 0
+    with strata.Database.open(path) as db:
+        assert [f["name"] for f in db.schema["fields"]] == ["id", "headline", "price", "stock"]
+        assert db.query("SELECT price, stock FROM items WHERE id = 'a'")[0] == {"price": 1.5, "stock": 0}

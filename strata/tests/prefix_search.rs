@@ -265,7 +265,7 @@ fn a_prefix_plan_names_its_feature_and_runs_from_json() {
     let sql = "SELECT id FROM queries WHERE id LIKE 'a!_%' ESCAPE '!' OR PREFIX(id, 'hho') ORDER BY n DESC, id LIMIT 5";
     let plan = db.explain(sql, &none).unwrap();
     assert!(plan.features.iter().any(|f| f == "prefix"), "{:?}", plan.features);
-    let text = plan.explain(&[db.schema()]).join("\n");
+    let text = plan.explain(&[&db.schema()]).join("\n");
     assert!(text.contains("PREFIX(id, 'a_')"), "{text}");
     let again = Plan::from_json(&serde_json::from_str(&plan.to_json_text().unwrap()).unwrap()).unwrap();
     let want = db.query(sql, &none).unwrap().rows;
@@ -281,7 +281,7 @@ fn a_prefix_plan_names_its_feature_and_runs_from_json() {
     let sql = "SELECT id FROM queries WHERE PREFIX(id, 'hwo', fuzzy => 'auto') ORDER BY n DESC, id LIMIT 5";
     let plan = db.explain(sql, &none).unwrap();
     assert!(plan.features.iter().any(|f| f == "prefix_edits"), "{:?}", plan.features);
-    let text = plan.explain(&[db.schema()]).join("\n");
+    let text = plan.explain(&[&db.schema()]).join("\n");
     assert!(text.contains("PREFIX(id, 'hwo', fuzzy => 1)"), "{text}");
     let again = Plan::from_json(&serde_json::from_str(&plan.to_json_text().unwrap()).unwrap()).unwrap();
     let want = db.query(sql, &none).unwrap().rows;

@@ -21,6 +21,17 @@
 //! The model's hash, FNV-1a of its three files, goes into the plans that
 //! use it, as a GBDT model's does ([`crate::query::model`]).
 //!
+//! A model may instead be served elsewhere: a provider's, named
+//! `cohere/rerank-v3.5`, `voyage/rerank-2.5` or
+//! `jina/jina-reranker-v2-base-multilingual` (its key in `COHERE_API_KEY`,
+//! `VOYAGE_API_KEY` or `JINA_API_KEY`), or a server of one of their APIs or
+//! of Hugging Face TEI's (a GPU serving a model too slow for a CPU) that the
+//! model directory's `endpoint.json` names
+//! ([`crate::hosted::RerankEndpoint`]). Each request scores a batch of rows
+//! (feature `hosted`, on by default). A provider's score is its
+//! `relevance_score`, between 0 and 1; TEI's is the logit, as here. The
+//! hash is of the endpoint: its API, URL and model, not its secret.
+//!
 //! `builtin:overlap` needs no files or feature: the share of the query's
 //! distinct words that the text holds, for tests and demos.
 
@@ -35,6 +46,26 @@ pub const FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensor
 
 /// The built-in cross-encoder ([module docs](self)).
 pub const OVERLAP: &str = "builtin:overlap";
+
+/// The file of a model directory naming a server that runs the model
+/// ([module docs](self)).
+pub const ENDPOINT: &str = "endpoint.json";
+
+/// Whether the cross-encoder `name` of the directory `dir` is served
+/// elsewhere: `dir` holds an `endpoint.json`, or holds no weights and
+/// `name` is a provider's ([`crate::hosted::is_reranker_name`]).
+pub fn is_hosted(name: &str, dir: &Path) -> bool {
+    dir.join(ENDPOINT).exists() || (crate::hosted::is_reranker_name(name) && !dir.join("model.safetensors").exists())
+}
+
+/// The files the cross-encoder `name` of `dir` is read from: what a cache
+/// of open models watches for changes.
+pub fn files(name: &str, dir: &Path) -> Vec<std::path::PathBuf> {
+    match is_hosted(name, dir) {
+        true => vec![dir.join(ENDPOINT)],
+        false => FILES.iter().map(|f| dir.join(f)).collect(),
+    }
+}
 
 /// Cross-encoders `strata-server fetch-model` knows by name: name, Hugging
 /// Face repository, and what it is.
@@ -66,6 +97,8 @@ enum Net {
     Overlap,
     #[cfg(feature = "bert")]
     Bert(bert::Bert),
+    #[cfg(feature = "hosted")]
+    Hosted(crate::hosted::HostedReranker),
 }
 
 fn model_err(name: &str, what: impl std::fmt::Display) -> Error {
@@ -78,6 +111,9 @@ impl CrossEncoder {
     pub fn open(name: &str, dir: &Path) -> Result<CrossEncoder> {
         if name == OVERLAP {
             return Ok(CrossEncoder { name: name.into(), hash: "builtin".into(), net: Net::Overlap });
+        }
+        if is_hosted(name, dir) {
+            return Self::hosted(name, dir);
         }
         let mut h = Fnv::default();
         for f in FILES {
@@ -95,9 +131,36 @@ impl CrossEncoder {
         }
     }
 
+    /// A model served elsewhere ([module docs](self)).
+    fn hosted(name: &str, dir: &Path) -> Result<CrossEncoder> {
+        let path = dir.join(ENDPOINT);
+        let config = match path.exists() {
+            true => {
+                let text = std::fs::read_to_string(&path).map_err(|e| model_err(name, format!("{}: {e}", path.display())))?;
+                Some(serde_json::from_str::<serde_json::Value>(&text).map_err(|e| model_err(name, format!("{}: {e}", path.display())))?)
+            }
+            false => None,
+        };
+        let ep = crate::hosted::RerankEndpoint::from_config(name, config.as_ref(), &|k| std::env::var(k).ok()).map_err(|e| model_err(name, e.to_string().trim_start_matches(&format!("model {name}: "))))?;
+        let mut h = Fnv::default();
+        h.read(format!("{:?}\n{}\n{}", ep.api, ep.url, ep.model).as_bytes())?;
+        let hash = format!("{:016x}", h.0);
+        #[cfg(feature = "hosted")]
+        return Ok(CrossEncoder { name: name.into(), hash, net: Net::Hosted(crate::hosted::HostedReranker::new(ep)) });
+        #[cfg(not(feature = "hosted"))]
+        {
+            let _ = hash;
+            Err(model_err(name, "a model served elsewhere is called over HTTP: build Strata with the `hosted` feature"))
+        }
+    }
+
     /// The model's score of each text for `query`, in order. `check` runs
     /// between batches (a query's deadline).
     pub fn score(&self, query: &str, texts: &[&str], check: &mut dyn FnMut() -> Result<()>) -> Result<Vec<f64>> {
+        #[cfg(feature = "hosted")]
+        if let Net::Hosted(m) = &self.net {
+            return m.score(query, texts, check);
+        }
         let mut out = Vec::with_capacity(texts.len());
         for batch in texts.chunks(BATCH) {
             check()?;
@@ -105,6 +168,8 @@ impl CrossEncoder {
                 Net::Overlap => out.extend(batch.iter().map(|t| overlap(query, t))),
                 #[cfg(feature = "bert")]
                 Net::Bert(m) => out.extend(m.score(query, batch).map_err(|e| model_err(&self.name, e))?),
+                #[cfg(feature = "hosted")]
+                Net::Hosted(_) => unreachable!("scored above"),
             }
         }
         Ok(out)

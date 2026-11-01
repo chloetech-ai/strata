@@ -249,7 +249,7 @@ fn distinct_on_over_groups_and_as_a_plan() {
     let q = "SELECT DISTINCT ON (video) id, video FROM clips WHERE lang = 'en' ORDER BY start_ms DESC, id LIMIT 7";
     let plan = db.explain(q, &none).unwrap();
     assert!(plan.features.iter().any(|f| f == "distinct_on") && plan.features.iter().any(|f| f == "operators"), "{:?}", plan.features);
-    let text = plan.explain(&[db.schema()]).join("\n");
+    let text = plan.explain(&[&db.schema()]).join("\n");
     assert!(text.contains("Distinct on: video"), "{text}");
     let again = Plan::from_json(&serde_json::from_str(&plan.to_json_text().unwrap()).unwrap()).unwrap();
     match db.run(&again).unwrap() {

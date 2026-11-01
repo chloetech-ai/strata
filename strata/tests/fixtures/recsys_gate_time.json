@@ -1,0 +1,69 @@
+{
+ "data": {
+  "name": "MovieLens-1M",
+  "users": 6040,
+  "items": 3706,
+  "ratings": 1000209
+ },
+ "protocol": "global time split at the 90th percentile of rating times: sources learn from the ratings before it, rank the items rated before it without the user's own, for each user's first rating after it",
+ "split": {
+  "cutoff": "2000-12-29 23:43:34Z",
+  "test_users": 1178,
+  "left_out_new_items": 2
+ },
+ "model": "ml1m-time",
+ "tolerance": {
+  "recall@10": 0.002,
+  "recall@50": 0.002,
+  "recall@100": 0.002,
+  "ndcg@10": 0.002,
+  "coverage@10": 0.005
+ },
+ "beat_both_baselines": [
+  "encode"
+ ],
+ "sources": {
+  "popularity": {
+   "ndcg@10": 0.0301,
+   "recall@10": 0.0586,
+   "recall@100": 0.2869,
+   "recall@50": 0.1944,
+   "coverage@10": 0.04
+  },
+  "item_knn": {
+   "ndcg@10": 0.0238,
+   "recall@10": 0.0484,
+   "recall@100": 0.1935,
+   "recall@50": 0.1324,
+   "coverage@10": 0.0827
+  },
+  "encode": {
+   "ndcg@10": 0.085,
+   "recall@10": 0.1579,
+   "recall@100": 0.4457,
+   "recall@50": 0.3447,
+   "coverage@10": 0.2042
+  },
+  "maxsim": {
+   "ndcg@10": 0.01,
+   "recall@10": 0.0238,
+   "recall@100": 0.1672,
+   "recall@50": 0.1095,
+   "coverage@10": 0.3551
+  },
+  "next_items": {
+   "ndcg@10": 0.0198,
+   "recall@10": 0.039,
+   "recall@100": 0.1834,
+   "recall@50": 0.1231,
+   "coverage@10": 0.55
+  },
+  "ppr": {
+   "ndcg@10": 0.0293,
+   "recall@10": 0.0594,
+   "recall@100": 0.2148,
+   "recall@50": 0.1511,
+   "coverage@10": 0.3622
+  }
+ }
+}
