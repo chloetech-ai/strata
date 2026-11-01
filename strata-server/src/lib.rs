@@ -9,6 +9,8 @@
 //! * [`agent`]: answers a question in words by letting a Claude model
 //!   query the table.
 //! * [`replication`]: a primary shipping its writes to its replicas.
+//! * [`cores`]: the cluster's protocols as decisions with no I/O, and
+//!   [`sim`], which runs them on a seeded model of a cluster.
 //! * [`media`]: fetching the files MEDIA fields name over HTTP(S).
 //! * [`keys`]: API keys with scopes, and the audit log; [`alerts`]: alert
 //!   rules over the series.
@@ -23,6 +25,7 @@ pub mod alerts;
 pub mod aws;
 pub mod auth;
 pub mod coord;
+pub mod cores;
 pub mod demo;
 pub mod grpc;
 pub mod heap;
@@ -43,6 +46,7 @@ pub mod profiling;
 pub mod replication;
 pub mod server;
 pub mod service;
+pub mod sim;
 pub mod slots;
 pub mod telemetry;
 pub mod ui;
@@ -52,7 +56,7 @@ pub mod pb {
 }
 
 /// An error with the HTTP status it answers with.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiError {
     pub status: u16,
     pub message: String,
