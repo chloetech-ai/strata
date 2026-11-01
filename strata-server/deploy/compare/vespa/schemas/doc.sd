@@ -1,0 +1,134 @@
+# The BEIR collection of engine-compare, as the other engines index it:
+# body analysed by the Lucene chain of linguistics (see services.xml), the
+# structured fields as attributes, and the vectors in an HNSW index of m 16,
+# ef_construction 200, by dot product (full precision, as Solr's).
+schema doc {
+    document doc {
+        field id type string {
+            indexing: summary | attribute
+            attribute: fast-search
+            match: word
+            rank: filter
+        }
+        field title type string {
+            indexing: summary
+        }
+        field text type string {
+            indexing: summary
+        }
+        field body type string {
+            indexing: index
+            index: enable-bm25
+            linguistics {
+                profile {
+                    index: strata
+                    search: strata_query
+                }
+            }
+        }
+        field year type int {
+            indexing: summary | attribute
+            attribute: fast-search
+            rank: filter
+        }
+        field category type string {
+            indexing: summary | attribute
+            attribute: fast-search
+            match: word
+            rank: filter
+        }
+        field rating type float {
+            indexing: summary | attribute
+            attribute: fast-search
+            rank: filter
+        }
+        field topic type string {
+            indexing: summary | attribute
+            attribute: fast-search
+            match: word
+            rank: filter
+        }
+        field emb type tensor<float>(x[1024]) {
+            indexing: attribute | index
+            attribute {
+                distance-metric: dotproduct
+            }
+            index {
+                hnsw {
+                    max-links-per-node: 16
+                    neighbors-to-explore-at-insert: 200
+                }
+            }
+        }
+    }
+
+    fieldset default {
+        fields: body
+    }
+
+    document-summary minimal {
+        summary id {}
+    }
+
+    document-summary lookup {
+        summary id {}
+        summary title {}
+        summary year {}
+        summary rating {}
+    }
+
+    rank-profile bm25 {
+        first-phase {
+            expression: bm25(body)
+        }
+    }
+
+    # decay(year, 2024, 5): halves every 5 years.
+    rank-profile boosted {
+        first-phase {
+            expression: bm25(body) * exp(-0.13862943611198906 * fabs(attribute(year) - 2024))
+        }
+    }
+
+    rank-profile vector {
+        inputs {
+            query(v) tensor<float>(x[1024])
+        }
+        first-phase {
+            expression: closeness(field, emb)
+        }
+    }
+
+    # Similar items: the nearest neighbours of an item's vector.
+    rank-profile similar {
+        inputs {
+            query(i) tensor<float>(x[1024])
+        }
+        first-phase {
+            expression: closeness(field, emb)
+        }
+    }
+
+    # Hybrid: the union of the lexical matches and the knn top 100, first
+    # ranked by their sum, then the best 200 re-ranked over the whole
+    # result (global phase): by RRF (k 60) or by min-max normalised scores.
+    rank-profile hybrid_rrf inherits vector {
+        first-phase {
+            expression: bm25(body) + closeness(field, emb)
+        }
+        global-phase {
+            expression: reciprocal_rank_fusion(bm25(body), closeness(field, emb))
+            rerank-count: 200
+        }
+    }
+
+    rank-profile hybrid_weighted inherits vector {
+        first-phase {
+            expression: bm25(body) + closeness(field, emb)
+        }
+        global-phase {
+            expression: 0.2 * normalize_linear(bm25(body)) + 0.8 * normalize_linear(closeness(field, emb))
+            rerank-count: 200
+        }
+    }
+}
