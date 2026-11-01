@@ -238,7 +238,23 @@ async fn a_primary_ships_its_profiles_and_tables_to_its_replicas() {
     sql(&p, "DROP TABLE notes").await.unwrap();
     assert!(rdb.storage().table("notes").is_none());
     assert_eq!(rdb.storage().seq_no(), pdb.storage().seq_no());
-    // No replica applies an ALTER TABLE yet, so a primary refuses it.
-    let e = sql(&p, "ALTER TABLE products ADD COLUMN stock INT").await.err().unwrap();
-    assert!(e.contains("does not reach replicas yet"), "{e}");
+    // And a table's columns: added, written, renamed and dropped on the
+    // primary, and on the replica in order with the rows, under the same
+    // field ids.
+    let SqlAnswer::Written { w, .. } = sql(&p, "ALTER TABLE products ADD COLUMN stock INT DEFAULT 0").await.unwrap() else { panic!("written") };
+    assert_eq!(w.seq_no, pdb.storage().seq_no().map(|n| n.seq), "a numbered transaction of its own");
+    assert_eq!(rdb.catalog(), pdb.catalog());
+    sql(&p, "UPDATE products SET stock = 7 WHERE id = 'p0000003'").await.unwrap();
+    let stock = |db: &Db, column: &str, id: &str| db.query(&format!("SELECT {column} FROM products WHERE id = '{id}'"), &Params::new()).unwrap().rows;
+    assert_eq!(stock(&rdb, "stock", "p0000003"), [[Value::Int(7)]]);
+    assert_eq!(stock(&rdb, "stock", "p0000004"), [[Value::Int(0)]], "a row from before reads the default");
+    sql(&p, "ALTER TABLE products RENAME COLUMN stock TO on_hand").await.unwrap();
+    sql(&p, "ALTER TABLE products DROP COLUMN reviews").await.unwrap();
+    assert_eq!(rdb.catalog(), pdb.catalog());
+    assert_eq!(stock(&rdb, "on_hand", "p0000003"), [[Value::Int(7)]]);
+    let kettles = "SELECT id, score() FROM products WHERE on_hand = 0 ORDER BY bm25(body, 'kettle') DESC LIMIT 10";
+    same(kettles, &query(&p, kettles).await.unwrap(), &query(&r, kettles).await.unwrap());
+    let e = sql(&r, "ALTER TABLE products ADD COLUMN x INT").await.err().unwrap();
+    assert!(e.contains("replica"), "{e}");
+    assert_eq!(rdb.storage().seq_no(), pdb.storage().seq_no());
 }
