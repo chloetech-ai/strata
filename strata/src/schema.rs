@@ -779,6 +779,29 @@ impl Schema {
         self.fields.len() == other.fields.len() && plain(self) == plain(other)
     }
 
+    /// Whether this schema is `earlier`, or one that `ALTER TABLE` could
+    /// have made of it ([`Schema::altered`]): the same table and key, each
+    /// column of `earlier` either gone or kept under its id with its type
+    /// (renamed, maybe), and every other column numbered from `earlier`'s
+    /// [`Schema::next_field_id`] on. A replica checks a table its primary
+    /// altered, and the first table of a copy of its primary, this way
+    /// ([`crate::storage::Database::apply_shipped`],
+    /// [`crate::storage::Database::install_copy`]).
+    pub fn follows(&self, earlier: &Schema) -> bool {
+        if self == earlier {
+            return true;
+        }
+        if self.is_legacy() || earlier.is_legacy() || !self.table.eq_ignore_ascii_case(&earlier.table) || self.next_field_id < earlier.next_field_id {
+            return false;
+        }
+        let key = |s: &Schema| s.primary_key.and_then(|k| s.fields.get(k)).map(|f| f.id);
+        key(self) == key(earlier)
+            && self.fields.iter().all(|f| match earlier.fields.iter().find(|e| e.id == f.id) {
+                Some(e) => e.ty == f.ty,
+                None => f.id >= earlier.next_field_id,
+            })
+    }
+
     /// What of this table names column `name` (any case) besides the
     /// column itself: another field (as a source of its text, vectors,
     /// caption or semantic IDs) or one of the table's options.

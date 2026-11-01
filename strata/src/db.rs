@@ -305,6 +305,17 @@ impl Db {
         let before = self.table(table)?;
         self.storage.alter_table(table, alters)?;
         let after = self.table(table)?;
+        self.columns_changed(&before, &after);
+        Ok(())
+    }
+
+    /// Makes the models of a table follow its columns, which `ALTER TABLE`
+    /// changed from `before` to `after` (here, or on the primary that
+    /// shipped the change): a renamed column keeps its model, and so does
+    /// one whose sources are renamed; a dropped one loses it; an added one,
+    /// or one whose model is another now, gets its own after
+    /// [`Db::open_embedders`].
+    fn columns_changed(&self, before: &Schema, after: &Schema) {
         // A model serves a field by its table's and its own name, and the
         // spec it was given; the field it served, by id, now.
         let now = |field: &str| before.field(field).and_then(|b| after.fields.iter().find(|a| a.id == b.id).map(|a| (b, a)));
@@ -315,7 +326,7 @@ impl Db {
             }
             let Some((b, a)) = now(&m.field) else { return false };
             if let (Some(was), Some(is)) = (&b.embed, &a.embed) {
-                if *was == m.embed {
+                if *was == m.embed && was.model == is.model {
                     m.embed = is.clone();
                 }
             }
@@ -328,7 +339,7 @@ impl Db {
             }
             let Some((b, a)) = now(&m.field) else { return false };
             if let (Some(was), Some(is)) = (&b.derive, &a.derive) {
-                if *was == m.derive {
+                if *was == m.derive && was.model == is.model {
                     m.derive = is.clone();
                 }
             }
@@ -337,10 +348,10 @@ impl Db {
         });
         let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(dir) = dir {
-            let added = |f: &crate::schema::Field| before.fields.iter().all(|b| b.id != f.id);
-            self.open_models_of(&after.table, &dir, added);
+            let model = |f: &crate::schema::Field| (f.embed.as_ref().map(|e| e.model.clone()), f.derive.as_ref().map(|d| d.model.clone()));
+            let new = |f: &crate::schema::Field| before.fields.iter().find(|b| b.id == f.id).is_none_or(|b| model(b) != model(f));
+            self.open_models_of(&after.table, &dir, new);
         }
-        Ok(())
     }
 
     /// Drops a table other than the first ([`Database::drop_table`]).
@@ -376,9 +387,10 @@ impl Db {
         r
     }
 
-    /// Opens the models of the tables made since the catalog was `before`
-    /// (or whose schema changed), as [`Db::create_table`] does, and forgets
-    /// those of the tables gone.
+    /// Opens the models of the tables made since the catalog was `before`,
+    /// as [`Db::create_table`] does, and forgets those of the tables gone.
+    /// Those of a table whose columns changed follow them, as they do on
+    /// the primary that altered it ([`Db::alter_table`]).
     fn tables_changed(&self, before: &[Arc<Schema>]) {
         let now = self.catalog();
         if now.len() == before.len() && now.iter().zip(before).all(|(a, b)| a == b) {
@@ -388,9 +400,15 @@ impl Db {
         let dir = self.models.read().unwrap_or_else(|e| e.into_inner()).clone();
         let models = dir.clone().unwrap_or_else(crate::embed::models_dir);
         for t in now.iter().filter(|t| !before.contains(t)) {
-            if let Some(dir) = &dir {
-                self.open_embedders_of(&t.table, dir);
+            match before.iter().find(|b| b.table.eq_ignore_ascii_case(&t.table)).filter(|b| t.follows(b)) {
+                Some(b) => self.columns_changed(b, t),
+                None => {
+                    if let Some(dir) = &dir {
+                        self.open_embedders_of(&t.table, dir);
+                    }
+                }
             }
+            // By the place of their field, which a copy may have moved.
             self.open_codebooks_of(&t.table, &models);
         }
     }

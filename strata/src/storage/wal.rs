@@ -17,6 +17,10 @@
 //!                 the id of the table record before it) as JSON text, or
 //!                 NULL where that table is dropped; only in a shipped
 //!                 transaction, never in a log
+//!          kind 8 table alter: the schema of the table of the id of the
+//!                 table record before it, then the one `ALTER TABLE` made
+//!                 of it (its columns keep their ids), each as JSON text;
+//!                 only in a shipped transaction, never in a log
 //! ```
 //!
 //! A log whose records use a feature logs in `STRWAL02`, whose header
@@ -29,10 +33,12 @@
 //! feature it does not know. Others log in `STRWAL01`, as before.
 //!
 //! A change of tables is not logged: it is a version of its own
-//! ([`crate::storage::Database::create_table`]). In a database that numbers
+//! ([`crate::storage::Database::create_table`],
+//! [`crate::storage::Database::alter_table`]). In a database that numbers
 //! its writes it takes a number all the same, and the ship log keeps it as
-//! a transaction of table def records, which a replica applies by making
-//! the same change ([`crate::storage::Database::apply_shipped`]).
+//! a transaction of table def or table alter records, which a replica
+//! applies by making the same change
+//! ([`crate::storage::Database::apply_shipped`]).
 //!
 //! A transaction is its operation records followed by a commit record,
 //! written with one `write` and made durable with one `fdatasync`. Replay
@@ -87,6 +93,7 @@ const SET: u8 = 4;
 const TABLE: u8 = 5;
 const PROFILE: u8 = 6;
 const TABLE_DEF: u8 = 7;
+const TABLE_ALTER: u8 = 8;
 
 /// One logged operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +110,18 @@ pub enum Op {
     /// with this id. Never logged, only shipped: a change of tables is a
     /// version of its own.
     Table { def: Option<Arc<Schema>> },
+    /// Gives the table with this id, whose schema is `was`, the schema
+    /// `ALTER TABLE` made of it ([`Schema::altered`]), whose columns keep
+    /// their ids. Never logged, only shipped, as [`Op::Table`].
+    Alter { was: Arc<Schema>, def: Arc<Schema> },
+}
+
+impl Op {
+    /// Whether this changes tables ([`Op::Table`], [`Op::Alter`]) rather
+    /// than a table's rows or profiles.
+    pub fn changes_tables(&self) -> bool {
+        matches!(self, Op::Table { .. } | Op::Alter { .. })
+    }
 }
 
 /// A committed transaction read back from the log: its sequence number
@@ -268,7 +287,7 @@ impl Wal {
         if !self.profiles && ops.iter().any(|(_, op)| matches!(op, Op::Profile { .. })) {
             return Err(Error::Schema("a rank profile, in a log that does not name rank_profiles (Wal::allow_profiles)".into()));
         }
-        if ops.iter().any(|(_, op)| matches!(op, Op::Table { .. })) {
+        if ops.iter().any(|(_, op)| op.changes_tables()) {
             return Err(Error::Schema("a change of tables is not logged: it is a version of its own".into()));
         }
         let buf = encode_txn(txn, seq, ops);
@@ -403,6 +422,12 @@ pub(crate) fn encode_txn(txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)]) -> Vec
                 let def = def.as_ref().map(|s| serde_json::to_string(&**s).expect("a schema serialises"));
                 put_value(&mut body, &def.map_or(Value::Null, Value::Str));
             }
+            Op::Alter { was, def } => {
+                body.push(TABLE_ALTER);
+                for s in [was, def] {
+                    put_value(&mut body, &Value::Str(serde_json::to_string(&**s).expect("a schema serialises")));
+                }
+            }
         }
         frame(&mut out, &body);
     }
@@ -508,8 +533,8 @@ fn commits_after(rest: &[u8], last: u64, numbered: bool) -> Vec<u64> {
 /// length of the prefix they occupy, up to the first operation that does
 /// not `fit`. In a `numbered` log, sequence numbers rise from one
 /// transaction to the next and terms never fall; one that does not is
-/// damage too. Table def records are read only in a `shipped`
-/// transaction: a log holds none.
+/// damage too. Table def and table alter records are read only in a
+/// `shipped` transaction: a log holds none.
 fn decode(buf: &[u8], numbered: bool, shipped: bool, fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
     let mut txns = Vec::new();
     let mut ops = Vec::new();
@@ -559,6 +584,16 @@ fn decode(buf: &[u8], numbered: bool, shipped: bool, fits: &dyn Fn(u32, &Op) -> 
                 },
                 _ => break,
             },
+            TABLE_ALTER if shipped => {
+                let mut schema = || match get_value(&mut r) {
+                    Ok(Value::Str(s)) => serde_json::from_str::<Schema>(&s).ok().map(Arc::new),
+                    _ => None,
+                };
+                match (schema(), schema()) {
+                    (Some(was), Some(def)) => Ok(Op::Alter { was, def }),
+                    _ => break,
+                }
+            }
             COMMIT => {
                 let (Ok(txn), Ok(n)) = (r.u64(), r.u32()) else { break };
                 let seq = match numbered {
@@ -966,13 +1001,15 @@ mod tests {
         }
     }
 
-    /// Table def records round-trip in a shipped transaction, are damage
-    /// in a log, and are never appended to one.
+    /// Table def and table alter records round-trip in a shipped
+    /// transaction, are damage in a log, and are never appended to one.
     #[test]
     fn table_defs_are_shipped_never_logged() {
-        use crate::schema::{Field, FieldType};
+        use crate::schema::{Alter, Field, FieldType};
         let schema = Schema::new("u", vec![Field::new("id", FieldType::Int), Field::new("x", FieldType::Float)], Some("id")).unwrap();
-        let ops = vec![(3, Op::Table { def: Some(Arc::new(schema)) }), (2, Op::Table { def: None })];
+        let altered = schema.altered(&Alter::RenameField { from: "x".into(), to: "y".into() }).unwrap();
+        let schema = Arc::new(schema);
+        let ops = vec![(3, Op::Table { def: Some(schema.clone()) }), (2, Op::Table { def: None }), (4, Op::Alter { was: schema, def: Arc::new(altered) })];
         let seq = Some(SeqNo { term: 2, seq: 9 });
         let buf = encode_txn(4, seq, &ops);
         assert_eq!(decode_shipped(&buf, &any).unwrap(), WalTxn { txn: 4, seq, ops: ops.clone() });
