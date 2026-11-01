@@ -50,6 +50,7 @@ kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
 | `tokenSecret` | | a Secret whose key `token` every server and coordinator requires; without it they run with `--no-token`, open to whatever reaches them |
 | `clusterTokenSecret` | | a Secret whose key `token` is the cluster's own token (`--cluster-token`), which the servers and coordinators send each other and clients never hold; with it, the `tokenSecret` token goes to the coordinators alone, as the admin token (the operator's too), and may not make the calls between servers. Needs `tokenSecret` |
 | `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args`, `coordinatorArgs` | `strata-server:dev` | the servers' image, containers and further arguments (`args` for every server, `coordinatorArgs` for every coordinator: `--hedge-ms 50`, `--partial`) |
+| `rollout` | `{holdAfterSeconds: 30, soakSeconds: 0}` | how a change is made: `paused`, `gates` (limits on `p99Ms`, `errorRatio`, `replicaBehind`, `diskUsedRatio`: one over its limit for `holdAfterSeconds` holds the change), and `soakSeconds`, how long a restarted copy serves before the next restarts. Not part of a version: changing it restarts nothing |
 
 What a change does:
 
@@ -86,15 +87,48 @@ What a change does:
   a coordinator that starts again finds the cluster; their number follows
   `coordinators`.
 
+Every step but those that heal can be held back:
+
+- **Paused** (`rollout.paused: true`): the operator takes no step toward
+  the spec (no copy or shard added or removed, no slot moved, no copy
+  restarted; a slot move under way stops once its run ends) until it is
+  false again. A copy that comes back without its volume still joins its
+  shard again. The phase is `Paused`.
+- **Held by a gate**: the operator reads the cluster's live numbers from
+  the coordinator before each step: the search p99 and the share of failed
+  searches its clients see, the most transactions a replica is behind,
+  and the fullest volume. A gate over its limit for `holdAfterSeconds`
+  holds the change where it is (`status.rollout.held` says which, at what
+  number); nothing done is undone. The hold lasts until it is resumed
+  (`POST /v1/admin/kube/resume`, which writes the annotation
+  `strata.chloetech.ai/resume` naming the hold, and starts the gates' clocks
+  again), its gate's limit changes, or the spec changes.
+- **A rollback** (`POST /v1/admin/kube {"rollback": version}`) sets the
+  spec back to an earlier version of `status.history`, its `rollout` kept,
+  and marks the new version with the annotation
+  `strata.chloetech.ai/rollback`: no gate holds it, so that it goes through
+  while the version it leaves is unwell.
+
+The status keeps the last 20 versions of the spec (`status.history`: each
+one's spec, when it was made, by whom when it came through a coordinator,
+when it first ran everywhere, and the version a rollback restores), the
+operator's last 50 messages (`status.log`), and the change under way
+(`status.rollout`: the gates' clocks, the hold, the copies still on older
+settings).
+
 The coordinators run as the service account `<cluster>-coordinator`, which
 a Role lets read and patch their own `StrataCluster` and nothing else: the
 command center's **Control center** (`kubectl -n strata port-forward
 svc/demo 7700`, then `http://127.0.0.1:7700/#/control`) edits the whole
 spec as a draft, with the operator's plan for it, and applies it, and the
 **Cluster** view shows the operator's phase and message; the operator then
-makes the change as above. Both go through `POST /v1/admin/kube/plan` and
-`POST /v1/admin/kube`, which take `{"spec": {...}}`, a merge patch of the
-spec, checked first.
+makes the change as above; **Rollout** (`#/rollout`) follows it step by
+step with its timeline, pauses and resumes it, sets the gates by dragging
+each limit on its own live chart, and lists the versions with their diffs
+and a rollback that shows its plan first. They go through
+`POST /v1/admin/kube/plan` and `POST /v1/admin/kube`, which take
+`{"spec": {...}}`, a merge patch of the spec, or `{"rollback": version}`,
+checked first, and `POST /v1/admin/kube/resume`.
 
 The operator does not choose primaries: the copies of a shard elect one
 among themselves ([failover](../../docs/strata/server.md#failover)), so a
@@ -119,9 +153,12 @@ strata-server/deploy/kind-test.sh scale 2 2   # back to two, a copy fewer each
 
 Its tests: `tests/operator.rs` runs the same steps with server processes
 standing in for pods (a cluster made, grown, healed and shrunk, every row
-kept, and every copy restarted with new settings one at a time), and
+kept; paused while its slots move; every copy restarted with new settings
+one at a time; a rollout paused, held by a gate, resumed and held again,
+then let through with each restarted copy serving a second first), and
 `tests/operator_kube.rs` makes a cluster's objects, rolls new settings into
-a set and grows its volumes on a real API server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
+a set, grows its volumes, and keeps its versions, resumes a hold and rolls
+back on a real API server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
 as `setup-envtest` downloads them).
 
 ## The fixed layout

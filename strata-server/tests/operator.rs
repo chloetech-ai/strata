@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as Json};
-use strata_server::operator::{reconcile, Admin, Phase, Platform, Set, Spec};
+use strata_server::operator::{noted, reconcile, Admin, Gates, Outcome, Phase, Platform, Rollout, RolloutSpec, Set, Spec};
 
 const ROWS: usize = 300;
 
@@ -266,7 +266,7 @@ impl Platform for Procs {
         Ok(())
     }
 
-    async fn grow_volumes(&self, _size: &str) -> Result<usize, String> {
+    async fn grow_volumes(&self, _size: &str, _apply: bool) -> Result<usize, String> {
         // A directory has no size.
         Ok(0)
     }
@@ -285,30 +285,51 @@ struct Run {
     procs: Procs,
     admin: Admin,
     spec: Spec,
+    /// What the last step left for the next (the resource's
+    /// `status.rollout`).
+    rollout: Mutex<Rollout>,
 }
 
 impl Run {
-    /// Steps until the cluster is as the spec says, with every step's
-    /// message.
-    async fn settle(&self, what: &str) -> Vec<String> {
+    fn new(procs: Procs, admin: Admin, spec: Spec) -> Run {
+        Run { procs, admin, spec, rollout: Mutex::new(Rollout::default()) }
+    }
+
+    /// One step toward the spec.
+    async fn once(&self) -> Outcome {
+        *self.procs.spec.lock().unwrap() = self.spec.clone();
+        let before = self.rollout.lock().unwrap().clone();
+        let out = reconcile(&self.spec, &self.procs, &self.admin, &before).await;
+        *self.rollout.lock().unwrap() = out.rollout.clone();
+        out
+    }
+
+    /// Steps until `done` holds of a step, with every step's message.
+    async fn until(&self, what: &str, done: impl Fn(&Outcome) -> bool) -> (Outcome, Vec<String>) {
         let t0 = Instant::now();
         let mut said: Vec<String> = Vec::new();
-        *self.procs.spec.lock().unwrap() = self.spec.clone();
         loop {
-            let out = reconcile(&self.spec, &self.procs, &self.admin).await;
+            let out = self.once().await;
             if said.last() != Some(&out.message) {
                 said.push(out.message.clone());
             }
-            match out.phase {
-                Phase::Ready => return said,
-                Phase::Failed => panic!("{what}: failed: {}\n{}", out.message, said.join("\n")),
-                _ => {}
+            if done(&out) {
+                return (out, said);
+            }
+            if out.phase == Phase::Failed {
+                panic!("{what}: failed: {}\n{}", out.message, said.join("\n"));
             }
             if t0.elapsed() > Duration::from_secs(120) {
-                panic!("{what}: not ready after 120 s:\n{}\n{}", said.join("\n"), self.procs.logs());
+                panic!("{what}: not there after 120 s:\n{}\n{}", said.join("\n"), self.procs.logs());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Steps until the cluster is as the spec says, with every step's
+    /// message.
+    async fn settle(&self, what: &str) -> Vec<String> {
+        self.until(what, |o| o.phase == Phase::Ready).await.1
     }
 
     async fn sql(&self, sql: &str) -> Json {
@@ -328,6 +349,20 @@ impl Run {
         self.admin.call(reqwest::Method::GET, "/v1/cluster", None).await.unwrap()
     }
 
+    /// Every server started with `--slow-ms` `ms`.
+    async fn slow_ms_everywhere(&self, ms: f64) {
+        let servers: Vec<u16> = self.procs.state.lock().unwrap().sets.values().flat_map(|(_, pods)| pods.values().map(|p| p.http)).collect();
+        assert_eq!(servers.len(), 9);
+        for http in servers {
+            let mut r = reqwest::Client::new().get(format!("http://127.0.0.1:{http}/v1/profile/settings"));
+            if let Some((_, cluster)) = &self.procs.tokens {
+                r = r.bearer_auth(cluster);
+            }
+            let j: Json = r.send().await.unwrap().json().await.unwrap();
+            assert_eq!(j["started_slow_ms"], json!(ms), "{http}: {j}");
+        }
+    }
+
     /// Servers per shard and slots per shard.
     async fn shape(&self) -> (Vec<usize>, Vec<u64>) {
         let c = self.cluster().await;
@@ -342,7 +377,7 @@ async fn a_cluster_is_made_grown_shrunk_and_healed() {
     let procs = Procs::new(dir.path(), None);
     let admin = Admin::new(&format!("http://127.0.0.1:{}", procs.coordinator_port), None);
     let spec = Spec { shards: 2, replicas: 2, demo: Some(ROWS), failover_after_ms: 1000, ..Spec::default() };
-    every_step(&mut Run { procs, admin, spec }).await;
+    every_step(&mut Run::new(procs, admin, spec)).await;
 }
 
 /// The same steps with a cluster token: the operator holds the admin
@@ -362,7 +397,7 @@ async fn a_cluster_with_its_own_token_is_made_grown_shrunk_and_healed() {
         cluster_token_secret: Some("inner".into()),
         ..Spec::default()
     };
-    let mut run = Run { procs, admin, spec };
+    let mut run = Run::new(procs, admin, spec);
     every_step(&mut run).await;
     // A server takes the cluster's token, not the admin's.
     let server = run.procs.state.lock().unwrap().sets[&0].1[&0].http;
@@ -390,9 +425,27 @@ async fn every_step(run: &mut Run) {
     }
     assert_eq!(run.sold().await, sum);
 
-    // A third shard, which takes a third of the slots.
+    // A third shard, which takes a third of the slots. Paused while they
+    // move, the moves stop after the one under way, and go on once the
+    // pause is lifted.
     run.spec.shards = 3;
-    let said = run.settle("three shards").await;
+    let (_, mut said) = run.until("moving", |o| o.message.contains("evening out the slots")).await;
+    run.spec.rollout.paused = true;
+    let (out, more) = run.until("paused", |o| o.phase == Phase::Paused).await;
+    said.extend(more);
+    assert!(out.message.starts_with("paused (spec.rollout.paused); next:"), "{out:?}");
+    let t0 = Instant::now();
+    while run.admin.call(reqwest::Method::GET, "/v1/admin/moves", None).await.unwrap()["job"]["state"] == "running" {
+        assert!(t0.elapsed() < Duration::from_secs(30), "the slot moves did not stop: {said:?}");
+        assert_eq!(run.once().await.phase, Phase::Paused);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for _ in 0..5 {
+        let o = run.once().await;
+        assert!(o.phase == Phase::Paused && o.message.contains("slots"), "{o:?}");
+    }
+    run.spec.rollout.paused = false;
+    said.extend(run.settle("three shards").await);
     assert!(said.iter().any(|m| m.contains("joins the cluster")) && said.iter().any(|m| m.contains("evening out the slots")), "{said:?}");
     let (servers, slots) = run.shape().await;
     assert_eq!(servers, vec![2, 2, 2]);
@@ -427,19 +480,48 @@ async fn every_step(run: &mut Run) {
     let said = run.settle("new settings").await;
     assert!(said.iter().any(|m| m.contains("restarting") && m.contains("with the new settings")), "{said:?}");
     assert!(said.iter().any(|m| m.contains("before") && m.contains("restarts with the new settings")), "{said:?}");
-    let servers: Vec<u16> = run.procs.state.lock().unwrap().sets.values().flat_map(|(_, pods)| pods.values().map(|p| p.http)).collect();
-    assert_eq!(servers.len(), 9);
-    for http in servers {
-        let mut r = reqwest::Client::new().get(format!("http://127.0.0.1:{http}/v1/profile/settings"));
-        if let Some((_, cluster)) = &run.procs.tokens {
-            r = r.bearer_auth(cluster);
-        }
-        let j: Json = r.send().await.unwrap().json().await.unwrap();
-        assert_eq!(j["started_slow_ms"], json!(777.0), "{http}: {j}");
-    }
+    run.slow_ms_everywhere(777.0).await;
     assert!(run.procs.stale(&run.spec).await.unwrap().is_empty());
     assert_eq!(run.shape().await.0, vec![3, 3, 3]);
     assert_eq!((run.count().await, run.sold().await), (ROWS as i64, sum));
+
+    // Paused, the next settings wait.
+    run.spec.args = vec!["--slow-ms".into(), "778".into()];
+    run.spec.rollout.paused = true;
+    let (out, _) = run.until("paused", |o| o.phase == Phase::Paused).await;
+    assert!(out.message.starts_with("paused") && out.message.contains("restarting") && out.message.contains("(9 copies left)"), "{out:?}");
+    assert!(out.rollout.paused && out.rollout.stale.len() == 9 && out.rollout.copies == 9, "{:?}", out.rollout);
+    for _ in 0..10 {
+        assert_eq!(run.once().await.phase, Phase::Paused);
+    }
+    assert_eq!(run.procs.stale(&run.spec).await.unwrap().len(), 9, "no copy restarts while paused");
+    // Gated: the fullest volume over 0.01% of its disk, which every volume
+    // here is, for a second holds the rollout, until it is resumed.
+    run.spec.rollout = RolloutSpec { paused: false, gates: Gates { disk_used_ratio: Some(0.0001), ..Gates::default() }, hold_after_seconds: 1, soak_seconds: 1 };
+    let (held, _) = run.until("held", |o| o.rollout.held.is_some()).await;
+    let h = held.rollout.held.clone().unwrap();
+    assert!(h.gate == "diskUsedRatio" && h.text.starts_with("the fullest volume was") && h.text.contains("over its 0.01% limit"), "{h:?}");
+    assert!(held.phase == Phase::Paused && held.message.starts_with("held: the fullest volume was"), "{held:?}");
+    for _ in 0..10 {
+        let o = run.once().await;
+        assert_eq!((o.phase, o.rollout.held.as_ref()), (Phase::Paused, Some(&h)), "{o:?}");
+    }
+    let left = run.procs.stale(&run.spec).await.unwrap().len();
+    assert!((7..=9).contains(&left), "{left} copies left: a second goes before the gate holds");
+    // A resume starts the gate's clock again: a second later it holds again.
+    let resumed = noted(run.rollout.lock().unwrap().clone(), Some(&h.at_ms.to_string()), None, &run.spec);
+    assert!(resumed.held.is_none() && resumed.gates.iter().all(|g| g.over_since_ms.is_none()), "{resumed:?}");
+    *run.rollout.lock().unwrap() = resumed;
+    let (again, _) = run.until("held again", |o| o.rollout.held.is_some()).await;
+    assert!(again.rollout.held.as_ref().unwrap().at_ms > h.at_ms, "{again:?}");
+    // Its limit raised over the number, the hold lifts, and the rest
+    // restart, each restarted copy serving a second before the next.
+    run.spec.rollout.gates.disk_used_ratio = Some(1.0);
+    let said = run.settle("gate raised").await;
+    assert!(said.iter().any(|m| m.contains("serves 1 s with them before the next restarts")), "{said:?}");
+    run.slow_ms_everywhere(778.0).await;
+    assert_eq!((run.count().await, run.sold().await), (ROWS as i64, sum));
+    run.spec.rollout = RolloutSpec::default();
 
     // Two copies each again. The highest copy of the first set is made its
     // shard's primary first: it hands the primary over before it goes.
