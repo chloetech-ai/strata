@@ -62,7 +62,8 @@ window.STRATA_BENCH = {
       dataset: "Shop: Amazon Reviews 2023, Video Games (137K products, 4.6M reviews, 2.8M users)",
       plan: [
         "SQLite 3.53 in WAL mode at synchronous=FULL and NORMAL, and DuckDB 1.x, each driven the way an app uses it",
-        "Load, open and first query, get by key, writes per durable transaction, list pages, aggregates, joins, a mixed 1-writer 4-reader load, footprint",
+        "Load, open and first query, get by key, list pages, aggregates, joins, a mixed 1-writer 4-reader load, footprint",
+        "Writes, updates and a stream of events, against SQLite, DuckDB and LanceDB: rows a second, p50 and p99 per write, and the time until a write is visible to a query; every write is read back",
         "Where Strata loses (DuckDB on scans and large aggregates, SQLite perhaps on single-row durable writes), the table says so"
       ],
       charts: [
@@ -82,15 +83,44 @@ window.STRATA_BENCH = {
           ]
         },
         {
-          id: "a1-writes", title: "Writes", sub: "Rows a second, higher is better", unit: "rows/s", better: "higher", scale: "row", status: "placeholder",
-          columns: [{ name: "Strata", self: true }, { name: "SQLite", ver: "synchronous=FULL" }, { name: "SQLite", ver: "synchronous=NORMAL" }, { name: "DuckDB", ver: "1.x" }],
+          id: "a1-writes", title: "Inserts", sub: "Rows a second, higher is better", unit: "rows/s", better: "higher", scale: "row", status: "placeholder",
+          columns: [{ name: "Strata", self: true }, { name: "SQLite", ver: "synchronous=FULL" }, { name: "SQLite", ver: "synchronous=NORMAL" }, { name: "DuckDB", ver: "1.x" }, { name: "LanceDB" }],
           rows: [
-            { label: "load products and reviews from JSONL", cells: [null, null, null, null] },
-            { label: "insert, 1 row per durable transaction", cells: [null, null, null, null] },
-            { label: "insert, 1,000 rows per transaction", cells: [null, null, null, null] },
-            { label: "update price and stock by id", cells: [null, null, null, null] },
-            { label: "delete by range", cells: [null, null, null, null] },
-            { label: "mixed: 1 writer, 4 readers, 80% reads", unit: "q/s", cells: [null, null, null, null] }
+            { label: "load products and reviews from JSONL", cells: [null, null, null, null, null] },
+            { label: "1 row per durable commit", cells: [null, null, null, null, null] },
+            { label: "100 rows per transaction", cells: [null, null, null, null, null] },
+            { label: "1,000 rows per transaction", cells: [null, null, null, null, null] },
+            { label: "10,000 rows per transaction", cells: [null, null, null, null, null] },
+            { label: "p50 per durable insert", unit: "ms", better: "lower", cells: [null, null, null, null, null] },
+            { label: "p99 per durable insert", unit: "ms", better: "lower", cells: [null, null, null, null, null] },
+            { label: "mixed: 1 writer, 4 readers, 80% reads", unit: "q/s", cells: [null, null, null, null, null] }
+          ],
+          note: "Into a table with its text and vector indexes, so every system indexes what it writes."
+        },
+        {
+          id: "a1-updates", title: "Updates and deletes", sub: "Rows a second, higher is better; latency rows lower is better", unit: "rows/s", better: "higher", scale: "row", status: "placeholder",
+          columns: [{ name: "Strata", self: true }, { name: "SQLite", ver: "3.53, WAL" }, { name: "DuckDB", ver: "1.x" }, { name: "LanceDB" }],
+          rows: [
+            { label: "a price or stock by id", cells: [null, null, null, null] },
+            { label: "a counter + 1", cells: [null, null, null, null] },
+            { label: "a text field changed (re-indexed)", cells: [null, null, null, null] },
+            { label: "a vector replaced", cells: [null, null, null, null] },
+            { label: "upsert", cells: [null, null, null, null] },
+            { label: "delete by id", cells: [null, null, null, null] },
+            { label: "p50 per durable update", unit: "ms", better: "lower", cells: [null, null, null, null] },
+            { label: "p99 per durable update", unit: "ms", better: "lower", cells: [null, null, null, null] },
+            { label: "time until an update is visible", unit: "ms", better: "lower", cells: [null, null, null, null] }
+          ]
+        },
+        {
+          id: "a1-stream", title: "A stream of events", sub: "Review events appended while 4 readers query", unit: "ms", better: "lower", scale: "row", status: "placeholder",
+          columns: [{ name: "Strata", self: true }, { name: "SQLite", ver: "3.53, WAL" }, { name: "DuckDB", ver: "1.x" }, { name: "LanceDB" }],
+          rows: [
+            { label: "events a second, flat out", unit: "ev/s", better: "higher", cells: [null, null, null, null] },
+            { label: "time until visible at 10K events a second", cells: [null, null, null, null] },
+            { label: "read p99 at 1K events a second", cells: [null, null, null, null] },
+            { label: "read p99 at 10K events a second", cells: [null, null, null, null] },
+            { label: "read p99 at 50K events a second", cells: [null, null, null, null] }
           ]
         },
         {
@@ -172,6 +202,36 @@ window.STRATA_BENCH = {
             { label: "vector with a filter", cells: [null, null, "na:no vectors", null, null] },
             { label: "hybrid, weighted", cells: [null, null, "na:no vectors", null, null] }
           ]
+        },
+        {
+          id: "a-operators", type: "ops", title: "Operator by operator, in one file", sub: "What each library can run, and its p50 in ms where it can", unit: "ms", status: "placeholder",
+          columns: [{ name: "Strata", self: true }, { name: "SQLite", ver: "FTS5" }, { name: "Tantivy", ver: "0.26" }, { name: "DuckDB", ver: "fts" }, { name: "LanceDB" }],
+          rows: [
+            { group: "Words" },
+            { label: "AND, OR, NOT, nested", cells: ["y", "y", "y", "c", "c"] },
+            { label: "word weights", cells: ["y", "c", "y", "c", "c"] },
+            { label: "at least n of the words", cells: ["y", "c", "c", "c", "c"] },
+            { label: "phrase", cells: ["y", "y", "y", "n:no phrase queries in its fts extension", "c"] },
+            { label: "words near each other", cells: ["n:not yet", "y:NEAR", "y:phrase slop", "n", "c"] },
+            { label: "prefix of a word", cells: ["y", "y:prefix*", "y", "n:no prefix queries in its fts extension", "c"] },
+            { label: "typos", cells: ["y", "n:no fuzzy matching", "y:fuzzy term query", "n", "c"] },
+            { label: "query-time synonyms", cells: ["y", "n", "c", "c", "c"] },
+            { label: "highlighted snippets", cells: ["n:not yet", "y:snippet(), highlight()", "y:snippet generator", "c", "c"] },
+            { group: "Ranking" },
+            { label: "hybrid RRF", cells: ["y", "p:in app code", "n:no vectors", "p:in SQL by hand", "c"] },
+            { label: "normalised weighted fusion", cells: ["y", "p:in app code", "n:no vectors", "p:in SQL by hand", "c"] },
+            { label: "boosts by a column or a decay", cells: ["y", "p:in SQL by hand", "c", "p:in SQL by hand", "c"] },
+            { label: "at most k rows per value", cells: ["y", "p:window function", "c", "p:window function", "c"] },
+            { group: "SQL" },
+            { label: "JSON paths of keys no schema names", data: "shop", cells: ["y", "y:json_extract, not indexed for search", "c", "y", "c"] },
+            { label: "GROUP BY two fields with HAVING", cells: ["y", "y", "n:no SQL", "y", "c"] },
+            { label: "joins of two tables", data: "shop", cells: ["y", "y", "n:no SQL", "y", "c"] },
+            { label: "correlated subqueries", data: "shop", cells: ["y", "y", "n:no SQL", "y", "c"] },
+            { label: "window functions, UNION", cells: ["n:until DataFusion's next step", "y", "n:no SQL", "y", "c"] },
+            { label: "graph walks over an edge table", data: "shop", cells: ["y", "p:recursive CTE", "n", "p:recursive CTE", "c"] },
+            { label: "percentiles", cells: ["n:not yet", "c", "c", "y", "c"] }
+          ],
+          note: "Marks come from each library's documentation and are confirmed or corrected by the runs. Strata's own gaps stay in the table."
         }
       ]
     },
@@ -223,59 +283,61 @@ window.STRATA_BENCH = {
     /* ------------------------------------------------------------- B */
     {
       id: "b", part: "B", title: "A cluster on Kubernetes, on the laptop",
-      lede: "Two shards per engine on kind, with the same CPUs and memory for each, one engine at a time. The 28 October run measured Strata, Elasticsearch and Solr on Quora; the laptop benchmark adds OpenSearch and Vespa, MS MARCO's 2M passages, five more kinds and operations tests.",
+      lede: "Two shards per engine on kind, with the same CPUs and memory for each, one engine at a time. The 28 October run measured Strata, Elasticsearch and Solr on Quora; the laptop benchmark adds OpenSearch and Vespa, MS MARCO's 2M passages, five more kinds, writes, updates and streams, 27 operators one by one, and operations tests.",
       dataset: "B1: BEIR Quora (523K questions, 1,024-dimension vectors, judged). B2: MS MARCO v2.1, 2M passages, 768-dimension vectors, larger than the memory budget",
       plan: [
         "Elasticsearch 9 (Basic licence, its default), OpenSearch 3, Solr 10 and Vespa 8, each with 2 data nodes in 3 CPUs and 6 GiB; Strata as 2 shards and a coordinator",
         "14 kinds at 1, 4 and 16 clients: the nine of 28 October plus phrase, typo-tolerant, prefix autocomplete, similar items with exclusions and a SQL aggregate",
-        "Load, writes under load, live scale-out from 2 to 3 shards, failover with one replica per shard, footprint"
+        "Writes, partial updates and a Kafka-compatible stream (Redpanda, 4 partitions) under load: documents a second, p50 and p99, time until visible, and what a consumer restart loses or repeats",
+        "27 operators, each timed wherever an engine has it and marked where it has none; Elasticsearch's paid hybrid retrievers run on a trial licence, labelled as such",
+        "Load, live scale-out from 2 to 3 shards, failover with one replica per shard, footprint"
       ],
       charts: [
         {
           id: "b-p50", title: "One client", sub: "Median latency in ms, lower is better; hover for p90 and p99", unit: "ms", better: "lower", scale: "row", status: "earlier", run: "m2-kind-2026-10-28",
-          columns: [{ name: "Strata", ver: "2 shards + coordinator", self: true }, { name: "Elasticsearch", ver: "9.5.5" }, { name: "OpenSearch", ver: "3", status: "placeholder" }, { name: "Solr", ver: "10.1" }, { name: "Vespa", ver: "8", status: "placeholder" }],
+          columns: [{ name: "Strata", ver: "2 shards + coordinator", self: true }, { name: "Elasticsearch", ver: "9.5.5" }, { name: "Elasticsearch", ver: "trial licence", status: "placeholder" }, { name: "OpenSearch", ver: "3", status: "placeholder" }, { name: "Solr", ver: "10.1" }, { name: "Vespa", ver: "8", status: "placeholder" }],
           rows: [
-            { label: "BM25", cells: [{ v: 0.68, p90: 0.89, p99: 1.8 }, { v: 3.20, p90: 5.56, p99: 12.8 }, null, { v: 3.08, p90: 5.52, p99: 18.4 }, null] },
-            { label: "BM25 + filter", cells: [{ v: 0.87, p90: 1.12, p99: 1.7 }, { v: 1.57, p90: 2.54, p99: 7.2 }, null, { v: 1.36, p90: 2.43, p99: 9.4 }, null] },
-            { label: "vector", cells: [{ v: 0.58, p90: 0.63, p99: 0.9 }, { v: 2.12, p90: 3.62, p99: 9.4 }, null, { v: 2.54, p90: 3.41, p99: 7.5 }, null] },
-            { label: "vector + filter", cells: [{ v: 0.75, p90: 0.82, p99: 1.2 }, { v: 1.86, p90: 2.39, p99: 4.2 }, null, { v: 4.92, p90: 7.01, p99: 12.8 }, null] },
-            { label: "hybrid, RRF", cells: [{ v: 1.82, p90: 2.09, p99: 2.6 }, "na:not on the free licence", null, { v: 3.32, p90: 5.23, p99: 11.3 }, null] },
-            { label: "hybrid, weighted", cells: [{ v: 1.83, p90: 2.18, p99: 2.9 }, { v: 2.42, p90: 3.77, p99: 8.1, note: "a raw-score sum: no normalised fusion on the free licence" }, null, { v: 3.47, p90: 4.84, p99: 10.0, note: "a raw-score sum" }, null] },
-            { label: "boosted: BM25 × date decay", cells: [{ v: 1.19, p90: 1.47, p99: 2.0 }, { v: 1.59, p90: 3.06, p99: 6.1 }, null, { v: 1.55, p90: 3.27, p99: 6.4 }, null] },
-            { label: "facet", cells: [{ v: 0.41, p90: 0.46, p99: 0.7 }, { v: 0.82, p90: 1.44, p99: 3.7 }, null, { v: 0.78, p90: 1.51, p99: 5.0 }, null] },
-            { label: "key lookup", cells: [{ v: 0.32, p90: 0.41, p99: 1.2 }, { v: 0.65, p90: 0.79, p99: 1.2 }, null, { v: 0.81, p90: 0.97, p99: 2.0 }, null] },
-            { label: "phrase", s: "placeholder", cells: [null, null, null, null, null] },
-            { label: "typo-tolerant", s: "placeholder", cells: [null, null, null, null, null] },
-            { label: "prefix autocomplete", s: "placeholder", cells: [null, null, null, null, null] },
-            { label: "similar items with exclusions", s: "placeholder", cells: [null, null, null, null, null] },
-            { label: "SQL aggregate: GROUP BY two fields, HAVING", s: "placeholder", cells: [null, null, null, null, null] }
+            { label: "BM25", cells: [{ v: 0.68, p90: 0.89, p99: 1.8 }, { v: 3.20, p90: 5.56, p99: 12.8 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 3.08, p90: 5.52, p99: 18.4 }, null] },
+            { label: "BM25 + filter", cells: [{ v: 0.87, p90: 1.12, p99: 1.7 }, { v: 1.57, p90: 2.54, p99: 7.2 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 1.36, p90: 2.43, p99: 9.4 }, null] },
+            { label: "vector", cells: [{ v: 0.58, p90: 0.63, p99: 0.9 }, { v: 2.12, p90: 3.62, p99: 9.4 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 2.54, p90: 3.41, p99: 7.5 }, null] },
+            { label: "vector + filter", cells: [{ v: 0.75, p90: 0.82, p99: 1.2 }, { v: 1.86, p90: 2.39, p99: 4.2 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 4.92, p90: 7.01, p99: 12.8 }, null] },
+            { label: "hybrid, RRF", cells: [{ v: 1.82, p90: 2.09, p99: 2.6 }, "na:not on the free licence", null, null, { v: 3.32, p90: 5.23, p99: 11.3 }, null] },
+            { label: "hybrid, weighted", cells: [{ v: 1.83, p90: 2.18, p99: 2.9 }, { v: 2.42, p90: 3.77, p99: 8.1, note: "a raw-score sum: no normalised fusion on the free licence" }, null, null, { v: 3.47, p90: 4.84, p99: 10.0, note: "a raw-score sum" }, null] },
+            { label: "boosted: BM25 × date decay", cells: [{ v: 1.19, p90: 1.47, p99: 2.0 }, { v: 1.59, p90: 3.06, p99: 6.1 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 1.55, p90: 3.27, p99: 6.4 }, null] },
+            { label: "facet", cells: [{ v: 0.41, p90: 0.46, p99: 0.7 }, { v: 0.82, p90: 1.44, p99: 3.7 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 0.78, p90: 1.51, p99: 5.0 }, null] },
+            { label: "key lookup", cells: [{ v: 0.32, p90: 0.41, p99: 1.2 }, { v: 0.65, p90: 0.79, p99: 1.2 }, "skip:only the hybrid kinds, which need the paid features", null, { v: 0.81, p90: 0.97, p99: 2.0 }, null] },
+            { label: "phrase", s: "placeholder", cells: [null, null, "skip:only the hybrid kinds, which need the paid features", null, null, null] },
+            { label: "typo-tolerant", s: "placeholder", cells: [null, null, "skip:only the hybrid kinds, which need the paid features", null, null, null] },
+            { label: "prefix autocomplete", s: "placeholder", cells: [null, null, "skip:only the hybrid kinds, which need the paid features", null, null, null] },
+            { label: "similar items with exclusions", s: "placeholder", cells: [null, null, "skip:only the hybrid kinds, which need the paid features", null, null, null] },
+            { label: "SQL aggregate: GROUP BY two fields, HAVING", s: "placeholder", cells: [null, null, "skip:only the hybrid kinds, which need the paid features", null, null, null] }
           ]
         },
         {
           id: "b-qps", title: "Sixteen clients", sub: "Queries a second, higher is better", unit: "q/s", digits: 0, better: "higher", scale: "row", status: "earlier", run: "m2-kind-2026-10-28",
-          columns: [{ name: "Strata", ver: "2 shards + coordinator", self: true }, { name: "Elasticsearch", ver: "9.5.5" }, { name: "OpenSearch", ver: "3", status: "placeholder" }, { name: "Solr", ver: "10.1" }, { name: "Vespa", ver: "8", status: "placeholder" }],
+          columns: [{ name: "Strata", ver: "2 shards + coordinator", self: true }, { name: "Elasticsearch", ver: "9.5.5" }, { name: "Elasticsearch", ver: "trial licence", status: "placeholder" }, { name: "OpenSearch", ver: "3", status: "placeholder" }, { name: "Solr", ver: "10.1" }, { name: "Vespa", ver: "8", status: "placeholder" }],
           rows: [
-            { label: "BM25", cells: [3058, 1162, null, 1114, null] },
-            { label: "BM25 + filter", cells: [2003, 1440, null, 1886, null] },
-            { label: "vector", cells: [3366, 1256, null, 584, null] },
-            { label: "vector + filter", cells: [2087, 1148, null, 281, null] },
-            { label: "hybrid, RRF", cells: [849, "na:not on the free licence", null, 469, null] },
-            { label: "hybrid, weighted", cells: [759, 707, null, 419, null] },
-            { label: "boosted: BM25 × date decay", cells: [1492, 1087, null, 1030, null] },
-            { label: "facet", cells: [6158, 6272, null, 3180, null] },
-            { label: "key lookup", cells: [11158, 8137, null, 3259, null] }
+            { label: "BM25", cells: [3058, 1162, "skip:only the hybrid kinds, which need the paid features", null, 1114, null] },
+            { label: "BM25 + filter", cells: [2003, 1440, "skip:only the hybrid kinds, which need the paid features", null, 1886, null] },
+            { label: "vector", cells: [3366, 1256, "skip:only the hybrid kinds, which need the paid features", null, 584, null] },
+            { label: "vector + filter", cells: [2087, 1148, "skip:only the hybrid kinds, which need the paid features", null, 281, null] },
+            { label: "hybrid, RRF", cells: [849, "na:not on the free licence", null, null, 469, null] },
+            { label: "hybrid, weighted", cells: [759, 707, null, null, 419, null] },
+            { label: "boosted: BM25 × date decay", cells: [1492, 1087, "skip:only the hybrid kinds, which need the paid features", null, 1030, null] },
+            { label: "facet", cells: [6158, 6272, "skip:only the hybrid kinds, which need the paid features", null, 3180, null] },
+            { label: "key lookup", cells: [11158, 8137, "skip:only the hybrid kinds, which need the paid features", null, 3259, null] }
           ],
           note: "At 16 clients every engine is throttled by its CPU quota, and the client shares the same 4 CPUs. Elasticsearch ties Strata on facets."
         },
         {
           id: "b-quality", title: "The same answers", sub: "nDCG@10 against Quora's judgments, or recall@10 against an exact search; higher is better", unit: "", digits: 3, better: "higher", scale: "unit", status: "earlier", run: "m2-kind-2026-10-28",
-          columns: [{ name: "Strata", self: true }, { name: "Elasticsearch", ver: "9.5.5" }, { name: "OpenSearch", ver: "3", status: "placeholder" }, { name: "Solr", ver: "10.1" }, { name: "Vespa", ver: "8", status: "placeholder" }],
+          columns: [{ name: "Strata", self: true }, { name: "Elasticsearch", ver: "9.5.5" }, { name: "Elasticsearch", ver: "trial licence", status: "placeholder" }, { name: "OpenSearch", ver: "3", status: "placeholder" }, { name: "Solr", ver: "10.1" }, { name: "Vespa", ver: "8", status: "placeholder" }],
           rows: [
-            { label: "BM25, nDCG@10", cells: [0.790, 0.788, null, 0.793, null] },
-            { label: "vector, recall@10", cells: [0.986, 0.984, null, 0.993, null] },
-            { label: "vector + filter, recall@10", cells: [0.991, 0.934, null, 0.998, null] },
-            { label: "hybrid RRF, nDCG@10", cells: [0.863, "na:not on the free licence", null, 0.871, null] },
-            { label: "hybrid weighted, nDCG@10", cells: [0.905, { v: 0.827, note: "a raw-score sum" }, null, { v: 0.823, note: "a raw-score sum" }, null] }
+            { label: "BM25, nDCG@10", cells: [0.790, 0.788, "skip:only the hybrid kinds, which need the paid features", null, 0.793, null] },
+            { label: "vector, recall@10", cells: [0.986, 0.984, "skip:only the hybrid kinds, which need the paid features", null, 0.993, null] },
+            { label: "vector + filter, recall@10", cells: [0.991, 0.934, "skip:only the hybrid kinds, which need the paid features", null, 0.998, null] },
+            { label: "hybrid RRF, nDCG@10", cells: [0.863, "na:not on the free licence", null, null, 0.871, null] },
+            { label: "hybrid weighted, nDCG@10", cells: [0.905, { v: 0.827, note: "a raw-score sum" }, null, null, { v: 0.823, note: "a raw-score sum" }, null] }
           ],
           note: "Strata's weighted hybrid normalises each score before summing (minmax); the others can only add raw scores."
         },
@@ -292,8 +354,6 @@ window.STRATA_BENCH = {
           id: "b-ops", title: "Operations", sub: "Measured while 4 clients query", unit: "", better: "lower", scale: "row", status: "placeholder",
           columns: [{ name: "Strata", self: true }, { name: "Elasticsearch", ver: "9" }, { name: "OpenSearch", ver: "3" }, { name: "Solr", ver: "10" }, { name: "Vespa", ver: "8" }],
           rows: [
-            { label: "read p99 with 500 updates a second", unit: "ms", cells: [null, null, null, null, null] },
-            { label: "time until a write is visible", unit: "ms", cells: [null, null, null, null, null] },
             { label: "scale out 2 → 3 shards: time until balanced", unit: "s", cells: [null, null, null, null, null] },
             { label: "query p99 during the move", unit: "ms", cells: [null, null, null, null, null] },
             { label: "failover: failed queries", unit: "", cells: [null, null, null, null, null] },
@@ -301,6 +361,80 @@ window.STRATA_BENCH = {
             { label: "memory", unit: "GiB", cells: [null, null, null, null, null] },
             { label: "pods", unit: "", cells: [null, null, null, null, null] }
           ]
+        },
+        {
+          id: "b-writes", title: "Writes on the cluster", sub: "Single-document writes after the bulk load; documents a second, higher is better", unit: "docs/s", better: "higher", scale: "row", status: "placeholder",
+          columns: [{ name: "Strata", ver: "/v1/write", self: true }, { name: "Elasticsearch", ver: "9, index API" }, { name: "OpenSearch", ver: "3, index API" }, { name: "Solr", ver: "10, update handler" }, { name: "Vespa", ver: "8, /document/v1" }],
+          rows: [
+            { label: "1 client", cells: [null, null, null, null, null] },
+            { label: "4 clients", cells: [null, null, null, null, null] },
+            { label: "16 clients", cells: [null, null, null, null, null] },
+            { label: "p50 per write", unit: "ms", better: "lower", cells: [null, null, null, null, null] },
+            { label: "p99 per write", unit: "ms", better: "lower", cells: [null, null, null, null, null] },
+            { label: "time until a write is visible", unit: "ms", better: "lower", cells: [null, null, null, null, null] },
+            { label: "read p99 at 500 writes a second, 4 clients querying", unit: "ms", better: "lower", cells: [null, null, null, null, null] }
+          ],
+          note: "Elasticsearch and OpenSearch at their 1 s refresh, Solr at a 1 s soft commit, Vespa and Strata as committed. Every write is read back."
+        },
+        {
+          id: "b-updates", title: "Updates on the cluster", sub: "Documents a second, higher is better; latency rows lower is better", unit: "docs/s", better: "higher", scale: "row", status: "placeholder",
+          columns: [{ name: "Strata", ver: "UPDATE", self: true }, { name: "Elasticsearch", ver: "9, _update" }, { name: "OpenSearch", ver: "3, _update" }, { name: "Solr", ver: "10, in-place" }, { name: "Vespa", ver: "8, partial update" }],
+          rows: [
+            { label: "a rating by id", cells: [null, null, null, null, null] },
+            { label: "a body changed (re-indexed)", cells: [null, null, null, null, null] },
+            { label: "p99 per update", unit: "ms", better: "lower", cells: [null, null, null, null, null] },
+            { label: "time until an update is visible", unit: "ms", better: "lower", cells: [null, null, null, null, null] }
+          ]
+        },
+        {
+          id: "b-stream", title: "A stream into the cluster", sub: "A Redpanda topic of 4 partitions, while 4 clients query", unit: "ms", better: "lower", scale: "row", status: "placeholder",
+          columns: [{ name: "Strata", ver: "its own consumer", self: true }, { name: "Elasticsearch", ver: "9, a consumer + bulk" }, { name: "OpenSearch", ver: "3, a consumer + bulk" }, { name: "Solr", ver: "10, a consumer + update" }, { name: "Vespa", ver: "8, a consumer + feed" }],
+          rows: [
+            { label: "events a second, flat out", unit: "ev/s", better: "higher", cells: [null, null, null, null, null] },
+            { label: "time until visible at 5K events a second", cells: [null, null, null, null, null] },
+            { label: "read p99 at 5K events a second", cells: [null, null, null, null, null] },
+            { label: "read p99 at 20K events a second", cells: [null, null, null, null, null] },
+            { label: "events lost after a consumer restart", unit: "", cells: [null, null, null, null, null] },
+            { label: "events repeated after a consumer restart", unit: "", cells: [null, null, null, null, null] }
+          ],
+          note: "Strata keeps the topic's offsets in the same transaction as the rows, so a restart should lose and repeat nothing; the others' at-least-once delivery is counted as it comes out."
+        },
+        {
+          id: "b-operators", type: "ops", title: "Operator by operator, on the cluster", sub: "What each engine can run, and its p50 in ms at one client where it can", unit: "ms", status: "placeholder",
+          columns: [{ name: "Strata", self: true }, { name: "Elasticsearch", ver: "9" }, { name: "OpenSearch", ver: "3" }, { name: "Solr", ver: "10" }, { name: "Vespa", ver: "8" }],
+          rows: [
+            { group: "Words" },
+            { label: "AND, OR, NOT, nested", cells: ["y", "y", "y", "y", "y"] },
+            { label: "word weights", cells: ["y", "y", "y", "y", "y"] },
+            { label: "at least n of the words", cells: ["y", "y", "y", "y", "n:weakAnd only approximates it"] },
+            { label: "at least n of several conditions", cells: ["y", "y", "y", "y", "n"] },
+            { label: "phrase", cells: ["y", "y", "y", "y", "y"] },
+            { label: "words near each other", cells: ["n:not yet", "y", "y", "y", "y"] },
+            { label: "prefix of a word in text", cells: ["y", "y", "y", "y", "n:on attributes only"] },
+            { label: "typos in text", cells: ["y", "y", "y", "y:fuzzy words are not stemmed", "n:on attributes only"] },
+            { label: "autocomplete with typos", cells: ["y", "y:completion suggester", "y", "y:suggester", "c"] },
+            { label: "query-time synonyms", cells: ["y", "y", "y", "y", "y"] },
+            { label: "highlighted snippets", cells: ["n:not yet", "y", "y", "y", "y"] },
+            { group: "Filters and ranking" },
+            { label: "range, IN, NOT IN, IS NULL", cells: ["y", "y", "y", "y", "p:no NULL"] },
+            { label: "JSON paths of keys no schema names", data: "shop", cells: ["y", "p:flattened, keyword only", "p:flat_object", "p:dynamic fields", "p:map attributes"] },
+            { label: "geo distance", cells: ["n:not yet", "y", "y", "y", "y"] },
+            { label: "hybrid RRF", cells: ["y", "$:RRF retriever; run on a trial licence", "y", "y", "y"] },
+            { label: "normalised weighted fusion", cells: ["y", "$:linear retriever with min-max; run on a trial licence", "y", "n", "y:min-max"] },
+            { label: "boosts by a column or a decay", cells: ["y", "y", "y", "y", "y"] },
+            { label: "sparse vectors (SPLADE)", data: "shop", cells: ["y", "y", "y", "n", "y"] },
+            { label: "several query vectors (MaxSim)", data: "shop", cells: ["y", "c:licence", "c", "n", "y"] },
+            { label: "at most k rows per value", cells: ["y", "y:collapse", "y:collapse", "y:collapse", "y"] },
+            { group: "SQL and analytics" },
+            { label: "GROUP BY two fields with HAVING", cells: ["y", "y", "y", "y", "p:no HAVING"] },
+            { label: "exact COUNT(DISTINCT) over shards", cells: ["y", "p:approximate", "p:approximate", "p:approximate", "c"] },
+            { label: "percentiles", cells: ["n:not yet", "y", "y", "y", "c"] },
+            { label: "joins of two tables", data: "shop", cells: ["y", "c:ES|QL lookup join", "p:SQL plugin", "p:filter only", "p:parent fields"] },
+            { label: "subqueries, correlated subqueries", data: "shop", cells: ["y", "n", "n", "n", "n"] },
+            { label: "graph walks over an edge table", data: "shop", cells: ["y", "n", "n", "p:streaming expressions", "n"] },
+            { label: "window functions, UNION", cells: ["n:until DataFusion's next step", "n", "n", "c", "n"] }
+          ],
+          note: "Marks come from each engine's documentation today; the runs confirm or correct each one. Rows marked shop need fields Quora lacks and run on the shop data, loaded into every engine. Strata's own gaps stay in the table."
         },
         {
           id: "b2-marco", title: "Larger than memory: MS MARCO, 2M passages", sub: "One client, median latency in ms, lower is better", unit: "ms", better: "lower", scale: "row", status: "placeholder",

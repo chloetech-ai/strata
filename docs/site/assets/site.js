@@ -140,6 +140,7 @@
   function cellInfo(cell, row, col, chart) {
     if (cell == null) return { kind: "ph", status: "placeholder" };
     if (typeof cell === "string" && cell.indexOf("na:") === 0) return { kind: "na", why: cell.slice(3) };
+    if (typeof cell === "string" && cell.indexOf("skip:") === 0) return { kind: "skip", why: cell.slice(5) };
     var o = typeof cell === "number" ? { v: cell } : cell;
     if (o.v == null) return { kind: "ph", status: "placeholder" };
     return { kind: "v", v: o.v, p90: o.p90, p99: o.p99, note: o.note, status: o.s || row.s || col.status || chart.status || "measured" };
@@ -153,6 +154,7 @@
     return null;
   }
   function renderChart(chart) {
+    if (chart.type === "ops") return renderOps(chart);
     var run = chart.run && BENCH.runs[chart.run];
     var infos = chart.rows.map(function (row) {
       return row.cells.map(function (c, i) { return cellInfo(c, row, chart.columns[i] || {}, chart); });
@@ -179,10 +181,11 @@
       var r = infos[ri];
       var nums = r.filter(function (c) { return c.kind === "v"; }).map(function (c) { return c.v; });
       var rowMax = nums.length ? Math.max.apply(null, nums) : 1;
-      var best = nums.length > 1 ? (chart.better === "higher" ? Math.max.apply(null, nums) : Math.min.apply(null, nums)) : null;
+      var better = row.better || chart.better;
+      var best = nums.length > 1 ? (better === "higher" ? Math.max.apply(null, nums) : Math.min.apply(null, nums)) : null;
       var unit = row.unit != null ? row.unit : "";
       var digits = row.digits != null ? row.digits : chart.digits;
-      h += '<tr><th scope="row">' + esc(row.label) + "</th>";
+      h += '<tr><th scope="row">' + esc(row.label) + (row.better && row.better !== chart.better ? '<small class="dir">' + (row.better === "higher" ? "higher is better" : "lower is better") + "</small>" : "") + "</th>";
       r.forEach(function (c, ci) {
         var col = chart.columns[ci] || {};
         var self = col.self || row.self;
@@ -190,6 +193,10 @@
         var who = esc(col.name + (col.ver ? " " + col.ver : ""));
         if (c.kind === "ph") {
           h += '<td><div class="' + cls + ' ph" tabindex="0" data-tip="<b>' + who + "</b> · " + esc(row.label) + '<br>Placeholder: no measurement yet. The laptop benchmark measures it."><span class="val">placeholder</span><span class="bar" style="width:46%"></span></div></td>';
+          return;
+        }
+        if (c.kind === "skip") {
+          h += '<td><div class="' + cls + ' na skip" tabindex="0" data-tip="<b>' + who + "</b> · " + esc(row.label) + "<br>Not run: " + esc(c.why) + '"><span class="val">not run</span></div></td>';
           return;
         }
         if (c.kind === "na") {
@@ -217,6 +224,46 @@
     if (chart.scale === "log") h += "<span>bars on a log scale</span>";
     h += "<span>bold: best in the row</span>";
     h += "</div>";
+    if (chart.note || run) {
+      h += '<div class="chart-foot">';
+      if (chart.note) h += "<span>" + esc(chart.note) + "</span>";
+      if (run) h += "<span>" + esc(run.machine) + ". Source: <code>" + esc(run.source) + "</code></span>";
+      h += "</div>";
+    }
+    h += "</div>";
+    return h;
+  }
+  /* An operator matrix: what each engine can run, and how fast where it
+     can. A cell is "y", "p:how", "$:how", "n:why" or "c:what to check"
+     (from each engine's documentation, to be confirmed by the runs), or
+     {m, v, s, note} once timed, with v in the chart's unit. */
+  var OPS_LABEL = { y: "Built in", p: "Partly", $: "Paid tier only", n: "Not supported", c: "To check" };
+  function renderOps(chart) {
+    var run = chart.run && BENCH.runs[chart.run];
+    var h = '<div class="chart ops" id="' + esc(chart.id) + '">';
+    h += '<div class="chart-head"><h4>' + esc(chart.title) + (chart.sub ? '<span class="sub">' + esc(chart.sub) + "</span>" : "") + "</h4>";
+    h += '<div class="chart-tools"><span class="tag ' + esc(chart.status || "placeholder") + '">' + esc(chart.status === "earlier" && run ? run.label : STATUS_LABEL[chart.status || "placeholder"]) + "</span></div></div>";
+    h += '<div class="matrix-wrap"><table class="matrix"><thead><tr><th class="cap" scope="col">Operator</th>';
+    chart.columns.forEach(function (col) { h += '<th scope="col"' + (col.self ? ' class="self"' : "") + ">" + esc(col.name) + (col.ver ? "<small>" + esc(col.ver) + "</small>" : "") + "</th>"; });
+    h += "</tr></thead><tbody>";
+    chart.rows.forEach(function (row) {
+      if (row.group) { h += '<tr class="grp"><td colspan="' + (chart.columns.length + 1) + '">' + esc(row.group) + "</td></tr>"; return; }
+      h += '<tr><td class="cap">' + esc(row.label) + (row.data ? ' <span class="small muted">(' + esc(row.data) + ")</span>" : "") + "</td>";
+      row.cells.forEach(function (cell, ci) {
+        var col = chart.columns[ci] || {};
+        var o = typeof cell === "string" ? { m: cell.charAt(0), note: cell.charAt(1) === ":" ? cell.slice(2) : "" } : (cell || { m: "c" });
+        var code = o.m === "$" ? "paid" : o.m;
+        var label = OPS_LABEL[o.m] || o.m;
+        var runs = o.m === "y" || o.m === "p" || o.m === "$";
+        var time = "";
+        if (runs) time = o.v != null ? '<span class="t">' + esc(fmt(o.v)) + " " + esc(chart.unit || "ms") + "</span>" : '<span class="t ph">pending</span>';
+        var tipText = "<b>" + esc(col.name + (col.ver ? " " + col.ver : "")) + "</b> · " + esc(row.label) + "<br>" + esc(label) + (o.note ? ": " + esc(o.note) : "") + (runs ? "<br>" + (o.v != null ? "p50 " + esc(fmt(o.v)) + " " + esc(chart.unit || "ms") : "Timing pending: the laptop benchmark runs it") : "");
+        h += "<td" + (col.self ? ' class="self"' : "") + '><span class="opc" tabindex="0" data-tip="' + esc(tipText) + '"><span class="mk ' + esc(code) + '" role="img" aria-label="' + esc(label + (o.note ? ": " + o.note : "")) + '"></span>' + time + "</span></td>";
+      });
+      h += "</tr>";
+    });
+    h += "</tbody></table></div>";
+    h += '<div class="legend"><span><span class="mk y"></span>built in</span><span><span class="mk p"></span>partly, or by a documented workaround</span><span><span class="mk paid"></span>paid tier only (run on a trial licence)</span><span><span class="mk n"></span>not supported</span><span><span class="mk c"></span>to check</span><span>Under each mark: the p50 where it runs.</span></div>';
     if (chart.note || run) {
       h += '<div class="chart-foot">';
       if (chart.note) h += "<span>" + esc(chart.note) + "</span>";
