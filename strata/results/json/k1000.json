@@ -1,0 +1,591 @@
+{
+  "bench": "strata-json-bench",
+  "data": {
+    "json_bytes_per_row": 98.3,
+    "keys_held": 1000,
+    "keys_in_under_0.1pct_of_rows": 0,
+    "keys_in_under_1pct_of_rows": 890,
+    "pct_of_rows_holding_key_rank": {
+      "1": 65.634,
+      "10": 10.512,
+      "100": 1.105,
+      "1000": 0.106
+    },
+    "type_conflicts": 21277,
+    "values_per_row": 7.51
+  },
+  "database": {
+    "A": {
+      "bytes": 657416192,
+      "bytes_per_row": 657.4,
+      "load_s": 83.52,
+      "open_ms": 23.96,
+      "rows_per_s": 11973.0,
+      "segments": 10,
+      "values_dropped": 21277
+    },
+    "J": {
+      "bytes": 250900480,
+      "bytes_per_row": 250.9,
+      "load_s": 31.58,
+      "open_ms": 7.42,
+      "rows_per_s": 31664.0,
+      "segments": 10,
+      "values_dropped": 0
+    }
+  },
+  "inserts": {
+    "A": {
+      "rows": 5000,
+      "rows_per_s": 15.0,
+      "wal_bytes_per_row": 1104.9
+    },
+    "J": {
+      "rows": 5000,
+      "rows_per_s": 143.0,
+      "wal_bytes_per_row": 147.0
+    }
+  },
+  "keys": 1000,
+  "keys_queried": {
+    "0.1pct": {
+      "key": "k963",
+      "rows": 1089
+    },
+    "1pct": {
+      "key": "k106",
+      "rows": 10233
+    },
+    "float": {
+      "key": "k17",
+      "rows": 60238
+    },
+    "hex": {
+      "key": "k8",
+      "rows": 116565
+    },
+    "hot": {
+      "key": "k0",
+      "rows": 656338
+    },
+    "int": {
+      "key": "k12",
+      "rows": 82208
+    },
+    "int_1pct": {
+      "key": "k112",
+      "rows": 9762
+    }
+  },
+  "machine": {
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "memory_gb": 16.9,
+    "os": "Linux 6.18.44-fc-v185"
+  },
+  "queries": [
+    {
+      "A": {
+        "best_ms": 0.099,
+        "first": "[Int(32697)]",
+        "median_ms": 0.124,
+        "peak_mb": 45.0,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.228,
+        "first": "[Int(32697)]",
+        "median_ms": 0.271,
+        "peak_mb": 6.3,
+        "rows": 1
+      },
+      "name": "eq hot",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k0 = 'v3'",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k0 = 'v3'"
+    },
+    {
+      "A": {
+        "best_ms": 0.036,
+        "first": "[Int(506)]",
+        "median_ms": 0.038,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.093,
+        "first": "[Int(506)]",
+        "median_ms": 0.107,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "name": "eq 1%",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k106 = 'v3'",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k106 = 'v3'"
+    },
+    {
+      "A": {
+        "best_ms": 0.052,
+        "first": "[Int(40)]",
+        "median_ms": 0.053,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.084,
+        "first": "[Int(40)]",
+        "median_ms": 0.086,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "name": "eq 0.1%",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k963 = 'v3'",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k963 = 'v3'"
+    },
+    {
+      "A": {
+        "best_ms": 0.268,
+        "first": "[Int(131343)]",
+        "median_ms": 0.3,
+        "peak_mb": 0.2,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.562,
+        "first": "[Int(131343)]",
+        "median_ms": 0.666,
+        "peak_mb": 0.2,
+        "rows": 1
+      },
+      "name": "in hot",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k0 IN ('v1', 'v2', 'v3', 'v4')",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k0 IN ('v1', 'v2', 'v3', 'v4')"
+    },
+    {
+      "A": {
+        "best_ms": 0.047,
+        "first": "[Int(425)]",
+        "median_ms": 0.05,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.104,
+        "first": "[Int(425)]",
+        "median_ms": 0.119,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "name": "prefix hex",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k8 LIKE 'ab%'",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k8 LIKE 'ab%'"
+    },
+    {
+      "A": {
+        "best_ms": 0.07,
+        "first": "[Int(8186)]",
+        "median_ms": 0.081,
+        "peak_mb": 0.2,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.368,
+        "first": "[Int(8186)]",
+        "median_ms": 0.487,
+        "peak_mb": 0.1,
+        "rows": 1
+      },
+      "name": "range int",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k12 BETWEEN 10000 AND 19999",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k12 BETWEEN 10000 AND 19999"
+    },
+    {
+      "A": {
+        "best_ms": 0.044,
+        "first": "[Int(5792)]",
+        "median_ms": 0.046,
+        "peak_mb": 0.2,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.349,
+        "first": "[Int(5792)]",
+        "median_ms": 0.409,
+        "peak_mb": 0.1,
+        "rows": 1
+      },
+      "name": "range float",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k17 > 900.5",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k17 > 900.5"
+    },
+    {
+      "A": {
+        "best_ms": 0.193,
+        "first": "[Int(10233)]",
+        "median_ms": 0.238,
+        "peak_mb": 0.1,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.126,
+        "first": "[Int(10233)]",
+        "median_ms": 0.138,
+        "peak_mb": 0.1,
+        "rows": 1
+      },
+      "name": "exists 1%",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k106 IS NOT NULL",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k106 IS NOT NULL"
+    },
+    {
+      "A": {
+        "best_ms": 0.104,
+        "first": "[Int(1089)]",
+        "median_ms": 0.114,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 0.111,
+        "first": "[Int(1089)]",
+        "median_ms": 0.126,
+        "peak_mb": 0.0,
+        "rows": 1
+      },
+      "name": "exists 0.1%",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k963 IS NOT NULL",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k963 IS NOT NULL"
+    },
+    {
+      "A": {
+        "best_ms": 0.398,
+        "first": "[Int(1350)]",
+        "median_ms": 0.434,
+        "peak_mb": 0.1,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 1.0,
+        "first": "[Int(1350)]",
+        "median_ms": 1.018,
+        "peak_mb": 0.1,
+        "rows": 1
+      },
+      "name": "and",
+      "same_rows": true,
+      "sql_A": "SELECT COUNT(*) FROM t WHERE k0 = 'v3' AND k12 < 50000",
+      "sql_J": "SELECT COUNT(*) FROM t WHERE attrs.k0 = 'v3' AND attrs.k12 < 50000"
+    },
+    {
+      "A": {
+        "best_ms": 0.024,
+        "first": "[Str(\"r1736\")]",
+        "median_ms": 0.025,
+        "peak_mb": 0.1,
+        "rows": 10
+      },
+      "J": {
+        "best_ms": 0.066,
+        "first": "[Str(\"r1736\")]",
+        "median_ms": 0.073,
+        "peak_mb": 0.0,
+        "rows": 10
+      },
+      "name": "ids limit 10",
+      "same_rows": true,
+      "sql_A": "SELECT id FROM t WHERE k106 = 'v3' LIMIT 10",
+      "sql_J": "SELECT id FROM t WHERE attrs.k106 = 'v3' LIMIT 10"
+    },
+    {
+      "A": {
+        "best_ms": 30.169,
+        "first": "[Str(\"r1736\"), Null, Str(\"v9\"), Null, Null, Null, Null, Str(\"v16\"), Null, Null, Str(\"53ce63230a\"), Null, Null, Null, Null, Null, Null, Null, Null, Null, Null...",
+        "median_ms": 30.735,
+        "peak_mb": 4.5,
+        "rows": 100
+      },
+      "J": {
+        "best_ms": 2.145,
+        "first": "[Str(\"r1736\"), Str(\"{\\\"k1\\\":\\\"v9\\\",\\\"k106\\\":\\\"v3\\\",\\\"k187\\\":\\\"v0\\\",\\\"k22\\\":\\\"v4\\\",\\\"k6\\\":\\\"v16\\\",\\\"k69\\\":\\\"6b791d8803\\\",\\\"k9\\\":\\\"53ce63230a\\\"}\")]",
+        "median_ms": 2.3,
+        "peak_mb": 0.1,
+        "rows": 100
+      },
+      "name": "rows limit 100",
+      "same_rows": false,
+      "sql_A": "SELECT * FROM t WHERE k106 = 'v3' LIMIT 100",
+      "sql_J": "SELECT * FROM t WHERE attrs.k106 = 'v3' LIMIT 100"
+    },
+    {
+      "A": {
+        "best_ms": 2.363,
+        "first": "[Str(\"v16\"), Int(33238)]",
+        "median_ms": 2.437,
+        "peak_mb": 0.2,
+        "rows": 5
+      },
+      "J": {
+        "best_ms": 2.65,
+        "first": "[Str(\"v16\"), Int(33238)]",
+        "median_ms": 2.692,
+        "peak_mb": 0.2,
+        "rows": 5
+      },
+      "name": "group hot",
+      "same_rows": true,
+      "sql_A": "SELECT k0, COUNT(*) FROM t WHERE k0 IS NOT NULL GROUP BY k0 ORDER BY COUNT(*) DESC, k0 LIMIT 5",
+      "sql_J": "SELECT attrs.k0, COUNT(*) FROM t WHERE attrs.k0 IS NOT NULL GROUP BY attrs.k0 ORDER BY COUNT(*) DESC, attrs.k0 LIMIT 5"
+    },
+    {
+      "A": {
+        "best_ms": 0.299,
+        "first": "[Str(\"v1\"), Int(573)]",
+        "median_ms": 0.335,
+        "peak_mb": 0.1,
+        "rows": 5
+      },
+      "J": {
+        "best_ms": 0.429,
+        "first": "[Str(\"v1\"), Int(573)]",
+        "median_ms": 0.453,
+        "peak_mb": 0.1,
+        "rows": 5
+      },
+      "name": "group 1%",
+      "same_rows": true,
+      "sql_A": "SELECT k106, COUNT(*) FROM t WHERE k106 IS NOT NULL GROUP BY k106 ORDER BY COUNT(*) DESC, k106 LIMIT 5",
+      "sql_J": "SELECT attrs.k106, COUNT(*) FROM t WHERE attrs.k106 IS NOT NULL GROUP BY attrs.k106 ORDER BY COUNT(*) DESC, attrs.k106 LIMIT 5"
+    },
+    {
+      "A": {
+        "best_ms": 0.088,
+        "first": "[Null, Int(162)]",
+        "median_ms": 0.092,
+        "peak_mb": 0.0,
+        "rows": 5
+      },
+      "J": {
+        "best_ms": 5.358,
+        "first": "[Null, Int(162)]",
+        "median_ms": 5.476,
+        "peak_mb": 0.1,
+        "rows": 5
+      },
+      "name": "group hot of 1%",
+      "same_rows": true,
+      "sql_A": "SELECT k0, COUNT(*) FROM t WHERE k106 = 'v3' GROUP BY k0 ORDER BY COUNT(*) DESC, k0 LIMIT 5",
+      "sql_J": "SELECT attrs.k0, COUNT(*) FROM t WHERE attrs.k106 = 'v3' GROUP BY attrs.k0 ORDER BY COUNT(*) DESC, attrs.k0 LIMIT 5"
+    },
+    {
+      "A": {
+        "best_ms": 13.342,
+        "first": "[Float(49786.30363790498), Int(2), Int(99996)]",
+        "median_ms": 13.571,
+        "peak_mb": 0.2,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 21.355,
+        "first": "[Float(49786.30363790498), Int(2), Str(\"n/a\")]",
+        "median_ms": 21.858,
+        "peak_mb": 0.8,
+        "rows": 1
+      },
+      "name": "avg int",
+      "same_rows": false,
+      "sql_A": "SELECT AVG(k12), MIN(k12), MAX(k12) FROM t WHERE k12 IS NOT NULL",
+      "sql_J": "SELECT AVG(attrs.k12), MIN(attrs.k12), MAX(attrs.k12) FROM t WHERE attrs.k12 IS NOT NULL"
+    },
+    {
+      "A": {
+        "best_ms": 1.7,
+        "first": "[Float(49774.170872983035), Int(10), Int(99972)]",
+        "median_ms": 1.858,
+        "peak_mb": 0.3,
+        "rows": 1
+      },
+      "J": {
+        "best_ms": 3.357,
+        "first": "[Float(49774.170872983035), Int(10), Str(\"n/a\")]",
+        "median_ms": 3.488,
+        "peak_mb": 0.6,
+        "rows": 1
+      },
+      "name": "avg int 1%",
+      "same_rows": false,
+      "sql_A": "SELECT AVG(k112), MIN(k112), MAX(k112) FROM t WHERE k112 IS NOT NULL",
+      "sql_J": "SELECT AVG(attrs.k112), MIN(attrs.k112), MAX(attrs.k112) FROM t WHERE attrs.k112 IS NOT NULL"
+    },
+    {
+      "A": {
+        "best_ms": 0.254,
+        "first": "[Str(\"r251730\"), Int(2)]",
+        "median_ms": 0.3,
+        "peak_mb": 0.2,
+        "rows": 10
+      },
+      "J": {
+        "best_ms": 9.992,
+        "first": "[Str(\"r251730\"), Int(2)]",
+        "median_ms": 11.272,
+        "peak_mb": 1.0,
+        "rows": 10
+      },
+      "name": "order int limit 10",
+      "same_rows": true,
+      "sql_A": "SELECT id, k12 FROM t WHERE k12 IS NOT NULL ORDER BY k12, id LIMIT 10",
+      "sql_J": "SELECT id, attrs.k12 FROM t WHERE attrs.k12 IS NOT NULL ORDER BY attrs.k12, id LIMIT 10"
+    },
+    {
+      "A": {
+        "best_ms": 1.536,
+        "first": "[Str(\"r897993\"), Int(34)]",
+        "median_ms": 1.706,
+        "peak_mb": 0.3,
+        "rows": 10
+      },
+      "J": {
+        "best_ms": 2.941,
+        "first": "[Str(\"r897993\"), Int(34)]",
+        "median_ms": 3.195,
+        "peak_mb": 0.8,
+        "rows": 10
+      },
+      "name": "order int of eq hot",
+      "same_rows": true,
+      "sql_A": "SELECT id, k12 FROM t WHERE k0 = 'v3' ORDER BY k12, id LIMIT 10",
+      "sql_J": "SELECT id, attrs.k12 FROM t WHERE attrs.k0 = 'v3' ORDER BY attrs.k12, id LIMIT 10"
+    },
+    {
+      "A": null,
+      "J": {
+        "best_ms": 541.69,
+        "first": "[Str(\"k0\"), Int(656338), Float(0.656338), Int(656338), Int(0), Int(0), Null, Null, Int(20), Str(\"[[\\\"v16\\\",33238],[\\\"v10\\\",33123],[\\\"v11\\\",33061],[\\\"v8\\\",330...",
+        "median_ms": 639.488,
+        "peak_mb": 1.2,
+        "rows": 1000
+      },
+      "name": "paths",
+      "sql_A": null,
+      "sql_J": "SELECT * FROM json_paths('t', 'attrs')"
+    },
+    {
+      "A": null,
+      "J": {
+        "best_ms": 473.354,
+        "first": "[Str(\"k0\"), Int(344), Float(0.6798418972332015), Int(344), Int(0), Int(0), Null, Null, Int(20), Str(\"[[\\\"v9\\\",25],[\\\"v2\\\",23],[\\\"v4\\\",22],[\\\"v6\\\",22],[\\\"v7\\\"...",
+        "median_ms": 516.1,
+        "peak_mb": 0.6,
+        "rows": 680
+      },
+      "name": "paths of eq 1%",
+      "sql_A": null,
+      "sql_J": "SELECT * FROM json_paths('t', 'attrs', filter => 'attrs.k106 = ''v3''')"
+    }
+  ],
+  "reps": 7,
+  "rows": 1000000,
+  "segment": {
+    "rows": 100000,
+    "variants": {
+      "A": {
+        "build_s": 5.157,
+        "bytes": 65543012,
+        "bytes_per_row": 655.43,
+        "sections": {
+          "col": {
+            "bytes": 19192688,
+            "bytes_per_row": 191.93
+          },
+          "fields": {
+            "bytes": 4004,
+            "bytes_per_row": 0.04
+          },
+          "kw": {
+            "bytes": 24068632,
+            "bytes_per_row": 240.69
+          },
+          "pk": {
+            "bytes": 3054504,
+            "bytes_per_row": 30.55
+          },
+          "range": {
+            "bytes": 9343288,
+            "bytes_per_row": 93.43
+          },
+          "store": {
+            "bytes": 6146658,
+            "bytes_per_row": 61.47
+          }
+        }
+      },
+      "J": {
+        "build_s": 1.415,
+        "bytes": 24935368,
+        "bytes_per_row": 249.35,
+        "sections": {
+          "fields": {
+            "bytes": 8,
+            "bytes_per_row": 0.0
+          },
+          "json": {
+            "bytes": 8,
+            "bytes_per_row": 0.0
+          },
+          "kw": {
+            "bytes": 14725624,
+            "bytes_per_row": 147.26
+          },
+          "pk": {
+            "bytes": 3054504,
+            "bytes_per_row": 30.55
+          },
+          "store": {
+            "bytes": 7135191,
+            "bytes_per_row": 71.35
+          }
+        }
+      },
+      "J text": {
+        "build_s": 2.889,
+        "bytes": 28445640,
+        "bytes_per_row": 284.46,
+        "sections": {
+          "fields": {
+            "bytes": 8,
+            "bytes_per_row": 0.0
+          },
+          "json": {
+            "bytes": 8,
+            "bytes_per_row": 0.0
+          },
+          "kw": {
+            "bytes": 14725624,
+            "bytes_per_row": 147.26
+          },
+          "pk": {
+            "bytes": 3054504,
+            "bytes_per_row": 30.55
+          },
+          "store": {
+            "bytes": 7135191,
+            "bytes_per_row": 71.35
+          },
+          "text": {
+            "bytes": 3500253,
+            "bytes_per_row": 35.0
+          }
+        }
+      }
+    }
+  }
+}
