@@ -34,7 +34,8 @@
 use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray, UInt64Array,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray,
+    TimestampMicrosecondBuilder, UInt64Array,
 };
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
@@ -653,9 +654,8 @@ impl<'a> Lower<'a, '_> {
         let mut fields = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
         let mut cols = Vec::with_capacity(width);
-        for i in 0..width {
+        for a in columns_of(&rows, width)? {
             let name = self.fresh("c");
-            let a = array_of(rows.iter().map(|r| r.get(i).unwrap_or(&Value::Null)))?;
             fields.push(Field::new(&name, a.data_type().clone(), true));
             arrays.push(a);
             cols.push(name);
@@ -663,7 +663,7 @@ impl<'a> Lower<'a, '_> {
         let key = match keys {
             Some(k) => {
                 let name = self.fresh("key");
-                let a = array_of(k.iter())?;
+                let a = column_of(&k)?;
                 fields.push(Field::new(&name, a.data_type().clone(), true));
                 arrays.push(a);
                 Some(name)
@@ -877,12 +877,27 @@ impl<'a> Lower<'a, '_> {
         let r = if right.is_leaf() {
             // As the operators do: the right side read only for the join
             // values the left holds.
-            l = self.materialize(l)?;
+            let (m, left_rows) = self.materialized(l)?;
+            l = m;
+            // Many values cost the restricted scan more than reading the
+            // rows they would cut: the right side is read whole and hashed.
+            let whole = left_rows > RESTRICT_ALWAYS
+                && plain(right)
+                && match self.count(right)? {
+                    Some(rows) if (left_rows as u64).saturating_mul(RESTRICT_RATIO) > rows => {
+                        let values = self.distinct_keys(&l, keys)?;
+                        values > RESTRICT_ALWAYS && (values as u64).saturating_mul(RESTRICT_RATIO) > rows
+                    }
+                    _ => false,
+                };
+            if whole {
+                let r = self.leaf(right, "join", Vec::new())?;
+                return self.joined(l, r, kind, keys, on);
+            }
             let Node::Project { columns, .. } = right else { unreachable!("a leaf") };
             let schema = self.table(right)?;
             let mut restrict = Vec::new();
             let mut none = false;
-            let mut values = 0;
             for k in keys {
                 let e = self.top(&k.left, &l.cols, l.plan.schema())?;
                 if matches!(e.get_type(l.plan.schema())?, DataType::List(_)) {
@@ -899,23 +914,41 @@ impl<'a> Lower<'a, '_> {
                 let Expr::Field(f) = &c.expr else { return no("a join key of a scanned table that is not one of its fields") };
                 let vals = ops::equal_to(Some(schema), Some(*f as usize), vals)?;
                 none |= vals.is_empty();
-                values += vals.len();
                 restrict.push(Expr::In { expr: Box::new(Expr::Field(*f)), list: vals.into_iter().map(Expr::Lit).collect() });
             }
-            // Many values cost the restricted scan more than reading the
-            // rows they would cut: the right side is read whole and hashed.
-            let whole = values > RESTRICT_ALWAYS && plain(right) && self.count(right)?.is_some_and(|rows| (values as u64).saturating_mul(RESTRICT_RATIO) > rows);
             match none {
                 true => {
                     let names = columns.iter().map(|c| c.name.clone()).collect();
                     self.memory(names, Vec::new(), None, None)?
                 }
-                false if whole => self.leaf(right, "join", Vec::new())?,
                 false => self.leaf(right, "join", restrict)?,
             }
         } else {
             self.node(right, "join")?
         };
+        self.joined(l, r, kind, keys, on)
+    }
+
+    /// How many distinct values, NULL aside, the join keys take in the
+    /// rows of `l` (summed over the keys).
+    fn distinct_keys(&mut self, l: &Rel, keys: &[crate::query::ir::JoinKey]) -> R<usize> {
+        let mut total = 0;
+        for k in keys {
+            let e = self.top(&k.left, &l.cols, l.plan.schema())?;
+            let (v, c) = (self.fresh("v"), self.fresh("n"));
+            let plan = LogicalPlanBuilder::from(l.plan.clone())
+                .project(vec![e.alias(&v)])?
+                .aggregate(Vec::<DExpr>::new(), vec![agg_fn::count_distinct(col(&v)).alias(&c)])?
+                .build()?;
+            for b in self.collect(plan)? {
+                total += values_of(b.column(0))?.first().and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
+            }
+        }
+        Ok(total)
+    }
+
+    /// The join of `l` and `r` on `keys` (and `on`).
+    fn joined(&mut self, l: Rel, r: Rel, kind: JoinKind, keys: &[crate::query::ir::JoinKey], on: Option<&Expr>) -> R<Rel> {
         let both: Vec<String> = l.cols.iter().chain(&r.cols).cloned().collect();
         let mut conds = Vec::new();
         for k in keys {
@@ -1338,6 +1371,90 @@ fn kind_of(v: &Value) -> R<Kind> {
             k
         }
     })
+}
+
+/// One column being built a row at a time: typed by its first value that
+/// is not NULL. Lists and vectors are left to [`array_of`].
+enum Col {
+    Nulls(usize),
+    Int(Int64Builder),
+    Float(Float64Builder),
+    Str(StringBuilder),
+    Bool(BooleanBuilder),
+    Time(TimestampMicrosecondBuilder),
+    Other,
+}
+
+impl Col {
+    /// The array of `n` rows; `other` builds a column of lists or vectors.
+    fn finish(self, n: usize, other: impl FnOnce() -> R<ArrayRef>) -> R<ArrayRef> {
+        Ok(match self {
+            Col::Nulls(_) => Arc::new(datafusion::arrow::array::NullArray::new(n)),
+            Col::Int(mut b) => Arc::new(b.finish()),
+            Col::Float(mut b) => Arc::new(b.finish()),
+            Col::Str(mut b) => Arc::new(b.finish()),
+            Col::Bool(mut b) => Arc::new(b.finish()),
+            Col::Time(mut b) => Arc::new(b.finish()),
+            Col::Other => other()?,
+        })
+    }
+
+    fn push(&mut self, v: &Value, n: usize) -> R<()> {
+        match (&mut *self, v) {
+            (Col::Other, _) => {}
+            (Col::Nulls(k), Value::Null) => *k += 1,
+            (Col::Nulls(k), v) => {
+                let k = *k;
+                *self = match v {
+                    Value::Int(_) => Col::Int(Int64Builder::with_capacity(n)),
+                    Value::Float(_) => Col::Float(Float64Builder::with_capacity(n)),
+                    Value::Str(_) => Col::Str(StringBuilder::with_capacity(n, n * 8)),
+                    Value::Bool(_) => Col::Bool(BooleanBuilder::with_capacity(n)),
+                    Value::Timestamp(_) => Col::Time(TimestampMicrosecondBuilder::with_capacity(n)),
+                    _ => Col::Other,
+                };
+                for _ in 0..k {
+                    self.push(&Value::Null, n)?;
+                }
+                self.push(v, n)?;
+            }
+            (Col::Int(b), Value::Int(x)) => b.append_value(*x),
+            (Col::Float(b), Value::Float(x)) => b.append_value(*x),
+            (Col::Str(b), Value::Str(x)) => b.append_value(x),
+            (Col::Bool(b), Value::Bool(x)) => b.append_value(*x),
+            (Col::Time(b), Value::Timestamp(x)) => b.append_value(*x),
+            (Col::Int(b), Value::Null) => b.append_null(),
+            (Col::Float(b), Value::Null) => b.append_null(),
+            (Col::Str(b), Value::Null) => b.append_null(),
+            (Col::Bool(b), Value::Null) => b.append_null(),
+            (Col::Time(b), Value::Null) => b.append_null(),
+            (_, v) => return no(format!("a column of values of several types, {v:?} among them")),
+        }
+        Ok(())
+    }
+}
+
+/// Columns `0..width` of `rows` as Arrow arrays, in one pass over the
+/// rows: a column of one type each, NULLs aside.
+fn columns_of(rows: &[Vec<Value>], width: usize) -> R<Vec<ArrayRef>> {
+    let n = rows.len();
+    let mut cols: Vec<Col> = (0..width).map(|_| Col::Nulls(0)).collect();
+    for r in rows {
+        for (i, c) in cols.iter_mut().enumerate() {
+            c.push(r.get(i).unwrap_or(&Value::Null), n)?;
+        }
+    }
+    cols.into_iter().enumerate().map(|(i, c)| c.finish(n, || array_of(rows.iter().map(|r| r.get(i).unwrap_or(&Value::Null))))).collect()
+}
+
+/// `values` as one Arrow array ([`columns_of`] of one column).
+fn column_of(values: &[Value]) -> R<ArrayRef> {
+    let n = values.len();
+    let mut c = Col::Nulls(0);
+    for v in values {
+        c.push(v, n)?;
+    }
+    c.finish(n, || array_of(values.iter()))
 }
 
 /// The values of one column as an Arrow array of their one type.
