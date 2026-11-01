@@ -87,6 +87,10 @@ pub enum FieldType {
 
 /// The feature of a database with a JSON field ([`FieldType::Json`]).
 pub const JSON: &str = "json";
+/// The feature of a database with a JSON field whose strings are indexed
+/// as text too ([`Field::text`]): its segments hold a text index beside
+/// the field's terms.
+pub const JSON_TEXT: &str = "json_text";
 
 /// What an INT column's integers stand for (format 3; a database is
 /// written in format 3 only while a table has such a field). Queries and
@@ -250,6 +254,14 @@ pub struct Field {
     /// that would find those sections missing refuse it by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added: Option<Added>,
+    /// A JSON field whose string values are also indexed as text
+    /// (`OPTIONS(text = true)`): one text index over the strings of each
+    /// row's object, so `MATCH(attrs, ...)` and `bm25(attrs, ...)` search
+    /// them as they do a TEXT field's, with the field's [`Field::analyzer`]
+    /// and positions ([`crate::json::text_of`]). Makes the database format
+    /// 3 (feature [`JSON_TEXT`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text: bool,
 }
 
 /// What [`Field::added`] records of a field added to a table.
@@ -363,6 +375,7 @@ impl Field {
             semantic_id: None,
             derive: None,
             added: None,
+            text: false,
         }
     }
     /// What the field's sections are named by in a segment
@@ -452,6 +465,16 @@ impl Field {
     /// The analyzer of a TEXT field's text ([`Field::analyzer`]).
     pub fn text_analyzer(&self) -> Analyzer {
         self.analyzer.unwrap_or_default()
+    }
+    /// Indexes a JSON field's strings as text too ([`Field::text`]).
+    pub fn json_text(mut self) -> Self {
+        self.text = true;
+        self
+    }
+    /// The field has a text index that `MATCH` and `bm25` read: an
+    /// indexed TEXT field, or a JSON field with [`Field::text`].
+    pub fn has_text(&self) -> bool {
+        self.indexed && (matches!(self.ty, FieldType::Text { .. }) || self.ty == FieldType::Json && self.text)
     }
     /// Gives the field a default ([`Field::default`]).
     pub fn default(mut self, value: serde_json::Value) -> Self {
@@ -959,8 +982,14 @@ impl Schema {
             if f.analyzer == Some(Analyzer::English) {
                 f.analyzer = None;
             }
-            if f.analyzer.is_some() && !matches!(f.ty, FieldType::Text { .. }) {
-                return Err(Error::Schema(format!("field {}: only a TEXT field has an analyzer", f.name)));
+            if f.analyzer.is_some() && !matches!(f.ty, FieldType::Text { .. }) && !(f.ty == FieldType::Json && f.text) {
+                return Err(Error::Schema(format!("field {}: only a TEXT field, or a JSON field with text, has an analyzer", f.name)));
+            }
+            if f.text && f.ty != FieldType::Json {
+                return Err(Error::Schema(format!("field {}: text is an option of a JSON field (a TEXT field is text already)", f.name)));
+            }
+            if f.text && !f.indexed {
+                return Err(Error::Schema(format!("field {}: text indexes the field's strings, so the field is indexed", f.name)));
             }
         }
         for (i, f) in s.fields.iter().enumerate() {
@@ -1257,7 +1286,8 @@ impl Schema {
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
     /// `multi_vector`, `semantic_id`, [`Analyzer::feature`], `media`
-    /// ([`Field::media`]), `derive` ([`Field::derive`]) and [`JSON`], and
+    /// ([`Field::media`]), `derive` ([`Field::derive`]), [`JSON`] and
+    /// [`JSON_TEXT`], and
     /// its options `shard_by`, `cluster_by`, `retain` and `edge_table`
     /// ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
     /// [`Schema::with_retain`], [`Schema::with_edges`]).
@@ -1273,6 +1303,7 @@ impl Schema {
                 f.derive.as_ref().map(|_| "derive"),
                 f.added.as_ref().map(|_| ADDED_FIELDS),
                 (f.ty == FieldType::Json).then_some(JSON),
+                (f.ty == FieldType::Json && f.text).then_some(JSON_TEXT),
             ];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
@@ -1658,7 +1689,12 @@ impl Schema {
                     }
                     FieldType::Sparse => ("sparse", true),
                     FieldType::Edges => ("edges", true),
-                    FieldType::Json => ("json", true),
+                    FieldType::Json => {
+                        if f.text {
+                            m.insert("text".into(), json!(true));
+                        }
+                        ("json", true)
+                    }
                 };
                 m.insert("type".into(), json!(ty));
                 if f.multi {
@@ -1738,7 +1774,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
     use serde_json::Value as J;
     let name = j.get("name").and_then(J::as_str).ok_or_else(|| Error::Schema(format!("a field needs a \"name\": {j}")))?;
     let bad = |m: &str| Error::Schema(format!("field {name}: {m}"));
-    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "keep_f32", "pool", "pool_factor", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive"];
+    let known = ["name", "type", "stored", "indexed", "multi", "positions", "from", "dim", "index", "codes", "keep_f32", "pool", "pool_factor", "embed", "references", "not_null", "default", "analyzer", "kind", "semantic_id", "derive", "text"];
     if let Some(k) = j.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
         return Err(bad(&format!("unknown option {k:?} (known: {})", known.join(", "))));
     }
@@ -1840,6 +1876,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
         Some(_) => return Err(bad("references names a table")),
     }
     f.not_null = flag("not_null")?.unwrap_or(false);
+    f.text = flag("text")?.unwrap_or(false);
     f.default = j.get("default").filter(|d| !d.is_null()).cloned();
     f.analyzer = match j.get("analyzer") {
         None | Some(J::Null) => None,

@@ -45,6 +45,7 @@ export function fieldNotes(f, key) {
   if (f.codes) out.push(`${f.codes} codes`);
   if (f.analyzer && f.analyzer !== "english") out.push(`${typeof f.analyzer === "string" ? f.analyzer : "custom"} analyzer`);
   if (f.positions === false) out.push("no positions");
+  if (f.text) out.push("strings searched as text");
   if (f.indexed === false) out.push("not indexed");
   if (f.stored === false) out.push("not stored");
   if (f.kind) out.push(f.kind);
@@ -467,7 +468,7 @@ function designer(host, bar, { seed, onCreated }) {
     row.ondragstart = (e) => { if (!row.draggable) return; dragRow = row; row.classList.add("dragging-src"); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", f.name); };
     row.ondragend = () => { row.draggable = false; row.classList.remove("dragging-src"); if (dragRow) { const ids = [...row.parentNode.querySelectorAll(".sf")].map((r) => r.dataset.id); d.fields.sort((a, b) => ids.indexOf(a._id) - ids.indexOf(b._id)); dragRow = null; changed(); } };
     const nm = h("input", { class: "input sm fname mono", value: f.name, spellcheck: "false", "aria-label": "field name", oninput: () => { const old = f.name; f.name = nm.value.trim(); if (d.key === old) d.key = f.name; changed(false); } });
-    const ty = h("select", { class: "select sm", "aria-label": "type", onchange: () => { f.type = ty.value; for (const k of ["dim", "index", "embed", "codes", "analyzer", "positions", "from", "kind", "references", "semantic_id", "derive"]) delete f[k]; if (!["keyword", "int"].includes(f.type)) delete f.multi; if (f.type === "vector") f.dim = 384; changed(); } },
+    const ty = h("select", { class: "select sm", "aria-label": "type", onchange: () => { f.type = ty.value; for (const k of ["dim", "index", "embed", "codes", "analyzer", "positions", "from", "kind", "references", "semantic_id", "derive", "text"]) delete f[k]; if (!["keyword", "int"].includes(f.type)) delete f.multi; if (f.type === "vector") f.dim = 384; changed(); } },
       Object.entries(TYPES).map(([k, v]) => h("option", { value: k, selected: k === f.type }, v.label)));
     const canKey = (f.type === "keyword" || f.type === "int") && !f.multi;
     row.append(
@@ -508,6 +509,11 @@ function designer(host, bar, { seed, onCreated }) {
       out.push(lab("Codes", "sq8: 8 bits a dimension (the default); binary: 1 bit, 32 times smaller", sel(f, "codes", ["sq8", "binary"], "sq8")));
     }
     if (f.type === "media") out.push(lab("Kind", "", sel(f, "kind", ["image", "audio", "video", "pdf", "file"])));
+    if (f.type === "json") {
+      out.push(lab("Text", "Index the objects' strings as text too, for MATCH and bm25 (long strings included)",
+        h("input", { type: "checkbox", checked: !!f.text, onchange: (e) => { if (e.target.checked) f.text = true; else { delete f.text; delete f.analyzer; } changed(); } })));
+      if (f.text) out.push(lab("Analyzer", "english: stopwords dropped, words stemmed; simple: every word as written", sel(f, "analyzer", ["english", "simple"], "english")));
+    }
     if (!out.length) out.push(h("div", { class: "small muted" }, `${typeMeta(f).label} has no options.`));
     return h("div", { class: "sch-grid" }, out);
   }

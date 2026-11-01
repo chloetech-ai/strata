@@ -406,6 +406,31 @@ pub fn terms(v: &Value) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The text a JSON field with text ([`crate::schema::Field::text`])
+/// indexes for a row: its object's strings, long ones too, in the order of
+/// their paths (keys sorted), one a line; `None` for a row with none.
+/// Numbers, booleans and keys are not text: a query reads them by path.
+pub fn text_of(v: &Value) -> Result<Option<String>> {
+    let s = match v {
+        Value::Null => return Ok(None),
+        Value::Str(s) => s,
+        v => return Err(bad(format!("a JSON field holds JSON text, not {v:?}"))),
+    };
+    let j: Json = serde_json::from_str(s).map_err(|e| bad(format!("a stored JSON value does not parse: {e}")))?;
+    let mut out = String::new();
+    walk(&j, &mut String::new(), 0, &mut |_, leaf| {
+        if let Some(Json::String(s)) = leaf {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(s);
+        }
+        Ok(())
+    })
+    .map_err(bad)?;
+    Ok((!out.is_empty()).then_some(out))
+}
+
 /// The value at `path` of a row's stored object, as a query returns it:
 /// a string, an integer (a JSON number that is one) or a double, a
 /// boolean; an object as its JSON text; an array of plain values as a list
@@ -517,24 +542,35 @@ fn plain(x: &Json) -> Option<Value> {
 
 // ---------------------------------------------------------------- builder
 
-/// Builds a JSON field's keyword column of terms ([`terms`]).
+/// Builds a JSON field's keyword column of terms ([`terms`]), and with
+/// [`crate::schema::Field::text`] the text index of its strings
+/// ([`text_of`]), under the field's key as a TEXT field's
+/// (`text.<key>.*`, beside the column's `kw.<key>.*`).
 pub(crate) struct JsonBuilder {
     inner: Box<dyn crate::segment::FieldIndexBuilder>,
+    text: Option<Box<crate::text::TextFieldBuilder>>,
 }
 
 impl JsonBuilder {
     pub fn new(field: &crate::schema::Field, opts: &crate::segment::build::BuildOptions) -> Result<Self> {
-        Ok(JsonBuilder { inner: crate::forward::field_builder(field, opts)? })
+        let text = if field.text { Some(Box::new(crate::text::text_builder(field, opts)?)) } else { None };
+        Ok(JsonBuilder { inner: crate::forward::field_builder(field, opts)?, text })
     }
 }
 
 impl crate::segment::FieldIndexBuilder for JsonBuilder {
     fn add(&mut self, doc: crate::segment::DocId, value: &Value) -> Result<()> {
+        if let Some(t) = &mut self.text {
+            t.add(doc, &text_of(value)?.map_or(Value::Null, Value::Str))?;
+        }
         let terms = terms(value)?;
         self.inner.add(doc, &Value::List(terms.into_iter().map(Value::Str).collect()))
     }
 
     fn finish(self: Box<Self>, out: &mut crate::segment::SegmentWriter) -> Result<()> {
+        if let Some(t) = self.text {
+            t.finish(out)?;
+        }
         self.inner.finish(out)
     }
 }
