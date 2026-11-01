@@ -321,6 +321,9 @@ mod tests {
     #[test]
     fn the_time_around_a_run_is_steps_too() {
         let ms = std::time::Duration::from_millis;
+        // The clock starts at its first reading: before `queued`, or a test
+        // process of its own (cargo-nextest) reads `queued` as 0.
+        epoch();
         let queued = Instant::now();
         let (started, ended, back) = (queued + ms(1), queued + ms(5), queued + ms(6));
         let mut steps = vec![Step { start_us: us_at(started) + 100.0, us: 2000.0, ..step("rank") }, Step { depth: 1, start_us: us_at(started) + 200.0, us: 3000.0, ..step("segment") }];
