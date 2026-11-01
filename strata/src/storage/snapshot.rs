@@ -141,6 +141,12 @@ impl Snapshot {
         &self.view().schema
     }
 
+    /// [`Snapshot::schema`] as the table holds it, shared by snapshots
+    /// until the table's schema changes.
+    pub(crate) fn shared_schema(&self) -> &Arc<Schema> {
+        &self.view().schema
+    }
+
     /// The rank profiles of the table this snapshot looks at, by name.
     pub fn rank_profiles(&self) -> &[RankProfile] {
         &self.view().profiles
@@ -616,6 +622,12 @@ impl State {
             *slot = Some(seg.clone());
         }
     }
+}
+
+/// `image` copied to page-aligned memory, as a segment opened from it
+/// needs for its sections to be viewed in place.
+pub(crate) fn page_aligned(image: &[u8]) -> OwnedBytes {
+    OwnedBytes::new(PageAligned::new(image))
 }
 
 /// Builds the segment of a memtable chunk's first `len` documents.

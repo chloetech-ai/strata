@@ -49,7 +49,7 @@ fn create(dir: &Path, name: &str) -> Arc<Db> {
 }
 
 fn service(db: Arc<Db>, timeout: Duration) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Service::new(Backend::Local(db), schema, agent(), 16, timeout)
 }
 
@@ -495,7 +495,8 @@ async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
     until("both apply the next write", || async { last(&fdb) == last(&pdb) && last(&ddb) == last(&pdb) }).await;
     assert_eq!(rows(&ddb), rows(&pdb));
 
-    // One whose tables are not the primary's is not changed by the copy.
+    // One whose first table is not the primary's is not changed by the
+    // copy.
     let odb = {
         let schema = strata::Schema::new("products", vec![strata::Field::new("id", strata::FieldType::Keyword)], Some("id")).unwrap();
         let db = Db::create(&dir.path().join("other.strata"), schema, options(64 << 20)).unwrap();
@@ -505,7 +506,7 @@ async fn a_replica_the_log_does_not_reach_is_sent_a_copy() {
     replica_on(odb.clone(), None, Some(TcpListener::bind(other_at).await.unwrap())).await;
     until("the copy is refused", || async { follower(&p, 2).await["error"].as_str().is_some_and(|e| e.contains("sending it a copy of the primary failed")) }).await;
     let f = follower(&p, 2).await;
-    assert!(f["in_sync"] == false && f["copies"] == 0 && f["error"].as_str().unwrap().contains("the copy's tables (products) are not this database's (products), or their schemas differ"), "{f}");
+    assert!(f["in_sync"] == false && f["copies"] == 0 && f["error"].as_str().unwrap().contains("the copy's first table (products) is not this database's (products), or their schemas differ"), "{f}");
     assert_eq!(odb.snapshot().n_live_docs(), 0);
 
     // One started from a checkpoint of the primary follows from there,
@@ -767,7 +768,7 @@ async fn a_replica_serves_reads_once_caught_up_and_waits_for_a_write() {
     let dir = tempfile::tempdir().unwrap();
     let (pdb, rdb) = (create(dir.path(), "p.strata"), create(dir.path(), "r.strata"));
     // One query slot, which a read waiting for a write does not hold.
-    let mut r = Service::new(Backend::Local(rdb.clone()), rdb.schema().clone(), agent(), 1, Duration::from_secs(10));
+    let mut r = Service::new(Backend::Local(rdb.clone()), (*rdb.schema()).clone(), agent(), 1, Duration::from_secs(10));
     r.set_replication(Replication::Replica(Arc::new(Follow::open(rdb.clone(), None).unwrap())));
     let r = Arc::new(r);
     let ur = grpc(r.clone()).await;

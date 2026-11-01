@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value as J};
 
-use super::{Api, Endpoint, QUERY_CACHE};
+use super::{Api, Endpoint, RerankApi, RerankEndpoint, QUERY_CACHE};
 use crate::embed::{Embedder, Usage};
 use crate::error::{Error, Result};
 
@@ -246,43 +246,7 @@ impl HostedEmbedder {
     /// Sends `body`, and reads the answer's JSON.
     fn post(&self, body: &J) -> std::result::Result<J, Failure> {
         let ep = &self.ep;
-        let mut req = self.agent.post(&ep.url).header("content-type", "application/json");
-        if let Some(k) = &ep.key {
-            req = match ep.key_header.as_str() {
-                "authorization" => req.header("authorization", format!("Bearer {k}")),
-                h => req.header(h, k.as_str()),
-            };
-        }
-        for (k, v) in &ep.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let mut res = match req.send(serde_json::to_vec(body).expect("JSON").as_slice()) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(match e {
-                    ureq::Error::BadUri(_) | ureq::Error::InvalidProxyUrl | ureq::Error::Http(_) | ureq::Error::RedirectFailed => Failure::Fatal(format!("{}: {e}", ep.url)),
-                    e => Failure::Again(format!("{}: {e}", ep.url), None),
-                })
-            }
-        };
-        let status = res.status().as_u16();
-        let wait = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s >= 0.0).map(Duration::from_secs_f64);
-        let bytes = match res.body_mut().with_config().limit(MAX_ANSWER).read_to_vec() {
-            Ok(b) => b,
-            Err(e) => return Err(Failure::Again(format!("{}: reading the answer: {e}", ep.url), None)),
-        };
-        let j: Option<J> = serde_json::from_slice(&bytes).ok();
-        if (200..300).contains(&status) {
-            return j.ok_or_else(|| Failure::Fatal(format!("{} answered {status} with no JSON", ep.url)));
-        }
-        let said = j.as_ref().and_then(error_message).unwrap_or_else(|| String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).trim().to_string());
-        let m = format!("{} answered {status}: {said}", ep.url);
-        Err(match status {
-            401 | 403 => Failure::Fatal(format!("{m} (the API key in {} was refused)", ep.key_from)),
-            408 | 409 | 425 | 429 | 500..=599 => Failure::Again(m, wait),
-            400 | 413 | 422 if too_long(&said) => Failure::TooLong(m),
-            _ => Failure::Fatal(m),
-        })
+        post(&self.agent, Wire { url: &ep.url, key: ep.key.as_deref(), key_header: &ep.key_header, key_from: &ep.key_from, headers: &ep.headers }, body)
     }
 
     /// The `n` vectors an answer holds, in the order of the texts.
@@ -368,6 +332,174 @@ impl Embedder for HostedEmbedder {
             tokens: self.tokens.load(Ordering::Relaxed),
         })
     }
+}
+
+/// A cross-encoder behind an HTTP API ([`RerankEndpoint`]).
+pub struct HostedReranker {
+    ep: RerankEndpoint,
+    agent: ureq::Agent,
+}
+
+impl HostedReranker {
+    pub fn new(ep: RerankEndpoint) -> HostedReranker {
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(ep.timeout)).http_status_as_error(false).user_agent(format!("strata/{}", env!("CARGO_PKG_VERSION"))).build().into();
+        HostedReranker { ep, agent }
+    }
+
+    pub fn endpoint(&self) -> &RerankEndpoint {
+        &self.ep
+    }
+
+    /// The model's score of each of `texts` for `query`, in order: in
+    /// batches of the endpoint's size, `concurrency` sent at once, `check`
+    /// (a query's deadline) running before each round. A text of only
+    /// spaces is not sent, and scores NaN (no score).
+    pub fn score(&self, query: &str, texts: &[&str], check: &mut dyn FnMut() -> Result<()>) -> Result<Vec<f64>> {
+        let mut out = vec![f64::NAN; texts.len()];
+        let todo: Vec<usize> = (0..texts.len()).filter(|&i| !texts[i].trim().is_empty()).collect();
+        let inputs: Vec<String> = todo.iter().map(|&i| cut(texts[i], self.ep.max_chars).to_string()).collect();
+        let batches = batches(&inputs, self.ep.batch, usize::MAX);
+        for round in batches.chunks(self.ep.concurrency.max(1)) {
+            check()?;
+            let scored: Vec<Result<Vec<f64>>> = match round {
+                [one] => vec![self.batch(query, &inputs[one.clone()])],
+                _ => std::thread::scope(|s| {
+                    let hs: Vec<_> = round.iter().map(|r| s.spawn(|| self.batch(query, &inputs[r.clone()]))).collect();
+                    hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(Error::Unavailable("a reranking request's thread panicked".into())))).collect()
+                }),
+            };
+            for (r, scores) in round.iter().zip(scored) {
+                for (j, x) in scores?.into_iter().enumerate() {
+                    out[todo[r.start + j]] = x;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One batch's scores, tried again on a rate limit or a server's
+    /// failure (with pauses of at most 5 s, as a query waits), and with its
+    /// texts cut shorter when one was too long.
+    fn batch(&self, query: &str, texts: &[String]) -> Result<Vec<f64>> {
+        let mut cut_to: Option<usize> = None;
+        let (mut shortened, mut attempt) = (0, 0u32);
+        let ep = &self.ep;
+        loop {
+            let owned: Vec<&str> = texts.iter().map(|t| cut_to.map_or(t.as_str(), |n| cut(t, n))).collect();
+            let body = match ep.api {
+                RerankApi::Cohere => json!({"model": ep.model, "query": query, "documents": owned}),
+                RerankApi::Jina => json!({"model": ep.model, "query": query, "documents": owned, "return_documents": false}),
+                RerankApi::Voyage => json!({"model": ep.model, "query": query, "documents": owned, "truncation": true}),
+                RerankApi::Tei => json!({"query": query, "texts": owned, "raw_scores": true, "truncate": true}),
+            };
+            let wire = Wire { url: &ep.url, key: ep.key.as_deref(), key_header: &ep.key_header, key_from: &ep.key_from, headers: &ep.headers };
+            let failure = match post(&self.agent, wire, &body).and_then(|j| self.parse(&j, texts.len())) {
+                Ok(scores) => return Ok(scores),
+                Err(f) => f,
+            };
+            let longest = owned.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+            match failure {
+                Failure::TooLong(m) if shortened < 4 && longest > 256 => {
+                    shortened += 1;
+                    cut_to = Some(longest / 2);
+                    tracing::warn!(model = %ep.name, chars = longest / 2, "a text was too long for the cross-encoder: cut and sent again ({m})");
+                }
+                Failure::Again(m, wait) if attempt < ep.retries => {
+                    attempt += 1;
+                    let pause = wait.unwrap_or_else(|| backoff(attempt)).min(Duration::from_secs(5));
+                    tracing::warn!(model = %ep.name, attempt, pause_ms = pause.as_millis() as u64, "reranking request failed, trying again: {m}");
+                    std::thread::sleep(pause);
+                }
+                Failure::Again(m, _) => return Err(Error::Unavailable(format!("cross-encoder {}: {m} (after {} tries)", ep.name, attempt + 1))),
+                Failure::TooLong(m) | Failure::Fatal(m) => return Err(Error::Unavailable(format!("cross-encoder {}: {m}", ep.name))),
+            }
+        }
+    }
+
+    /// The `n` scores an answer holds, in the order of the texts: every
+    /// text's, once.
+    fn parse(&self, j: &J, n: usize) -> std::result::Result<Vec<f64>, Failure> {
+        let url = &self.ep.url;
+        let (list, key) = match self.ep.api {
+            RerankApi::Cohere | RerankApi::Jina => (j.get("results"), "relevance_score"),
+            RerankApi::Voyage => (j.get("data"), "relevance_score"),
+            RerankApi::Tei => (Some(j), "score"),
+        };
+        let list = list.and_then(J::as_array).ok_or_else(|| Failure::Fatal(format!("{url} answered without a list of scores")))?;
+        let mut out = vec![f64::NAN; n];
+        let mut seen = 0;
+        for r in list {
+            let (Some(i), Some(x)) = (r.get("index").and_then(J::as_u64), r.get(key).and_then(J::as_f64)) else {
+                return Err(Failure::Fatal(format!("{url} answered a score without \"index\" and \"{key}\"")));
+            };
+            match out.get_mut(i as usize) {
+                Some(o) if o.is_nan() => {
+                    *o = x;
+                    seen += 1;
+                }
+                _ => return Err(Failure::Fatal(format!("{url} answered a score for text {i} of {n}, or twice"))),
+            }
+        }
+        if seen != n {
+            return Err(Failure::Fatal(format!("{url} answered {seen} scores for {n} texts")));
+        }
+        Ok(out)
+    }
+}
+
+/// Where a request goes, and the secret and headers it carries.
+#[derive(Clone, Copy)]
+struct Wire<'a> {
+    url: &'a str,
+    key: Option<&'a str>,
+    /// `authorization` takes `Bearer <key>`.
+    key_header: &'a str,
+    /// Where the secret was looked for, for errors.
+    key_from: &'a str,
+    headers: &'a [(String, String)],
+}
+
+/// POSTs `body` to `to`, and reads the answer's JSON: a failure that is
+/// worth another try (a rate limit, a server's error, a dropped
+/// connection) says so.
+fn post(agent: &ureq::Agent, to: Wire<'_>, body: &J) -> std::result::Result<J, Failure> {
+    let mut req = agent.post(to.url).header("content-type", "application/json");
+    if let Some(k) = to.key {
+        req = match to.key_header {
+            "authorization" => req.header("authorization", format!("Bearer {k}")),
+            h => req.header(h, k),
+        };
+    }
+    for (k, v) in to.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let mut res = match req.send(serde_json::to_vec(body).expect("JSON").as_slice()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(match e {
+                ureq::Error::BadUri(_) | ureq::Error::InvalidProxyUrl | ureq::Error::Http(_) | ureq::Error::RedirectFailed => Failure::Fatal(format!("{}: {e}", to.url)),
+                e => Failure::Again(format!("{}: {e}", to.url), None),
+            })
+        }
+    };
+    let status = res.status().as_u16();
+    let wait = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s >= 0.0).map(Duration::from_secs_f64);
+    let bytes = match res.body_mut().with_config().limit(MAX_ANSWER).read_to_vec() {
+        Ok(b) => b,
+        Err(e) => return Err(Failure::Again(format!("{}: reading the answer: {e}", to.url), None)),
+    };
+    let j: Option<J> = serde_json::from_slice(&bytes).ok();
+    if (200..300).contains(&status) {
+        return j.ok_or_else(|| Failure::Fatal(format!("{} answered {status} with no JSON", to.url)));
+    }
+    let said = j.as_ref().and_then(error_message).unwrap_or_else(|| String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).trim().to_string());
+    let m = format!("{} answered {status}: {said}", to.url);
+    Err(match status {
+        401 | 403 => Failure::Fatal(format!("{m} (the API key in {} was refused)", to.key_from)),
+        408 | 409 | 425 | 429 | 500..=599 => Failure::Again(m, wait),
+        400 | 413 | 422 if too_long(&said) => Failure::TooLong(m),
+        _ => Failure::Fatal(m),
+    })
 }
 
 /// The ranges of `inputs` each request sends: at most `n` texts and

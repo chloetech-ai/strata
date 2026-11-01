@@ -1,7 +1,7 @@
 //! The operations both front ends serve, over a local database or, as a
 //! coordinator, over shard servers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -19,7 +19,7 @@ use strata::query::model::Models;
 use strata::query::sql::{ident, quoted};
 use strata::query::{bind_command, compound, ops, profile, steps, Command, Params, Select};
 use strata::rank_log::{self, Log};
-use strata::schema::Schema;
+use strata::schema::{Alter, Schema};
 use strata::storage::{CheckpointOptions, CheckpointStats, Layout, RankProfile, Snapshot, TableTxn, WriteTxn};
 use strata::text::Synonyms;
 use strata::value::Value;
@@ -163,6 +163,23 @@ pub struct FieldModel {
     pub model: Result<Arc<dyn Embedder>, String>,
 }
 
+/// The filling in of the vectors an embedded field's rows were stored
+/// without, while it had no model open ([`Service::keep_models`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Backfill {
+    /// `running`, `done` or `failed` (tried again five minutes later).
+    pub state: &'static str,
+    /// Rows found without a vector as it started, those whose sources are
+    /// all empty included (they get none).
+    pub missing: u64,
+    /// Rows given their vector.
+    pub embedded: u64,
+    pub error: Option<String>,
+}
+
+/// Rows a backfill write fills in.
+const BACKFILL_BATCH: usize = 256;
+
 /// The agent's model settings ([`crate::agent`]).
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -176,6 +193,9 @@ pub struct Service {
     pub schema: Schema,
     pub metrics: Metrics,
     pub agent: AgentConfig,
+    /// The `StrataCluster` that runs this coordinator on Kubernetes, if one
+    /// does ([`crate::operator::kube::Link`]).
+    pub kube: Option<crate::operator::kube::Link>,
     /// The queries running now ([`telemetry::LiveQueries`]).
     pub live: Arc<LiveQueries>,
     /// The latest and slow queries, and statistics per statement.
@@ -199,6 +219,19 @@ pub struct Service {
     /// Where [`Service::open_models`] opened them, for tables created
     /// later, and where ranking models are.
     models_dir: Option<PathBuf>,
+    /// Whether [`Service::keep_models`] fills in the vectors of rows stored
+    /// without one (`--no-backfill`: not), and fetches the models Strata
+    /// knows that a field names and the models directory lacks
+    /// (`--no-fetch-models`: not).
+    pub backfill: bool,
+    pub fetch_models: bool,
+    /// Told when the models may have changed: a table created or altered,
+    /// a model fetched, a replica promoted.
+    models_changed: tokio::sync::watch::Sender<u64>,
+    /// Each embedded field's backfill, by table (lower case) and field.
+    backfills: Mutex<HashMap<(String, String), Backfill>>,
+    /// The models a fetch was tried for, once each.
+    fetch_tried: Mutex<HashSet<String>>,
     /// A coordinator's ranking models ([`Service::open_ranking_models`]);
     /// a database keeps its own.
     ranking: Models,
@@ -318,6 +351,7 @@ impl Service {
             schema,
             metrics: Metrics::default(),
             agent,
+            kube: None,
             live: Arc::new(LiveQueries::default()),
             query_log: QueryLog::default(),
             series: Series::default(),
@@ -328,6 +362,11 @@ impl Service {
             log_store: None,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
+            backfill: true,
+            fetch_models: false,
+            models_changed: tokio::sync::watch::Sender::new(0),
+            backfills: Mutex::new(HashMap::new()),
+            fetch_tried: Mutex::new(HashSet::new()),
             ranking: Models::default(),
             timeout,
             max_timeout: timeout.max(Duration::from_secs(60)),
@@ -428,7 +467,12 @@ impl Service {
     /// Applies a batch its primary shipped (`Replicate`), on a replica.
     pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
         match &self.replication() {
-            Replication::Replica(f) => f.replicate(r).await,
+            Replication::Replica(f) => {
+                let before = self.catalog();
+                let r = f.replicate(r).await;
+                self.tables_shipped(&before);
+                r
+            }
             Replication::Primary(p) => p.shipped_to(&r.primary, r.term),
             Replication::None => Err(conflict("this server is not a replica (--replica): it takes no shipped transactions".into())),
         }
@@ -437,9 +481,22 @@ impl Service {
     /// Installs a copy of its primary (`Restore`), on a replica.
     pub async fn restore(&self, chunks: tonic::Streaming<pb::RestoreChunk>) -> Result<pb::ReplicateResponse, ApiError> {
         match &self.replication() {
-            Replication::Replica(f) => f.restore(chunks).await,
+            Replication::Replica(f) => {
+                let before = self.catalog();
+                let r = f.restore(chunks).await;
+                self.tables_shipped(&before);
+                r
+            }
             Replication::Primary(p) => p.copied_to(chunks).await,
             Replication::None => Err(conflict("this server is not a replica (--replica): it takes no copy of a primary".into())),
+        }
+    }
+
+    /// Lists the models again when what a primary shipped, or its copy,
+    /// changed the tables, which were `before`.
+    fn tables_shipped(&self, before: &[Arc<Schema>]) {
+        if self.catalog() != before {
+            self.refresh_models();
         }
     }
 
@@ -530,6 +587,8 @@ impl Service {
         let opts = PrimaryOptions { replicas, acks, ..self.primary_options() };
         let (p, answer) = f.promote(opts, voters, force).await?;
         *self.replication.write().unwrap_or_else(|e| e.into_inner()) = Replication::Primary(p);
+        // A primary fills in what its rows lack.
+        self.models_changed.send_modify(|n| *n += 1);
         Ok(answer)
     }
 
@@ -839,13 +898,23 @@ impl Service {
     /// those already listed: after `CREATE TABLE`, and when a coordinator
     /// learns of new tables. Nothing before [`Service::open_models`].
     fn refresh_models(&self) {
+        self.list_models(false)
+    }
+
+    /// [`Self::refresh_models`], opening again the models that did not open
+    /// (after a fetch).
+    fn reopen_models(&self) {
+        self.list_models(true)
+    }
+
+    fn list_models(&self, reopen: bool) {
         let Some(dir) = &self.models_dir else { return };
         let old = self.models();
         let mut list = Vec::new();
         for t in self.catalog() {
             for f in &t.fields {
                 let Some(spec) = f.embed.clone() else { continue };
-                if let Some(m) = old.iter().find(|m| m.table.eq_ignore_ascii_case(&t.table) && m.field == f.name && m.spec == spec) {
+                if let Some(m) = old.iter().find(|m| m.table.eq_ignore_ascii_case(&t.table) && m.field == f.name && m.spec == spec).filter(|m| !reopen || m.model.is_ok()) {
                     list.push(m.clone());
                     continue;
                 }
@@ -863,7 +932,141 @@ impl Service {
                 list.push(FieldModel { table: t.table.clone(), field: f.name.clone(), spec, model: model.map_err(|e| e.to_string()) });
             }
         }
+        // A field with a model it did not have: its rows may lack vectors.
+        let opened = |l: &[FieldModel]| l.iter().filter(|m| m.model.is_ok()).map(|m| (m.table.to_lowercase(), m.field.clone(), m.spec.clone())).collect::<Vec<_>>();
+        let gained = opened(&list).iter().any(|m| !opened(&old).contains(m));
         *self.models.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(list);
+        if gained {
+            self.models_changed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// Keeps the embedded fields' models, for the server's life: fetches
+    /// those of [`strata::embed::KNOWN_MODELS`] a field names that the
+    /// models directory lacks ([`Self::fetch_models`]), then fills in the
+    /// vectors of rows stored without one while their field had no model
+    /// open, on a database that takes writes ([`Self::backfill`]). It runs
+    /// at start and whenever a field gains a model (a table created or
+    /// altered, a model fetched) or a replica becomes primary; a backfill
+    /// a model failed is tried again five minutes later.
+    pub async fn keep_models(self: Arc<Self>) {
+        let mut changed = self.models_changed.subscribe();
+        loop {
+            // A change from here on is another pass.
+            changed.borrow_and_update();
+            if self.fetch_models {
+                self.fetch_known_models().await;
+            }
+            let again = self.backfill && self.backfill_all().await;
+            match again {
+                true => drop(tokio::time::timeout(Duration::from_secs(300), changed.changed()).await),
+                false => drop(changed.changed().await),
+            }
+        }
+    }
+
+    /// Fetches the models [`Self::keep_models`] fetches, each once, and
+    /// opens them.
+    async fn fetch_known_models(&self) {
+        let Some(dir) = self.models_dir.clone() else { return };
+        let mut fetched = false;
+        for m in self.models().iter().filter(|m| m.model.is_err()) {
+            let Some(name) = strata::embed::to_fetch(&m.spec.model, &dir) else { continue };
+            if !self.fetch_tried.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string()) {
+                continue;
+            }
+            tracing::info!(table = %m.table, field = %m.field, model = name, "fetching the model of an embedded field");
+            match crate::server::fetch_model(name, &dir).await {
+                Ok(_) => fetched = true,
+                Err(e) => tracing::warn!(model = name, error = %e, "could not fetch the model of an embedded field: fetch it with strata-server fetch-model, or start with --no-fetch-models"),
+            }
+        }
+        if fetched {
+            self.reopen_models();
+        }
+    }
+
+    /// Fills in the vectors each embedded field's rows lack
+    /// ([`Self::backfill_field`]); whether a model failed, for another try.
+    async fn backfill_all(self: &Arc<Self>) -> bool {
+        let Some(db) = self.local().cloned() else { return false };
+        let mut again = false;
+        for m in self.models().iter().filter(|m| m.model.is_ok()) {
+            // A replica's rows come from its primary.
+            if self.takes_writes().is_err() {
+                return false;
+            }
+            again |= self.backfill_field(&db, &m.table, &m.field).await;
+        }
+        again
+    }
+
+    /// Fills in the vectors of `table.field` that rows lack
+    /// ([`Db::missing_vectors`]), [`BACKFILL_BATCH`] rows a write, through
+    /// the writer as any statement goes; whether the model failed, for
+    /// another try later.
+    async fn backfill_field(self: &Arc<Self>, db: &Arc<Db>, table: &str, field: &str) -> bool {
+        let id = (table.to_lowercase(), field.to_string());
+        let set = |b: Backfill| {
+            self.backfills.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), b);
+        };
+        let (d, t, f) = (db.clone(), table.to_string(), field.to_string());
+        let keys = match tokio::task::spawn_blocking(move || d.missing_vectors(&t, &f)).await {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
+                tracing::warn!(table, field, error = %e, "cannot fill in the vectors rows lack");
+                set(Backfill { state: "failed", missing: 0, embedded: 0, error: Some(e.to_string()) });
+                return false;
+            }
+            Err(_) => return false,
+        };
+        let missing = keys.len() as u64;
+        let before = self.backfills.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+        // Rows without text get no vector: nothing to do again.
+        if before.as_ref().is_some_and(|b| b.state == "done" && b.missing - b.embedded == missing) || (before.is_none() && missing == 0) {
+            return false;
+        }
+        tracing::info!(table, field, rows = missing, "filling in the vectors of rows stored without one");
+        let t0 = Instant::now();
+        let mut b = Backfill { state: "running", missing, embedded: 0, error: None };
+        set(b.clone());
+        for chunk in keys.chunks(BACKFILL_BATCH) {
+            let mut busy = 0;
+            let written = loop {
+                let (t, f, chunk) = (table.to_string(), field.to_string(), chunk.to_vec());
+                let guard = self.statement_guard(0, Arc::new(Mutex::new(None)));
+                let prepare = move |db: &Db| db.prepare_backfill(&t, &f, chunk).map(|p| Some(p.guarded(guard)));
+                match self.write_local(db, prepare, 0).await {
+                    // The queue is full: clients' writes come first.
+                    Err(e) if e.status == 429 && busy < 600 => {
+                        busy += 1;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    r => break r,
+                }
+            };
+            match written {
+                Ok(w) => {
+                    b.embedded += w.rows;
+                    set(b.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(table, field, embedded = b.embedded, error = %e.message, "filling in vectors stopped; tried again in five minutes");
+                    set(Backfill { state: "failed", error: Some(e.message.clone()), ..b });
+                    return e.status >= 500 || e.status == 429;
+                }
+            }
+        }
+        self.metrics.embedded("backfill", b.embedded, t0.elapsed().as_secs_f64());
+        tracing::info!(table, field, embedded = b.embedded, without_text = missing - b.embedded, seconds = t0.elapsed().as_secs_f64(), "filled in the vectors of rows stored without one");
+        set(Backfill { state: "done", ..b });
+        false
+    }
+
+    /// The backfill of `table.field` ([`Self::keep_models`]), if it had
+    /// rows to fill in.
+    pub fn backfill_of(&self, table: &str, field: &str) -> Option<Backfill> {
+        self.backfills.lock().unwrap_or_else(|e| e.into_inner()).get(&(table.to_lowercase(), field.to_string())).cloned()
     }
 
     /// Whether this server embeds any field's text.
@@ -1122,6 +1325,12 @@ impl Service {
             Backend::Local(db) => db.catalog(),
             Backend::Cluster(c) => c.catalog(),
         }
+    }
+
+    /// The first table's schema as it is now: [`Self::schema`] is the one
+    /// the server started with, before any ALTER TABLE.
+    pub fn first_table(&self) -> Arc<Schema> {
+        self.catalog().into_iter().next().unwrap_or_else(|| Arc::new(self.schema.clone()))
     }
 
     /// The table named `name` (any case). A coordinator that does not know
@@ -1519,8 +1728,10 @@ impl Service {
     /// it, on every shard through a coordinator. A replica refuses it, the
     /// log being a write. Returns the request's id and the log's write.
     /// A logged query needs a write key, and the first one to a table,
-    /// which creates it, an admin key.
-    pub async fn query_logged(self: &Arc<Self>, who: &Principal, mut req: QueryReq, log: Log) -> Result<(Answer, String, Written), ApiError> {
+    /// which creates it, an admin key. An interleaved one
+    /// ([`Log::interleave`]) runs both rankings at once and answers their
+    /// [`rank_log::interleave`], with each row's team.
+    pub async fn query_logged(self: &Arc<Self>, who: &Principal, mut req: QueryReq, log: Log) -> Result<(Answer, rank_log::Served, Written), ApiError> {
         who.may(Scope::Write, "a logged query (it writes the rank log)")?;
         self.takes_writes()?;
         let schema = match self.table(&log.table).await {
@@ -1534,17 +1745,36 @@ impl Service {
         };
         rank_log::check(&schema)?;
         let p = rank_log::prepare(&req.sql, &req.params, &log)?;
-        req.sql = p.sql.clone();
-        let mut a = self.query(req).await?;
-        let rs = std::mem::replace(&mut a.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
-        let served = rank_log::serve(rs, &p, &log)?;
-        a.rs = served.rs;
+        let take = |a: &mut Answer| std::mem::replace(&mut a.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
+        let (mut a, mut served) = match &log.interleave {
+            None => {
+                req.sql = p.sql.clone();
+                let mut a = self.query(req).await?;
+                let served = rank_log::serve(take(&mut a), &p, &log)?;
+                (a, served)
+            }
+            Some(il) => {
+                let pb = rank_log::prepare(&il.sql, &req.params, &log)?;
+                let mut rb = req.clone();
+                req.sql = p.sql.clone();
+                rb.sql = pb.sql.clone();
+                let (mut a, mut b) = tokio::try_join!(self.query(req), self.query(rb))?;
+                let (sa, sb) = (rank_log::serve(take(&mut a), &p, &log)?, rank_log::serve(take(&mut b), &pb, &log)?);
+                for m in b.missing {
+                    if !a.missing.contains(&m) {
+                        a.missing.push(m);
+                    }
+                }
+                (a, rank_log::interleave(sa, sb, &p, il)?)
+            }
+        };
+        a.rs = std::mem::replace(&mut served.rs, ResultSet { columns: Vec::new(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() });
         let ops: Vec<Json> = served.entries.iter().map(|e| json!({"op": "upsert", "table": log.table, "doc": e.to_json()})).collect();
         let w = match ops.is_empty() {
             true => Written { rows: 0, seq_no: None, seq_nos: Vec::new(), skipped: 0, stamps: Vec::new() },
             false => self.write_ops(ops, None).await?,
         };
-        Ok((a, served.request, w))
+        Ok((a, served, w))
     }
 
     /// Runs a plan ([`strata::query::ir`]): a read answers as
@@ -1990,17 +2220,30 @@ impl Service {
                 return Ok(SqlAnswer::Rows(a));
             }
             Command::Explain { .. } => return Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain")),
-            Command::CreateTable { .. } | Command::DropTable { .. } => Some(Ddl::Table),
-            Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Some(Ddl::RankProfile),
-            Command::Write { .. } => None,
+            Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => true,
+            Command::AlterTable { alters, .. } => {
+                // A coordinator's plans name a table's columns by their
+                // place, and its shards drop a column one by one: a query
+                // planned before a shard dropped one would read the next.
+                if matches!(self.backend, Backend::Cluster(_)) && alters.iter().any(|a| matches!(a, Alter::DropField(_))) {
+                    return Err(ApiError::bad("ALTER TABLE ... DROP COLUMN does not run through a coordinator yet (its plans name columns by place); ADD COLUMN and RENAME COLUMN do"));
+                }
+                // A primary ships CREATE TABLE and DROP TABLE, but no
+                // replica applies a shipped ALTER TABLE yet.
+                if let (Backend::Local(_), Replication::Primary(_)) = (&self.backend, self.replication()) {
+                    return Err(conflict("ALTER TABLE does not reach replicas yet: change a table's columns before its copies replicate".into()));
+                }
+                true
+            }
+            Command::Write { .. } => false,
         };
         if after != After::Any {
             return Err(ApiError::bad(FOR_READS));
         }
         let t0 = Instant::now();
         let r = match (&self.backend, ddl) {
-            (_, Some(ddl)) => self.ddl(sql, params, ddl, timeout_ms).await,
-            (Backend::Local(db), None) => {
+            (_, true) => self.ddl(sql, params, timeout_ms).await,
+            (Backend::Local(db), false) => {
                 let (text, p) = (sql.to_string(), params.clone());
                 let only = slots.map(|s| moving::mask_outside(&s));
                 let refused = Arc::new(Mutex::new(None));
@@ -2020,34 +2263,30 @@ impl Service {
                     _ => r,
                 }
             }
-            (Backend::Cluster(c), None) => c.sql(sql, params).await,
+            (Backend::Cluster(c), false) => c.sql(sql, params).await,
         };
         let w = self.wrote(r, t0, Some(sql))?;
         Ok(SqlAnswer::Written { w, took_ms: t0.elapsed().as_secs_f64() * 1e3 })
     }
 
-    /// `CREATE TABLE` or `DROP TABLE`, `CREATE RANK PROFILE` or `DROP RANK
-    /// PROFILE`: on a local database, once no write holds the writer;
+    /// `CREATE TABLE`, `ALTER TABLE` or `DROP TABLE`, `CREATE RANK PROFILE`
+    /// or `DROP RANK PROFILE`: on a local database, once no write holds the writer;
     /// through a coordinator, on every shard ([`Coordinator::ddl`]). A
-    /// replica refuses it, as it refuses every write. A primary refuses a
-    /// table's: the tables a primary has are not shipped to its replicas
-    /// yet, so each copy takes them before replication starts. A rank
-    /// profile is logged as a write is, so a primary ships it, and answers
-    /// once the copies its acks name hold it.
-    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, ddl: Ddl, timeout_ms: u64) -> Result<Written, ApiError> {
+    /// replica refuses it, as it refuses every write. Each is a numbered
+    /// transaction in a database that numbers its writes, so a primary
+    /// ships it as it ships a write, and answers once the copies its acks
+    /// name hold it.
+    async fn ddl(self: &Arc<Self>, sql: &str, params: &Params, timeout_ms: u64) -> Result<Written, ApiError> {
         let r = match &self.backend {
             Backend::Local(db) => {
                 self.takes_writes()?;
-                if let (Replication::Primary(_), Ddl::Table) = (self.replication(), ddl) {
-                    return Err(conflict("CREATE TABLE and DROP TABLE do not reach replicas yet: give each copy its tables before it replicates".into()));
-                }
                 let timeout = self.timeout_of(timeout_ms);
                 let (db, sql, params) = (db.clone(), sql.to_string(), params.clone());
                 let w = tokio::task::spawn_blocking(move || {
                     wait_for_writer(Instant::now() + timeout, || {
                         db.sql(&sql, &params)?;
                         // Its number, or a later one.
-                        Ok(Written { seq_no: db.storage().seq_no().map(|n| n.seq).filter(|_| ddl == Ddl::RankProfile), ..Default::default() })
+                        Ok(Written { seq_no: db.storage().seq_no().map(|n| n.seq), ..Default::default() })
                     })
                 })
                 .await
@@ -2261,7 +2500,7 @@ impl Service {
     pub async fn import(self: &Arc<Self>, table: Option<&str>, body: axum::body::Bytes, format: Format) -> Result<(u64, Vec<String>), ApiError> {
         let schema = match table {
             Some(t) => self.table(t).await?,
-            None => Arc::new(self.schema.clone()),
+            None => self.first_table(),
         };
         // Rows of the first table name none, as before there were tables.
         let named = table.map(|_| schema.table.clone());
@@ -2400,16 +2639,13 @@ impl Service {
     }
 
     /// Creates a table, as `CREATE TABLE` does ([`Self::ddl`]): on a local
-    /// database, once no write holds the writer. A coordinator creates
-    /// tables only through `CREATE TABLE`.
+    /// database, once no write holds the writer; a primary ships it with
+    /// the rows. A coordinator creates tables only through `CREATE TABLE`.
     async fn create_table(self: &Arc<Self>, schema: Schema, timeout_ms: u64) -> Result<(), ApiError> {
         let Backend::Local(db) = &self.backend else {
             return Err(ApiError::bad(format!("a coordinator imports into the tables its shards have: create table {} first (CREATE TABLE through the coordinator), or import on each shard", schema.table)));
         };
         self.takes_writes()?;
-        if let Replication::Primary(_) = self.replication() {
-            return Err(conflict(format!("the import would create table {}, and CREATE TABLE does not reach replicas yet: give each copy its tables before it replicates", schema.table)));
-        }
         let deadline = Instant::now() + self.timeout_of(timeout_ms);
         let db = db.clone();
         tokio::task::spawn_blocking(move || wait_for_writer(deadline, || Ok(db.create_table(schema.clone())?))).await.map_err(ApiError::internal)??;
@@ -2720,13 +2956,6 @@ impl Service {
 pub enum SqlAnswer {
     Rows(Answer),
     Written { w: Written, took_ms: f64 },
-}
-
-/// What a statement that changes the catalog changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ddl {
-    Table,
-    RankProfile,
 }
 
 /// What a write did: the rows it wrote and, in a database that numbers
@@ -3197,7 +3426,7 @@ pub fn command_scope(c: &Command) -> Scope {
     match c {
         Command::Query | Command::Explain { .. } => Scope::Read,
         Command::Write { .. } => Scope::Write,
-        Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
+        Command::CreateTable { .. } | Command::AlterTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } => Scope::Admin,
     }
 }
 

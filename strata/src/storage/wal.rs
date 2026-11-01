@@ -13,6 +13,10 @@
 //!                 on table 0)
 //!          kind 6 profile: name value, then the rank profile as JSON
 //!                 text, or NULL where it is dropped
+//!          kind 7 table def: the schema of the table to create (with
+//!                 the id of the table record before it) as JSON text, or
+//!                 NULL where that table is dropped; only in a shipped
+//!                 transaction, never in a log
 //! ```
 //!
 //! A log whose records use a feature logs in `STRWAL02`, whose header
@@ -23,6 +27,12 @@
 //! started again with that name, [`Wal::allow_profiles`], and a log that
 //! is emptied starts again without it). A reader refuses a log naming a
 //! feature it does not know. Others log in `STRWAL01`, as before.
+//!
+//! A change of tables is not logged: it is a version of its own
+//! ([`crate::storage::Database::create_table`]). In a database that numbers
+//! its writes it takes a number all the same, and the ship log keeps it as
+//! a transaction of table def records, which a replica applies by making
+//! the same change ([`crate::storage::Database::apply_shipped`]).
 //!
 //! A transaction is its operation records followed by a commit record,
 //! written with one `write` and made durable with one `fdatasync`. Replay
@@ -59,6 +69,7 @@ use std::sync::Arc;
 
 use crate::error::{corrupt, Error, Result};
 use crate::storage::io;
+use crate::schema::Schema;
 use crate::storage::manifest::{RankProfile, SeqNo, RANK_PROFILES};
 use crate::value::{Document, Value};
 
@@ -75,6 +86,7 @@ const COMMIT: u8 = 3;
 const SET: u8 = 4;
 const TABLE: u8 = 5;
 const PROFILE: u8 = 6;
+const TABLE_DEF: u8 = 7;
 
 /// One logged operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,6 +99,10 @@ pub enum Op {
     /// Gives the table this rank profile, in place of one of the same name
     /// (any case); `None` drops the profile named `name`.
     Profile { name: String, def: Option<Arc<RankProfile>> },
+    /// Creates the table with this id and schema; `None` drops the table
+    /// with this id. Never logged, only shipped: a change of tables is a
+    /// version of its own.
+    Table { def: Option<Arc<Schema>> },
 }
 
 /// A committed transaction read back from the log: its sequence number
@@ -192,7 +208,7 @@ impl Wal {
             wal.reset(sync)?;
             return Ok((wal, Vec::new()));
         };
-        let (txns, end) = decode(&buf[header as usize..], logged, fits);
+        let (txns, end) = decode(&buf[header as usize..], logged, false, fits);
         if logged != numbered {
             if !txns.is_empty() {
                 return Err(corrupt(format!(
@@ -251,6 +267,9 @@ impl Wal {
         }
         if !self.profiles && ops.iter().any(|(_, op)| matches!(op, Op::Profile { .. })) {
             return Err(Error::Schema("a rank profile, in a log that does not name rank_profiles (Wal::allow_profiles)".into()));
+        }
+        if ops.iter().any(|(_, op)| matches!(op, Op::Table { .. })) {
+            return Err(Error::Schema("a change of tables is not logged: it is a version of its own".into()));
         }
         let buf = encode_txn(txn, seq, ops);
         let res = io::write_at(&self.file, &buf, self.len).and_then(|_| if sync { io::sync(&self.file) } else { Ok(()) });
@@ -379,6 +398,11 @@ pub(crate) fn encode_txn(txn: u64, seq: Option<SeqNo>, ops: &[(u32, Op)]) -> Vec
                 let def = def.as_ref().map(|p| serde_json::to_string(&**p).expect("a rank profile serialises"));
                 put_value(&mut body, &def.map_or(Value::Null, Value::Str));
             }
+            Op::Table { def } => {
+                body.push(TABLE_DEF);
+                let def = def.as_ref().map(|s| serde_json::to_string(&**s).expect("a schema serialises"));
+                put_value(&mut body, &def.map_or(Value::Null, Value::Str));
+            }
         }
         frame(&mut out, &body);
     }
@@ -442,7 +466,7 @@ pub fn sealed_files(path: &Path) -> Result<Vec<(u64, PathBuf)>> {
 pub fn read_sealed(path: &Path, db_id: u64, fits: &dyn Fn(u32, &Op) -> bool) -> Result<Option<(Vec<WalTxn>, Option<u64>)>> {
     let buf = std::fs::read(path)?;
     let Some((numbered, _, header)) = header(&buf, db_id, path)? else { return Ok(None) };
-    let (txns, end) = decode(&buf[header as usize..], numbered, fits);
+    let (txns, end) = decode(&buf[header as usize..], numbered, false, fits);
     let end = header + end as u64;
     Ok(Some((txns, (end < buf.len() as u64).then_some(end))))
 }
@@ -451,7 +475,7 @@ pub fn read_sealed(path: &Path, db_id: u64, fits: &dyn Fn(u32, &Op) -> bool) -> 
 /// (a primary's, shipped to a replica: [`crate::storage::ship`]); an error
 /// if it holds anything else or an operation that does not `fit`.
 pub fn decode_shipped(buf: &[u8], fits: &dyn Fn(u32, &Op) -> bool) -> Result<WalTxn> {
-    match decode(buf, true, fits) {
+    match decode(buf, true, true, fits) {
         (mut txns, end) if txns.len() == 1 && end == buf.len() => Ok(txns.pop().expect("one")),
         _ => Err(corrupt("a shipped transaction is damaged, or is not one numbered transaction")),
     }
@@ -484,8 +508,9 @@ fn commits_after(rest: &[u8], last: u64, numbered: bool) -> Vec<u64> {
 /// length of the prefix they occupy, up to the first operation that does
 /// not `fit`. In a `numbered` log, sequence numbers rise from one
 /// transaction to the next and terms never fall; one that does not is
-/// damage too.
-fn decode(buf: &[u8], numbered: bool, fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
+/// damage too. Table def records are read only in a `shipped`
+/// transaction: a log holds none.
+fn decode(buf: &[u8], numbered: bool, shipped: bool, fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<WalTxn>, usize) {
     let mut txns = Vec::new();
     let mut ops = Vec::new();
     let mut table = 0u32;
@@ -523,6 +548,14 @@ fn decode(buf: &[u8], numbered: bool, fits: &dyn Fn(u32, &Op) -> bool) -> (Vec<W
                 (Ok(Value::Str(name)), Ok(Value::Str(def))) => match serde_json::from_str::<RankProfile>(&def) {
                     Ok(p) if p.name == name => Ok(Op::Profile { name, def: Some(Arc::new(p)) }),
                     _ => break,
+                },
+                _ => break,
+            },
+            TABLE_DEF if shipped => match get_value(&mut r) {
+                Ok(Value::Null) => Ok(Op::Table { def: None }),
+                Ok(Value::Str(def)) => match serde_json::from_str::<Schema>(&def) {
+                    Ok(s) => Ok(Op::Table { def: Some(Arc::new(s)) }),
+                    Err(_) => break,
                 },
                 _ => break,
             },
@@ -754,7 +787,7 @@ mod tests {
     fn roundtrip() {
         for (txns, numbered) in [(sample(), false), (numbered(), true)] {
             let (buf, _) = encode(&txns);
-            let (got, end) = decode(&buf, numbered, &any);
+            let (got, end) = decode(&buf, numbered, false, &any);
             assert_eq!(end, buf.len());
             let want: Vec<WalTxn> = txns.into_iter().map(|(txn, seq, ops)| WalTxn { txn, seq, ops }).collect();
             assert_eq!(got, want);
@@ -768,16 +801,16 @@ mod tests {
         let mut txns = numbered();
         txns[3].1 = Some(SeqNo { term: 2, seq: 7 });
         let (buf, ends) = encode(&txns);
-        assert_eq!(decode(&buf, true, &any), (decode(&buf[..ends[2]], true, &any).0, ends[2]));
+        assert_eq!(decode(&buf, true, false, &any), (decode(&buf[..ends[2]], true, false, &any).0, ends[2]));
         let mut txns = numbered();
         txns[4].1 = Some(SeqNo { term: 1, seq: 9 });
         let (buf, ends) = encode(&txns);
-        assert_eq!(decode(&buf, true, &any).1, ends[3]);
+        assert_eq!(decode(&buf, true, false, &any).1, ends[3]);
         // Gaps are allowed: what the log holds is what was numbered.
         let mut txns = numbered();
         txns[5].1 = Some(SeqNo { term: 7, seq: 100 });
         let (buf, _) = encode(&txns);
-        assert_eq!(decode(&buf, true, &any).0.len(), 6);
+        assert_eq!(decode(&buf, true, false, &any).0.len(), 6);
     }
 
     /// Cutting the log at every byte (a torn write) and appending garbage
@@ -792,7 +825,7 @@ mod tests {
                     let mut b = buf[..cut].to_vec();
                     b.extend_from_slice(tail);
                     let committed = ends.iter().filter(|&&e| b.starts_with(&buf[..e])).count();
-                    let (txns, end) = decode(&b, numbered, &any);
+                    let (txns, end) = decode(&b, numbered, false, &any);
                     assert_eq!(txns.len(), committed, "cut at {cut}");
                     assert_eq!(end, if committed == 0 { 0 } else { ends[committed - 1] });
                 }
@@ -800,7 +833,7 @@ mod tests {
             // A flipped bit inside the second transaction loses it and the rest.
             let mut b = buf.clone();
             b[ends[0] + 12] ^= 4;
-            assert_eq!(decode(&b, numbered, &any).0.len(), 1);
+            assert_eq!(decode(&b, numbered, false, &any).0.len(), 1);
         }
     }
 
@@ -889,10 +922,10 @@ mod tests {
             let txns: Txns = txns.iter().map(|(t, seq, ops)| (*t, seq.filter(|_| numbered), ops.clone())).collect();
             let (buf, ends) = encode(&txns);
             let want = || txns.iter().map(|(txn, seq, ops)| WalTxn { txn: *txn, seq: *seq, ops: ops.clone() }).collect::<Vec<_>>();
-            assert_eq!(decode(&buf, numbered, &any), (want(), buf.len()));
+            assert_eq!(decode(&buf, numbered, false, &any), (want(), buf.len()));
             for cut in 0..=buf.len() {
                 let committed = ends.iter().filter(|&&e| e <= cut).count();
-                assert_eq!(decode(&buf[..cut], numbered, &any).0, want()[..committed], "cut at {cut}");
+                assert_eq!(decode(&buf[..cut], numbered, false, &any).0, want()[..committed], "cut at {cut}");
             }
             let mut other = txns.clone();
             other[1].2[0].1 = match profile("b", -1.0) {
@@ -901,7 +934,7 @@ mod tests {
             };
             let mut first = want();
             first.truncate(1);
-            assert_eq!(decode(&encode(&other).0, numbered, &any), (first, ends[0]));
+            assert_eq!(decode(&encode(&other).0, numbered, false, &any), (first, ends[0]));
 
             let dir = tempfile::tempdir().unwrap();
             let p = dir.path().join("db-wal");
@@ -933,6 +966,27 @@ mod tests {
         }
     }
 
+    /// Table def records round-trip in a shipped transaction, are damage
+    /// in a log, and are never appended to one.
+    #[test]
+    fn table_defs_are_shipped_never_logged() {
+        use crate::schema::{Field, FieldType};
+        let schema = Schema::new("u", vec![Field::new("id", FieldType::Int), Field::new("x", FieldType::Float)], Some("id")).unwrap();
+        let ops = vec![(3, Op::Table { def: Some(Arc::new(schema)) }), (2, Op::Table { def: None })];
+        let seq = Some(SeqNo { term: 2, seq: 9 });
+        let buf = encode_txn(4, seq, &ops);
+        assert_eq!(decode_shipped(&buf, &any).unwrap(), WalTxn { txn: 4, seq, ops: ops.clone() });
+        for cut in 0..buf.len() {
+            assert!(decode_shipped(&buf[..cut], &any).is_err(), "cut at {cut}");
+        }
+        assert_eq!(decode(&buf, true, false, &any), (Vec::new(), 0));
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::create(&dir.path().join("db-wal"), 11, true, false).unwrap();
+        let e = wal.append(4, seq, &ops, false).unwrap_err().to_string();
+        assert!(e.contains("not logged"), "{e}");
+        assert!(wal.is_empty());
+    }
+
     /// An operation that does not fit (intact records the schema could
     /// not have committed) ends replay before its transaction, like a
     /// failed checksum.
@@ -941,9 +995,9 @@ mod tests {
         for (txns, numbered) in [(sample(), false), (numbered(), true)] {
             let (buf, ends) = encode(&txns);
             let no_set = |_: u32, op: &Op| !matches!(op, Op::Set { .. });
-            assert_eq!(decode(&buf, numbered, &no_set), (decode(&buf[..ends[2]], numbered, &any).0, ends[2]));
+            assert_eq!(decode(&buf, numbered, false, &no_set), (decode(&buf[..ends[2]], numbered, false, &any).0, ends[2]));
             let no_table_5 = |t: u32, _: &Op| t != 5;
-            assert_eq!(decode(&buf, numbered, &no_table_5).1, ends[3]);
+            assert_eq!(decode(&buf, numbered, false, &no_table_5).1, ends[3]);
 
             let dir = tempfile::tempdir().unwrap();
             let p = dir.path().join("db-wal");

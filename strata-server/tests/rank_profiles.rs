@@ -40,7 +40,7 @@ fn create(dir: &Path, name: &str, ship: bool, keep: impl Fn(usize) -> bool) -> A
 }
 
 fn service(db: Arc<Db>) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10))
 }
 
@@ -187,7 +187,7 @@ async fn shards_rank_by_a_profile_like_one_database() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_primary_ships_its_profiles_to_its_replicas() {
+async fn a_primary_ships_its_profiles_and_tables_to_its_replicas() {
     let dir = tempfile::tempdir().unwrap();
     let rdb = create(dir.path(), "r.strata", true, |_| true);
     let mut r = service(rdb.clone());
@@ -223,7 +223,22 @@ async fn a_primary_ships_its_profiles_to_its_replicas() {
     assert!(e.contains("replica"), "{e}");
     sql(&p, "DROP RANK PROFILE cheap ON products").await.unwrap();
     assert!(held(&rdb).is_empty());
-    // A table's DDL still does not reach replicas, so a primary refuses it.
-    let e = sql(&p, "CREATE TABLE notes (id INT PRIMARY KEY)").await.err().unwrap();
-    assert!(e.contains("do not reach replicas yet"), "{e}");
+    // So do a table's: made, written and dropped on the primary, and on
+    // the replica in order with the rows.
+    let SqlAnswer::Written { w, .. } = sql(&p, "CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT)").await.unwrap() else { panic!("written") };
+    assert_eq!(w.seq_no, pdb.storage().seq_no().map(|n| n.seq), "a numbered transaction of its own");
+    assert_eq!(rdb.catalog(), pdb.catalog());
+    sql(&p, "INSERT INTO notes (id, body) VALUES ('n1', 'kept on both copies'), ('n2', 'shipped with the rows')").await.unwrap();
+    let notes = "SELECT id FROM notes ORDER BY bm25(body, 'shipped copies') DESC LIMIT 10";
+    let want = query(&p, notes).await.unwrap();
+    assert_eq!(want.len(), 2);
+    same(notes, &want, &query(&r, notes).await.unwrap());
+    let e = sql(&r, "DROP TABLE notes").await.err().unwrap();
+    assert!(e.contains("replica"), "{e}");
+    sql(&p, "DROP TABLE notes").await.unwrap();
+    assert!(rdb.storage().table("notes").is_none());
+    assert_eq!(rdb.storage().seq_no(), pdb.storage().seq_no());
+    // No replica applies an ALTER TABLE yet, so a primary refuses it.
+    let e = sql(&p, "ALTER TABLE products ADD COLUMN stock INT").await.err().unwrap();
+    assert!(e.contains("does not reach replicas yet"), "{e}");
 }

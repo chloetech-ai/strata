@@ -245,6 +245,25 @@ pub struct Listed {
     pub ready: std::result::Result<(), String>,
 }
 
+/// The feature this build lacks to run model `name` of [`KNOWN_MODELS`].
+fn missing_feature(name: &str) -> Option<&'static str> {
+    match name {
+        n if n.starts_with("siglip") => (!cfg!(feature = "vision")).then_some("vision"),
+        n if n.starts_with("clap") => (!cfg!(feature = "audio")).then_some("audio"),
+        n if n.starts_with("bge") || n.starts_with("snowflake") => (!cfg!(feature = "bert")).then_some("bert"),
+        _ => None,
+    }
+}
+
+/// The name in [`KNOWN_MODELS`] of model `name` when this build runs it
+/// and its files are not all under `models` yet: what a server fetches
+/// for the fields that name it (unless `strata-server --no-fetch-models`).
+pub fn to_fetch(name: &str, models: &Path) -> Option<&'static str> {
+    let &(known, _, _) = KNOWN_MODELS.iter().find(|m| m.0.eq_ignore_ascii_case(name))?;
+    let dir = models.join(known);
+    (missing_feature(known).is_none() && !model_files(known).iter().all(|f| dir.join(f).exists())).then_some(known)
+}
+
 /// The models a schema can name, and whether each would open here: those
 /// Strata fetches ([`KNOWN_MODELS`]), the hosted models it knows
 /// ([`crate::hosted::KNOWN`]), and the other directories of `models` that
@@ -255,13 +274,7 @@ pub fn catalog(models: &Path) -> Vec<Listed> {
         .map(|&(name, _, what)| {
             let dir = models.join(name);
             let fetched = model_files(name).iter().all(|f| dir.join(f).exists());
-            let feature = match name {
-                n if n.starts_with("siglip") => (!cfg!(feature = "vision")).then_some("vision"),
-                n if n.starts_with("clap") => (!cfg!(feature = "audio")).then_some("audio"),
-                n if n.starts_with("bge") || n.starts_with("snowflake") => (!cfg!(feature = "bert")).then_some("bert"),
-                _ => None,
-            };
-            let ready = match (feature, fetched) {
+            let ready = match (missing_feature(name), fetched) {
                 (Some(f), _) => Err(format!("built without the `{f}` feature")),
                 (None, false) => Err(format!("not fetched: strata-server fetch-model {name}")),
                 (None, true) => Ok(()),

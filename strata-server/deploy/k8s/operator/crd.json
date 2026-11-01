@@ -59,6 +59,10 @@
                     },
                     "type": "array"
                   },
+                  "clusterTokenSecret": {
+                    "description": "A Secret whose key token is the cluster's token (--cluster-token), which the servers and coordinators send each other and clients never hold. Needs tokenSecret.",
+                    "type": "string"
+                  },
                   "coordinatorResources": {
                     "description": "Resources of each coordinator's container.",
                     "type": "object",
@@ -119,7 +123,7 @@
                     "type": "object"
                   },
                   "tokenSecret": {
-                    "description": "A Secret whose key token every server and coordinator requires.",
+                    "description": "A Secret whose key token every server and coordinator requires; with clusterTokenSecret, the coordinators only (the admin token).",
                     "type": "string"
                   },
                   "writeAcks": {

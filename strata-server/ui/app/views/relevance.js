@@ -1,10 +1,14 @@
 // The relevance lab: two rankings of one query side by side, the lines
 // between them showing how each row moved, grades given to the rows (kept
 // in this browser) and the measures they give each ranking: nDCG, the
-// share of good rows, the first good row. A set of queries with grades
-// compares the rankings over all of them, and a weighted hybrid's weight
-// (or rank fusion's k) is tuned by trying each over the set. The ranking
-// that wins can be kept with its table as a rank profile.
+// share of good rows, the first good row. Claude can grade the rows both
+// rankings show (the pool) with UMBRELA's prompt (/v1/judge), and the
+// measures then read your grades, Claude's, or yours with Claude's where
+// you gave none; where both graded a row, how often they agree is shown. A
+// set of queries with grades compares the rankings over all of them, and
+// a weighted hybrid's weight (or rank fusion's k) is tuned by trying each
+// over the set. The ranking that wins can be kept with its table as a
+// rank profile.
 //
 // A weighted hybrid normalises each score with tmm() by default: theoretical
 // min-max, which Bruch, Gai and Ingber (TOIS 2023) find fuses better than
@@ -26,6 +30,8 @@ const NORMS = [["tmm", "tmm"], ["minmax", "minmax"], ["zscore", "zscore"]];
 const RRF_KS = [1, 5, 10, 20, 40, 60, 100];
 const COLORS = ["var(--s1)", "var(--s2)"];
 const GRADES = [[0, "bad"], [1, "fair"], [2, "good"], [3, "perfect"]];
+/** Whose grades the measures read. */
+const SOURCES = [["mine", "yours"], ["claude", "Claude's"], ["both", "yours, else Claude's"]];
 const ROW_H = 48;
 
 /** nDCG@k, the share of good rows (grade ≥ 2) in the top k, the reciprocal rank of the first good row, and how many of the top k are graded. */
@@ -44,6 +50,23 @@ export function measures(keys, grades, k = 10) {
   };
 }
 
+/** How two graders agree on the rows both graded: the rows, the share given the same grade, within one, and Cohen's kappa with linear weights. */
+export function agreement(a, b) {
+  const both = Object.keys(a).filter((k) => b[k] != null);
+  const n = both.length;
+  if (!n) return { n: 0, exact: null, withinOne: null, kappa: null };
+  const exact = both.filter((k) => a[k] === b[k]).length / n;
+  const withinOne = both.filter((k) => Math.abs(a[k] - b[k]) <= 1).length / n;
+  // Weighted kappa: 1 - observed disagreement / disagreement expected from each grader's own grades.
+  const pa = [0, 0, 0, 0], pb = [0, 0, 0, 0];
+  for (const k of both) { pa[a[k]]++; pb[b[k]]++; }
+  const w = (i, j) => Math.abs(i - j) / 3;
+  const obs = both.reduce((x, k) => x + w(a[k], b[k]), 0) / n;
+  let exp = 0;
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) exp += (pa[i] / n) * (pb[j] / n) * w(i, j);
+  return { n, exact, withinOne, kappa: exp > 0 ? 1 - obs / exp : null };
+}
+
 function render(page) {
   let ts = [];
   let st = store.get("rel.state", null);
@@ -56,7 +79,23 @@ function render(page) {
     if (v == null) delete qq[key]; else qq[key] = v;
     store.set("rel.grades", all); drawCompare();
   };
-  const querySet = () => Object.entries(allGrades()[st.table] || {}).filter(([, g]) => Object.keys(g).length).map(([q]) => q);
+  // Claude's grades, kept apart from yours: {table: {query: {key: grade}}}.
+  const allLlm = () => store.get("rel.llm", {});
+  const llmFor = (q = st.q) => allLlm()[st.table]?.[q.trim().toLowerCase()] || {};
+  const addLlm = (q, got) => {
+    const all = allLlm(); const t = (all[st.table] ||= {}); Object.assign((t[q.trim().toLowerCase()] ||= {}), got);
+    store.set("rel.llm", all);
+  };
+  const source = () => st.source || "both";
+  /** The grades the measures read, by the source chosen. */
+  const measured = (q = st.q) => source() === "mine" ? gradesFor(q) : source() === "claude" ? llmFor(q) : { ...llmFor(q), ...gradesFor(q) };
+  const querySet = () => {
+    const qs = new Set();
+    if (source() !== "claude") for (const [q, g] of Object.entries(allGrades()[st.table] || {})) if (Object.keys(g).length) qs.add(q);
+    if (source() !== "mine") for (const [q, g] of Object.entries(allLlm()[st.table] || {})) if (Object.keys(g).length) qs.add(q);
+    return [...qs];
+  };
+  let judging = false;
 
   const top = h("div", { class: "rl-top" });
   const setBar = h("div", { class: "rl-set" });
@@ -134,10 +173,50 @@ function render(page) {
   function drawSet() {
     const qs = querySet();
     const cur = st.q.trim().toLowerCase();
-    clear(setBar, h("span", { class: "small muted" }, qs.length ? "Graded queries" : "Grade a few rows of a query to start a set; the set compares the rankings over all of them."),
-      qs.map((q) => { const n = Object.keys(allGrades()[st.table][q]).length; return h("button", { class: "chip", "aria-pressed": String(q === cur), title: `${fmt.plural(n, "grade")}`, onclick: () => { st.q = q; save(); drawTop(); run(); } }, q, h("span", { class: "muted" }, n)); }),
+    clear(setBar, h("span", { class: "small muted" }, qs.length ? "Graded queries" : "Grade a few rows of a query to start a set, or let Claude grade them; the set compares the rankings over all of them."),
+      qs.map((q) => { const n = Object.keys(measured(q)).length; return h("button", { class: "chip", "aria-pressed": String(q === cur), title: `${fmt.plural(n, "grade")}`, onclick: () => { st.q = q; save(); drawTop(); run(); } }, q, h("span", { class: "muted" }, n)); }),
       h("span", { class: "sep" }),
+      h("label", { class: "row nw small dim", title: "Whose grades the measures read" }, "grades", seg(SOURCES, source(), (v) => { st.source = v; save(); drawSet(); drawCompare(); })),
+      h("button", { class: "btn sm", disabled: judging || !st.q.trim(), title: "Claude grades the rows both rankings show for this query (UMBRELA's prompt), each on its own", onclick: () => judge([st.q]) }, icon("agent"), judging ? "Grading…" : "Grade with Claude"),
       qs.length ? h("button", { class: "btn sm primary", onclick: evaluate }, icon("relevance"), `Compare over ${fmt.plural(qs.length, "query", "queries")}`) : null);
+  }
+
+  // ------------------------------------------------------------ Claude's grades
+  /** The server's key, or one entered here (kept in this browser only if asked). */
+  async function apiKey() {
+    const cfg = await api("/v1/config").catch(() => ({}));
+    if (cfg.agent?.server_key) return { key: undefined, model: cfg.agent.model };
+    const kept = store.get("judge.key", "");
+    if (kept) return { key: kept, model: cfg.agent?.model };
+    return new Promise((resolve) => {
+      const k = h("input", { class: "input mono", type: "password", placeholder: "sk-ant-…", style: { width: "100%" } });
+      const keep = h("input", { type: "checkbox" });
+      const done = (v) => { m.close(); resolve(v); };
+      const m = modal({ title: "An Anthropic API key", body: [h("p", { class: "small dim" }, "This server has no key of its own (ANTHROPIC_API_KEY). Grades are asked for with this one; it goes to this server with each request and is not stored there."), h("label", { class: "f" }, "Key", k), h("label", { class: "row nw small" }, keep, "Remember it in this browser")],
+        foot: [h("button", { class: "btn", onclick: () => done(null) }, "Cancel"), h("button", { class: "btn primary", onclick: () => { const v = k.value.trim(); if (!v) return; if (keep.checked) store.set("judge.key", v); done({ key: v, model: cfg.agent?.model }); } }, "Grade")] });
+      setTimeout(() => k.focus(), 30);
+    });
+  }
+  /** Claude grades the pool of each query: the rows either ranking shows that it has not graded yet. */
+  async function judge(qs) {
+    const auth = await apiKey();
+    if (!auth) return;
+    judging = true; drawSet();
+    let graded = 0, failed = 0, firstError = null;
+    try {
+      for (const q of qs) {
+        const res = q === st.q && results.every((x) => x?.rows) ? results : await Promise.all(st.rankings.map((r) => query(r, q)));
+        const have = llmFor(q);
+        const keys = [...new Set(res.flatMap((x) => x.rows.map((r) => r.key)))].filter((k) => have[k] == null);
+        if (!keys.length) continue;
+        const j = await api("/v1/judge", { body: { table: st.table, query: q, keys, api_key: auth.key } });
+        const got = {};
+        for (const g of j.grades) { if (g.grade != null) { got[g.key] = g.grade; graded++; } else { failed++; firstError ||= g.error; } }
+        addLlm(q, got);
+      }
+      toast(graded || !failed ? `Claude graded ${fmt.plural(graded, "row")}${failed ? `; ${failed} without a grade (${firstError})` : ""}` : `No grades: ${firstError}`, failed ? "warn" : "ok", failed ? 9000 : 4000);
+    } catch (e) { toast(e.message, "bad", 9000); }
+    judging = false; drawSet(); drawCompare();
   }
 
   // ------------------------------------------------------------ running
@@ -154,7 +233,7 @@ function render(page) {
 
   // ------------------------------------------------------------ the two lists
   function drawCompare() {
-    const grades = gradesFor();
+    const grades = measured();
     const cards = st.rankings.map((r, i) => rankingCard(r, i, results[i], grades));
     const shift = h("div", { class: "rl-shift" });
     clear(cmp, cards[0], shift, cards[1]);
@@ -181,7 +260,7 @@ function render(page) {
     if (res?.error) list.append(h("div", { class: "error", style: { margin: "10px" } }, res.error));
     else if (!res) list.append(empty("search", "Type a query", "Both rankings run as you type."));
     else if (!res.rows.length) list.append(empty("search", "No rows", "Nothing matched."));
-    else res.rows.forEach((row, n) => list.append(rowEl(row, n, grades, i)));
+    else { const mine = gradesFor(), llm = llmFor(); res.rows.forEach((row, n) => list.append(rowEl(row, n, mine, llm, i))); }
     return h("section", { class: "card rl-card", style: { "--c": COLORS[i] } },
       h("div", { class: "rl-hd" }, h("span", { class: "rl-letter" }, letter),
         h("select", { class: "select sm", onchange: (e) => { r.preset = e.target.value; save(); drawCompare(); run(); } }, PRESETS.map(([v, l]) => h("option", { value: v, selected: v === r.preset }, l))),
@@ -201,12 +280,13 @@ function render(page) {
     const out = h("span", { class: "small dim mono" }, label(r[key]));
     return h("span", { class: "row nw", style: { gap: "6px" } }, h("input", { type: "range", min, max, step, value: r[key], style: { width: "120px" }, oninput: (e) => { r[key] = Number(e.target.value); out.textContent = label(r[key]); save(); runSoon(); } }), out);
   }
-  function rowEl(row, n, grades, side) {
-    const g = grades[row.key];
+  function rowEl(row, n, grades, llm, side) {
+    const g = grades[row.key], c = llm[row.key];
     const feats = Object.entries(row.feats).filter(([, v]) => typeof v === "number");
     const el = h("div", { class: "rl-row", dataset: { key: row.key }, style: { height: ROW_H + "px" } },
       h("span", { class: "rl-n" }, n + 1),
       h("div", { class: "rl-t" }, h("div", { class: "ellipsis" }, row.title == null || row.title === "" ? row.key : String(row.title)), h("div", { class: "small muted mono ellipsis" }, row.key, " · ", fmt.si(row.score, 3))),
+      c != null ? h("span", { class: "rl-llm g" + c, title: `Claude's grade: ${GRADES[c][1]} (UMBRELA's prompt)${g != null && g !== c ? `; yours is ${GRADES[g][1]}` : ""}` }, "C", c) : null,
       h("div", { class: "rl-g", role: "group", "aria-label": "grade" }, GRADES.map(([v, l]) => h("button", { class: "g" + v, "aria-pressed": String(g === v), title: l, onclick: () => setGrade(row.key, g === v ? null : v) }, v))));
     if (feats.length) {
       el.addEventListener("pointerenter", (e) => showTip(e.clientX, e.clientY, [h("div", { class: "t" }, `#${n + 1} in ${"AB"[side]}: the values it was ranked by`), feats.map(([k, v]) => h("div", { class: "r" }, h("span", { class: "mono" }, k), h("b", { class: "n" }, fmt.si(v, 3))))]));
@@ -252,7 +332,7 @@ function render(page) {
     try {
       const per = [];
       for (const q of qs) {
-        const g = gradesFor(q);
+        const g = measured(q);
         const [ra, rb] = await Promise.all(st.rankings.map((r) => query(r, q)));
         per.push({ q, a: measures(ra.rows.map((x) => x.key), g, st.k), b: measures(rb.rows.map((x) => x.key), g, st.k) });
       }
@@ -260,17 +340,27 @@ function render(page) {
       evalOut = { per, mean };
       const tunable = st.rankings.map((r, i) => (r.preset === "weighted" || r.preset === "rrf") && r.field && r.vfield ? i : -1).filter((i) => i >= 0);
       clear(evalBox,
-        h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Over the graded queries"), h("span", { class: "sub" }, `${fmt.plural(qs.length, "query", "queries")} · top ${st.k} · rows without a grade count as bad`)),
+        h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Over the graded queries"), h("span", { class: "sub" }, `${fmt.plural(qs.length, "query", "queries")} · top ${st.k} · ${SOURCES.find(([v]) => v === source())[1]} grades · rows without a grade count as bad`),
+            h("span", { class: "sep" }), h("button", { class: "btn sm", disabled: judging, title: "Claude grades the rows of either ranking it has not graded, for every query of the set", onclick: async () => { await judge(qs); evaluate(); } }, icon("agent"), "Grade the pools with Claude")),
           h("div", { class: "bd" }, h("div", { class: "grid g2" },
             h("div", {}, h("div", { class: "rl-sum" }, ["ndcg", "precision", "mrr"].map((k) => h("div", { class: "rl-m big" }, h("span", { class: "lbl" }, { ndcg: `mean nDCG@${st.k}`, precision: `good in top ${st.k}`, mrr: "mean reciprocal rank" }[k]),
               h("div", { class: "row nw", style: { gap: "10px" } }, ["a", "b"].map((side, i) => h("span", { class: "row nw", style: { gap: "5px" } }, h("span", { class: "rl-letter sm", style: { "--c": COLORS[i] } }, "AB"[i]), h("b", {}, mean(side, k) == null ? "–" : k === "precision" ? fmt.pct(mean(side, k), 0) : mean(side, k).toFixed(3)))))))),
-              wins(per)),
+              wins(per), agreeLine(qs)),
             h("div", {}, h("div", { class: "small dim", style: { marginBottom: "6px" } }, `nDCG@${st.k} of B minus A, a query a bar`), deltaChart(per))))),
         tunable.map((i) => h("section", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "hd" },
           h("h3", {}, st.rankings[i].preset === "rrf" ? `Tune ${"AB"[i]}'s k` : `Tune ${"AB"[i]}'s weight`),
           h("span", { class: "sub" }, st.rankings[i].preset === "rrf" ? `mean nDCG over the set at each k (${qs.length < 20 ? "a few more graded queries make the choice firmer" : "fit on these queries"})` : `mean nDCG over the set at each share of words, ${st.rankings[i].norm || "tmm"} on both`)),
           h("div", { class: "bd" }, sweepBox(i, qs)))));
     } catch (e) { clear(evalBox, h("div", { class: "error", style: { margin: "12px" } }, e.message)); }
+  }
+  /** How Claude's grades agree with yours over the set. */
+  function agreeLine(qs) {
+    const mine = {}, llm = {};
+    for (const q of qs) { for (const [k, v] of Object.entries(gradesFor(q))) mine[q + "\u0000" + k] = v; for (const [k, v] of Object.entries(llmFor(q))) llm[q + "\u0000" + k] = v; }
+    const a = agreement(mine, llm);
+    if (!a.n) return null;
+    return h("div", { class: "small dim", style: { marginTop: "6px" }, title: "Over the rows both you and Claude graded. Kappa weights a disagreement by its size: 1 is full agreement, 0 what chance would give." },
+      `Claude and you graded ${fmt.plural(a.n, "row")} alike: the same grade ${fmt.pct(a.exact, 0)}, within one ${fmt.pct(a.withinOne, 0)}, weighted kappa ${a.kappa == null ? "–" : a.kappa.toFixed(2)}.`);
   }
   function wins(per) {
     const w = per.filter((p) => (p.b.ndcg ?? 0) > (p.a.ndcg ?? 0) + 1e-9).length, l = per.filter((p) => (p.b.ndcg ?? 0) < (p.a.ndcg ?? 0) - 1e-9).length;
@@ -297,7 +387,7 @@ function render(page) {
       const pts = [];
       for (const t of tries) {
         let sum = 0, n = 0;
-        for (const q of qs) { const res = await query(r, q, t.over); const m = measures(res.rows.map((x) => x.key), gradesFor(q), st.k); if (m.ndcg != null) { sum += m.ndcg; n++; } }
+        for (const q of qs) { const res = await query(r, q, t.over); const m = measures(res.rows.map((x) => x.key), measured(q), st.k); if (m.ndcg != null) { sum += m.ndcg; n++; } }
         pts.push({ ...t, v: n ? sum / n : 0 });
       }
       const best = pts.reduce((a, b) => (b.v > a.v ? b : a));

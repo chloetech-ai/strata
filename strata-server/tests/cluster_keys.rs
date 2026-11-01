@@ -51,7 +51,7 @@ fn create(dir: &Path, name: &str, keep: impl Fn(usize) -> bool) -> Arc<Db> {
 /// other copies of its shard with `access.cluster`.
 async fn serve(db: Arc<Db>, dir: &Path, name: &str, access: Access, set: impl FnOnce(&mut Service)) -> (Arc<Service>, String) {
     let path = dir.join(name);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10));
     svc.keep_slots_in(slots::file_of(&path)).unwrap();
     svc.keep_replication_in(replication::file_of(&path));
@@ -247,7 +247,7 @@ async fn a_replica_holds_its_primarys_keys() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ur = format!("http://{}", l.local_addr().unwrap());
     let rdb = create(d, "r.strata", |_| false);
-    let schema = rdb.schema().clone();
+    let schema = (*rdb.schema()).clone();
     let mut r = Service::new(Backend::Local(rdb.clone()), schema, agent(), 16, Duration::from_secs(10));
     r.set_replication(Replication::Replica(Arc::new(Follow::open(rdb, None).unwrap())));
     r.keys = Arc::new(Keys::open(d.join("r.strata.keys.json")).unwrap());

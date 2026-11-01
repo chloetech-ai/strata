@@ -2,13 +2,29 @@
 candidate source Strata has and two baselines, in one harness, checked
 against the numbers committed in strata/tests/fixtures/recsys_gate.json.
 
-The protocol is eval.py's, the one published SASRec numbers use:
-leave-one-out (each user's last rating is the test; everything before it
-is what the sources learn from and what the user has seen), ranked against
-every item but the user's own, over all 6,040 users. Each source answers
-each user's top 100 and the gate scores Recall@10, @50 and @100 (HR@k, one
-test item), NDCG@10, and coverage: the share of the 3,706 items in some
-user's top 10.
+Two protocols, each with its own model and fixture:
+
+- `loo`, eval.py's and the one published SASRec numbers use: leave-one-out
+  (each user's last rating is the test; everything before it is what the
+  sources learn from and what the user has seen), ranked against every item
+  but the user's own, over all 6,040 users
+  (strata/tests/fixtures/recsys_gate.json, model ml1m).
+- `time`, a global time split, which leave-one-out is not: one cutoff, the
+  time by which 90% of the ratings were made (29 December 2000), for every
+  user. The sources learn from the ratings before it only, so nothing they
+  read happened after any test; the candidates are the items rated before
+  it, the ones that existed; and each user with ratings on both sides is
+  asked for their first rating after it, given everything before (1,178
+  users; 2 whose next item was new are left out). Leave-one-out trains on
+  other users' later ratings and ranks items that did not exist yet, which
+  every model Ji et al. tested exploits (TOIS 2023, "A Critical Study on
+  Data Leakage in Recommender System Offline Evaluation")
+  (strata/tests/fixtures/recsys_gate_time.json, model ml1m-time, trained on
+  the ratings before the cutoff).
+
+Each source answers each user's top 100 and the gate scores Recall@10, @50
+and @100 (HR@k, one test item), NDCG@10, and coverage: the share of the
+candidate items in some user's top 10.
 
 The sources:
 
@@ -34,9 +50,10 @@ The sources:
 
 All but the baselines run as Strata queries on a database the gate builds.
 
-    python gate.py --ratings ~/data/ml-1m/ratings.dat              # check
+    python gate.py --ratings ~/data/ml-1m/ratings.dat              # check both protocols
+    python gate.py --ratings ... --protocol time                    # check one
     STRATA_RECSYS_GATE=update python gate.py --ratings ...           # rewrite
-    python gate.py --ratings ... --train 30                          # retrain the model (PyTorch), 30 min
+    python gate.py --ratings ... --protocol time --train 60          # retrain its model (PyTorch), 60 min
 
 CI reads ratings.csv from a mirror of MovieLens-1M on Hugging Face, pinned
 by revision and SHA-256 (.github/workflows/ci.yml).
@@ -65,9 +82,22 @@ import strata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-FIXTURE = os.path.join(ROOT, "tests", "fixtures", "recsys_gate.json")
 MODELS = os.path.join(ROOT, "tests", "fixtures", "recsys")
-MODEL = "ml1m"
+# Each protocol's fixture, model and description.
+PROTOCOLS = {
+    "loo": {
+        "fixture": os.path.join(ROOT, "tests", "fixtures", "recsys_gate.json"),
+        "model": "ml1m",
+        "protocol": "leave-one-out, full ranking without the user's own items, all users",
+    },
+    "time": {
+        "fixture": os.path.join(ROOT, "tests", "fixtures", "recsys_gate_time.json"),
+        "model": "ml1m-time",
+        "protocol": "global time split at the 90th percentile of rating times: sources learn from the ratings before it, rank the items rated before it without the user's own, for each user's first rating after it",
+    },
+}
+# The share of ratings before the time split's cutoff.
+CUTOFF = 0.9
 TOLERANCE = {"recall@10": 0.002, "recall@50": 0.002, "recall@100": 0.002, "ndcg@10": 0.002, "coverage@10": 0.005}
 K = 100
 
@@ -85,6 +115,30 @@ def ratings(path):
     for order, (u, m, _r, t) in enumerate(rows):
         seqs.setdefault(f"u{u}", []).append((int(t.strip()), order, f"m{m}"))
     return {u: sorted(evs) for u, evs in seqs.items()}
+
+
+def split(seqs, protocol):
+    """What the sources learn from and what the user has seen (`train`),
+    each test user's target (`test`), and the items there are to rank."""
+    if protocol == "loo":
+        items = sorted({e[2] for s in seqs.values() for e in s})
+        return {u: s[:-1] for u, s in seqs.items()}, {u: s[-1] for u, s in seqs.items()}, items, {}
+    times = sorted(e[0] for s in seqs.values() for e in s)
+    cutoff = times[int(len(times) * CUTOFF)]
+    train = {u: [e for e in s if e[0] < cutoff] for u, s in seqs.items()}
+    train = {u: s for u, s in train.items() if s}
+    items = sorted({e[2] for s in train.values() for e in s})
+    known = set(items)
+    test, new = {}, 0
+    for u, s in seqs.items():
+        after = [e for e in s if e[0] >= cutoff]
+        if u in train and after:
+            if after[0][2] in known:
+                test[u] = after[0]
+            else:
+                new += 1
+    when = datetime.datetime.fromtimestamp(cutoff, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    return train, test, items, {"cutoff": when, "test_users": len(test), "left_out_new_items": new}
 
 
 def scores(top, target, cut=(10, 50, 100)):
@@ -181,20 +235,21 @@ def build(work, train, items, vectors):
     return db, eid, len(edges)
 
 
-def load_vectors():
+def load_vectors(model):
     """The item vectors the model was trained with (its items.safetensors)."""
     from strata import _sequence as S
 
-    vectors = S.read_items(os.path.join(MODELS, MODEL))
+    vectors = S.read_items(os.path.join(MODELS, model))
     if not vectors:
-        raise SystemExit(f"no item vectors beside the model in {MODELS}/{MODEL}: train it with --train")
+        raise SystemExit(f"no item vectors beside the model in {MODELS}/{model}: train it with --train")
     return vectors
 
 
-def train_model(train, items, minutes, seed=0):
+def train_model(model, train, items, minutes, epochs=200, seed=0):
     """Trains the gate's model as eval.py does (with times, item vectors
     learned from a random start, every item a negative, the last training
-    event of each user held out to stop on), for at most `minutes`."""
+    event of each user held out to stop on), for at most `minutes` and
+    `epochs`."""
     import torch
 
     import strata.train
@@ -205,8 +260,8 @@ def train_model(train, items, minutes, seed=0):
     vectors = {k: start[i].tolist() for i, k in enumerate(items)}
     seqs = {u: [(it, None, float(t)) for t, _, it in evs] for u, evs in train.items()}
     r = strata.train.sequence(
-        None, MODEL, vectors=vectors, sequences=seqs, models=MODELS, width=64, layers=2, heads=1, max_len=200,
-        learn_items=True, negatives="all", temperature=0.05, epochs=200, batch=128, lr=1e-3, dropout=0.2,
+        None, model, vectors=vectors, sequences=seqs, models=MODELS, width=64, layers=2, heads=1, max_len=200,
+        learn_items=True, negatives="all", temperature=0.05, epochs=epochs, batch=128, lr=1e-3, dropout=0.2,
         holdout=True, patience=10, max_seconds=minutes * 60, seed=seed, log=lambda row: print(json.dumps(row), flush=True),
     )
     best = max(r["history"], key=lambda h: h["ndcg@10"])
@@ -216,29 +271,44 @@ def train_model(train, items, minutes, seed=0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ratings", required=True, help="ratings.dat of MovieLens-1M, or a CSV of the same columns")
+    ap.add_argument("--protocol", choices=["both", *PROTOCOLS], default="both", help="leave-one-out (loo), the global time split (time), or both")
     ap.add_argument("--work", default=None)
-    ap.add_argument("--fixture", default=FIXTURE)
     ap.add_argument("--users", type=int, default=None, help="score this many users only (a quick run; not a check)")
-    ap.add_argument("--train", type=float, default=None, metavar="MINUTES", help="first retrain the model, for at most this long")
+    ap.add_argument("--train", type=float, default=None, metavar="MINUTES", help="first retrain each protocol's model, for at most this long")
+    ap.add_argument("--epochs", type=int, default=200, help="with --train, at most this many epochs (a count does not depend on the machine's load)")
     a = ap.parse_args()
     update = os.environ.get("STRATA_RECSYS_GATE") == "update"
 
     seqs = ratings(os.path.expanduser(a.ratings))
-    users = sorted(seqs)
-    items = sorted({e[2] for s in seqs.values() for e in s})
+    n_items = len({e[2] for s in seqs.values() for e in s})
     n_events = sum(len(s) for s in seqs.values())
-    print(f"{len(users)} users, {len(items)} items, {n_events} ratings", flush=True)
-    train = {u: s[:-1] for u, s in seqs.items()}
-    test = {u: s[-1] for u, s in seqs.items()}
+    print(f"{len(seqs)} users, {n_items} items, {n_events} ratings", flush=True)
+    data = {"name": "MovieLens-1M", "users": len(seqs), "items": n_items, "ratings": n_events}
+    failed = 0
+    for protocol in PROTOCOLS if a.protocol == "both" else [a.protocol]:
+        print(f"== {protocol}: {PROTOCOLS[protocol]['protocol']}", flush=True)
+        failed |= gate(protocol, seqs, data, a, update)
+    return failed
+
+
+def gate(protocol, seqs, data, a, update):
+    """One protocol's sources and baselines, checked against its fixture
+    (or written to it); 1 when the gate fails."""
+    p = PROTOCOLS[protocol]
+    model = p["model"]
+    train, test, items, about = split(seqs, protocol)
+    if about:
+        print("   " + ", ".join(f"{k} {v}" for k, v in about.items()), flush=True)
+    users = sorted(test)
     if a.users:
         users = users[: a.users]
     if a.train is not None:
-        train_model(train, items, a.train)
+        train_model(model, train, items, a.train, a.epochs)
 
     t0 = time.time()
-    R, pop, S = baselines(train, items, sorted(seqs))
-    index = {k: i for i, k in enumerate(items)}
-    row_of = {u: i for i, u in enumerate(sorted(seqs))}
+    everyone = sorted(train)
+    R, pop, S = baselines(train, items, everyone)
+    row_of = {u: i for i, u in enumerate(everyone)}
     tally = {s: Tally(len(items)) for s in ["popularity", "item_knn", "encode", "maxsim", "next_items", "ppr"]}
     popular = {}
     for u in users:
@@ -249,7 +319,10 @@ def main():
         tally["item_knn"].add([items[i] for i in top_of(R[row_of[u]] @ S, seen)], target)
     print(f"baselines in {time.time() - t0:.0f} s", flush=True)
 
-    vectors = load_vectors()
+    vectors = load_vectors(model)
+    missing = [k for k in items if k not in vectors]
+    if missing:
+        raise SystemExit(f"{len(missing)} items have no vector in {MODELS}/{model}: train it with --train")
     work = a.work or tempfile.mkdtemp(prefix="recsys-gate-")
     t0 = time.time()
     db, n_ev, n_edges = build(work, train, items, vectors)
@@ -258,7 +331,7 @@ def main():
     not_seen = "NOT id IN (SELECT item FROM events WHERE usr = :u)"
     last5 = "(SELECT item FROM events WHERE usr = :u ORDER BY seq DESC LIMIT 5)"
     sql = {
-        "encode": f"SELECT id FROM items WHERE {not_seen} ORDER BY similarity(emb, encode('{MODEL}', (SELECT item, ts FROM events WHERE usr = :u ORDER BY seq DESC LIMIT 200), now => :t)) DESC LIMIT {K}",
+        "encode": f"SELECT id FROM items WHERE {not_seen} ORDER BY similarity(emb, encode('{model}', (SELECT item, ts FROM events WHERE usr = :u ORDER BY seq DESC LIMIT 200), now => :t)) DESC LIMIT {K}",
         "maxsim": f"SELECT id FROM items WHERE {not_seen} ORDER BY maxsim(emb, :recent) DESC LIMIT {K}",
         "ppr": f"SELECT id FROM items WHERE {not_seen} ORDER BY ppr(after, {last5}, dir => 'out', eps => 1e-6) DESC LIMIT {K}",
     }
@@ -296,21 +369,27 @@ def main():
     baseline = max(got["popularity"]["recall@10"], got["item_knn"]["recall@10"])
     beats = sorted(s for s in ("encode", "maxsim", "next_items", "ppr") if got[s]["recall@10"] > baseline)
     if update:
+        # A source is held to beating the baselines when it beats them by
+        # more than the tolerance: by a user or two it could stop on noise.
+        margin = baseline + TOLERANCE["recall@10"]
         out = {
-            "data": {"name": "MovieLens-1M", "users": len(users), "items": len(items), "ratings": n_events},
-            "protocol": "leave-one-out, full ranking without the user's own items, all users",
-            "model": MODEL,
+            "data": data,
+            "protocol": p["protocol"],
+            **({"split": about} if about else {}),
+            "model": model,
             "tolerance": TOLERANCE,
-            "beat_both_baselines": beats,
+            "beat_both_baselines": [s for s in beats if got[s]["recall@10"] > margin],
             "sources": {s: {k: v for k, v in r.items() if not k.startswith("query_ms")} for s, r in got.items()},
         }
-        with open(a.fixture, "w") as f:
+        with open(p["fixture"], "w") as f:
             json.dump(out, f, indent=1)
             f.write("\n")
-        print(f"wrote {a.fixture}")
+        print(f"wrote {p['fixture']}")
         return 0
-    want = json.load(open(a.fixture))
+    want = json.load(open(p["fixture"]))
     failed = []
+    if want.get("split", about) != about:
+        failed.append(f"the split is {about}, the fixture's {want['split']}")
     for s, metrics in want["sources"].items():
         for k, v in metrics.items():
             d = got[s][k] - v
@@ -320,9 +399,9 @@ def main():
         if s not in beats:
             failed.append(f"{s} no longer beats both baselines' Recall@10 ({got[s]['recall@10']} against {baseline})")
     if failed:
-        print("the recommender gate fails:\n  " + "\n  ".join(failed) + "\nIf the change is meant to move them, rerun with STRATA_RECSYS_GATE=update, commit the fixture, and say why in the pull request.")
+        print(f"the recommender gate ({protocol}) fails:\n  " + "\n  ".join(failed) + "\nIf the change is meant to move them, rerun with STRATA_RECSYS_GATE=update, commit the fixture, and say why in the pull request.")
         return 1
-    print("the recommender gate holds")
+    print(f"the recommender gate ({protocol}) holds")
     return 0
 
 

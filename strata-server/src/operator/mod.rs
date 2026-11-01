@@ -67,7 +67,16 @@ pub struct Spec {
     pub write_acks: String,
     /// A Secret whose key `token` every server and coordinator requires
     /// (none: the servers answer anyone who reaches them, `--no-token`).
+    /// With `cluster_token_secret`, only the coordinators take it: it is
+    /// then the admin token of the API, the operator's included, and it
+    /// may not make the calls between servers.
     pub token_secret: Option<String>,
+    /// A Secret whose key `token` is the cluster's own token
+    /// (`--cluster-token`): every server and coordinator sends it to the
+    /// others, and only it makes the calls between them (replication,
+    /// slot moves, key sharing, votes). Clients and the operator never
+    /// hold it. It needs `token_secret`.
+    pub cluster_token_secret: Option<String>,
     /// Resources of each server's and each coordinator's container.
     pub resources: Option<Json>,
     pub coordinator_resources: Option<Json>,
@@ -103,6 +112,7 @@ impl Default for Spec {
             failover_after_ms: 3000,
             write_acks: "all".into(),
             token_secret: None,
+            cluster_token_secret: None,
             resources: None,
             coordinator_resources: None,
             args: Vec::new(),
@@ -118,6 +128,14 @@ impl Spec {
         }
         if self.shards > 4096 {
             return Err("a cluster has at most 4,096 shards, one a slot".into());
+        }
+        if let Some(c) = &self.cluster_token_secret {
+            if self.token_secret.is_none() {
+                return Err("clusterTokenSecret needs tokenSecret: the operator, and whoever runs the cluster, call the coordinators with that token".into());
+            }
+            if self.token_secret.as_ref() == Some(c) {
+                return Err("clusterTokenSecret and tokenSecret name the same Secret: the cluster's token would be the admin's".into());
+            }
         }
         if !matches!(self.write_acks.as_str(), "all" | "majority" | "primary") {
             return Err(format!("writeAcks is all, majority or primary, not {:?}", self.write_acks));
@@ -503,7 +521,8 @@ pub fn crd() -> Json {
             "demo": int(0, "Instead of a schema: this many demo products, split over the shards the cluster starts with."),
             "failoverAfterMs": int(0, "--failover-after-ms of every server (default 3000; 0: failover by hand)."),
             "writeAcks": {"type": "string", "enum": ["all", "majority", "primary"], "description": "--write-acks of every primary (default all)."},
-            "tokenSecret": {"type": "string", "description": "A Secret whose key token every server and coordinator requires."},
+            "tokenSecret": {"type": "string", "description": "A Secret whose key token every server and coordinator requires; with clusterTokenSecret, the coordinators only (the admin token)."},
+            "clusterTokenSecret": {"type": "string", "description": "A Secret whose key token is the cluster's token (--cluster-token), which the servers and coordinators send each other and clients never hold. Needs tokenSecret."},
             "resources": free("Resources of each server's container."),
             "coordinatorResources": free("Resources of each coordinator's container."),
             "args": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every server."},
@@ -550,6 +569,9 @@ mod tests {
         assert!(bad(json!({})).contains("give the first table's schema"));
         assert!(bad(json!({"writeAcks": "most", "demo": 1})).contains("writeAcks"));
         assert!(bad(json!({"schema": {"table": "t"}})).contains("schema:"));
+        assert!(bad(json!({"demo": 1, "clusterTokenSecret": "c"})).contains("needs tokenSecret"));
+        assert!(bad(json!({"demo": 1, "clusterTokenSecret": "t", "tokenSecret": "t"})).contains("the same Secret"));
+        serde_json::from_value::<Spec>(json!({"demo": 1, "clusterTokenSecret": "c", "tokenSecret": "t"})).unwrap().check().unwrap();
         let s: Spec = serde_json::from_value(json!({"demo": 30})).unwrap();
         assert_eq!(strata::schema::Schema::from_json(&s.schema_json()).unwrap(), crate::demo::schema(30));
     }

@@ -20,7 +20,7 @@ async fn serve() -> String {
     let db = Db::create(&dir.path().join("p.strata"), demo::schema(N), opts).unwrap();
     db.set_embedder("emb", Arc::new(strata::embed::HashEmbedder { dim: demo::DIM })).unwrap();
     db.load((0..N).map(|i| demo::product(i, 7))).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let agent = AgentConfig { api_key: None, model: String::new(), base_url: String::new() };
     let svc = Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(60)));
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

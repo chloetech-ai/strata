@@ -56,8 +56,8 @@ use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
 
-use crate::error::{corrupt, Result};
-use crate::schema::{Field, VectorCodes};
+use crate::error::{corrupt, Error, Result};
+use crate::schema::{Field, FieldType, VectorCodes};
 use crate::value::Value;
 use crate::segment::build::BuildOptions;
 use crate::segment::{DocFilter, DocId, FieldIndexBuilder, SegmentFile};
@@ -314,6 +314,40 @@ pub struct VectorReader {
     cost: CostModel,
     io_hints: bool,
     hnsw_filter: HnswFilterMode,
+    /// A field the segment was written without ([`absent_meta`]): every
+    /// row reads the one row of zeros `vectors` and `codes` hold.
+    absent: bool,
+}
+
+/// The header that stands in, in a segment written before one-vector field
+/// `field` was added to its table, for the field's sections
+/// ([`crate::segment::build::build_missing`]): `n_docs` rows, none with a
+/// vector, and no other section. [`VectorReader::open`] reads it as a field
+/// whose every row has no vector, holding no array of `n_docs` rows. It is
+/// built in memory as the segment opens, and never written.
+pub(crate) fn absent_meta(field: &Field, n_docs: usize) -> Result<Vec<u8>> {
+    let FieldType::Vector { dim, .. } = field.ty else {
+        return Err(Error::Schema(format!("field {} is not a vector", field.name)));
+    };
+    let info = VectorInfo {
+        dim,
+        n: n_docs,
+        missing: n_docs,
+        index: "flat".into(),
+        stride_f32: build::strides(dim).0,
+        stride_u8: field.codes.stride(dim),
+        codes: field.codes,
+        nlist: None,
+        train_points: None,
+        iters: None,
+        m: None,
+        ef_construction: None,
+        entry: None,
+        max_level: None,
+        rows: None,
+        f32: true,
+    };
+    serde_json::to_vec(&info).map_err(|e| Error::Schema(e.to_string()))
 }
 
 impl VectorReader {
@@ -323,6 +357,9 @@ impl VectorReader {
         let rows = info.rows.unwrap_or(n);
         if (info.stride_f32, info.stride_u8) != (build::strides(dim).0, info.codes.stride(dim)) || rows != seg.n_docs() || (info.rows.is_none() && !info.f32) {
             return Err(corrupt(format!("vector field {field}: header does not match the segment")));
+        }
+        if info.rows.is_none() && info.missing == n && !seg.has(&section(field, "f32")) {
+            return Ok(Self::absent(info));
         }
         let (codes_part, params_part) = match info.codes {
             VectorCodes::Sq8 => ("sq8", "sq8p"),
@@ -387,7 +424,33 @@ impl VectorReader {
             other => return Err(corrupt(format!("unknown vector index {other}"))),
         }
         let shape = IndexShape { n: n - info.missing, kind: info.index.clone(), nlist: info.nlist.unwrap_or(1), hnsw_m: info.m.unwrap_or(16) };
-        Ok(VectorReader { info, vectors, codes, quant, rescore, multi, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse })
+        Ok(VectorReader { info, vectors, codes, quant, rescore, multi, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse, absent: false })
+    }
+
+    /// The reader of an [`absent_meta`] header: no row has a vector.
+    fn absent(info: VectorInfo) -> Self {
+        let zeros = || Slice::Owned(vec![0f32; info.dim]);
+        let quant = match info.codes {
+            VectorCodes::Sq8 => Quantiser::Sq8(Sq8 { min: zeros(), scale: zeros() }),
+            VectorCodes::Binary => Quantiser::Bits(Bits { mean: zeros(), spread: zeros() }),
+        };
+        let shape = IndexShape { n: 0, kind: info.index.clone(), nlist: 1, hnsw_m: 16 };
+        VectorReader {
+            vectors: Slice::Owned(vec![0f32; info.stride_f32]),
+            codes: Slice::Owned(vec![0u8; info.stride_u8]),
+            quant,
+            rescore: None,
+            multi: None,
+            present: Some(Slice::Owned(vec![0u64; info.n.div_ceil(64)])),
+            ivf: None,
+            hnsw: None,
+            shape,
+            cost: CostModel::default(),
+            io_hints: false,
+            hnsw_filter: HnswFilterMode::Traverse,
+            absent: true,
+            info,
+        }
     }
 
     pub fn dim(&self) -> usize {
@@ -507,7 +570,7 @@ impl VectorReader {
 
     /// The stored vector of `doc` (zeros if it has none).
     pub fn vector(&self, doc: DocId) -> &[f32] {
-        let s = self.info.stride_f32;
+        let s = if self.absent { 0 } else { self.info.stride_f32 };
         &self.vectors[doc as usize * s..doc as usize * s + self.info.dim]
     }
 
@@ -518,7 +581,10 @@ impl VectorReader {
 
     /// The codes of `doc` (padded to the code stride).
     pub fn codes(&self, doc: DocId) -> &[u8] {
-        Codes { data: &self.codes, stride: self.info.stride_u8 }.row(doc)
+        match self.absent {
+            true => &self.codes,
+            false => Codes { data: &self.codes, stride: self.info.stride_u8 }.row(doc),
+        }
     }
 
     /// The SQ8 quantiser (per-dimension minimum and scale), if the field
