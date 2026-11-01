@@ -1139,8 +1139,9 @@ impl<'a> Executor<'a> {
 
     /// [`Executor::execute`], with the rows as Arrow columns when there are
     /// more than `over` of them and the query neither groups nor counts
-    /// (nor runs for a coordinator): what DataFusion reads, without the
-    /// rows being made first.
+    /// (nor, run for a coordinator, needs more than its rows to be merged,
+    /// [`crate::cluster::concatenates`]): what DataFusion reads, without
+    /// the rows being made first.
     #[cfg(feature = "datafusion")]
     pub fn execute_arrow(self, q: &Select, over: usize) -> Result<Leaf> {
         self.answer(q, Some(over))
@@ -1218,7 +1219,7 @@ impl<'a> Executor<'a> {
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
         let m = self.mark();
         #[cfg(feature = "datafusion")]
-        if arrow_over.is_some_and(|o| hits.len() > o) && !self.opts.shard {
+        if arrow_over.is_some_and(|o| hits.len() > o) && (!self.opts.shard || crate::cluster::concatenates(q)) {
             if let Some((arrays, keys)) = self.project_arrow(q, &hits)? {
                 self.step(m, "project", format!("{} column{} into Arrow", columns.len(), if columns.len() == 1 { "" } else { "s" }), Some(hits.len() as u64));
                 let scores = hits.iter().map(|h| h.score).collect();

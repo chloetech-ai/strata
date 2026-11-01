@@ -75,7 +75,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value as Json};
 use strata::db::Source;
 use strata::query::agg::Part;
-use strata::query::exec::ResultSet;
+#[cfg(feature = "datafusion")]
+use strata::query::arrow::Columns;
+use strata::query::exec::{Leaf, ResultSet};
 use strata::query::paths::{Call, Paths};
 use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
@@ -89,7 +91,7 @@ use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::auth::Secret;
-use crate::grpc::{params_to_pb, result_from_pb, CLUSTER_PROTOCOL, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
+use crate::grpc::{params_to_pb, result_from_pb, ARROW_PROTOCOL, CLUSTER_PROTOCOL, GUARD_PROTOCOL, MIN_PROTOCOL, PROTOCOL, SIDNEXT_PROTOCOL, SOURCES_PROTOCOL};
 use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
@@ -562,6 +564,30 @@ pub struct Coordinator {
 pub struct Merged {
     pub rs: ResultSet,
     pub missing: Vec<String>,
+    /// With [`QueryReq::arrow`], the rows as Arrow columns, which `rs` then
+    /// does not hold.
+    #[cfg(feature = "datafusion")]
+    pub arrow: Option<Columns>,
+}
+
+impl Merged {
+    fn rows(rs: ResultSet, missing: Vec<String>) -> Merged {
+        Merged {
+            rs,
+            missing,
+            #[cfg(feature = "datafusion")]
+            arrow: None,
+        }
+    }
+
+    /// The rows, as rows or as Arrow columns: a leaf of a compound query.
+    pub fn leaf(self) -> Leaf {
+        #[cfg(feature = "datafusion")]
+        if let Some(c) = self.arrow {
+            return Leaf::Arrow(c);
+        }
+        Leaf::Rows(self.rs)
+    }
 }
 
 /// The share of calls that may be hedged: each call earns this much of a
@@ -1338,6 +1364,9 @@ impl Coordinator {
             true => Some(strata::cluster::ids(select, schema)?),
             false => None,
         };
+        // A compound query's leaf that DataFusion runs, whose shards' rows
+        // go one after another: as Arrow columns ([`ARROW_PROTOCOL`]).
+        let arrow = cfg!(feature = "datafusion") && req.arrow.is_some() && protocol >= ARROW_PROTOCOL && ids.is_none() && strata::cluster::concatenates(select);
         let ids_plan = ids.as_ref().map(|q| Plan::of_select(schema, q));
         let none = Params::new();
         let (params, given) = match &ids_plan {
@@ -1393,20 +1422,36 @@ impl Coordinator {
                         // From protocol 3, the lease is held for the fetch
                         // round, or ended once answered.
                         let (hold, release) = (hold && p >= 3, !hold && snapshot != 0 && p >= 3);
-                        timed(sent, i, r, c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, hold, release, ..read.request(p, i) })).await
+                        let arrow = arrow && p >= ARROW_PROTOCOL;
+                        timed(sent, i, r, c.query(pb::QueryRequest { timeout_ms: ms_left(deadline), shard: true, stats_json, snapshot, hold, release, arrow, ..read.request(p, i) })).await
                     }
                 });
                 (i, rs.await)
             }
         });
         let mut shards = Vec::new();
+        // The shards' Arrow answers, for each of `shards`.
+        #[cfg(feature = "datafusion")]
+        let mut columns: Vec<Option<Columns>> = Vec::new();
         // Per shard answering: the replica that did, and the lease it holds.
         let mut held = Vec::new();
         for (i, a) in join_all(calls).await {
             match a {
-                Ok((r, a)) => {
+                #[allow(unused_mut)]
+                Ok((r, mut a)) => {
                     held.push((i, r, a.snapshot));
-                    shards.push(self.shard_answer(t, i, r, a, sent, "query")?);
+                    #[cfg(feature = "datafusion")]
+                    let c = match a.arrow.is_empty() {
+                        true => None,
+                        false => Some(Columns::from_ipc(&std::mem::take(&mut a.arrow), a.columns.clone(), Default::default())?),
+                    };
+                    #[cfg(feature = "datafusion")]
+                    let rows = c.as_ref().map(|c| c.rows);
+                    #[cfg(not(feature = "datafusion"))]
+                    let rows = None;
+                    shards.push(self.shard_answer(t, i, r, a, sent, "query", rows)?);
+                    #[cfg(feature = "datafusion")]
+                    columns.push(c);
                 }
                 Err(e) => self.leave_out(t, partial, i, e, &mut failed)?,
             }
@@ -1415,6 +1460,26 @@ impl Coordinator {
         if shards.is_empty() {
             let e = failed.into_iter().flatten().next();
             return Err(e.unwrap_or_else(|| ApiError::internal("no shard answered")));
+        }
+        #[cfg(feature = "datafusion")]
+        if columns.iter().any(Option::is_some) {
+            let t0 = Instant::now();
+            let Some(mut c) = strata::cluster::merge_columns(select, &shards, columns)? else {
+                // A shard could not answer with columns, or the shards'
+                // columns are of different types: the rows, then.
+                let rows = QueryReq { arrow: None, ..req.clone() };
+                return Box::pin(self.query_at(t, &rows, schema, select, deadline)).await;
+            };
+            let missing = failed.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| t.shards[i].clone()).collect();
+            c.stats.steps.push(leaf_step("merge", format!("{} shard answers, as Arrow columns", held.len()), t0, Some(c.rows as u64)));
+            c.stats.steps.splice(0..0, own);
+            // Few rows are answered as rows, which the operators may take
+            // over ([`Leaf`]).
+            if c.rows <= req.arrow.unwrap_or(0) {
+                return Ok(Merged::rows(c.into_result()?, missing));
+            }
+            let rs = ResultSet { columns: c.names.clone(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() };
+            return Ok(Merged { rs, missing, arrow: Some(c) });
         }
         let mut merge_step = None;
         let mut merge = |q: &Select, shards: Vec<ResultSet>| {
@@ -1462,15 +1527,17 @@ impl Coordinator {
         // calls, inside it) last.
         rs.stats.steps.extend(merge_step);
         rs.stats.steps.splice(0..0, own);
-        Ok(Merged { rs, missing })
+        Ok(Merged::rows(rs, missing))
     }
 
     /// Shard `i`'s answer `a` from replica `r`, its steps moved onto this
     /// server's clock, inside a `shard` step for the call (from sent to
     /// received, as `sent` holds it) and an `on the shard` step for the
     /// shard's own time (`took_ms`), centred in the call: what the network
-    /// took is the difference, half each way.
-    fn shard_answer(&self, t: &Topology, i: usize, r: usize, a: pb::QueryResponse, sent: &Sent, what: &str) -> Result<ResultSet, ApiError> {
+    /// took is the difference, half each way. Their rows are `rows`, an
+    /// Arrow answer's, or those of `a`.
+    #[allow(clippy::too_many_arguments)]
+    fn shard_answer(&self, t: &Topology, i: usize, r: usize, a: pb::QueryResponse, sent: &Sent, what: &str, rows: Option<usize>) -> Result<ResultSet, ApiError> {
         let took_us = a.took_ms * 1e3;
         let mut rs = result_from_pb(a)?;
         let Some((t0, t1)) = sent.lock().unwrap_or_else(|e| e.into_inner()).get(&(i, r)).copied() else { return Ok(rs) };
@@ -1478,7 +1545,7 @@ impl Coordinator {
         let start = steps::us_at(t0);
         let on_shard = start + ((call_us - took_us) / 2.0).max(0.0);
         steps::shift(&mut rs.stats.steps, on_shard);
-        let rows = Some(rs.rows.len() as u64);
+        let rows = Some(rows.unwrap_or(rs.rows.len()) as u64);
         let own = Step { op: "on the shard".into(), detail: format!("network {:.2} ms", ((call_us - took_us) / 1e3).max(0.0)), start_us: steps::tenth(on_shard), us: steps::tenth(took_us.min(call_us)), rows, ..Step::default() };
         steps::wrap(&mut rs.stats.steps, 0, own);
         let replica = &t.replicas[i][r].url;
@@ -1562,7 +1629,7 @@ impl Coordinator {
         let mut fetched = Vec::new();
         for (i, a) in join_all(calls).await {
             match a {
-                Ok((r, a)) => fetched.push(self.shard_answer(t, i, r, a, sent, "fetch")?),
+                Ok((r, a)) => fetched.push(self.shard_answer(t, i, r, a, sent, "fetch", None)?),
                 Err(e) => self.leave_out(t, partial, i, e, failed)?,
             }
         }

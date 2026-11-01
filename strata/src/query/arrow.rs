@@ -10,11 +10,18 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, NullArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampMicrosecondBuilder,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, NullArray, StringBuilder,
+    TimestampMicrosecondArray, TimestampMicrosecondBuilder,
 };
+use datafusion::arrow::compute::{cast, concat, concat_batches};
+use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema as ArrowSchema, TimeUnit};
+use datafusion::arrow::error::ArrowError;
+use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
-use crate::query::exec::ExecStats;
+use crate::error::{Error, Result as StrataResult};
+use crate::query::exec::{ExecStats, ResultSet};
 use crate::value::Value;
 
 /// A search leaf's rows as Arrow arrays, as the executor gives them
@@ -47,6 +54,143 @@ impl Columns {
             false => self.keys.get_array_memory_size(),
         };
         (self.arrays.iter().map(|a| a.get_array_memory_size()).sum::<usize>() + keys + 8 * self.scores.len()) as u64
+    }
+
+    /// The rows as one Arrow IPC stream, as a shard sends a coordinator a
+    /// leaf of its compound query: the projection's columns, the rows'
+    /// keys, then their scores (FLOAT, or NULLs for none), named by their
+    /// places. The columns' names, which may repeat, travel beside it.
+    pub fn to_ipc(&self) -> StrataResult<Vec<u8>> {
+        let scores: ArrayRef = match self.scores.len() == self.rows {
+            true => Arc::new(Float64Array::from(self.scores.clone())),
+            false => Arc::new(NullArray::new(self.rows)),
+        };
+        let arrays: Vec<ArrayRef> = self.arrays.iter().chain([&self.keys, &scores]).cloned().collect();
+        let fields: Vec<Field> = arrays.iter().enumerate().map(|(i, a)| Field::new(i.to_string(), a.data_type().clone(), true)).collect();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let write = || -> Result<Vec<u8>, ArrowError> {
+            let batch = RecordBatch::try_new_with_options(schema.clone(), arrays, &RecordBatchOptions::new().with_row_count(Some(self.rows)))?;
+            let mut out = Vec::with_capacity(self.bytes() as usize + 1024);
+            let mut w = StreamWriter::try_new(&mut out, &schema)?;
+            w.write(&batch)?;
+            w.finish()?;
+            drop(w);
+            Ok(out)
+        };
+        write().map_err(ipc_error)
+    }
+
+    /// The rows of [`Columns::to_ipc`]'s stream `bytes`, their columns
+    /// named `names`, with the statistics `stats`.
+    pub fn from_ipc(bytes: &[u8], names: Vec<String>, stats: ExecStats) -> StrataResult<Columns> {
+        let read = || -> Result<RecordBatch, ArrowError> {
+            let r = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+            let schema = r.schema();
+            let batches = r.collect::<Result<Vec<_>, _>>()?;
+            concat_batches(&schema, &batches)
+        };
+        let batch = read().map_err(ipc_error)?;
+        if batch.num_columns() != names.len() + 2 {
+            return Err(Error::Query(format!("an Arrow answer of {} columns for {} named", batch.num_columns(), names.len())));
+        }
+        let mut arrays = batch.columns().to_vec();
+        let scores = arrays.pop().expect("the scores");
+        let keys = arrays.pop().expect("the keys");
+        let scores = match scores.data_type() {
+            DataType::Float64 => scores.as_primitive::<Float64Type>().values().to_vec(),
+            _ => Vec::new(),
+        };
+        Ok(Columns { names, arrays, keys, scores, rows: batch.num_rows(), stats })
+    }
+
+    /// The rows as a [`ResultSet`]'s, their values as Strata gives them
+    /// ([`values_of`]).
+    pub fn into_result(self) -> StrataResult<ResultSet> {
+        let mixed = |m: Mixed| Error::Query(format!("an Arrow answer: {}", m.0));
+        let cols = self.arrays.iter().map(values_of).collect::<Result<Vec<_>, _>>().map_err(mixed)?;
+        let mut rows: Vec<Vec<Value>> = (0..self.rows).map(|_| Vec::with_capacity(cols.len())).collect();
+        for col in cols {
+            for (row, v) in rows.iter_mut().zip(col) {
+                row.push(v);
+            }
+        }
+        let keys = values_of(&self.keys).map_err(mixed)?;
+        Ok(ResultSet { columns: self.names, rows, keys, scores: self.scores, parts: None, stats: self.stats })
+    }
+}
+
+fn ipc_error(e: ArrowError) -> Error {
+    Error::Query(format!("Arrow IPC: {e}"))
+}
+
+/// Whether a column of type `t` holds no values that type it: NULLs, or
+/// lists without values, which take the type of another part's column
+/// ([`concat_columns`]).
+fn untyped(a: &ArrayRef) -> bool {
+    match a.data_type() {
+        DataType::Null => true,
+        DataType::List(_) => a.as_list::<i32>().values().is_empty(),
+        _ => a.null_count() == a.len(),
+    }
+}
+
+/// The rows of `parts` one after another, as a coordinator puts its
+/// shards' answers to a leaf together: each part's columns, of the same
+/// names, of one type each but for columns that [`untyped`] says hold no
+/// values that type them, which are made the others' type. `None` when the
+/// types differ otherwise (the values of one column are of several types,
+/// which DataFusion does not run). The parts' statistics are left to the
+/// caller, who gives `stats`.
+pub fn concat_columns(parts: Vec<Columns>, stats: ExecStats) -> StrataResult<Option<Columns>> {
+    let Some(first) = parts.first() else { return Err(Error::Query("no answers to put together".into())) };
+    let (names, width) = (first.names.clone(), first.arrays.len());
+    if parts.iter().any(|p| p.arrays.len() != width) {
+        return Err(Error::Query("answers of different columns to put together".into()));
+    }
+    // Column `width` is the keys.
+    let mut columns = Vec::with_capacity(width + 1);
+    for c in 0..=width {
+        let arrays: Vec<&ArrayRef> = parts.iter().map(|p| if c == width { &p.keys } else { &p.arrays[c] }).collect();
+        let typed = arrays.iter().find(|a| !untyped(a)).unwrap_or(&arrays[0]).data_type().clone();
+        let mut same = Vec::with_capacity(arrays.len());
+        for a in arrays {
+            match a.data_type() == &typed {
+                true => same.push(a.clone()),
+                false if untyped(a) => match cast(a, &typed) {
+                    Ok(a) => same.push(a),
+                    Err(_) => return Ok(None),
+                },
+                false => return Ok(None),
+            }
+        }
+        let refs: Vec<&dyn Array> = same.iter().map(|a| a.as_ref()).collect();
+        columns.push(concat(&refs).map_err(ipc_error)?);
+    }
+    let keys = columns.pop().expect("the keys");
+    let rows = parts.iter().map(|p| p.rows).sum();
+    let scores = match parts.iter().all(|p| p.scores.len() == p.rows) {
+        true => parts.into_iter().flat_map(|p| p.scores).collect(),
+        false => Vec::new(),
+    };
+    Ok(Some(Columns { names, arrays: columns, keys, scores, rows, stats }))
+}
+
+impl Columns {
+    /// Rows `offset..offset + limit` (to the end without a limit), as the
+    /// arrays' slices.
+    pub fn slice(mut self, offset: usize, limit: Option<usize>) -> Columns {
+        let at = offset.min(self.rows);
+        let n = limit.map_or(self.rows - at, |l| l.min(self.rows - at));
+        if (at, n) == (0, self.rows) {
+            return self;
+        }
+        self.arrays = self.arrays.iter().map(|a| a.slice(at, n)).collect();
+        self.keys = self.keys.slice(at, n);
+        if self.scores.len() == self.rows {
+            self.scores = self.scores[at..at + n].to_vec();
+        }
+        self.rows = n;
+        self
     }
 }
 
@@ -303,4 +447,121 @@ fn array_of<'v>(values: impl Iterator<Item = &'v Value> + Clone) -> Result<Array
             Arc::new(b.finish())
         }
     })
+}
+
+/// The values of an Arrow array, as Strata gives them: of the types
+/// [`columns_of`] makes, and of those DataFusion's answers hold.
+pub fn values_of(a: &ArrayRef) -> Result<Vec<Value>, Mixed> {
+    use datafusion::arrow::datatypes as t;
+    let n = a.len();
+    let mut out = Vec::with_capacity(n);
+    macro_rules! each {
+        ($arr:expr, $f:expr) => {{
+            let arr = $arr;
+            for i in 0..n {
+                out.push(if arr.is_null(i) { Value::Null } else { $f(arr.value(i)) });
+            }
+        }};
+    }
+    match a.data_type() {
+        DataType::Null => out.resize(n, Value::Null),
+        DataType::Boolean => each!(a.as_boolean(), Value::Bool),
+        DataType::Int8 => each!(a.as_primitive::<t::Int8Type>(), |x| Value::Int(x as i64)),
+        DataType::Int16 => each!(a.as_primitive::<t::Int16Type>(), |x| Value::Int(x as i64)),
+        DataType::Int32 => each!(a.as_primitive::<t::Int32Type>(), |x| Value::Int(x as i64)),
+        DataType::Int64 => each!(a.as_primitive::<t::Int64Type>(), Value::Int),
+        DataType::UInt8 => each!(a.as_primitive::<t::UInt8Type>(), |x| Value::Int(x as i64)),
+        DataType::UInt16 => each!(a.as_primitive::<t::UInt16Type>(), |x| Value::Int(x as i64)),
+        DataType::UInt32 => each!(a.as_primitive::<t::UInt32Type>(), |x| Value::Int(x as i64)),
+        DataType::UInt64 => each!(a.as_primitive::<t::UInt64Type>(), |x: u64| i64::try_from(x).map_or(Value::Float(x as f64), Value::Int)),
+        DataType::Float32 => each!(a.as_primitive::<t::Float32Type>(), |x| Value::Float(x as f64)),
+        DataType::Float64 => each!(a.as_primitive::<t::Float64Type>(), Value::Float),
+        // An exact sum: an INT where it fits, else a FLOAT.
+        DataType::Decimal128(_, 0) => each!(a.as_primitive::<t::Decimal128Type>(), |x: i128| i64::try_from(x).map_or(Value::Float(x as f64), Value::Int)),
+        DataType::Decimal128(_, s) => {
+            let s = *s as i32;
+            each!(a.as_primitive::<t::Decimal128Type>(), |x: i128| Value::Float(x as f64 / 10f64.powi(s)))
+        }
+        DataType::Utf8 => each!(a.as_string::<i32>(), |s: &str| Value::Str(s.to_string())),
+        DataType::LargeUtf8 => each!(a.as_string::<i64>(), |s: &str| Value::Str(s.to_string())),
+        DataType::Utf8View => each!(a.as_string_view(), |s: &str| Value::Str(s.to_string())),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => each!(a.as_primitive::<t::TimestampMicrosecondType>(), Value::Timestamp),
+        DataType::List(f) => {
+            let list = a.as_list::<i32>();
+            let vector = matches!(f.data_type(), DataType::Float32);
+            for i in 0..n {
+                if list.is_null(i) {
+                    out.push(Value::Null);
+                    continue;
+                }
+                let inner = list.value(i);
+                out.push(match vector {
+                    true => Value::Vector(inner.as_primitive::<t::Float32Type>().values().iter().copied().collect()),
+                    false => Value::List(values_of(&inner)?),
+                });
+            }
+        }
+        t => return mixed(format!("an answer column of type {t}")),
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(rows: Vec<Vec<Value>>, keys: Vec<Value>) -> Columns {
+        let n = rows.len();
+        let width = rows.first().map_or(2, Vec::len);
+        let arrays = columns_of(rows, width).unwrap();
+        let keys = column_of(keys).unwrap();
+        Columns { names: vec!["a".into(), "a".into()], arrays, keys, scores: (0..n).map(|i| i as f64 / 2.0).collect(), rows: n, stats: ExecStats::default() }
+    }
+
+    fn rows(c: Columns) -> Vec<Vec<Value>> {
+        c.into_result().unwrap().rows
+    }
+
+    #[test]
+    fn columns_travel_as_arrow_ipc() {
+        let list = Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]);
+        let c = part(
+            vec![vec![Value::Int(1), list.clone()], vec![Value::Null, Value::List(Vec::new())], vec![Value::Int(-3), Value::Null]],
+            vec![Value::Str("k1".into()), Value::Str("k2".into()), Value::Str("k3".into())],
+        );
+        let back = Columns::from_ipc(&c.to_ipc().unwrap(), c.names.clone(), ExecStats::default()).unwrap();
+        assert_eq!((back.names.clone(), back.rows, back.scores.clone()), (c.names.clone(), 3, vec![0.0, 0.5, 1.0]));
+        assert_eq!(values_of(&back.keys).unwrap(), values_of(&c.keys).unwrap());
+        let r = back.into_result().unwrap();
+        assert_eq!(r.rows, vec![vec![Value::Int(1), list], vec![Value::Null, Value::List(Vec::new())], vec![Value::Int(-3), Value::Null]]);
+        assert_eq!(r.keys.len(), 3);
+        // No rows, and no scores.
+        let empty = Columns { names: Vec::new(), arrays: Vec::new(), keys: Arc::new(NullArray::new(0)), scores: Vec::new(), rows: 0, stats: ExecStats::default() };
+        let back = Columns::from_ipc(&empty.to_ipc().unwrap(), Vec::new(), ExecStats::default()).unwrap();
+        assert_eq!((back.rows, back.scores.len()), (0, 0));
+    }
+
+    #[test]
+    fn parts_put_together_take_one_type() {
+        let k = |s: &str| Value::Str(s.into());
+        // The second part's first column is all NULL, its second lists
+        // without values: both take the first part's types.
+        let a = part(vec![vec![Value::Int(1), Value::List(vec![Value::Int(7)])]], vec![k("a")]);
+        let b = part(vec![vec![Value::Null, Value::List(Vec::new())], vec![Value::Null, Value::Null]], vec![k("b"), k("c")]);
+        let all = concat_columns(vec![a, b], ExecStats::default()).unwrap().expect("one type a column");
+        assert_eq!((all.rows, all.scores.clone()), (3, vec![0.0, 0.0, 0.5]));
+        assert_eq!(all.arrays[0].data_type(), &DataType::Int64);
+        let all = all.slice(1, Some(5));
+        assert_eq!(values_of(&all.keys).unwrap(), vec![k("b"), k("c")]);
+        assert_eq!(rows(all), vec![vec![Value::Null, Value::List(Vec::new())], vec![Value::Null, Value::Null]]);
+        // INT in one part and text in another: not put together.
+        let a = part(vec![vec![Value::Int(1), Value::Null]], vec![k("a")]);
+        let b = part(vec![vec![k("one"), Value::Null]], vec![k("b")]);
+        assert!(concat_columns(vec![a, b], ExecStats::default()).unwrap().is_none());
+        // OFFSET and LIMIT.
+        let a = part((0..5).map(|i| vec![Value::Int(i), Value::Null]).collect(), (0..5).map(|i| k(&i.to_string())).collect());
+        assert_eq!(rows(a.slice(3, None)), vec![vec![Value::Int(3), Value::Null], vec![Value::Int(4), Value::Null]]);
+        let a = part((0..5).map(|i| vec![Value::Int(i), Value::Null]).collect(), (0..5).map(|i| k(&i.to_string())).collect());
+        assert_eq!(a.slice(9, Some(2)).rows, 0);
+    }
 }
