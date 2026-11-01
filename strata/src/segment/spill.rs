@@ -147,7 +147,7 @@ impl Spill {
             if let Some(p) = &self.pacer {
                 p.pace(piece.len());
             }
-            sio::write_at(f, piece, off + (k * CHUNK) as u64)?;
+            sio::scratch_write_at(f, piece, off + (k * CHUNK) as u64)?;
             self.written.fetch_add(piece.len() as u64, Ordering::Relaxed);
         }
         Ok(())
