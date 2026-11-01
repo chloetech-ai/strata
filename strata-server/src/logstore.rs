@@ -2,7 +2,7 @@
 //!
 //! Every line the server logs and every query it answers go to a Strata
 //! database of their own, its log store (`<db>.logs` beside the database
-//! it serves; `--log-store`), in two tables:
+//! it serves; `--log-store`), in three tables:
 //!
 //! - `logs`, a row per line: its time (`ts`, and `minute` and `hour`,
 //!   whole minutes and hours since 1970, for `GROUP BY`), the server it
@@ -17,6 +17,13 @@
 //!   [`crate::telemetry::fingerprint`]), `ms`, `n_rows`, `error`, and the
 //!   rest of what the query log keeps of it, its trace among them, as a
 //!   JSON object (`detail`).
+//! - `load`, a row a minute: how busy the server was over that minute
+//!   ([`Load`]): its `role` (`coordinator`, `primary`, `replica` or
+//!   `standalone`) and `shard`, `qps`, `cpu` (cores busy), `cores`, `busy`
+//!   (`cpu` over `cores`), the slowest `p99_ms` and its volume's
+//!   `disk_used_ratio`, with `step` (whole ten minutes since 1970) for
+//!   `GROUP BY`. Autoscaling replays its rules on a week of it
+//!   ([`crate::operator::autoscale::replay`]).
 //!
 //! They are queried with SQL like any other table (`POST /v1/logs/query`):
 //!
@@ -83,11 +90,17 @@ use crate::{json as js, pb, ApiError};
 pub const LOGS: &str = "logs";
 /// The table of queries answered.
 pub const QUERIES: &str = "queries";
+/// The table of each minute's load.
+pub const LOAD: &str = "load";
+/// The tables, in their order in [`schemas`].
+const TABLES: [&str; 3] = [LOGS, QUERIES, LOAD];
 
 const LOGS_SQL: &str = "CREATE TABLE logs (id INT PRIMARY KEY, ts TIMESTAMP NOT NULL, minute INT, hour INT, node KEYWORD, level KEYWORD, target KEYWORD, \
      message TEXT, fields TEXT, request_id KEYWORD, method KEYWORD, route KEYWORD, status INT, error TEXT, ms FLOAT)";
 const QUERIES_SQL: &str = "CREATE TABLE queries (id INT PRIMARY KEY, ts TIMESTAMP NOT NULL, minute INT, hour INT, node KEYWORD, request_id KEYWORD, kind KEYWORD, \
      outcome KEYWORD, shard BOOL, sql TEXT, fingerprint KEYWORD, ms FLOAT, n_rows INT, error TEXT, detail KEYWORD OPTIONS(indexed = false))";
+const LOAD_SQL: &str = "CREATE TABLE load (id INT PRIMARY KEY, ts TIMESTAMP NOT NULL, minute INT, hour INT, step INT, node KEYWORD, role KEYWORD, shard INT, \
+     qps FLOAT, cpu FLOAT, cores INT, busy FLOAT, p99_ms FLOAT, disk_used_ratio FLOAT)";
 
 /// How often the writer writes what waits.
 pub const WRITE_EVERY: Duration = Duration::from_secs(1);
@@ -107,7 +120,7 @@ const RUNNING: usize = 4;
 pub fn schemas() -> &'static [Arc<Schema>] {
     static S: OnceLock<Vec<Arc<Schema>>> = OnceLock::new();
     S.get_or_init(|| {
-        [LOGS_SQL, QUERIES_SQL]
+        [LOGS_SQL, QUERIES_SQL, LOAD_SQL]
             .iter()
             .map(|sql| match bind_command(sql, &[], &Params::new()) {
                 Ok(Command::CreateTable { schema, .. }) => Arc::new(schema),
@@ -183,6 +196,8 @@ pub struct LogStore {
     capture: bool,
     /// Queries waiting for the writer.
     queued: Mutex<Vec<Arc<Finished>>>,
+    /// Minutes of load waiting for the writer.
+    loads: Mutex<Vec<Load>>,
     query_rate: obs::RateLimit,
     gate: Arc<Semaphore>,
     closed: AtomicBool,
@@ -194,6 +209,7 @@ pub struct LogStore {
 struct Stats {
     lines: AtomicU64,
     queries: AtomicU64,
+    loads: AtomicU64,
     /// Queries past `queries_per_sec`, and past [`QUEUED_QUERIES`].
     sampled_out: AtomicU64,
     dropped_queries: AtomicU64,
@@ -217,7 +233,8 @@ fn db_options() -> DbOptions {
     DbOptions { sync: false, ..crate::server::db_options(false) }
 }
 
-/// The store's database at `path`, made if missing, with both tables.
+/// The store's database at `path`, made if missing, with its tables (a
+/// store an older server made gets the ones it lacks).
 fn open_db(path: &Path) -> Result<Db, String> {
     let at = |e: strata::Error| format!("log store {}: {e}", path.display());
     let db = match path.exists() {
@@ -349,6 +366,53 @@ fn query_row(schema: &Schema, node: &str, q: &Finished, last: &mut i64) -> Docum
     )
 }
 
+/// A server's load over a minute: a row of `load`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Load {
+    /// The minute's end.
+    pub ts_ms: u64,
+    /// `coordinator`, `primary`, `replica` or `standalone`.
+    pub role: String,
+    pub shard: Option<usize>,
+    pub qps: f64,
+    /// Cores busy, on average.
+    pub cpu: f64,
+    pub cores: usize,
+    /// The slowest search p99 of the minute.
+    pub p99_ms: Option<f64>,
+    pub disk_used_ratio: Option<f64>,
+}
+
+impl Load {
+    /// The share of its cores the server used.
+    pub fn busy(&self) -> f64 {
+        self.cpu / self.cores.max(1) as f64
+    }
+}
+
+fn load_row(schema: &Schema, node: &str, l: &Load, last: &mut i64) -> Document {
+    let ts = l.ts_ms as i64 * 1000;
+    row(
+        schema,
+        vec![
+            ("id", Value::Int(next_id(last, ts))),
+            ("ts", Value::Timestamp(ts)),
+            ("minute", Value::Int(ts.div_euclid(60_000_000))),
+            ("hour", Value::Int(ts.div_euclid(3_600_000_000))),
+            ("step", Value::Int(ts.div_euclid(600_000_000))),
+            ("node", Value::Str(node.to_string())),
+            ("role", Value::Str(l.role.clone())),
+            ("shard", l.shard.map_or(Value::Null, |s| Value::Int(s as i64))),
+            ("qps", float(Some(l.qps))),
+            ("cpu", float(Some(l.cpu))),
+            ("cores", Value::Int(l.cores as i64)),
+            ("busy", float(Some(l.busy()))),
+            ("p99_ms", float(l.p99_ms)),
+            ("disk_used_ratio", float(l.disk_used_ratio)),
+        ],
+    )
+}
+
 impl LogStore {
     /// Opens the store at `opts.path` (made if missing) and starts its
     /// writer and maintenance threads.
@@ -357,12 +421,13 @@ impl LogStore {
             return Err("a log store needs the name of its server (--node-name)".into());
         }
         let db = Arc::new(open_db(&opts.path)?);
-        let last = [max_id(&db, LOGS)?, max_id(&db, QUERIES)?];
+        let last = [max_id(&db, LOGS)?, max_id(&db, QUERIES)?, max_id(&db, LOAD)?];
         let capture = opts.capture && !CAPTURING.swap(true, Ordering::SeqCst);
         let store = Arc::new(LogStore {
             db,
             capture,
             queued: Mutex::new(Vec::new()),
+            loads: Mutex::new(Vec::new()),
             query_rate: obs::RateLimit::new(opts.queries_per_sec),
             gate: Arc::new(Semaphore::new(RUNNING)),
             closed: AtomicBool::new(false),
@@ -408,13 +473,22 @@ impl LogStore {
         queued.push(q.clone());
     }
 
+    /// Keeps a minute of the server's load, for the writer.
+    pub fn keep_load(&self, l: Load) {
+        let mut loads = lock(&self.loads);
+        // A writer that cannot write keeps an hour at most.
+        if loads.len() < 60 {
+            loads.push(l);
+        }
+    }
+
     /// Writes what waits now, rather than at the writer's next second.
     pub fn flush(&self) {
-        let mut last = [0; 2];
+        let mut last = [0; 3];
         // The writer's ids are past every row written; reading them again
         // keeps this write's after them.
-        if let (Ok(a), Ok(b)) = (max_id(&self.db, LOGS), max_id(&self.db, QUERIES)) {
-            last = [a, b];
+        if let (Ok(a), Ok(b), Ok(c)) = (max_id(&self.db, LOGS), max_id(&self.db, QUERIES), max_id(&self.db, LOAD)) {
+            last = [a, b, c];
         }
         let _one = lock(&self.writer);
         self.write_waiting(&mut last);
@@ -431,26 +505,28 @@ impl LogStore {
     }
 
     /// Writes the lines and queries waiting, a batch per transaction.
-    fn write_waiting(&self, last: &mut [i64; 2]) {
+    fn write_waiting(&self, last: &mut [i64; 3]) {
         loop {
             let lines = if self.capture { obs::sink().take(BATCH) } else { Vec::new() };
             let queries = std::mem::take(&mut *lock(&self.queued));
-            if lines.is_empty() && queries.is_empty() {
+            let loads = std::mem::take(&mut *lock(&self.loads));
+            if lines.is_empty() && queries.is_empty() && loads.is_empty() {
                 return;
             }
             let more = lines.len() == BATCH;
-            match self.write(&lines, &queries, last) {
+            match self.write(&lines, &queries, &loads, last) {
                 Ok(()) => {
                     self.stats.lines.fetch_add(lines.len() as u64, Ordering::Relaxed);
                     self.stats.queries.fetch_add(queries.len() as u64, Ordering::Relaxed);
+                    self.stats.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
                     self.stats.writes.fetch_add(1, Ordering::Relaxed);
                     self.stats.last_write_ms.store(crate::telemetry::now_ms(), Ordering::Relaxed);
                 }
                 Err(e) => {
                     static LIMIT: obs::RateLimit = obs::RateLimit::new(1);
-                    self.stats.failed.fetch_add((lines.len() + queries.len()) as u64, Ordering::Relaxed);
+                    self.stats.failed.fetch_add((lines.len() + queries.len() + loads.len()) as u64, Ordering::Relaxed);
                     if LIMIT.admit().is_some() {
-                        tracing::warn!(error = %e, rows = lines.len() + queries.len(), "the log store could not write; those rows are lost");
+                        tracing::warn!(error = %e, rows = lines.len() + queries.len() + loads.len(), "the log store could not write; those rows are lost");
                     }
                     *lock(&self.stats.last_error) = Some(e.to_string());
                 }
@@ -464,28 +540,35 @@ impl LogStore {
     /// Lines and queries for this store, which are written by
     /// [`Self::write_waiting`]; tests give lines this way too.
     pub fn write_lines(&self, lines: &[Arc<LogLine>]) -> strata::Result<()> {
-        let mut last = [max_id(&self.db, LOGS).map_err(strata::Error::Query)?, 0];
+        let mut last = [max_id(&self.db, LOGS).map_err(strata::Error::Query)?, 0, 0];
         let _one = lock(&self.writer);
-        self.write(lines, &[], &mut last)
+        self.write(lines, &[], &[], &mut last)
     }
 
-    fn write(&self, lines: &[Arc<LogLine>], queries: &[Arc<Finished>], last: &mut [i64; 2]) -> strata::Result<()> {
+    /// Minutes of load, written now (tests, and tools that fill a store).
+    pub fn write_loads(&self, loads: &[Load]) -> strata::Result<()> {
+        let mut last = [0, 0, max_id(&self.db, LOAD).map_err(strata::Error::Query)?];
+        let _one = lock(&self.writer);
+        self.write(&[], &[], loads, &mut last)
+    }
+
+    fn write(&self, lines: &[Arc<LogLine>], queries: &[Arc<Finished>], loads: &[Load], last: &mut [i64; 3]) -> strata::Result<()> {
         let catalog = self.db.catalog();
         let table = |name: &str| catalog.iter().find(|t| t.table == name).cloned().ok_or_else(|| strata::Error::Query(format!("the log store has no table {name}")));
-        let (logs, queried) = (table(LOGS)?, table(QUERIES)?);
+        let (logs, queried, loaded) = (table(LOGS)?, table(QUERIES)?, table(LOAD)?);
         let node = &self.opts.node;
-        let line_rows: Vec<Document> = lines.iter().map(|l| line_row(&logs, node, l, &mut last[0])).collect();
-        let query_rows: Vec<Document> = queries.iter().map(|q| query_row(&queried, node, q, &mut last[1])).collect();
+        let rows: [Vec<Document>; 3] = [
+            lines.iter().map(|l| line_row(&logs, node, l, &mut last[0])).collect(),
+            queries.iter().map(|q| query_row(&queried, node, q, &mut last[1])).collect(),
+            loads.iter().map(|l| load_row(&loaded, node, l, &mut last[2])).collect(),
+        ];
         let mut t = begin(&self.db)?;
-        if !line_rows.is_empty() {
-            let mut tt = t.table(LOGS)?;
-            for d in line_rows {
-                tt.insert(d)?;
+        for (name, rows) in TABLES.iter().zip(rows) {
+            if rows.is_empty() {
+                continue;
             }
-        }
-        if !query_rows.is_empty() {
-            let mut tt = t.table(QUERIES)?;
-            for d in query_rows {
+            let mut tt = t.table(name)?;
+            for d in rows {
                 tt.insert(d)?;
             }
         }
@@ -505,7 +588,7 @@ impl LogStore {
         let now = strata::timestamp::now();
         let mut n = 0;
         let cut = now - self.opts.retain.as_micros().min(i64::MAX as u128) as i64;
-        for t in [LOGS, QUERIES] {
+        for t in TABLES {
             let d = self.delete_before(t, cut)?;
             self.stats.expired.fetch_add(d, Ordering::Relaxed);
             n += d;
@@ -517,7 +600,7 @@ impl LogStore {
         while self.opts.max_bytes > 0 && self.bytes() > self.opts.max_bytes && rounds < 8 {
             rounds += 1;
             let mut deleted = 0;
-            for t in [LOGS, QUERIES] {
+            for t in TABLES {
                 let rs = self.db.query(&format!("SELECT MIN(ts), MAX(ts) FROM {t}"), &Params::new())?;
                 let time = |i: usize| match rs.rows.first().map(|r| &r[i]) {
                     Some(Value::Timestamp(t) | Value::Int(t)) => Some(*t),
@@ -610,8 +693,8 @@ impl LogStore {
             "max_bytes": self.opts.max_bytes,
             "queries_per_sec": self.opts.queries_per_sec,
             "bytes": self.bytes(),
-            "tables": {LOGS: {"rows": rows(LOGS)}, QUERIES: {"rows": rows(QUERIES)}},
-            "written": {"lines": s.lines.load(Ordering::Relaxed), "queries": s.queries.load(Ordering::Relaxed), "writes": s.writes.load(Ordering::Relaxed)},
+            "tables": {LOGS: {"rows": rows(LOGS)}, QUERIES: {"rows": rows(QUERIES)}, LOAD: {"rows": rows(LOAD)}},
+            "written": {"lines": s.lines.load(Ordering::Relaxed), "queries": s.queries.load(Ordering::Relaxed), "loads": s.loads.load(Ordering::Relaxed), "writes": s.writes.load(Ordering::Relaxed)},
             "waiting": {"lines": waiting, "queries": lock(&self.queued).len()},
             "dropped": {"lines": dropped, "queries": s.dropped_queries.load(Ordering::Relaxed), "failed": s.failed.load(Ordering::Relaxed)},
             "sampled_out": s.sampled_out.load(Ordering::Relaxed),
@@ -630,8 +713,8 @@ impl LogStore {
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
         let by = |pairs: &[(&str, f64)], label: &str| pairs.iter().map(|(k, v)| (format!("{label}=\"{k}\""), *v)).collect();
         vec![
-            Family { name: "strata_log_store_rows", ty: "gauge", help: "Rows in the log store, by table.", values: by(&[(LOGS, rows(LOGS)), (QUERIES, rows(QUERIES))], "table") },
-            Family { name: "strata_log_store_written_total", ty: "counter", help: "Rows the log store wrote, by table.", values: by(&[(LOGS, get(&s.lines)), (QUERIES, get(&s.queries))], "table") },
+            Family { name: "strata_log_store_rows", ty: "gauge", help: "Rows in the log store, by table.", values: by(&[(LOGS, rows(LOGS)), (QUERIES, rows(QUERIES)), (LOAD, rows(LOAD))], "table") },
+            Family { name: "strata_log_store_written_total", ty: "counter", help: "Rows the log store wrote, by table.", values: by(&[(LOGS, get(&s.lines)), (QUERIES, get(&s.queries)), (LOAD, get(&s.loads))], "table") },
             Family::one("strata_log_store_bytes", "gauge", "Bytes the log store takes: its live pages and write-ahead log.", self.bytes() as f64),
             Family::one("strata_log_store_waiting_lines", "gauge", "Log lines waiting for the log store's writer.", waiting as f64),
             Family {
@@ -656,7 +739,7 @@ impl Drop for LogStore {
 
 /// The writer thread: what waits, every [`WRITE_EVERY`] or as soon as a
 /// batch of lines waits, until the store closes or is dropped.
-fn write_loop(store: Weak<LogStore>, mut last: [i64; 2]) {
+fn write_loop(store: Weak<LogStore>, mut last: [i64; 3]) {
     obs::quiet_thread();
     loop {
         obs::sink().wait(WRITE_EVERY);
@@ -820,7 +903,7 @@ mod tests {
 
     #[test]
     fn the_schemas_bind() {
-        assert_eq!(schemas().len(), 2);
+        assert_eq!(schemas().len(), 3);
         assert_eq!(schema_of(LOGS).primary_key.map(|k| schema_of(LOGS).fields[k].name.as_str()), Some("id"));
     }
 
@@ -935,6 +1018,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_minute_of_load_is_a_row_and_ages_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LogStore::open(LogOptions { capture: false, retain: Duration::from_secs(3600), ..LogOptions::new(dir.path().join("l.logs"), "s0-1".into()) }).unwrap();
+        let now = crate::telemetry::now_ms();
+        let minute = |ts_ms: u64, cpu: f64| Load { ts_ms, role: "replica".into(), shard: Some(2), qps: 120.0, cpu, cores: 4, p99_ms: Some(18.0), disk_used_ratio: Some(0.41) };
+        s.keep_load(minute(now, 3.0));
+        s.flush();
+        s.write_loads(&[minute(now - 7_200_000, 1.0)]).unwrap();
+        let q = |sql: &'static str| {
+            let s = s.clone();
+            async move { s.query(sql, &Params::new(), false, Duration::from_secs(5)).await.unwrap().0.rows }
+        };
+        let rows = q("SELECT node, role, shard, busy, cores, step FROM load ORDER BY ts DESC LIMIT 5").await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(&rows[0][..5], &[Value::Str("s0-1".into()), Value::Str("replica".into()), Value::Int(2), Value::Float(0.75), Value::Int(4)]);
+        assert_eq!(rows[0][5], Value::Int((now / 600_000) as i64), "ten-minute steps");
+        assert_eq!(s.status()["tables"]["load"]["rows"], 2);
+        assert_eq!(s.trim().unwrap(), 1, "the old minute is past retention");
+        assert_eq!(q("SELECT COUNT(*) FROM load").await, vec![vec![Value::Int(1)]]);
+        // A writer that cannot write keeps an hour at most.
+        for i in 0..70 {
+            s.keep_load(minute(now + i, 1.0));
+        }
+        assert_eq!(lock(&s.loads).len(), 60);
+    }
+
+    #[tokio::test]
     async fn past_its_size_the_oldest_go() {
         let dir = tempfile::tempdir().unwrap();
         let s = LogStore::open(LogOptions { capture: false, max_bytes: 1, ..LogOptions::new(dir.path().join("s.logs"), "n".into()) }).unwrap();
@@ -985,5 +1095,19 @@ mod tests {
         drop(Db::create(&path, other, DbOptions::default()).unwrap());
         let e = LogStore::open(LogOptions { capture: false, ..LogOptions::new(path, "n".into()) }).err().unwrap();
         assert!(e.contains("move it aside"), "{e}");
+    }
+
+    #[test]
+    fn a_store_an_older_server_made_gets_the_load_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.logs");
+        let db = Db::create(&path, (**schema_of(LOGS)).clone(), DbOptions::default()).unwrap();
+        db.create_table((**schema_of(QUERIES)).clone()).unwrap();
+        drop(db);
+        drop(open_db(&path).unwrap());
+        let tables: Vec<String> = Db::open(&path, DbOptions::default()).unwrap().catalog().into_iter().map(|t| t.table.clone()).collect();
+        for t in TABLES {
+            assert!(tables.iter().any(|have| have == t), "{t} in {tables:?}");
+        }
     }
 }

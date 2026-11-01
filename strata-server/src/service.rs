@@ -2914,12 +2914,37 @@ impl Service {
     }
 
     /// This server's health and latest point, as a coordinator's
-    /// `/v1/cluster` shows each shard's copy.
+    /// `/v1/cluster` shows each shard's copy, and its last minute's load
+    /// (`minute`), which autoscaling reads.
     pub async fn detail(self: &Arc<Self>) -> Json {
         let health = self.health().await;
         let load = self.series.last().map(|p| (*p).clone());
         let log_store = self.log_store.as_ref().map(|s| s.status());
-        json!({"health": health, "load": load, "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores}, "running": self.live.len(), "log_store": log_store})
+        let minute = self.minute_load(telemetry::now_ms()).map(|l| {
+            json!({"qps": l.qps, "cpu": l.cpu, "cores": l.cores, "busy": l.busy(), "p99_ms": l.p99_ms, "disk_used_ratio": l.disk_used_ratio})
+        });
+        json!({
+            "health": health, "load": load, "minute": minute,
+            "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores},
+            "running": self.live.len(), "log_store": log_store,
+        })
+    }
+
+    /// This server's load over the minute before `now_ms` (from its
+    /// points), as the log store's `load` keeps it.
+    pub fn minute_load(&self, now_ms: u64) -> Option<crate::logstore::Load> {
+        let points = self.series.since(now_ms.saturating_sub(60_000));
+        let (qps, cpu, p99_ms, disk_used_ratio) = telemetry::load_of(&points)?;
+        let role = match &self.backend {
+            Backend::Cluster(_) => "coordinator",
+            Backend::Local(_) => match self.role() {
+                pb::Role::Primary => "primary",
+                pb::Role::Replica => "replica",
+                _ => "standalone",
+            },
+        };
+        let shard = self.slots().map(|(_, s)| s);
+        Some(crate::logstore::Load { ts_ms: now_ms, role: role.into(), shard, qps, cpu, cores: self.cores, p99_ms, disk_used_ratio })
     }
 
     /// The metrics (`GET /metrics`). A coordinator does not ask its shards

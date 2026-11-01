@@ -31,6 +31,7 @@
 //! Failover is the servers' own (`--failover-after-ms`): the operator does
 //! not choose primaries, except to hand one over before its pod goes.
 
+pub mod autoscale;
 pub mod kube;
 
 use std::collections::HashMap;
@@ -93,6 +94,10 @@ pub struct Spec {
     /// How changes are made: paused, or held by gates on the cluster's
     /// live numbers.
     pub rollout: RolloutSpec,
+    /// Rules that change the copies, shards or volumes from how busy and
+    /// how full the servers are ([`autoscale`]). Like `rollout`, not part
+    /// of a version: the changes they make are.
+    pub autoscale: autoscale::Autoscale,
 }
 
 /// How the operator makes a change (`spec.rollout`). Not part of a
@@ -184,18 +189,37 @@ pub struct Numbers {
     pub replica_behind: Option<f64>,
     /// The fullest volume of a server that answers.
     pub disk_used_ratio: Option<f64>,
+    /// How busy the busiest shard's copies were over the last minute: the
+    /// mean, over its copies that answer, of the share of its cores each
+    /// used (autoscaling reads it, no gate does).
+    pub busy: Option<f64>,
 }
 
 impl Numbers {
     pub fn from(cluster: &Json) -> Numbers {
-        let servers: Vec<&Json> = cluster["shards"].as_array().into_iter().flatten().flat_map(|s| s["replicas"].as_array().into_iter().flatten()).filter(|r| r["status"] != "down").collect();
+        let up = |s: &Json| -> Vec<Json> { s["replicas"].as_array().into_iter().flatten().filter(|r| r["status"] != "down").cloned().collect() };
+        let shards: Vec<Vec<Json>> = cluster["shards"].as_array().into_iter().flatten().map(up).collect();
+        let servers: Vec<&Json> = shards.iter().flatten().collect();
         let worst = |k: &str| servers.iter().filter_map(|r| r["detail"]["load"][k].as_f64()).reduce(f64::max);
         let coordinator = &cluster["coordinator"]["load"];
+        // A copy's minute, or (from an older server) its last point.
+        let busy_of = |r: &Json| {
+            let d = &r["detail"];
+            d["minute"]["busy"].as_f64().or_else(|| Some(d["load"]["cpu"].as_f64()? / d["system"]["cores"].as_f64().filter(|c| *c > 0.0)?))
+        };
+        let busy = shards
+            .iter()
+            .filter_map(|copies| {
+                let b: Vec<f64> = copies.iter().filter_map(busy_of).collect();
+                (!b.is_empty()).then(|| b.iter().sum::<f64>() / b.len() as f64)
+            })
+            .reduce(f64::max);
         Numbers {
             p99_ms: coordinator["p99_ms"].as_f64().or_else(|| worst("p99_ms")),
             error_ratio: coordinator["error_ratio"].as_f64().or_else(|| worst("error_ratio")),
             replica_behind: worst("replica_behind_max"),
             disk_used_ratio: worst("disk_used_ratio"),
+            busy,
         }
     }
 
@@ -245,6 +269,7 @@ impl Default for Spec {
             args: Vec::new(),
             coordinator_args: Vec::new(),
             rollout: RolloutSpec::default(),
+            autoscale: autoscale::Autoscale::default(),
         }
     }
 }
@@ -268,11 +293,15 @@ impl Spec {
         }))
     }
 
-    /// The spec but for `rollout`, as a short hash: another one is
-    /// another version of the cluster.
+    /// The spec but for `rollout` and `autoscale`, as a short hash:
+    /// another one is another version of the cluster.
     pub fn version(&self) -> String {
         let s = Spec { rollout: RolloutSpec::default(), ..self.clone() };
-        short_hash(&serde_json::to_value(&s).unwrap_or(Json::Null))
+        let mut j = serde_json::to_value(&s).unwrap_or(Json::Null);
+        if let Some(o) = j.as_object_mut() {
+            o.remove("autoscale");
+        }
+        short_hash(&j)
     }
 
     /// What is wrong with it, if anything.
@@ -290,6 +319,7 @@ impl Spec {
         if self.shards > 4096 {
             return Err("a cluster has at most 4,096 shards, one a slot".into());
         }
+        self.autoscale.check()?;
         if let Some(c) = &self.cluster_token_secret {
             if self.token_secret.is_none() {
                 return Err("clusterTokenSecret needs tokenSecret: the operator, and whoever runs the cluster, call the coordinators with that token".into());
@@ -531,11 +561,13 @@ pub struct Outcome {
     pub shards: Json,
     /// What the next call takes from this one (`status.rollout`).
     pub rollout: Rollout,
+    /// The live numbers it read, if it read them.
+    pub numbers: Option<Numbers>,
 }
 
 impl Outcome {
     fn new(phase: Phase, message: impl Into<String>) -> Outcome {
-        Outcome { phase, message: message.into(), shards: Json::Null, rollout: Rollout::default() }
+        Outcome { phase, message: message.into(), shards: Json::Null, rollout: Rollout::default(), numbers: None }
     }
 }
 
@@ -717,6 +749,7 @@ async fn step<P: Platform>(spec: &Spec, p: &P, admin: &Admin, before: &Rollout) 
     }
     out.shards = shards_json(p, &view);
     out.rollout = rollout;
+    out.numbers = Some(view.numbers);
     Ok(out)
 }
 
@@ -1039,6 +1072,7 @@ pub fn versions(history: &Json, spec: &Spec, generation: Option<u64>, by: Option
         let mut s = serde_json::to_value(spec).unwrap_or(Json::Null);
         if let Some(o) = s.as_object_mut() {
             o.remove("rollout");
+            o.remove("autoscale");
         }
         h.push(json!({"version": n, "hash": version, "generation": generation, "atMs": now, "by": by, "restores": restores, "spec": s, "readyMs": null}));
     }
@@ -1166,6 +1200,9 @@ pub fn plan(old: &Spec, new: &Spec, shards_now: usize, copies_now: usize) -> Jso
     if b.soak_seconds != a.soak_seconds {
         steps.push(format!("each copy restarted with new settings serves {} s before the next restarts", b.soak_seconds));
     }
+    if new.autoscale != old.autoscale {
+        steps.push(format!("new autoscaling rules, no restart: {}", new.autoscale.said()));
+    }
     if steps.is_empty() && changes.is_empty() {
         steps.push("nothing: the spec says what it says now".into());
     }
@@ -1227,6 +1264,7 @@ pub fn crd() -> Json {
                 "holdAfterSeconds": int(0, "How long a gate is over its limit before it holds the change (default 30)."),
                 "soakSeconds": int(0, "How long a copy restarted with new settings serves before the next restarts (default 0)."),
             }},
+            "autoscale": autoscale::schema(),
         },
     });
     let status = free("What the operator found and does.");
@@ -1354,7 +1392,13 @@ mod tests {
             {"status": "up", "detail": {"load": {"p99_ms": 40.0, "disk_used_ratio": 0.4, "replica_behind_max": 3.0}}},
             {"status": "down", "detail": {"load": {"disk_used_ratio": 0.99}}},
             {"status": "up", "detail": {"load": {"disk_used_ratio": 0.6}}}]}]});
-        assert_eq!(Numbers::from(&c), Numbers { p99_ms: Some(12.5), error_ratio: Some(0.0), replica_behind: Some(3.0), disk_used_ratio: Some(0.6) });
+        assert_eq!(Numbers::from(&c), Numbers { p99_ms: Some(12.5), error_ratio: Some(0.0), replica_behind: Some(3.0), disk_used_ratio: Some(0.6), busy: None });
+        // How busy: the busiest shard's copies that answer, on average,
+        // from each one's minute (or its last point over its cores).
+        let busy = json!({"shards": [
+            {"replicas": [{"status": "up", "detail": {"minute": {"busy": 0.9}}}, {"status": "up", "detail": {"minute": {"busy": 0.5}}}, {"status": "down", "detail": {"minute": {"busy": 1.0}}}]},
+            {"replicas": [{"status": "up", "detail": {"load": {"cpu": 1.2}, "system": {"cores": 2}}}]}]});
+        assert_eq!(Numbers::from(&busy).busy, Some(0.7));
         assert_eq!(Numbers::from(&json!({"shards": [{"replicas": [{"status": "up", "detail": {"load": {"p99_ms": 40.0}}}]}]})).p99_ms, Some(40.0));
         assert_eq!([gate_words("diskUsedRatio", 0.0001), gate_words("errorRatio", 0.025), gate_words("diskUsedRatio", 0.643)], ["0.01%", "2.5%", "64%"]);
         let bad = |j: Json| serde_json::from_value::<Spec>(j).unwrap().check().unwrap_err();
