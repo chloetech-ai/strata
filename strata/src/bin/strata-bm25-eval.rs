@@ -42,7 +42,12 @@
 //! `features()` and its grades, in `<DIR>/<collection>.jsonl`, which
 //! `scripts/train_ltr.py` trains the models on. `ce_rerank<N>` ranks
 //! BM25's top `N` again by `cross_encoder('<--cross-encoder>', body, :q)`
-//! in a global phase, the model in `--models`. Each variant reports
+//! in a global phase, the model in `--models`. `colbert_rerank<N>` ranks
+//! it again by `maxsim(tok, :t)`, late interaction: `tok` a multi-vector
+//! field (`VECTOR(d)[]`) embedded from `body` at load by `--colbert` (in
+//! `--models`), a vector a token, pooled by `--colbert-pool` if given, and
+//! `:t` the vectors of the query's tokens, embedded in the timed query.
+//! Each collection reports its database's size on disk. Each variant reports
 //! nDCG@10, recall@10 and, when `plain` runs too, the p-value of a paired
 //! randomization test of its nDCG@10 against plain BM25's (10,000
 //! rounds). `--queries N` evaluates the first `N` queries only. `--reps N` runs the
@@ -107,6 +112,14 @@ struct Args {
     /// Evaluates the first N queries of each collection only.
     #[arg(long)]
     queries: Option<usize>,
+    /// The `colbert_rerank<N>` variants' model of a vector a token, in
+    /// `--models`.
+    #[arg(long, default_value = "answerai-colbert-small-v1")]
+    colbert: String,
+    /// Pools the ColBERT vectors of each document by this factor
+    /// (`pool_factor`).
+    #[arg(long)]
+    colbert_pool: Option<f32>,
 }
 
 /// A variant's query on collection `coll` and whether it ranks rank-safe.
@@ -119,6 +132,9 @@ fn query(variant: &str, coll: &str, cross_encoder: &str) -> (String, bool) {
     let model = format!("gbdt('ltr_{coll}', bm25(body, :q, syntax => 'plain'), importance)");
     if let Some(n) = variant.strip_prefix("ce_rerank").and_then(|n| n.parse().ok()) {
         return (rerank_n(&format!("cross_encoder('{cross_encoder}', body, :q)"), n), true);
+    }
+    if let Some(n) = variant.strip_prefix("colbert_rerank").and_then(|n| n.parse().ok()) {
+        return (rerank_n("maxsim(tok, :t)", n), true);
     }
     match variant {
         "plain" => (top10("bm25(body, :q, syntax => 'plain')"), true),
@@ -138,7 +154,7 @@ fn query(variant: &str, coll: &str, cross_encoder: &str) -> (String, bool) {
         "plain_r100" => (top100("bm25(body, :q, syntax => 'plain')"), true),
         "all_r100" => (top100("bm25(body, :q, syntax => 'plain', min => '100%')"), true),
         "guard_r100" => (top100("bm25(body, :q, syntax => 'plain', min => 1, min_rows => 100)"), true),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, ce_rerank<N>, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, ce_rerank<N>, colbert_rerank<N>, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
     }
 }
 
@@ -206,6 +222,14 @@ fn log_features(db: &Db, coll: &beir::RawCollection, file: &std::path::Path) {
     eprintln!("{}: features of {} queries", file.display(), coll.queries.len());
 }
 
+/// The bytes of the files under `dir`.
+fn disk_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| match e.file_type() {
+        Ok(t) if t.is_dir() => disk_bytes(&e.path()),
+        _ => e.metadata().map_or(0, |m| m.len()),
+    }).sum()
+}
+
 fn machine() -> Json {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -233,19 +257,32 @@ fn main() {
         let path = tmp.join(format!("strata-bm25-eval-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
-        let schema = Schema::new(
-            "docs",
-            vec![Field::new("id", FieldType::Keyword), Field::new("body", FieldType::Text { positions: false }), Field::new("importance", FieldType::Float)],
-            Some("id"),
-        )
-        .unwrap();
-        let db = Db::create(&path.join("db.strata"), schema, DbOptions::default()).unwrap();
-        db.load(coll.docs.iter().enumerate().map(|(i, (id, body))| vec![Value::Str(id.clone()), Value::Str(body.clone()), Value::Float(importance(i))]))
-            .unwrap();
-        let load_s = t0.elapsed().as_secs_f64();
-        if let Some(models) = &args.models {
-            db.open_embedders(models);
+        let mut fields = vec![Field::new("id", FieldType::Keyword), Field::new("body", FieldType::Text { positions: false }), Field::new("importance", FieldType::Float)];
+        let colbert = args.variants.iter().any(|v| v.starts_with("colbert_rerank"));
+        if colbert {
+            let models = args.models.as_ref().expect("the colbert variants need --models");
+            let dim = strata::embed::open_for(&args.colbert, None, models).unwrap_or_else(|e| panic!("{}: {e}", args.colbert)).dim();
+            let mut tok = Field::new("tok", FieldType::Vector { dim, index: strata::VectorIndexKind::Flat }).multi().embedded(&args.colbert, &["body"]);
+            if let Some(f) = args.colbert_pool {
+                tok = tok.pooled_by(f);
+            }
+            fields.push(tok);
         }
+        let schema = Schema::new("docs", fields, Some("id")).unwrap();
+        let db = Db::create(&path.join("db.strata"), schema, DbOptions::default()).unwrap();
+        // Before the load, which embeds the ColBERT field.
+        if let Some(models) = &args.models {
+            let failed = db.open_embedders(models);
+            assert!(failed.is_empty(), "{failed:?}");
+        }
+        let width = if colbert { 4 } else { 3 };
+        db.load(coll.docs.iter().enumerate().map(|(i, (id, body))| {
+            let mut row = vec![Value::Str(id.clone()), Value::Str(body.clone()), Value::Float(importance(i))];
+            row.resize(width, Value::Null);
+            row
+        }))
+        .unwrap();
+        let load_s = t0.elapsed().as_secs_f64();
         if let Some(dir) = &args.features {
             log_features(&db, &coll, &dir.join(format!("{name}.jsonl")));
             drop(db);
@@ -263,7 +300,11 @@ fn main() {
                 for (q, (_, text)) in coll.queries.iter().enumerate() {
                     let text = text_of(v, text);
                     let t = Instant::now();
-                    let got: Vec<String> = match db.query_with(&sql, &Params::new().set("q", Value::Str(text)), &opts) {
+                    let mut params = Params::new();
+                    if v.starts_with("colbert_rerank") {
+                        params = params.set("t", db.embed_query_in("docs", "tok", &text).unwrap_or_else(|e| panic!("{name}: {e}")));
+                    }
+                    let got: Vec<String> = match db.query_with(&sql, &params.set("q", Value::Str(text)), &opts) {
                         Ok(r) => r.keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect(),
                         Err(e) => {
                             if failed[j] == 0 && rep == 0 {
@@ -338,7 +379,11 @@ fn main() {
             eprintln!("{line}");
             variants.insert(v.clone(), doc);
         }
-        report.insert(name.clone(), json!({ "docs": coll.docs.len(), "queries": coll.queries.len(), "load_s": load_s, "variants": variants }));
+        let mut entry = json!({ "docs": coll.docs.len(), "queries": coll.queries.len(), "load_s": load_s, "db_bytes": disk_bytes(&path), "variants": variants });
+        if colbert {
+            entry["colbert"] = json!({ "model": args.colbert, "pool_factor": args.colbert_pool });
+        }
+        report.insert(name.clone(), entry);
         drop(db);
         let _ = std::fs::remove_dir_all(&path);
         // Written after each collection, so a stopped run keeps what it measured.

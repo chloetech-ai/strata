@@ -367,7 +367,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer", "derive", "model"],
-        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor"],
+        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor", "embed", "model"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
         "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],

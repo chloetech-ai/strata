@@ -188,6 +188,16 @@ The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text e
 - an `UPDATE` that changes a source recomputes the vector; merges do not (they keep the stored vectors);
 - a parameter `{"embed": "some text", "field": "emb_title"}` is the text's vector by that field's model, so queries and rows are always embedded alike (`field` defaults to the first embedded field with a model); the query console's "Similar to: a description" uses the chosen vector field's model.
 
+#### A vector a token
+
+A multi-vector field (`"multi": true`; `VECTOR(d)[]` in SQL) embedded from text holds a vector for each token of its text, by a model of late interaction, ColBERT, and [`maxsim`](query-language.md#maxsimfield-vectors-several-query-vectors) ranks rows by the sum over the query's tokens of each one's best match in the row:
+
+```json
+{"name": "tok", "type": "vector", "dim": 96, "multi": true, "embed": {"from": ["body"], "model": "answerai-colbert-small-v1"}}
+```
+
+Strata reads a checkpoint of the colbert-ai library (its `artifact.metadata` beside the BERT's `config.json`, `tokenizer.json` and `model.safetensors`, whose `linear.weight` projects each token) as the library does: a document is `[CLS] [D] text [SEP]`, cut to the model's `doc_maxlen` tokens, and its punctuation gets no vectors; a query is `[CLS] [Q] text [SEP]`, padded with `[MASK]` to `query_maxlen` tokens, each of them a vector. `{"embed": "text", "field": "tok"}` is the query's list of vectors, as `maxsim` takes it. Such a field embeds text, not media; a model of one vector a text is refused for it, and ColBERT for a field of one vector. `pool_factor` and `pool` pool embedded vectors as they pool written ones, when a row's text is embedded. `hash:N` gives a vector a word, for tests.
+
 Several fields can embed different sources side by side, and a query picks one: `ORDER BY similarity(emb_title, :q)`, or both fused, `rrf(similarity(emb_title, :q), similarity(emb_both, :p))`. Each 512-dimension field costs about 0.5 KB a row as 8-bit codes, plus its HNSW graph.
 
 The model can be computed here (the table below) or sit behind an API, such as `openai/text-embedding-3-small` ([hosted models](#hosted-models)). A field may also name a model the server cannot open (its API key not set, a model directory not there yet): rows written meanwhile are stored without the vector, and text cannot be searched against the field (only rows, with `vector_of`). `/v1/schema` says, for each embedded field, whether its model is open here and why not; `GET /v1/models` lists the models a schema can name and whether each would open on this server.
@@ -204,7 +214,8 @@ The model can be computed here (the table below) or sit behind an API, such as `
 | `snowflake-arctic-embed-m-v1.5` | BERT encoder, 768 dimensions | build with `--features bert`; slower, better |
 | `siglip-base-patch16-224` | SigLIP base: images and text in one space, 768 dimensions | build with `--features vision`; about 0.5 s an image and 80 ms a text on a 4-vCPU cloud VM |
 | `clap-htsat-unfused` | CLAP (HTSAT and RoBERTa): sound and text in one space, 512 dimensions | build with `--features audio`; about 0.27 s for each 10 seconds of sound and 20 ms a text on a 4-vCPU cloud VM |
-| `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
+| `answerai-colbert-small-v1` | ColBERT (BERT, 33M parameters), a 96-dimension vector a token, for a [multi-vector field](#a-vector-a-token) | build with `--features bert` |
+| `hash:N` | hashed bag of words, *N* dimensions (on a multi-vector field, a vector a word) | no files; tests and the demo |
 | `ms-marco-MiniLM-L-6-v2` | a [cross-encoder](query-language.md#cross-encoders-cross_encodermodel-fields-query) (BERT, 22M parameters, English), not an embedding model | build with `--features bert` |
 | `bge-reranker-base` | a cross-encoder (XLM-RoBERTa, 278M parameters, English and Chinese) | build with `--features bert`; larger and slower |
 | `ms-marco-MiniLM-L-6-v2-int8` | `ms-marco-MiniLM-L-6-v2` quantized to int8, its repository's ONNX export for this CPU (ARM64's on ARM, AVX-512 VNNI's on an x86-64 with VNNI, AVX2's on one without) | build with `--features onnx` |
@@ -213,7 +224,7 @@ The model can be computed here (the table below) or sit behind an API, such as `
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
-`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`; CLAP's `pytorch_model.bin`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
+`strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`; CLAP's `pytorch_model.bin`; and `artifact.metadata` too for a name with `colbert` in it, such as `colbert-ir/colbertv2.0`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
 
 ### Hosted models
 
@@ -441,7 +452,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `GET /v1/export?tables=A,B&fts=false&indexes=false&schemas=false` | | the database (or those tables) as a new SQLite file, `application/vnd.sqlite3`; `x-strata-tables` names the tables |
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short, sql}` (`sql` the `CREATE TABLE` that makes it), or the error |
 | `POST /v1/explain` | `{sql, params?, hits?, profile?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the timed steps of the run (`steps`, its [profile](#what-the-server-is-doing-now)), the bound query (`logical`) and counts; with `hits: n`, a ranked query's top `n` rows as objects with their `score()` and [`features()`](query-language.md#features-the-values-a-ranking-read), the values each was ranked by |
-| `POST /v1/embed` | `{text, image or audio, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image or sound file (`image` or `audio`, base64, for a model of images or of sound), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `POST /v1/embed` | `{text, image or audio, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image or sound file (`image` or `audio`, base64, for a model of images or of sound), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values. A [multi-vector field](#a-vector-a-token)'s model gives `vectors`, a vector a token of the text |
 | `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name (those Strata fetches, the hosted ones it knows, and the directories of `--models`), and whether each would open here: fetched, its key set, its feature built; nothing is loaded or sent |
 | `GET /v1/media/<sha256>` | | the bytes of the file a row's `media` value names, by the file's SHA-256, read as writes read files (the media store, or a place `--media-fetch` lists) and checked against the hash, so a UI can show it; only files that rows name, 404 otherwise; a coordinator refuses (400): ask a shard server |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |

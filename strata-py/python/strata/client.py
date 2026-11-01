@@ -160,6 +160,12 @@ class Client(Search):
         body = {k: v for k, v in {"text": text, "image": b64(image), "audio": b64(audio), "field": field, "table": table}.items() if v is not None}
         return self._call("POST", "/v1/embed", body)["vector"]
 
+    def embed_tokens(self, text: str, field: str, *, table: str | None = None) -> list[list[float]]:
+        """The vectors of `text`'s tokens as a query, by the model of
+        multi-vector field `field` (ColBERT), on the server."""
+        body = {k: v for k, v in {"text": text, "field": field, "table": table}.items() if v is not None}
+        return self._call("POST", "/v1/embed", body)["vectors"]
+
     def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
         """The codes that can follow each prefix of semantic-ID field
         `field` among the rows `where` matches (POST /v1/sid/next), summed
