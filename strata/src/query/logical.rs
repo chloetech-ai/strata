@@ -774,6 +774,10 @@ pub enum OrderBy {
     GroupValue { desc: bool },
     /// Aggregate queries: order groups by an aggregate or a group field.
     Agg { what: Projection, desc: bool },
+    /// Rows by their value of a path ([`Select::paths`]), values of
+    /// different types in the order [`crate::query::agg::cmp`] gives them;
+    /// rows without one last unless `nulls_first`.
+    Path { path: usize, desc: bool, nulls_first: bool },
 }
 
 /// A rerank phase ([`Select::phases`]): the top `count` rows of the phase
@@ -815,9 +819,48 @@ pub enum Having {
     Not(Box<Having>),
 }
 
+/// A column a SELECT groups by or aggregates: a field, or a path of a JSON
+/// field ([`Select::paths`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Col {
+    Field(usize),
+    Path(usize),
+}
+
+impl Col {
+    /// The column's value as a SELECT names it.
+    pub fn projection(self) -> Projection {
+        match self {
+            Col::Field(f) => Projection::Field(f),
+            Col::Path(p) => Projection::Path(p),
+        }
+    }
+
+    /// The field, when the column is one.
+    pub fn field(self) -> Option<usize> {
+        match self {
+            Col::Field(f) => Some(f),
+            Col::Path(_) => None,
+        }
+    }
+}
+
+/// A path of a JSON field read as a column (`attrs.color`,
+/// `json_extract(attrs, 'price', 'number')`): its values are what
+/// `json_extract` returns for each row, read from the field's terms
+/// ([`crate::json::PathValues`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathCol {
+    pub field: usize,
+    pub path: String,
+    pub kind: Option<crate::json::Kind>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Projection {
     Field(usize),
+    /// A path's value ([`Select::paths`]).
+    Path(usize),
     /// The ORDER BY score (`score()`), or the fused score for hybrids.
     Score,
     /// `COUNT(*)`: of the whole result, or per group.
@@ -829,8 +872,8 @@ pub enum Projection {
     /// ([`crate::storage::Database::seq_of`]).
     SeqNo,
     /// `SUM(f)`, `AVG(f)`, `MIN(f)`, `MAX(f)`, `COUNT(f)`, `COUNT(DISTINCT
-    /// f)`: of the whole result, or per group.
-    Agg { func: AggFn, field: usize },
+    /// f)`: of the whole result, or per group; of a field or a path.
+    Agg { func: AggFn, of: Col },
     /// A ranking expression that scores each row by itself (`bm25(title,
     /// :q)`, `ln(1 + rating)`; no set function, RRF or fusion): the value
     /// the query's ranking gives it ([`crate::query::rank`]), NULL where the
@@ -916,8 +959,11 @@ pub struct Select {
     pub filter: Pred,
     pub order: Option<OrderBy>,
     /// Fields to group by (KEYWORD, INT or FLOAT, multi-valued ones
-    /// counting a row once per value), with aggregates per group.
-    pub group_by: Vec<usize>,
+    /// counting a row once per value) and paths, with aggregates per group.
+    pub group_by: Vec<Col>,
+    /// The paths of JSON fields the query reads as columns, which
+    /// [`Col::Path`], [`Projection::Path`] and [`OrderBy::Path`] index.
+    pub paths: Vec<PathCol>,
     /// Which groups to keep.
     pub having: Option<Having>,
     /// Secondary order for rows that tie on the primary one.

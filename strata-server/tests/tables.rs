@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value as Json};
 use strata::db::Db;
+use strata::query::exec::Engine;
 use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::Schema;
@@ -44,14 +45,28 @@ fn agent() -> AgentConfig {
 }
 
 fn local(dir: &std::path::Path, name: &str) -> Arc<Service> {
+    local_on(dir, name, Engine::from_env())
+}
+
+/// A database whose compound queries run on `engine`.
+fn local_on(dir: &std::path::Path, name: &str, engine: Engine) -> Arc<Service> {
     let db = Db::create(&dir.join(name), items(), DbOptions { segment_max_docs: 500, publish_snapshots: true, ..DbOptions::default() }).unwrap();
     let schema = (*db.schema()).clone();
-    Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent(), 16, Duration::from_secs(20)))
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent(), 16, Duration::from_secs(20));
+    svc.engine = engine;
+    Arc::new(svc)
 }
 
 fn cluster(c: Coordinator) -> Arc<Service> {
+    cluster_on(c, Engine::from_env())
+}
+
+/// A coordinator whose compound queries run on `engine` above its shards.
+fn cluster_on(c: Coordinator, engine: Engine) -> Arc<Service> {
     let schema = c.schema.clone();
-    Arc::new(Service::new(Backend::Cluster(Arc::new(c)), schema, agent(), 16, Duration::from_secs(20)))
+    let mut svc = Service::new(Backend::Cluster(Arc::new(c)), schema, agent(), 16, Duration::from_secs(20));
+    svc.engine = engine;
+    Arc::new(svc)
 }
 
 async fn grpc(svc: Arc<Service>) -> String {
@@ -293,6 +308,50 @@ async fn three_shards_answer_like_one_database() {
     for s in &shards {
         assert!(!names(s).contains(&"notes".to_string()));
     }
+}
+
+// A coordinator and a database whose compound queries run on DataFusion
+// answer as a database on the operators does; the queries DataFusion does
+// not run are the operators' on both.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_datafusion_three_shards_answer_like_one_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = local_on(dir.path(), "whole.strata", Engine::Operators);
+    let one = local_on(dir.path(), "one.strata", Engine::DataFusion);
+    let shards: Vec<Arc<Service>> = (0..3).map(|s| local(dir.path(), &format!("s{s}.strata"))).collect();
+    let mut urls = Vec::new();
+    for s in &shards {
+        urls.push(grpc(s.clone()).await);
+    }
+    let coord = cluster_on(Coordinator::connect(urls).await.unwrap(), Engine::DataFusion);
+    for svc in [&whole, &one, &coord] {
+        for ddl in [USERS_DDL, EVENTS_DDL] {
+            sql(svc, ddl).await.unwrap();
+        }
+        load(svc).await;
+    }
+    // The compound queries (the single-table ones are the executor's), on
+    // each of the database and the coordinator.
+    let (mut fell_back, mut on_datafusion) = (Vec::new(), [Vec::new(), Vec::new()]);
+    for (q, ordered) in QUERIES {
+        let want = query(&whole, q).await;
+        for (i, svc) in [&one, &coord].into_iter().enumerate() {
+            let a = svc.query(QueryReq { sql: q.into(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{q}: {}", e.message));
+            same(q, ordered, &want, &js::result(&a.rs, 0.0));
+            let plan = &a.rs.stats.plan;
+            if let Some(why) = plan.first().filter(|l| l.starts_with("operators (not datafusion")) {
+                fell_back.push(format!("{q}: {why}"));
+            }
+            if plan.iter().any(|l| l.starts_with("datafusion:")) {
+                on_datafusion[i].push(q);
+            }
+        }
+    }
+    assert!(fell_back.is_empty(), "{fell_back:#?}");
+    // All but the single-table queries and the IN subquery, which the
+    // operators answer as one leaf; the same ones on both.
+    assert_eq!(on_datafusion[0], on_datafusion[1]);
+    assert_eq!(on_datafusion[1].len(), QUERIES.len() - 8, "{:#?}", on_datafusion[1]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

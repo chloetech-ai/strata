@@ -22,8 +22,13 @@
 //!   divisor NULL, and a sum of integers is exact (a decimal sum, an INT
 //!   where it fits).
 //! * **Types.** A column has one Arrow type; a leaf column that mixes INT
-//!   and FLOAT values, or a multi-valued column used as a key, is not
-//!   lowered.
+//!   and FLOAT values is not lowered.
+//! * **Multi-valued columns** are lists, and mean what they mean to the
+//!   operators: a condition holds when one of the values does (and is
+//!   never UNKNOWN), a row is in a group per distinct value (the group
+//!   NULL without any), an aggregate adds each value, and a join matches
+//!   on any value, once per pair of rows. A sort, window, or set operation
+//!   other than `UNION ALL` by one is not lowered.
 //!
 //! Whatever is not lowered here (a subquery in a leaf, links of an EDGES
 //! field, a function without an equivalent) gives [`Outcome::Fallback`]
@@ -36,7 +41,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Float64Builder, Int64Builder, UInt64Array,
+    Array, ArrayRef, AsArray, BooleanBuilder, Float64Array, Float64Builder, Int64Builder, UInt64Array,
 };
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
@@ -59,7 +64,7 @@ use datafusion::prelude::SessionConfig;
 use crate::error::{Error, Result};
 use crate::query::arrow::{self, Columns, Mixed};
 use crate::query::exec::{Engine, ExecOptions, ExecStats, Leaf, ResultSet};
-use crate::query::ir::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Func, JoinKind, Node, Plan, SetOp, SortKey, WindowFn, WindowFunc};
+use crate::query::ir::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Func, JoinKind, Node, Plan, SetOp, SortKey, When, WindowFn, WindowFunc};
 use crate::query::memory::Charge;
 use crate::query::ops;
 use crate::query::steps::{self, Clock, Step};
@@ -69,7 +74,7 @@ use crate::value::Value;
 
 /// Runs a leaf plan for DataFusion: its rows, as Arrow columns
 /// ([`Leaf::Arrow`]) when there are more than the number it is given.
-pub type Runner<'r> = dyn FnMut(&Plan, usize) -> Result<Leaf> + 'r;
+pub type Runner<'r> = ops::LeafRunner<'r>;
 
 /// What [`run_in`] made of a plan.
 #[derive(Debug)]
@@ -1053,6 +1058,13 @@ impl<'a> Lower<'a, '_> {
                 return Ok((r, c));
             }
         }
+        self.numbered(r)
+    }
+
+    /// `r` with a column numbering its rows 1, 2, .. in its order, which
+    /// is then its order: unlike [`Self::position`]'s, never NULL and
+    /// never the same for two rows.
+    fn numbered(&mut self, r: Rel) -> R<(Rel, String)> {
         let name = self.fresh("pos");
         let w = row_number().order_by(r.sort_exprs()).build()?.alias(&name);
         let plan = LogicalPlanBuilder::from(r.plan.clone()).window(vec![w])?.build()?;
@@ -1146,13 +1158,65 @@ impl<'a> Lower<'a, '_> {
         Ok(Rel { plan, ..r })
     }
 
+    /// `r` with a row per value of each multi-valued key of `keys` (its
+    /// distinct values, in their order; one row of NULL without any), as
+    /// the operators group them: a row is in a group per value, the last
+    /// key's values fastest. Each such key's values are a new column (`r`'s
+    /// own columns are kept, for the aggregates), whose name the key's
+    /// place gives, and its rows are ordered by their row, then by the
+    /// value's place in it.
+    fn unnest_keys(&mut self, r: Rel, keys: &[Expr]) -> R<(Rel, Vec<Option<String>>)> {
+        let schema = r.plan.schema().clone();
+        let mut lists = Vec::new();
+        for k in keys {
+            let e = self.top(k, &r.cols, &schema)?;
+            lists.push(match e.get_type(&schema)? {
+                DataType::List(f) if f.data_type() != &DataType::Float32 => Some((e, f.data_type().clone())),
+                _ => None,
+            });
+        }
+        let mut by = vec![None; keys.len()];
+        if lists.iter().all(Option::is_none) {
+            return Ok((r, by));
+        }
+        let (mut r, _) = self.position(r)?;
+        let mut kept: Vec<String> = Vec::new();
+        for (i, list) in lists.into_iter().enumerate() {
+            let Some((e, elem)) = list else { continue };
+            let (v, n) = (self.fresh("u"), self.fresh("i"));
+            let distinct = ScalarUDF::new_from_impl(ListOf::new(ListOp::Distinct, DataType::List(Arc::new(Field::new("item", elem, true))))).call(vec![e]);
+            let mut exprs = r.all();
+            exprs.extend(kept.iter().map(|k| col(k)));
+            let mut with_places = exprs.clone();
+            exprs.push(distinct.alias(&v));
+            with_places.push(col(&v));
+            with_places.push(ScalarUDF::new_from_impl(ListOf::new(ListOp::Places, DataType::List(Arc::new(Field::new("item", DataType::Int64, true))))).call(vec![col(&v)]).alias(&n));
+            use datafusion::common::{NullHandling, UnnestOptions};
+            let options = UnnestOptions::new().with_null_handling(NullHandling::PreserveAndExpandEmpty);
+            let plan = LogicalPlanBuilder::from(r.plan.clone())
+                .project(exprs)?
+                .project(with_places)?
+                .unnest_columns_with_options(vec![DfColumn::new_unqualified(&v), DfColumn::new_unqualified(&n)], options)?
+                .build()?;
+            r.ord.push(Ord { col: n, desc: false, nulls_first: false });
+            r.plan = plan;
+            kept.push(v.clone());
+            by[i] = Some(v);
+        }
+        Ok((r, by))
+    }
+
     fn aggregate(&mut self, r: Rel, keys: &[Expr], aggs: &[Agg]) -> R<Rel> {
+        let (r, by) = self.unnest_keys(r, keys)?;
         let (r, pos) = self.position(r)?;
         let schema = r.plan.schema().clone();
         let mut group = Vec::new();
         let mut cols = Vec::new();
-        for k in keys {
-            let e = self.top(k, &r.cols, &schema)?;
+        for (k, by) in keys.iter().zip(by) {
+            let e = match by {
+                Some(v) => col(&v),
+                None => self.top(k, &r.cols, &schema)?,
+            };
             if matches!(e.get_type(&schema)?, DataType::List(_)) {
                 return no("a group by a multi-valued column");
             }
@@ -1167,14 +1231,32 @@ impl<'a> Lower<'a, '_> {
         for a in aggs {
             let arg = a.arg.as_ref().map(|x| self.top(x, &r.cols, &schema)).transpose()?;
             let ty = arg.as_ref().map(|x| x.get_type(&schema)).transpose()?;
-            if matches!(ty, Some(DataType::List(_))) {
-                return no("an aggregate of a multi-valued column");
-            }
             let mut part = |l: &mut Self, e: DExpr| {
                 let n = l.fresh("a");
                 parts.push(e.alias(&n));
                 n
             };
+            // A multi-valued argument adds each of its values: each row's
+            // count, sum, least or greatest of them, aggregated.
+            if let (Some(x), Some(DataType::List(f))) = (&arg, &ty) {
+                let each = |op: ListOp, ret: DataType| ScalarUDF::new_from_impl(ListOf::new(op, ret)).call(vec![x.clone()]);
+                let elem = f.data_type().clone();
+                let int = is_int(&elem);
+                let out = match a.func {
+                    AggFn::Count => col(&part(self, agg_fn::sum(each(ListOp::Count, DataType::Int64)))),
+                    AggFn::Sum if int => col(&part(self, agg_fn::sum(each(ListOp::Sum, DataType::Decimal128(38, 0))))),
+                    AggFn::Min if int || is_text(&elem) => col(&part(self, agg_fn::min(each(ListOp::Min, elem.clone())))),
+                    AggFn::Max if int || is_text(&elem) => col(&part(self, agg_fn::max(each(ListOp::Max, elem.clone())))),
+                    AggFn::Avg if int => {
+                        let s = part(self, agg_fn::sum(each(ListOp::Sum, DataType::Decimal128(38, 0))));
+                        let c = part(self, agg_fn::sum(each(ListOp::Count, DataType::Int64)));
+                        when(col(&c).eq(lit(0i64)), lit(ScalarValue::Float64(None))).otherwise(cast(col(&s), DataType::Float64) / cast(col(&c), DataType::Float64))?
+                    }
+                    f => return no(format!("aggregate {f:?} of a multi-valued column of {elem}")),
+                };
+                finals.push(out);
+                continue;
+            }
             let out = match (a.func, arg, ty) {
                 (AggFn::Count, None, _) => col(&part(self, agg_fn::count(lit(1i64)))),
                 (AggFn::Count, Some(x), _) => col(&part(self, agg_fn::count(x))),
@@ -1469,9 +1551,6 @@ impl<'a> Lower<'a, '_> {
             let mut none = false;
             for k in keys {
                 let e = self.top(&k.left, &l.cols, l.plan.schema())?;
-                if matches!(e.get_type(l.plan.schema())?, DataType::List(_)) {
-                    return no("a join on a multi-valued column");
-                }
                 let vals = self.key_values(&l, &held, e)?;
                 let j = ops::output(&k.right)?;
                 let Some(c) = columns.get(j) else { return no(format!("no column {j} in the join's right rows")) };
@@ -1507,7 +1586,8 @@ impl<'a> Lower<'a, '_> {
 
     /// The distinct values, NULL aside, of `e` over the rows of `l`, which
     /// `held` holds, in the order of the rows they first come in, as the
-    /// operators list them: a column's are read from `held`.
+    /// operators list them: a column's are read from `held`, and a
+    /// multi-valued one's are each of its values.
     fn key_values(&mut self, l: &Rel, held: &RecordBatch, e: DExpr) -> R<Vec<Value>> {
         let column = match &e {
             DExpr::Column(c) => held.column_by_name(&c.name).cloned(),
@@ -1525,8 +1605,13 @@ impl<'a> Lower<'a, '_> {
                 vals
             }
         };
+        // A multi-valued column's values are each of its lists'.
+        let each = all.into_iter().flat_map(|v| match v {
+            Value::List(xs) => xs,
+            v => vec![v],
+        });
         let mut seen = std::collections::HashSet::new();
-        Ok(all.into_iter().filter(|v| !matches!(v, Value::Null) && seen.insert(ops::part(v))).collect())
+        Ok(each.filter(|v| !matches!(v, Value::Null) && seen.insert(ops::part(v))).collect())
     }
 
     /// The join of `l` and `r` on `keys` (and `on`).
@@ -1538,7 +1623,7 @@ impl<'a> Lower<'a, '_> {
             let b = self.top(&k.right, &r.cols, r.plan.schema())?;
             let (ta, tb) = (a.get_type(l.plan.schema())?, b.get_type(r.plan.schema())?);
             if matches!(ta, DataType::List(_)) || matches!(tb, DataType::List(_)) {
-                return no("a join on a multi-valued column");
+                return self.joined_lists(l, r, kind, keys, on);
             }
             comparable(&ta, &tb)?;
             conds.push(a.eq(b));
@@ -1561,6 +1646,98 @@ impl<'a> Lower<'a, '_> {
         ord.extend(r.ord.iter().cloned());
         let names = l.names.iter().chain(&r.names).cloned().collect();
         Ok(Rel { plan, cols: both, names, key: None, score, ord })
+    }
+
+    /// [`Self::joined`] on keys of which some are multi-valued, as the
+    /// operators join them: a multi-valued key matches on any of its
+    /// values, a pair of rows joins once however many values they share,
+    /// and a LEFT JOIN's row that matches none (or has no values) keeps
+    /// one row of NULLs. Each side's rows are numbered, a multi-valued
+    /// key unnested to a row per value, and the pairs joined on the
+    /// values kept once, in the left's order, then the right's.
+    fn joined_lists(&mut self, l: Rel, r: Rel, kind: JoinKind, keys: &[crate::query::ir::JoinKey], on: Option<&Expr>) -> R<Rel> {
+        let both: Vec<String> = l.cols.iter().chain(&r.cols).cloned().collect();
+        let names = l.names.iter().chain(&r.names).cloned().collect();
+        let score = match &l.score {
+            Score::Col(s) => Score::Col(s.clone()),
+            _ => Score::Zero,
+        };
+        let (l, lp) = self.numbered(l)?;
+        let (r, rp) = self.numbered(r)?;
+        let (l, lk) = self.join_side(l, &lp, keys.iter().map(|k| &k.left), kind == JoinKind::Left)?;
+        let (r, rk) = self.join_side(r, &rp, keys.iter().map(|k| &k.right), false)?;
+        let mut conds = Vec::new();
+        for (a, b) in lk.into_iter().zip(rk) {
+            comparable(&a.get_type(l.plan.schema())?, &b.get_type(r.plan.schema())?)?;
+            conds.push(a.eq(b));
+        }
+        let jt = match kind {
+            JoinKind::Inner => JoinType::Inner,
+            JoinKind::Left => JoinType::Left,
+        };
+        if let Some(c) = on {
+            let probe = LogicalPlanBuilder::from(l.plan.clone()).join_on(r.plan.clone(), JoinType::Inner, conds.clone())?.build()?;
+            conds.push(self.top_cond(c, &both, probe.schema())?);
+        }
+        let plan = LogicalPlanBuilder::from(l.plan.clone()).join_on(r.plan.clone(), jt, conds)?.build()?;
+        let ord = vec![Ord { col: lp.clone(), desc: false, nulls_first: false }, Ord { col: rp.clone(), desc: false, nulls_first: false }];
+        let mut rel = Rel { plan, cols: both, names, key: None, score, ord };
+        if kind == JoinKind::Left {
+            // A left row's copies that matched nothing go when another
+            // copy matched.
+            use datafusion::logical_expr::{WindowFrame, WindowFrameBound as WB, WindowFrameUnits as WU};
+            let n = self.fresh("n");
+            let whole = WindowFrame::new_bounds(WU::Rows, WB::Preceding(ScalarValue::UInt64(None)), WB::Following(ScalarValue::UInt64(None)));
+            let w = over_rows(agg_fn::count(col(&rp))).partition_by(vec![col(&lp)]).window_frame(whole).build()?.alias(&n);
+            let keep = rel.all();
+            rel.plan = LogicalPlanBuilder::from(rel.plan.clone())
+                .window(vec![w])?
+                .filter(col(&rp).is_not_null().or(cast(col(&n), DataType::Int64).eq(lit(0i64))))?
+                .project(keep)?
+                .build()?;
+        }
+        self.first_per(rel, vec![col(&lp), col(&rp)], 1)
+    }
+
+    /// `r` and each of `keys` as an expression over its rows, a
+    /// multi-valued key's unnested: a row per value, and for a row
+    /// without any (with `keep`) one row whose value is NULL, or none.
+    ///
+    /// `pos` numbers `r`'s rows, and once they are unnested DataFusion is
+    /// not told it orders them: it would take the copies of a row for
+    /// rows in order, and a hash join probing them for rows ordered by
+    /// `pos` and then by the other side's order, which they are not
+    /// (DataFusion 55 then skips the sort the pairs need, and keeps some
+    /// twice and drops others).
+    fn join_side<'k>(&mut self, mut r: Rel, pos: &str, keys: impl Iterator<Item = &'k Expr>, keep: bool) -> R<(Rel, Vec<DExpr>)> {
+        use datafusion::common::{NullHandling, UnnestOptions};
+        let schema = r.plan.schema().clone();
+        let mut out = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        for k in keys {
+            let e = self.top(k, &r.cols, &schema)?;
+            match e.get_type(&schema)? {
+                DataType::List(f) if f.data_type() != &DataType::Float32 => {
+                    let u = self.fresh("u");
+                    let unordered = |c: DExpr| match &c {
+                        DExpr::Column(x) if x.name == pos => ScalarUDF::new_from_impl(Unordered::new()).call(vec![c]).alias(pos),
+                        _ => c,
+                    };
+                    let mut exprs: Vec<DExpr> = r.all().into_iter().map(unordered).collect();
+                    exprs.extend(values.iter().map(|v| col(v)));
+                    exprs.push(e.alias(&u));
+                    let nulls = if keep { NullHandling::PreserveAndExpandEmpty } else { NullHandling::Drop };
+                    r.plan = LogicalPlanBuilder::from(r.plan.clone())
+                        .project(exprs)?
+                        .unnest_columns_with_options(vec![DfColumn::new_unqualified(&u)], UnnestOptions::new().with_null_handling(nulls))?
+                        .build()?;
+                    values.push(u.clone());
+                    out.push(col(&u));
+                }
+                _ => out.push(e),
+            }
+        }
+        Ok((r, out))
     }
 
     /// `r`'s rows in the order of `b`'s rows with the same primary key
@@ -1586,6 +1763,76 @@ impl<'a> Lower<'a, '_> {
     }
 
     /// A condition: an expression that is TRUE, FALSE or NULL.
+    /// A condition on a multi-valued column (a comparison, `IN`, `IS NULL`,
+    /// `BETWEEN`, `LIKE`), as Strata's evaluator decides it ([`StrataCond`]):
+    /// a list holds when one of its values does, and is never UNKNOWN.
+    /// Its operands are lowered, the condition reads them as its columns.
+    /// None for a condition of no list.
+    fn list_cond(&mut self, e: &Expr, cols: &[String], schema: &DFSchema) -> R<Option<DExpr>> {
+        let operands: Vec<&Expr> = match e {
+            Expr::Cmp { left, right, .. } => vec![left, right],
+            Expr::In { expr, list } => std::iter::once(&**expr).chain(list).collect(),
+            Expr::IsNull(x) => vec![x],
+            Expr::Between { expr, lo, hi } => std::iter::once(&**expr).chain(lo.as_deref()).chain(hi.as_deref()).collect(),
+            Expr::Like { expr, pattern, .. } => vec![expr, pattern],
+            _ => return Ok(None),
+        };
+        // A list here is a column's (or the binder's guard around one), and
+        // a column costs nothing to lower: the other operands are lowered
+        // once a list is found, so that a condition nested in another is
+        // not lowered twice for each level.
+        let mut lists = false;
+        for o in &operands {
+            if let Expr::Output(_) = listy(o).unwrap_or(o) {
+                let d = self.expr(listy(o).unwrap_or(o), cols, schema)?;
+                lists |= matches!(d.get_type(schema)?, DataType::List(f) if f.data_type() != &DataType::Float32);
+            }
+        }
+        if !lists {
+            return Ok(None);
+        }
+        let mut args = Vec::new();
+        let mut slots: Vec<Option<Expr>> = Vec::new();
+        for o in &operands {
+            // A literal stays in the condition.
+            if let Expr::Lit(_) = o {
+                slots.push(None);
+                continue;
+            }
+            let inner = listy(o);
+            args.push(self.expr(inner.unwrap_or(o), cols, schema)?);
+            let at = Expr::Output(args.len() as u32 - 1);
+            slots.push(Some(match inner {
+                Some(_) => listy_case(at),
+                None => at,
+            }));
+        }
+        let mut slots = slots.into_iter();
+        let mut next = |o: &Expr| slots.next().flatten().unwrap_or_else(|| o.clone());
+        let read = match e {
+            Expr::Cmp { op, left, right } => {
+                let l = next(left);
+                Expr::Cmp { op: *op, left: Box::new(l), right: Box::new(next(right)) }
+            }
+            Expr::In { expr, list } => {
+                let x = next(expr);
+                Expr::In { expr: Box::new(x), list: list.iter().map(&mut next).collect() }
+            }
+            Expr::IsNull(x) => Expr::IsNull(Box::new(next(x))),
+            Expr::Between { expr, lo, hi } => {
+                let x = next(expr);
+                let lo = lo.as_deref().map(&mut next).map(Box::new);
+                Expr::Between { expr: Box::new(x), lo, hi: hi.as_deref().map(&mut next).map(Box::new) }
+            }
+            Expr::Like { expr, pattern, case_insensitive } => {
+                let x = next(expr);
+                Expr::Like { expr: Box::new(x), pattern: Box::new(next(pattern)), case_insensitive: *case_insensitive }
+            }
+            _ => unreachable!("a condition of operands"),
+        };
+        Ok(Some(ScalarUDF::new_from_impl(StrataCond::new(read)).call(args)))
+    }
+
     fn cond(&mut self, e: &Expr, cols: &[String], schema: &DFSchema) -> R<DExpr> {
         let x = self.expr(e, cols, schema)?;
         match x.get_type(schema)? {
@@ -1597,6 +1844,9 @@ impl<'a> Lower<'a, '_> {
     /// An expression over rows whose column `i` is `cols[i]`.
     fn expr(&mut self, e: &Expr, cols: &[String], schema: &DFSchema) -> R<DExpr> {
         let ty = |x: &DExpr| x.get_type(schema).map_err(Fail::from);
+        if let Some(c) = self.list_cond(e, cols, schema)? {
+            return Ok(c);
+        }
         Ok(match e {
             Expr::Output(i) => match cols.get(*i as usize) {
                 Some(c) => col(c),
@@ -2044,6 +2294,227 @@ fn arg_values(args: &[ColumnarValue], rows: usize) -> datafusion::error::Result<
     let arrays = ColumnarValue::values_to_arrays(args)?;
     let cols: Vec<Vec<Value>> = arrays.iter().map(|a| values_of(a).map_err(|_| DataFusionError::Execution(format!("strata: no values of {}", a.data_type())))).collect::<datafusion::error::Result<_>>()?;
     Ok((0..rows).map(|i| cols.iter().map(|c| c.get(i).cloned().unwrap_or(Value::Null)).collect()).collect())
+}
+
+/// The column a multi-valued operand reads, when `e` is the binder's
+/// `CASE WHEN x IS NULL THEN [] ELSE x END` of it (a NULL list compares as
+/// the empty one).
+fn listy(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Case { operand: None, whens, otherwise: Some(o) } => match &whens[..] {
+            [When { when: Expr::IsNull(x), then: Expr::Lit(Value::List(v)) }] if v.is_empty() && **x == **o => Some(o),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`listy`]'s `CASE` of `x`.
+fn listy_case(x: Expr) -> Expr {
+    Expr::Case { operand: None, whens: vec![When { when: Expr::IsNull(Box::new(x.clone())), then: Expr::Lit(Value::List(Vec::new())) }], otherwise: Some(Box::new(x)) }
+}
+
+/// Its argument as it is, of an order DataFusion does not know (see
+/// [`Lower::join_side`]).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Unordered {
+    signature: Signature,
+}
+
+impl Unordered {
+    fn new() -> Unordered {
+        Unordered { signature: Signature::any(1, Volatility::Immutable) }
+    }
+}
+
+impl ScalarUDFImpl for Unordered {
+    fn name(&self) -> &str {
+        "strata_unordered"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, args: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(args[0].clone())
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        Ok(args.args.remove(0))
+    }
+}
+
+/// What [`ListOf`] computes of each row's list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ListOp {
+    /// Its distinct values, each where it first comes (as
+    /// [`crate::query::agg::Part`]s tell them apart).
+    Distinct,
+    /// Its values' places, 0, 1, ..
+    Places,
+    /// How many values it has (0 for NULL).
+    Count,
+    /// The sum of its INT values, exactly (NULL for none).
+    Sum,
+    /// Its least value (NULL for none).
+    Min,
+    /// Its greatest value.
+    Max,
+}
+
+/// A function of a multi-valued column's list, row by row, its values of
+/// type `ret`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ListOf {
+    op: ListOp,
+    ret: DataType,
+    signature: Signature,
+}
+
+impl ListOf {
+    fn new(op: ListOp, ret: DataType) -> ListOf {
+        ListOf { op, ret, signature: Signature::any(1, Volatility::Immutable) }
+    }
+}
+
+impl ScalarUDFImpl for ListOf {
+    fn name(&self) -> &str {
+        match self.op {
+            ListOp::Distinct => "strata_list_distinct",
+            ListOp::Places => "strata_list_places",
+            ListOp::Count => "strata_list_count",
+            ListOp::Sum => "strata_list_sum",
+            ListOp::Min => "strata_list_min",
+            ListOp::Max => "strata_list_max",
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(self.ret.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        use crate::query::agg::Part;
+        let rows = arg_values(&args.args, args.number_rows)?;
+        let lists = rows.into_iter().map(|mut r| match r.pop() {
+            Some(Value::List(xs)) => xs,
+            _ => Vec::new(),
+        });
+        let values: Vec<Value> = match self.op {
+            ListOp::Distinct => lists
+                .map(|xs| {
+                    let mut seen = std::collections::HashSet::new();
+                    Value::List(xs.into_iter().filter(|x| seen.insert(Part::of(x))).collect())
+                })
+                .collect(),
+            ListOp::Places => lists.map(|xs| Value::List((0..xs.len() as i64).map(Value::Int).collect())).collect(),
+            ListOp::Count => lists.map(|xs| Value::Int(xs.iter().filter(|x| !matches!(x, Value::Null)).count() as i64)).collect(),
+            ListOp::Sum => lists
+                .map(|xs| {
+                    let ints: Vec<i128> = xs.iter().filter_map(|x| x.as_i64()).map(i128::from).collect();
+                    if ints.is_empty() { Value::Null } else { Value::Str(ints.iter().sum::<i128>().to_string()) }
+                })
+                .collect(),
+            ListOp::Min | ListOp::Max => lists
+                .map(|xs| {
+                    let mut best: Option<Value> = None;
+                    for x in xs.into_iter().filter(|x| !matches!(x, Value::Null)) {
+                        let better = match &best {
+                            None => true,
+                            Some(b) => {
+                                let o = crate::query::exec::cmp_values(&x, b);
+                                if self.op == ListOp::Min { o.is_lt() } else { o.is_gt() }
+                            }
+                        };
+                        if better {
+                            best = Some(x);
+                        }
+                    }
+                    best.unwrap_or(Value::Null)
+                })
+                .collect(),
+        };
+        let out: ArrayRef = match (&self.ret, self.op) {
+            (DataType::Decimal128(p, sc), ListOp::Sum) => {
+                let a: datafusion::arrow::array::Decimal128Array = values.iter().map(|v| match v {
+                    Value::Str(s) => s.parse::<i128>().ok(),
+                    _ => None,
+                }).collect();
+                Arc::new(a.with_precision_and_scale(*p, *sc).map_err(DataFusionError::from)?)
+            }
+            (t, _) => {
+                let a = arrow::column_of(values).map_err(|e| DataFusionError::Execution(format!("strata: {}", e.0)))?;
+                datafusion::arrow::compute::cast(&a, t)?
+            }
+        };
+        Ok(ColumnarValue::Array(out))
+    }
+}
+
+/// A condition as Strata's evaluator decides it, over its arguments as
+/// the columns `Expr::Output(i)` it reads: TRUE, FALSE or NULL (UNKNOWN).
+#[derive(Debug)]
+struct StrataCond {
+    /// The condition, written out: what tells two apart.
+    key: String,
+    cond: Expr,
+    signature: Signature,
+}
+
+impl StrataCond {
+    fn new(cond: Expr) -> StrataCond {
+        StrataCond { key: format!("{cond:?}"), cond, signature: Signature::variadic_any(Volatility::Immutable) }
+    }
+}
+
+impl PartialEq for StrataCond {
+    fn eq(&self, o: &Self) -> bool {
+        self.key == o.key
+    }
+}
+
+impl Eq for StrataCond {}
+
+impl std::hash::Hash for StrataCond {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.key.hash(h);
+    }
+}
+
+impl ScalarUDFImpl for StrataCond {
+    fn name(&self) -> &str {
+        "strata_cond"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let rows = arg_values(&args.args, args.number_rows)?;
+        let mut b = BooleanBuilder::with_capacity(rows.len());
+        for r in &rows {
+            let read = |x: crate::query::ir::eval::Ref| match x {
+                crate::query::ir::eval::Ref::Output(i) => Ok(r.get(i as usize).cloned().unwrap_or(Value::Null)),
+                x => Err(Error::Query(format!("{x:?} is not a column of a condition's arguments"))),
+            };
+            match crate::query::ir::eval::eval(&self.cond, &read).map_err(|e| DataFusionError::Execution(format!("strata: {e}")))? {
+                Value::Bool(x) => b.append_value(x),
+                Value::Null => b.append_null(),
+                v => return Err(DataFusionError::Execution(format!("strata: a condition gave {v:?}"))),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+    }
 }
 
 /// A scalar function as Strata's evaluator computes it

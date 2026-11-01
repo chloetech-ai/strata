@@ -720,6 +720,10 @@ async fn step<P: Platform>(spec: &Spec, p: &P, admin: &Admin, before: &Rollout) 
         // copy of each set (the others join as replicas).
         let waiting = sets.iter().filter(|s| !s.ready.contains(&0)).count();
         if waiting > 0 {
+            let stale = p.stale(spec).await?;
+            if let Some(m) = restart_stuck(spec, p, &sets, |_| false, &stale).await? {
+                return Ok(Outcome::new(Phase::Creating, m));
+            }
             return Ok(Outcome::new(Phase::Creating, format!("waiting for the first copy of {waiting} of {} shards to start", sets.len())));
         }
         let first: Vec<Vec<String>> = sets.iter().map(|s| vec![p.url(s.id, 0)]).collect();
@@ -769,6 +773,10 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
                 return Ok(o);
             }
         };
+    }
+    let up = |url: &str| view.shards.iter().any(|s| s.servers.iter().any(|r| r.url == url && r.up));
+    if let Some(m) = restart_stuck(spec, p, sets, up, stale).await? {
+        return scaling(m);
     }
     let shard_of: HashMap<u32, usize> = view.shards.iter().enumerate().filter_map(|(i, s)| set_of_shard(p, s).map(|id| (id, i))).collect();
     let in_map: Vec<&str> = view.shards.iter().flat_map(|s| s.servers.iter().map(|r| r.url.as_str())).collect();
@@ -918,6 +926,24 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
         return Ok(Outcome::new(Phase::Scaling, format!("shards {} wait for copies to start", short.join(", "))));
     }
     Ok(Outcome::new(Phase::Ready, format!("{n} shards of {} copies", spec.replicas)))
+}
+
+/// A copy running older settings than `spec`'s that has not started (its
+/// pod not ready, and not `up` in the cluster) serves nothing, and may
+/// never start with them: requests no node has room for, say, or a flag
+/// its server does not take. It restarts at once with `spec`'s, its set
+/// first made to start copies with them, rather than being waited for,
+/// for ever, by the cluster being made, a new shard or a rollout. Not
+/// held by a pause or a gate: it heals.
+async fn restart_stuck<P: Platform>(spec: &Spec, p: &P, sets: &[Set], up: impl Fn(&str) -> bool, stale: &[(u32, usize)]) -> Result<Option<String>, String> {
+    let ready = |id: u32, k: usize| sets.iter().any(|s| s.id == id && s.ready.contains(&k));
+    let Some(&(id, k)) = stale.iter().find(|&&(id, k)| !ready(id, k) && !up(&p.url(id, k))) else { return Ok(None) };
+    if p.configure(id, spec).await? {
+        return Ok(Some(format!("set {id}: new copies start with the new settings")));
+    }
+    let url = p.url(id, k);
+    p.restart(id, k).await?;
+    Ok(Some(format!("restarting {url}, which has not started, with the new settings")))
 }
 
 /// New settings: each set starts its copies with them, the volumes grow,

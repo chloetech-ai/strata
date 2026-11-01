@@ -58,6 +58,10 @@
   ],
   "sizes": [
    {
+    "name": "s-2vcpu-4gb",
+    "slug": "s-2vcpu-4gb"
+   },
+   {
     "name": "s-4vcpu-8gb",
     "slug": "s-4vcpu-8gb"
    },

@@ -406,6 +406,52 @@ async fn a_cluster_with_its_own_token_is_made_grown_shrunk_and_healed() {
     assert_eq!(ask("cluster-token").await.unwrap().status(), 200);
 }
 
+/// A copy that cannot start with its settings (here an argument its
+/// server does not take; on Kubernetes, requests no node has room for)
+/// restarts at once with the settings that fix it, rather than being
+/// waited for: while the cluster is made, and when a rollout of a bad
+/// setting is rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_that_cannot_start_restarts_with_the_settings_that_fix_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let procs = Procs::new(dir.path(), None);
+    let admin = Admin::new(&format!("http://127.0.0.1:{}", procs.coordinator_port), None);
+    let bad = vec!["--no-such-flag".to_string()];
+    let spec = Spec { shards: 1, replicas: 2, demo: Some(ROWS), failover_after_ms: 1000, args: bad.clone(), ..Spec::default() };
+    let mut run = Run::new(procs, admin, spec);
+
+    // Made with an argument no copy starts with: it waits for them.
+    for _ in 0..20 {
+        let o = run.once().await;
+        assert!(o.phase == Phase::Creating && !o.message.contains("which has not started"), "{o:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Fixed, the copies restart with it at once.
+    run.spec.args = Vec::new();
+    let said = run.settle("made once its settings are fixed").await;
+    assert!(said.iter().any(|m| m.contains("which has not started")), "{said:?}");
+    assert_eq!(run.shape().await.0, vec![2]);
+    assert_eq!(run.count().await, ROWS as i64);
+
+    // The bad argument rolls out to a replica, which does not come back:
+    // the rollout waits for it, and the primary serves.
+    run.spec.args = bad;
+    let (_, said) = run.until("a copy down", |o| o.message.contains("to be back")).await;
+    assert!(said.iter().any(|m| m.starts_with("restarting")), "{said:?}");
+    for _ in 0..10 {
+        let o = run.once().await;
+        assert!(o.message.contains("to be back"), "{o:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(run.count().await, ROWS as i64);
+    // Rolled back, the copy restarts with the settings it had.
+    run.spec.args = Vec::new();
+    let said = run.settle("rolled back").await;
+    assert!(said.iter().any(|m| m.contains("which has not started")), "{said:?}");
+    assert_eq!(run.shape().await.0, vec![2]);
+    assert_eq!(run.count().await, ROWS as i64);
+}
+
 /// Makes the cluster, grows it in shards and copies, heals a copy that
 /// lost its volume, hands a primary over, shrinks it back and starts the
 /// coordinator again, every row and write kept.

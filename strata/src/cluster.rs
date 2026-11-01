@@ -44,7 +44,7 @@
 use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
-use crate::query::exec::{cmp_values, ExecOptions, ExecStats, RankParts, ResultSet, DEFAULT_K};
+use crate::query::exec::{cmp_values, path_order, ExecOptions, ExecStats, RankParts, ResultSet, DEFAULT_K};
 use crate::query::agg;
 use crate::query::steps::Clock;
 use crate::query::logical::{OrderBy, Pred, Projection, Score, Select, Tiebreak};
@@ -125,6 +125,12 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
             let want = if matches!(score, Score::Column { .. }) { q.limit } else { Some(q.limit.unwrap_or(DEFAULT_K)) };
             (rows, want)
         }
+        // By the path's column, which the query selects for it.
+        Some(OrderBy::Path { path, desc, nulls_first }) => {
+            let c = q.projection.iter().position(|(_, p)| *p == Projection::Path(*path)).ok_or_else(|| err("rows ordered by a path over shards select the path"))?;
+            rows.sort_by(|a, b| path_order(&a.values[c], &b.values[c], *desc, *nulls_first).then_with(|| by_key(&a.key, &b.key, key_desc)));
+            (rows, q.limit)
+        }
         Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
     };
     if matches!(&q.order, Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some()) {
@@ -193,7 +199,9 @@ pub fn fetches(q: &Select, schema: &Schema) -> bool {
     let Some(pk) = schema.primary_key else { return false };
     let rows = q.limit.is_some() && q.group_by.is_empty() && !agg::is_general(q, |_| false) && !q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. }));
     // A BOOL or TIMESTAMP key would come back as its stored integer.
+    // Rows ordered by a path are merged by its column.
     rows && q.graphs.is_empty()
+        && !matches!(q.order, Some(OrderBy::Path { .. }))
         && schema.fields[pk].logical.is_none()
         && q.projection.iter().any(|(_, p)| matches!(p, Projection::Field(f) if *f != pk) || matches!(p, Projection::Feature(_)))
 }
@@ -217,6 +225,7 @@ pub fn fetch(q: &Select, schema: &Schema, keys: Vec<Value>) -> Result<Select> {
         filter: if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } },
         order: None,
         group_by: Vec::new(),
+        paths: q.paths.clone(),
         having: None,
         tiebreak: None,
         phases: Vec::new(),
