@@ -43,6 +43,17 @@ env:
 # request (and the merge queue) runs only Strata's tests on macOS, where
 # its NEON kernels and syncs differ from Linux; a push to main, the nightly
 # run and a run started by hand run every macOS job.
+#
+# Caches (Swatinem/rust-cache, one per job) are saved by runs on main, the
+# nightly and runs started by hand, and only restored by pull requests: a
+# repository keeps 10 GB of caches, and with every pull request saving its
+# own, main's were evicted and most jobs compiled every dependency (the
+# Python job took 26 to 39 minutes that way, 20 with a cache). For the same
+# reason Linux builds in strata/ name x86-64-v3 (AVX2, which every runner
+# has) instead of its config's target-cpu=native, so that one cache serves
+# every runner's CPU; on a runner with AVX-512 Strata still picks those
+# kernels at run time (strata::simd). macOS builds keep native, and the CPU
+# in their cache's key.
 jobs:
   # Whether the change touches more than the documentation site and
   # Markdown files: if not, every other job is skipped.
@@ -96,13 +107,15 @@ jobs:
             crate: strata
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.crate == 'strata' && '-C target-cpu=x86-64-v3' || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # The strata crate builds with -C target-cpu=native
-      # (strata/.cargo/config.toml), so a cache must not be restored on a
+      # On macOS the strata crate builds with -C target-cpu=native
+      # (strata/.cargo/config.toml), so its cache must not be restored on a
       # runner with another CPU: the key hashes the model and its
       # instruction sets (runners with the same model name differ in them,
       # and a cached proc macro then dies of SIGILL).
@@ -112,8 +125,9 @@ jobs:
         run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: ${{ matrix.crate }}
-          key: ${{ matrix.crate }}-${{ steps.cpu.outputs.model }}
+          key: ${{ matrix.crate }}${{ runner.os == 'macOS' && matrix.crate == 'strata' && format('-{0}', steps.cpu.outputs.model) || '' }}
       # The ci profile is release without link-time optimisation and with
       # 16 codegen units (each crate's Cargo.toml): with release's, building
       # Strata's test binaries took 37 of the 40 minutes of its tests.
@@ -147,6 +161,7 @@ jobs:
       # A generic build runs on any x86-64 runner: no CPU model in the key.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata
           key: strata-generic
       - name: Kernels
@@ -172,17 +187,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: CPU model
-        id: cpu
-        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
             strata
             strata-server
-          key: vision-${{ steps.cpu.outputs.model }}
+          key: vision
       - name: Strata
         working-directory: strata
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
         run: |
           cargo test --profile ci --features vision --test media_vectors --test media_fields --test derived_text --test rank_cross
           cargo clippy --profile ci --features vision --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
@@ -206,17 +221,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: CPU model
-        id: cpu
-        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
             strata
             strata-server
-          key: audio-${{ steps.cpu.outputs.model }}
+          key: audio
       - name: Strata
         working-directory: strata
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
         run: |
           cargo test --profile ci --features audio --test derived_audio --test audio_vectors
           cargo test --profile ci --features audio --lib -- audio:: clap::
@@ -237,18 +252,18 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: CPU model
-        id: cpu
-        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata
-          key: datafusion-${{ steps.cpu.outputs.model }}
+          key: datafusion
       - name: Strata
         working-directory: strata
         run: |
@@ -270,6 +285,8 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -279,8 +296,9 @@ jobs:
         run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata
-          key: strata-faults-${{ steps.cpu.outputs.model }}
+          key: strata-faults${{ runner.os == 'macOS' && format('-{0}', steps.cpu.outputs.model) || '' }}
       - name: Fault injection
         working-directory: strata
         run: cargo test --profile ci --features fault-injection --test storage_faults
@@ -293,17 +311,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: CPU model
-        id: cpu
-        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata
-          key: relevance-${{ steps.cpu.outputs.model }}
+          key: relevance
       - uses: actions/cache@v6
         with:
           path: ~/beir
@@ -323,17 +341,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: CPU model
-        id: cpu
-        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata
-          key: relevance-bert-${{ steps.cpu.outputs.model }}
+          key: relevance-bert
       - uses: actions/cache@v6
         with:
           path: ~/beir
@@ -382,6 +400,7 @@ jobs:
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata
           key: miri
       - name: Miri
@@ -402,6 +421,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: strata-server
           key: strata-server-smoke
       - name: Build
@@ -460,16 +480,15 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: CPU model
-        id: cpu
-        shell: bash
-        run: echo "model=$( (if [ -r /proc/cpuinfo ]; then grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u; else sysctl -n machdep.cpu.brand_string; fi) | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      # strata-py and strata-server build for a generic CPU: one cache on
+      # every runner.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
             strata-py
             strata-server
-          key: python-${{ steps.cpu.outputs.model }}
+          key: python
       # The client tests run against a real server.
       - name: Build strata-server
         working-directory: strata-server
@@ -495,7 +514,9 @@ jobs:
           pip install maturin pytest numpy confluent-kafka
           # strata.train.sequence's test: CPU PyTorch (PyPI's macOS wheel is one)
           if [ "$RUNNER_OS" = Linux ]; then pip install torch --index-url https://download.pytorch.org/whl/cpu; else pip install torch; fi
-          maturin develop --release
+          # The ci profile, as the crates' tests have: release's link-time
+          # optimisation and single codegen unit took most of this step.
+          maturin develop --profile ci
           pytest tests -v
       # The recommender gate (strata/results/sequence/gate.py): every
       # candidate source and two baselines on MovieLens-1M, checked against
