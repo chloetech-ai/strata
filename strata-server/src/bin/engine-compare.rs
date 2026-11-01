@@ -119,6 +119,32 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Times writes against an engine loaded with the collection: new
+    /// documents one per request and in batches, an update of one field of
+    /// existing documents, and how long a written document takes to be found.
+    /// Then deletes what it wrote and puts the old values back (run it after `run`).
+    Writes {
+        #[arg(long, value_enum)]
+        engine: Engine,
+        /// The engine's HTTP endpoints, comma-separated (Strata: its coordinator); requests go round-robin.
+        #[arg(long, value_delimiter = ',', required = true)]
+        url: Vec<String>,
+        #[arg(long, value_delimiter = ',', default_value = "1,4,16")]
+        concurrency: Vec<usize>,
+        #[arg(long, default_value_t = 6.0)]
+        seconds: f64,
+        /// Documents per batched write.
+        #[arg(long, default_value_t = 100)]
+        batch: usize,
+        /// Writes timed until their document is found.
+        #[arg(long, default_value_t = 30)]
+        samples: usize,
+        /// Names the run in the report (`--out/writes-<label>.json`).
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -164,7 +190,7 @@ fn meta(collection: &str) -> Result<Meta, String> {
     serde_json::from_reader(File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(s)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawDoc {
     id: String,
     title: String,
@@ -1426,6 +1452,430 @@ async fn run(
     Ok(())
 }
 
+/// One write: a request (PUT for Vespa's partial updates, POST otherwise),
+/// or Vespa's batch, which is one request a document, all sent at once.
+enum WriteReq {
+    One { url: String, put: bool, body: Vec<u8> },
+    Many(Vec<(String, Vec<u8>)>),
+}
+
+/// What a write's answer says went wrong, if anything.
+async fn write_error(res: Result<reqwest::Response, reqwest::Error>) -> Option<String> {
+    match res {
+        Err(e) => Some(e.to_string()),
+        Ok(res) => {
+            let status = res.status();
+            let j = res.json::<Json>().await.unwrap_or(Json::Null);
+            if !status.is_success() {
+                return Some(format!("{status}: {j}"));
+            }
+            if j["errors"].as_bool() == Some(true) {
+                // A bulk request with an item that failed.
+                let item = j["items"].as_array().and_then(|items| items.iter().find(|i| i.as_object().is_some_and(|o| o.values().any(|v| v.get("error").is_some()))).cloned());
+                return Some(format!("bulk item failed: {}", item.unwrap_or(Json::Null)));
+            }
+            error_of(&j)
+        }
+    }
+}
+
+async fn send_write(client: &reqwest::Client, w: &WriteReq) -> Option<String> {
+    match w {
+        WriteReq::One { url, put, body } => {
+            let ctype = if url.contains("/_bulk") { "application/x-ndjson" } else { "application/json" };
+            let rb = if *put { client.put(url) } else { client.post(url) };
+            write_error(rb.header("content-type", ctype).body(body.clone()).send().await).await
+        }
+        WriteReq::Many(reqs) => {
+            // As loading does: each put again a second later while Vespa is overloaded.
+            let all = reqs.iter().map(|(url, body)| async move { vespa_retry(|| client.post(url).header("content-type", "application/json").body(body.clone())).await });
+            futures::future::join_all(all).await.into_iter().flatten().next()
+        }
+    }
+}
+
+/// Sends the writes `make(n)` for n = start, start + 1, ... from `concurrency`
+/// clients for `seconds`; returns the timings and the next n.
+async fn drive_writes(client: &reqwest::Client, make: Arc<dyn Fn(usize) -> WriteReq + Send + Sync>, start: usize, concurrency: usize, seconds: f64) -> (Timed, usize) {
+    let next = Arc::new(AtomicUsize::new(start));
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    let t0 = Instant::now();
+    let tasks: Vec<_> = (0..concurrency)
+        .map(|_| {
+            let (client, make, next) = (client.clone(), make.clone(), next.clone());
+            tokio::spawn(async move {
+                let mut t = Timed::default();
+                while Instant::now() < deadline {
+                    let w = make(next.fetch_add(1, Ordering::Relaxed));
+                    let start = Instant::now();
+                    let err = send_write(&client, &w).await;
+                    let ms = start.elapsed().as_secs_f64() * 1e3;
+                    match err {
+                        None => t.ms.push(ms),
+                        Some(e) => {
+                            t.errors += 1;
+                            t.first_error.get_or_insert(e);
+                        }
+                    }
+                }
+                t
+            })
+        })
+        .collect();
+    let mut all = Timed::default();
+    for task in tasks {
+        let t = task.await.expect("client task");
+        all.ms.extend(t.ms);
+        all.errors += t.errors;
+        if all.first_error.is_none() {
+            all.first_error = t.first_error;
+        }
+    }
+    all.seconds = t0.elapsed().as_secs_f64();
+    (all, next.load(Ordering::Relaxed))
+}
+
+/// A document for Strata's /v1/write: its fields without `body`, which
+/// Strata makes from the title and text.
+fn strata_doc(r: &RawDoc, id: &str, v: &[f32]) -> Json {
+    json!({"id": id, "title": r.title, "text": r.text, "year": r.year, "category": r.category, "rating": r.rating, "topic": r.topic, "emb": v})
+}
+
+/// The document `r` under the key `id`, with `rating`, as the engine's own JSON (the others' have `body`).
+fn engine_doc(engine: Engine, r: &RawDoc, id: &str, rating: f64, v: &[f32]) -> String {
+    let r = RawDoc { id: id.to_string(), rating, ..r.clone() };
+    match engine {
+        Engine::Strata => {
+            let mut d = strata_doc(&r, id, v);
+            d["rating"] = json!(rating);
+            d.to_string()
+        }
+        _ => doc_json(&r, v),
+    }
+}
+
+/// The document `r` written as a new one under the key `id`.
+fn insert_one(engine: Engine, url: &str, r: &RawDoc, id: &str, v: &[f32]) -> WriteReq {
+    let (url, body) = match engine {
+        Engine::Strata => (format!("{url}/v1/write"), json!({"ops": [{"op": "insert", "doc": strata_doc(r, id, v)}]}).to_string()),
+        Engine::Vespa => (format!("{url}/document/v1/doc/doc/docid/{}", id_path(id)), format!("{{\"fields\":{}}}", engine_doc(engine, r, id, r.rating, v))),
+        Engine::Es | Engine::Os => (format!("{url}/quora/_doc/{}", id_path(id)), engine_doc(engine, r, id, r.rating, v)),
+        Engine::Solr => (format!("{url}/solr/quora/update"), format!("[{}]", engine_doc(engine, r, id, r.rating, v))),
+    };
+    WriteReq::One { url, put: false, body: body.into_bytes() }
+}
+
+/// Writes of `docs` (documents a request) as new documents with keys `w<n>`, or (`update`) as a new rating of existing ones.
+fn write_req(engine: Engine, url: &str, docs: &[(RawDoc, Vec<f32>)], first: usize, count: usize, update: bool) -> WriteReq {
+    let pick = |n: usize| &docs[n % docs.len()];
+    if count == 1 && !update {
+        let (r, v) = pick(first);
+        return insert_one(engine, url, r, &format!("w{first}"), v);
+    }
+    // An update picks the document as the query kinds pick their keys, and gives it a rating of 1.0 to 4.9.
+    let upd = |n: usize| {
+        let (r, v) = &docs[(n * 7919) % docs.len()];
+        (r, v, 1.0 + (n % 40) as f64 / 10.0)
+    };
+    match engine {
+        Engine::Strata => {
+            let ops: Vec<Json> = (first..first + count)
+                .map(|n| {
+                    if update {
+                        let (r, _, x) = upd(n);
+                        json!({"op": "set", "key": r.id, "field": "rating", "value": x})
+                    } else {
+                        let (r, v) = pick(n);
+                        json!({"op": "insert", "doc": strata_doc(r, &format!("w{n}"), v)})
+                    }
+                })
+                .collect();
+            WriteReq::One { url: format!("{url}/v1/write"), put: false, body: serde_json::to_vec(&json!({"ops": ops})).unwrap() }
+        }
+        Engine::Vespa => {
+            let one = |n: usize| {
+                if update {
+                    // A partial update: the attribute is changed in memory, nothing else is written again.
+                    let (r, _, x) = upd(n);
+                    (format!("{url}/document/v1/doc/doc/docid/{}", id_path(&r.id)), json!({"fields": {"rating": {"assign": x}}}).to_string())
+                } else {
+                    let (r, v) = pick(n);
+                    let id = format!("w{n}");
+                    (format!("{url}/document/v1/doc/doc/docid/{id}"), format!("{{\"fields\":{}}}", engine_doc(engine, r, &id, r.rating, v)))
+                }
+            };
+            if count == 1 {
+                let (u, b) = one(first);
+                WriteReq::One { url: u, put: update, body: b.into_bytes() }
+            } else {
+                assert!(!update, "Vespa's batched updates are not timed");
+                WriteReq::Many((first..first + count).map(|n| { let (u, b) = one(n); (u, b.into_bytes()) }).collect())
+            }
+        }
+        // An update sends the whole document again: their partial updates
+        // rebuild a document from its stored source, which leaves out `body`
+        // and `emb` here (as the index keeps them only in its index structures).
+        Engine::Es | Engine::Os => {
+            let doc = |n: usize| if update { let (r, v, x) = upd(n); (r.id.clone(), engine_doc(engine, r, &r.id, x, v)) } else { let (r, v) = pick(n); let id = format!("w{n}"); let d = engine_doc(engine, r, &id, r.rating, v); (id, d) };
+            if count == 1 {
+                let (id, d) = doc(first);
+                WriteReq::One { url: format!("{url}/quora/_doc/{}", id_path(&id)), put: false, body: d.into_bytes() }
+            } else {
+                let mut body = Vec::new();
+                for n in first..first + count {
+                    let (id, d) = doc(n);
+                    body.extend_from_slice(json!({"index": {"_id": id}}).to_string().as_bytes());
+                    body.push(b'\n');
+                    body.extend_from_slice(d.as_bytes());
+                    body.push(b'\n');
+                }
+                WriteReq::One { url: format!("{url}/quora/_bulk"), put: false, body }
+            }
+        }
+        Engine::Solr => {
+            let docs: Vec<String> = (first..first + count)
+                .map(|n| if update { let (r, v, x) = upd(n); engine_doc(engine, r, &r.id, x, v) } else { let (r, v) = pick(n); engine_doc(engine, r, &format!("w{n}"), r.rating, v) })
+                .collect();
+            WriteReq::One { url: format!("{url}/solr/quora/update"), put: false, body: format!("[{}]", docs.join(",")).into_bytes() }
+        }
+    }
+}
+
+/// Whether a search for the one word `w` finds a document.
+async fn found(engine: Engine, client: &reqwest::Client, url: &str, w: &str) -> Result<bool, String> {
+    let (u, body) = match engine {
+        Engine::Strata => (format!("{url}/v1/query"), json!({"sql": "SELECT id FROM docs WHERE MATCH(body, :w) LIMIT 1", "params": {"w": w}})),
+        Engine::Es | Engine::Os => (format!("{url}/quora/_search?request_cache=false"), json!({"size": 1, "_source": false, "query": {"match": {"body": w}}})),
+        Engine::Solr => (format!("{url}/solr/quora/query"), json!({"query": format!("{{!term f=body}}{w}"), "limit": 1, "fields": "id"})),
+        Engine::Vespa => (format!("{url}/search/"), json!({"yql": format!("select * from doc where body contains {}", yql_str(w)), "hits": 1, "presentation.summary": "minimal", "ranking": "unranked"})),
+    };
+    let j = check(client.post(u).json(&body).send().await, "search").await?;
+    let n = match engine {
+        Engine::Strata => j["keys"].as_array().map_or(0, |k| k.len()),
+        Engine::Es | Engine::Os => j["hits"]["hits"].as_array().map_or(0, |h| h.len()),
+        Engine::Solr => j["response"]["docs"].as_array().map_or(0, |d| d.len()),
+        Engine::Vespa => j["root"]["children"].as_array().map_or(0, |c| c.len()),
+    };
+    Ok(n > 0)
+}
+
+/// A word no document has, made of letters the stemmers leave alone.
+fn marker(i: usize) -> String {
+    let mut w = String::from("zqx");
+    let mut n = i;
+    loop {
+        w.push(b"bcdfghjk"[n % 8] as char);
+        n /= 8;
+        if n == 0 {
+            break;
+        }
+    }
+    w.push('q');
+    w
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn writes(collection: &str, engine: Engine, urls: &[String], concurrency: &[usize], seconds: f64, batch: usize, samples: usize, label: Option<String>, out: &Path) -> Result<(), String> {
+    let client = reqwest::Client::builder().pool_max_idle_per_host(1024).timeout(Duration::from_secs(60)).build().map_err(s)?;
+    let label = label.unwrap_or_else(|| engine.name().to_string());
+    let u0 = &urls[0];
+    // Searchable within a second of a write, as Elasticsearch's and
+    // OpenSearch's default refresh is (loading turned it off); Solr's soft
+    // commits the same. Strata and Vespa make a write searchable when it returns.
+    let nrt = match engine {
+        Engine::Es | Engine::Os => {
+            check(client.put(format!("{u0}/quora/_settings")).json(&json!({"index": {"refresh_interval": "1s"}})).send().await, "settings").await?;
+            "refresh_interval 1s (the default; loading turned it off)"
+        }
+        Engine::Solr => {
+            check(client.post(format!("{u0}/solr/quora/config")).json(&json!({"set-property": {"updateHandler.autoSoftCommit.maxTime": 1000}})).send().await, "config").await?;
+            "autoSoftCommit.maxTime 1000 ms (as Elasticsearch's 1 s refresh; loading turned it off)"
+        }
+        Engine::Strata | Engine::Vespa => "searchable when the write returns",
+    };
+    // The documents written: the first 20,000, each under a new key.
+    let mut docs = Vec::new();
+    each_doc(collection, Some(20_000), |r, v| {
+        docs.push((r, v));
+        Ok(())
+    })?;
+    let docs = Arc::new(docs);
+    let urls = Arc::new(urls.to_vec());
+    let mut rows = Vec::new();
+    let (mut next_new, mut next_upd) = (0usize, 0usize);
+    let phases: [(&str, usize, bool); 3] = [("insert one", 1, false), ("insert batch", batch, false), ("update one", 1, true)];
+    for (phase, per, update) in phases {
+        for &c in concurrency {
+            let (docs2, urls2) = (docs.clone(), urls.clone());
+            let make: Arc<dyn Fn(usize) -> WriteReq + Send + Sync> = Arc::new(move |n| write_req(engine, &urls2[n % urls2.len()], &docs2, n * per, per, update));
+            let start = if update { next_upd } else { next_new.div_ceil(per) };
+            let (t, end) = drive_writes(&client, make, start, c, seconds).await;
+            if update {
+                next_upd = end;
+            } else {
+                next_new = end * per;
+            }
+            let docs_s = (t.ms.len() * per) as f64 / t.seconds.max(1e-9);
+            eprintln!(
+                "{label:<8} {phase:<14} c={c:<3} {docs_s:>8.0} docs/s  p50 {:>8.3} ms  p90 {:>8.3} ms  p99 {:>8.3} ms  errors {}",
+                percentile(&t.ms, 50.0),
+                percentile(&t.ms, 90.0),
+                percentile(&t.ms, 99.0),
+                t.errors
+            );
+            if let Some(e) = &t.first_error {
+                eprintln!("  first error: {}", e.chars().take(300).collect::<String>());
+            }
+            rows.push(json!({
+                "phase": phase, "concurrency": c, "docs_per_request": per, "requests": t.ms.len(), "docs_per_s": docs_s,
+                "p50_ms": percentile(&t.ms, 50.0), "p90_ms": percentile(&t.ms, 90.0), "p99_ms": percentile(&t.ms, 99.0),
+                "max_ms": t.ms.iter().cloned().fold(0.0, f64::max), "mean_ms": mean(&t.ms), "errors": t.errors, "first_error": t.first_error,
+            }));
+        }
+    }
+    // Until visible: one write at a time of a document with a word of its
+    // own, then a search for the word every 5 ms until it finds it.
+    let (mut ack_ms, mut seen_ms) = (Vec::new(), Vec::new());
+    for i in 0..samples {
+        let (r, v) = &docs[i % docs.len()];
+        let w = marker(i);
+        let id = format!("v{i}");
+        let doc = RawDoc { title: format!("{w} {}", r.title), ..r.clone() };
+        let req = insert_one(engine, u0, &doc, &id, v);
+        let t0 = Instant::now();
+        if let Some(e) = send_write(&client, &req).await {
+            return Err(format!("write: {e}"));
+        }
+        ack_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        loop {
+            if found(engine, &client, u0, &w).await? {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(60) {
+                return Err(format!("{id} not found a minute after it was written"));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        seen_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    eprintln!(
+        "{label:<8} visible        written in p50 {:.1} ms, found after p50 {:.1} ms  p90 {:.1} ms  max {:.1} ms",
+        percentile(&ack_ms, 50.0),
+        percentile(&seen_ms, 50.0),
+        percentile(&seen_ms, 90.0),
+        seen_ms.iter().cloned().fold(0.0, f64::max)
+    );
+    let visible = json!({
+        "samples": samples, "ack_p50_ms": percentile(&ack_ms, 50.0), "visible_p50_ms": percentile(&seen_ms, 50.0),
+        "visible_p90_ms": percentile(&seen_ms, 90.0), "visible_max_ms": seen_ms.iter().cloned().fold(0.0, f64::max), "visible_ms": seen_ms,
+    });
+
+    // Put the index back: delete what was written, give the updated documents their ratings again.
+    let t_clean = Instant::now();
+    let new_keys: Vec<String> = (0..next_new).map(|n| format!("w{n}")).chain((0..samples).map(|i| format!("v{i}"))).collect();
+    let mut touched: Vec<usize> = (0..next_upd).map(|n| (n * 7919) % docs.len()).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    restore(engine, &client, u0, &new_keys, &touched.iter().map(|&i| &docs[i]).collect::<Vec<_>>()).await?;
+    eprintln!("{label:<8} deleted {} written documents and put back {} ratings in {:.1} s", new_keys.len(), touched.len(), t_clean.elapsed().as_secs_f64());
+
+    let report = json!({
+        "engine": engine.name(), "label": label, "collection": collection, "urls": urls.as_slice(),
+        "params": {"seconds": seconds, "concurrency": concurrency, "batch": batch, "samples": samples, "searchable": nrt},
+        "writes": rows, "visible": visible,
+    });
+    std::fs::create_dir_all(out).map_err(s)?;
+    let path = out.join(format!("writes-{}.json", label.replace(' ', "-")));
+    std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).map_err(s)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
+/// Sends a request to Vespa again, a second later, while it is overloaded
+/// (429 or 503) or the connection failed (its puts, updates and deletes are
+/// idempotent).
+async fn vespa_retry(rb: impl Fn() -> reqwest::RequestBuilder) -> Option<String> {
+    let mut last = None;
+    for _ in 0..30 {
+        match rb().send().await {
+            Ok(r) if matches!(r.status().as_u16(), 429 | 503) => last = Some(format!("{}", r.status())),
+            Err(e) if !e.is_status() => last = Some(e.to_string()),
+            res => return write_error(res).await,
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Some(format!("still failing after 30 tries: {}", last.unwrap_or_default()))
+}
+
+/// Deletes `keys` and writes `docs` again as they were (their ratings).
+async fn restore(engine: Engine, client: &reqwest::Client, url: &str, keys: &[String], docs: &[&(RawDoc, Vec<f32>)]) -> Result<(), String> {
+    // Vespa queues 256 requests at most.
+    let size = if engine == Engine::Vespa { 64 } else { 500 };
+    for chunk in keys.chunks(size) {
+        let err = match engine {
+            Engine::Strata => {
+                let ops: Vec<Json> = chunk.iter().map(|k| json!({"op": "delete", "key": k})).collect();
+                send_write(client, &WriteReq::One { url: format!("{url}/v1/write"), put: false, body: serde_json::to_vec(&json!({"ops": ops})).unwrap() }).await
+            }
+            Engine::Es | Engine::Os => {
+                let body: String = chunk.iter().map(|k| format!("{}\n", json!({"delete": {"_id": k}}))).collect();
+                send_write(client, &WriteReq::One { url: format!("{url}/quora/_bulk"), put: false, body: body.into_bytes() }).await
+            }
+            Engine::Solr => send_write(client, &WriteReq::One { url: format!("{url}/solr/quora/update"), put: false, body: json!({"delete": chunk}).to_string().into_bytes() }).await,
+            Engine::Vespa => {
+                let dels = chunk.iter().map(|k| async move { vespa_retry(|| client.delete(format!("{url}/document/v1/doc/doc/docid/{}", id_path(k)))).await });
+                futures::future::join_all(dels).await.into_iter().flatten().next()
+            }
+        };
+        if let Some(e) = err {
+            return Err(format!("deleting the written documents: {e}"));
+        }
+    }
+    for chunk in docs.chunks(size.min(200)) {
+        let err = match engine {
+            Engine::Strata => {
+                let ops: Vec<Json> = chunk.iter().map(|(r, _)| json!({"op": "set", "key": r.id, "field": "rating", "value": r.rating})).collect();
+                send_write(client, &WriteReq::One { url: format!("{url}/v1/write"), put: false, body: serde_json::to_vec(&json!({"ops": ops})).unwrap() }).await
+            }
+            Engine::Vespa => {
+                let puts = chunk.iter().map(|(r, _)| async move {
+                    let body = json!({"fields": {"rating": {"assign": r.rating}}}).to_string();
+                    vespa_retry(|| client.put(format!("{url}/document/v1/doc/doc/docid/{}", id_path(&r.id))).header("content-type", "application/json").body(body.clone())).await
+                });
+                futures::future::join_all(puts).await.into_iter().flatten().next()
+            }
+            Engine::Es | Engine::Os => {
+                let mut body = Vec::new();
+                for (r, v) in chunk.iter().map(|d| (&d.0, &d.1)) {
+                    body.extend_from_slice(json!({"index": {"_id": r.id}}).to_string().as_bytes());
+                    body.push(b'\n');
+                    body.extend_from_slice(doc_json(r, v).as_bytes());
+                    body.push(b'\n');
+                }
+                send_write(client, &WriteReq::One { url: format!("{url}/quora/_bulk"), put: false, body }).await
+            }
+            Engine::Solr => {
+                let docs: Vec<String> = chunk.iter().map(|(r, v)| doc_json(r, v)).collect();
+                send_write(client, &WriteReq::One { url: format!("{url}/solr/quora/update"), put: false, body: format!("[{}]", docs.join(",")).into_bytes() }).await
+            }
+        };
+        if let Some(e) = err {
+            return Err(format!("putting the ratings back: {e}"));
+        }
+    }
+    // Searchable again as after loading.
+    match engine {
+        Engine::Es | Engine::Os => {
+            check(client.post(format!("{url}/quora/_refresh")).send().await, "refresh").await?;
+        }
+        Engine::Solr => {
+            check(client.get(format!("{url}/solr/quora/update?commit=true")).send().await, "commit").await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1434,6 +1884,9 @@ async fn main() {
         Cmd::Load { engine, url, shards, batch, clients, limit, out } => load(&cli.collection, *engine, url, *shards, *batch, *clients, *limit, out).await,
         Cmd::Run { engine, url, queries, concurrency, seconds, label, kinds, paid, out } => {
             run(&cli.collection, *engine, url, *queries, concurrency, *seconds, label.clone(), kinds, *paid, out).await
+        }
+        Cmd::Writes { engine, url, concurrency, seconds, batch, samples, label, out } => {
+            writes(&cli.collection, *engine, url, concurrency, *seconds, *batch, *samples, label.clone(), out).await
         }
     };
     if let Err(e) = r {

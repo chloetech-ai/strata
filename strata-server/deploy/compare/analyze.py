@@ -3,7 +3,7 @@
 
     python3 analyze.py REPORTS_DIR BEIR_DIR/quora > tables.md
 
-Reads run-<label>.json (timings and answers), load-<engine>.json,
+Reads run-<label>.json (timings and answers), writes-<engine>.json, load-<engine>.json,
 build-strata-s<i>.json and disk-vespa.jsonl (load time and index size) and
 cpu.jsonl from REPORTS_DIR, and the collection from BEIR_DIR/quora, and
 prints Markdown tables: load time and index size; latency and throughput per
@@ -379,6 +379,36 @@ def main():
                     cells.append(f"{q.get('same_as_strata')} of {q.get('of')} equal")
             print(f"| {kind} | " + " | ".join(cells) + " |")
 
+    # Writes (engine-compare writes): documents a second and latency per phase and clients, and how soon a write is found.
+    wr = {e: load_json(rep / f"writes-{e}.json") for e in ENGINES}
+    wr = {e: w for e, w in wr.items() if w}
+    if wr:
+        summary["writes"] = wr
+        print("\n## Writes: documents a second, and latency in ms (p50 / p99)\n")
+        print("| phase | clients | " + " | ".join(f"{NAMES[e]} docs/s | {NAMES[e]} ms" for e in wr) + " |")
+        print("|---|---|" + "---|---|" * len(wr))
+        keys = []
+        for w in wr.values():
+            for row in w["writes"]:
+                if (row["phase"], row["concurrency"]) not in keys:
+                    keys.append((row["phase"], row["concurrency"]))
+        for phase, c in keys:
+            cells = []
+            for w in wr.values():
+                row = next((r for r in w["writes"] if (r["phase"], r["concurrency"]) == (phase, c)), None)
+                if row:
+                    err = f" ({row['errors']} errors)" if row["errors"] else ""
+                    cells += [fmt(row["docs_per_s"], 0), f"{row['p50_ms']:.2f} / {row['p99_ms']:.2f}{err}"]
+                else:
+                    cells += ["n/a", "n/a"]
+            print(f"| {phase} | {c} | " + " | ".join(cells) + " |")
+        print("\n## How soon a written document is found (ms from the write's start)\n")
+        print("| engine | searchable | write returned (p50) | found (p50) | found (p90) | found (max) |")
+        print("|---|---|---|---|---|---|")
+        for e, w in wr.items():
+            v = w["visible"]
+            print(f"| {NAMES[e]} | {w['params']['searchable']} | {v['ack_p50_ms']:.1f} | {v['visible_p50_ms']:.1f} | {v['visible_p90_ms']:.1f} | {v['visible_max_ms']:.1f} |")
+
     # CPU used during each run, from the containers' cgroups.
     cpu_lines = [json.loads(l) for l in open(rep / "cpu.jsonl")] if (rep / "cpu.jsonl").exists() else []
     for e in ENGINES:
@@ -390,7 +420,7 @@ def main():
         print("| engine | phase | pod | CPU seconds | wall seconds | average cores | throttled (s) |")
         print("|---|---|---|---|---|---|---|")
         for e in ENGINES:
-            for phase, (tb, ta) in [("load", ("load-before", "load-after")), ("timed run", ("before", "after"))]:
+            for phase, (tb, ta) in [("load", ("load-before", "load-after")), ("timed run", ("before", "after")), ("writes", ("writes-before", "writes-after"))]:
                 # Lines written before runs had labels name the run by its engine.
                 mine = [l for l in cpu_lines if l.get("label", l["engine"]) == e]
                 for pod in sorted({l["pod"] for l in mine}):

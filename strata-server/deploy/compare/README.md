@@ -119,6 +119,33 @@ labelled `es-trial`, asks the two hybrid kinds of the `rrf` retriever and
 the `linear` retriever with the `minmax` normalizer; `analyze.py` shows it
 beside the free run.
 
+## Writes
+
+`compare.sh writes ENGINE` (`engine-compare writes`) times writes against
+the loaded engine, through the same endpoints as the queries (Strata's
+coordinator, Vespa's container), at 1, 4 and 16 clients for 6 s each:
+
+| phase | Strata | Elasticsearch, OpenSearch | Solr | Vespa |
+|---|---|---|---|---|
+| insert one | `/v1/write`, one `insert` | `POST /quora/_doc/<id>` | `/update`, one document | `POST /document/v1/…/<id>` |
+| insert batch (100) | one `/v1/write` of 100 inserts | `_bulk` of 100 | `/update` of 100 | 100 puts at once (`/document/v1` takes one document a request) |
+| update one | `set` of `rating` in place | the whole document again | the whole document again | partial update (`assign`) of the `rating` attribute |
+
+New documents are copies of the collection's first 20,000 under new keys;
+an update gives a document of the first 20,000 a new rating. Elasticsearch's,
+OpenSearch's and Solr's partial updates rebuild a document from its stored
+source, which here leaves out `body` and `emb` (kept only in the index), so
+they would lose them: they are sent the whole document instead, as an
+application that owns its records would. "Visible" writes 30 documents one
+at a time, each with a word no other has, and searches for the word every 5
+ms until it is found: Strata and Vespa make a write searchable when it
+returns; Elasticsearch and OpenSearch get their default refresh of 1 s
+(loading turned it off) and Solr a soft commit every second. Durability is
+each engine's default (Strata and Elasticsearch sync the log at every
+write). Afterwards the written documents are deleted and the old ratings
+written back, so the queries can be run again; the segments differ from
+the loaded ones, so time the queries first.
+
 ## Running it
 
 With the cluster of `../kind-test.sh up` (its `/data` and `/beir`
@@ -128,12 +155,12 @@ mounts), from the repository root:
 export STRATA_WORK=/path/to/dbs          # mounted at /data; reports go to $STRATA_WORK/compare
 C=strata-server/deploy/compare/compare.sh
 $C image
-$C build;        $C up strata; $C run strata; $C down strata
-$C up es;        $C load es;   $C run es
+$C build;        $C up strata; $C run strata; $C writes strata; $C down strata
+$C up es;        $C load es;   $C run es;     $C writes es
 $C trial;        $C run es --kinds "hybrid (RRF),hybrid (weighted)" --paid --label es-trial; $C down es
-$C up os;        $C load os;   $C run os;     $C down os
-$C up solr;      $C load solr; $C run solr;   $C down solr
-$C up vespa;     $C load vespa; $C run vespa; $C down vespa
+$C up os;        $C load os;   $C run os;     $C writes os;    $C down os
+$C up solr;      $C load solr; $C run solr;   $C writes solr;  $C down solr
+$C up vespa;     $C load vespa; $C run vespa; $C writes vespa; $C down vespa
 python3 strata-server/deploy/compare/analyze.py $STRATA_WORK/compare $STRATA_DATA/quora
 # Strata at another split of its 3 CPUs, kept beside the default run:
 SHARD_CPU=1250m COORD_CPU=500m $C up strata; $C run strata --label strata-coord500m; $C down strata

@@ -8,6 +8,7 @@
 #   compare.sh up ENGINE              # start an engine: strata, es, os, solr or vespa
 #   compare.sh load es|os|solr|vespa  # load the collection into it (timed), then its size on disk
 #   compare.sh run ENGINE [ARGS]      # time the query kinds and record answers; CPU use around it
+#   compare.sh writes ENGINE [ARGS]   # time writes, updates and how soon a write is found (after run: it changes the index, then puts it back)
 #   compare.sh trial                  # Elasticsearch: start the 30-day trial licence (hybrid retrievers)
 #   compare.sh down ENGINE            # stop it (Strata's shard files stay on the nodes)
 #
@@ -215,6 +216,13 @@ run)
     job "run-$label" "$CLIENT_NODE" "" "" run --engine "$e" --url "$(urls "$e")" --out "$OUT" "$@"
     cpu "$e" after "$label"
     ;;
+writes)
+    e=${1:?writes strata|es|os|solr|vespa}
+    shift
+    cpu "$e" writes-before
+    job "writes-$e" "$CLIENT_NODE" "" "" writes --engine "$e" --url "$(urls "$e")" --out "$OUT" "$@"
+    cpu "$e" writes-after
+    ;;
 trial)
     $K exec es-0 -- curl -sf -X POST 'http://localhost:9200/_license/start_trial?acknowledge=true'
     echo
@@ -229,7 +237,7 @@ down)
     esac
     ;;
 *)
-    sed -n '2,16p' "$0"
+    sed -n '2,17p' "$0"
     exit 2
     ;;
 esac
