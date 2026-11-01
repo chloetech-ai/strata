@@ -707,6 +707,8 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The minute the log store last had a row of load for.
+        let mut minute = crate::telemetry::now_ms() / 60_000;
         loop {
             tick.tick().await;
             let Some(svc) = svc.upgrade() else { return };
@@ -716,6 +718,13 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
                 if !changes.is_empty() {
                     let svc = svc.clone();
                     tokio::spawn(async move { svc.alerts.notify(&changes).await });
+                }
+            }
+            let now = crate::telemetry::now_ms();
+            if now / 60_000 != minute {
+                minute = now / 60_000;
+                if let Some((store, load)) = svc.log_store.as_ref().zip(svc.minute_load(now)) {
+                    store.keep_load(load);
                 }
             }
         }

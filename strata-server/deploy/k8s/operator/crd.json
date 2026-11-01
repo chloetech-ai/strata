@@ -59,6 +59,116 @@
                     },
                     "type": "array"
                   },
+                  "autoscale": {
+                    "description": "Rules that change the copies, shards or volumes from how busy and full the servers are.",
+                    "properties": {
+                      "cooldownMinutes": {
+                        "description": "Minutes after a change before the next (default 20).",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "freeze": {
+                        "description": "Weekly windows, in UTC, in which nothing changes.",
+                        "items": {
+                          "properties": {
+                            "allowGrow": {
+                              "description": "Copies may still be added in it (default true).",
+                              "type": "boolean"
+                            },
+                            "from": {
+                              "description": "A day and a time, like Fri 16:00.",
+                              "type": "string"
+                            },
+                            "to": {
+                              "description": "A day and a time, like Mon 08:00.",
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "grow": {
+                        "description": "Add copies when the busiest shard's copies are busy.",
+                        "properties": {
+                          "add": {
+                            "description": "Copies added to every shard (default 1).",
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "busyAbove": {
+                            "description": "The share of their cores the copies use (default 0.7).",
+                            "maximum": 1,
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "forMinutes": {
+                            "description": "For this long (default 10).",
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "max": {
+                            "description": "Copies of each shard at most (default 5).",
+                            "minimum": 1,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "mode": {
+                        "description": "off: nothing (the rules can be replayed); suggest: a change waits in status.autoscale for a person; on: the operator makes it (default off).",
+                        "enum": [
+                          "off",
+                          "suggest",
+                          "on"
+                        ],
+                        "type": "string"
+                      },
+                      "shrink": {
+                        "description": "Remove a copy when every shard's copies are idle.",
+                        "properties": {
+                          "busyBelow": {
+                            "description": "The share of their cores the busiest shard's copies use (default 0.35).",
+                            "maximum": 1,
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "forMinutes": {
+                            "description": "For this long (default 60).",
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "min": {
+                            "description": "Copies of each shard at least (default 2).",
+                            "minimum": 1,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "volumes": {
+                        "description": "When the fullest volume fills.",
+                        "properties": {
+                          "action": {
+                            "description": "grow: every volume by half; addShard: one more shard (default grow).",
+                            "enum": [
+                              "grow",
+                              "addShard"
+                            ],
+                            "type": "string"
+                          },
+                          "fullAbove": {
+                            "description": "Its used share (default 0.8).",
+                            "maximum": 1,
+                            "minimum": 0,
+                            "type": "number"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "clusterTokenSecret": {
                     "description": "A Secret whose key token is the cluster's token (--cluster-token), which the servers and coordinators send each other and clients never hold. Needs tokenSecret.",
                     "type": "string"
