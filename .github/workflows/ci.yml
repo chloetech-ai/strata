@@ -227,8 +227,9 @@ jobs:
 
   # DataFusion as the engine of plans' operators (feature `datafusion`,
   # strata::query::df): the differential test against Strata's own
-  # operators, the compound-query suites again with DataFusion as the
-  # engine (STRATA_ENGINE=datafusion: a plan it does not lower runs on the
+  # operators, window functions on both engines against SQLite's answers,
+  # the compound-query suites again with DataFusion as the engine
+  # (STRATA_ENGINE=datafusion: a plan it does not lower runs on the
   # operators), and clippy over the feature's code.
   datafusion:
     name: DataFusion engine (feature datafusion)
@@ -252,6 +253,7 @@ jobs:
         working-directory: strata
         run: |
           cargo test --profile ci --features datafusion --test datafusion_engine
+          cargo test --profile ci --features datafusion,sqlite --test window_functions
           STRATA_ENGINE=datafusion cargo test --profile ci --features datafusion --test compound_queries --test joins_across_tables --test operators --test distinct_on --test per_cap --test one_evaluator --test sql_tables --test correlated --test query_memory --test plan_ir --test json_fields
           cargo clippy --profile ci --features datafusion --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
 

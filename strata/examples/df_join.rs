@@ -1,5 +1,5 @@
 //! Times compound queries (joins, groups over joined rows, `DISTINCT`,
-//! `WITH`) on Strata's operators (`strata::query::ops`) and on DataFusion
+//! `WITH`, window functions) on Strata's operators (`strata::query::ops`) and on DataFusion
 //! (`strata::query::df`), over two tables of `n` rows each, and checks
 //! that both give the same rows.
 //!
@@ -48,6 +48,21 @@ const QUERIES: &[(&str, &str, &[&str])] = &[
         "selective join (1,000 left rows)",
         "SELECT a.id, b.z FROM a JOIN b ON b.a_id = a.id WHERE a.x < 1000",
         &["SELECT id FROM a WHERE x < 1000"],
+    ),
+    (
+        "window: the top 3 of each group (QUALIFY)",
+        "SELECT id, g, x FROM a QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY x DESC) <= 3",
+        &["SELECT id, g, x FROM a"],
+    ),
+    (
+        "window: a moving sum and a lag",
+        "SELECT id, SUM(y) OVER (ORDER BY x ROWS BETWEEN 9 PRECEDING AND CURRENT ROW), LAG(x) OVER (ORDER BY id) FROM a ORDER BY id LIMIT 10",
+        &["SELECT id, x, y FROM a"],
+    ),
+    (
+        "window: groups ranked",
+        "SELECT g, COUNT(*), RANK() OVER (ORDER BY SUM(y) DESC) FROM a GROUP BY g",
+        &["SELECT g, y FROM a"],
     ),
 ];
 

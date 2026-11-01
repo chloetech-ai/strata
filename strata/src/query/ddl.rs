@@ -38,6 +38,9 @@
 //! `semantic_id = 'emb'` and `codebook = 'name'` holds the semantic IDs of
 //! VECTOR column `emb`'s vectors ([`crate::sid`]; feature `semantic_id`):
 //! `sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq')`.
+//! A JSON column with `text = true` indexes its strings as text too, for
+//! `MATCH` and `bm25` (and takes `analyzer`; feature `json_text`):
+//! `attrs JSON OPTIONS(text = true)`.
 //!
 //! The key is a column's `PRIMARY KEY` or a `PRIMARY KEY (column)`
 //! constraint. `REFERENCES table [(key)]` on a column, or `FOREIGN KEY
@@ -371,13 +374,14 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
         "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
+        "json" => &["stored", "indexed", "text", "analyzer"],
         _ => &["stored", "indexed"],
     };
     if !allowed.contains(&"semantic_id") && (opts.contains_key("semantic_id") || opts.contains_key("codebook")) {
         return Err(bad("semantic_id and codebook are options of a KEYWORD[] column".into()));
     }
     if let Some(k) = opts.keys().find(|k| !allowed.contains(&k.as_str())) {
-        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor", "dim", "embed", "model", "kind", "semantic_id", "codebook", "derive"];
+        let known = ["positions", "stored", "indexed", "from", "analyzer", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor", "dim", "embed", "model", "kind", "semantic_id", "codebook", "derive", "text"];
         return Err(bad(if known.contains(&k.as_str()) {
             format!("{k} is not an option of a {} column (its options: {})", ty.to_uppercase(), allowed.join(", "))
         } else {
@@ -448,7 +452,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     }
     for (k, v) in opts {
         match k.as_str() {
-            "positions" | "stored" | "indexed" | "keep_f32" if !v.is_boolean() => return Err(bad(format!("{k} is true or false"))),
+            "positions" | "stored" | "indexed" | "keep_f32" | "text" if !v.is_boolean() => return Err(bad(format!("{k} is true or false"))),
             "pool" if !v.is_number() => return Err(bad("pool is a cosine similarity, such as 0.9".into())),
             "pool_factor" if !v.is_number() => return Err(bad("pool_factor is a number above 1, such as 2".into())),
             "dim" => {

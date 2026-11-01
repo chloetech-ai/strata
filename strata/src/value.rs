@@ -93,10 +93,10 @@ pub type Document = Vec<Value>;
 
 /// Puts `doc`'s values in the form the table stores
 /// ([`crate::schema::Field::store`]: BOOL and TIMESTAMP values as
-/// integers, a boolean in another INT or FLOAT field as 1 or 0, a JSON
-/// field's object as compact text, [`crate::json::canonical`]) and
-/// [`validate`]s it. Writes call this; documents read back hold the
-/// stored form.
+/// integers, a boolean in another INT field as 1 or 0, a FLOAT field's
+/// values as FLOATs, a JSON field's object as compact text,
+/// [`crate::json::canonical`]) and [`validate`]s it. Writes call this;
+/// documents read back hold the stored form.
 pub fn conform(schema: &Schema, doc: &mut Document) -> Result<()> {
     conform_as(schema, doc, Pooling::All)
 }
@@ -135,7 +135,7 @@ pub fn conform_as(schema: &Schema, doc: &mut Document, pooling: Pooling) -> Resu
             *v = crate::json::canonical(std::mem::replace(v, Value::Null), &f.name)?;
             continue;
         }
-        if f.logical.is_some() || typed(v) || matches!(v, Value::List(xs) if xs.iter().any(typed)) {
+        if f.logical.is_some() || f.ty == FieldType::Float || typed(v) || matches!(v, Value::List(xs) if xs.iter().any(typed)) {
             *v = f.store(std::mem::replace(v, Value::Null))?;
         }
     }

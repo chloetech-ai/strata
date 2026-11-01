@@ -36,8 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray,
-    TimestampMicrosecondBuilder, UInt64Array,
+    Array, ArrayRef, AsArray, Float64Array, Float64Builder, Int64Builder, UInt64Array,
 };
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
@@ -48,6 +47,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::functions_aggregate::expr_fn as agg_fn;
+use datafusion::functions_window::expr_fn as win_fn;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::{
@@ -57,14 +57,19 @@ use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 
 use crate::error::{Error, Result};
-use crate::query::exec::{Engine, ExecOptions, ExecStats, ResultSet};
-use crate::query::ir::{Agg, ArithOp, CmpOp, Expr, Func, JoinKind, Node, Plan, SortKey};
+use crate::query::arrow::{self, Columns, Mixed};
+use crate::query::exec::{Engine, ExecOptions, ExecStats, Leaf, ResultSet};
+use crate::query::ir::{Agg, ArithOp, Bound, CmpOp, Expr, FrameUnits, Func, JoinKind, Node, Plan, SortKey, WindowFn, WindowFunc};
 use crate::query::memory::Charge;
-use crate::query::ops::{self, Runner};
+use crate::query::ops;
 use crate::query::steps::{self, Clock, Step};
 use crate::query::AggFn;
 use crate::schema::Schema;
 use crate::value::Value;
+
+/// Runs a leaf plan for DataFusion: its rows, as Arrow columns
+/// ([`Leaf::Arrow`]) when there are more than the number it is given.
+pub type Runner<'r> = dyn FnMut(&Plan, usize) -> Result<Leaf> + 'r;
 
 /// What [`run_in`] made of a plan.
 #[derive(Debug)]
@@ -119,6 +124,12 @@ enum Fail {
 impl From<Error> for Fail {
     fn from(e: Error) -> Fail {
         Fail::Err(e)
+    }
+}
+
+impl From<Mixed> for Fail {
+    fn from(m: Mixed) -> Fail {
+        Fail::No(m.0)
     }
 }
 
@@ -692,6 +703,10 @@ impl<'a> Lower<'a, '_> {
                 let b = self.node(by, what)?;
                 self.key_order(r, b)
             }
+            Node::Window { input, funcs } => {
+                let r = self.node(input, what)?;
+                self.window(r, funcs)
+            }
             Node::Search(_) => no("a Search outside a leaf"),
             Node::Insert { .. } | Node::Update { .. } | Node::Delete { .. } => no("a write"),
         }
@@ -737,16 +752,16 @@ impl<'a> Lower<'a, '_> {
             columns: vec![crate::query::ir::Column { name: "n".into(), expr: Expr::Output(0) }],
         };
         self.opts.check()?;
-        let n = match (self.runner)(&Plan::new(count)) {
-            Ok(rs) => rs.rows.first().and_then(|r| r.first()).and_then(Value::as_i64).map(|n| n.max(0) as u64),
-            Err(_) => None,
+        let n = match (self.runner)(&Plan::new(count), usize::MAX) {
+            Ok(Leaf::Rows(rs)) => rs.rows.first().and_then(|r| r.first()).and_then(Value::as_i64).map(|n| n.max(0) as u64),
+            Ok(Leaf::Arrow(_)) | Err(_) => None,
         };
         self.opts.check()?;
         Ok(n)
     }
 
-    fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<Expr>) -> R<Rel> {
-        let mut leaf = self.prepared(n)?;
+    fn leaf(&mut self, node: &Node, what: &str, restrict: Vec<Expr>) -> R<Rel> {
+        let mut leaf = self.prepared(node)?;
         let restricted = restrict.iter().map(|c| if let Expr::In { list, .. } = c { list.len() } else { 0 }).max().unwrap_or(0);
         if !restrict.is_empty() {
             let s = leaf.search_mut().expect("a leaf");
@@ -759,7 +774,7 @@ impl<'a> Lower<'a, '_> {
             s.filter = if conds.len() == 1 { conds.pop().expect("a condition") } else { Expr::And(conds) };
         }
         // The scan a LIMIT over joins grows.
-        let driven = self.driver.filter(|(p, ..)| std::ptr::eq(*p, n)).map(|(_, cap, _)| cap);
+        let driven = self.driver.filter(|(p, ..)| std::ptr::eq(*p, node)).map(|(_, cap, _)| cap);
         if let Some(cap) = driven {
             let Node::Project { input, .. } = &mut leaf else { unreachable!("a leaf") };
             match input.as_mut() {
@@ -770,7 +785,7 @@ impl<'a> Lower<'a, '_> {
                 }
             }
         }
-        if let Some(cap) = self.per.filter(|(p, _)| std::ptr::eq(*p, n)).map(|(_, c)| c) {
+        if let Some(cap) = self.per.filter(|(p, _)| std::ptr::eq(*p, node)).map(|(_, c)| c) {
             if let Some(s) = leaf.search_mut() {
                 s.per = Some(cap);
             }
@@ -779,38 +794,64 @@ impl<'a> Lower<'a, '_> {
         let table = leaf.search().map(|s| s.table.clone()).unwrap_or_default();
         let m = self.clock.mark(&self.prof);
         let leaf = Plan::new(leaf);
-        let rs = (self.runner)(&leaf)?;
-        self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
-        self.leaf_rows = self.leaf_rows.saturating_add(rs.rows.len());
-        match self.leaf_rows <= SMALL {
-            true => {
-                let mut kept = rs.clone();
-                kept.stats.steps = Vec::new();
-                kept.stats.steps_dropped = 0;
-                self.ran.push((leaf, kept));
+        // With `auto`, rows while the leaves read few, for the operators to
+        // take over without running them again; Arrow columns past that.
+        let over = match self.opts.engine {
+            Engine::Auto => SMALL.saturating_sub(self.leaf_rows),
+            _ => 0,
+        };
+        let (n, stats, rel) = match (self.runner)(&leaf, over)? {
+            Leaf::Rows(rs) => {
+                self.leaf_rows = self.leaf_rows.saturating_add(rs.rows.len());
+                match self.leaf_rows <= SMALL {
+                    true => {
+                        let mut kept = rs.clone();
+                        kept.stats.steps = Vec::new();
+                        kept.stats.steps_dropped = 0;
+                        self.ran.push((leaf, kept));
+                    }
+                    false => self.ran.clear(),
+                }
+                for r in &rs.rows {
+                    self.charge.row(r)?;
+                }
+                let n = rs.rows.len();
+                let keys = (rs.keys.len() == n).then_some(rs.keys);
+                let scores = (rs.scores.len() == n).then_some(rs.scores);
+                let width = rs.columns.len().max(rs.rows.first().map_or(0, Vec::len));
+                let arrays = arrow::columns_of(rs.rows, width)?;
+                let keys = keys.map(arrow::column_of).transpose()?;
+                (n, rs.stats, (rs.columns, arrays, keys, scores))
             }
-            false => self.ran.clear(),
-        }
-        if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, n)) {
-            *read = rs.rows.len();
+            Leaf::Arrow(c) => {
+                // Not kept for the operators, which run the leaf again
+                // if they take the plan over.
+                self.leaf_rows = self.leaf_rows.saturating_add(c.rows);
+                if self.leaf_rows > SMALL {
+                    self.ran.clear();
+                }
+                self.charge.add(c.bytes())?;
+                let Columns { names, arrays, keys, scores, rows, stats } = c;
+                let scores = (scores.len() == rows).then_some(scores);
+                (rows, stats, (names, arrays, Some(keys), scores))
+            }
+        };
+        self.dropped += steps::nest(&mut self.prof, &stats.steps, 0) as u64 + stats.steps_dropped;
+        if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, node)) {
+            *read = n;
         }
         // The leaf as the plan has it, as the operators' lines give it.
-        let text: Vec<String> = Plan::new(n.clone()).explain(self.catalog).iter().map(|l| l.trim().to_string()).collect();
-        let mut line = format!("{what}: {} rows: {}", rs.rows.len(), text.join(" / "));
+        let text: Vec<String> = Plan::new(node.clone()).explain(self.catalog).iter().map(|l| l.trim().to_string()).collect();
+        let mut line = format!("{what}: {n} rows: {}", text.join(" / "));
         if restricted > 0 {
             line += &format!(" (restricted to {restricted} join values)");
         }
         self.lines.push(line);
-        self.lines.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
-        self.filter_docs += rs.stats.filter_docs;
-        self.scored += rs.stats.scored;
-        for r in &rs.rows {
-            self.charge.row(r)?;
-        }
-        let n = rs.rows.len();
-        let keys = (rs.keys.len() == n).then_some(rs.keys);
-        let scores = (rs.scores.len() == n).then_some(rs.scores);
-        let rel = self.memory(rs.columns, rs.rows, keys, scores)?;
+        self.lines.extend(stats.plan.iter().map(|l| format!("  {l}")));
+        self.filter_docs += stats.filter_docs;
+        self.scored += stats.scored;
+        let (names, arrays, keys, scores) = rel;
+        let rel = self.memory(names, arrays, keys, scores, n)?;
         if self.clock.wrap(&mut self.prof, m, "leaf", format!("{what}: {table}"), Some(n as u64)).is_none() {
             self.dropped += 1;
         }
@@ -850,25 +891,24 @@ impl<'a> Lower<'a, '_> {
         r
     }
 
-    /// Rows as a memory table: a column per value of a row, then the keys,
+    /// A leaf's `n` rows as a memory table: its columns, then the keys,
     /// the scores, and their position.
-    fn memory(&mut self, names: Vec<String>, rows: Vec<Vec<Value>>, keys: Option<Vec<Value>>, scores: Option<Vec<f64>>) -> R<Rel> {
-        let width = names.len().max(rows.first().map_or(0, Vec::len));
+    fn memory(&mut self, names: Vec<String>, arrays: Vec<ArrayRef>, keys: Option<ArrayRef>, scores: Option<Vec<f64>>, n: usize) -> R<Rel> {
+        let width = arrays.len();
         let mut fields = Vec::new();
-        let mut arrays: Vec<ArrayRef> = Vec::new();
         let mut cols = Vec::with_capacity(width);
-        for a in columns_of(&rows, width)? {
+        let mut all: Vec<ArrayRef> = Vec::with_capacity(width + 3);
+        for a in arrays {
             let name = self.fresh("c");
             fields.push(Field::new(&name, a.data_type().clone(), true));
-            arrays.push(a);
+            all.push(a);
             cols.push(name);
         }
         let key = match keys {
-            Some(k) => {
+            Some(a) => {
                 let name = self.fresh("key");
-                let a = column_of(&k)?;
                 fields.push(Field::new(&name, a.data_type().clone(), true));
-                arrays.push(a);
+                all.push(a);
                 Some(name)
             }
             None => None,
@@ -877,16 +917,16 @@ impl<'a> Lower<'a, '_> {
             Some(s) => {
                 let name = self.fresh("score");
                 fields.push(Field::new(&name, DataType::Float64, true));
-                arrays.push(Arc::new(Float64Array::from(s)));
+                all.push(Arc::new(Float64Array::from(s)));
                 Score::Col(name)
             }
             None => Score::None,
         };
         let ord = self.fresh("ord");
         fields.push(Field::new(&ord, DataType::UInt64, false));
-        arrays.push(Arc::new(UInt64Array::from_iter_values(0..rows.len() as u64)));
+        all.push(Arc::new(UInt64Array::from_iter_values(0..n as u64)));
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(DataFusionError::from)?;
+        let batch = RecordBatch::try_new(schema.clone(), all).map_err(DataFusionError::from)?;
         let mut names = names;
         names.resize(width, String::new());
         let ords = vec![Ord { col: ord, desc: false, nulls_first: false }];
@@ -1090,6 +1130,231 @@ impl<'a> Lower<'a, '_> {
         Ok(Rel { plan, cols: out_cols, names, key: None, score: Score::None, ord: vec![Ord { col: first, desc: false, nulls_first: false }] })
     }
 
+    /// `r`'s rows with a column per window function after their own, in
+    /// `r`'s order. Rows that tie in a function's order take `r`'s order
+    /// where the function's value depends on it (a row number, a lag, a
+    /// `ROWS` frame's rows), as the operators order them; the functions
+    /// whose value would depend on how DataFusion breaks ties (the last
+    /// row of a `RANGE` frame's peers but by these patterns) fall back.
+    fn window(&mut self, r: Rel, funcs: &[WindowFn]) -> R<Rel> {
+        use datafusion::logical_expr::{WindowFrame, WindowFrameBound as WB, WindowFrameUnits as WU};
+        let (r, pos) = self.position(r)?;
+        let schema = r.plan.schema().clone();
+        let unbounded = || ScalarValue::UInt64(None);
+        let mut parts: Vec<DExpr> = Vec::new();
+        let mut finals: Vec<DExpr> = Vec::new();
+        for w in funcs {
+            let partition: Vec<DExpr> = w.partition.iter().map(|k| self.top(k, &r.cols, &schema)).collect::<R<_>>()?;
+            let mut order: Vec<SortExpr> = Vec::with_capacity(w.order.len() + 1);
+            let mut order_types = Vec::new();
+            for k in &w.order {
+                let e = self.top(&k.expr, &r.cols, &schema)?;
+                let t = e.get_type(&schema)?;
+                if matches!(t, DataType::List(_)) {
+                    return no("a window ordered by a multi-valued column");
+                }
+                order_types.push(t);
+                order.push(e.sort(!k.desc, k.nulls_first));
+            }
+            // The order with the rows' own as the last key: no ties.
+            let mut total = order.clone();
+            total.push(col(&pos).sort(true, false));
+            let arg = |l: &mut Self, e: &Expr| -> R<(DExpr, DataType)> {
+                let x = l.top(e, &r.cols, &schema)?;
+                let t = x.get_type(&schema)?;
+                if matches!(t, DataType::List(_)) {
+                    return no("a window function of a multi-valued column");
+                }
+                Ok((x, t))
+            };
+            let mut part = |l: &mut Self, e: DExpr| -> R<DExpr> {
+                let n = l.fresh("w");
+                parts.push(e.alias(&n));
+                Ok(col(&n))
+            };
+            let whole = WindowFrame::new_bounds(WU::Rows, WB::Preceding(unbounded()), WB::Following(unbounded()));
+            let out = match &w.func {
+                WindowFunc::RowNumber => cast(part(self, row_number().partition_by(partition).order_by(total).build()?)?, DataType::Int64),
+                // Without an order every row is its partition's peer.
+                WindowFunc::Rank | WindowFunc::DenseRank if order.is_empty() => lit(1i64),
+                WindowFunc::PercentRank if order.is_empty() => lit(0.0f64),
+                WindowFunc::CumeDist if order.is_empty() => lit(1.0f64),
+                WindowFunc::Rank => cast(part(self, win_fn::rank().partition_by(partition).order_by(order).build()?)?, DataType::Int64),
+                WindowFunc::DenseRank => cast(part(self, win_fn::dense_rank().partition_by(partition).order_by(order).build()?)?, DataType::Int64),
+                WindowFunc::PercentRank => cast(part(self, win_fn::percent_rank().partition_by(partition).order_by(order).build()?)?, DataType::Float64),
+                WindowFunc::CumeDist => cast(part(self, win_fn::cume_dist().partition_by(partition).order_by(order).build()?)?, DataType::Float64),
+                WindowFunc::Ntile(0) => return no("NTILE(0)"),
+                WindowFunc::Ntile(b) => {
+                    // As the operators: buckets as even as can be, the
+                    // first ones a row larger.
+                    let rn = part(self, row_number().partition_by(partition.clone()).order_by(total).build()?)?;
+                    let m = part(self, over_rows(agg_fn::count(lit(1i64))).partition_by(partition).window_frame(whole).build()?)?;
+                    let (i, m, b) = (cast(rn, DataType::Int64) - lit(1i64), cast(m, DataType::Int64), lit(*b as i64));
+                    let (q, rest) = (m.clone() / b.clone(), m % b);
+                    let big = rest.clone() * (q.clone() + lit(1i64));
+                    let q1 = when(q.clone().eq(lit(0i64)), lit(1i64)).otherwise(q.clone())?;
+                    when(i.clone().lt(big.clone()), i.clone() / (q + lit(1i64)) + lit(1i64)).otherwise((i - big) / q1 + rest + lit(1i64))?
+                }
+                WindowFunc::Lag { arg: a, offset, default } | WindowFunc::Lead { arg: a, offset, default } => {
+                    let (x, t) = arg(self, a)?;
+                    let d = match default {
+                        None => None,
+                        Some(Expr::Lit(v)) => match (scalar(v)?, &t) {
+                            (ScalarValue::Null, _) => None,
+                            (d, t) if d.data_type() == *t => Some(d),
+                            _ => return no("a lag's or lead's default of another type than its value"),
+                        },
+                        Some(_) => return no("a lag's or lead's default that is not a literal"),
+                    };
+                    let offset = i64::try_from(*offset).map_err(|_| Fail::No("a lag's offset".into()))?;
+                    let f = match w.func {
+                        WindowFunc::Lag { .. } => win_fn::lag(x, Some(offset), d),
+                        _ => win_fn::lead(x, Some(offset), d),
+                    };
+                    part(self, f.partition_by(partition).order_by(total).build()?)?
+                }
+                f @ (WindowFunc::FirstValue(_) | WindowFunc::LastValue(_) | WindowFunc::NthValue { .. } | WindowFunc::Agg(_)) => {
+                    let frame = w.frame();
+                    // A frame and the order it is taken in.
+                    let bound = |b: &Bound, start: bool| -> R<WB> {
+                        let off = |e: &Expr| -> R<ScalarValue> {
+                            let Expr::Lit(v) = e else { return no("a frame's offset that is not a literal") };
+                            Ok(match (frame.units, v, order_types.first()) {
+                                (FrameUnits::Rows, Value::Int(k), _) if *k >= 0 => ScalarValue::UInt64(Some(*k as u64)),
+                                (FrameUnits::Range, Value::Int(k), Some(t)) if *k >= 0 && is_int(t) => ScalarValue::Int64(Some(*k)),
+                                (FrameUnits::Range, Value::Int(_) | Value::Float(_), Some(t)) if is_float(t) && v.as_f64().is_some_and(|x| x >= 0.0) => ScalarValue::Float64(v.as_f64()),
+                                _ => return no(format!("a frame's offset {v:?}")),
+                            })
+                        };
+                        Ok(match b {
+                            Bound::UnboundedPreceding if start => WB::Preceding(unbounded()),
+                            Bound::UnboundedFollowing if !start => WB::Following(unbounded()),
+                            Bound::UnboundedPreceding | Bound::UnboundedFollowing => return no("a frame that starts at its partition's end or ends at its start"),
+                            Bound::Preceding(e) => WB::Preceding(off(e)?),
+                            Bound::CurrentRow => WB::CurrentRow,
+                            Bound::Following(e) => WB::Following(off(e)?),
+                        })
+                    };
+                    let units = match frame.units {
+                        FrameUnits::Rows => WU::Rows,
+                        FrameUnits::Range => WU::Range,
+                    };
+                    let df_frame = WindowFrame::new_bounds(units, bound(&frame.start, true)?, bound(&frame.end, false)?);
+                    let rows = frame.units == FrameUnits::Rows;
+                    match f {
+                        WindowFunc::Agg(a) => {
+                            let x = a.arg.as_ref().map(|e| arg(self, e)).transpose()?;
+                            // A RANGE frame holds whole groups of peers,
+                            // whatever their order; ROWS count rows.
+                            let ord = if rows { total } else { order };
+                            let mut over = |l: &mut Self, e: DExpr| -> R<DExpr> { part(l, over_rows(e).partition_by(partition.clone()).order_by(ord.clone()).window_frame(df_frame.clone()).build()?) };
+                            match (a.func, x) {
+                                (AggFn::Count, None) => over(self, agg_fn::count(lit(1i64)))?,
+                                (AggFn::Count, Some((x, _))) => over(self, agg_fn::count(x))?,
+                                (AggFn::Min, Some((x, _))) => over(self, agg_fn::min(x))?,
+                                (AggFn::Max, Some((x, _))) => over(self, agg_fn::max(x))?,
+                                (AggFn::Sum, Some((x, t))) if is_whole(&t) => over(self, agg_fn::sum(cast(x, DataType::Decimal128(38, 0))))?,
+                                (AggFn::Sum, Some((x, t))) if is_float(&t) => over(self, agg_fn::sum(x))?,
+                                (AggFn::Sum | AggFn::Avg, Some((_, DataType::Null))) => lit(ScalarValue::Float64(None)),
+                                (AggFn::Avg, Some((x, t))) if is_whole(&t) => {
+                                    let s = over(self, agg_fn::sum(cast(x.clone(), DataType::Decimal128(38, 0))))?;
+                                    let c = over(self, agg_fn::count(x))?;
+                                    when(c.clone().eq(lit(0i64)), lit(ScalarValue::Float64(None))).otherwise(cast(s, DataType::Float64) / cast(c, DataType::Float64))?
+                                }
+                                (AggFn::Avg, Some((x, t))) if is_float(&t) => over(self, agg_fn::avg(x))?,
+                                (f, x) => return no(format!("a window aggregate {f:?} of {:?}", x.map(|x| x.1))),
+                            }
+                        }
+                        f => {
+                            let (a, _) = arg(self, match f {
+                                WindowFunc::FirstValue(a) | WindowFunc::LastValue(a) | WindowFunc::NthValue { arg: a, .. } => a,
+                                _ => unreachable!("a value function"),
+                            })?;
+                            let last = matches!(f, WindowFunc::LastValue(_));
+                            // NTH_VALUE over RANGE frames from the
+                            // partition's first row: the partition's n-th
+                            // row in the total order, while the frame
+                            // (to the row's last peer) holds n rows.
+                            if let (WindowFunc::NthValue { n, .. }, false) = (f, rows) {
+                                let n = i64::try_from(*n).map_err(|_| Fail::No("NTH_VALUE's n".into()))?;
+                                let v = part(self, win_fn::nth_value(a, n).partition_by(partition.clone()).order_by(total).window_frame(whole.clone()).build()?)?;
+                                let out = match (&frame.start, &frame.end) {
+                                    (Bound::UnboundedPreceding, Bound::UnboundedFollowing) => v,
+                                    (Bound::UnboundedPreceding, Bound::CurrentRow) => {
+                                        let to_peers = WindowFrame::new_bounds(WU::Range, WB::Preceding(unbounded()), WB::CurrentRow);
+                                        let c = part(self, over_rows(agg_fn::count(lit(1i64))).partition_by(partition).order_by(order).window_frame(to_peers).build()?)?;
+                                        when(cast(c, DataType::Int64).gt_eq(lit(n)), v).end()?
+                                    }
+                                    _ => return no("NTH_VALUE over a RANGE frame that starts after the partition's first row"),
+                                };
+                                finals.push(out);
+                                continue;
+                            }
+                            // ROWS frames take the rows in the total order;
+                            // a RANGE frame's first row or last row, the
+                            // partition's or the row's peers', is the
+                            // first or last of those in the total order.
+                            let (partition, ord, df_frame) = match (rows, last, &frame.start, &frame.end) {
+                                (true, _, _, _) => (partition, total, df_frame),
+                                (false, false, Bound::UnboundedPreceding, Bound::CurrentRow | Bound::UnboundedFollowing) | (false, true, Bound::UnboundedPreceding | Bound::CurrentRow, Bound::UnboundedFollowing) => {
+                                    (partition, total, whole.clone())
+                                }
+                                (false, false, Bound::CurrentRow, Bound::CurrentRow | Bound::UnboundedFollowing) | (false, true, Bound::UnboundedPreceding | Bound::CurrentRow, Bound::CurrentRow) => {
+                                    // Over the row's peers: the partition
+                                    // and the order's keys.
+                                    let mut peers = partition;
+                                    peers.extend(order.iter().map(|o| o.expr.clone()));
+                                    (peers, vec![col(&pos).sort(true, false)], whole.clone())
+                                }
+                                _ => return no("a value function over a RANGE frame of this shape"),
+                            };
+                            let e = match f {
+                                WindowFunc::FirstValue(_) => win_fn::first_value(a),
+                                WindowFunc::LastValue(_) => win_fn::last_value(a),
+                                WindowFunc::NthValue { n, .. } => win_fn::nth_value(a, i64::try_from(*n).map_err(|_| Fail::No("NTH_VALUE's n".into()))?),
+                                _ => unreachable!("a value function"),
+                            };
+                            part(self, e.partition_by(partition).order_by(ord).window_frame(df_frame).build()?)?
+                        }
+                    }
+                }
+            };
+            finals.push(out);
+        }
+        // A Window node per partition and order: DataFusion's physical
+        // plan sorts a node's rows once, by its first function's keys, for
+        // every function of it.
+        let mut groups: Vec<(Vec<DExpr>, Vec<SortExpr>, Vec<DExpr>)> = Vec::new();
+        for e in parts {
+            let (partition, order) = match &e {
+                DExpr::Alias(a) => match a.expr.as_ref() {
+                    DExpr::WindowFunction(w) => (w.params.partition_by.clone(), w.params.order_by.clone()),
+                    e => return no(format!("not a window function: {e}")),
+                },
+                e => return no(format!("not a named window function: {e}")),
+            };
+            match groups.iter_mut().find(|g| g.0 == partition && g.1 == order) {
+                Some(g) => g.2.push(e),
+                None => groups.push((partition, order, vec![e])),
+            }
+        }
+        let mut plan = r.plan.clone();
+        for (_, _, es) in groups {
+            plan = LogicalPlanBuilder::from(plan).window(es)?.build()?;
+        }
+        let mut cols = r.cols.clone();
+        let mut names = r.names.clone();
+        let mut project = r.all();
+        for f in finals {
+            let n = self.fresh("c");
+            project.push(f.alias(&n));
+            names.push(format!("#{}", cols.len()));
+            cols.push(n);
+        }
+        let plan = LogicalPlanBuilder::from(plan).project(project)?.build()?;
+        Ok(Rel { plan, cols, names, ..r })
+    }
+
     fn join(&mut self, left: &Node, right: &Node, kind: JoinKind, keys: &[crate::query::ir::JoinKey], on: Option<&Expr>) -> R<Rel> {
         if keys.iter().any(|k| k.left_links || k.right_links) {
             return no("a join along links");
@@ -1135,8 +1400,9 @@ impl<'a> Lower<'a, '_> {
             }
             match none {
                 true => {
-                    let names = columns.iter().map(|c| c.name.clone()).collect();
-                    self.memory(names, Vec::new(), None, None)?
+                    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                    let arrays = arrow::columns_of(Vec::new(), names.len())?;
+                    self.memory(names, arrays, None, None, 0)?
                 }
                 false => self.leaf(right, "join", restrict)?,
             }
@@ -1572,6 +1838,20 @@ fn what(e: &Expr) -> String {
     d.split(['(', ' ', '{']).next().unwrap_or("").to_string()
 }
 
+/// An aggregate's call as a window function, which takes a partition, an
+/// order and a frame ([`ExprFunctionExt`] does not for an aggregate's).
+fn over_rows(e: DExpr) -> DExpr {
+    match e {
+        DExpr::AggregateFunction(a) => DExpr::WindowFunction(Box::new(datafusion::logical_expr::expr::WindowFunction::new(a.func, a.params.args))),
+        e => e,
+    }
+}
+
+/// An INT, or a sum of INTs (a decimal of no fraction).
+fn is_whole(t: &DataType) -> bool {
+    is_int(t) || matches!(t, DataType::Decimal128(_, 0))
+}
+
 fn is_int(t: &DataType) -> bool {
     matches!(t, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32)
 }
@@ -1619,200 +1899,6 @@ fn slices(batch: &RecordBatch, n: usize) -> Vec<RecordBatch> {
         return vec![batch.clone()];
     }
     (0..rows).step_by(n).map(|at| batch.slice(at, n.min(rows - at))).collect()
-}
-
-/// What Arrow type holds a column's values.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Kind {
-    Null,
-    Int,
-    Float,
-    Str,
-    Bool,
-    Time,
-    Vector,
-    IntList,
-    StrList,
-    /// A list without values: of either.
-    List,
-}
-
-fn kind_of(v: &Value) -> R<Kind> {
-    Ok(match v {
-        Value::Null => Kind::Null,
-        Value::Int(_) => Kind::Int,
-        Value::Float(_) => Kind::Float,
-        Value::Str(_) => Kind::Str,
-        Value::Bool(_) => Kind::Bool,
-        Value::Timestamp(_) => Kind::Time,
-        Value::Vector(_) => Kind::Vector,
-        Value::List(xs) => {
-            let mut k = Kind::List;
-            for x in xs {
-                let kx = match x {
-                    Value::Int(_) => Kind::IntList,
-                    Value::Str(_) => Kind::StrList,
-                    v => return no(format!("a list holding {v:?}")),
-                };
-                if k != Kind::List && k != kx {
-                    return no("a list of INT and text values");
-                }
-                k = kx;
-            }
-            k
-        }
-    })
-}
-
-/// One column being built a row at a time: typed by its first value that
-/// is not NULL. Lists and vectors are left to [`array_of`].
-enum Col {
-    Nulls(usize),
-    Int(Int64Builder),
-    Float(Float64Builder),
-    Str(StringBuilder),
-    Bool(BooleanBuilder),
-    Time(TimestampMicrosecondBuilder),
-    Other,
-}
-
-impl Col {
-    /// The array of `n` rows; `other` builds a column of lists or vectors.
-    fn finish(self, n: usize, other: impl FnOnce() -> R<ArrayRef>) -> R<ArrayRef> {
-        Ok(match self {
-            Col::Nulls(_) => Arc::new(datafusion::arrow::array::NullArray::new(n)),
-            Col::Int(mut b) => Arc::new(b.finish()),
-            Col::Float(mut b) => Arc::new(b.finish()),
-            Col::Str(mut b) => Arc::new(b.finish()),
-            Col::Bool(mut b) => Arc::new(b.finish()),
-            Col::Time(mut b) => Arc::new(b.finish()),
-            Col::Other => other()?,
-        })
-    }
-
-    fn push(&mut self, v: &Value, n: usize) -> R<()> {
-        match (&mut *self, v) {
-            (Col::Other, _) => {}
-            (Col::Nulls(k), Value::Null) => *k += 1,
-            (Col::Nulls(k), v) => {
-                let k = *k;
-                *self = match v {
-                    Value::Int(_) => Col::Int(Int64Builder::with_capacity(n)),
-                    Value::Float(_) => Col::Float(Float64Builder::with_capacity(n)),
-                    Value::Str(_) => Col::Str(StringBuilder::with_capacity(n, n * 8)),
-                    Value::Bool(_) => Col::Bool(BooleanBuilder::with_capacity(n)),
-                    Value::Timestamp(_) => Col::Time(TimestampMicrosecondBuilder::with_capacity(n)),
-                    _ => Col::Other,
-                };
-                for _ in 0..k {
-                    self.push(&Value::Null, n)?;
-                }
-                self.push(v, n)?;
-            }
-            (Col::Int(b), Value::Int(x)) => b.append_value(*x),
-            (Col::Float(b), Value::Float(x)) => b.append_value(*x),
-            (Col::Str(b), Value::Str(x)) => b.append_value(x),
-            (Col::Bool(b), Value::Bool(x)) => b.append_value(*x),
-            (Col::Time(b), Value::Timestamp(x)) => b.append_value(*x),
-            (Col::Int(b), Value::Null) => b.append_null(),
-            (Col::Float(b), Value::Null) => b.append_null(),
-            (Col::Str(b), Value::Null) => b.append_null(),
-            (Col::Bool(b), Value::Null) => b.append_null(),
-            (Col::Time(b), Value::Null) => b.append_null(),
-            (_, v) => return no(format!("a column of values of several types, {v:?} among them")),
-        }
-        Ok(())
-    }
-}
-
-/// Columns `0..width` of `rows` as Arrow arrays, in one pass over the
-/// rows: a column of one type each, NULLs aside.
-fn columns_of(rows: &[Vec<Value>], width: usize) -> R<Vec<ArrayRef>> {
-    let n = rows.len();
-    let mut cols: Vec<Col> = (0..width).map(|_| Col::Nulls(0)).collect();
-    for r in rows {
-        for (i, c) in cols.iter_mut().enumerate() {
-            c.push(r.get(i).unwrap_or(&Value::Null), n)?;
-        }
-    }
-    cols.into_iter().enumerate().map(|(i, c)| c.finish(n, || array_of(rows.iter().map(|r| r.get(i).unwrap_or(&Value::Null))))).collect()
-}
-
-/// `values` as one Arrow array ([`columns_of`] of one column).
-fn column_of(values: &[Value]) -> R<ArrayRef> {
-    let n = values.len();
-    let mut c = Col::Nulls(0);
-    for v in values {
-        c.push(v, n)?;
-    }
-    c.finish(n, || array_of(values.iter()))
-}
-
-/// The values of one column as an Arrow array of their one type.
-fn array_of<'v>(values: impl Iterator<Item = &'v Value> + Clone) -> R<ArrayRef> {
-    let mut kind = Kind::Null;
-    for v in values.clone() {
-        let k = kind_of(v)?;
-        kind = match (kind, k) {
-            (a, Kind::Null) => a,
-            (Kind::Null, b) => b,
-            (Kind::List, b @ (Kind::IntList | Kind::StrList | Kind::List)) | (b @ (Kind::IntList | Kind::StrList), Kind::List) => b,
-            (a, b) if a == b => a,
-            (a, b) => return no(format!("a column of {a:?} and {b:?} values")),
-        };
-    }
-    let n = values.clone().count();
-    Ok(match kind {
-        Kind::Null => Arc::new(datafusion::arrow::array::NullArray::new(n)),
-        Kind::Int => Arc::new(values.map(|v| v.as_i64()).collect::<Int64Array>()),
-        Kind::Float => Arc::new(values.map(|v| if let Value::Float(x) = v { Some(*x) } else { None }).collect::<Float64Array>()),
-        Kind::Str => {
-            let mut b = StringBuilder::new();
-            values.for_each(|v| b.append_option(v.as_str()));
-            Arc::new(b.finish())
-        }
-        Kind::Bool => Arc::new(values.map(|v| if let Value::Bool(x) = v { Some(*x) } else { None }).collect::<BooleanArray>()),
-        Kind::Time => Arc::new(values.map(|v| if let Value::Timestamp(x) = v { Some(*x) } else { None }).collect::<TimestampMicrosecondArray>()),
-        Kind::Vector => {
-            let mut b = ListBuilder::new(Float32Builder::new());
-            for v in values {
-                match v {
-                    Value::Vector(x) => {
-                        b.values().append_slice(x);
-                        b.append(true);
-                    }
-                    _ => b.append(false),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        Kind::IntList => {
-            let mut b = ListBuilder::new(Int64Builder::new());
-            for v in values {
-                match v {
-                    Value::List(xs) => {
-                        xs.iter().for_each(|x| b.values().append_option(x.as_i64()));
-                        b.append(true);
-                    }
-                    _ => b.append(false),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        Kind::StrList | Kind::List => {
-            let mut b = ListBuilder::new(StringBuilder::new());
-            for v in values {
-                match v {
-                    Value::List(xs) => {
-                        xs.iter().for_each(|x| b.values().append_option(x.as_str()));
-                        b.append(true);
-                    }
-                    _ => b.append(false),
-                }
-            }
-            Arc::new(b.finish())
-        }
-    })
 }
 
 /// The values of an Arrow array, as Strata gives them.

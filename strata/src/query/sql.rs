@@ -1630,7 +1630,7 @@ impl<'a> Binder<'a> {
                 match name.as_str() {
                     "bm25" => {
                         let [field, text] = args.as_slice() else { return Err(err("bm25(field, text)")) };
-                        let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
+                        let field = self.text_field(field)?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         let mut opts = opts;
                         Expand::from_opts(&opts).map_err(err)?;
@@ -1989,7 +1989,7 @@ impl<'a> Binder<'a> {
             Expr::Function(func) if fname(func) == "match" => {
                 let (args, opts) = self.args(func)?;
                 let [field, q] = args.as_slice() else { return Err(err("MATCH(field, query, synonyms => 0 | 1, fuzzy => 0 | 1 | 2 | 'auto', min => n | 'p%')")) };
-                let field = self.typed_field(field, |t| matches!(t, FieldType::Text { .. }), "TEXT")?;
+                let field = self.text_field(field)?;
                 if !self.schema.fields[field].indexed {
                     return Err(err(format!("{} is not indexed", self.schema.fields[field].name)));
                 }
@@ -2377,6 +2377,17 @@ impl<'a> Binder<'a> {
     fn typed_field(&self, e: &Expr, ok: impl Fn(&FieldType) -> bool, what: &str) -> Result<usize> {
         let f = self.field_of(e)?;
         if ok(&self.schema.fields[f].ty) { Ok(f) } else { Err(err(format!("{} is not a {what} field", self.schema.fields[f].name))) }
+    }
+
+    /// The field of `MATCH` and `bm25`: a TEXT field, or a JSON field with
+    /// text ([`crate::schema::Field::text`]), whose strings they search.
+    fn text_field(&self, e: &Expr) -> Result<usize> {
+        let f = self.typed_field(e, |t| matches!(t, FieldType::Text { .. } | FieldType::Json), "TEXT")?;
+        let fld = &self.schema.fields[f];
+        if fld.ty == FieldType::Json && !fld.text {
+            return Err(err(format!("{} is a JSON field without text: MATCH and bm25 read a JSON field's strings when it is declared {} JSON OPTIONS(text = true)", fld.name, fld.name)));
+        }
+        Ok(f)
     }
 
     /// The field of `LIKE` and `PREFIX()`: an indexed KEYWORD field.
