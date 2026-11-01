@@ -3,7 +3,7 @@
 
     python3 analyze.py REPORTS_DIR BEIR_DIR/quora > tables.md
 
-Reads run-<label>.json (timings and answers), writes-<engine>.json, load-<engine>.json,
+Reads run-<label>.json (timings and answers), writes-<engine>.json, stream-<engine>.json, load-<engine>.json,
 build-strata-s<i>.json and disk-vespa.jsonl (load time and index size) and
 cpu.jsonl from REPORTS_DIR, and the collection from BEIR_DIR/quora, and
 prints Markdown tables: load time and index size; latency and throughput per
@@ -409,6 +409,37 @@ def main():
             v = w["visible"]
             print(f"| {NAMES[e]} | {w['params']['searchable']} | {v['ack_p50_ms']:.1f} | {v['visible_p50_ms']:.1f} | {v['visible_p90_ms']:.1f} | {v['visible_max_ms']:.1f} |")
 
+    # Streams (engine-compare stream): each rate's lag, the top speed, and the crash test.
+    st = {e: load_json(rep / f"stream-{e}.json") for e in ENGINES}
+    st = {e: x for e, x in st.items() if x}
+    if st:
+        summary["stream"] = st
+        print("\n## Streams through Redpanda: documents written a second, and lag in ms from when a document was due (p50 / p99)\n")
+        print("| phase | " + " | ".join(f"{NAMES[e]} docs/s | {NAMES[e]} lag" for e in st) + " |")
+        print("|---|" + "---|---|" * len(st))
+        names = []
+        for x in st.values():
+            for row in x["phases"]:
+                if row["phase"] not in names and row["phase"] != "before the crash":
+                    names.append(row["phase"])
+        for name in names:
+            cells = []
+            for x in st.values():
+                row = next((r for r in x["phases"] if r["phase"] == name), None)
+                if row:
+                    behind = "" if row["kept_up"] or name == "flat out" else " (fell behind)"
+                    cells += [fmt(row["written_per_s"], 0), f"{row['lag_p50_ms']:.0f} / {row['lag_p99_ms']:.0f}{behind}"]
+                else:
+                    cells += ["not run", "not run"]
+            print(f"| {name} | " + " | ".join(cells) + " |")
+        print("\nLag includes reading the topic (Redpanda's part, the same for every engine, is the 'read' column below).\n")
+        print("| engine | what written means | read lag p50 (ms) | crash: events written again | documents lost |")
+        print("|---|---|---|---|---|")
+        for e, x in st.items():
+            first = x["phases"][0]
+            r = x["restart"]
+            print(f"| {NAMES[e]} | {x['params']['written_means']} | {fmt(first.get('fetch_lag_p50_ms'), 0)} | {r['written_again']} ({r['how']}) | {r['lost']} |")
+
     # CPU used during each run, from the containers' cgroups.
     cpu_lines = [json.loads(l) for l in open(rep / "cpu.jsonl")] if (rep / "cpu.jsonl").exists() else []
     for e in ENGINES:
@@ -420,7 +451,7 @@ def main():
         print("| engine | phase | pod | CPU seconds | wall seconds | average cores | throttled (s) |")
         print("|---|---|---|---|---|---|---|")
         for e in ENGINES:
-            for phase, (tb, ta) in [("load", ("load-before", "load-after")), ("timed run", ("before", "after")), ("writes", ("writes-before", "writes-after"))]:
+            for phase, (tb, ta) in [("load", ("load-before", "load-after")), ("timed run", ("before", "after")), ("writes", ("writes-before", "writes-after")), ("stream", ("stream-before", "stream-after"))]:
                 # Lines written before runs had labels name the run by its engine.
                 mine = [l for l in cpu_lines if l.get("label", l["engine"]) == e]
                 for pod in sorted({l["pod"] for l in mine}):

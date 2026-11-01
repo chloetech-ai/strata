@@ -145,6 +145,44 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Streams new documents through a Kafka (Redpanda) topic into an
+    /// engine: a producer at each of `--rates` documents a second, then a
+    /// backlog as fast as it can, and a consumer that crashes halfway
+    /// through a last stream, right after a write, and starts again. Times
+    /// how long each document takes to be written, counts the events written
+    /// twice and the documents lost, then deletes what it streamed (run it
+    /// after `run`).
+    Stream {
+        #[arg(long, value_enum)]
+        engine: Engine,
+        /// The engine's HTTP endpoints, comma-separated (Strata: its coordinator); partitions go round-robin.
+        #[arg(long, value_delimiter = ',', required = true)]
+        url: Vec<String>,
+        /// Kafka (or Redpanda) brokers, comma-separated.
+        #[arg(long, default_value = "redpanda:9092")]
+        brokers: String,
+        #[arg(long, default_value_t = 4)]
+        partitions: i32,
+        /// Documents a second, each for `--seconds` (each carries a 1,024-number vector: about 10 KB of JSON).
+        #[arg(long, value_delimiter = ',', default_value = "250,500,1000,2000")]
+        rates: Vec<usize>,
+        #[arg(long, default_value_t = 30.0)]
+        seconds: f64,
+        /// Documents produced as fast as the producer can, for the consumer's own top speed.
+        #[arg(long, default_value_t = 20_000)]
+        flat: usize,
+        /// Documents of the crash test.
+        #[arg(long, default_value_t = 10_000)]
+        restart: usize,
+        /// Most documents a write.
+        #[arg(long, default_value_t = 500)]
+        batch: usize,
+        /// Names the run in the report (`--out/stream-<label>.json`).
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -1876,6 +1914,473 @@ async fn restore(engine: Engine, client: &reqwest::Client, url: &str, keys: &[St
     Ok(())
 }
 
+/// Milliseconds since the epoch, now.
+fn epoch_ms() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1e3)
+}
+
+/// A request to an engine again, a second later, while it pushes back
+/// (429, 503, a bulk item refused with 429) or cannot be reached: a
+/// consumer drops no event. The answer's text.
+async fn post_retry(client: &reqwest::Client, url: &str, ctype: &str, body: &[u8]) -> Result<String, String> {
+    let mut last = String::new();
+    for _ in 0..120 {
+        match client.post(url).header("content-type", ctype).body(body.to_vec()).send().await {
+            Ok(r) if matches!(r.status().as_u16(), 429 | 503) => last = r.status().to_string(),
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.map_err(s)?;
+                if !status.is_success() {
+                    return Err(format!("{status}: {}", text.chars().take(500).collect::<String>()));
+                }
+                // Elasticsearch's and OpenSearch's bulk answer 200 with the items that failed.
+                if text.contains("\"errors\":true") {
+                    if text.contains("\"status\":429") {
+                        last = "bulk items refused with 429".into();
+                    } else {
+                        return Err(format!("bulk item failed: {}", text.chars().take(500).collect::<String>()));
+                    }
+                } else {
+                    return Ok(text);
+                }
+            }
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!("still refused after 120 tries: {last}"))
+}
+
+/// One partition's progress, shared with the test (it outlives a consumer
+/// that crashes).
+#[derive(Default)]
+struct PartState {
+    /// The next offset to read when a consumer starts: Strata's, from the
+    /// server; the others', the offset their consumer committed (every second).
+    committed: i64,
+    /// The last offset the engine acknowledged, if any.
+    acked: Option<i64>,
+    /// The time of the last commit.
+    committed_at: Option<Instant>,
+}
+
+/// What the consumers of one phase share.
+struct Phase {
+    parts: Vec<std::sync::Mutex<PartState>>,
+    /// Each written event's lag: from when it was due (its record's timestamp) to the engine's answer.
+    lags: std::sync::Mutex<Vec<f64>>,
+    /// The part of it before the engine: from when it was due to when the consumer had read it.
+    fetch_lags: std::sync::Mutex<Vec<f64>>,
+    written: AtomicUsize,
+    /// Events Strata's server skipped as replays (its offsets were past them).
+    skipped: AtomicUsize,
+    stop: std::sync::atomic::AtomicBool,
+    /// Crash (return without committing) once this many events were written.
+    crash_at: Option<usize>,
+}
+
+impl Phase {
+    fn new(parts: &[i64], crash_at: Option<usize>) -> Arc<Phase> {
+        Arc::new(Phase {
+            parts: parts.iter().map(|&o| std::sync::Mutex::new(PartState { committed: o, acked: None, committed_at: None })).collect(),
+            lags: std::sync::Mutex::new(Vec::new()),
+            fetch_lags: std::sync::Mutex::new(Vec::new()),
+            written: AtomicUsize::new(0),
+            skipped: AtomicUsize::new(0),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            crash_at,
+        })
+    }
+}
+
+/// The next offset of every partition after a phase: what a consumer starting now reads first.
+fn next_offsets(ph: &Phase) -> Vec<i64> {
+    ph.parts.iter().map(|p| p.lock().unwrap().committed).collect()
+}
+
+/// Reads partition `p` from the phase's offset and writes its events to the
+/// engine, at most `batch` a request, one request at a time, until told to
+/// stop (or, with `crash_at`, until it crashes right after a write).
+#[allow(clippy::too_many_arguments)]
+async fn consume_part(
+    engine: Engine,
+    client: reqwest::Client,
+    url: String,
+    pc: Arc<rskafka::client::partition::PartitionClient>,
+    topic: String,
+    p: usize,
+    ph: Arc<Phase>,
+    batch: usize,
+) -> Result<(), String> {
+    let mut offset = ph.parts[p].lock().unwrap().committed;
+    loop {
+        if ph.stop.load(Ordering::Relaxed) {
+            // Stopped between phases: everything written is committed.
+            let mut st = ph.parts[p].lock().unwrap();
+            st.committed = offset;
+            return Ok(());
+        }
+        // A short wait: Redpanda answered a waiting fetch only at its
+        // deadline, not when records came (100 ms put 140 ms under every lag).
+        let (recs, _high) = pc.fetch_records(offset, 1..8_000_000, 10).await.map_err(|e| format!("fetch: {e}"))?;
+        let recs: Vec<_> = recs.into_iter().filter(|r| r.offset >= offset).collect();
+        let fetched = epoch_ms();
+        ph.fetch_lags.lock().unwrap().extend(recs.iter().map(|r| fetched - r.record.timestamp.timestamp_millis() as f64));
+        for chunk in recs.chunks(batch.max(1)) {
+            let key = |r: &rskafka::record::RecordAndOffset| String::from_utf8_lossy(r.record.key.as_deref().unwrap_or_default()).into_owned();
+            let value = |r: &rskafka::record::RecordAndOffset| r.record.value.clone().unwrap_or_default();
+            let mut skipped = 0;
+            match engine {
+                Engine::Strata => {
+                    // One stream of the chunk's events, each with its offset: the server keeps the offsets with the rows.
+                    let mut body = Vec::new();
+                    for r in chunk {
+                        let src = json!({"name": format!("{topic}/{p}"), "offset": r.offset, "ts": r.record.timestamp.timestamp_millis()});
+                        body.extend_from_slice(format!("{{\"source\":{src},\"op\":\"insert\",\"doc\":").as_bytes());
+                        body.extend_from_slice(&value(r));
+                        body.extend_from_slice(b"}\n");
+                    }
+                    let text = post_retry(&client, &format!("{url}/v1/stream"), "application/x-ndjson", &body).await?;
+                    let done = text.lines().filter_map(|l| serde_json::from_str::<Json>(l).ok()).find(|j| j["done"].as_bool() == Some(true));
+                    let done = done.ok_or_else(|| format!("stream answered without its end: {}", text.chars().take(300).collect::<String>()))?;
+                    skipped = done["skipped"].as_u64().unwrap_or(0) as usize;
+                }
+                Engine::Es | Engine::Os => {
+                    let mut body = Vec::new();
+                    for r in chunk {
+                        body.extend_from_slice(json!({"index": {"_id": key(r)}}).to_string().as_bytes());
+                        body.push(b'\n');
+                        body.extend_from_slice(&value(r));
+                        body.push(b'\n');
+                    }
+                    post_retry(&client, &format!("{url}/quora/_bulk"), "application/x-ndjson", &body).await?;
+                }
+                Engine::Solr => {
+                    let mut body = vec![b'['];
+                    for (i, r) in chunk.iter().enumerate() {
+                        if i > 0 {
+                            body.push(b',');
+                        }
+                        body.extend_from_slice(&value(r));
+                    }
+                    body.push(b']');
+                    post_retry(&client, &format!("{url}/solr/quora/update"), "application/json", &body).await?;
+                }
+                Engine::Vespa => {
+                    // One put a document (Vespa's /document/v1), 48 at once a
+                    // partition: four partitions stay within the 256 requests
+                    // Vespa's container queues.
+                    for sub in chunk.chunks(48) {
+                        let puts = sub.iter().map(|r| {
+                            let (client, u) = (client.clone(), format!("{url}/document/v1/doc/doc/docid/{}", id_path(&key(r))));
+                            let mut body = b"{\"fields\":".to_vec();
+                            body.extend_from_slice(&value(r));
+                            body.push(b'}');
+                            async move { post_retry(&client, &u, "application/json", &body).await }
+                        });
+                        for r in futures::future::join_all(puts).await {
+                            r?;
+                        }
+                    }
+                }
+            }
+            let now = epoch_ms();
+            let last = chunk.last().unwrap().offset;
+            ph.lags.lock().unwrap().extend(chunk.iter().map(|r| now - r.record.timestamp.timestamp_millis() as f64));
+            ph.skipped.fetch_add(skipped, Ordering::Relaxed);
+            let written = ph.written.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+            offset = last + 1;
+            let mut st = ph.parts[p].lock().unwrap();
+            st.acked = Some(last);
+            if ph.crash_at.is_some_and(|n| written >= n) {
+                // Crashed right after the engine took the write, before committing its offset.
+                return Ok(());
+            }
+            // Strata's offset is committed with the rows; the others' consumer commits every second, as Kafka's do.
+            if engine == Engine::Strata || st.committed_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                st.committed = offset;
+                st.committed_at = Some(Instant::now());
+            }
+        }
+        if recs.is_empty() && ph.crash_at.is_some_and(|n| ph.written.load(Ordering::Relaxed) >= n) {
+            return Ok(());
+        }
+    }
+}
+
+/// Produces events `first .. first + count` (each a copy of a document under
+/// the key `s<n>`), at `rate` a second (None: as fast as it can), round-robin
+/// over the partitions, each record stamped with the time it was due.
+/// Returns the seconds it took.
+async fn produce_events(parts: &[Arc<rskafka::client::partition::PartitionClient>], values: &[(String, String)], first: usize, count: usize, rate: Option<f64>) -> Result<f64, String> {
+    use rskafka::chrono::{TimeZone, Utc};
+    let t0 = Instant::now();
+    let e0 = epoch_ms();
+    let record = |n: usize, due_ms: f64| {
+        let (a, b) = &values[n % values.len()];
+        let id = format!("s{n}");
+        rskafka::record::Record {
+            key: Some(id.clone().into_bytes()),
+            value: Some(format!("{a}{id}{b}").into_bytes()),
+            headers: BTreeMap::new(),
+            timestamp: Utc.timestamp_millis_opt(due_ms as i64).unwrap(),
+        }
+    };
+    let mut sent = 0;
+    while sent < count {
+        // Every 10 ms, the events due by now (flat out: 50 a partition).
+        let due = match rate {
+            Some(r) => ((t0.elapsed().as_secs_f64() * r) as usize).min(count),
+            None => (sent + 50 * parts.len()).min(count),
+        };
+        if due > sent {
+            let mut per: Vec<Vec<rskafka::record::Record>> = (0..parts.len()).map(|_| Vec::new()).collect();
+            for i in sent..due {
+                let due_ms = match rate {
+                    Some(r) => e0 + i as f64 / r * 1e3,
+                    None => epoch_ms(),
+                };
+                per[i % parts.len()].push(record(first + i, due_ms));
+            }
+            let sends = per.into_iter().zip(parts).filter(|(r, _)| !r.is_empty()).map(|(recs, pc)| async move {
+                // Records of up to about 1 MB a request.
+                let mut out = Vec::new();
+                let mut it = recs.into_iter().peekable();
+                while it.peek().is_some() {
+                    let chunk: Vec<_> = it.by_ref().take(64).collect();
+                    out.push(pc.produce(chunk, rskafka::client::partition::Compression::NoCompression).await.map(|_| ()));
+                }
+                out.into_iter().collect::<Result<(), _>>()
+            });
+            for r in futures::future::join_all(sends).await {
+                r.map_err(|e| format!("produce: {e}"))?;
+            }
+            sent = due;
+        }
+        if rate.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    Ok(t0.elapsed().as_secs_f64())
+}
+
+/// How many documents the engine has (after making the latest writes searchable).
+async fn count_docs(engine: Engine, client: &reqwest::Client, url: &str) -> Result<u64, String> {
+    Ok(match engine {
+        Engine::Strata => {
+            let j = check(client.post(format!("{url}/v1/query")).json(&json!({"sql": "SELECT COUNT(*) FROM docs"})).send().await, "count").await?;
+            j["rows"][0][0].as_u64().or_else(|| j["rows"][0].as_object().and_then(|o| o.values().next()).and_then(|v| v.as_u64())).unwrap_or(0)
+        }
+        Engine::Es | Engine::Os => {
+            check(client.post(format!("{url}/quora/_refresh")).send().await, "refresh").await?;
+            check(client.get(format!("{url}/quora/_count")).send().await, "count").await?["count"].as_u64().unwrap_or(0)
+        }
+        Engine::Solr => {
+            check(client.get(format!("{url}/solr/quora/update?commit=true")).send().await, "commit").await?;
+            check(client.get(format!("{url}/solr/quora/select?q=*:*&rows=0")).send().await, "count").await?["response"]["numFound"].as_u64().unwrap_or(0)
+        }
+        Engine::Vespa => {
+            let j = check(client.post(format!("{url}/search/")).json(&json!({"yql": "select * from doc where true", "hits": 0, "timeout": "30s"})).send().await, "count").await?;
+            j["root"]["fields"]["totalCount"].as_u64().unwrap_or(0)
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream(
+    collection: &str,
+    engine: Engine,
+    urls: &[String],
+    brokers: &str,
+    partitions: i32,
+    rates: &[usize],
+    seconds: f64,
+    flat: usize,
+    restart: usize,
+    batch: usize,
+    label: Option<String>,
+    out: &Path,
+) -> Result<(), String> {
+    use rskafka::client::{partition::UnknownTopicHandling, ClientBuilder};
+    let label = label.unwrap_or_else(|| engine.name().to_string());
+    let client = reqwest::Client::builder().pool_max_idle_per_host(1024).timeout(Duration::from_secs(120)).build().map_err(s)?;
+    let u0 = urls[0].clone();
+    // Searchable within a second of a write, as for `writes`.
+    let searchable = match engine {
+        Engine::Es | Engine::Os => {
+            check(client.put(format!("{u0}/quora/_settings")).json(&json!({"index": {"refresh_interval": "1s"}})).send().await, "settings").await?;
+            "written: searchable within the 1 s refresh"
+        }
+        Engine::Solr => {
+            check(client.post(format!("{u0}/solr/quora/config")).json(&json!({"set-property": {"updateHandler.autoSoftCommit.maxTime": 1000}})).send().await, "config").await?;
+            "written: searchable within the 1 s soft commit"
+        }
+        Engine::Strata => "searchable (the server answers a batch once its rows are visible)",
+        Engine::Vespa => "searchable (a put is visible when it returns)",
+    };
+    // A topic of its own for the run.
+    let kafka = ClientBuilder::new(brokers.split(',').map(str::to_string).collect()).max_message_size(64 << 20).build().await.map_err(|e| format!("kafka: {e}"))?;
+    let topic = format!("docs-{}-{}", label.replace(' ', "-"), epoch_ms() as u64 / 1000);
+    kafka.controller_client().map_err(|e| format!("kafka: {e}"))?.create_topic(&topic, partitions, 1, 30_000).await.map_err(|e| format!("create topic: {e}"))?;
+    let mut parts = Vec::new();
+    for p in 0..partitions {
+        parts.push(Arc::new(kafka.partition_client(&topic, p, UnknownTopicHandling::Retry).await.map_err(|e| format!("partition {p}: {e}"))?));
+    }
+    // The events: the first 5,000 documents as JSON with their key cut out, under new keys.
+    let mut values = Vec::new();
+    each_doc(collection, Some(5_000), |r, v| {
+        let d = doc_json(&RawDoc { id: "@@key@@".into(), ..r }, &v);
+        let (a, b) = d.split_once("@@key@@").ok_or("no key in a document's JSON")?;
+        values.push((a.to_string(), b.to_string()));
+        Ok(())
+    })?;
+    let base = count_docs(engine, &client, &u0).await?;
+    eprintln!("{label:<8} topic {topic}, {partitions} partitions; {base} documents before");
+
+    let mut rows = Vec::new();
+    let mut offsets = vec![0i64; partitions as usize];
+    let mut produced = 0usize;
+    // A phase: consumers from `offsets`, `count` events produced at `rate`, then until every event is written (or 5 minutes more).
+    let run_phase = |name: String, rate: Option<f64>, count: usize, first: usize, offsets: Vec<i64>, crash_at: Option<usize>| {
+        let (client, parts, values, topic, urls) = (client.clone(), parts.clone(), &values, topic.clone(), urls.to_vec());
+        let label: &str = &label;
+        async move {
+            let ph = Phase::new(&offsets, crash_at);
+            let consumers: Vec<_> = (0..parts.len())
+                .map(|p| tokio::spawn(consume_part(engine, client.clone(), urls[p % urls.len()].clone(), parts[p].clone(), topic.clone(), p, ph.clone(), batch)))
+                .collect();
+            let t0 = Instant::now();
+            let produce_s = produce_events(&parts, values, first, count, rate).await?;
+            let target = crash_at.unwrap_or(count);
+            let deadline = Instant::now() + Duration::from_secs(600);
+            while ph.written.load(Ordering::Relaxed) < target && Instant::now() < deadline && !consumers.iter().all(|c| c.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let all_s = t0.elapsed().as_secs_f64();
+            ph.stop.store(true, Ordering::Relaxed);
+            for c in consumers {
+                c.await.map_err(s)??;
+            }
+            let lags = ph.lags.lock().unwrap().clone();
+            let fetch_lags = ph.fetch_lags.lock().unwrap().clone();
+            let written = ph.written.load(Ordering::Relaxed);
+            eprintln!(
+                "{label:<8} {name:<16} produced {count} in {produce_s:.1} s; written {written} in {all_s:.1} s ({:.0}/s); lag p50 {:.0} ms  p90 {:.0} ms  p99 {:.0} ms  max {:.0} ms (read p50 {:.0} ms)",
+                written as f64 / all_s,
+                percentile(&lags, 50.0),
+                percentile(&lags, 90.0),
+                percentile(&lags, 99.0),
+                lags.iter().cloned().fold(0.0, f64::max),
+                percentile(&fetch_lags, 50.0)
+            );
+            let row = json!({
+                "phase": name, "rate": rate, "produced": count, "produce_s": produce_s, "written": written, "seconds": all_s,
+                "written_per_s": written as f64 / all_s, "kept_up": written >= target && all_s <= produce_s + 2.0,
+                "lag_p50_ms": percentile(&lags, 50.0), "lag_p90_ms": percentile(&lags, 90.0), "lag_p99_ms": percentile(&lags, 99.0),
+                "lag_max_ms": lags.iter().cloned().fold(0.0, f64::max), "skipped": ph.skipped.load(Ordering::Relaxed),
+                "fetch_lag_p50_ms": percentile(&fetch_lags, 50.0), "fetch_lag_p99_ms": percentile(&fetch_lags, 99.0),
+            });
+            Ok::<_, String>((row, ph))
+        }
+    };
+    for &r in rates {
+        let count = (r as f64 * seconds) as usize;
+        let (row, ph) = run_phase(format!("{r}/s"), Some(r as f64), count, produced, offsets.clone(), None).await?;
+        produced += count;
+        offsets = next_offsets(&ph);
+        let kept_up = row["kept_up"].as_bool() == Some(true);
+        let drained = row["written"].as_u64() == Some(count as u64);
+        rows.push(row);
+        if !drained {
+            return Err(format!("{r}/s: not every event was written within 10 minutes"));
+        }
+        if !kept_up {
+            // Fell behind: the higher rates would only fall further behind.
+            eprintln!("{label:<8} fell behind at {r}/s: no higher rate");
+            break;
+        }
+    }
+    let (row, ph) = run_phase("flat out".into(), None, flat, produced, offsets.clone(), None).await?;
+    if row["written"].as_u64() != Some(flat as u64) {
+        return Err("flat out: not every event was written within 10 minutes".into());
+    }
+    let flat_rate = row["written_per_s"].as_f64().unwrap_or(1000.0);
+    produced += flat;
+    offsets = next_offsets(&ph);
+    rows.push(row);
+
+    // A consumer that crashes halfway through, right after a write, and starts again.
+    let rate = (flat_rate / 2.0).clamp(100.0, 5000.0);
+    let (row, ph) = run_phase("before the crash".into(), Some(rate), restart, produced, offsets.clone(), Some(restart / 2)).await?;
+    rows.push(row);
+    let acked: Vec<Option<i64>> = ph.parts.iter().map(|p| p.lock().unwrap().acked).collect();
+    let resume: Vec<i64> = match engine {
+        // Strata's consumer starts after the offsets the server has.
+        Engine::Strata => {
+            let have = check(client.get(format!("{u0}/v1/sources")).send().await, "sources").await?;
+            let list = have.as_array().cloned().or_else(|| have["sources"].as_array().cloned()).unwrap_or_default();
+            (0..partitions as usize)
+                .map(|p| list.iter().find(|s| s["name"].as_str() == Some(&format!("{topic}/{p}"))).and_then(|s| s["offset"].as_i64()).map_or(0, |o| o + 1))
+                .collect()
+        }
+        _ => next_offsets(&ph),
+    };
+    let again: i64 = acked.iter().zip(&resume).map(|(a, r)| a.map_or(0, |a| (a + 1 - r).max(0))).sum();
+    // The rest of the events, already produced: the new consumer reads them from where it resumes.
+    let left_from = restart;
+    let ph2 = Phase::new(&resume, None);
+    let consumers: Vec<_> = (0..parts.len())
+        .map(|p| tokio::spawn(consume_part(engine, client.clone(), urls[p % urls.len()].clone(), parts[p].clone(), topic.clone(), p, ph2.clone(), batch)))
+        .collect();
+    let t0 = Instant::now();
+    let target = (left_from as i64 - ph.written.load(Ordering::Relaxed) as i64 + again).max(0) as usize;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while ph2.written.load(Ordering::Relaxed) < target && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A last look for stragglers.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ph2.stop.store(true, Ordering::Relaxed);
+    for c in consumers {
+        c.await.map_err(s)??;
+    }
+    produced += restart;
+    let after = count_docs(engine, &client, &u0).await?;
+    let lost = (base + produced as u64) as i64 - after as i64;
+    eprintln!(
+        "{label:<8} after the crash   resumed in {:.1} s: {again} events written a second time, {} skipped by the server; {after} documents, {lost} lost",
+        t0.elapsed().as_secs_f64(),
+        ph2.skipped.load(Ordering::Relaxed)
+    );
+    let restart_row = json!({
+        "events": restart, "crash_after": restart / 2, "rate": rate, "written_again": again,
+        "skipped_by_server": ph2.skipped.load(Ordering::Relaxed), "resumed_written": ph2.written.load(Ordering::Relaxed),
+        "documents_before": base, "documents_after": after, "expected": base + produced as u64, "lost": lost,
+        "how": match engine {
+            Engine::Strata => "the consumer resumes after the offsets the server keeps with the rows (GET /v1/sources)",
+            _ => "the consumer resumes after the offsets it committed, every second, as Kafka's consumers do",
+        },
+    });
+
+    // Delete what was streamed.
+    let t_clean = Instant::now();
+    let keys: Vec<String> = (0..produced).map(|n| format!("s{n}")).collect();
+    restore(engine, &client, &u0, &keys, &[]).await?;
+    eprintln!("{label:<8} deleted {} streamed documents in {:.1} s", keys.len(), t_clean.elapsed().as_secs_f64());
+    let _ = kafka.controller_client().map_err(|e| e.to_string())?.delete_topic(&topic, 30_000).await;
+
+    let report = json!({
+        "engine": engine.name(), "label": label, "collection": collection, "urls": urls, "topic": topic, "partitions": partitions,
+        "params": {"rates": rates, "seconds": seconds, "flat": flat, "restart": restart, "batch": batch, "written_means": searchable},
+        "phases": rows, "restart": restart_row,
+    });
+    std::fs::create_dir_all(out).map_err(s)?;
+    let path = out.join(format!("stream-{}.json", label.replace(' ', "-")));
+    std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).map_err(s)?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1887,6 +2392,9 @@ async fn main() {
         }
         Cmd::Writes { engine, url, concurrency, seconds, batch, samples, label, out } => {
             writes(&cli.collection, *engine, url, concurrency, *seconds, *batch, *samples, label.clone(), out).await
+        }
+        Cmd::Stream { engine, url, brokers, partitions, rates, seconds, flat, restart, batch, label, out } => {
+            stream(&cli.collection, *engine, url, brokers, *partitions, rates, *seconds, *flat, *restart, *batch, label.clone(), out).await
         }
     };
     if let Err(e) = r {

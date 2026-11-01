@@ -14,6 +14,7 @@ Elasticsearch and Solr, 28 October 2026) are in
 | `es.yaml`, `os.yaml`, `solr.yaml` | two data nodes of Elasticsearch 9.5.5, OpenSearch 3.9.0 or Solr 10.1.0 (SolrCloud, ZooKeeper embedded in `solr-0`) |
 | `vespa.yaml`, `vespa/` | Vespa 8.778.45: `vespa-0` (config server, cluster controller and the container that answers queries) and two content nodes; `vespa/package.sh` writes the application package (`services-cluster.xml`, `schemas/doc.sd`, the stopword lists); `vespa/services.xml` is the same application on one node, for trying it in Docker |
 | `strata.yaml`, `strata-coordinator.yaml` | two Strata shards and their coordinator |
+| `redpanda.yaml` | one Redpanda broker for the stream test |
 | `analyze.py` | scores the answers and prints the tables |
 | `../../src/bin/engine-compare.rs` | the client: `build` (a Strata shard), `load` (the other engines) and `run` (time the kinds and record the answers) |
 
@@ -146,6 +147,41 @@ write). Afterwards the written documents are deleted and the old ratings
 written back, so the queries can be run again; the segments differ from
 the loaded ones, so time the queries first.
 
+## Streams
+
+`compare.sh stream ENGINE` (`engine-compare stream`) starts one Redpanda
+broker on the clients' node (`redpanda.yaml`: 1 CPU and 1 GiB, outside the
+engine's budget, developer mode without fsync) and streams new documents
+through a topic of 4 partitions into the engine. A document is about 10 KB of
+JSON (its 1,024-number vector), keyed by a new id; a record's timestamp is
+the time it was due.
+
+- **Rates**: 250, 500, 1,000 and 2,000 documents a second for 30 s each,
+  stopping after the first rate the engine falls behind at; then 20,000
+  produced as fast as the producer can, for the consumer's top speed.
+- **The consumer**: one task a partition, reading with a 10 ms wait and
+  writing at most 500 documents a request, one request at a time: Strata
+  through `/v1/stream` (each line with its source offset, kept by the
+  server in the rows' transaction), Elasticsearch and OpenSearch `_bulk`,
+  Solr `/update`, Vespa one put a document, 48 at once a partition. Pushback
+  (429, 503) is retried a second later, so no event is dropped.
+- **Lag**: from when a document was due to the engine's answer to the write
+  holding it. Strata answers a batch once its rows are visible, and a Vespa
+  put is visible when it returns; Elasticsearch, OpenSearch and Solr answer
+  once a document is written, and it is searchable within their 1 s
+  refresh or soft commit. The read lag (due to read from the topic) is
+  reported beside it.
+- **Crash**: a last stream of 10,000 documents at half the top speed, whose
+  consumer crashes once half are written, right after a write and before
+  it commits its offsets, and starts again: Strata's from the offsets the
+  server has (`GET /v1/sources`), the others' from the offsets they
+  committed (every second, as Kafka's consumers do). It counts the events
+  written a second time (harmless here, since a document's id makes the
+  write idempotent, but each would count twice in a counter) and the
+  documents lost (none should be).
+
+Afterwards the streamed documents are deleted and the topic too.
+
 ## Running it
 
 With the cluster of `../kind-test.sh up` (its `/data` and `/beir`
@@ -155,12 +191,12 @@ mounts), from the repository root:
 export STRATA_WORK=/path/to/dbs          # mounted at /data; reports go to $STRATA_WORK/compare
 C=strata-server/deploy/compare/compare.sh
 $C image
-$C build;        $C up strata; $C run strata; $C writes strata; $C down strata
-$C up es;        $C load es;   $C run es;     $C writes es
+$C build;        $C up strata; $C run strata; $C writes strata; $C stream strata; $C down strata
+$C up es;        $C load es;   $C run es;     $C writes es;    $C stream es
 $C trial;        $C run es --kinds "hybrid (RRF),hybrid (weighted)" --paid --label es-trial; $C down es
-$C up os;        $C load os;   $C run os;     $C writes os;    $C down os
-$C up solr;      $C load solr; $C run solr;   $C writes solr;  $C down solr
-$C up vespa;     $C load vespa; $C run vespa; $C writes vespa; $C down vespa
+$C up os;        $C load os;   $C run os;     $C writes os;    $C stream os;    $C down os
+$C up solr;      $C load solr; $C run solr;   $C writes solr;  $C stream solr;  $C down solr
+$C up vespa;     $C load vespa; $C run vespa; $C writes vespa; $C stream vespa; $C down vespa
 python3 strata-server/deploy/compare/analyze.py $STRATA_WORK/compare $STRATA_DATA/quora
 # Strata at another split of its 3 CPUs, kept beside the default run:
 SHARD_CPU=1250m COORD_CPU=500m $C up strata; $C run strata --label strata-coord500m; $C down strata

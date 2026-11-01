@@ -9,6 +9,7 @@
 #   compare.sh load es|os|solr|vespa  # load the collection into it (timed), then its size on disk
 #   compare.sh run ENGINE [ARGS]      # time the query kinds and record answers; CPU use around it
 #   compare.sh writes ENGINE [ARGS]   # time writes, updates and how soon a write is found (after run: it changes the index, then puts it back)
+#   compare.sh stream ENGINE [ARGS]   # stream documents through Redpanda into it: rates, flat out, a consumer crash (after run)
 #   compare.sh trial                  # Elasticsearch: start the 30-day trial licence (hybrid retrievers)
 #   compare.sh down ENGINE            # stop it (Strata's shard files stay on the nodes)
 #
@@ -23,6 +24,7 @@ ES_IMAGE=elasticsearch:9.5.5
 SOLR_IMAGE=solr:10.1.0
 OS_IMAGE=opensearchproject/opensearch:3.9.0
 VESPA_IMAGE=vespaengine/vespa:8.778.45
+REDPANDA_IMAGE=redpandadata/redpanda:v25.2.9
 NS=compare
 HERE=$(cd "$(dirname "$0")" && pwd)
 K="kubectl --context kind-$CLUSTER -n $NS"
@@ -127,6 +129,7 @@ image)
     kind load docker-image "$IMAGE" --name "$CLUSTER" --nodes "$nodes"
     kind load docker-image "$ES_IMAGE" "$OS_IMAGE" "$SOLR_IMAGE" --name "$CLUSTER" --nodes "$(IFS=,; echo "${NODES[*]}")"
     kind load docker-image "$VESPA_IMAGE" --name "$CLUSTER" --nodes "$nodes"
+    kind load docker-image "$REDPANDA_IMAGE" --name "$CLUSTER" --nodes "$CLIENT_NODE"
     kubectl --context "kind-$CLUSTER" create namespace "$NS" --dry-run=client -o yaml | kubectl --context "kind-$CLUSTER" apply -f -
     ;;
 build)
@@ -223,6 +226,19 @@ writes)
     job "writes-$e" "$CLIENT_NODE" "" "" writes --engine "$e" --url "$(urls "$e")" --out "$OUT" "$@"
     cpu "$e" writes-after
     ;;
+stream)
+    # One broker beside the clients (1 CPU, 1 GiB, outside the engine's
+    # budget), started for the first stream and left for the next.
+    e=${1:?stream strata|es|os|solr|vespa}
+    shift
+    if ! $K get pod redpanda >/dev/null 2>&1; then
+        render redpanda.yaml 0 "$CLIENT_NODE" 1 1Gi | $K apply -f -
+    fi
+    $K wait --for=condition=Ready pod/redpanda --timeout=300s
+    cpu "$e" stream-before
+    job "stream-$e" "$CLIENT_NODE" "" "" stream --engine "$e" --url "$(urls "$e")" --brokers redpanda.redpanda:9092 --out "$OUT" "$@"
+    cpu "$e" stream-after
+    ;;
 trial)
     $K exec es-0 -- curl -sf -X POST 'http://localhost:9200/_license/start_trial?acknowledge=true'
     echo
@@ -237,7 +253,7 @@ down)
     esac
     ;;
 *)
-    sed -n '2,17p' "$0"
+    sed -n '2,18p' "$0"
     exit 2
     ;;
 esac
