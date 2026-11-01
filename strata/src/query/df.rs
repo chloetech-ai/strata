@@ -1777,9 +1777,22 @@ impl<'a> Lower<'a, '_> {
             Expr::Like { expr, pattern, .. } => vec![expr, pattern],
             _ => return Ok(None),
         };
+        // A list here is a column's (or the binder's guard around one), and
+        // a column costs nothing to lower: the other operands are lowered
+        // once a list is found, so that a condition nested in another is
+        // not lowered twice for each level.
+        let mut lists = false;
+        for o in &operands {
+            if let Expr::Output(_) = listy(o).unwrap_or(o) {
+                let d = self.expr(listy(o).unwrap_or(o), cols, schema)?;
+                lists |= matches!(d.get_type(schema)?, DataType::List(f) if f.data_type() != &DataType::Float32);
+            }
+        }
+        if !lists {
+            return Ok(None);
+        }
         let mut args = Vec::new();
         let mut slots: Vec<Option<Expr>> = Vec::new();
-        let mut lists = false;
         for o in &operands {
             // A literal stays in the condition.
             if let Expr::Lit(_) = o {
@@ -1787,17 +1800,12 @@ impl<'a> Lower<'a, '_> {
                 continue;
             }
             let inner = listy(o);
-            let d = self.expr(inner.unwrap_or(o), cols, schema)?;
-            lists |= matches!(d.get_type(schema)?, DataType::List(f) if f.data_type() != &DataType::Float32);
-            let at = Expr::Output(args.len() as u32);
-            args.push(d);
+            args.push(self.expr(inner.unwrap_or(o), cols, schema)?);
+            let at = Expr::Output(args.len() as u32 - 1);
             slots.push(Some(match inner {
                 Some(_) => listy_case(at),
                 None => at,
             }));
-        }
-        if !lists {
-            return Ok(None);
         }
         let mut slots = slots.into_iter();
         let mut next = |o: &Expr| slots.next().flatten().unwrap_or_else(|| o.clone());
