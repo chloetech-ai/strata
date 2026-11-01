@@ -52,6 +52,7 @@ use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::{
     binary_expr, cast, in_list, lit, not, when, ColumnarValue, Expr as DExpr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SortExpr, Volatility,
 };
+use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 
 use crate::error::{Error, Result};
@@ -59,6 +60,7 @@ use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
 use crate::query::ir::{Agg, ArithOp, CmpOp, Expr, Func, JoinKind, Node, Plan, SortKey};
 use crate::query::memory::Charge;
 use crate::query::ops::{self, Runner};
+use crate::query::steps::{self, Clock, Step};
 use crate::query::AggFn;
 use crate::schema::Schema;
 use crate::value::Value;
@@ -115,7 +117,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
     let pool = Arc::new(Pool { charge: charge.clone(), limited: opts.memory.is_some(), used: AtomicUsize::new(0), refused: Mutex::new(None) });
     let env = RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc().map_err(|e| Error::Query(format!("datafusion: {e}")))?;
     let ctx = SessionContext::new_with_config_rt(config, env);
-    let mut l = Lower { catalog, runner, opts, ctx, pool, next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge };
+    let mut l = Lower { catalog, runner, opts, ctx, pool, next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge, filter_docs: 0, scored: 0, clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
     match l.answer(&plan.root) {
         Ok(rs) => Ok(Outcome::Done(rs)),
         Err(Fail::No(why)) => Ok(Outcome::Fallback(why)),
@@ -265,6 +267,15 @@ struct Lower<'a, 'r> {
     per: Option<(*const Node, crate::query::ir::PerCap)>,
     lines: Vec<String>,
     charge: Charge,
+    /// The leaves' rows passing their filters, and scored, summed, as the
+    /// operators sum them.
+    filter_docs: u64,
+    scored: u64,
+    /// The steps of the query's profile ([`steps`]): each leaf's, its
+    /// executor's inside, and each DataFusion plan's operators.
+    clock: Clock,
+    prof: Vec<Step>,
+    dropped: u64,
 }
 
 impl<'a> Lower<'a, '_> {
@@ -277,6 +288,10 @@ impl<'a> Lower<'a, '_> {
         let rel = self.node(root, "query")?;
         let (mut rs, _) = self.rows(rel)?;
         rs.stats.plan = std::mem::take(&mut self.lines);
+        rs.stats.filter_docs = self.filter_docs;
+        rs.stats.scored = self.scored;
+        rs.stats.steps = std::mem::take(&mut self.prof);
+        rs.stats.steps_dropped = self.dropped;
         Ok(rs)
     }
 
@@ -501,9 +516,17 @@ impl<'a> Lower<'a, '_> {
         self.opts.check()?;
         *self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let ctx = self.ctx.clone();
+        let m = self.clock.mark(&self.prof);
         let (tx, rx) = std::sync::mpsc::channel();
         let task = runtime().spawn(async move {
-            let r = async move { ctx.execute_logical_plan(plan).await?.collect().await }.await;
+            let r = async move {
+                let df = ctx.execute_logical_plan(plan).await?;
+                let task = Arc::new(df.task_ctx());
+                let physical = df.create_physical_plan().await?;
+                let batches = datafusion::physical_plan::collect(physical.clone(), task).await?;
+                Ok::<_, DataFusionError>((batches, physical))
+            }
+            .await;
             let _ = tx.send(r);
         });
         let r = loop {
@@ -518,11 +541,24 @@ impl<'a> Lower<'a, '_> {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Fail::Err(Error::Query("datafusion: the plan's task stopped without an answer".into()))),
             }
         };
-        let batches = r.map_err(|e| match (e.find_root(), self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()).take()) {
+        let (batches, physical) = r.map_err(|e| match (e.find_root(), self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()).take()) {
             // Past the memory budget: the query's answer, as the operators'.
             (DataFusionError::ResourcesExhausted(_), Some(wanted)) => Fail::Err(self.charge.refuse(self.charge.counted().saturating_add(wanted))),
             _ => Fail::from(e),
         })?;
+        // The plan's operators, each a step inside this one.
+        let wall = m.t0.elapsed().as_nanos() as f64 / 1e3;
+        let ops = operator_steps(&physical, steps::us_at(m.t0), wall, self.clock.cpu);
+        // Their CPU time, on DataFusion's threads, counts in this step's.
+        if let Some(root) = ops.first() {
+            self.clock.helped_by(root);
+        }
+        self.dropped += steps::nest(&mut self.prof, &ops, 0) as u64;
+        let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let top = ops.first().map(|s| s.op.clone()).unwrap_or_default();
+        if self.clock.wrap(&mut self.prof, m, "datafusion", top, Some(rows)).is_none() {
+            self.dropped += 1;
+        }
         self.opts.check()?;
         Ok(batches)
     }
@@ -690,7 +726,10 @@ impl<'a> Lower<'a, '_> {
             }
         }
         self.opts.check()?;
+        let table = leaf.search().map(|s| s.table.clone()).unwrap_or_default();
+        let m = self.clock.mark(&self.prof);
         let rs = (self.runner)(&Plan::new(leaf))?;
+        self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
         if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, n)) {
             *read = rs.rows.len();
         }
@@ -702,13 +741,19 @@ impl<'a> Lower<'a, '_> {
         }
         self.lines.push(line);
         self.lines.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
+        self.filter_docs += rs.stats.filter_docs;
+        self.scored += rs.stats.scored;
         for r in &rs.rows {
             self.charge.row(r)?;
         }
         let n = rs.rows.len();
         let keys = (rs.keys.len() == n).then_some(rs.keys);
         let scores = (rs.scores.len() == n).then_some(rs.scores);
-        self.memory(rs.columns, rs.rows, keys, scores)
+        let rel = self.memory(rs.columns, rs.rows, keys, scores)?;
+        if self.clock.wrap(&mut self.prof, m, "leaf", format!("{what}: {table}"), Some(n as u64)).is_none() {
+            self.dropped += 1;
+        }
+        Ok(rel)
     }
 
     /// `input`, under a LIMIT that wants `want` of its rows, whose rows keep
@@ -1350,6 +1395,63 @@ const RESTRICT_ALWAYS: usize = 1024;
 /// set reads the right side whole and hashes it. Measured: a million keys
 /// against a million-row table, 1.1 s restricted, 0.15 s read whole.
 const RESTRICT_RATIO: u64 = 32;
+
+/// The steps of a DataFusion physical plan's operators, in pre-order:
+/// `HashJoinExec` as `hash join`, its line of `EXPLAIN` as the detail, and
+/// the rows it gave. DataFusion measures the time an operator spent itself
+/// (`elapsed_compute`, which leaves out its inputs', summed over its
+/// partitions); a step's time is that and its inputs', which are laid out
+/// one after the other from its start (a hash join builds from its first
+/// input, then probes with the second), as its CPU time when the query
+/// measures CPU. The operators of a plan run at once, each pulling from
+/// its inputs, so the times are the plan's work, not when each ran; scaled
+/// to fit within the plan's `wall` time, starting at `start`.
+fn operator_steps(plan: &Arc<dyn ExecutionPlan>, start: f64, wall: f64, cpu: bool) -> Vec<Step> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, depth: u16, at: f64, out: &mut Vec<Step>) -> f64 {
+        let metrics = plan.metrics().map(|m| m.aggregate_by_name());
+        let own = metrics.as_ref().and_then(|m| m.elapsed_compute()).map_or(0.0, |ns| ns as f64 / 1e3);
+        let line = displayable(plan.as_ref()).one_line().to_string();
+        let detail = line.split_once(": ").map_or("", |(_, d)| d).trim();
+        let i = out.len();
+        out.push(Step {
+            op: operator_name(plan.name()),
+            detail: steps::short(detail, 200),
+            depth,
+            start_us: at,
+            rows: metrics.as_ref().and_then(|m| m.output_rows()).map(|n| n as u64),
+            ..Step::default()
+        });
+        let mut t = at;
+        for c in plan.children() {
+            t += walk(c, depth.saturating_add(1), t, out);
+        }
+        out[i].us = own + (t - at);
+        out[i].us
+    }
+    let mut out = Vec::new();
+    let total = walk(plan, 0, 0.0, &mut out);
+    let scale = if total > wall && total > 0.0 { wall / total } else { 1.0 };
+    for s in &mut out {
+        s.cpu_us = cpu.then_some(steps::tenth(s.us));
+        s.start_us = start + s.start_us * scale;
+        s.us = steps::tenth(s.us * scale);
+    }
+    out
+}
+
+/// `HashJoinExec` as `hash join`, `SortPreservingMergeExec` as `sort
+/// preserving merge`.
+fn operator_name(name: &str) -> String {
+    let name = name.strip_suffix("Exec").unwrap_or(name);
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
 
 /// Whether the leaf `n` returns the same rows restricted or not, but for
 /// the rows the restriction drops: `Project [Sort] [Filter] Search`, with
