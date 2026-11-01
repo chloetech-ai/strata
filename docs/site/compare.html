@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Compare · Strata</title>
+<meta name="description" content="Strata's capabilities beside SQLite, PostgreSQL, LanceDB, Elasticsearch, OpenSearch, Solr, Vespa, Qdrant, Weaviate and Milvus, and where each of them is ahead.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="index.html"><i><b></b><b></b><b></b></i>Strata</a>
+  <nav class="nav" aria-label="Site">
+    <a href="features.html">Features</a>
+    <a href="compare.html" aria-current="page">Compare</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="examples.html">Queries</a>
+    <a href="use-cases.html">Use cases</a>
+    <a href="scale.html">Small to big</a>
+  </nav>
+  <div class="top-links"><a href="../">Docs</a><a href="https://github.com/chloetech-ai/strata">GitHub</a></div>
+</div></header>
+<div class="sample-banner gutter"><div class="wrap"><b>Sample</b><span>A draft for review. Cells with a dashed outline have not yet been checked against that project's current documentation.</span></div></div>
+
+<main>
+  <div class="gutter"><div class="wrap page-head">
+    <span class="eyebrow">Compare</span>
+    <h1>What usually takes several systems</h1>
+    <p class="lede">The search engines, the vector databases and the embedded databases each cover part of what an app with search and recommendations needs. Here is where Strata stands beside each of them, row by row, and below it, where they are ahead.</p>
+  </div></div>
+
+  <section class="gutter"><div class="wrap block" style="border-top:0; padding-top:0">
+    <div data-matrix></div>
+    <p class="small muted">Elasticsearch is shown at its default Basic licence, which is what the cluster benchmark runs; paid tiers add RRF, linear fusion and more. Hover or tab to a mark for its detail.</p>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">Why one engine</span>
+      <h2>One copy of each row, one planner, one structure</h2>
+    </div>
+    <div class="grid cols-3">
+      <div class="card"><h3>No pipelines to keep in step</h3><p>A row's text, columns, vector and edges are written in one transaction and read from one snapshot. There is no second store to re-index, and no window where the search box and the database disagree.</p></div>
+      <div class="card"><h3>Filters and rankings planned together</h3><p>The planner sees the filter, the words, the vector and the graph walk of one statement, with exact counts per segment, so it can run the filter inside the vector search or fuse rankings under the same filter.</p></div>
+      <div class="card"><h3>The laptop runs the cloud's structure</h3><p>A shard is a Strata file. The file an app opens in-process, the server in front of it and the cluster on Kubernetes read the same format and answer the same SQL.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">Where others are ahead</span>
+      <h2>What Strata does not do as well, yet</h2>
+      <p>A comparison that only lists wins is not one. These are the places to look before choosing Strata.</p>
+    </div>
+    <div class="behind">
+      <div class="card"><h4>Elasticsearch and OpenSearch</h4><p>Years of production at very large scale, an ecosystem around them (dashboards, ingest agents, security, alerting), analyzers for dozens of languages, and log analytics at petabyte scale.</p></div>
+      <div class="card"><h4>Vespa</h4><p>Proven serving at very large scale, tensor ranking with ONNX models in several phases, and a managed cloud. It is the fourth engine in the cluster benchmark for that reason.</p></div>
+      <div class="card"><h4>Milvus, Qdrant and Weaviate</h4><p>Indexes built for billions of vectors (on disk, on GPUs), more quantisation choices, and managed clouds. Strata has no vector index built for collections far larger than memory yet.</p></div>
+      <div class="card"><h4>SQLite and PostgreSQL</h4><p>Decades of hardening as general-purpose databases, and in SQLite's case a library that runs everywhere in a few hundred kilobytes. Strata loads 1.7–5.9× slower than SQLite when it builds an HNSW graph.</p></div>
+      <div class="card"><h4>Tantivy</h4><p>Faster facet counts on small collections (1.1–2.1× on three of four BEIR sets) and faster cold structured filters, where a range in Strata touches more pages.</p></div>
+      <div class="card"><h4>Strata itself</h4><p>A young project: English and simple analyzers only, no managed service, no point-in-time recovery between checkpoints yet, one writing process per file, and changes to the file format and cluster protocol still reviewed one by one.</p></div>
+    </div>
+  </div></section>
+</main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div><h4>Strata</h4><p>A search database with SQL, from one file to a cluster. Apache-2.0.</p></div>
+  <div><h4>This site</h4><ul><li><a href="features.html">Features</a></li><li><a href="compare.html">Compare</a></li><li><a href="benchmarks.html">Benchmarks</a></li><li><a href="examples.html">Queries and examples</a></li><li><a href="use-cases.html">Use cases and demos</a></li><li><a href="scale.html">Small to big</a></li></ul></div>
+  <div><h4>Documentation</h4><ul><li><a href="../strata/">Design</a></li><li><a href="../strata/query-language.html">Query language</a></li><li><a href="../strata/server.html">Server and cluster</a></li><li><a href="../strata/python.html">Python</a></li><li><a href="../strata/results.html">Results</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/strata">GitHub</a></li><li><a href="../engram/">Engram</a></li><li><a href="../reproduce.html">Reproducing the results</a></li></ul></div>
+</div></footer>
+<script src="assets/compare-data.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>

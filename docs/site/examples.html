@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Queries · Strata</title>
+<meta name="description" content="Strata's SQL on one shop: a search box, vectors and hybrid ranking, rerankers, recommendations, graph walks, JSON fields and joins, and the clients that run them.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="index.html"><i><b></b><b></b><b></b></i>Strata</a>
+  <nav class="nav" aria-label="Site">
+    <a href="features.html">Features</a>
+    <a href="compare.html">Compare</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="examples.html" aria-current="page">Queries</a>
+    <a href="use-cases.html">Use cases</a>
+    <a href="scale.html">Small to big</a>
+  </nav>
+  <div class="top-links"><a href="../">Docs</a><a href="https://github.com/chloetech-ai/strata">GitHub</a></div>
+</div></header>
+<div class="sample-banner gutter"><div class="wrap"><b>Sample</b><span>The queries follow the query language as documented today. They will be run against the benchmark's shop file, and each will show its answer and time, before this page goes live.</span></div></div>
+
+<main>
+  <div class="gutter"><div class="wrap page-head">
+    <span class="eyebrow">Queries and examples</span>
+    <h1>One shop, every kind of query</h1>
+    <p class="lede">Everything here runs on one schema: the products of a game shop, its customers' reviews, and the items bought together. Each statement runs unchanged on the file in your program, on one server, and on a cluster; the badge under each says so.</p>
+  </div></div>
+
+  <section class="gutter"><div class="wrap ex-layout">
+    <nav class="ex-nav" aria-label="Examples">
+      <span class="h">The data</span>
+      <a href="#schema">Schema</a>
+      <span class="h">Finding</span>
+      <a href="#search">A search box</a>
+      <a href="#hybrid">Vectors and hybrid</a>
+      <a href="#ranking">Ranking</a>
+      <span class="h">Suggesting</span>
+      <a href="#recs">Recommendations</a>
+      <a href="#graph">Graphs</a>
+      <span class="h">Everything else</span>
+      <a href="#sql">Analytics, JSON, SQL</a>
+      <a href="#data">Data in and out</a>
+      <a href="#clients">Clients</a>
+    </nav>
+
+    <div>
+      <!-- schema -->
+      <div class="ex-group" id="schema">
+        <div class="block-head"><span class="eyebrow">The data</span><h2>Three tables in one file</h2>
+          <p>Products carry text, columns, a JSON object of the attributes no schema names, and a vector the database fills from the title and features as rows arrive. Reviews are placed by customer, so a customer's history stays on one shard. <code>bought_with</code> is a table and a graph at once.</p></div>
+        <div class="ex">
+<pre data-lang="sql" data-title="shop.sql">CREATE TABLE products (
+  id KEYWORD PRIMARY KEY, title TEXT, features TEXT,
+  brand KEYWORD, category KEYWORD, platforms KEYWORD[],
+  price FLOAT, rating FLOAT, ratings INT, in_stock BOOL DEFAULT TRUE,
+  released TIMESTAMP, attrs JSON,
+  emb VECTOR OPTIONS(embed = 'title, features', model = 'bge-small-en-v1.5')
+);
+
+CREATE TABLE reviews (
+  id KEYWORD PRIMARY KEY, usr KEYWORD NOT NULL,
+  item KEYWORD NOT NULL REFERENCES products,
+  stars INT, body TEXT, ts TIMESTAMP
+) OPTIONS(shard_by = 'usr', cluster_by = 'usr');
+
+CREATE TABLE bought_with (
+  id KEYWORD PRIMARY KEY,
+  src KEYWORD NOT NULL REFERENCES products,
+  dst KEYWORD NOT NULL REFERENCES products,
+  w FLOAT DEFAULT 0
+) OPTIONS(edges = 'src, dst, w');</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/query-language.html">Types and options</a></div>
+        </div>
+      </div>
+
+      <!-- search -->
+      <div class="ex-group" id="search">
+        <div class="block-head"><span class="eyebrow">Finding</span><h2>A search box</h2></div>
+        <div class="ex">
+          <h3>Words, typos and synonyms</h3>
+          <p>BM25 over the title, a tilde for "close enough", and the table's synonyms, under ordinary filters.</p>
+<pre data-lang="sql">SELECT id, title, price, score() FROM products
+WHERE MATCH(title, 'controler~ OR gamepad', synonyms => 1)
+  AND price BETWEEN 20 AND 60 AND in_stock
+ORDER BY bm25(title, 'controller gamepad') DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>Facets beside the results</h3>
+          <p>Aggregates run over any result, so the counts beside a search box are one more statement on the same snapshot.</p>
+<pre data-lang="sql">SELECT brand, COUNT(*), AVG(rating), MIN(price) FROM products
+WHERE MATCH(title, :q)
+GROUP BY brand HAVING COUNT(*) >= 3 ORDER BY 2 DESC LIMIT 8;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>Autocomplete from what people searched</h3>
+          <p>Each search counts itself into a table, and the box completes from it, forgiving a typo in what has been typed so far.</p>
+<pre data-lang="sql">CREATE TABLE queries (id KEYWORD PRIMARY KEY, n INT DEFAULT 0) OPTIONS(cluster_by = 'id');
+
+INSERT INTO queries (id, n) VALUES (:q, 1)
+ON CONFLICT (id) DO UPDATE SET n = n + 1;
+
+SELECT id, n FROM queries
+WHERE PREFIX(id, :typed, fuzzy => 'auto')
+ORDER BY n DESC, id LIMIT 8;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/query-language.html#prefixes-and-autocomplete">Prefixes and autocomplete</a></div>
+        </div>
+      </div>
+
+      <!-- hybrid -->
+      <div class="ex-group" id="hybrid">
+        <div class="block-head"><span class="eyebrow">Finding</span><h2>Vectors and hybrid</h2></div>
+        <div class="ex">
+          <h3>Search by meaning</h3>
+          <p>The parameter is text; the database embeds it with the field's own model, so the app never handles a vector.</p>
+<pre data-lang="python">db.query("""SELECT id, title FROM products
+            WHERE category = 'Accessories' AND price &lt; 40
+            ORDER BY similarity(emb, :v) DESC LIMIT 10""",
+         v={"embed": "something to keep my console cool"})</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><span class="small muted">The filter runs inside the vector search when it is selective, and after it when it is not; the planner counts which.</span></div>
+        </div>
+        <div class="ex">
+          <h3>Words and meaning, fused</h3>
+          <p>Two ways to combine the rankings: normalised scores with weights, or reciprocal rank fusion, which needs no weights.</p>
+<pre data-lang="sql">-- weighted, on scores scaled to 0..1
+SELECT id, title, score() FROM products WHERE in_stock
+ORDER BY 0.5 * minmax(bm25(title, :q)) + 0.5 * minmax(similarity(emb, :v)) DESC LIMIT 10;
+
+-- by rank, with no weights to tune
+SELECT id, title, score() FROM products WHERE in_stock
+ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/query-language.html">Fusion: rrf, minmax, tmm, zscore</a></div>
+        </div>
+        <div class="ex">
+          <h3>More like this one</h3>
+<pre data-lang="sql">-- :v = {"vector_of": "B07XYZ", "field": "emb"}
+SELECT id, title FROM products WHERE id != 'B07XYZ'
+ORDER BY similarity(emb, :v) DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+      </div>
+
+      <!-- ranking -->
+      <div class="ex-group" id="ranking">
+        <div class="block-head"><span class="eyebrow">Finding</span><h2>Ranking</h2></div>
+        <div class="ex">
+          <h3>Any expression of scores and columns</h3>
+          <p>Relevance, rating and age in one order, with no plugin or script language.</p>
+<pre data-lang="sql">SELECT id, title, score() FROM products WHERE MATCH(title, :q)
+ORDER BY ln(1 + bm25(title, :q)) * (1 + 0.2 * coalesce(rating, 0))
+       + decay(released, now(), 2592000) DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>A cheap first phase, then a reranker</h3>
+          <p>The first phase keeps a hundred rows; a cross-encoder reads each with the query and orders the ten that are shown.</p>
+<pre data-lang="sql">WITH top AS (
+  SELECT * FROM products
+  ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 100
+)
+SELECT id, title, score() FROM top
+ORDER BY cross_encoder('ms-marco-MiniLM-L-6-v2', title, features, :q) DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/query-language.html#cross-encoders-cross_encodermodel-fields-query">Cross-encoders, local or hosted</a></div>
+        </div>
+        <div class="ex">
+          <h3>A ranking with a name</h3>
+          <p>Kept in the database, so the app asks for "the shop's ranking" and the people who tune it change it in one place.</p>
+<pre data-lang="sql">CREATE RANK PROFILE shop ON products AS
+  WITH top AS (SELECT * FROM products ORDER BY bm25(title, :q) DESC LIMIT 200)
+  SELECT * FROM top ORDER BY bm25(title, :q) * (1 + :pop * ln(1 + ratings)) DESC
+  WITH (pop => 0.1);
+
+SELECT id, title FROM products WHERE in_stock
+ORDER BY rank_profile('shop', q => :q) LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/query-language.html">Rank profiles, gbdt and the rank log</a></div>
+        </div>
+      </div>
+
+      <!-- recs -->
+      <div class="ex-group" id="recs">
+        <div class="block-head"><span class="eyebrow">Suggesting</span><h2>Recommendations</h2>
+          <p>The same statement reads a customer's history and ranks the catalogue by it, so a recommendation is a query, not a pipeline.</p></div>
+        <div class="ex">
+          <h3>What this customer will want next</h3>
+          <p><code>encode</code> runs a sequence model over the customer's last reviews and returns a vector; the products nearest it come back, at most two of a brand.</p>
+<pre data-lang="sql">SELECT id, title, brand FROM products WHERE in_stock
+ORDER BY similarity(emb, encode('next',
+  (SELECT item, ts FROM reviews WHERE usr = :u ORDER BY ts DESC LIMIT 200)))
+DESC MAX 2 PER brand LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/python.html">Training the sequence model</a></div>
+        </div>
+        <div class="ex">
+          <h3>Bought together, walked from the basket</h3>
+          <p>Personalised PageRank over <code>bought_with</code>, started from the items the customer reviewed last.</p>
+<pre data-lang="sql">SELECT id, title, score() FROM products WHERE in_stock
+ORDER BY ppr(bought_with,
+  (SELECT item FROM reviews WHERE usr = :u ORDER BY ts DESC LIMIT 20)) DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>All three signals at once</h3>
+<pre data-lang="sql">SELECT id, title FROM products WHERE in_stock AND MATCH(title, :q)
+ORDER BY rrf(
+  bm25(title, :q),
+  similarity(emb, encode('next', (SELECT item, ts FROM reviews WHERE usr = :u ORDER BY ts DESC LIMIT 200))),
+  ppr(bought_with, (SELECT item FROM reviews WHERE usr = :u ORDER BY ts DESC LIMIT 20))
+) DESC MAX 2 PER brand LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+      </div>
+
+      <!-- graph -->
+      <div class="ex-group" id="graph">
+        <div class="block-head"><span class="eyebrow">Suggesting</span><h2>Graphs</h2></div>
+        <div class="ex">
+          <h3>Two steps out, either direction</h3>
+<pre data-lang="sql">SELECT id, title, hops() FROM products
+WHERE REACHABLE(bought_with, 'B07XYZ', hops => 2, dir => 'both') AND in_stock
+ORDER BY hops(), rating DESC LIMIT 20;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>Start the walk from a search</h3>
+<pre data-lang="sql">SELECT id, title FROM products
+WHERE REACHABLE(bought_with, (SELECT id FROM products ORDER BY similarity(emb, :v) DESC LIMIT 3))
+LIMIT 50;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+      </div>
+
+      <!-- sql -->
+      <div class="ex-group" id="sql">
+        <div class="block-head"><span class="eyebrow">Everything else</span><h2>Analytics, JSON and plain SQL</h2></div>
+        <div class="ex">
+          <h3>A join with aggregates</h3>
+<pre data-lang="sql">SELECT p.brand, COUNT(*) AS reviews, AVG(r.stars) AS stars
+FROM reviews r JOIN products p ON r.item = p.id
+WHERE r.ts >= '2026-01-01'
+GROUP BY p.brand ORDER BY reviews DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>Keys no schema names</h3>
+          <p>Paths into a JSON column are indexed as they arrive; <code>json_paths</code> lists what has been seen.</p>
+<pre data-lang="sql">SELECT id, title, attrs.dims.w FROM products
+WHERE attrs.voltage >= 5 AND attrs.certs = 'UL'
+ORDER BY attrs.dims.w DESC LIMIT 10;
+
+SELECT * FROM json_paths('products', 'attrs');</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>Each customer's latest review</h3>
+<pre data-lang="sql">SELECT DISTINCT ON (usr) usr, item, stars, ts FROM reviews ORDER BY ts DESC, id;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>Change the schema in place</h3>
+<pre data-lang="sql">ALTER TABLE products ADD COLUMN stock INT NOT NULL DEFAULT 0;
+ALTER TABLE products RENAME COLUMN ratings TO rating_count;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><span class="small muted">On a cluster the change reaches every shard and replica in order with the writes.</span></div>
+        </div>
+        <div class="ex">
+          <h3>See the plan</h3>
+<pre data-lang="sql">EXPLAIN SELECT id FROM products WHERE MATCH(title, :q) AND price &lt; 40
+ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 10;</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+      </div>
+
+      <!-- data -->
+      <div class="ex-group" id="data">
+        <div class="block-head"><span class="eyebrow">Everything else</span><h2>Data in and out</h2>
+          <p>A SQLite file comes in as tables with their types and keys, and any table goes back out as one.</p></div>
+        <div class="ex">
+          <h3>From SQLite</h3>
+<pre data-lang="sh">strata-server import --db shop.strata shop.sqlite        # a new file from SQLite's tables
+curl -s -X POST 'localhost:7700/v1/import?format=sqlite&amp;plan=true' \
+  -H 'content-type: application/vnd.sqlite3' --data-binary @shop.sqlite   # what it would make
+curl -s 'localhost:7700/v1/export' -o copy.sqlite            # and back out</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span><a class="small" href="../strata/sqlite.html">SQLite in and out</a></div>
+        </div>
+        <div class="ex">
+          <h3>From Python</h3>
+<pre data-lang="python">import strata
+
+strata.from_sqlite("shop.sqlite", "shop.strata")
+db = strata.open("shop.strata")
+db.insert([{"id": "B0C1", "title": "Cooling stand", "brand": "Kiwi", "price": 29.0}], table="products")
+db.import_file("reviews.jsonl", table="reviews")</pre>
+          <div class="ex-meta"><span class="runs"><b>file</b><b>server</b><b>cluster</b></span></div>
+        </div>
+        <div class="ex">
+          <h3>A consistent copy while it serves</h3>
+<pre data-lang="sh">curl -s localhost:7700/v1/admin/checkpoint -H 'content-type: application/json' \
+  -d '{"name": "shop-2026-11-01.strata"}'</pre>
+          <div class="ex-meta"><span class="runs"><b>server</b><b>cluster</b></span></div>
+        </div>
+      </div>
+
+      <!-- clients -->
+      <div class="ex-group" id="clients">
+        <div class="block-head"><span class="eyebrow">Everything else</span><h2>The same query from every client</h2>
+          <p>In-process and over the network take the same SQL and the same parameters, and the Python client has the same methods as the embedded database.</p></div>
+        <div class="tabs" data-tabs>
+          <div class="tablist" role="tablist" aria-label="Client">
+            <button type="button" role="tab" data-tab="py">Python, in-process</button>
+            <button type="button" role="tab" data-tab="pyc">Python, a server</button>
+            <button type="button" role="tab" data-tab="http">HTTP</button>
+            <button type="button" role="tab" data-tab="rust">Rust</button>
+            <button type="button" role="tab" data-tab="sh">Shell</button>
+          </div>
+          <div data-panel="py">
+<pre data-lang="python">import strata
+
+db = strata.open("shop.strata")
+rows = db.query(
+    "SELECT id, title FROM products WHERE in_stock "
+    "ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 10",
+    q="wireless controller", v={"embed": "wireless controller"}).rows</pre>
+          </div>
+          <div data-panel="pyc" hidden>
+<pre data-lang="python">import strata
+
+db = strata.connect("http://127.0.0.1:7700")   # one server, or a cluster's coordinator
+rows = db.query(
+    "SELECT id, title FROM products WHERE in_stock "
+    "ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 10",
+    q="wireless controller", v={"embed": "wireless controller"}).rows</pre>
+          </div>
+          <div data-panel="http" hidden>
+<pre data-lang="sh">curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
+  "sql": "SELECT id, title FROM products WHERE in_stock ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 10",
+  "params": {"q": "wireless controller", "v": {"embed": "wireless controller", "field": "emb"}}
+}'</pre>
+          </div>
+          <div data-panel="rust" hidden>
+<pre data-lang="rust">use std::path::Path;
+use strata::{db::Db, query::Params, storage::DbOptions, value::Value};
+
+let db = Db::open(Path::new("shop.strata"), DbOptions::default())?;
+let q = Value::Str("wireless controller".into());
+let rs = db.query(
+    "SELECT id, title FROM products WHERE MATCH(title, :q) ORDER BY bm25(title, :q) DESC LIMIT 10",
+    &amp;Params::new().set("q", q),
+)?;
+for row in &amp;rs.rows { println!("{row:?}"); }</pre>
+          </div>
+          <div data-panel="sh" hidden>
+<pre data-lang="sh">strata shop.strata "SELECT id, title FROM products WHERE MATCH(title, 'wireless controller') LIMIT 10"
+strata shop.strata "SELECT id FROM products WHERE price &lt; 40 ORDER BY rating DESC LIMIT 5" --plan</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div></section>
+</main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div><h4>Strata</h4><p>A search database with SQL, from one file to a cluster. Apache-2.0.</p></div>
+  <div><h4>This site</h4><ul><li><a href="features.html">Features</a></li><li><a href="compare.html">Compare</a></li><li><a href="benchmarks.html">Benchmarks</a></li><li><a href="examples.html">Queries and examples</a></li><li><a href="use-cases.html">Use cases and demos</a></li><li><a href="scale.html">Small to big</a></li></ul></div>
+  <div><h4>Documentation</h4><ul><li><a href="../strata/">Design</a></li><li><a href="../strata/query-language.html">Query language</a></li><li><a href="../strata/server.html">Server and cluster</a></li><li><a href="../strata/python.html">Python</a></li><li><a href="../strata/results.html">Results</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/strata">GitHub</a></li><li><a href="../engram/">Engram</a></li><li><a href="../reproduce.html">Reproducing the results</a></li></ul></div>
+</div></footer>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Strata</title>
+<meta name="description" content="Strata is a search database with SQL: full text, columns, vectors and graph edges in one file your program opens, and the same file as a shard of a cluster on Kubernetes.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="index.html"><i><b></b><b></b><b></b></i>Strata</a>
+  <nav class="nav" aria-label="Site">
+    <a href="features.html">Features</a>
+    <a href="compare.html">Compare</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="examples.html">Queries</a>
+    <a href="use-cases.html">Use cases</a>
+    <a href="scale.html">Small to big</a>
+  </nav>
+  <div class="top-links"><a href="../">Docs</a><a href="https://github.com/chloetech-ai/strata">GitHub</a></div>
+</div></header>
+<div class="sample-banner gutter"><div class="wrap"><b>Sample</b><span>A draft of the Strata site for review. Hatched bars and "pending" tiles are placeholders, not measurements. Numbers tagged "earlier run" come from runs before the laptop benchmark, which will replace them.</span></div></div>
+
+<main>
+  <div class="gutter"><div class="wrap hero">
+    <div class="hero-copy">
+      <span class="eyebrow">A search database with SQL</span>
+      <h1>Start with one file. Grow to a cluster. <em>Keep the same SQL.</em></h1>
+      <p class="lede">Strata keeps full text, structured columns, vectors and graph edges over the same rows, in one file your program opens the way it opens SQLite. When the app outgrows the laptop, that file becomes a shard behind a coordinator on Kubernetes, and every query keeps working.</p>
+      <div class="actions">
+        <a class="btn primary" href="examples.html">See the queries</a>
+        <a class="btn" href="scale.html">From a file to a cluster</a>
+        <a class="btn" href="https://github.com/chloetech-ai/strata">Source on GitHub</a>
+      </div>
+    </div>
+    <div class="annot">
+      <div class="code">
+        <div class="code-head"><span>One statement, four indexes</span><button class="copy" type="button">Copy</button></div>
+<pre><code><span class="tok-kw">SELECT</span> id, title, price, <span class="tok-fn">score</span>() <span class="tok-kw">FROM</span> products
+<span class="tok-kw">WHERE</span> <span class="u-text"><span class="tok-fn">MATCH</span>(title, <span class="tok-str">'wireles~ controller'</span>)</span>
+  <span class="tok-kw">AND</span> <span class="u-cols">price <span class="tok-kw">BETWEEN</span> <span class="tok-num">20</span> <span class="tok-kw">AND</span> <span class="tok-num">60</span></span> <span class="tok-kw">AND</span> <span class="u-cols">in_stock = <span class="tok-kw">TRUE</span></span>
+<span class="tok-kw">ORDER BY</span> <span class="tok-fn">rrf</span>(
+    <span class="u-text"><span class="tok-fn">bm25</span>(title, <span class="tok-str">'wireless controller'</span>)</span>,
+    <span class="u-vec"><span class="tok-fn">similarity</span>(emb, <span class="tok-par">:query_vector</span>)</span>,
+    <span class="u-graph"><span class="tok-fn">ppr</span>(bought_with,</span> (<span class="tok-kw">SELECT</span> item <span class="tok-kw">FROM</span> reviews
+        <span class="tok-kw">WHERE</span> usr = <span class="tok-par">:user</span> <span class="tok-kw">ORDER BY</span> ts <span class="tok-kw">DESC</span> <span class="tok-kw">LIMIT</span> <span class="tok-num">5</span>)))
+  <span class="tok-kw">DESC</span> <span class="u-cols"><span class="tok-kw">MAX</span> <span class="tok-num">2</span> <span class="tok-kw">PER</span> brand</span> <span class="tok-kw">LIMIT</span> <span class="tok-num">10</span>;</code></pre>
+      </div>
+      <div class="annot-legend">
+        <span class="fam text">full text</span>
+        <span class="fam cols">columns</span>
+        <span class="fam vec">vectors</span>
+        <span class="fam graph">graph edges</span>
+      </div>
+      <p class="annot-note">A typo-tolerant match, a price range, a vector search and a PageRank walk from what the user reviewed last, fused into one ranking with at most two products per brand. The planner chooses, per segment and from exact counts, how to run each part.</p>
+    </div>
+  </div></div>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">What one file replaces</span>
+      <h2>The database, the search box and the recommendations, in the same rows</h2>
+      <p>An app that needs search and recommendations usually runs four systems and the code that keeps them in step. Strata keeps one copy of each row and indexes it every way at once, inside one transaction.</p>
+    </div>
+    <div class="replace">
+      <div class="col">
+        <div class="box"><b>SQLite or PostgreSQL</b><span>rows, transactions, joins</span></div>
+        <div class="box"><b>Elasticsearch or OpenSearch</b><span>the search box, facets, typos</span></div>
+        <div class="box"><b>A vector database</b><span>similar items, semantic search</span></div>
+        <div class="box"><b>A recommender service</b><span>next items, a feature store, glue code that fuses the lists</span></div>
+      </div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="one">
+        <h3><code>shop.strata</code></h3>
+        <p class="small muted">One file and its write-ahead log. Every table is indexed four ways, read in place through mmap, with ACID commits and snapshot isolation.</p>
+        <div class="core" aria-label="What the file holds">
+          <div style="--c: var(--fam-text)">full text<span>posting lists, BM25, positions</span></div>
+          <div style="--c: var(--fam-cols)">columns<span>keywords, numbers, times, JSON</span></div>
+          <div style="--c: var(--fam-vec)">vectors<span>HNSW, IVF, 8-bit codes</span></div>
+          <div style="--c: var(--fam-graph)">graph edges<span>edge fields, edge tables</span></div>
+          <div>rows and log<span>doc store, WAL, segments</span></div>
+        </div>
+      </div>
+    </div>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">Start small, go big</span>
+      <h2>The same file at every size</h2>
+      <p>A developer works against the structure the cluster runs: the same schema, the same SQL, the same file format and the same console, on a laptop or on a cloud's Kubernetes.</p>
+    </div>
+    <div class="ladder">
+      <div class="rung">
+        <span class="step">In your program</span>
+        <div class="viz" aria-hidden="true"><i class="s" style="height:30%"></i></div>
+        <h4>A file, no server</h4>
+        <p>Open it from Rust or Python, like <code>sqlite3</code>.</p>
+        <code>strata.open("shop.strata")</code>
+      </div>
+      <div class="rung">
+        <span class="step">One server</span>
+        <div class="viz" aria-hidden="true"><i class="s" style="height:30%"></i><i class="c" style="height:55%"></i></div>
+        <h4>The same file, served</h4>
+        <p>HTTP JSON, gRPC, API keys and the command center.</p>
+        <code>strata-server --db shop.strata</code>
+      </div>
+      <div class="rung">
+        <span class="step">Replicas</span>
+        <div class="viz" aria-hidden="true"><i class="s" style="height:30%"></i><i style="height:30%"></i><i style="height:30%"></i></div>
+        <h4>A primary and its copies</h4>
+        <p>Writes shipped to replicas; a new primary elected when one dies.</p>
+        <code>--replicas host:7701,…</code>
+      </div>
+      <div class="rung">
+        <span class="step">Shards</span>
+        <div class="viz" aria-hidden="true"><i class="c" style="height:55%"></i><i class="s" style="height:30%"></i><i class="s" style="height:30%"></i><i class="s" style="height:30%"></i></div>
+        <h4>A coordinator over shards</h4>
+        <p>Rows placed by slots, which move while it serves.</p>
+        <code>--shards a:7701,b:7701,…</code>
+      </div>
+      <div class="rung">
+        <span class="step">Kubernetes</span>
+        <div class="viz" aria-hidden="true"><i class="c" style="height:55%"></i><i class="s" style="height:30%"></i><i style="height:30%"></i><i class="s" style="height:30%"></i><i style="height:30%"></i><i class="s" style="height:30%"></i><i style="height:30%"></i></div>
+        <h4>The operator, laptop or cloud</h4>
+        <p>kind on the laptop, EKS or DigitalOcean in the cloud, one spec.</p>
+        <code>kubectl apply -f cluster.yaml</code>
+      </div>
+      <div class="same"><b>The same at every step</b><span>SQL</span><span>schema</span><span>file format</span><span>Python methods</span><span>command center</span></div>
+    </div>
+    <div class="actions"><a class="btn" href="scale.html">How each step works</a></div>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">Benchmarks</span>
+      <h2>Fast in one file, and fast as a cluster</h2>
+      <p>Measured on one MacBook Air, against the tools people use for each job today. Every number names its run and machine; the answers are checked for quality beside the speed.</p>
+    </div>
+    <div class="stats" data-headlines></div>
+    <div data-chart="b-p50"></div>
+    <div class="actions"><a class="btn" href="benchmarks.html">All the benchmarks</a></div>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">Features</span>
+      <h2>Everything a search and recommendation stack does, in SQL</h2>
+    </div>
+    <div class="grid cols-4">
+      <a class="card" href="features.html#text"><span class="fam text">full text</span><h3>Search a box can type into</h3><p>BM25, boolean queries, phrases, typos, synonyms, and autocomplete that tolerates typos.</p><span class="more">Full text</span></a>
+      <a class="card" href="features.html#columns"><span class="fam cols">columns</span><h3>Filters, facets, JSON</h3><p>Typed columns, ranges, facets, schemaless JSON attributes, and columns changed while serving.</p><span class="more">Columns</span></a>
+      <a class="card" href="features.html#vectors"><span class="fam vec">vectors</span><h3>Vectors, filtered and fused</h3><p>HNSW or IVF with the filter planned in, multi-vector MaxSim, sparse vectors, embeddings on write.</p><span class="more">Vectors</span></a>
+      <a class="card" href="features.html#graph"><span class="fam graph">graph edges</span><h3>Graphs inside a search</h3><p>Reachability, shortest paths and personalized PageRank, seeded by any query.</p><span class="more">Graphs</span></a>
+      <a class="card" href="features.html#ranking"><h3>Ranking you can ship</h3><p>Ranking expressions, rank profiles, LightGBM and XGBoost models, cross-encoders, interleaving.</p><span class="more">Ranking</span></a>
+      <a class="card" href="features.html#recs"><h3>Recommendations</h3><p>Sequence models in the query, items like a user's history, counted next items, semantic IDs.</p><span class="more">Recommendations</span></a>
+      <a class="card" href="features.html#sql"><h3>SQL and transactions</h3><p>Joins, subqueries, WITH, aggregates, ACID commits, SQLite in and out.</p><span class="more">SQL</span></a>
+      <a class="card" href="features.html#cluster"><h3>A cluster you can see</h3><p>Shards, replicas, failover, a Kubernetes operator, and a command center with flame graphs.</p><span class="more">Cluster and operations</span></a>
+    </div>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="block-head">
+      <span class="eyebrow">Use cases</span>
+      <h2>One shop, four jobs</h2>
+      <p>The site's examples follow one app, a game shop built on Amazon's Video Games reviews: 137,000 products, 4.6 million reviews and 2.8 million users.</p>
+    </div>
+    <div class="grid cols-4">
+      <a class="card" href="use-cases.html#app-search"><h3>The app's database and its search box</h3><p>Replace SQLite and FTS5 with one file that also ranks, filters, facets and completes.</p><span class="more">App search</span></a>
+      <a class="card" href="use-cases.html#recommendations"><h3>Recommendations next to search</h3><p>Similar items, the next item for a user and a home feed with rules, in the same SQL.</p><span class="more">Recommendations</span></a>
+      <a class="card" href="use-cases.html#rag"><h3>Retrieval for agents</h3><p>Hybrid retrieval with rerank phases for RAG, and long-term memory for coding agents.</p><span class="more">Agents and RAG</span></a>
+      <a class="card" href="use-cases.html#media"><h3>Images and sound</h3><p>Media fields embedded on write, searched by text or by example, captions made into text.</p><span class="more">Media search</span></a>
+    </div>
+  </div></section>
+
+  <section class="gutter"><div class="wrap block">
+    <div class="split">
+      <div class="block-head">
+        <span class="eyebrow">Built on Strata</span>
+        <h2>Engram: long-term memory for Claude Code</h2>
+        <p>Engram keeps every event of a coding session in a Strata file per project and brings back what a prompt needs. Recall is two searches under a filter, the briefing a handful of structured queries, and the model's own search tool is Strata's SQL. With it, Claude Code solved 100 of 100 follow-up tasks against 60 of 100 without.</p>
+        <div class="actions"><a class="btn primary" href="../demo/inspector.html">Try the inspector</a><a class="btn" href="../engram/">How Engram works</a></div>
+      </div>
+      <figure class="shot"><img src="../assets/img/inspector-new-session.png" alt="The Engram inspector: a new Claude Code session answers from memory, with the stored records beside it" loading="lazy"><figcaption>A new session answers from memory; on the right, the records the hooks wrote and what was distilled from them.</figcaption></figure>
+    </div>
+  </div></section>
+</main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div><h4>Strata</h4><p>A search database with SQL, from one file to a cluster. Apache-2.0.</p></div>
+  <div><h4>This site</h4><ul><li><a href="features.html">Features</a></li><li><a href="compare.html">Compare</a></li><li><a href="benchmarks.html">Benchmarks</a></li><li><a href="examples.html">Queries and examples</a></li><li><a href="use-cases.html">Use cases and demos</a></li><li><a href="scale.html">Small to big</a></li></ul></div>
+  <div><h4>Documentation</h4><ul><li><a href="../strata/">Design</a></li><li><a href="../strata/query-language.html">Query language</a></li><li><a href="../strata/server.html">Server and cluster</a></li><li><a href="../strata/python.html">Python</a></li><li><a href="../strata/results.html">Results</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/strata">GitHub</a></li><li><a href="../engram/">Engram</a></li><li><a href="../reproduce.html">Reproducing the results</a></li></ul></div>
+</div></footer>
+<script src="assets/bench-data.js"></script>
+<script src="assets/site.js"></script>
+</body>
+</html>
