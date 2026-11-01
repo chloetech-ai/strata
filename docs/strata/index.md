@@ -151,7 +151,7 @@ A relevance gate in CI holds the ranking still: BM25 through SQL on the test spl
 
 ### Vectors
 
-- **Forward vectors.** Every vector field stores float32 vectors for exact re-ranking and 8-bit scalar-quantised codes (SQ8, per-dimension min/max) for scanning: 4× less I/O, and with the query quantised too, integer dot products at about 14 ns per 1,024-dimension vector with NEON `usdot` on the M2 (AVX-512 VNNI on x86-64). A field can keep 1-bit codes instead (`"codes": "binary"`), an eighth of the memory, with 8 times as many candidates re-ranked ([results](results.md#compressed-vectors)).
+- **Forward vectors.** Every vector field stores float32 vectors for exact re-ranking and 8-bit scalar-quantised codes (SQ8, per-dimension min/max) for scanning: 4× less I/O, and with the query quantised too, integer dot products at about 14 ns per 1,024-dimension vector with NEON `usdot` on the M2 (AVX-512 VNNI on x86-64). A field can keep 1-bit codes instead (`"codes": "binary"`), an eighth of the memory, with 8 times as many candidates re-ranked, or RaBitQ codes of 1, 2 or 4 bits (`"rabitq1"`, `"rabitq2"`, `"rabitq4"`), whose per-row error bounds let the re-ranking skip candidates that cannot make the top k ([results](results.md#compressed-vectors)).
 - **Flat.** An exact scan of the codes plus float32 re-ranking: the right answer for small segments and very selective filters.
 - **IVF.** k-means centroids; each cluster's members are stored contiguously as a docID list followed by their codes. Probing a cluster is one sequential read, and a filter is applied by intersecting the cluster's list with the filter's, the same operation as a text conjunction.
 - **HNSW.** A navigable small-world graph with fixed-degree adjacency lists in the segment. Fastest in memory; random I/O on disk.
@@ -219,7 +219,7 @@ Strata is built for embedded retrieval: local search over documents with metadat
 | `strata/src/segment/` | immutable segments of named, aligned sections, read zero-copy through `mmap` |
 | `strata/src/text/` | analyser, Loom and BP128 postings, positions, BM25 with MaxScore and Block-Max WAND |
 | `strata/src/forward/` | columns with zone maps, keyword dictionaries and Pyramid lists, range histograms, facets, doc store |
-| `strata/src/vector/` | float32 vectors with SQ8 or binary codes, flat, IVF and HNSW, filtered search |
+| `strata/src/vector/` | float32 vectors with SQ8, binary or RaBitQ codes, flat, IVF and HNSW, filtered search |
 | `strata/src/graph/` | EDGES fields: out-edge CSR and reverse index per segment; BFS, shortest paths, personalized PageRank |
 | `strata/src/query/` | SQL binder, plan IR and `EXPLAIN`, logical plan, cost-based planner, executor, fusion, graph predicates and scores |
 | `strata/src/baselines/` | SQLite + FTS5 and Tantivy baselines (feature `baselines`) |

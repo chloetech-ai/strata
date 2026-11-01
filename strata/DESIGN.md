@@ -234,7 +234,8 @@ need no table.
   is written in format 3 only while a table uses a feature (a `BOOL` or
   `TIMESTAMP` field is `"bool"` or `"timestamp"`, a `NOT NULL` field
   `"not_null"`, a default `"default"`, a TEXT field's analyzer other than
-  `english` `"analyzer:<name>:<version>"`; a database that numbers its
+  `english` `"analyzer:<name>:<version>"`, a VECTOR field searched by
+  RaBitQ codes `"rabitq"`; a database that numbers its
   writes `"seq_no"`, for good; a table with a rank profile
   `"rank_profiles"`), and falls back to 2 or 1,
   in both meta slots, when the last one goes. A reader refuses a manifest

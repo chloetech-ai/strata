@@ -31,8 +31,8 @@
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
 //! a generated TEXT field joins), `analyzer` (`'english'`, the default, or
 //! `'simple'`; another than `english` makes the database format 3), `index` (`'hnsw'` with `m` and
-//! `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'`
-//! or `'binary'`), `dim`, and `embed` with `model` (the fields a VECTOR
+//! `ef_construction`, `'flat'`, or `'ivf'` with `nlist`), `codes` (`'sq8'`,
+//! `'binary'`, `'rabitq1'`, `'rabitq2'` or `'rabitq4'`), `dim`, and `embed` with `model` (the fields a VECTOR
 //! field is the model's embedding of). Field lists are a string, `'title,
 //! abstract'`, or `ARRAY['title', 'abstract']`. A KEYWORD[] column with
 //! `semantic_id = 'emb'` and `codebook = 'name'` holds the semantic IDs of
@@ -735,7 +735,7 @@ mod tests {
                papers KEYWORD[] REFERENCES papers (id), both_ TEXT OPTIONS(from = 'name, topics'),
                emb VECTOR(8) OPTIONS(index = 'ivf', nlist = 4, codes = 'binary'),
                e2 VECTOR OPTIONS(embed = ARRAY['name', 'bio'], model = 'hash:16', m = 8, ef_construction = 100),
-               hidden INT OPTIONS(indexed = false), flat VECTOR(3) OPTIONS(index = 'flat'),
+               hidden INT OPTIONS(indexed = false), flat VECTOR(3) OPTIONS(index = 'flat', codes = 'rabitq4'),
                sid KEYWORD[] OPTIONS(semantic_id = 'emb', codebook = 'items-rq'),
                patches VECTOR(4)[] OPTIONS(keep_f32 = true, pool = 0.9))",
             "CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD NOT NULL, item KEYWORD REFERENCES papers, done BOOL DEFAULT FALSE,
@@ -769,7 +769,7 @@ mod tests {
                papers KEYWORD[] REFERENCES papers (id), both_ TEXT OPTIONS(from = 'name, topics'),
                emb VECTOR(8) OPTIONS(index = 'ivf', nlist = 4, codes = 'binary'),
                e2 VECTOR OPTIONS(embed = ARRAY['name'], model = 'hash:16', m = 8),
-               hidden INT OPTIONS(indexed = false), flat VECTOR(3) OPTIONS(index = 'flat'))",
+               hidden INT OPTIONS(indexed = false), flat VECTOR(3) OPTIONS(index = 'flat', codes = 'RaBitQ1'))",
             &[&p],
         )
         .unwrap();
@@ -791,6 +791,7 @@ mod tests {
         assert_eq!(f("e2").embed.as_ref().map(|e| (e.from.clone(), e.model.as_str())), Some((vec!["name".to_string()], "hash:16")));
         assert!(!f("hidden").indexed);
         assert_eq!(f("flat").ty, FieldType::Vector { dim: 3, index: VectorIndexKind::Flat });
+        assert_eq!(f("flat").codes, VectorCodes::Rabitq1);
 
         let (s, ine) = create("CREATE TABLE w (a INT, p KEYWORD, PRIMARY KEY (a), FOREIGN KEY (p) REFERENCES papers)", &[&p]).unwrap();
         assert!(!ine);

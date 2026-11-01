@@ -239,6 +239,23 @@ Binary codes hold an eighth of the memory of 8-bit codes (a 32nd of the float32 
 
 The data is synthetic because the container could not download embeddings. How much recall binary codes cost depends on the embedding model, so measure it on the collection before choosing them. [`strata/notes/vector.md`](https://github.com/rkonow/strata/blob/main/strata/notes/vector.md#binary-codes) has every depth and the kernels; the numbers are in `strata/results/vector/`.
 
+RaBitQ codes (`"rabitq1"`, `"rabitq2"`, `"rabitq4"`: 1, 2 or 4 bits per dimension after a fixed random rotation, with an error bound per row) keep 8, 4 or 2 times as many candidates and skip the float32 rows of those whose bound shows they cannot make the top 10. Measured in a later run on the same container, idle, one search thread, on FiQA's 57,638 Cohere embed-english-v3 vectors (1,024 dimensions, 648 queries) at the default rerank of 40:
+
+| codes | index | candidates | float32 rows read | codes in memory | recall@10 | p50 |
+|---|---|---|---|---|---|---|
+| 8-bit | flat | 40 | 40 | 59.0 MB | 1.000 | 6.93 ms |
+| 1-bit | flat | 320 | 320 | 7.4 MB | 1.000 | 1.93 ms |
+| RaBitQ 1-bit | flat | 320 | 91 | 7.8 MB | 1.000 | 2.50 ms |
+| RaBitQ 2-bit | flat | 160 | 28 | 15.2 MB | 1.000 | 5.31 ms |
+| RaBitQ 4-bit | flat | 80 | 13 | 30.0 MB | 1.000 | 10.11 ms |
+| 8-bit | HNSW, ef 64 | 40 | 40 | 59.0 MB | 0.982 | 0.33 ms |
+| 1-bit | HNSW | 320 | 320 | 7.4 MB | 0.997 | 0.83 ms |
+| RaBitQ 1-bit | HNSW | 320 | 89 | 7.8 MB | 0.998 | 0.57 ms |
+| RaBitQ 2-bit | HNSW | 160 | 28 | 15.2 MB | 0.996 | 0.49 ms |
+| RaBitQ 4-bit | HNSW | 80 | 13 | 30.0 MB | 0.987 | 0.40 ms |
+
+On these embeddings the bounds cut the float32 rows read 3.5 times (1 bit), 11 times (2 bits) and 24 times (4 bits) from binary codes' 320, at the same recall. Each RaBitQ row costs more to scan: 1-bit codes 1.3 to 1.6 times binary's flat time, 4-bit codes 1.4 to 1.5 times SQ8's at half its memory. On the synthetic data above, where every row's error is alike, 1-bit RaBitQ prunes nothing at the default rerank and matches binary codes (0.995 against 0.994 with 320 rows), while 2-bit codes reach 1.000 reading 159 rows and 4-bit codes 1.000 reading 33. So RaBitQ codes pay off where reading float32 rows is the cost, as with a table larger than memory; [`strata/notes/vector.md`](https://github.com/rkonow/strata/blob/main/strata/notes/vector.md#rabitq-codes) has both runs, IVF and builds, in `strata/results/vector/codes-*-rabitq.json`.
+
 ## MaxSim
 
 `maxsim(emb, vectors)` runs one vector search per query vector and scores the union of their top 10 exactly against every query vector. Measured on 200,000 synthetic 384-dimension unit vectors (1,000 centres sharing a common direction, as for [compressed vectors](#compressed-vectors)), 100 lists of query vectors, `LIMIT 10`, one query thread, on the 4-core cloud container (Intel Xeon at 2.10 GHz, AVX-512 VNNI), not the M2:

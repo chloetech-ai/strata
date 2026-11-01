@@ -128,7 +128,7 @@ A database starts with one table, whose schema is set when the database is creat
 | `from` | `text` | | generated: the named fields' text joined, such as a `body` of title and description to search at once |
 | `dim` | `vector` | the model's, for a known `embed` model | the number of dimensions |
 | `index` | `vector` | `"hnsw"` (m 16, ef_construction 200) | `"flat"` (an exact scan), `{"hnsw": {"m": 32, "ef_construction": 400}}` or `{"ivf": {"nlist": 1024}}` |
-| `codes` | `vector` | `"sq8"` (a byte a dimension) | `"binary"`: a bit a dimension, 1/32 of the vectors, rescored |
+| `codes` | `vector` | `"sq8"` (a byte a dimension) | `"binary"`: a bit a dimension, 1/32 of the vectors, rescored; `"rabitq1"`, `"rabitq2"` or `"rabitq4"`: RaBitQ codes of that many bits a dimension, whose error bounds skip rescoring rows that cannot rank ([results](results.md#compressed-vectors)); RaBitQ makes the database format 3 |
 | `kind` | `media` | any | `"image"`, `"audio"`, `"video"` or `"pdf"`: the files the field takes |
 | `embed` | `vector` | | `{"from": [fields], "model": name}`: the vectors are that model's embedding of those fields ([below](#embedded-vector-fields)) |
 | `not_null` | all but the key | false | a write must give the field a value (`NOT NULL`) |

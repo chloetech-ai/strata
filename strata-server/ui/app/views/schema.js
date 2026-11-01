@@ -505,7 +505,7 @@ function designer(host, bar, { seed, onCreated }) {
       const ix = typeof f.index === "object" ? Object.keys(f.index)[0] : f.index || "hnsw";
       out.push(lab("Index", "hnsw: fast approximate search (the default); flat: exact, for small tables; ivf: clusters", seg([["hnsw", "HNSW"], ["flat", "flat"], ["ivf", "IVF"]], ix, (v) => { f.index = v === "ivf" ? { ivf: { nlist: 256 } } : v === "hnsw" ? undefined : v; changed(); })));
       if (ix === "ivf") out.push(lab("Lists", "", h("input", { class: "input sm num", type: "number", min: 1, value: f.index.ivf.nlist, style: { width: "90px" }, oninput: (e) => { f.index.ivf.nlist = Number(e.target.value) || 256; changed(false); } })));
-      out.push(lab("Codes", "sq8: 8 bits a dimension (the default); binary: 1 bit, 32 times smaller", sel(f, "codes", ["sq8", "binary"], "sq8")));
+      out.push(lab("Codes", "sq8: 8 bits a dimension (the default); rabitq4, rabitq2, rabitq1: 4, 2 or 1 bits of the rotated vectors and a correction a row; binary: 1 bit, signs around the mean", sel(f, "codes", ["sq8", "rabitq4", "rabitq2", "rabitq1", "binary"], "sq8")));
     }
     if (f.type === "media") out.push(lab("Kind", "", sel(f, "kind", ["image", "audio", "video", "pdf", "file"])));
     if (!out.length) out.push(h("div", { class: "small muted" }, `${typeMeta(f).label} has no options.`));
