@@ -2573,7 +2573,7 @@ impl Database {
             .iter()
             .map(|v| {
                 let expired = retention.map_or(0, |(f, cutoff)| self.expired_in(v, &snap.schema().fields[f].key(), cutoff));
-                SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0) }
+                SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0), spilled: v.file.section_bytes(crate::segment::spill::streams) }
             })
             .collect();
         let cap = |g: &[u64]| match (m.record.cap(g), budget) {
@@ -2581,9 +2581,10 @@ impl Database {
             (a, b) => a.or(b),
         };
         let threads = build_threads(&self.opts.build).unwrap_or(1);
-        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap, threads);
+        let spill = self.opts.merge_spill_bytes;
+        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap, threads, spill);
         let mut group = group?;
-        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads);
+        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads, spill);
         // It fits the budget alone: it waits for running merges to finish.
         if budget.is_some_and(|b| m.memory() + memory > b) {
             return None;

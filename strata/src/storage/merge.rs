@@ -46,6 +46,9 @@ pub struct SegmentInfo {
     pub n_live: u32,
     /// The size of the segment's image.
     pub bytes: u64,
+    /// The bytes of its image in sections a merge that spills writes out as
+    /// it goes instead of holding ([`crate::segment::spill::streams`]).
+    pub spilled: u64,
 }
 
 /// Work done by `Database::merge`.
@@ -128,22 +131,33 @@ pub(crate) const MERGE_BATCH_BYTES: usize = 32 << 20;
 pub(crate) const MERGE_BATCH_DOCS: std::ops::Range<usize> = 16_384..262_144;
 
 /// The estimated peak memory of merging segments with a build on
-/// `threads` threads. A merge holds a batch of decoded documents, the next
-/// one being decoded, and the builder's structures for the batch; it keeps
-/// compact forms of the batches before (packed postings, keys, the
-/// compressed doc store, columns, a vector graph) and finally the merged
-/// sections. Over the first four batches' worth of input image that comes
-/// to at most about [`memory_per_image_byte`] times the bytes; each byte
-/// after them adds about [`memory_per_streamed_byte`]. Only image bytes
-/// that hold live documents count.
-pub fn merge_memory(segs: &[SegmentInfo], threads: usize) -> u64 {
-    let live: f64 = segs.iter().map(|s| s.bytes as f64 * s.n_live as f64 / s.n_docs.max(1) as f64).sum();
+/// `threads` threads, in a database whose merges of more than `spill`
+/// bytes of live image spill ([`crate::storage::DbOptions::merge_spill_bytes`]).
+/// A merge holds a batch of decoded documents, the next one being decoded,
+/// and the builder's structures for the batch; it keeps compact forms of
+/// the batches before (packed postings, keys, columns, vector codes and
+/// graph) and, unless it spills, the vectors' float32 rows, the compressed
+/// doc store and finally the merged sections. Over the first four batches'
+/// worth of input image that comes to at most about
+/// [`memory_per_image_byte`] times the bytes. Each byte after them adds
+/// about [`memory_per_streamed_byte`] in a merge that does not spill; in
+/// one that does, only the bytes of the sections it holds count
+/// ([`SegmentInfo::spilled`] are left out), at [`memory_per_held_byte`].
+/// Only image bytes that hold live documents count.
+pub fn merge_memory(segs: &[SegmentInfo], threads: usize, spill: u64) -> u64 {
+    let live_share = |s: &SegmentInfo| s.n_live as f64 / s.n_docs.max(1) as f64;
+    let live: f64 = segs.iter().map(|s| s.bytes as f64 * live_share(s)).sum();
+    let spilled: f64 = segs.iter().map(|s| s.spilled.min(s.bytes) as f64 * live_share(s)).sum();
     // A batch is MERGE_BATCH_BYTES, unless that is fewer documents than a
     // batch takes at least.
     let per_doc = segs.iter().map(|s| s.bytes as f64 / s.n_docs.max(1) as f64).fold(0.0, f64::max);
     let batch = (MERGE_BATCH_BYTES as f64).max(MERGE_BATCH_DOCS.start as f64 * per_doc);
     let first = live.min(4.0 * batch);
-    (first * memory_per_image_byte(threads) + (live - first) * memory_per_streamed_byte(threads)) as u64
+    let rest = match live > spill as f64 {
+        true => (live - first) * (1.0 - spilled / live) * memory_per_held_byte(threads),
+        false => (live - first) * memory_per_streamed_byte(threads),
+    };
+    (first * memory_per_image_byte(threads) + rest) as u64
 }
 
 /// A merge's peak memory per byte of input image, over its first four
@@ -165,6 +179,18 @@ pub fn memory_per_image_byte(threads: usize) -> f64 {
 /// 384-dim vectors 1.2 to 1.4 and short texts 0.4 to 0.5.
 pub fn memory_per_streamed_byte(threads: usize) -> f64 {
     2.0 + 0.25 * threads.max(1) as f64
+}
+
+/// What each byte of input image past a merge's first four batches adds to
+/// the peak memory of a merge that spills, counting only the bytes of the
+/// sections it holds (not [`SegmentInfo::spilled`]), with a margin over
+/// what was measured between merges of 280 to 1,963 MB
+/// (`examples/merge_memory.rs`): 1.9 to 2.7 on one thread and 2.4 to 3.4
+/// on four, 10-word texts taking the most (a keyword and a key per short
+/// row) and 64-dim vectors next, then long texts, 256-dim (the scale
+/// probe's table) and 384-dim vectors.
+pub fn memory_per_held_byte(threads: usize) -> f64 {
+    2.75 + 0.25 * threads.max(1) as f64
 }
 
 /// The memory this process may use: the tightest cgroup limit that
@@ -349,17 +375,17 @@ impl MergePolicy {
 
     /// [`select`](Self::select) among the segments `skip` does not name,
     /// with the selected group cut to its smallest inputs until
-    /// [`merge_memory`] (with a build on `threads` threads) estimates it at
-    /// most `cap(group)`. A group that
+    /// [`merge_memory`] (with a build on `threads` threads, merges of more
+    /// than `spill` bytes spilling) estimates it at most `cap(group)`. A group that
     /// cannot be cut that far (one input, or two that do not fit) is left
     /// alone and the policy selects again without it. Returns the group and
     /// whether it was cut, or whether any group was left alone.
-    pub fn select_within(&self, segs: &[SegmentInfo], skip: impl Fn(u64) -> bool, cap: impl Fn(&[u64]) -> Option<u64>, threads: usize) -> (Option<Vec<u64>>, bool) {
+    pub fn select_within(&self, segs: &[SegmentInfo], skip: impl Fn(u64) -> bool, cap: impl Fn(&[u64]) -> Option<u64>, threads: usize, spill: u64) -> (Option<Vec<u64>>, bool) {
         let mut left: Vec<SegmentInfo> = segs.iter().copied().filter(|s| !skip(s.id)).collect();
         let mut limited = false;
         while let Some(mut group) = self.select(&left) {
             let info = |id: &u64| *left.iter().find(|s| s.id == *id).expect("selected from these");
-            let fits = |g: &[u64]| cap(g).is_none_or(|c| merge_memory(&g.iter().map(info).collect::<Vec<_>>(), threads) <= c);
+            let fits = |g: &[u64]| cap(g).is_none_or(|c| merge_memory(&g.iter().map(info).collect::<Vec<_>>(), threads, spill) <= c);
             // Smallest inputs first: they are cheapest to keep.
             group.sort_by_key(|id| (info(id).n_live, *id));
             let whole = group.len();
@@ -381,8 +407,11 @@ mod tests {
     use super::*;
 
     fn seg(id: u64, n_docs: u32, n_live: u32) -> SegmentInfo {
-        SegmentInfo { id, n_docs, n_live, bytes: n_docs as u64 * 100 }
+        SegmentInfo { id, n_docs, n_live, bytes: n_docs as u64 * 100, spilled: 0 }
     }
+
+    /// No merge spills.
+    const HELD: u64 = u64::MAX;
 
     #[test]
     fn tiers_and_expunge() {
@@ -407,33 +436,33 @@ mod tests {
     fn selections_fit_their_memory_cap() {
         let p = MergePolicy { merge_factor: 4, floor_docs: 100, max_merged_docs: 10_000, max_deleted_ratio: 0.5 };
         let segs: Vec<SegmentInfo> = (1..=6).map(|i| seg(i, 50 + i as u32, 50 + i as u32)).collect();
-        let one = merge_memory(&segs[..1], 1);
+        let one = merge_memory(&segs[..1], 1, HELD);
         let none = |_: u64| false;
         // No cap: the policy's group.
-        assert_eq!(p.select_within(&segs, none, |_| None, 1), (Some(vec![1, 2, 3, 4]), false));
+        assert_eq!(p.select_within(&segs, none, |_| None, 1, HELD), (Some(vec![1, 2, 3, 4]), false));
         // Cut to its smallest inputs.
-        assert_eq!(p.select_within(&segs, none, |_| Some(3 * one), 1), (Some(vec![1, 2]), true));
+        assert_eq!(p.select_within(&segs, none, |_| Some(3 * one), 1, HELD), (Some(vec![1, 2]), true));
         // Claimed segments are left to their merge.
-        assert_eq!(p.select_within(&segs, |id| id <= 2, |_| None, 1), (Some(vec![3, 4, 5, 6]), false));
+        assert_eq!(p.select_within(&segs, |id| id <= 2, |_| None, 1, HELD), (Some(vec![3, 4, 5, 6]), false));
         // A group that cannot be cut to fit is left alone; the rest are
         // too few for another.
-        assert_eq!(p.select_within(&segs, none, |_| Some(one), 1), (None, true));
+        assert_eq!(p.select_within(&segs, none, |_| Some(one), 1, HELD), (None, true));
         // A cap on some segments only (an interrupted merge's): the
         // smallest two are left alone, the next four fit.
         let cap = |g: &[u64]| g.contains(&1).then_some(one);
-        assert_eq!(p.select_within(&segs, none, cap, 1), (Some(vec![3, 4, 5, 6]), true));
+        assert_eq!(p.select_within(&segs, none, cap, 1, HELD), (Some(vec![3, 4, 5, 6]), true));
         // A single-segment rewrite that does not fit is left alone too.
         let gone = [seg(7, 1000, 100)];
-        assert_eq!(p.select_within(&gone, none, |_| Some(1), 1), (None, true));
-        assert_eq!(p.select_within(&gone, none, |_| None, 1), (Some(vec![7]), false));
+        assert_eq!(p.select_within(&gone, none, |_| Some(1), 1, HELD), (None, true));
+        assert_eq!(p.select_within(&gone, none, |_| None, 1, HELD), (Some(vec![7]), false));
     }
 
     #[test]
     fn merges_past_four_batches_cost_less_per_byte() {
         const MB: u64 = 1 << 20;
         // Short documents, 128 bytes each: a batch is 32 MB of image.
-        let segs = |mb: u64| -> Vec<SegmentInfo> { (1..=4).map(|id| SegmentInfo { id, n_docs: (mb * MB / 4 / 128) as u32, n_live: (mb * MB / 4 / 128) as u32, bytes: mb * MB / 4 }).collect() };
-        let at = |mb: u64, threads: usize| merge_memory(&segs(mb), threads) as f64;
+        let segs = |mb: u64| -> Vec<SegmentInfo> { (1..=4).map(|id| SegmentInfo { id, n_docs: (mb * MB / 4 / 128) as u32, n_live: (mb * MB / 4 / 128) as u32, bytes: mb * MB / 4, spilled: mb * MB / 10 }).collect() };
+        let at = |mb: u64, threads: usize| merge_memory(&segs(mb), threads, HELD) as f64;
         for threads in [1, 4, 8] {
             // Up to four batches, each byte costs the full estimate.
             assert!((at(100, threads) - 100.0 * MB as f64 * memory_per_image_byte(threads)).abs() < 1e3);
@@ -444,11 +473,33 @@ mod tests {
         }
         // Deleted documents' bytes do not count.
         let half: Vec<SegmentInfo> = segs(1000).into_iter().map(|s| SegmentInfo { n_live: s.n_docs / 2, ..s }).collect();
-        assert!((merge_memory(&half, 1) as f64 - at(500, 1)).abs() < 1e3);
+        assert!((merge_memory(&half, 1, HELD) as f64 - at(500, 1)).abs() < 1e3);
         // Long documents make a batch of at least 16,384 of them, so four
         // batches of 8 KB documents are 512 MB.
-        let long: Vec<SegmentInfo> = (1..=4).map(|id| SegmentInfo { id, n_docs: 32_768, n_live: 32_768, bytes: 32_768 * 8192 }).collect();
-        assert!((merge_memory(&long, 1) as f64 - 1024.0 * MB as f64 * memory_per_image_byte(1) + 512.0 * MB as f64 * (memory_per_image_byte(1) - memory_per_streamed_byte(1))).abs() < 1e3);
+        let long: Vec<SegmentInfo> = (1..=4).map(|id| SegmentInfo { id, n_docs: 32_768, n_live: 32_768, bytes: 32_768 * 8192, spilled: 0 }).collect();
+        assert!((merge_memory(&long, 1, HELD) as f64 - 1024.0 * MB as f64 * memory_per_image_byte(1) + 512.0 * MB as f64 * (memory_per_image_byte(1) - memory_per_streamed_byte(1))).abs() < 1e3);
+    }
+
+    #[test]
+    fn merges_that_spill_count_only_the_sections_they_hold() {
+        const MB: u64 = 1 << 20;
+        // 40% of each image streams when the merge spills.
+        let segs = |mb: u64| -> Vec<SegmentInfo> { (1..=4).map(|id| SegmentInfo { id, n_docs: (mb * MB / 4 / 128) as u32, n_live: (mb * MB / 4 / 128) as u32, bytes: mb * MB / 4, spilled: mb * MB / 10 }).collect() };
+        let at = |mb: u64, threads: usize, spill: u64| merge_memory(&segs(mb), threads, spill) as f64;
+        for threads in [1, 4, 8] {
+            // The first four batches cost what they did.
+            assert!((at(100, threads, 0) - at(100, threads, HELD)).abs() < 1e3);
+            // Past them, each byte adds 60% of the held cost.
+            let added = (at(1000, threads, 0) - at(500, threads, 0)) / (500 * MB) as f64;
+            assert!((added - 0.6 * memory_per_held_byte(threads)).abs() < 1e-6, "{added}");
+            assert!(at(1000, threads, 0) < at(1000, threads, HELD));
+        }
+        // A merge of no more than the threshold does not spill.
+        assert_eq!(at(1000, 4, 1000 * MB), at(1000, 4, HELD));
+        assert!(at(1000, 4, 1000 * MB - 1) < at(1000, 4, HELD));
+        // Deleted documents' spilled bytes do not count either.
+        let half: Vec<SegmentInfo> = segs(1000).into_iter().map(|s| SegmentInfo { n_live: s.n_docs / 2, ..s }).collect();
+        assert!((merge_memory(&half, 1, 0) as f64 - at(500, 1, 0)).abs() < 1e3);
     }
 
     #[test]
