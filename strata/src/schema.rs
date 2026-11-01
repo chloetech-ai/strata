@@ -404,12 +404,19 @@ impl Field {
     /// `v` in the form this field's column stores: a BOOL field's value
     /// as 1 or 0 (from a boolean, 1 or 0, or the text `true`, `false`,
     /// `t`, `f`, `1` or `0`), a TIMESTAMP field's as microseconds since
-    /// the epoch (from a timestamp, that integer, or ISO 8601 text), and a
-    /// boolean given to any other INT or FLOAT field as 1 or 0. Any other
-    /// value is returned as it is, for [`crate::value::validate`] to
-    /// judge.
+    /// the epoch (from a timestamp, that integer, or ISO 8601 text), a
+    /// boolean given to any other INT field as 1 or 0, and a FLOAT field's
+    /// value as a FLOAT, as its column reads it back (an integer or a
+    /// boolean as its double, -0.0 as 0.0). Any other value is returned as
+    /// it is, for [`crate::value::validate`] to judge.
     pub fn store(&self, v: crate::value::Value) -> Result<crate::value::Value> {
         use crate::value::Value;
+        let float = |v: Value| match v {
+            Value::Bool(b) => Value::Float(b as i64 as f64),
+            Value::Int(x) => Value::Float(x as f64),
+            Value::Float(x) if x == 0.0 => Value::Float(0.0),
+            v => v,
+        };
         let bad = |v: &Value, want: Logical| Error::Schema(format!("bad value for {}: {v:?} ({})", self.name, want.expects()));
         const BOOL: Logical = Logical::Bool;
         const TIME: Logical = Logical::Timestamp;
@@ -429,7 +436,7 @@ impl Field {
                 None => return Err(bad(&Value::Str(s), TIME)),
             },
             (Some(Logical::Timestamp), v) => return Err(bad(&v, TIME)),
-            (None, Value::Bool(b)) if matches!(self.ty, FieldType::Int | FieldType::Float) => Value::Int(b as i64),
+            (None, Value::Bool(b)) if self.ty == FieldType::Int => Value::Int(b as i64),
             (None, Value::List(xs)) if self.ty == FieldType::Int => Value::List(
                 xs.into_iter()
                     .map(|x| match x {
@@ -438,6 +445,8 @@ impl Field {
                     })
                     .collect(),
             ),
+            (None, Value::List(xs)) if self.ty == FieldType::Float => Value::List(xs.into_iter().map(float).collect()),
+            (None, v) if self.ty == FieldType::Float => float(v),
             (None, v) => v,
         })
     }

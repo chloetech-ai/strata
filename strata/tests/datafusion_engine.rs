@@ -369,3 +369,68 @@ fn auto_leaves_small_plans_to_the_operators_and_runs_large_ones_on_datafusion() 
         assert_eq!(ran_on_datafusion(&got), big, "{sql}: {:?}", got.stats.plan);
     }
 }
+
+// A leaf DataFusion reads as Arrow columns (`Db::execute_leaf`) holds what
+// its rows hold (`Db::execute`): every type, NULLs, rows written since the
+// last flush and rows changed since, keys and scores.
+#[test]
+fn a_leaf_s_arrow_columns_hold_what_its_rows_hold() {
+    use strata::query::arrow;
+    use strata::query::exec::Leaf;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions { segment_max_docs: 150, sync: false, ..DbOptions::default() };
+    let first = Schema::new("l", vec![Field::new("id", FieldType::Int)], Some("id")).unwrap();
+    let db = Db::create(&dir.path().join("t.strata"), first, opts).unwrap();
+    let none = Params::new();
+    db.sql("CREATE TABLE t (id KEYWORD PRIMARY KEY, n INT, x FLOAT, k KEYWORD, body TEXT, ok BOOL, at TIMESTAMP, v VECTOR(3), tags KEYWORD[], nums INT[], j JSON)", &none).unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let insert = |db: &Db, rng: &mut rand::rngs::StdRng, from: usize, to: usize| {
+        let rows: Vec<String> = (from..to)
+            .map(|i| {
+                let mut or_null = |s: String| if rng.gen_range(0..6) == 0 { "NULL".to_string() } else { s };
+                let n = or_null(format!("{}", i % 17));
+                let x = or_null(format!("{}.25", i % 13));
+                let k = or_null(format!("'k{}'", i % 7));
+                let body = or_null(format!("'row {i} on {}'", ["graphs", "vectors", "ranking"][i % 3]));
+                let ok = or_null(["TRUE", "FALSE"][i % 2].to_string());
+                let at = or_null(format!("'2026-10-{:02}T08:00:00Z'", 1 + i % 28));
+                let v = or_null(format!("'[{}.0, 0.5, -1.0]'", i % 5));
+                let tags = or_null(format!("ARRAY['t{}', 't{}']", i % 3, i % 4));
+                let nums = or_null(format!("ARRAY[{}, {}]", i, i * 2));
+                let j = or_null(format!("'{{\"a\": {i}, \"b\": \"x{}\"}}'", i % 3));
+                format!("('r{i:04}', {n}, {x}, {k}, {body}, {ok}, {at}, {v}, {tags}, {nums}, {j})")
+            })
+            .collect();
+        db.sql(&format!("INSERT INTO t (id, n, x, k, body, ok, at, v, tags, nums, j) VALUES {}", rows.join(", ")), &Params::new()).unwrap();
+    };
+    insert(&db, &mut rng, 0, 400);
+    db.storage().flush().unwrap();
+    insert(&db, &mut rng, 400, 450);
+    db.sql("UPDATE t SET n = 99, k = 'changed' WHERE id IN ('r0001', 'r0007', 'r0130', 'r0420')", &none).unwrap();
+    let queries = [
+        "SELECT * FROM t",
+        "SELECT id, n, x, k, ok, at, v, tags, nums, j, body FROM t WHERE n > 3",
+        "SELECT k, id, x FROM t ORDER BY x DESC LIMIT 50",
+        "SELECT n, x, k FROM t WHERE k IS NOT NULL",
+        "SELECT id, score() FROM t ORDER BY bm25(body, 'graphs') DESC LIMIT 30",
+        "SELECT body, id FROM t WHERE ok",
+    ];
+    for sql in queries {
+        let snap = db.snapshot();
+        let view = snap.table("t").unwrap();
+        let select = strata::query::sql::bind(sql, view.schema(), &none).unwrap();
+        let rs = db.execute(&view, &select, &db.exec).unwrap();
+        assert!(rs.rows.len() > 1, "{sql}: {} rows", rs.rows.len());
+        let Leaf::Arrow(c) = db.execute_leaf(&view, &select, &db.exec, 0).unwrap() else { panic!("{sql}: rows, not Arrow columns") };
+        assert_eq!(c.names, rs.columns, "{sql}: names");
+        assert_eq!(c.rows, rs.rows.len(), "{sql}: rows");
+        let want = arrow::columns_of(rs.rows.clone(), rs.columns.len()).unwrap();
+        for (i, (w, g)) in want.iter().zip(&c.arrays).enumerate() {
+            assert_eq!(w.to_data(), g.to_data(), "{sql}: column {}", rs.columns[i]);
+        }
+        assert_eq!(arrow::column_of(rs.keys.clone()).unwrap().to_data(), c.keys.to_data(), "{sql}: keys");
+        assert_eq!(rs.scores, c.scores, "{sql}: scores");
+        // Over as many rows as it has, the leaf gives rows.
+        assert!(matches!(db.execute_leaf(&view, &select, &db.exec, rs.rows.len()).unwrap(), Leaf::Rows(_)), "{sql}");
+    }
+}

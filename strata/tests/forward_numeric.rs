@@ -244,3 +244,46 @@ fn zone_maps_prune_sorted_columns() {
     let est = col.estimate(0.0, 50_000.0);
     assert!((est - 50_001.0).abs() < 1.0, "estimate {est}");
 }
+
+/// A query reads a single-valued INT or FLOAT field from its column rather
+/// than its stored row, and gets what was written: integers to the last
+/// bit, and a FLOAT field's values as FLOATs whether or not it has a
+/// column (an integer written to one is stored as its double, and -0.0 as
+/// 0.0, as the column reads them).
+#[test]
+fn a_query_reads_numbers_from_their_columns_as_written() {
+    use strata::db::Db;
+    use strata::query::exec::ExecOptions;
+    use strata::query::Params;
+    use strata::storage::DbOptions;
+    let mut plain = Field::new("g", FieldType::Float);
+    plain.indexed = false;
+    let fields = vec![Field::new("id", FieldType::Keyword), Field::new("i", FieldType::Int), Field::new("f", FieldType::Float), plain];
+    let schema = Schema::new("t", fields, Some("id")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("n.strata"), schema, DbOptions::default()).unwrap();
+    let row = |id: &str, i: Value, f: Value| vec![Value::Str(id.into()), i, f.clone(), f];
+    let written = [
+        row("a", Value::Int(i64::MIN), Value::Int(3)),
+        row("b", Value::Int(i64::MAX), Value::Float(-0.0)),
+        row("c", Value::Int(i64::MAX - 1), Value::Float(0.1)),
+        row("d", Value::Null, Value::Bool(true)),
+        row("e", Value::Int(-7), Value::Null),
+    ];
+    let want = |id: &str, i: Value, f: Value| vec![Value::Str(id.into()), i, f.clone(), f];
+    let expected = vec![
+        want("a", Value::Int(i64::MIN), Value::Float(3.0)),
+        want("b", Value::Int(i64::MAX), Value::Float(0.0)),
+        want("c", Value::Int(i64::MAX - 1), Value::Float(0.1)),
+        want("d", Value::Null, Value::Float(1.0)),
+        want("e", Value::Int(-7), Value::Null),
+    ];
+    // In a segment, then also in memory.
+    db.load(written[..3].to_vec()).unwrap();
+    db.storage().flush().unwrap();
+    db.load(written[3..].to_vec()).unwrap();
+    let rs = db.query_with("SELECT id, i, f, g FROM t ORDER BY id", &Params::new(), &ExecOptions::default()).unwrap();
+    assert_eq!(rs.rows, expected);
+    let signs: Vec<bool> = rs.rows.iter().filter_map(|r| r[2].as_f64()).map(f64::is_sign_negative).collect();
+    assert_eq!(signs, [false, false, false, false]);
+}

@@ -18,6 +18,8 @@
 //!   rerank phase scores rows' text with.
 
 pub mod agg;
+#[cfg(feature = "datafusion")]
+pub mod arrow;
 pub mod compound;
 pub mod cross_encoder;
 pub mod ddl;
