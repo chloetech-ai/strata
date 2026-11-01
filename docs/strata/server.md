@@ -739,6 +739,28 @@ What a failover keeps depends on `--write-acks`. With `all` and `majority`, a wr
 
 `/v1/health` shows `replication`. On a primary: its `id`, `term`, last number (`seq_no`), `write_acks`, `global_checkpoint`, the newer term of a primary that replaced it (`replaced_by_term`), and each replica's `url`, `seq_no`, `behind`, `in_sync`, `error`, whether it is being sent a copy (`copying`), the `copies` it installed, how many times its rows were compared (`verifications`), found to differ (`divergences`) or could not be compared (`verify_failures`), and the last comparison (`verified`: `seq_no`, `ms_ago`, `differing_slots`, `error`); also `verify_every_s`. On a replica: its `id`, `term`, `seq_no`, the primary it `follows` and that primary's term, the `global_checkpoint` the primary last sent, `called_ms_ago`, the copies of the primary it installed (`restores`), whether it `serves_reads`, the reads that waited for a write (`read_waits`) or were refused (`reads_refused`), and the digests it computed for its primary (`digests`). The [metrics](#health) are the `strata_replica*` families.
 
+### The cluster simulator
+
+`strata-sim`, built with the server, runs a shard's copies and two coordinators in a simulated cluster, one seed at a time. A seed draws a run: three or five copies with automatic failover, `--write-acks` `all` or `majority`, clients that write, read from the primary and now and then promote a replica by hand, and 20 s of faults: a network that delays, reorders and drops calls and cuts copies apart (both ways or one way), copies that crash and start again, sometimes a majority of them, and clocks that run up to 1% apart. The copies make the protocol's decisions as `strata-server/src/cores/` makes them, on a model of their databases; the simulator does their I/O one event at a time, in virtual time, every choice drawn from the seed, so a seed replays exactly. After the faults, the network heals, every copy starts again, and the run checks that one copy began each term, that every primary elected after a write was acknowledged holds it, that a primary served no read without a write acknowledged before the read was sent, that two copies holding the same number of the same term hold the same history up to it, and that the shard settled: one primary, every copy holding what it holds.
+
+```sh
+cd strata-server && cargo build --release --bin strata-sim
+./target/release/strata-sim --seeds 0..10000                      # the seeds that fail, each run twice to check it replays
+./target/release/strata-sim --seed 1066 --trace                   # what happened in one
+./target/release/strata-sim --seeds 0..2000 --bug asks-a-known-term   # a bug it found, put back
+./target/release/strata-sim --seeds 0..2000 --drop-ppm 150000 --promote-ppm 50000   # more calls lost, more promotions by hand
+```
+
+A seed runs in about 35 ms of one core (20 s of faults, 20 to 35 s of settling), so 2,000 seeds take 18 s on 4 cores (measured on a cloud Intel Xeon at 2.80 GHz, 4 cores, 2026-11-01). `cargo test --test sim` runs 400 seeds (`STRATA_SIM_SEEDS=A..B` for others), checks that a seed replays, and that the first and third bugs below, put back, are found again.
+
+It found three bugs, which the decisions it runs fix and `--bug` puts back. The server's replication takes the same fixes in a change of its own.
+
+- `asks-a-known-term`: a replica whose pre-vote a copy refused, as it knew the term asked for, asked for the same term again. Once a minority of the copies voted in a term for a candidate that lost, the copies holding the most transactions never learned the term from a primary and asked for it forever, refused each time, while the copies that knew it were behind: no primary until one was promoted with `force` (12 of the first 2,000 seeds). A replica now asks above the newest term any copy told it.
+- `takes-writes-in-a-lease`: a replica promoted by hand took writes at once. A primary that did not hear of the handover still served reads under its lease, which the votes of the handover did not wait out, and served them without the new primary's writes (one seed in 20,000). The new primary now waits out the lease before it takes writes, unless the primary it replaced voted for it.
+- `refuses-older-terms`: a copy that began a term and wrote nothing in it, or installed a copy of a primary that had not, refused the transactions of an older term that a newer primary held past its last, as if they came from a replaced primary, and never caught up: with two such replicas of three, the shard took no more writes (one seed in 20,000). The terms that hold no transactions are now dropped for those the primary ships.
+
+The simulator does not cover the database's own threads and files (the fault-injection tests do), nor map changes and slot moves yet.
+
 ### Reads that see a write
 
 A write's answer carries its sequence number (`seq_no`). A read with `"min_seq_no": n` (`/v1/query`, `/v1/sql`, `/v1/plan`, `/v1/term_stats`; `QueryRequest.min_seq_no` over gRPC) reads a version that holds transaction n, so a client reads its own writes from any copy:
