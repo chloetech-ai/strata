@@ -20,6 +20,8 @@ from .result import Result
 
 # Rows a write request carries.
 WRITE_BATCH = 1000
+# Keys a read by key sends in one request (the server takes 10,000).
+GET_BATCH = 10_000
 
 FORMATS = {".jsonl": "jsonl", ".ndjson": "jsonl", ".json": "json", ".csv": "csv", ".tsv": "tsv", ".tab": "tsv"}
 # The content type an import is sent with: a server refuses text/plain.
@@ -206,6 +208,40 @@ class Client(Search):
         for i in range(0, len(keys), WRITE_BATCH):
             n += self.write([{"op": "delete", **named, "key": k} for k in keys[i : i + WRITE_BATCH]])
         return n
+
+    def _table(self, table: str | None) -> str:
+        return table if table is not None else self.schema["table"]
+
+    def get(self, key: Any, *, table: str | None = None) -> dict | None:
+        """The row with this primary key in the first table or `table`, read
+        without SQL (GET /v1/kv/:table/:key): a dict of the columns `SELECT
+        *` answers, or None when no live row has the key (or its
+        `expire_by` time has passed). A coordinator asks the key's shard."""
+        path = f"/v1/kv/{urllib.parse.quote(self._table(table), safe='')}/{urllib.parse.quote(str(key), safe='')}"
+        try:
+            return self._call("GET", path)["row"]
+        except StrataError as e:
+            if e.status == 404 and isinstance(e.answer, dict) and e.answer.get("found") is False:
+                return None
+            raise
+
+    def get_many(self, keys: Iterable[Any], *, table: str | None = None) -> list[dict | None]:
+        """`get` of several keys (POST /v1/kv/get), 10,000 a request, in
+        their order."""
+        keys = list(keys)
+        out: list[dict | None] = []
+        for i in range(0, len(keys), GET_BATCH):
+            out += self._call("POST", "/v1/kv/get", {"table": self._table(table), "keys": keys[i : i + GET_BATCH]})["rows"]
+        return out
+
+    def put(self, key: Any, row: Mapping[str, Any], *, table: str | None = None, if_seq_no: int | None = None) -> int:
+        """Writes `row` as the row with this key (PUT /v1/kv/:table/:key),
+        in place of any that has it; with `if_seq_no`, only while that
+        row's sequence number is that. Returns the rows written."""
+        path = f"/v1/kv/{urllib.parse.quote(self._table(table), safe='')}/{urllib.parse.quote(str(key), safe='')}"
+        if if_seq_no is not None:
+            path += f"?if_seq_no={int(if_seq_no)}"
+        return int(self._call("PUT", path, dict(row))["written"])
 
     def stream(self, events: Iterable[Mapping[str, Any]]) -> dict:
         """Writes `events` through /v1/stream as they come, in batches the

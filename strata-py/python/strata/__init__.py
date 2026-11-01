@@ -287,6 +287,21 @@ class Database(Search):
         in transactions of 10,000 rows. Returns how many."""
         return self._db.upsert(rows, table)
 
+    def get(self, key: Any, *, table: str | None = None) -> dict | None:
+        """The row with this primary key in the first table or `table`, read
+        without SQL: a dict of the columns `SELECT *` answers, or None when
+        no live row has the key (or its `expire_by` time has passed)."""
+        return self._db.get_many([key], table)[0]
+
+    def get_many(self, keys: Iterable[Any], *, table: str | None = None) -> list[dict | None]:
+        """`get` of several keys at once, in their order."""
+        return self._db.get_many(list(keys), table)
+
+    def expire(self) -> int:
+        """Deletes the rows whose `expire_by` time has passed, in every
+        table with one; returns how many. Reads leave them out already."""
+        return self._db.expire()
+
     def delete(self, keys: Any, *, table: str | None = None) -> int:
         """Deletes the rows with this key or these keys; returns how many
         there were."""

@@ -136,6 +136,24 @@ async fn rows_by_key_from_a_server_and_a_coordinator() {
         assert!(got["rows"][1].is_null());
         assert_eq!(got["rows"][2]["n"], json!(5));
     }
+    // A query that pins the key asks only its shard, and answers as one
+    // database does.
+    for (sql, routed) in [
+        (format!("SELECT * FROM kv WHERE id = '{}'", key(5)), true),
+        (format!("SELECT id, n FROM kv WHERE id = '{}' AND n > 0 OR id = '{}'", key(8), key(8)), true),
+        (format!("SELECT COUNT(*) FROM kv WHERE id = '{}' AND n < 1000", key(4)), true),
+        ("SELECT id FROM kv WHERE id IN ('nope')".to_string(), true),
+        // Keys on both shards ask both.
+        (format!("SELECT id, n FROM kv WHERE id IN ({}) ORDER BY n", (0..12).map(|i| format!("'{}'", key(i))).collect::<Vec<_>>().join(", ")), false),
+    ] {
+        let got = coord.query(strata_server::service::QueryReq { sql: sql.clone(), ..Default::default() }).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        let want = one.query(strata_server::service::QueryReq { sql: sql.clone(), ..Default::default() }).await.unwrap();
+        assert_eq!(got.rs.rows, want.rs.rows, "{sql}");
+        assert_eq!(got.rs.stats.plan.iter().any(|l| l.starts_with("routed by key: 1 of 2")), routed, "{sql}: {:?}", got.rs.stats.plan);
+    }
+    let sql = "SELECT COUNT(*) FROM kv WHERE n > 100";
+    let got = coord.query(strata_server::service::QueryReq { sql: sql.into(), ..Default::default() }).await.unwrap();
+    assert!(!got.rs.stats.plan.iter().any(|l| l.starts_with("routed")), "{:?}", got.rs.stats.plan);
     // Keys of the wrong type, a table without a key, too many keys.
     let e = coord.get_rows(Some("kv"), vec![Value::Int(3)], &After::Any, 0).await.unwrap_err();
     assert!(e.message.contains("KEYWORD"), "{}", e.message);

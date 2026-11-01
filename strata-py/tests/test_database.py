@@ -556,3 +556,22 @@ def test_columns_added_dropped_and_renamed(tmp_path):
     with strata.Database.open(path) as db:
         assert [f["name"] for f in db.schema["fields"]] == ["id", "headline", "price", "stock"]
         assert db.query("SELECT price, stock FROM items WHERE id = 'a'")[0] == {"price": 1.5, "stock": 0}
+
+
+def test_rows_by_key(db, tmp_path):
+    got = db.get("b0007")
+    assert got["id"] == "b0007" and got["year"] == book(7)["year"] and "emb" not in got
+    assert db.get("nope") is None
+    rows = db.get_many(["b0001", "missing", "b0002"])
+    assert [r and r["id"] for r in rows] == ["b0001", None, "b0002"]
+    assert rows[0] == db.query("SELECT * FROM books WHERE id = 'b0001'")[0]
+    db.delete("b0002")
+    assert db.get("b0002") is None
+    # Rows of a table with expire_by are none once their time has passed,
+    # and expire() deletes them.
+    db.sql("CREATE TABLE sessions (id KEYWORD PRIMARY KEY, user KEYWORD, until TIMESTAMP) OPTIONS(expire_by = 'until')")
+    db.insert([{"id": "s1", "user": "a", "until": "2001-01-01T00:00:00Z"}, {"id": "s2", "user": "b", "until": "2999-01-01T00:00:00Z"}, {"id": "s3", "user": "c"}], table="sessions")
+    assert [r and r["id"] for r in db.get_many(["s1", "s2", "s3"], table="sessions")] == [None, "s2", "s3"]
+    assert db.sql("SELECT COUNT(*) FROM sessions").scalar() == 2
+    assert db.expire() == 1
+    assert db.expire() == 0
