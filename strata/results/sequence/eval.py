@@ -66,8 +66,12 @@ def beauty(d):
 
 
 def machine():
-    cpu = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.processor())
-    mem = next((int(l.split()[1]) / 1e6 for l in open("/proc/meminfo") if l.startswith("MemTotal")), None)
+    if platform.system() == "Darwin":
+        q = lambda k: subprocess.run(["sysctl", "-n", k], capture_output=True, text=True).stdout.strip()  # noqa: E731
+        cpu, mem = f"{q('machdep.cpu.brand_string')} ({q('hw.model')})", int(q("hw.memsize") or 0) / 1e9
+    else:
+        cpu = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.processor())
+        mem = next((int(l.split()[1]) / 1e6 for l in open("/proc/meminfo") if l.startswith("MemTotal")), None)
     return {"cpu": cpu, "cores": os.cpu_count(), "memory_gb": round(mem, 1) if mem else None, "os": f"{platform.system()} {platform.release()}", "torch": torch.__version__}
 
 
