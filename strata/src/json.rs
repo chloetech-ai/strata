@@ -37,6 +37,15 @@
 //! over that row too. Numbers compare as doubles in the index (an integer
 //! above 2^53 loses its last digits there; the stored text keeps them).
 //!
+//! **Marks.** A row whose value at a path is anything but the one value of
+//! its one term there (an object, a list, a string too long for a term, a
+//! number its term does not give back as [`value_of_number`] reads it, such
+//! as `5.0` or an integer above 2^53) also has the term `path \0 x`. So a
+//! path's values can be read from its terms ([`PathValues`]) for every row
+//! but the marked ones, which read their objects: a segment written before
+//! marks has the section `json.<field>.marks` missing, and every row holding
+//! the path reads its object there.
+//!
 //! **Limits** per row, past which a write is refused with the limit named:
 //! [`MAX_DEPTH`] levels of nesting, paths of [`MAX_PATH`] bytes, and
 //! [`MAX_LEAVES`] values and objects. A string longer than [`MAX_EXACT`] bytes is
@@ -201,6 +210,49 @@ pub fn number_of_key(s: &str) -> Option<f64> {
 /// The term every row holding `path` has.
 pub fn has_term(path: &str) -> String {
     format!("{path}{SEP}")
+}
+
+/// The term of the rows whose value at `path` its value terms do not give
+/// ([`terms`]): `path \0 x`, after the path's value terms.
+pub fn mark_term(path: &str) -> String {
+    format!("{path}{SEP}x")
+}
+
+/// The section a segment has when its JSON field `key`'s terms include
+/// marks ([`mark_term`]).
+pub fn marks_section(key: &str) -> String {
+    format!("json.{key}.marks")
+}
+
+/// A number as a path's value reads it from its term: an integer when it
+/// is one and at most 2^53 from 0, else a double.
+pub fn value_of_number(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0 {
+        Value::Int(x as i64)
+    } else {
+        Value::Float(x)
+    }
+}
+
+/// The value a value term spells, as a path reads it ([`value_of_number`]
+/// for a number); `None` for another term.
+pub fn value_of_term(term: &str) -> Option<Value> {
+    let (_, rest) = term.split_once(SEP)?;
+    let (&tag, text) = rest.as_bytes().split_first()?;
+    let text = std::str::from_utf8(text).ok()?;
+    Some(match Kind::of_tag(tag)? {
+        Kind::Str => Value::Str(text.to_string()),
+        Kind::Number => value_of_number(number_of_key(text)?),
+        Kind::Bool => Value::Bool(text == "1"),
+    })
+}
+
+/// The run of a path's value terms `[lo, hi)`: of every type, or of one.
+pub fn value_run(path: &str, kind: Option<Kind>) -> (String, String) {
+    match kind {
+        Some(k) => kind_run(path, k),
+        None => (format!("{path}{SEP}b"), format!("{path}{SEP}t")),
+    }
 }
 
 /// The term of a value of type `kind` at `path`, its text already spelled
@@ -373,8 +425,9 @@ fn walk(j: &Json, path: &mut String, depth: usize, f: &mut dyn FnMut(&str, Optio
     }
 }
 
-/// The terms a row's stored object is indexed by, sorted and distinct;
-/// none for NULL.
+/// The terms a row's stored object is indexed by, sorted and distinct,
+/// with the marks of the paths whose values they do not give
+/// ([`mark_term`]); none for NULL.
 pub fn terms(v: &Value) -> Result<Vec<String>> {
     let s = match v {
         Value::Null => return Ok(Vec::new()),
@@ -403,6 +456,26 @@ pub fn terms(v: &Value) -> Result<Vec<String>> {
     .map_err(bad)?;
     out.sort_unstable();
     out.dedup();
+    // Each path's run of terms: its own term, then its value terms.
+    let mut marks = Vec::new();
+    let mut at = 0;
+    while at < out.len() {
+        let path = out[at].split_once(SEP).map_or("", |(p, _)| p);
+        let end = at + out[at..].iter().take_while(|t| t.split_once(SEP).is_some_and(|(p, _)| p == path)).count();
+        let mut values = out[at..end].iter().filter(|t| !t.ends_with(SEP));
+        let exact = match (values.next(), values.next()) {
+            (Some(t), None) => gives_exactly(&j, path, t),
+            _ => false,
+        };
+        if !exact {
+            marks.push(mark_term(path));
+        }
+        at = end;
+    }
+    if !marks.is_empty() {
+        out.extend(marks);
+        out.sort_unstable();
+    }
     Ok(out)
 }
 
@@ -436,7 +509,8 @@ pub fn text_of(v: &Value) -> Result<Option<String>> {
 /// boolean; an object as its JSON text; an array of plain values as a list
 /// of them, and one that holds objects or arrays as its JSON text. A path
 /// through an array gathers each element's value, as a list when there
-/// are several. NULL where the object has no value there. With `kind`,
+/// are several. NULL where the object has no value there (an empty array
+/// included). With `kind`,
 /// only values of that type ([`Kind`]), and strings no longer than
 /// [`MAX_EXACT`]: what a comparison with a value of that type reads, as the
 /// index does.
@@ -447,9 +521,36 @@ pub fn extract(v: &Value, path: &str, kind: Option<Kind>) -> Result<Value> {
         v => return Err(Error::Query(format!("json_extract reads a JSON field, not {v:?}"))),
     };
     let j: Json = serde_json::from_str(s).map_err(|e| Error::Query(format!("json_extract: not JSON ({e})")))?;
+    Ok(extract_json(&j, path, kind))
+}
+
+/// Whether `term`, the one value term of `path` in `j`, spells the value
+/// [`extract_json`] reads there. A path that reaches a string, a number or
+/// a boolean through objects only (most paths) holds that one value, so it
+/// is compared in place; any other path is read as `extract_json` reads it.
+fn gives_exactly(j: &Json, path: &str, term: &str) -> bool {
+    fn step<'j>(at: &'j Json, key: &str) -> Option<&'j Json> {
+        match at {
+            Json::Object(m) => m.get(key),
+            _ => None,
+        }
+    }
+    let direct = match path.contains('\\') {
+        false => path.split('.').try_fold(j, step),
+        true => keys(path).iter().try_fold(j, |at, k| step(at, k)),
+    };
+    match direct {
+        Some(Json::String(s)) => term.split_once(SEP).is_some_and(|(_, t)| t.strip_prefix(Kind::Str.tag()) == Some(s.as_str())),
+        Some(x @ (Json::Number(_) | Json::Bool(_))) => value_of_term(term).is_some_and(|v| plain(x) == Some(v)),
+        _ => value_of_term(term).is_some_and(|v| extract_json(j, path, None) == v),
+    }
+}
+
+/// [`extract`] of a parsed object.
+pub fn extract_json(j: &Json, path: &str, kind: Option<Kind>) -> Value {
     let keys = keys(path);
     let mut found: Vec<&Json> = Vec::new();
-    gather(&j, &keys, &mut found);
+    gather(j, &keys, &mut found);
     let mut out: Vec<Value> = Vec::new();
     let one = |x: &Json| -> Option<Value> {
         let v = plain(x)?;
@@ -479,12 +580,12 @@ pub fn extract(v: &Value, path: &str, kind: Option<Kind>) -> Result<Value> {
             x => out.extend(one(x)),
         }
     }
-    Ok(match out.len() {
-        0 if kind.is_none() && matches!(j.pointer(&pointer(&keys)), Some(Json::Array(xs)) if xs.is_empty()) => Value::List(Vec::new()),
+    // An empty array holds no value: NULL, as IS NULL has it.
+    match out.len() {
         0 => Value::Null,
         1 => out.pop().expect("one"),
         _ => Value::List(out),
-    })
+    }
 }
 
 /// Whether `j` holds a value or an object, at any depth of arrays.
@@ -494,12 +595,6 @@ fn present(j: &Json) -> bool {
         Json::Array(xs) => xs.iter().any(present),
         _ => true,
     }
-}
-
-/// A JSON Pointer to `keys` (for the one case [`extract`] needs it: an
-/// empty array where no array was passed through).
-fn pointer(keys: &[String]) -> String {
-    keys.iter().map(|k| format!("/{}", k.replace('~', "~0").replace('/', "~1"))).collect()
 }
 
 /// The values at `keys` below `j`, through arrays.
@@ -540,6 +635,152 @@ fn plain(x: &Json) -> Option<Value> {
     })
 }
 
+// ------------------------------------------------------- values by path
+
+/// A row with no value term at a path ([`PathValues`]).
+const NO_VALUE: u32 = u32::MAX;
+
+/// A path's values over rows of a segment, read from the path's terms in
+/// the field's keyword column: each row's one value term, and for the rows
+/// the terms do not give (marked, [`mark_term`]; every row holding the path
+/// in a segment written before marks) the value of its object. Each row's
+/// value is what `json_extract(field, path [, kind])` returns for it, and
+/// only those rows' objects are read.
+pub struct PathValues {
+    /// Per row, the index in `values` of its value, or [`NO_VALUE`].
+    at: Vec<u32>,
+    values: Vec<Value>,
+    /// The values of rows read from their objects.
+    others: std::collections::HashMap<crate::segment::DocId, Value>,
+    /// Rows read from their objects.
+    pub objects_read: usize,
+}
+
+impl PathValues {
+    /// The values at `path` (of type `kind`, or any) of the rows of `rows`,
+    /// from `kw`, the JSON field's keyword column in a segment whose terms
+    /// include marks when `marks`; `object(d)` reads row `d`'s object.
+    pub fn read(
+        kw: &crate::forward::KeywordColumn,
+        marks: bool,
+        path: &str,
+        kind: Option<Kind>,
+        rows: &crate::segment::DocSet,
+        mut object: impl FnMut(crate::segment::DocId) -> Result<Value>,
+    ) -> Result<PathValues> {
+        let n = rows.universe() as usize;
+        let mut out = PathValues { at: vec![NO_VALUE; n], values: Vec::new(), others: Default::default(), objects_read: 0 };
+        let odd = odd_rows(kw, marks, path, rows);
+        let mut docs = Vec::new();
+        let (lo, hi) = value_run(path, kind);
+        for code in kw.lower_bound(&lo)..kw.lower_bound(&hi) {
+            kw.docs_code_into(code, &mut docs);
+            let mut first = true;
+            for &d in &docs {
+                if !rows.contains(d) || odd.contains(d) {
+                    continue;
+                }
+                if first {
+                    out.values.push(term_value(kw, code)?);
+                    first = false;
+                }
+                out.at[d as usize] = (out.values.len() - 1) as u32;
+            }
+        }
+        for d in odd.iter() {
+            let v = extract(&object(d)?, path, kind)?;
+            out.objects_read += 1;
+            if !matches!(v, Value::Null) {
+                out.others.insert(d, v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The groups of the rows of `rows` by their value at `path` (as
+    /// [`Self::read`] reads it), with the rows of each: a list's distinct
+    /// values ([`crate::query::agg::Part::group`]) one group each, and the
+    /// rows without a value the NULL group. The values come in no order,
+    /// and one value may come more than once (from the terms and from
+    /// objects). Rows whose value is one term are counted from its
+    /// postings, without a pass over the rows.
+    pub fn counts(
+        kw: &crate::forward::KeywordColumn,
+        marks: bool,
+        path: &str,
+        kind: Option<Kind>,
+        rows: &crate::segment::DocSet,
+        mut object: impl FnMut(crate::segment::DocId) -> Result<Value>,
+    ) -> Result<(Vec<(Value, u64)>, usize)> {
+        let odd = odd_rows(kw, marks, path, rows);
+        let mut out: Vec<(Value, u64)> = Vec::new();
+        let mut valued = 0u64;
+        let mut docs = Vec::new();
+        let (lo, hi) = value_run(path, kind);
+        for code in kw.lower_bound(&lo)..kw.lower_bound(&hi) {
+            kw.docs_code_into(code, &mut docs);
+            let c = docs.iter().filter(|&&d| rows.contains(d) && !odd.contains(d)).count() as u64;
+            if c > 0 {
+                out.push((term_value(kw, code)?, c));
+                valued += c;
+            }
+        }
+        let mut objects = 0;
+        let mut null = rows.len() as u64 - valued - odd.len() as u64;
+        for d in odd.iter() {
+            objects += 1;
+            match extract(&object(d)?, path, kind)? {
+                Value::Null => null += 1,
+                Value::List(xs) => {
+                    let mut seen = std::collections::HashSet::new();
+                    for x in xs {
+                        if seen.insert(crate::query::agg::Part::group(&x)) {
+                            out.push((x, 1));
+                        }
+                    }
+                    if seen.is_empty() {
+                        null += 1;
+                    }
+                }
+                v => out.push((v, 1)),
+            }
+        }
+        if null > 0 {
+            out.push((Value::Null, null));
+        }
+        Ok((out, objects))
+    }
+
+    /// Row `d`'s value (NULL for none).
+    pub fn get(&self, d: crate::segment::DocId) -> &Value {
+        const NULL: Value = Value::Null;
+        match self.at.get(d as usize) {
+            Some(&i) if i != NO_VALUE => &self.values[i as usize],
+            _ => self.others.get(&d).unwrap_or(&NULL),
+        }
+    }
+}
+
+/// The rows of `rows` whose value at `path` is read from their objects:
+/// those marked ([`mark_term`]), or in a segment whose terms have no
+/// marks every row holding the path.
+fn odd_rows(kw: &crate::forward::KeywordColumn, marks: bool, path: &str, rows: &crate::segment::DocSet) -> crate::segment::DocSet {
+    let read = match marks {
+        true => kw.code(&mark_term(path)),
+        false => kw.code(&has_term(path)),
+    };
+    let Some(c) = read else { return crate::segment::DocSet::empty(rows.universe()) };
+    let mut docs = Vec::new();
+    kw.docs_code_into(c, &mut docs);
+    docs.retain(|&d| rows.contains(d));
+    crate::segment::DocSet::from_sorted(docs, rows.universe())
+}
+
+/// The value of the term of code `code`.
+fn term_value(kw: &crate::forward::KeywordColumn, code: u32) -> Result<Value> {
+    value_of_term(kw.value(code)).ok_or_else(|| crate::error::corrupt(format!("JSON term {:?} has no value", kw.value(code))))
+}
+
 // ---------------------------------------------------------------- builder
 
 /// Builds a JSON field's keyword column of terms ([`terms`]), and with
@@ -549,12 +790,17 @@ fn plain(x: &Json) -> Option<Value> {
 pub(crate) struct JsonBuilder {
     inner: Box<dyn crate::segment::FieldIndexBuilder>,
     text: Option<Box<crate::text::TextFieldBuilder>>,
+    key: String,
 }
+
+/// The version of the section that says a segment's JSON terms include
+/// marks ([`marks_section`]).
+const MARKS_VERSION: u64 = 1;
 
 impl JsonBuilder {
     pub fn new(field: &crate::schema::Field, opts: &crate::segment::build::BuildOptions) -> Result<Self> {
         let text = if field.text { Some(Box::new(crate::text::text_builder(field, opts)?)) } else { None };
-        Ok(JsonBuilder { inner: crate::forward::field_builder(field, opts)?, text })
+        Ok(JsonBuilder { inner: crate::forward::field_builder(field, opts)?, text, key: field.key() })
     }
 }
 
@@ -571,6 +817,7 @@ impl crate::segment::FieldIndexBuilder for JsonBuilder {
         if let Some(t) = self.text {
             t.finish(out)?;
         }
+        out.put(marks_section(&self.key), MARKS_VERSION.to_le_bytes().to_vec());
         self.inner.finish(out)
     }
 }
@@ -587,6 +834,30 @@ mod tests {
 
     fn s(x: &str) -> Value {
         Value::Str(x.into())
+    }
+
+    #[test]
+    fn the_mark_check_reads_as_extract_does() {
+        let objects = [
+            json!({"c": "red", "p": 5, "q": 5.0, "b": true, "n": -0.5, "big": 9007199254740993u64, "huge": 1e300}),
+            json!({"a.b": "dot", "a": {"b": "nested", "c": [1]}, "x\\y": 1}),
+            json!({"items": [{"k": "x"}], "l": [3], "ll": [[3]], "o": {"w": {"h": 2}}}),
+            json!([{"k": 1}]),
+            json!("top"),
+        ];
+        let mut checked = 0;
+        for j in &objects {
+            for t in terms(&s(&j.to_string())).unwrap() {
+                let Some((path, _)) = t.split_once(SEP) else { continue };
+                if t.ends_with(SEP) || t == mark_term(path) {
+                    continue;
+                }
+                let want = value_of_term(&t).is_some_and(|v| extract_json(j, path, None) == v);
+                assert_eq!(gives_exactly(j, path, &t), want, "{j} {path}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 15, "{checked}");
     }
 
     #[test]
@@ -640,10 +911,11 @@ mod tests {
         assert!(canonical(s(&json!({"": 1}).to_string()), "attrs").is_err());
         assert_eq!(canonical(s("null"), "attrs").unwrap(), Value::Null);
         assert_eq!(canonical(s("{ \"a\" : 1 }"), "attrs").unwrap(), s("{\"a\":1}"));
-        // A long string is kept, and indexed by its path only.
+        // A long string is kept, and indexed by its path only, the row
+        // marked for its value to be read from the object.
         let long = "x".repeat(MAX_EXACT + 1);
         let v = canonical(s(&json!({ "d": long }).to_string()), "attrs").unwrap();
-        assert_eq!(terms(&v).unwrap(), vec![has_term("d")]);
+        assert_eq!(terms(&v).unwrap(), vec![has_term("d"), mark_term("d")]);
     }
 
     #[test]
@@ -673,7 +945,7 @@ mod tests {
         assert_eq!(x("items.n"), Value::Int(1));
         assert_eq!(x("items"), s("[{\"sku\":\"a\"},{\"n\":1,\"sku\":\"b\"}]"), "keys sorted");
         assert_eq!(x("nested"), s("[[1],[2]]"));
-        assert_eq!(x("e"), Value::List(vec![]));
+        assert_eq!(x("e"), Value::Null, "an empty array holds no value");
         let deep_empty = s(&json!({"e": [[], [null]]}).to_string());
         assert_eq!(extract(&deep_empty, "e", None).unwrap(), Value::Null, "nothing there, as the index has it");
         assert_eq!(terms(&deep_empty).unwrap(), Vec::<String>::new());
@@ -684,5 +956,71 @@ mod tests {
         assert_eq!(extract(&v, "nested", Some(Kind::Number)).unwrap(), Value::List(vec![Value::Int(1), Value::Int(2)]));
         assert_eq!(extract(&v, "color", Some(Kind::Number)).unwrap(), Value::Null);
         assert_eq!(extract(&Value::Null, "color", None).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn marks_and_values_by_path() {
+        let objects = [
+            json!({"c": "red", "p": 5, "l": [1, 2]}),
+            json!({"c": "red", "p": 5.0, "l": [2, 2], "o": {"w": 1}}),
+            json!({"p": 9007199254740993u64, "l": [], "o": {}}),
+            json!({"c": "x".repeat(300), "p": -0.5, "l": [[1]], "b": true}),
+            json!({"p": "n/a", "l": ["x"], "b": 1}),
+            json!({"p": [3, "n/a"], "l": 3, "m": {"k": 1}}),
+            json!({"b": false, "p": 1e300}),
+        ];
+        let docs: Vec<Value> = objects.iter().map(|j| s(&j.to_string())).collect();
+        // Marked: rows whose one value term is not their value.
+        let marked = |d: usize, path: &str| terms(&docs[d]).unwrap().contains(&mark_term(path));
+        assert!(!marked(0, "p") && marked(1, "p") && marked(2, "p") && !marked(3, "p") && marked(5, "p") && !marked(6, "p"));
+        assert!(marked(0, "l") && marked(1, "l") && !marked(2, "l") && marked(3, "l") && !marked(4, "l") && !marked(5, "l"));
+        assert!(marked(1, "o") && !marked(1, "o.w") && marked(3, "c") && !marked(0, "c") && !marked(4, "b"));
+        assert_eq!(value_of_term(&term("p", &Value::Int(5)).unwrap()), Some(Value::Int(5)));
+        assert_eq!(value_of_term(&term("p", &Value::Float(1e300)).unwrap()), Some(Value::Float(1e300)));
+        // A segment of them, its terms read with marks and without (as a
+        // segment written before marks is), against each object.
+        let schema = crate::schema::Schema::new("t", vec![crate::schema::Field::new("attrs", crate::schema::FieldType::Json)], None).unwrap();
+        let rows: Vec<crate::value::Document> = docs.iter().map(|v| vec![v.clone()]).collect();
+        let image = crate::segment::build::build_segment(&schema, &rows, &crate::segment::build::BuildOptions::default()).unwrap();
+        let seg = crate::segment::SegmentFile::from_vec(image).unwrap();
+        assert!(seg.has(&marks_section(&schema.fields[0].key())));
+        let kw = crate::forward::KeywordColumn::open(&seg, &schema.fields[0].key()).unwrap();
+        let n = docs.len() as u32;
+        for path in ["c", "p", "l", "o", "o.w", "b", "m", "m.k", "absent"] {
+            for kind in [None, Some(Kind::Str), Some(Kind::Number), Some(Kind::Bool)] {
+                for rows in [crate::segment::DocSet::all(n), crate::segment::DocSet::from_sorted(vec![1, 2, 5], n)] {
+                    let mut seen = Vec::new();
+                    for marks in [true, false] {
+                        let pv = PathValues::read(&kw, marks, path, kind, &rows, |d| Ok(docs[d as usize].clone())).unwrap();
+                        for d in 0..n {
+                            let want = if rows.contains(d) { extract(&docs[d as usize], path, kind).unwrap() } else { Value::Null };
+                            assert_eq!(pv.get(d), &want, "{path} {kind:?} row {d}, marks {marks}");
+                        }
+                        let (counts, _) = PathValues::counts(&kw, marks, path, kind, &rows, |d| Ok(docs[d as usize].clone())).unwrap();
+                        let mut by: std::collections::BTreeMap<crate::query::agg::Part, u64> = Default::default();
+                        for (v, c) in counts {
+                            *by.entry(crate::query::agg::Part::group(&v)).or_default() += c;
+                        }
+                        seen.push((pv.objects_read, by));
+                    }
+                    // Each row in the group of each distinct value it holds.
+                    let mut want: std::collections::BTreeMap<crate::query::agg::Part, u64> = Default::default();
+                    for d in rows.iter() {
+                        let mut parts: Vec<crate::query::agg::Part> = match extract(&docs[d as usize], path, kind).unwrap() {
+                            Value::List(xs) => xs.iter().map(crate::query::agg::Part::group).collect(),
+                            v => vec![crate::query::agg::Part::group(&v)],
+                        };
+                        parts.sort();
+                        parts.dedup();
+                        for p in parts {
+                            *want.entry(p).or_default() += 1;
+                        }
+                    }
+                    assert_eq!(seen[0].1, want, "{path} {kind:?}: counts with marks");
+                    assert_eq!(seen[1].1, want, "{path} {kind:?}: counts without marks");
+                    assert!(seen[0].0 <= seen[1].0, "marks read fewer objects");
+                }
+            }
+        }
     }
 }

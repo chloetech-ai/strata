@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::{lower, Expr};
 use crate::query::memory::Charge;
-use crate::query::logical::{AggFn, Having, OrderBy, Projection, Select, Tiebreak};
+use crate::query::logical::{AggFn, Col, Having, OrderBy, Projection, Select, Tiebreak};
 use crate::value::Value;
 
 fn err(m: impl Into<String>) -> Error {
@@ -27,6 +27,8 @@ pub enum Part {
     /// Bits of an `f64` (no NaNs reach a group).
     Float(u64),
     Str(String),
+    /// A boolean group value ([`Part::group`]).
+    Bool(bool),
 }
 
 impl Part {
@@ -41,12 +43,22 @@ impl Part {
         }
     }
 
+    /// A value as a group of GROUP BY: a boolean stays one (a JSON path's
+    /// `true` is not the group of the number 1), else as [`Part::of`].
+    pub fn group(v: &Value) -> Part {
+        match v {
+            Value::Bool(b) => Part::Bool(*b),
+            v => Part::of(v),
+        }
+    }
+
     pub fn value(&self) -> Value {
         match self {
             Part::Null => Value::Null,
             Part::Int(x) => Value::Int(*x),
             Part::Float(b) => Value::Float(f64::from_bits(*b)),
             Part::Str(s) => Value::Str(s.clone()),
+            Part::Bool(b) => Value::Bool(*b),
         }
     }
 
@@ -279,11 +291,11 @@ pub fn needed(q: &Select) -> Vec<Projection> {
 
 /// Whether the query takes the general aggregate path (anything beyond
 /// counting the values of one keyword field, which facets answer).
-pub fn is_general(q: &Select, facet_field: impl Fn(usize) -> bool) -> bool {
+pub fn is_general(q: &Select, facet_field: impl Fn(Col) -> bool) -> bool {
     let facet = q.group_by.len() == 1
         && facet_field(q.group_by[0])
         && q.having.is_none()
-        && q.projection.iter().all(|(_, p)| matches!(p, Projection::Count) || *p == Projection::Field(q.group_by[0]))
+        && q.projection.iter().all(|(_, p)| matches!(p, Projection::Count) || *p == q.group_by[0].projection())
         && matches!(q.order, None | Some(OrderBy::Count { .. }) | Some(OrderBy::GroupValue { .. }));
     let plain_count = q.group_by.is_empty() && q.having.is_none() && q.projection.iter().all(|(_, p)| matches!(p, Projection::Count));
     !facet && !plain_count && (!q.group_by.is_empty() || q.projection.iter().any(|(_, p)| matches!(p, Projection::Agg { .. })) || q.having.is_some())
@@ -338,7 +350,7 @@ impl Groups {
             if r.len() != group_cols + needed.len() {
                 return Err(err("a shard's aggregate row has the wrong width"));
             }
-            let accs = self.entry(r[..group_cols].iter().map(Part::of).collect(), needed)?;
+            let accs = self.entry(r[..group_cols].iter().map(Part::group).collect(), needed)?;
             for (a, v) in accs.iter_mut().zip(&r[group_cols..]) {
                 a.merge(v)?;
             }
@@ -358,7 +370,7 @@ pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Result<V
     }
     let value_of = |key: &[Part], accs: &[Acc], p: &Projection| -> Value {
         match p {
-            Projection::Field(f) => q.group_by.iter().position(|g| g == f).map_or(Value::Null, |i| key[i].value()),
+            Projection::Field(_) | Projection::Path(_) => q.group_by.iter().position(|g| g.projection() == *p).map_or(Value::Null, |i| key[i].value()),
             _ => needed.iter().position(|n| n == p).map_or(Value::Null, |i| accs[i].value()),
         }
     };
@@ -387,10 +399,16 @@ pub fn finish(q: &Select, mut groups: Groups, needed: &[Projection]) -> Result<V
         }
     }
     let value_desc = matches!(q.tiebreak, Some(Tiebreak::GroupValue { desc: true }));
-    let by_key = |a: &[Part], b: &[Part]| if value_desc { b.cmp(a) } else { a.cmp(b) };
+    // Group values in the order values have (a part's order puts a
+    // negative double after a positive one, and a JSON path's values may be
+    // of several types).
+    let by_key = |a: &[Part], b: &[Part]| {
+        let o = a.iter().zip(b).map(|(x, y)| cmp(&x.value(), &y.value())).find(|o| o.is_ne()).unwrap_or(Ordering::Equal);
+        if value_desc { o.reverse() } else { o }
+    };
     let primary: Option<(Projection, bool)> = match &q.order {
         Some(OrderBy::Count { desc }) => Some((Projection::Count, *desc)),
-        Some(OrderBy::GroupValue { desc }) => q.group_by.first().map(|g| (Projection::Field(*g), *desc)),
+        Some(OrderBy::GroupValue { desc }) => q.group_by.first().map(|g| (g.projection(), *desc)),
         Some(OrderBy::Agg { what, desc }) => Some((what.clone(), *desc)),
         // Without an ORDER BY, the largest groups first.
         None if !q.group_by.is_empty() => Some((Projection::Count, true)),
@@ -435,9 +453,9 @@ mod tests {
 
     #[test]
     fn accumulators_and_partials() {
-        let sum = Projection::Agg { func: AggFn::Sum, field: 0 };
-        let avg = Projection::Agg { func: AggFn::Avg, field: 0 };
-        let dis = Projection::Agg { func: AggFn::CountDistinct, field: 0 };
+        let sum = Projection::Agg { func: AggFn::Sum, of: Col::Field(0) };
+        let avg = Projection::Agg { func: AggFn::Avg, of: Col::Field(0) };
+        let dis = Projection::Agg { func: AggFn::CountDistinct, of: Col::Field(0) };
         let (mut a, mut b, mut c) = (Acc::new(&sum), Acc::new(&avg), Acc::new(&dis));
         for v in [Value::Int(2), Value::Int(4), Value::Null, Value::Int(4)] {
             a.add(&v);
@@ -463,7 +481,7 @@ mod tests {
     /// lost their low bits (`SUM(n) = 3` with `AVG(n) = 0.0`).
     #[test]
     fn avg_of_integers_sums_them_exactly() {
-        let avg = Projection::Agg { func: AggFn::Avg, field: 0 };
+        let avg = Projection::Agg { func: AggFn::Avg, of: Col::Field(0) };
         let big = (1i64 << 53) + 1;
         let values = [Value::Int(big), Value::Int(big), Value::Int(-2 * big + 2), Value::Int(1)];
         let mut a = Acc::new(&avg);

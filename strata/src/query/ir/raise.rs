@@ -5,7 +5,7 @@
 
 use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, NormKind, OnConflict, Plan};
 use crate::error::Result;
-use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors, CROSS_ENCODER_FIRST};
+use crate::query::logical::{self, AggFn, Col, GraphQuery, Having, OrderBy, PathCol, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors, CROSS_ENCODER_FIRST};
 use crate::query::rank::Rank;
 use crate::query::sql::{self, Assign, Conflict, Write};
 use crate::schema::{FieldType, Schema};
@@ -81,15 +81,36 @@ fn name(n: &Node) -> &'static str {
 
 const SHAPES: &str = "the executor runs Project [Limit] Search and Project [Limit] [Sort] [Filter] Aggregate Search (other plans run with operators)";
 
+/// The SELECT of `schema`'s table that node `n` runs as ([`Plan::to_select`]).
+pub(crate) fn select_of(n: &Node, schema: &Schema) -> Result<Select> {
+    Raise::new(schema).select(n)
+}
+
 struct Raise<'a> {
     schema: &'a Schema,
     /// The graph computations raised so far (`Select::graphs`).
     graphs: Vec<GraphQuery>,
+    /// The paths read as columns so far (`Select::paths`).
+    paths: Vec<PathCol>,
 }
 
 impl<'a> Raise<'a> {
     fn new(schema: &'a Schema) -> Self {
-        Raise { schema, graphs: Vec::new() }
+        Raise { schema, graphs: Vec::new(), paths: Vec::new() }
+    }
+
+    /// The column `e` reads: a field, or a path of an indexed JSON field
+    /// (`json_extract(field, path [, type])`, [`Select::paths`]).
+    fn col_of(&mut self, e: &Expr) -> Result<Col> {
+        let Some((field, path, kind)) = self.typed_path_of(e)? else { return Ok(Col::Field(self.field_of(e)?)) };
+        let pc = PathCol { field, path, kind };
+        Ok(Col::Path(match self.paths.iter().position(|p| *p == pc) {
+            Some(i) => i,
+            None => {
+                self.paths.push(pc);
+                self.paths.len() - 1
+            }
+        }))
     }
 
     fn table(&self, t: &str) -> Result<()> {
@@ -218,6 +239,7 @@ impl<'a> Raise<'a> {
                             c.name.clone(),
                             match &c.expr {
                                 Expr::Field(f) => Projection::Field(self.field(*f)?),
+                                e @ Expr::Call { func: Func::JsonExtract, .. } => self.col_of(e)?.projection(),
                                 Expr::Score => Projection::Score,
                                 Expr::Hops => Projection::Hops(self.hops_graph()?),
                                 Expr::SeqNo => Projection::SeqNo,
@@ -240,6 +262,10 @@ impl<'a> Raise<'a> {
                 let order = match search.order.first() {
                     None => None,
                     Some(k) if k.expr == Expr::Hops => Some(OrderBy::Score { score: Score::Hops { graph: self.hops_graph()?, far_first: k.desc }, desc: true, nulls_first: false }),
+                    Some(k) if matches!(k.expr, Expr::Call { func: Func::JsonExtract, .. }) => match self.col_of(&k.expr)? {
+                        Col::Path(path) => Some(OrderBy::Path { path, desc: k.desc, nulls_first: k.nulls_first }),
+                        Col::Field(_) => unreachable!("json_extract reads a path"),
+                    },
                     Some(k) => Some(OrderBy::Score { score: self.score(&k.expr)?, desc: k.desc, nulls_first: k.nulls_first }),
                 };
                 if matches!(&order, Some(OrderBy::Score { score, .. }) if score.has_cross_encoder()) {
@@ -257,17 +283,16 @@ impl<'a> Raise<'a> {
                 if !search.order.is_empty() || !search.phases.is_empty() {
                     return Err(err("a Search under an Aggregate is not ordered"));
                 }
-                let group_by: Vec<usize> = keys.iter().map(|k| self.field_of(k)).collect::<Result<_>>()?;
+                let group_by: Vec<Col> = keys.iter().map(|k| self.col_of(k)).collect::<Result<_>>()?;
+                let mut of = Vec::with_capacity(aggs.len());
                 for a in aggs.iter() {
-                    match (&a.func, &a.arg) {
-                        (AggFn::Count, None) => {}
-                        (_, Some(e)) => {
-                            self.field_of(e)?;
-                        }
+                    of.push(match (&a.func, &a.arg) {
+                        (AggFn::Count, None) => None,
+                        (_, Some(e)) => Some(self.col_of(e)?),
                         (f, None) => return Err(err(format!("{f:?} takes a field"))),
-                    }
+                    });
                 }
-                let out = |e: &Expr| output(e, &group_by, aggs);
+                let out = |e: &Expr| output(e, &group_by, aggs, &of);
                 let projection = columns.iter().map(|c| Ok((c.name.clone(), out(&c.expr)?))).collect::<Result<Vec<_>>>()?;
                 let having = having.map(|h| self.having(h, &out)).transpose()?;
                 let keys = sort.map_or(&[][..], |k| &k[..]);
@@ -293,8 +318,8 @@ impl<'a> Raise<'a> {
             }
         };
         let types = sql::projection_types(self.schema, &projection);
-        let per = per.filter(|_| group_by.is_empty() && phases.is_empty() && order.is_some());
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, types, guard, per })
+        let per = per.filter(|_| group_by.is_empty() && phases.is_empty() && matches!(order, Some(OrderBy::Score { .. })));
+        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases, limit, offset, graphs: self.graphs, paths: self.paths, types, guard, per })
     }
 
     /// The graph `hops()` refers to: the first REACHABLE or PATH.
@@ -951,16 +976,18 @@ fn path_value(v: Value) -> Result<Value> {
     }
 }
 
-/// What an Aggregate's output column `e` holds.
-fn output(e: &Expr, keys: &[usize], aggs: &[Agg]) -> Result<Projection> {
+/// What an Aggregate's output column `e` holds; `of` is the column each
+/// aggregate reads.
+fn output(e: &Expr, keys: &[Col], aggs: &[Agg], of: &[Option<Col>]) -> Result<Projection> {
     let Expr::Output(i) = e else { return Err(err(format!("above an Aggregate, columns are its outputs, not {e:?}"))) };
     let i = *i as usize;
-    if let Some(&f) = keys.get(i) {
-        return Ok(Projection::Field(f));
+    if let Some(&c) = keys.get(i) {
+        return Ok(c.projection());
     }
-    match aggs.get(i - keys.len()) {
-        Some(Agg { func: AggFn::Count, arg: None }) => Ok(Projection::Count),
-        Some(Agg { func, arg: Some(Expr::Field(f)) }) => Ok(Projection::Agg { func: *func, field: *f as usize }),
+    let j = i - keys.len();
+    match (aggs.get(j), of.get(j)) {
+        (Some(Agg { func: AggFn::Count, arg: None }), _) => Ok(Projection::Count),
+        (Some(Agg { func, arg: Some(_) }), Some(Some(c))) => Ok(Projection::Agg { func: *func, of: *c }),
         _ => Err(err(format!("the Aggregate has no output {i}"))),
     }
 }

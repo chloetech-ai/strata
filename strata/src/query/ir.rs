@@ -57,16 +57,18 @@ use crate::value::Value;
 
 pub mod eval;
 mod explain;
+mod fuse;
 pub(crate) mod lower;
 mod raise;
+pub(crate) use fuse::paths as fuse_paths;
 
 /// The plan version this version of Strata writes and reads.
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 24] = [
+pub const FEATURES: [&str; 25] = [
     OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE,
-    SCORE_NORMS, JSON, WINDOW,
+    SCORE_NORMS, JSON, WINDOW, JSON_COLUMNS,
 ];
 
 /// The feature of a plan with operators over rows in memory: a join,
@@ -172,6 +174,12 @@ pub const ENCODE: &str = "encode";
 /// ([`Func::JsonExtract`]): to filter by it, which a Search reads from the
 /// field's terms ([`crate::json`]), or as a value of rows.
 pub const JSON: &str = "json";
+
+/// The feature of a plan with a leaf that reads a path of a JSON field
+/// beyond its filter: as a column, a group, an aggregate's values or its
+/// order, which the executor reads from the field's terms
+/// ([`crate::json::PathValues`]).
+pub const JSON_COLUMNS: &str = "json_columns";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1234,6 +1242,40 @@ impl Node {
         }
     }
 
+    /// Whether a leaf in the node reads a path of a JSON field beyond its
+    /// Search's filter ([`JSON_COLUMNS`]).
+    pub fn reads_json_columns(&self) -> bool {
+        let json = |e: &Expr| {
+            let mut found = false;
+            e.visit(&mut |x| found |= matches!(x, Expr::Call { func: Func::JsonExtract, .. }));
+            found
+        };
+        if !self.is_leaf() {
+            return self.inputs().into_iter().any(Node::reads_json_columns);
+        }
+        let mut n = self;
+        let mut found = false;
+        loop {
+            match n {
+                Node::Project { input, columns } => {
+                    found |= columns.iter().any(|c| json(&c.expr));
+                    n = input;
+                }
+                Node::Sort { input, keys } => {
+                    found |= keys.iter().any(|k| json(&k.expr));
+                    n = input;
+                }
+                Node::Aggregate { input, keys, aggs } => {
+                    found |= keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())).any(json);
+                    n = input;
+                }
+                Node::Limit { input, .. } | Node::Filter { input, .. } => n = input,
+                Node::Search(s) => return found || s.order.iter().any(|k| json(&k.expr)),
+                _ => return found,
+            }
+        }
+    }
+
     /// Whether running the node takes operators: it is not a leaf
     /// ([`Node::is_leaf`]), or holds a subquery that runs first.
     pub fn uses_operators(&self) -> bool {
@@ -1936,6 +1978,9 @@ impl Plan {
         }
         if json {
             features.push(JSON.to_string());
+        }
+        if root.reads_json_columns() {
+            features.push(JSON_COLUMNS.to_string());
         }
         if root.has_phases() {
             features.push(RANK_PHASES.to_string());

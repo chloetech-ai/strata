@@ -34,7 +34,7 @@ use crate::query::compound::{func_args, outer_field};
 use crate::query::ir::{ArithOp, CmpOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::rank::Rank;
-use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Guard, GuardSite, Having, OrderBy, Opts, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
+use crate::query::logical::{AggFn, Col, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Guard, GuardSite, Having, OrderBy, Opts, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
@@ -448,7 +448,7 @@ pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
     let projection = every_field(schema);
     let types = projection_types(schema, &projection);
     let filter = if keys.is_empty() { Pred::False } else { Pred::In { field: pk, values: keys } };
-    Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types, guard: None, per: None })
+    Ok(Select { projection, filter, order: None, group_by: Vec::new(), paths: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types, guard: None, per: None })
 }
 
 fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
@@ -1032,7 +1032,8 @@ impl<'a> Binder<'a> {
         let filter = filter.three_valued(&|f| self.schema.fields[f].multi).simplify();
         let graphs = self.graphs.take();
         let types = projection_types(self.schema, &projection);
-        Ok(Select { projection, filter, order, group_by, having, tiebreak, phases: Vec::new(), limit, offset, graphs, types, guard, per: None })
+        let group_by = group_by.into_iter().map(Col::Field).collect();
+        Ok(Select { projection, filter, order, group_by, paths: Vec::new(), having, tiebreak, phases: Vec::new(), limit, offset, graphs, types, guard, per: None })
     }
 
     /// The graph predicate `hops()` refers to: the first REACHABLE or PATH.
@@ -1432,7 +1433,7 @@ impl<'a> Binder<'a> {
         if !fld.indexed {
             return Err(err(format!("{}: aggregates read the field's column, and it is not indexed", fld.name)));
         }
-        Ok(Projection::Agg { func, field })
+        Ok(Projection::Agg { func, of: Col::Field(field) })
     }
 
     /// An aggregate or group value named in HAVING or ORDER BY: a function
@@ -1542,6 +1543,7 @@ impl<'a> Binder<'a> {
                 Projection::SeqNo => Err(err("ORDER BY seq_no(): a query cannot order by it")),
                 Projection::Hops(g) => Ok(OrderBy::Score { score: Score::Hops { graph: *g, far_first: desc }, desc: true, nulls_first: false }),
                 Projection::Feature(s) => Ok(OrderBy::Score { score: s.clone(), desc, nulls_first: false }),
+                Projection::Path(p) => Ok(OrderBy::Path { path: *p, desc, nulls_first: false }),
                 Projection::Count | Projection::Agg { .. } => Err(err("ORDER BY an aggregate needs GROUP BY")),
             };
         }
@@ -2672,7 +2674,7 @@ impl<'a> Binder<'a> {
 /// holds: the field itself, or its MIN or MAX.
 fn typed_source(schema: &Schema, p: &Projection) -> Option<usize> {
     match p {
-        Projection::Field(f) | Projection::Agg { func: AggFn::Min | AggFn::Max, field: f } => Some(*f).filter(|&f| schema.fields[f].logical.is_some()),
+        Projection::Field(f) | Projection::Agg { func: AggFn::Min | AggFn::Max, of: Col::Field(f) } => Some(*f).filter(|&f| schema.fields[f].logical.is_some()),
         _ => None,
     }
 }
@@ -2973,7 +2975,7 @@ mod tests {
     fn binds_facets_and_rejects_errors() {
         let s = bind("SELECT category, COUNT(*) FROM docs WHERE MATCH(body, 'x') GROUP BY category ORDER BY 2 DESC LIMIT 5", &schema(), &q())
             .unwrap();
-        assert_eq!(s.group_by, vec![5]);
+        assert_eq!(s.group_by, vec![Col::Field(5)]);
         assert_eq!(s.order, Some(OrderBy::Count { desc: true }));
         assert_eq!(s.projection[1].1, Projection::Count);
         let s = bind("SELECT category, COUNT(*) FROM docs GROUP BY category ORDER BY 2 DESC, 1 LIMIT 5", &schema(), &q()).unwrap();

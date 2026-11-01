@@ -609,11 +609,30 @@ pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Para
 
 /// [`plan_in`] of a parsed query.
 pub(crate) fn plan_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    plan_query_fused(q, catalog, params, true)
+}
+
+/// [`plan_query`]; with `fuse`, the executor reads the paths of JSON
+/// fields outside WHERE from the field's terms ([`ir::fuse_paths`]).
+fn plan_query_fused(q: &sql::Query, catalog: &[&Schema], params: &Params, fuse: bool) -> Result<ir::Plan> {
     let mut q = q.clone();
     json_paths(&mut q, catalog)?;
     inline_windows(&mut q)?;
     let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()), outer: RefCell::new(None) };
-    Ok(ir::Plan::new(p.query(&q)?.node))
+    let mut node = p.query(&q)?.node;
+    if fuse {
+        ir::fuse_paths(&mut node, catalog);
+    }
+    Ok(ir::Plan::new(node))
+}
+
+/// The plan of a compound SELECT ([`plan_read`]) that reads the paths of
+/// JSON fields outside WHERE row by row, with operators over each row's
+/// object, as plans did before the executor read them from the field's
+/// terms: what tests check the executor's answers against.
+#[doc(hidden)]
+pub fn plan_read_by_rows(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    plan_query_fused(&*super::sql::parse_query(sql_text)?, catalog, params, false)
 }
 
 /// Runs a compound SELECT: its [`plan`], each leaf run by `runner`.

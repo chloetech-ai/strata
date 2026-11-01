@@ -18,18 +18,18 @@
     "A": {
       "bytes": 657416192,
       "bytes_per_row": 657.4,
-      "load_s": 75.91,
-      "open_ms": 44.68,
-      "rows_per_s": 13173.0,
+      "load_s": 83.52,
+      "open_ms": 23.96,
+      "rows_per_s": 11973.0,
       "segments": 10,
       "values_dropped": 21277
     },
     "J": {
-      "bytes": 250847232,
-      "bytes_per_row": 250.8,
-      "load_s": 25.67,
-      "open_ms": 6.39,
-      "rows_per_s": 38955.0,
+      "bytes": 250900480,
+      "bytes_per_row": 250.9,
+      "load_s": 31.58,
+      "open_ms": 7.42,
+      "rows_per_s": 31664.0,
       "segments": 10,
       "values_dropped": 0
     }
@@ -37,12 +37,12 @@
   "inserts": {
     "A": {
       "rows": 5000,
-      "rows_per_s": 17.0,
+      "rows_per_s": 15.0,
       "wal_bytes_per_row": 1104.9
     },
     "J": {
       "rows": 5000,
-      "rows_per_s": 185.0,
+      "rows_per_s": 143.0,
       "wal_bytes_per_row": 147.0
     }
   },
@@ -87,16 +87,16 @@
   "queries": [
     {
       "A": {
-        "best_ms": 0.249,
+        "best_ms": 0.099,
         "first": "[Int(32697)]",
-        "median_ms": 0.265,
+        "median_ms": 0.124,
         "peak_mb": 45.0,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.123,
+        "best_ms": 0.228,
         "first": "[Int(32697)]",
-        "median_ms": 0.135,
+        "median_ms": 0.271,
         "peak_mb": 6.3,
         "rows": 1
       },
@@ -107,16 +107,16 @@
     },
     {
       "A": {
-        "best_ms": 0.084,
+        "best_ms": 0.036,
         "first": "[Int(506)]",
-        "median_ms": 0.142,
+        "median_ms": 0.038,
         "peak_mb": 0.0,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.059,
+        "best_ms": 0.093,
         "first": "[Int(506)]",
-        "median_ms": 0.063,
+        "median_ms": 0.107,
         "peak_mb": 0.0,
         "rows": 1
       },
@@ -127,16 +127,16 @@
     },
     {
       "A": {
-        "best_ms": 0.082,
+        "best_ms": 0.052,
         "first": "[Int(40)]",
-        "median_ms": 0.097,
+        "median_ms": 0.053,
         "peak_mb": 0.0,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.102,
+        "best_ms": 0.084,
         "first": "[Int(40)]",
-        "median_ms": 0.111,
+        "median_ms": 0.086,
         "peak_mb": 0.0,
         "rows": 1
       },
@@ -147,16 +147,16 @@
     },
     {
       "A": {
-        "best_ms": 0.614,
+        "best_ms": 0.268,
         "first": "[Int(131343)]",
-        "median_ms": 0.83,
+        "median_ms": 0.3,
         "peak_mb": 0.2,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.315,
+        "best_ms": 0.562,
         "first": "[Int(131343)]",
-        "median_ms": 0.376,
+        "median_ms": 0.666,
         "peak_mb": 0.2,
         "rows": 1
       },
@@ -167,16 +167,16 @@
     },
     {
       "A": {
-        "best_ms": 0.099,
+        "best_ms": 0.047,
         "first": "[Int(425)]",
-        "median_ms": 0.117,
+        "median_ms": 0.05,
         "peak_mb": 0.0,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.071,
+        "best_ms": 0.104,
         "first": "[Int(425)]",
-        "median_ms": 0.076,
+        "median_ms": 0.119,
         "peak_mb": 0.0,
         "rows": 1
       },
@@ -187,16 +187,16 @@
     },
     {
       "A": {
-        "best_ms": 0.176,
+        "best_ms": 0.07,
         "first": "[Int(8186)]",
-        "median_ms": 0.274,
+        "median_ms": 0.081,
         "peak_mb": 0.2,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.27,
+        "best_ms": 0.368,
         "first": "[Int(8186)]",
-        "median_ms": 0.297,
+        "median_ms": 0.487,
         "peak_mb": 0.1,
         "rows": 1
       },
@@ -207,16 +207,16 @@
     },
     {
       "A": {
-        "best_ms": 0.107,
+        "best_ms": 0.044,
         "first": "[Int(5792)]",
-        "median_ms": 0.182,
+        "median_ms": 0.046,
         "peak_mb": 0.2,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.176,
+        "best_ms": 0.349,
         "first": "[Int(5792)]",
-        "median_ms": 0.193,
+        "median_ms": 0.409,
         "peak_mb": 0.1,
         "rows": 1
       },
@@ -227,16 +227,16 @@
     },
     {
       "A": {
-        "best_ms": 0.366,
+        "best_ms": 0.193,
         "first": "[Int(10233)]",
-        "median_ms": 0.39,
+        "median_ms": 0.238,
         "peak_mb": 0.1,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.07,
+        "best_ms": 0.126,
         "first": "[Int(10233)]",
-        "median_ms": 0.071,
+        "median_ms": 0.138,
         "peak_mb": 0.1,
         "rows": 1
       },
@@ -247,16 +247,16 @@
     },
     {
       "A": {
-        "best_ms": 0.198,
+        "best_ms": 0.104,
         "first": "[Int(1089)]",
-        "median_ms": 0.256,
+        "median_ms": 0.114,
         "peak_mb": 0.0,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.059,
+        "best_ms": 0.111,
         "first": "[Int(1089)]",
-        "median_ms": 0.06,
+        "median_ms": 0.126,
         "peak_mb": 0.0,
         "rows": 1
       },
@@ -267,16 +267,16 @@
     },
     {
       "A": {
-        "best_ms": 0.811,
+        "best_ms": 0.398,
         "first": "[Int(1350)]",
-        "median_ms": 1.097,
+        "median_ms": 0.434,
         "peak_mb": 0.1,
         "rows": 1
       },
       "J": {
-        "best_ms": 0.565,
+        "best_ms": 1.0,
         "first": "[Int(1350)]",
-        "median_ms": 0.597,
+        "median_ms": 1.018,
         "peak_mb": 0.1,
         "rows": 1
       },
@@ -287,16 +287,16 @@
     },
     {
       "A": {
-        "best_ms": 0.038,
+        "best_ms": 0.024,
         "first": "[Str(\"r1736\")]",
-        "median_ms": 0.052,
+        "median_ms": 0.025,
         "peak_mb": 0.1,
         "rows": 10
       },
       "J": {
-        "best_ms": 0.047,
+        "best_ms": 0.066,
         "first": "[Str(\"r1736\")]",
-        "median_ms": 0.049,
+        "median_ms": 0.073,
         "peak_mb": 0.0,
         "rows": 10
       },
@@ -307,16 +307,16 @@
     },
     {
       "A": {
-        "best_ms": 29.674,
+        "best_ms": 30.169,
         "first": "[Str(\"r1736\"), Null, Str(\"v9\"), Null, Null, Null, Null, Str(\"v16\"), Null, Null, Str(\"53ce63230a\"), Null, Null, Null, Null, Null, Null, Null, Null, Null, Null...",
-        "median_ms": 34.28,
-        "peak_mb": 4.4,
+        "median_ms": 30.735,
+        "peak_mb": 4.5,
         "rows": 100
       },
       "J": {
-        "best_ms": 1.322,
+        "best_ms": 2.145,
         "first": "[Str(\"r1736\"), Str(\"{\\\"k1\\\":\\\"v9\\\",\\\"k106\\\":\\\"v3\\\",\\\"k187\\\":\\\"v0\\\",\\\"k22\\\":\\\"v4\\\",\\\"k6\\\":\\\"v16\\\",\\\"k69\\\":\\\"6b791d8803\\\",\\\"k9\\\":\\\"53ce63230a\\\"}\")]",
-        "median_ms": 1.425,
+        "median_ms": 2.3,
         "peak_mb": 0.1,
         "rows": 100
       },
@@ -327,17 +327,17 @@
     },
     {
       "A": {
-        "best_ms": 2.492,
+        "best_ms": 2.363,
         "first": "[Str(\"v16\"), Int(33238)]",
-        "median_ms": 2.552,
+        "median_ms": 2.437,
         "peak_mb": 0.2,
         "rows": 5
       },
       "J": {
-        "best_ms": 1857.223,
+        "best_ms": 2.65,
         "first": "[Str(\"v16\"), Int(33238)]",
-        "median_ms": 1904.818,
-        "peak_mb": 160.4,
+        "median_ms": 2.692,
+        "peak_mb": 0.2,
         "rows": 5
       },
       "name": "group hot",
@@ -347,17 +347,17 @@
     },
     {
       "A": {
-        "best_ms": 0.322,
+        "best_ms": 0.299,
         "first": "[Str(\"v1\"), Int(573)]",
-        "median_ms": 0.377,
+        "median_ms": 0.335,
         "peak_mb": 0.1,
         "rows": 5
       },
       "J": {
-        "best_ms": 88.422,
+        "best_ms": 0.429,
         "first": "[Str(\"v1\"), Int(573)]",
-        "median_ms": 95.411,
-        "peak_mb": 2.7,
+        "median_ms": 0.453,
+        "peak_mb": 0.1,
         "rows": 5
       },
       "name": "group 1%",
@@ -367,17 +367,17 @@
     },
     {
       "A": {
-        "best_ms": 0.091,
+        "best_ms": 0.088,
         "first": "[Null, Int(162)]",
-        "median_ms": 0.096,
+        "median_ms": 0.092,
         "peak_mb": 0.0,
         "rows": 5
       },
       "J": {
-        "best_ms": 8.009,
+        "best_ms": 5.358,
         "first": "[Null, Int(162)]",
-        "median_ms": 8.455,
-        "peak_mb": 0.4,
+        "median_ms": 5.476,
+        "peak_mb": 0.1,
         "rows": 5
       },
       "name": "group hot of 1%",
@@ -387,17 +387,17 @@
     },
     {
       "A": {
-        "best_ms": 12.932,
+        "best_ms": 13.342,
         "first": "[Float(49786.30363790498), Int(2), Int(99996)]",
-        "median_ms": 14.26,
+        "median_ms": 13.571,
         "peak_mb": 0.2,
         "rows": 1
       },
       "J": {
-        "best_ms": 537.414,
+        "best_ms": 21.355,
         "first": "[Float(49786.30363790498), Int(2), Str(\"n/a\")]",
-        "median_ms": 551.725,
-        "peak_mb": 20.5,
+        "median_ms": 21.858,
+        "peak_mb": 0.8,
         "rows": 1
       },
       "name": "avg int",
@@ -407,17 +407,17 @@
     },
     {
       "A": {
-        "best_ms": 1.827,
+        "best_ms": 1.7,
         "first": "[Float(49774.170872983035), Int(10), Int(99972)]",
-        "median_ms": 1.926,
+        "median_ms": 1.858,
         "peak_mb": 0.3,
         "rows": 1
       },
       "J": {
-        "best_ms": 118.789,
+        "best_ms": 3.357,
         "first": "[Float(49774.170872983035), Int(10), Str(\"n/a\")]",
-        "median_ms": 136.038,
-        "peak_mb": 2.6,
+        "median_ms": 3.488,
+        "peak_mb": 0.6,
         "rows": 1
       },
       "name": "avg int 1%",
@@ -427,17 +427,17 @@
     },
     {
       "A": {
-        "best_ms": 0.25,
+        "best_ms": 0.254,
         "first": "[Str(\"r251730\"), Int(2)]",
-        "median_ms": 0.292,
+        "median_ms": 0.3,
         "peak_mb": 0.2,
         "rows": 10
       },
       "J": {
-        "best_ms": 399.739,
+        "best_ms": 9.992,
         "first": "[Str(\"r251730\"), Int(2)]",
-        "median_ms": 428.996,
-        "peak_mb": 53.9,
+        "median_ms": 11.272,
+        "peak_mb": 1.0,
         "rows": 10
       },
       "name": "order int limit 10",
@@ -447,17 +447,17 @@
     },
     {
       "A": {
-        "best_ms": 2.033,
+        "best_ms": 1.536,
         "first": "[Str(\"r897993\"), Int(34)]",
-        "median_ms": 2.21,
+        "median_ms": 1.706,
         "peak_mb": 0.3,
         "rows": 10
       },
       "J": {
-        "best_ms": 201.065,
+        "best_ms": 2.941,
         "first": "[Str(\"r897993\"), Int(34)]",
-        "median_ms": 206.518,
-        "peak_mb": 21.2,
+        "median_ms": 3.195,
+        "peak_mb": 0.8,
         "rows": 10
       },
       "name": "order int of eq hot",
@@ -468,9 +468,9 @@
     {
       "A": null,
       "J": {
-        "best_ms": 553.054,
+        "best_ms": 541.69,
         "first": "[Str(\"k0\"), Int(656338), Float(0.656338), Int(656338), Int(0), Int(0), Null, Null, Int(20), Str(\"[[\\\"v16\\\",33238],[\\\"v10\\\",33123],[\\\"v11\\\",33061],[\\\"v8\\\",330...",
-        "median_ms": 615.071,
+        "median_ms": 639.488,
         "peak_mb": 1.2,
         "rows": 1000
       },
@@ -481,9 +481,9 @@
     {
       "A": null,
       "J": {
-        "best_ms": 472.584,
+        "best_ms": 473.354,
         "first": "[Str(\"k0\"), Int(344), Float(0.6798418972332015), Int(344), Int(0), Int(0), Null, Null, Int(20), Str(\"[[\\\"v9\\\",25],[\\\"v2\\\",23],[\\\"v4\\\",22],[\\\"v6\\\",22],[\\\"v7\\\"...",
-        "median_ms": 510.739,
+        "median_ms": 516.1,
         "peak_mb": 0.6,
         "rows": 680
       },
@@ -498,7 +498,7 @@
     "rows": 100000,
     "variants": {
       "A": {
-        "build_s": 4.179,
+        "build_s": 5.157,
         "bytes": 65543012,
         "bytes_per_row": 655.43,
         "sections": {
@@ -529,17 +529,21 @@
         }
       },
       "J": {
-        "build_s": 1.276,
-        "bytes": 24927176,
-        "bytes_per_row": 249.27,
+        "build_s": 1.415,
+        "bytes": 24935368,
+        "bytes_per_row": 249.35,
         "sections": {
           "fields": {
             "bytes": 8,
             "bytes_per_row": 0.0
           },
+          "json": {
+            "bytes": 8,
+            "bytes_per_row": 0.0
+          },
           "kw": {
-            "bytes": 14720968,
-            "bytes_per_row": 147.21
+            "bytes": 14725624,
+            "bytes_per_row": 147.26
           },
           "pk": {
             "bytes": 3054504,
@@ -552,17 +556,21 @@
         }
       },
       "J text": {
-        "build_s": 2.649,
-        "bytes": 28437448,
-        "bytes_per_row": 284.37,
+        "build_s": 2.889,
+        "bytes": 28445640,
+        "bytes_per_row": 284.46,
         "sections": {
           "fields": {
             "bytes": 8,
             "bytes_per_row": 0.0
           },
+          "json": {
+            "bytes": 8,
+            "bytes_per_row": 0.0
+          },
           "kw": {
-            "bytes": 14720968,
-            "bytes_per_row": 147.21
+            "bytes": 14725624,
+            "bytes_per_row": 147.26
           },
           "pk": {
             "bytes": 3054504,

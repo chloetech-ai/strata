@@ -1,9 +1,10 @@
 //! JSON fields through a coordinator: a table with a JSON field is created
 //! on every shard, path conditions reach the shards in plans (as
 //! `json_extract` calls, plan feature "json") and filter there from the
-//! field's terms, and paths in SELECT, ORDER BY and GROUP BY are read from
-//! the rows the shards return. Each answer is the one database's of the
-//! same rows.
+//! field's terms, paths in GROUP BY, aggregates and ORDER BY are read from
+//! the shards' terms (plan feature "json_columns"), each shard's groups or
+//! rows merged by value, and paths of the rows returned from their objects.
+//! Each answer is the one database's of the same rows.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -106,14 +107,29 @@ async fn paths_through_a_coordinator_answer_as_one_database() {
         "SELECT id, attrs.color, attrs.dims.w FROM items WHERE attrs.certs = 'CE'",
         "SELECT attrs.color, COUNT(*) FROM items GROUP BY attrs.color",
         "SELECT name, MAX(attrs.dims.w), COUNT(attrs.voltage) FROM items GROUP BY name",
+        // Read from the shards' terms: each shard's groups and partial
+        // aggregates, merged by value.
+        "SELECT attrs.color, COUNT(*) FROM items GROUP BY attrs.color ORDER BY COUNT(*) DESC, attrs.color LIMIT 2",
+        "SELECT attrs.voltage, COUNT(*), MIN(attrs.dims.w) FROM items GROUP BY attrs.voltage HAVING COUNT(*) > 3",
+        "SELECT COUNT(*), AVG(attrs.voltage), MIN(attrs.voltage), MAX(attrs.voltage), SUM(attrs.dims.w), COUNT(DISTINCT attrs.certs) FROM items",
+        "SELECT attrs.certs, name, COUNT(*) FROM items GROUP BY attrs.certs, name",
     ] {
         let want = sorted(local(&one, q));
         assert!(!want.is_empty(), "{q}");
         assert_eq!(sorted(select(&svc, q).await), want, "{q}");
     }
-    // Ordered by a path, across shards.
-    let q = "SELECT id, attrs.dims.w FROM items WHERE attrs.dims.w > 0 ORDER BY attrs.dims.w DESC, id LIMIT 7";
-    assert_eq!(select(&svc, q).await, local(&one, q), "{q}");
+    // Ordered by a path, across shards: merged by the path's column, which
+    // a leaf selects for it when the query does not.
+    for q in [
+        "SELECT id, attrs.dims.w FROM items WHERE attrs.dims.w > 0 ORDER BY attrs.dims.w DESC, id LIMIT 7",
+        "SELECT id, attrs.voltage FROM items ORDER BY attrs.voltage, id LIMIT 9 OFFSET 3",
+        "SELECT id FROM items WHERE attrs.certs = 'UL' ORDER BY attrs.voltage DESC, id LIMIT 6",
+        "SELECT id, attrs.color FROM items ORDER BY attrs.color DESC NULLS FIRST, id LIMIT 5",
+    ] {
+        let want = local(&one, q);
+        assert!(!want.is_empty(), "{q}");
+        assert_eq!(select(&svc, q).await, want, "{q}");
+    }
 
     // The paths listing: each shard's, summed, is the one database's, as
     // SQL and over HTTP. A few rows change first: deleted, rewritten.
