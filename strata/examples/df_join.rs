@@ -10,7 +10,7 @@
 //! Prints, per query, the median of three runs (or one run, past ten
 //! seconds): the operators (one thread, as they run), DataFusion on one
 //! partition and on four, and the leaves alone (the single-table scans
-//! every engine runs first).
+//! every engine runs first). `DF_ONLY=i` runs query `i` alone.
 
 use std::time::Instant;
 
@@ -115,7 +115,11 @@ fn main() {
     println!("{n} rows a table; {} cores; {cpu}", std::thread::available_parallelism().map_or(0, |n| n.get()));
     println!("| query | rows | operators | DataFusion, 1 partition | DataFusion, 4 partitions | leaves alone |");
     println!("|---|---|---|---|---|---|");
-    for (name, sql, leaves) in QUERIES {
+    let only: Option<usize> = std::env::var("DF_ONLY").ok().and_then(|v| v.parse().ok());
+    for (qi, (name, sql, leaves)) in QUERIES.iter().enumerate() {
+        if only.is_some_and(|o| o != qi) {
+            continue;
+        }
         let run = |engine: Engine, threads: usize| ExecOptions { engine, threads, ..db.exec.clone() };
         let ops = run(Engine::Operators, 1);
         let (t_ops, want) = match db.query_with(sql, &Params::new(), &ops) {
