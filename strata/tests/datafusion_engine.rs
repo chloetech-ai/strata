@@ -10,6 +10,7 @@
 use rand::{Rng, SeedableRng};
 use strata::db::Db;
 use strata::query::exec::{Engine, ExecOptions, ResultSet};
+use strata::query::steps::Step;
 use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::value::Value;
@@ -162,6 +163,8 @@ fn datafusion_answers_as_the_operators() {
         let want = run(&db, sql, Engine::Operators);
         let got = run(&db, sql, Engine::DataFusion);
         same(sql, &want, &got);
+        // The leaves' counts, summed as the operators sum them.
+        assert_eq!((want.stats.filter_docs, want.stats.scored), (got.stats.filter_docs, got.stats.scored), "{sql}: filtered and scored rows");
         if !on_datafusion(&got) {
             assert!(!must, "{sql}: ran on the operators: {:?}", got.stats.plan.first());
             fell_back.push(sql);
@@ -228,4 +231,100 @@ fn a_join_on_many_keys_reads_its_right_side_whole() {
         let restricted = restricted && plan_line(&want).contains("restricted to");
         assert_eq!(plan_line(&got).contains("restricted to"), restricted, "{sql}: {}", plan_line(&got));
     }
+}
+
+/// Two tables of 1,100 rows on one key: their join holds 1,210,000 rows.
+fn big_join(dir: &std::path::Path) -> Db {
+    let schema = Schema::new("l", vec![Field::new("id", FieldType::Int), Field::new("k", FieldType::Int)], Some("id")).unwrap();
+    let db = Db::create(&dir.join("big.strata"), schema, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    db.load((0..1_100).map(|i| vec![Value::Int(i), Value::Int(1)])).unwrap();
+    db.sql("CREATE TABLE r (id INT PRIMARY KEY, k INT)", &Params::new()).unwrap();
+    db.load_into("r", (0..1_100).map(|i| vec![Value::Int(i), Value::Int(1)])).unwrap();
+    db
+}
+
+#[test]
+fn datafusion_memory_counts_against_the_query_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = big_join(dir.path());
+    // A group a joined row: 1,210,000 groups, tens of MiB.
+    let sql = "SELECT COUNT(*) FROM (SELECT l.id, r.id FROM l JOIN r ON l.k = r.k GROUP BY l.id, r.id) t";
+    let budget = strata::query::memory::MemoryBudget::new(1 << 30);
+    let opts = ExecOptions { engine: Engine::DataFusion, memory: Some(budget.clone()), ..db.exec.clone() };
+    let rs = db.query_with(sql, &Params::new(), &opts).unwrap();
+    assert!(on_datafusion(&rs));
+    assert_eq!(rs.rows, vec![vec![Value::Int(1_210_000)]]);
+    assert_eq!(budget.used(), 0, "given back when the query ends");
+    assert_eq!(budget.trips(), 0);
+    // Past a budget of 2 MiB the query fails as the operators' would, with
+    // Strata's memory error, and does not run again on the operators.
+    let small = strata::query::memory::MemoryBudget::new(2 << 20);
+    let opts = ExecOptions { engine: Engine::DataFusion, memory: Some(small.clone()), ..db.exec.clone() };
+    match db.query_with(sql, &Params::new(), &opts) {
+        Err(strata::Error::Memory(m)) => assert!(m.contains("MiB"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(small.trips() >= 1);
+    assert_eq!(small.used(), 0);
+}
+
+#[test]
+fn a_datafusion_plan_stops_at_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = big_join(dir.path());
+    let sql = "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k ORDER BY l.id DESC, r.id DESC LIMIT 5";
+    let opts = ExecOptions { engine: Engine::DataFusion, deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)), ..db.exec.clone() };
+    let t = std::time::Instant::now();
+    match db.query_with(sql, &Params::new(), &opts) {
+        Err(strata::Error::Timeout(_)) => {}
+        Ok(rs) => assert!(t.elapsed() < std::time::Duration::from_millis(30), "answered past the deadline: {:?}", rs.rows),
+        Err(e) => panic!("{e}"),
+    }
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "stopped soon after the deadline: {:?}", t.elapsed());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let opts = ExecOptions { engine: Engine::DataFusion, cancel: Some(cancel), ..db.exec.clone() };
+    assert!(matches!(db.query_with(sql, &Params::new(), &opts), Err(strata::Error::Timeout(_))));
+}
+
+/// The steps directly inside the step at `at`.
+fn children(steps: &[Step], at: usize) -> Vec<usize> {
+    let d = steps[at].depth;
+    steps[at + 1..].iter().enumerate().take_while(|(_, s)| s.depth > d).filter(|(_, s)| s.depth == d + 1).map(|(i, _)| at + 1 + i).collect()
+}
+
+#[test]
+fn a_datafusion_plan_s_profile_holds_its_leaves_and_operators() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let sql = "SELECT a.country, COUNT(*) FROM papers p JOIN authors a ON p.author = a.id WHERE MATCH(p.title, 'graph') GROUP BY a.country";
+    let opts = ExecOptions { engine: Engine::DataFusion, profile: true, ..db.exec.clone() };
+    let rs = db.query_with(sql, &Params::new(), &opts).unwrap();
+    assert!(on_datafusion(&rs), "{:?}", rs.stats.plan);
+    let st = &rs.stats.steps;
+    assert!(!st.is_empty() && st[0].depth == 0);
+    for w in st.windows(2) {
+        assert!(w[1].depth <= w[0].depth + 1, "{st:#?}");
+    }
+    for i in 0..st.len() {
+        for c in children(st, i) {
+            let (p, s) = (&st[i], &st[c]);
+            assert!(s.start_us + 0.3 >= p.start_us && s.start_us + s.us <= p.start_us + p.us + 0.3, "{s:?} is not inside {p:?}");
+        }
+    }
+    // Each leaf, its executor's steps inside.
+    let leaves: Vec<usize> = (0..st.len()).filter(|&i| st[i].op == "leaf").collect();
+    let tables: Vec<&str> = leaves.iter().map(|&i| st[i].detail.rsplit(": ").next().unwrap()).collect();
+    assert_eq!(tables, ["papers", "authors"], "{st:#?}");
+    assert!(leaves.iter().all(|&i| !children(st, i).is_empty()), "{st:#?}");
+    assert!(leaves.iter().all(|&i| st[i].rows.is_some_and(|n| n > 0)) && st[leaves[1]].rows <= Some(AUTHORS as u64), "{st:#?}");
+    // DataFusion's plans (the left side's rows, for the values that
+    // restrict the right side's leaf, then the answer's), their operators
+    // inside, with their rows and CPU time.
+    let df = st.iter().rposition(|s| s.op == "datafusion").unwrap_or_else(|| panic!("no datafusion step in {st:#?}"));
+    assert_eq!(st[df].rows, Some(rs.rows.len() as u64));
+    assert!(st[df].cpu_us.is_some());
+    let ops: Vec<&Step> = st[df + 1..].iter().take_while(|s| s.depth > st[df].depth).collect();
+    assert!(ops.iter().any(|s| s.op == "hash join" && s.rows.is_some()), "{ops:#?}");
+    assert!(ops.iter().any(|s| s.op == "aggregate" && s.detail.contains("gby")), "{ops:#?}");
+    assert!(ops.iter().all(|s| s.cpu_us.is_some()), "{ops:#?}");
 }

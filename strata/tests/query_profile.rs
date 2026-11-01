@@ -94,14 +94,18 @@ fn a_query_s_steps_are_its_operators_and_segments() {
     assert!(steps.iter().any(|s| (s.op == "facet" || s.op == "aggregate") && s.rows.is_some_and(|n| n > 1)), "{steps:#?}");
 
     // A compound query: its operators, each leaf's executor steps inside
-    // the leaf's.
+    // the leaf's. Strata's operators are steps around the leaves;
+    // DataFusion's (STRATA_ENGINE=datafusion) are inside a `datafusion`
+    // step after them.
     let compound = "SELECT DISTINCT year FROM (SELECT year FROM docs ORDER BY bm25(body, :t) DESC LIMIT 50) AS t";
     let rs = db.query_with(compound, &params, &ExecOptions::default()).unwrap();
     let steps = &rs.stats.steps;
     well_formed(steps);
+    let on_datafusion = steps.iter().any(|s| s.op == "datafusion");
     let leaf = steps.iter().position(|s| s.op == "leaf").unwrap_or_else(|| panic!("no leaf step in {steps:#?}"));
-    assert!(steps[leaf].depth > 0 && steps[leaf].detail.ends_with("docs"), "{:?}", steps[leaf]);
+    assert!((on_datafusion || steps[leaf].depth > 0) && steps[leaf].detail.ends_with("docs"), "{:?}", steps[leaf]);
     assert!(children(steps, leaf).iter().any(|&i| steps[i].op == "rank"), "{steps:#?}");
     // DISTINCT runs as GROUP BY its columns.
-    assert!(steps.iter().any(|s| s.op == "aggregate" && s.detail == "1 key, 1 aggregate"), "{steps:#?}");
+    let distinct = |s: &Step| s.op == "aggregate" && if on_datafusion { s.detail.contains("gby=") && s.depth > 0 } else { s.detail == "1 key, 1 aggregate" };
+    assert!(steps.iter().any(distinct), "{steps:#?}");
 }

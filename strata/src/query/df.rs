@@ -31,10 +31,12 @@
 //! any error of DataFusion's own, so a plan answers here exactly when
 //! DataFusion and the operators agree on what it means.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray, UInt64Array,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray,
+    TimestampMicrosecondBuilder, UInt64Array,
 };
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
@@ -42,12 +44,15 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Column as DfColumn, DFSchema, DataFusionError, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::functions_aggregate::expr_fn as agg_fn;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::{
     binary_expr, cast, in_list, lit, not, when, ColumnarValue, Expr as DExpr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SortExpr, Volatility,
 };
+use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 
 use crate::error::{Error, Result};
@@ -55,6 +60,7 @@ use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
 use crate::query::ir::{Agg, ArithOp, CmpOp, Expr, Func, JoinKind, Node, Plan, SortKey};
 use crate::query::memory::Charge;
 use crate::query::ops::{self, Runner};
+use crate::query::steps::{self, Clock, Step};
 use crate::query::AggFn;
 use crate::schema::Schema;
 use crate::value::Value;
@@ -107,11 +113,78 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// is not lowered here.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<Outcome> {
     let config = SessionConfig::new().with_target_partitions(opts.threads.max(1)).with_batch_size(8192);
-    let mut l = Lower { catalog, runner, opts, ctx: SessionContext::new_with_config(config), next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge: Charge::new(opts.memory.clone()) };
+    let charge = Charge::new(opts.memory.clone());
+    let pool = Arc::new(Pool { charge: charge.clone(), limited: opts.memory.is_some(), used: AtomicUsize::new(0), refused: Mutex::new(None) });
+    let env = RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc().map_err(|e| Error::Query(format!("datafusion: {e}")))?;
+    let ctx = SessionContext::new_with_config_rt(config, env);
+    let mut l = Lower { catalog, runner, opts, ctx, pool, next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge, filter_docs: 0, scored: 0, clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
     match l.answer(&plan.root) {
         Ok(rs) => Ok(Outcome::Done(rs)),
         Err(Fail::No(why)) => Ok(Outcome::Fallback(why)),
         Err(Fail::Err(e)) => Err(e),
+    }
+}
+
+/// DataFusion's memory, counted against the query's [`Charge`] while its
+/// joins, groups and sorts hold it, and given back as they free it. Past
+/// the budget a reservation is refused: a sort or a group that can spill
+/// to disk then spills, and anything else fails the query with Strata's
+/// [`Error::Memory`].
+struct Pool {
+    charge: Charge,
+    limited: bool,
+    used: AtomicUsize,
+    /// The bytes of the last reservation refused.
+    refused: Mutex<Option<u64>>,
+}
+
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pool {{ used: {} }}", self.used.load(AtomicOrdering::Relaxed))
+    }
+}
+
+impl std::fmt::Display for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "strata query memory ({} bytes held)", self.used.load(AtomicOrdering::Relaxed))
+    }
+}
+
+impl MemoryPool for Pool {
+    fn name(&self) -> &str {
+        "strata"
+    }
+
+    fn grow(&self, _: &MemoryReservation, additional: usize) {
+        // Infallible: counted, and the next fallible reservation is refused.
+        self.charge.add_anyway(additional as u64);
+        self.used.fetch_add(additional, AtomicOrdering::Relaxed);
+    }
+
+    fn shrink(&self, _: &MemoryReservation, shrink: usize) {
+        self.charge.sub(shrink as u64);
+        self.used.fetch_sub(shrink, AtomicOrdering::Relaxed);
+    }
+
+    fn try_grow(&self, _: &MemoryReservation, additional: usize) -> datafusion::common::Result<()> {
+        if self.charge.try_add(additional as u64) {
+            self.used.fetch_add(additional, AtomicOrdering::Relaxed);
+            return Ok(());
+        }
+        *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(additional as u64);
+        Err(DataFusionError::ResourcesExhausted(format!("{additional} bytes more than the query memory budget leaves")))
+    }
+
+    fn reserved(&self) -> usize {
+        self.used.load(AtomicOrdering::Relaxed)
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        if self.limited {
+            MemoryLimit::Unknown
+        } else {
+            MemoryLimit::Infinite
+        }
     }
 }
 
@@ -179,6 +252,8 @@ struct Lower<'a, 'r> {
     runner: &'a mut Runner<'r>,
     opts: &'a ExecOptions,
     ctx: SessionContext,
+    /// The memory DataFusion holds, counted against `charge`.
+    pool: Arc<Pool>,
     /// For names: columns, tables.
     next: usize,
     /// The `WITH` results in scope, each held in memory, the innermost
@@ -192,6 +267,15 @@ struct Lower<'a, 'r> {
     per: Option<(*const Node, crate::query::ir::PerCap)>,
     lines: Vec<String>,
     charge: Charge,
+    /// The leaves' rows passing their filters, and scored, summed, as the
+    /// operators sum them.
+    filter_docs: u64,
+    scored: u64,
+    /// The steps of the query's profile ([`steps`]): each leaf's, its
+    /// executor's inside, and each DataFusion plan's operators.
+    clock: Clock,
+    prof: Vec<Step>,
+    dropped: u64,
 }
 
 impl<'a> Lower<'a, '_> {
@@ -204,6 +288,10 @@ impl<'a> Lower<'a, '_> {
         let rel = self.node(root, "query")?;
         let (mut rs, _) = self.rows(rel)?;
         rs.stats.plan = std::mem::take(&mut self.lines);
+        rs.stats.filter_docs = self.filter_docs;
+        rs.stats.scored = self.scored;
+        rs.stats.steps = std::mem::take(&mut self.prof);
+        rs.stats.steps_dropped = self.dropped;
         Ok(rs)
     }
 
@@ -421,10 +509,56 @@ impl<'a> Lower<'a, '_> {
     /// Runs a plan to its batches, under the query's deadline and cancel
     /// flag (checked before and after: DataFusion's own run is not
     /// interrupted yet).
+    /// Runs `plan` on DataFusion's threads, checking the query's deadline
+    /// and cancel flag while it runs: past them, the plan is stopped and
+    /// the query fails as the operators' would.
     fn collect(&mut self, plan: LogicalPlan) -> R<Vec<RecordBatch>> {
         self.opts.check()?;
+        *self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let ctx = self.ctx.clone();
-        let batches = runtime().block_on(async move { ctx.execute_logical_plan(plan).await?.collect().await })?;
+        let m = self.clock.mark(&self.prof);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = runtime().spawn(async move {
+            let r = async move {
+                let df = ctx.execute_logical_plan(plan).await?;
+                let task = Arc::new(df.task_ctx());
+                let physical = df.create_physical_plan().await?;
+                let batches = datafusion::physical_plan::collect(physical.clone(), task).await?;
+                Ok::<_, DataFusionError>((batches, physical))
+            }
+            .await;
+            let _ = tx.send(r);
+        });
+        let r = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(r) => break r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(e) = self.opts.check() {
+                        task.abort();
+                        return Err(Fail::Err(e));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Fail::Err(Error::Query("datafusion: the plan's task stopped without an answer".into()))),
+            }
+        };
+        let (batches, physical) = r.map_err(|e| match (e.find_root(), self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()).take()) {
+            // Past the memory budget: the query's answer, as the operators'.
+            (DataFusionError::ResourcesExhausted(_), Some(wanted)) => Fail::Err(self.charge.refuse(self.charge.counted().saturating_add(wanted))),
+            _ => Fail::from(e),
+        })?;
+        // The plan's operators, each a step inside this one.
+        let wall = m.t0.elapsed().as_nanos() as f64 / 1e3;
+        let ops = operator_steps(&physical, steps::us_at(m.t0), wall, self.clock.cpu);
+        // Their CPU time, on DataFusion's threads, counts in this step's.
+        if let Some(root) = ops.first() {
+            self.clock.helped_by(root);
+        }
+        self.dropped += steps::nest(&mut self.prof, &ops, 0) as u64;
+        let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let top = ops.first().map(|s| s.op.clone()).unwrap_or_default();
+        if self.clock.wrap(&mut self.prof, m, "datafusion", top, Some(rows)).is_none() {
+            self.dropped += 1;
+        }
         self.opts.check()?;
         Ok(batches)
     }
@@ -592,7 +726,10 @@ impl<'a> Lower<'a, '_> {
             }
         }
         self.opts.check()?;
+        let table = leaf.search().map(|s| s.table.clone()).unwrap_or_default();
+        let m = self.clock.mark(&self.prof);
         let rs = (self.runner)(&Plan::new(leaf))?;
+        self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
         if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, n)) {
             *read = rs.rows.len();
         }
@@ -604,13 +741,19 @@ impl<'a> Lower<'a, '_> {
         }
         self.lines.push(line);
         self.lines.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
+        self.filter_docs += rs.stats.filter_docs;
+        self.scored += rs.stats.scored;
         for r in &rs.rows {
             self.charge.row(r)?;
         }
         let n = rs.rows.len();
         let keys = (rs.keys.len() == n).then_some(rs.keys);
         let scores = (rs.scores.len() == n).then_some(rs.scores);
-        self.memory(rs.columns, rs.rows, keys, scores)
+        let rel = self.memory(rs.columns, rs.rows, keys, scores)?;
+        if self.clock.wrap(&mut self.prof, m, "leaf", format!("{what}: {table}"), Some(n as u64)).is_none() {
+            self.dropped += 1;
+        }
+        Ok(rel)
     }
 
     /// `input`, under a LIMIT that wants `want` of its rows, whose rows keep
@@ -653,9 +796,8 @@ impl<'a> Lower<'a, '_> {
         let mut fields = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
         let mut cols = Vec::with_capacity(width);
-        for i in 0..width {
+        for a in columns_of(&rows, width)? {
             let name = self.fresh("c");
-            let a = array_of(rows.iter().map(|r| r.get(i).unwrap_or(&Value::Null)))?;
             fields.push(Field::new(&name, a.data_type().clone(), true));
             arrays.push(a);
             cols.push(name);
@@ -663,7 +805,7 @@ impl<'a> Lower<'a, '_> {
         let key = match keys {
             Some(k) => {
                 let name = self.fresh("key");
-                let a = array_of(k.iter())?;
+                let a = column_of(&k)?;
                 fields.push(Field::new(&name, a.data_type().clone(), true));
                 arrays.push(a);
                 Some(name)
@@ -877,12 +1019,27 @@ impl<'a> Lower<'a, '_> {
         let r = if right.is_leaf() {
             // As the operators do: the right side read only for the join
             // values the left holds.
-            l = self.materialize(l)?;
+            let (m, left_rows) = self.materialized(l)?;
+            l = m;
+            // Many values cost the restricted scan more than reading the
+            // rows they would cut: the right side is read whole and hashed.
+            let whole = left_rows > RESTRICT_ALWAYS
+                && plain(right)
+                && match self.count(right)? {
+                    Some(rows) if (left_rows as u64).saturating_mul(RESTRICT_RATIO) > rows => {
+                        let values = self.distinct_keys(&l, keys)?;
+                        values > RESTRICT_ALWAYS && (values as u64).saturating_mul(RESTRICT_RATIO) > rows
+                    }
+                    _ => false,
+                };
+            if whole {
+                let r = self.leaf(right, "join", Vec::new())?;
+                return self.joined(l, r, kind, keys, on);
+            }
             let Node::Project { columns, .. } = right else { unreachable!("a leaf") };
             let schema = self.table(right)?;
             let mut restrict = Vec::new();
             let mut none = false;
-            let mut values = 0;
             for k in keys {
                 let e = self.top(&k.left, &l.cols, l.plan.schema())?;
                 if matches!(e.get_type(l.plan.schema())?, DataType::List(_)) {
@@ -899,23 +1056,41 @@ impl<'a> Lower<'a, '_> {
                 let Expr::Field(f) = &c.expr else { return no("a join key of a scanned table that is not one of its fields") };
                 let vals = ops::equal_to(Some(schema), Some(*f as usize), vals)?;
                 none |= vals.is_empty();
-                values += vals.len();
                 restrict.push(Expr::In { expr: Box::new(Expr::Field(*f)), list: vals.into_iter().map(Expr::Lit).collect() });
             }
-            // Many values cost the restricted scan more than reading the
-            // rows they would cut: the right side is read whole and hashed.
-            let whole = values > RESTRICT_ALWAYS && plain(right) && self.count(right)?.is_some_and(|rows| (values as u64).saturating_mul(RESTRICT_RATIO) > rows);
             match none {
                 true => {
                     let names = columns.iter().map(|c| c.name.clone()).collect();
                     self.memory(names, Vec::new(), None, None)?
                 }
-                false if whole => self.leaf(right, "join", Vec::new())?,
                 false => self.leaf(right, "join", restrict)?,
             }
         } else {
             self.node(right, "join")?
         };
+        self.joined(l, r, kind, keys, on)
+    }
+
+    /// How many distinct values, NULL aside, the join keys take in the
+    /// rows of `l` (summed over the keys).
+    fn distinct_keys(&mut self, l: &Rel, keys: &[crate::query::ir::JoinKey]) -> R<usize> {
+        let mut total = 0;
+        for k in keys {
+            let e = self.top(&k.left, &l.cols, l.plan.schema())?;
+            let (v, c) = (self.fresh("v"), self.fresh("n"));
+            let plan = LogicalPlanBuilder::from(l.plan.clone())
+                .project(vec![e.alias(&v)])?
+                .aggregate(Vec::<DExpr>::new(), vec![agg_fn::count_distinct(col(&v)).alias(&c)])?
+                .build()?;
+            for b in self.collect(plan)? {
+                total += values_of(b.column(0))?.first().and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
+            }
+        }
+        Ok(total)
+    }
+
+    /// The join of `l` and `r` on `keys` (and `on`).
+    fn joined(&mut self, l: Rel, r: Rel, kind: JoinKind, keys: &[crate::query::ir::JoinKey], on: Option<&Expr>) -> R<Rel> {
         let both: Vec<String> = l.cols.iter().chain(&r.cols).cloned().collect();
         let mut conds = Vec::new();
         for k in keys {
@@ -1221,6 +1396,63 @@ const RESTRICT_ALWAYS: usize = 1024;
 /// against a million-row table, 1.1 s restricted, 0.15 s read whole.
 const RESTRICT_RATIO: u64 = 32;
 
+/// The steps of a DataFusion physical plan's operators, in pre-order:
+/// `HashJoinExec` as `hash join`, its line of `EXPLAIN` as the detail, and
+/// the rows it gave. DataFusion measures the time an operator spent itself
+/// (`elapsed_compute`, which leaves out its inputs', summed over its
+/// partitions); a step's time is that and its inputs', which are laid out
+/// one after the other from its start (a hash join builds from its first
+/// input, then probes with the second), as its CPU time when the query
+/// measures CPU. The operators of a plan run at once, each pulling from
+/// its inputs, so the times are the plan's work, not when each ran; scaled
+/// to fit within the plan's `wall` time, starting at `start`.
+fn operator_steps(plan: &Arc<dyn ExecutionPlan>, start: f64, wall: f64, cpu: bool) -> Vec<Step> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, depth: u16, at: f64, out: &mut Vec<Step>) -> f64 {
+        let metrics = plan.metrics().map(|m| m.aggregate_by_name());
+        let own = metrics.as_ref().and_then(|m| m.elapsed_compute()).map_or(0.0, |ns| ns as f64 / 1e3);
+        let line = displayable(plan.as_ref()).one_line().to_string();
+        let detail = line.split_once(": ").map_or("", |(_, d)| d).trim();
+        let i = out.len();
+        out.push(Step {
+            op: operator_name(plan.name()),
+            detail: steps::short(detail, 200),
+            depth,
+            start_us: at,
+            rows: metrics.as_ref().and_then(|m| m.output_rows()).map(|n| n as u64),
+            ..Step::default()
+        });
+        let mut t = at;
+        for c in plan.children() {
+            t += walk(c, depth.saturating_add(1), t, out);
+        }
+        out[i].us = own + (t - at);
+        out[i].us
+    }
+    let mut out = Vec::new();
+    let total = walk(plan, 0, 0.0, &mut out);
+    let scale = if total > wall && total > 0.0 { wall / total } else { 1.0 };
+    for s in &mut out {
+        s.cpu_us = cpu.then_some(steps::tenth(s.us));
+        s.start_us = start + s.start_us * scale;
+        s.us = steps::tenth(s.us * scale);
+    }
+    out
+}
+
+/// `HashJoinExec` as `hash join`, `SortPreservingMergeExec` as `sort
+/// preserving merge`.
+fn operator_name(name: &str) -> String {
+    let name = name.strip_suffix("Exec").unwrap_or(name);
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
 /// Whether the leaf `n` returns the same rows restricted or not, but for
 /// the rows the restriction drops: `Project [Sort] [Filter] Search`, with
 /// no LIMIT or aggregate whose rows would change with it.
@@ -1338,6 +1570,90 @@ fn kind_of(v: &Value) -> R<Kind> {
             k
         }
     })
+}
+
+/// One column being built a row at a time: typed by its first value that
+/// is not NULL. Lists and vectors are left to [`array_of`].
+enum Col {
+    Nulls(usize),
+    Int(Int64Builder),
+    Float(Float64Builder),
+    Str(StringBuilder),
+    Bool(BooleanBuilder),
+    Time(TimestampMicrosecondBuilder),
+    Other,
+}
+
+impl Col {
+    /// The array of `n` rows; `other` builds a column of lists or vectors.
+    fn finish(self, n: usize, other: impl FnOnce() -> R<ArrayRef>) -> R<ArrayRef> {
+        Ok(match self {
+            Col::Nulls(_) => Arc::new(datafusion::arrow::array::NullArray::new(n)),
+            Col::Int(mut b) => Arc::new(b.finish()),
+            Col::Float(mut b) => Arc::new(b.finish()),
+            Col::Str(mut b) => Arc::new(b.finish()),
+            Col::Bool(mut b) => Arc::new(b.finish()),
+            Col::Time(mut b) => Arc::new(b.finish()),
+            Col::Other => other()?,
+        })
+    }
+
+    fn push(&mut self, v: &Value, n: usize) -> R<()> {
+        match (&mut *self, v) {
+            (Col::Other, _) => {}
+            (Col::Nulls(k), Value::Null) => *k += 1,
+            (Col::Nulls(k), v) => {
+                let k = *k;
+                *self = match v {
+                    Value::Int(_) => Col::Int(Int64Builder::with_capacity(n)),
+                    Value::Float(_) => Col::Float(Float64Builder::with_capacity(n)),
+                    Value::Str(_) => Col::Str(StringBuilder::with_capacity(n, n * 8)),
+                    Value::Bool(_) => Col::Bool(BooleanBuilder::with_capacity(n)),
+                    Value::Timestamp(_) => Col::Time(TimestampMicrosecondBuilder::with_capacity(n)),
+                    _ => Col::Other,
+                };
+                for _ in 0..k {
+                    self.push(&Value::Null, n)?;
+                }
+                self.push(v, n)?;
+            }
+            (Col::Int(b), Value::Int(x)) => b.append_value(*x),
+            (Col::Float(b), Value::Float(x)) => b.append_value(*x),
+            (Col::Str(b), Value::Str(x)) => b.append_value(x),
+            (Col::Bool(b), Value::Bool(x)) => b.append_value(*x),
+            (Col::Time(b), Value::Timestamp(x)) => b.append_value(*x),
+            (Col::Int(b), Value::Null) => b.append_null(),
+            (Col::Float(b), Value::Null) => b.append_null(),
+            (Col::Str(b), Value::Null) => b.append_null(),
+            (Col::Bool(b), Value::Null) => b.append_null(),
+            (Col::Time(b), Value::Null) => b.append_null(),
+            (_, v) => return no(format!("a column of values of several types, {v:?} among them")),
+        }
+        Ok(())
+    }
+}
+
+/// Columns `0..width` of `rows` as Arrow arrays, in one pass over the
+/// rows: a column of one type each, NULLs aside.
+fn columns_of(rows: &[Vec<Value>], width: usize) -> R<Vec<ArrayRef>> {
+    let n = rows.len();
+    let mut cols: Vec<Col> = (0..width).map(|_| Col::Nulls(0)).collect();
+    for r in rows {
+        for (i, c) in cols.iter_mut().enumerate() {
+            c.push(r.get(i).unwrap_or(&Value::Null), n)?;
+        }
+    }
+    cols.into_iter().enumerate().map(|(i, c)| c.finish(n, || array_of(rows.iter().map(|r| r.get(i).unwrap_or(&Value::Null))))).collect()
+}
+
+/// `values` as one Arrow array ([`columns_of`] of one column).
+fn column_of(values: &[Value]) -> R<ArrayRef> {
+    let n = values.len();
+    let mut c = Col::Nulls(0);
+    for v in values {
+        c.push(v, n)?;
+    }
+    c.finish(n, || array_of(values.iter()))
 }
 
 /// The values of one column as an Arrow array of their one type.
