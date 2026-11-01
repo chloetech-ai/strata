@@ -75,53 +75,73 @@ fn open(dir: &std::path::Path) -> Db {
     db
 }
 
-/// The queries, each with whether DataFusion must run it (or the
-/// operators may, for what the lowering does not cover yet).
-const QUERIES: &[(&str, bool)] = &[
+/// The queries, each of which DataFusion runs itself.
+const QUERIES: &[&str] = &[
     // Joins.
-    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, p.year, v.name, v.rank FROM papers p LEFT JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank >= 3 AND p.year > 2000", true),
-    ("SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id WHERE MATCH(p.title, 'graph')", true),
-    ("SELECT p.id, a.name, v.name FROM papers p JOIN authors a ON p.author = a.id LEFT JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, v.id FROM papers p LEFT JOIN venues v ON p.venue = v.id AND v.rank > 2", true),
-    ("SELECT a.id, b.id FROM papers a JOIN papers b ON a.author = b.author AND b.id != a.id WHERE a.year = 2001", true),
-    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id ORDER BY bm25(p.title, 'vector') DESC LIMIT 7", true),
-    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.year DESC, p.id LIMIT 15 OFFSET 5", true),
+    "SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, p.year, v.name, v.rank FROM papers p LEFT JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank >= 3 AND p.year > 2000",
+    "SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id WHERE MATCH(p.title, 'graph')",
+    "SELECT p.id, a.name, v.name FROM papers p JOIN authors a ON p.author = a.id LEFT JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, v.id FROM papers p LEFT JOIN venues v ON p.venue = v.id AND v.rank > 2",
+    "SELECT a.id, b.id FROM papers a JOIN papers b ON a.author = b.author AND b.id != a.id WHERE a.year = 2001",
+    "SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id ORDER BY bm25(p.title, 'vector') DESC LIMIT 7",
+    "SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.year DESC, p.id LIMIT 15 OFFSET 5",
     // Groups over joined rows.
-    ("SELECT v.field, COUNT(*), SUM(p.cites), AVG(p.weight), MIN(p.year), MAX(p.id) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field", true),
-    ("SELECT a.country, COUNT(DISTINCT p.venue) AS n, AVG(p.cites) FROM papers p JOIN authors a ON p.author = a.id GROUP BY a.country ORDER BY n DESC, a.country", true),
-    ("SELECT v.name, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.name HAVING n > 30 ORDER BY n DESC", true),
-    ("SELECT COUNT(*), SUM(p.weight), AVG(p.year) FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank > 100", true),
-    ("SELECT v.field, a.country, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id JOIN authors a ON p.author = a.id GROUP BY v.field, a.country ORDER BY 3 DESC, 1, 2", true),
-    ("SELECT p.year % 5 AS b, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY b ORDER BY b", true),
+    "SELECT v.field, COUNT(*), SUM(p.cites), AVG(p.weight), MIN(p.year), MAX(p.id) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field",
+    "SELECT a.country, COUNT(DISTINCT p.venue) AS n, AVG(p.cites) FROM papers p JOIN authors a ON p.author = a.id GROUP BY a.country ORDER BY n DESC, a.country",
+    "SELECT v.name, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.name HAVING n > 30 ORDER BY n DESC",
+    "SELECT COUNT(*), SUM(p.weight), AVG(p.year) FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank > 100",
+    "SELECT v.field, a.country, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id JOIN authors a ON p.author = a.id GROUP BY v.field, a.country ORDER BY 3 DESC, 1, 2",
+    "SELECT p.year % 5 AS b, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY b ORDER BY b",
     // WITH and derived tables.
-    ("WITH top AS (SELECT id, venue FROM papers ORDER BY bm25(title, 'graph') DESC LIMIT 50) SELECT v.field, COUNT(*) FROM top t JOIN venues v ON t.venue = v.id GROUP BY v.field", true),
-    ("WITH old AS (SELECT id, author, year FROM papers WHERE year < 2000) SELECT a.id, b.id FROM old a JOIN old b ON a.author = b.author WHERE a.id < b.id", true),
-    ("SELECT field, n FROM (SELECT v.field AS field, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field) AS t WHERE n > 10 ORDER BY n DESC", true),
+    "WITH top AS (SELECT id, venue FROM papers ORDER BY bm25(title, 'graph') DESC LIMIT 50) SELECT v.field, COUNT(*) FROM top t JOIN venues v ON t.venue = v.id GROUP BY v.field",
+    "WITH old AS (SELECT id, author, year FROM papers WHERE year < 2000) SELECT a.id, b.id FROM old a JOIN old b ON a.author = b.author WHERE a.id < b.id",
+    "SELECT field, n FROM (SELECT v.field AS field, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field) AS t WHERE n > 10 ORDER BY n DESC",
     // DISTINCT and DISTINCT ON.
-    ("SELECT DISTINCT v.field, a.country FROM papers p JOIN venues v ON p.venue = v.id JOIN authors a ON p.author = a.id", true),
-    ("SELECT DISTINCT p.year FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.year DESC NULLS FIRST", true),
-    ("SELECT DISTINCT ON (v.field) v.field, p.id, p.weight FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.weight DESC, p.id", true),
-    ("SELECT DISTINCT ON (author) author, id, year FROM papers ORDER BY year DESC, id LIMIT 12", true),
+    "SELECT DISTINCT v.field, a.country FROM papers p JOIN venues v ON p.venue = v.id JOIN authors a ON p.author = a.id",
+    "SELECT DISTINCT p.year FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.year DESC NULLS FIRST",
+    "SELECT DISTINCT ON (v.field) v.field, p.id, p.weight FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.weight DESC, p.id",
+    "SELECT DISTINCT ON (author) author, id, year FROM papers ORDER BY year DESC, id LIMIT 12",
     // Expressions over joined rows.
-    ("SELECT p.id, p.year + p.cites, p.year - v.id, p.cites * v.id, p.cites / v.id, p.cites % 4, -p.cites FROM papers p JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, p.weight * v.rank, p.weight / (v.rank - 2), p.weight + 1 FROM papers p JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, CASE WHEN v.rank > 3 THEN 'high' WHEN v.rank > 1 THEN 'mid' ELSE 'low' END FROM papers p LEFT JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, COALESCE(a.name, p.author, 'none'), LOWER(v.name), UPPER(a.country), LENGTH(p.author) FROM papers p LEFT JOIN venues v ON p.venue = v.id LEFT JOIN authors a ON p.author = a.id", true),
-    ("SELECT p.id, ROUND(p.weight * v.rank, 1), ROUND(p.weight), ABS(p.cites - 20), ln(p.weight), pow(v.rank, 2), least(p.weight, v.rank) FROM papers p JOIN venues v ON p.venue = v.id", true),
-    ("SELECT p.id, v.name || '-' || p.author FROM papers p JOIN venues v ON p.venue = v.id WHERE v.name || p.author LIKE 'venue%a1%' OR (v.name || p.author) ILIKE 'VENUE2%'", true),
-    ("SELECT p.id FROM papers p JOIN venues v ON p.venue = v.id WHERE p.weight BETWEEN 2 AND 5 AND v.field IN ('db', 'ml') AND NOT (p.year IS NULL)", true),
-    ("SELECT p.id, a.born FROM papers p LEFT JOIN authors a ON p.author = a.id WHERE a.born IS NULL ORDER BY p.id DESC LIMIT 20", true),
-    ("SELECT p.id, v.rank FROM papers p JOIN venues v ON p.venue = v.id ORDER BY v.rank NULLS FIRST, p.cites DESC, p.id", true),
-    // Not lowered yet: a multi-valued column as a join key, links, a
-    // subquery in a leaf. They must still answer as the operators do.
-    ("SELECT p.id, a.name FROM papers p JOIN authors a ON p.tags = a.id", false),
-    ("SELECT id FROM papers WHERE venue IN (SELECT id FROM venues WHERE field = 'ir') ORDER BY id", false),
+    "SELECT p.id, p.year + p.cites, p.year - v.id, p.cites * v.id, p.cites / v.id, p.cites % 4, -p.cites FROM papers p JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, p.weight * v.rank, p.weight / (v.rank - 2), p.weight + 1 FROM papers p JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, CASE WHEN v.rank > 3 THEN 'high' WHEN v.rank > 1 THEN 'mid' ELSE 'low' END FROM papers p LEFT JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, COALESCE(a.name, p.author, 'none'), LOWER(v.name), UPPER(a.country), LENGTH(p.author) FROM papers p LEFT JOIN venues v ON p.venue = v.id LEFT JOIN authors a ON p.author = a.id",
+    "SELECT p.id, ROUND(p.weight * v.rank, 1), ROUND(p.weight), ABS(p.cites - 20), ln(p.weight), pow(v.rank, 2), least(p.weight, v.rank) FROM papers p JOIN venues v ON p.venue = v.id",
+    "SELECT p.id, v.name || '-' || p.author FROM papers p JOIN venues v ON p.venue = v.id WHERE v.name || p.author LIKE 'venue%a1%' OR (v.name || p.author) ILIKE 'VENUE2%'",
+    "SELECT p.id FROM papers p JOIN venues v ON p.venue = v.id WHERE p.weight BETWEEN 2 AND 5 AND v.field IN ('db', 'ml') AND NOT (p.year IS NULL)",
+    "SELECT p.id, a.born FROM papers p LEFT JOIN authors a ON p.author = a.id WHERE a.born IS NULL ORDER BY p.id DESC LIMIT 20",
+    "SELECT p.id, v.rank FROM papers p JOIN venues v ON p.venue = v.id ORDER BY v.rank NULLS FIRST, p.cites DESC, p.id",
+    // Multi-valued columns: a condition holds when one of the values
+    // does, a row is in a group per value, an aggregate adds each value,
+    // and a join matches on any value, once per pair of rows.
+    "SELECT p.id, a.name FROM papers p JOIN authors a ON p.tags = a.id",
+    "SELECT p.id, v.name, p.tags FROM papers p JOIN venues v ON p.tags = v.field",
+    "SELECT p.id, v.name FROM papers p LEFT JOIN venues v ON p.tags = v.field AND v.rank > 2",
+    "SELECT v.id, p.id FROM venues v JOIN papers p ON v.field = p.tags WHERE p.year > 2010",
+    "SELECT v.id, p.id FROM venues v LEFT JOIN papers p ON v.field = p.tags AND p.cites > 40",
+    "SELECT a.id, b.id FROM papers a JOIN papers b ON a.tags = b.tags AND a.author = b.author WHERE a.id < b.id",
+    "WITH t AS (SELECT id, tags, year FROM papers WHERE year > 2015) SELECT a.id, b.id FROM t a LEFT JOIN t b ON a.tags = b.tags AND b.id > a.id",
+    "SELECT p.id, v.field FROM papers p JOIN venues v ON p.venue = v.id WHERE p.tags = v.field",
+    "SELECT p.id, v.field FROM papers p JOIN venues v ON p.venue = v.id WHERE p.tags != v.field OR p.tags IS NULL",
+    "SELECT p.id FROM papers p JOIN venues v ON p.venue = v.id WHERE p.tags IN (v.field, 'sys') AND NOT p.tags LIKE 'm%'",
+    "SELECT p.id FROM papers p JOIN venues v ON p.venue = v.id WHERE p.tags BETWEEN 'e' AND v.field",
+    "WITH t AS (SELECT id, tags, year FROM papers WHERE year > 1995) SELECT tags, COUNT(*), AVG(year), MAX(id) FROM t GROUP BY tags",
+    "SELECT p.tags, p.author, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY p.tags, p.author ORDER BY n DESC, 1, 2 LIMIT 20",
+    "SELECT v.field, p.tags, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field, p.tags",
+    "SELECT p.tags, v.field, MIN(p.id) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY p.tags, v.field ORDER BY 3",
+    "SELECT p.tags, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY p.tags HAVING n > 40 ORDER BY p.tags NULLS FIRST",
+    "SELECT COUNT(p.tags), MIN(p.tags), MAX(p.tags), COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id",
+    "SELECT v.field, COUNT(p.tags), MIN(p.tags), MAX(p.tags) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field",
+    "SELECT p.tags, COUNT(p.tags), COUNT(DISTINCT p.author) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY p.tags",
+    "WITH t AS (SELECT id, tags FROM papers WHERE year > 2000) SELECT COUNT(tags), COUNT(*) FROM t",
+    "SELECT DISTINCT tags FROM papers",
+    "SELECT DISTINCT p.tags FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank > 2",
     // Subqueries in a leaf, over a WITH result or another table.
-    ("WITH ir AS (SELECT id FROM venues WHERE field = 'ir') SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id WHERE p.venue IN (SELECT id FROM ir)", true),
-    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id WHERE p.year > (SELECT AVG(year) FROM papers) AND EXISTS (SELECT id FROM authors WHERE country = 'cl')", true),
-    ("SELECT DISTINCT tags FROM papers", false),
+    "SELECT id FROM papers WHERE venue IN (SELECT id FROM venues WHERE field = 'ir') ORDER BY id",
+    "WITH ir AS (SELECT id FROM venues WHERE field = 'ir') SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id WHERE p.venue IN (SELECT id FROM ir)",
+    "SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id WHERE p.year > (SELECT AVG(year) FROM papers) AND EXISTS (SELECT id FROM authors WHERE country = 'cl')",
 ];
 
 fn run(db: &Db, sql: &str, engine: Engine) -> ResultSet {
@@ -158,19 +178,14 @@ fn on_datafusion(rs: &ResultSet) -> bool {
 fn datafusion_answers_as_the_operators() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
-    let mut fell_back = Vec::new();
-    for &(sql, must) in QUERIES {
+    for &sql in QUERIES {
         let want = run(&db, sql, Engine::Operators);
         let got = run(&db, sql, Engine::DataFusion);
         same(sql, &want, &got);
         // The leaves' counts, summed as the operators sum them.
         assert_eq!((want.stats.filter_docs, want.stats.scored), (got.stats.filter_docs, got.stats.scored), "{sql}: filtered and scored rows");
-        if !on_datafusion(&got) {
-            assert!(!must, "{sql}: ran on the operators: {:?}", got.stats.plan.first());
-            fell_back.push(sql);
-        }
+        assert!(on_datafusion(&got), "{sql}: ran on the operators: {:?}", got.stats.plan.first());
     }
-    assert!(!fell_back.is_empty() || QUERIES.iter().all(|q| q.1));
 }
 
 #[test]
@@ -336,7 +351,7 @@ fn auto_leaves_small_plans_to_the_operators_and_runs_large_ones_on_datafusion() 
     // the operators answer, and do not run again the leaves DataFusion ran.
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
-    for &(sql, _) in QUERIES {
+    for &sql in QUERIES {
         let want = run(&db, sql, Engine::Operators);
         let got = run(&db, sql, Engine::Auto);
         same(sql, &want, &got);
@@ -432,5 +447,60 @@ fn a_leaf_s_arrow_columns_hold_what_its_rows_hold() {
         assert_eq!(rs.scores, c.scores, "{sql}: scores");
         // Over as many rows as it has, the leaf gives rows.
         assert!(matches!(db.execute_leaf(&view, &select, &db.exec, rs.rows.len()).unwrap(), Leaf::Rows(_)), "{sql}");
+    }
+}
+
+// Multi-valued INT and KEYWORD columns, with empty lists, NULLs, a value
+// twice in a list and sums past 64 bits, answer on DataFusion as on the
+// operators: in conditions, groups, aggregates and joins.
+#[test]
+fn multi_valued_columns_answer_as_the_operators() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions { segment_max_docs: 100, sync: false, ..DbOptions::default() };
+    let first = Schema::new("l", vec![Field::new("id", FieldType::Int)], Some("id")).unwrap();
+    let db = Db::create(&dir.path().join("t.strata"), first, opts).unwrap();
+    let none = Params::new();
+    db.sql("CREATE TABLE m (id INT PRIMARY KEY, nums INT[], tags KEYWORD[], g KEYWORD)", &none).unwrap();
+    db.sql("CREATE TABLE n (id INT PRIMARY KEY, label KEYWORD)", &none).unwrap();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+    let rows: Vec<String> = (0..300)
+        .map(|i| {
+            let list = |rng: &mut rand::rngs::StdRng, f: &dyn Fn(i64) -> String| match rng.gen_range(0..8) {
+                0 => "NULL".to_string(),
+                1 => "ARRAY[]".to_string(),
+                k => format!("ARRAY[{}]", (0..k.min(4)).map(|_| f(rng.gen_range(0..40))).collect::<Vec<_>>().join(", ")),
+            };
+            let nums = if i % 50 == 7 { format!("ARRAY[{}, {}]", i64::MAX - 3, i64::MAX - 5) } else { list(&mut rng, &|v| v.to_string()) };
+            let tags = list(&mut rng, &|v| format!("'t{}'", v % 5));
+            format!("({i}, {nums}, {tags}, 'g{}')", i % 4)
+        })
+        .collect();
+    db.sql(&format!("INSERT INTO m (id, nums, tags, g) VALUES {}", rows.join(", ")), &none).unwrap();
+    db.storage().flush().unwrap();
+    db.sql("UPDATE m SET nums = ARRAY[3, 3, 9] WHERE id IN (4, 40, 140)", &none).unwrap();
+    let labels: Vec<String> = (0..60).map(|i| format!("({i}, 't{}')", i % 6)).collect();
+    db.sql(&format!("INSERT INTO n (id, label) VALUES {}", labels.join(", ")), &none).unwrap();
+    let queries = [
+        "SELECT m.nums, COUNT(*), SUM(n.id) FROM m JOIN n ON m.id = n.id GROUP BY m.nums",
+        "SELECT m.nums, m.tags, COUNT(*) FROM m JOIN n ON m.id = n.id GROUP BY m.nums, m.tags",
+        "SELECT m.g, SUM(m.nums), AVG(m.nums), MIN(m.nums), MAX(m.nums), COUNT(m.nums), MIN(m.tags), MAX(m.tags) FROM m JOIN n ON m.id = n.id GROUP BY m.g",
+        "WITH big AS (SELECT id, nums FROM m WHERE id > 100) SELECT SUM(nums), COUNT(nums), COUNT(*) FROM big",
+        "SELECT DISTINCT m.nums FROM m JOIN n ON m.id = n.id",
+        "SELECT m.id, n.label FROM m JOIN n ON m.nums = n.id",
+        "SELECT m.id, n.label FROM m LEFT JOIN n ON m.nums = n.id AND n.label != 't1'",
+        "SELECT n.id, m.id FROM n LEFT JOIN m ON n.id = m.nums",
+        "SELECT n.id, m.id FROM n JOIN m ON n.label = m.tags AND n.id = m.nums",
+        "SELECT a.id, b.id FROM m a JOIN m b ON a.nums = b.nums AND a.tags = b.tags WHERE a.id < b.id",
+        "SELECT m.id FROM m JOIN n ON m.id = n.id WHERE m.nums > n.id * 3",
+        "SELECT m.id FROM m JOIN n ON m.id = n.id WHERE m.nums IN (n.id, 7) OR m.nums IS NULL",
+        "SELECT m.id, m.tags FROM m JOIN n ON m.id = n.id WHERE NOT (m.tags = n.label)",
+        "SELECT m.id FROM m JOIN n ON m.id = n.id WHERE m.tags BETWEEN n.label AND 't3' AND m.nums != 3",
+    ];
+    for sql in queries {
+        let want = run(&db, sql, Engine::Operators);
+        let got = run(&db, sql, Engine::DataFusion);
+        assert!(!want.rows.is_empty(), "{sql}: no rows");
+        same(sql, &want, &got);
+        assert!(on_datafusion(&got), "{sql}: ran on the operators: {:?}", got.stats.plan.first());
     }
 }
