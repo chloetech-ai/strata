@@ -74,7 +74,7 @@ use crate::value::Value;
 
 /// Runs a leaf plan for DataFusion: its rows, as Arrow columns
 /// ([`Leaf::Arrow`]) when there are more than the number it is given.
-pub type Runner<'r> = dyn FnMut(&Plan, usize) -> Result<Leaf> + 'r;
+pub type Runner<'r> = ops::LeafRunner<'r>;
 
 /// What [`run_in`] made of a plan.
 #[derive(Debug)]

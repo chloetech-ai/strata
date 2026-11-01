@@ -11,7 +11,7 @@ use serde_json::{json, Value as Json};
 use strata::db::{Db, PreparedWrite, Source};
 use strata::embed::Embedder;
 use strata::ingest::{Format, Rows};
-use strata::query::exec::{ExecOptions, ResultSet};
+use strata::query::exec::{Engine, ExecOptions, Leaf, ResultSet};
 use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
@@ -267,6 +267,10 @@ pub struct Service {
     /// The memory queries may hold at once ([`ExecOptions::memory`];
     /// `None`: not counted).
     pub query_memory: Option<Arc<MemoryBudget>>,
+    /// The engine of compound queries' joins, groups and sorts, here or
+    /// above a coordinator's shards ([`Engine`]; `STRATA_ENGINE`, by
+    /// default `auto`).
+    pub engine: Engine,
     /// The most write requests in the write path at once (embedding,
     /// waiting for the writer or being applied); more are refused with 429.
     pub max_queued_writes: usize,
@@ -389,6 +393,7 @@ impl Service {
             max_rerank: None,
             max_groups: None,
             query_memory: None,
+            engine: Engine::from_env(),
             max_queued_writes: usize::MAX,
             max_body: 256 << 20,
             lease_ttl: Duration::from_secs(60),
@@ -1999,6 +2004,7 @@ impl Service {
                     max_groups: self.max_groups,
                     memory: self.query_memory.clone(),
                     profile: req.profile,
+                    engine: self.engine,
                     ..db.exec.clone()
                 };
                 let db = db.clone();
@@ -2007,12 +2013,12 @@ impl Service {
                     let _held = (permit, running);
                     let started = Instant::now();
                     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
-                    let r = ops::run_in(
+                    let r = ops::run_on_engine(
                         &plan,
                         &tables,
-                        &mut |leaf| {
+                        &mut |leaf, over| {
                             let view = snap.table(leaf.table()).ok_or_else(|| strata::Error::Query(format!("no such table: {}", leaf.table())))?;
-                            db.execute(&view, &leaf.to_select(view.schema())?, &opts)
+                            db.execute_leaf(&view, &leaf.to_select(view.schema())?, &opts, over)
                         },
                         &opts,
                     );
@@ -2033,6 +2039,7 @@ impl Service {
                 let rt = tokio::runtime::Handle::current();
                 let stop = cancel.0.clone();
                 let memory = self.query_memory.clone();
+                let (engine, threads) = (self.engine, self.cores.max(1));
                 // The leaves' calls to the shards carry the request's id.
                 let id = obs::current();
                 let trace = telemetry::trace();
@@ -2040,9 +2047,11 @@ impl Service {
                     let _held = permit;
                     // Shards any leaf was answered without (partial answers).
                     let mut missing: Vec<String> = Vec::new();
-                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, profile: req.profile, ..ExecOptions::default() };
+                    // The shards run the leaves; DataFusion or the operators
+                    // run the rest here, on this server's cores.
+                    let checks = ExecOptions { deadline: Some(deadline), cancel: Some(stop.clone()), memory, profile: req.profile, engine, threads, ..ExecOptions::default() };
                     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
-                    let rs = ops::run_in(&plan, &tables, &mut |leaf| {
+                    let rs = ops::run_on_engine(&plan, &tables, &mut |leaf, _| {
                         checks.check()?;
                         let schema = catalog.iter().find(|t| t.table.eq_ignore_ascii_case(leaf.table())).ok_or_else(|| strata::Error::Query(format!("no such table: {}", leaf.table())))?;
                         let select = leaf.to_select(schema)?;
@@ -2055,7 +2064,7 @@ impl Service {
                                 missing.push(s);
                             }
                         }
-                        Ok(m.rs)
+                        Ok(Leaf::Rows(m.rs))
                     }, &checks);
                     rs.map(|rs| (rs, missing))
                 })
