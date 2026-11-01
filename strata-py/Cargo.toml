@@ -17,6 +17,10 @@ strata = { path = "../strata", features = ["sqlite"] }
 serde_json = "1"
 
 [features]
+default = ["datafusion"]
+# DataFusion as the engine of joins, groups and sorts over a few thousand
+# rows or more (`strata::query::df`); the default engine picks it by size.
+datafusion = ["strata/datafusion"]
 # BERT embedding models (`bert`), with Apple's Accelerate on a Mac
 # (`accelerate`); Model2Vec models need neither.
 bert = ["strata/bert"]

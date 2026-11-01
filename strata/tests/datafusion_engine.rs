@@ -328,3 +328,44 @@ fn a_datafusion_plan_s_profile_holds_its_leaves_and_operators() {
     assert!(ops.iter().any(|s| s.op == "aggregate" && s.detail.contains("gby")), "{ops:#?}");
     assert!(ops.iter().all(|s| s.cpu_us.is_some()), "{ops:#?}");
 }
+
+#[test]
+fn auto_leaves_small_plans_to_the_operators_and_runs_large_ones_on_datafusion() {
+    let ran_on_datafusion = |rs: &ResultSet| rs.stats.plan.iter().any(|l| l.starts_with("datafusion:"));
+    // The papers and their tables: at most 4,096 rows read by the leaves,
+    // the operators answer, and do not run again the leaves DataFusion ran.
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    for &(sql, _) in QUERIES {
+        let want = run(&db, sql, Engine::Operators);
+        let got = run(&db, sql, Engine::Auto);
+        same(sql, &want, &got);
+        assert_eq!((want.stats.filter_docs, want.stats.scored), (got.stats.filter_docs, got.stats.scored), "{sql}: filtered and scored rows");
+        assert!(!ran_on_datafusion(&got), "{sql}: {:?}", got.stats.plan);
+    }
+    let sql = "SELECT a.country, COUNT(*) FROM papers p JOIN authors a ON p.author = a.id WHERE MATCH(p.title, 'graph') GROUP BY a.country";
+    let opts = ExecOptions { engine: Engine::Auto, profile: true, ..db.exec.clone() };
+    let st = db.query_with(sql, &Params::new(), &opts).unwrap().stats.steps;
+    let leaves: Vec<usize> = (0..st.len()).filter(|&i| st[i].op == "leaf").collect();
+    let searched: Vec<&str> = leaves.iter().filter(|&&i| !children(&st, i).is_empty()).map(|&i| st[i].detail.as_str()).collect();
+    assert_eq!(searched, ["scan: papers", "join: authors"], "each leaf searched once: {st:#?}");
+    assert_eq!(leaves.len(), 4, "the operators' leaves, given the rows DataFusion's read: {st:#?}");
+    assert!(st.iter().all(|s| s.op != "datafusion"), "{st:#?}");
+
+    // 3,000 rows joined with 4,000: DataFusion.
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::new("l", vec![Field::new("id", FieldType::Int), Field::new("g", FieldType::Keyword)], Some("id")).unwrap();
+    let db = Db::create(&dir.path().join("keys.strata"), schema, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    db.load((0..3_000).map(|i| vec![Value::Int(i), Value::Str(format!("g{}", i % 7))])).unwrap();
+    db.sql("CREATE TABLE r (id INT PRIMARY KEY, l_id INT, x FLOAT)", &Params::new()).unwrap();
+    db.load_into("r", (0..4_000).map(|i| vec![Value::Int(i), Value::Int((i * 7) % 3_500), Value::Float(i as f64 / 4.0)])).unwrap();
+    for (sql, big) in [
+        ("SELECT l.g, COUNT(*), SUM(r.x) FROM l JOIN r ON r.l_id = l.id GROUP BY l.g", true),
+        ("SELECT l.id, r.x FROM l JOIN r ON r.l_id = l.id WHERE l.id < 40", false),
+    ] {
+        let want = run(&db, sql, Engine::Operators);
+        let got = run(&db, sql, Engine::Auto);
+        same(sql, &want, &got);
+        assert_eq!(ran_on_datafusion(&got), big, "{sql}: {:?}", got.stats.plan);
+    }
+}

@@ -1081,20 +1081,42 @@ impl Db {
         #[allow(unused_mut)]
         let mut fallback: Option<String> = None;
         #[cfg(feature = "datafusion")]
+        let mut ran = crate::query::df::Ran::default();
+        #[cfg(feature = "datafusion")]
         // A leaf with subqueries has no operators for DataFusion to run.
-        if matches!(opts.engine, crate::query::exec::Engine::DataFusion | crate::query::exec::Engine::DataFusionOnly) && !plan.root.is_leaf() {
+        if opts.engine != crate::query::exec::Engine::Operators && !plan.root.is_leaf() {
+            use crate::query::df::Outcome;
             match crate::query::df::run_in(plan, &catalog, &mut runner, opts)? {
-                crate::query::df::Outcome::Done(rs) => {
+                Outcome::Done(rs) => {
                     if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
                         return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
                     }
                     return Ok(rs);
                 }
-                crate::query::df::Outcome::Fallback(why) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
-                crate::query::df::Outcome::Fallback(why) => fallback = Some(why),
+                Outcome::Fallback(why, _) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
+                Outcome::Fallback(why, r) => {
+                    fallback = Some(why);
+                    ran = r;
+                }
+                Outcome::Small(r) => ran = r,
             }
         }
+        // The leaves DataFusion ran are not run again, and the profile
+        // keeps their steps.
+        #[cfg(feature = "datafusion")]
+        let ran_steps = std::mem::take(&mut ran.steps);
+        #[cfg(feature = "datafusion")]
+        let mut runner = move |leaf: &Plan| match ran.take(leaf) {
+            Some(rs) => Ok(rs),
+            None => runner(leaf),
+        };
         let mut rs = ops::run_in(plan, &catalog, &mut runner, opts)?;
+        #[cfg(feature = "datafusion")]
+        if !ran_steps.is_empty() {
+            let mut steps = ran_steps;
+            rs.stats.steps_dropped += crate::query::steps::nest(&mut steps, &rs.stats.steps, 0) as u64;
+            rs.stats.steps = steps;
+        }
         if let Some(why) = fallback {
             rs.stats.plan.insert(0, format!("operators (not datafusion: {why})"));
         }
