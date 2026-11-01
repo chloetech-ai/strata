@@ -50,6 +50,8 @@ pprof = { version = "0.15", default-features = false }
 bert = ["strata/bert"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["strata/accelerate"]
+# Cross-encoders exported to ONNX, int8 ones among them, run by ONNX Runtime.
+onnx = ["strata/onnx"]
 # Images: decoded, and embedded by SigLIP (siglip-base-patch16-224).
 vision = ["strata/vision"]
 # Sound: decoded (WAV, FLAC, MP3, Ogg Vorbis, AAC), and transcribed by

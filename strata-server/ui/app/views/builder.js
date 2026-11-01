@@ -7,7 +7,7 @@
 
 import { h, icon, clear, fmt, api, store, toast, copy, menu, empty, seg, sqlBlock, debounce, failure, sortable } from "../core.js";
 import { quoteName } from "../sqledit.js";
-import { tables, cached, table as tableOf, typeBadge, typeMeta, operators, lit } from "../catalog.js";
+import { tables, cached, table as tableOf, typeBadge, typeMeta, operators, lit, paths as listPaths, cachedPaths, pathFields, pathSql, PATH_TYPES } from "../catalog.js";
 import { grid, answerStats, exportMenu } from "../results.js";
 import { SERIES } from "../charts.js";
 
@@ -24,6 +24,27 @@ const groupable = (f) => f && (f.type === "keyword" || isNum(f)) && f.indexed !=
 const sortableField = (f) => f && (f.type === "keyword" || isNum(f) || isTime(f) || f.type === "bool") && !f.multi;
 const showable = (f) => f && f.type !== "vector" && f.type !== "sparse" && f.stored !== false;
 const filterable = (f) => operators(f).length > 0 && (f.type !== "text" || f.indexed !== false);
+/** How SQL names a field, or a path of a JSON field (attrs.dims.w). */
+const col = (f) => f.sql || quoteName(f.name);
+
+/**
+ * Field `name` of table `t`, or a path of one of its JSON fields
+ * ("attrs.dims.w"): a field of the path's main type (keyword, float,
+ * bool) that SQL names by the path, from the field's paths listing (a
+ * string field until the listing is read).
+ */
+export function fieldOf(t, name) {
+  const fields = t?.short?.fields || [];
+  const f = fields.find((x) => x.name === name);
+  if (f) return f;
+  const listed = pathFields(t).find((x) => x.name === name);
+  if (listed) return listed;
+  const json = fields.find((x) => x.type === "json" && name.startsWith(x.name + "."));
+  if (!json) return null;
+  const path = name.slice(json.name.length + 1);
+  const keys = path.split(/(?<!\\)\./).map((k) => k.replace(/\\(.)/g, "$1"));
+  return { name, type: "keyword", sql: pathSql(json.name, keys), path, keys, json: json.name };
+}
 
 /** The blocks of the palette, and the stage each one lands in. */
 const BLOCKS = [
@@ -62,11 +83,16 @@ function value(f, v) {
 }
 
 function condition(f, c) {
-  const n = quoteName(f.name);
+  const n = col(f);
   switch (c.op) {
     case "matches": if (!c.value) throw new Error(`${f.name} needs words`); return `MATCH(${n}, ${lit(c.value)})`;
     case "in": { const vs = String(c.value || "").split(",").map((x) => x.trim()).filter(Boolean); if (!vs.length) throw new Error(`${f.name} needs values`); return `${n} IN (${vs.map((v) => value(f, v)).join(", ")})`; }
-    case "prefix": return `PREFIX(${n}, ${lit(c.value || "")})`;
+    case "prefix": {
+      // A path's prefix is LIKE 'p%', its wildcards escaped.
+      if (!f.path) return `PREFIX(${n}, ${lit(c.value || "")})`;
+      const v = String(c.value || "");
+      return /[%_\\]/.test(v) ? `${n} LIKE ${lit(v.replace(/[%_\\]/g, "\\$&") + "%")} ESCAPE '\\'` : `${n} LIKE ${lit(v + "%")}`;
+    }
     case "null": return `${n} IS NULL`;
     case "notnull": return `${n} IS NOT NULL`;
     case "true": return `${n} = TRUE`;
@@ -81,7 +107,7 @@ export function toSql(st) {
   const t = tableOf(st.table);
   if (!t) throw new Error("Pick a table");
   const fields = t.short?.fields || [];
-  const F = (name) => { const f = fields.find((x) => x.name === name); if (!f) throw new Error(`${st.table} has no field ${name}`); return f; };
+  const F = (name) => { const f = fieldOf(t, name); if (!f) throw new Error(`${st.table} has no field ${name}`); return f; };
   const params = {}, notes = [];
   const grouped = !!(st.group && (st.group.by.length || st.group.measures.length));
 
@@ -129,7 +155,7 @@ export function toSql(st) {
 
   let sql;
   if (grouped) {
-    const by = st.group.by.map((n) => quoteName(F(n).name));
+    const by = st.group.by.map((n) => col(F(n)));
     const ms = st.group.measures.map((m) => measureSql(m, F));
     if (!by.length && !ms.length) throw new Error("Group by a field or add a measure");
     const cols = [...by, ...ms.map((m) => `${m.sql} AS ${m.alias}`)];
@@ -137,18 +163,18 @@ export function toSql(st) {
     if (where.length) sql += `\nWHERE ${where.join("\n  AND ")}`;
     if (by.length) sql += `\nGROUP BY ${by.join(", ")}`;
     if (by.length && st.group.min > 1) sql += `\nHAVING COUNT(*) >= ${num(st.group.min)}`;
-    const order = st.sort && (st.group.by.includes(st.sort.field) || ms.some((m) => m.alias === st.sort.field)) ? `${st.group.by.includes(st.sort.field) ? quoteName(st.sort.field) : st.sort.field} ${st.sort.dir.toUpperCase()}` : ms.length ? `${ms[0].alias} DESC` : null;
+    const order = st.sort && (st.group.by.includes(st.sort.field) || ms.some((m) => m.alias === st.sort.field)) ? `${st.group.by.includes(st.sort.field) ? col(F(st.sort.field)) : st.sort.field} ${st.sort.dir.toUpperCase()}` : ms.length ? `${ms[0].alias} DESC` : null;
     if (order && by.length) sql += `\nORDER BY ${order}`;
     if (by.length) sql += `\nLIMIT ${num(st.limit || 20)}`;
   } else {
-    const cols = st.columns.map((n) => quoteName(F(n).name));
+    const cols = st.columns.map((n) => col(F(n)));
     const ranked = !!rank && !st.sort;
     if (ranked && st.score) cols.push("score()");
     sql = `SELECT ${st.columns.length ? cols.join(", ") : ranked && st.score ? "*, score()" : "*"}\nFROM ${quoteName(t.table)}`;
     if (where.length) sql += `\nWHERE ${where.join("\n  AND ")}`;
     if (st.sort) {
       const f = F(st.sort.field);
-      sql += `\nORDER BY ${quoteName(f.name)} ${st.sort.dir.toUpperCase()}${f.name !== t.short.key && t.short.key ? `, ${quoteName(t.short.key)}` : ""}`;
+      sql += `\nORDER BY ${col(f)} ${st.sort.dir.toUpperCase()}${f.name !== t.short.key && t.short.key ? `, ${quoteName(t.short.key)}` : ""}`;
       if (rank) notes.push("Sorted by a column, so the scores only find rows: words that must match filter, the rest is left out.");
     } else if (rank) sql += `\nORDER BY ${rank} DESC`;
     sql += `\nLIMIT ${num(st.limit || 20)}`;
@@ -159,7 +185,7 @@ export function toSql(st) {
 function measureSql(m, F) {
   if (m.fn === "count") return { sql: "COUNT(*)", alias: "n" };
   const f = F(m.field);
-  const n = quoteName(f.name);
+  const n = col(f);
   const alias = `${m.fn === "distinct" ? "distinct" : m.fn}_${f.name}`.replace(/\W/g, "_");
   return { sql: m.fn === "distinct" ? `COUNT(DISTINCT ${n})` : `${m.fn.toUpperCase()}(${n})`, alias };
 }
@@ -198,13 +224,13 @@ function render(page, r) {
   const startDrag = (kind, value) => (e) => {
     drag = { kind, value };
     e.dataTransfer.effectAllowed = "copy";
-    e.dataTransfer.setData("text/plain", kind === "field" ? quoteName(value) : kind === "table" ? quoteName(value) : value);
+    e.dataTransfer.setData("text/plain", kind === "field" ? (field(value) ? col(field(value)) : quoteName(value)) : kind === "table" ? quoteName(value) : value);
     document.body.classList.add("bld-dragging");
     for (const el of flow.querySelectorAll(".stage")) el.classList.toggle("can", accepts(el.dataset.stage));
   };
   const endDrag = () => { drag = null; document.body.classList.remove("bld-dragging"); for (const el of flow.querySelectorAll(".stage")) el.classList.remove("can", "over"); };
   addEventListener("dragend", endDrag);
-  const field = (name) => (tableOf(st.table)?.short?.fields || []).find((f) => f.name === name);
+  const field = (name) => fieldOf(tableOf(st.table), name);
   function accepts(stage) {
     if (!drag) return false;
     if (drag.kind === "table") return stage === "source";
@@ -266,6 +292,12 @@ function render(page, r) {
   // ------------------------------------------------------------ the field values the editors suggest
   async function loadStats(f) {
     const k = `${st.table}.${f.name}`;
+    // A path's values and range are in its paths listing.
+    if (f.path) {
+      const p = f.listed || pathFields(tableOf(st.table)).find((x) => x.name === f.name)?.listed;
+      if (p) stats.set(k, isNum(f) ? { min: p.min, max: p.max, avg: null } : { top: (p.values || []).filter((v) => typeof v.value === "string").slice(0, 12).map((v) => [v.value, v.rows]) });
+      return stats.get(k);
+    }
     if (stats.has(k) || !(isNum(f) || isTime(f) || f.type === "keyword")) return stats.get(k);
     stats.set(k, null);
     const n = quoteName(f.name), t = quoteName(st.table);
@@ -293,12 +325,25 @@ function render(page, r) {
     const t = tableOf(st.table);
     const fq = h("input", { class: "input sm", placeholder: "Filter fields…", style: { width: "100%" } });
     const list = h("div", { class: "bld-fields" });
-    const drawFields = () => clear(list, (t?.short?.fields || []).filter((f) => !fq.value || f.name.toLowerCase().includes(fq.value.toLowerCase())).map((f) => {
-      const el = h("div", { class: "fi", draggable: "true", tabIndex: 0, title: `${f.name}: drag onto a stage, or click for what it can do`, ondragstart: startDrag("field", f.name) },
-        typeBadge(f), h("span", { class: "grow ellipsis" }, f.name), f.multi ? h("span", { class: "badge" }, "[]") : null, t.short.key === f.name ? h("span", { class: "badge accent" }, "key") : null, icon("grip", "drag"));
+    const item = (f, el) => {
       el.onclick = () => fieldMenu(el, f);
       el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fieldMenu(el, f); } };
       return el;
+    };
+    const q = () => fq.value.toLowerCase();
+    const drawFields = () => clear(list, (t?.short?.fields || []).map((f) => {
+      // A JSON field's paths that hold values, each a field to drop.
+      const ps = f.type === "json" ? pathFields(t).filter((p) => p.json === f.name && (!q() || p.name.toLowerCase().includes(q()))) : [];
+      if (q() && !f.name.toLowerCase().includes(q()) && !ps.length) return null;
+      const el = item(f, h("div", { class: "fi", draggable: "true", tabIndex: 0, title: `${f.name}: drag onto a stage, or click for what it can do`, ondragstart: startDrag("field", f.name) },
+        typeBadge(f), h("span", { class: "grow ellipsis" }, f.name), f.multi ? h("span", { class: "badge" }, "[]") : null, t.short.key === f.name ? h("span", { class: "badge accent" }, "key") : null, icon("grip", "drag")));
+      if (f.type !== "json") return el;
+      if (!cachedPaths(t.table, f.name)) listPaths(t.table, f.name).then(() => { if (tableOf(st.table) === t) drawFields(); }).catch(() => {});
+      return [el, ps.map((p) => item(p, h("div", { class: "fi fi-path", draggable: "true", tabIndex: 0, title: `${p.sql}: ${fmt.plural(p.listed.rows, "row")} (${fmt.pct(p.share, 0)}), mostly ${({ float: "numbers", keyword: "strings", bool: "booleans" })[p.type]}. Drag onto a stage.`, ondragstart: startDrag("field", p.name) },
+        h("span", { class: "tb", style: { "--c": PATH_TYPES.find(([k]) => k === ({ float: "number", keyword: "string", bool: "bool" })[p.type])[1] } }, "."),
+        h("span", { class: "grow ellipsis mono small" }, p.keys.join(".")),
+        h("span", { class: "fi-share", "aria-hidden": "true" }, h("i", { style: { width: Math.max(2, p.share * 100) + "%" } })),
+        icon("grip", "drag"))))];
     }));
     fq.oninput = drawFields;
     drawFields();
@@ -388,9 +433,16 @@ function render(page, r) {
       output: [h("label", { class: "row nw small dim", title: "Show each row's score", style: { gap: "5px" } }, h("input", { type: "checkbox", checked: st.score, onchange: (e) => { st.score = e.target.checked; changed(false); } }), "score"), add("column", "column")],
     }[id] || []);
   }
+  // The fields `pred` takes, then the JSON fields' paths it takes (those
+  // listed, and the one chosen if it is not).
   const fieldSel = (cur, pred, onChange) => {
-    const fs = (tableOf(st.table)?.short?.fields || []).filter(pred);
-    return h("select", { class: "select sm", onchange: (e) => onChange(e.target.value) }, fs.map((f) => h("option", { value: f.name, selected: f.name === cur }, `${typeMeta(f).glyph}  ${f.name}`)));
+    const t = tableOf(st.table);
+    const fs = (t?.short?.fields || []).filter(pred);
+    const ps = pathFields(t).filter(pred);
+    const now = cur && !fs.some((f) => f.name === cur) && !ps.some((p) => p.name === cur) ? fieldOf(t, cur) : null;
+    if (now && now.json) ps.unshift(now);
+    const opt = (f) => h("option", { value: f.name, selected: f.name === cur }, f.json ? f.name : `${typeMeta(f).glyph}  ${f.name}`);
+    return h("select", { class: "select sm", onchange: (e) => onChange(e.target.value) }, fs.map(opt), ps.length ? h("optgroup", { label: "JSON paths" }, ps.map(opt)) : null);
   };
   const rm = (list, it) => h("button", { class: "btn ghost icon sm x", title: "Remove", onclick: () => { list.splice(list.indexOf(it), 1); changed(); } }, icon("x"));
 

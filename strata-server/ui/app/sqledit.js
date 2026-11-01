@@ -5,6 +5,7 @@
 // and explain (Ctrl+Shift+Enter).
 
 import { h, clear, highlightSql } from "./core.js";
+import { paths as listPaths, cachedPaths, pathType, lit } from "./catalog.js";
 
 /** Strata's functions: [name, arguments, what it is]. */
 export const FUNCS = [
@@ -25,6 +26,8 @@ export const FUNCS = [
   ["PATH", "edges, from, to", "the rows of one shortest path"],
   ["ppr", "edges, seeds", "personalized PageRank from the seeds"],
   ["PREFIX", "keyword, 'p'", "the values that start with p"],
+  ["json_extract", "field, 'path', 'type'", "a JSON field's value at a path (attrs.dims.w), of one type if named: 'string', 'number', 'bool'"],
+  ["json_paths", "'table', 'field', 'path'", "FROM json_paths(...): the paths a JSON field holds, with their rows, types and values"],
   ["sid_at", "sid, n", "the first n numbers of a semantic ID"],
   ["gbdt", "'model'", "a gradient-boosted trees model's score"],
   ["COUNT", "*", "the rows of each group"],
@@ -175,10 +178,23 @@ export function editor({ value = "", onChange, onRun, onExplain, catalog = () =>
     const word = (dot ? dot[2] : m[2]) || "";
     if (!forced && !word && !dot && !m[1]) { closePop(); return; }
     from = pos - word.length - (m[1] && !dot ? 1 : 0);
-    const q = word.toLowerCase();
+    let q = word.toLowerCase();
     const scope = tablesIn(v);
     let cands = [];
-    if (m[1] && !dot) cands = params().map((p) => ({ text: ":" + p, label: ":" + p, kind: "param", detail: "parameter" }));
+    // After a JSON field and a dot (attrs., t.attrs., attrs.dims.): the
+    // keys its objects hold there, read from its paths listing.
+    const jp = jsonPath(before, scope);
+    if (jp) {
+      const listing = cachedPaths(jp.table, jp.field);
+      if (!listing) {
+        closePop();
+        listPaths(jp.table, jp.field).then(() => { if (document.activeElement === ta && ta.selectionStart === pos) complete(forced); }).catch(() => {});
+        return;
+      }
+      from = jp.from;
+      q = jp.word.toLowerCase();
+      cands = pathKids(listing, jp);
+    } else if (m[1] && !dot) cands = params().map((p) => ({ text: ":" + p, label: ":" + p, kind: "param", detail: "parameter" }));
     else if (dot) {
       const t = scope.get(dot[1].toLowerCase());
       if (t) cands = fieldsOf(t);
@@ -203,14 +219,48 @@ export function editor({ value = "", onChange, onRun, onExplain, catalog = () =>
     pop.classList.remove("hidden");
     ta.setAttribute("aria-expanded", "true");
   }
-  const kindOrder = (c) => ({ field: 0, param: 0, table: 1, fn: 2, kw: 3 }[c.kind] ?? 4);
+  const kindOrder = (c) => ({ field: 0, param: 0, path: 0, table: 1, fn: 2, kw: 3 }[c.kind] ?? 4);
+  // The JSON field the dotted name before the caret starts at, if any:
+  // {table, field, keys (those after the field), word (the key typed so
+  // far), from (where the completion replaces from)}.
+  function jsonPath(before, scope) {
+    const c = /([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.(\w*)$/.exec(before);
+    if (!c) return null;
+    const parts = c[1].split("."), word = c[2];
+    const json = (t, name) => (t?.short?.fields || []).find((f) => f.type === "json" && f.name.toLowerCase() === name.toLowerCase());
+    let t = null, f = null, at = 0;
+    if (parts.length > 1 && (f = json(scope.get(parts[0].toLowerCase()), parts[1]))) { t = scope.get(parts[0].toLowerCase()); at = 2; }
+    else {
+      for (const x of scope.size ? new Set(scope.values()) : catalog()) if ((f = json(x, parts[0]))) { t = x; at = 1; break; }
+    }
+    if (!f) return null;
+    return { table: t.table, field: f.name, keys: parts.slice(at), word, from: before.length - word.length };
+  }
+  function pathKids(listing, jp) {
+    const n = jp.keys.length;
+    const out = [];
+    for (const p of listing.paths || []) {
+      const ks = p.keys || [];
+      if (ks.length !== n + 1 || !jp.keys.every((k, i) => k === ks[i])) continue;
+      const key = ks[n];
+      const ty = pathType(p);
+      const kids = (listing.paths || []).some((x) => (x.keys || []).length > n + 1 && x.path.startsWith(p.path + "."));
+      const share = listing.rows ? Math.round(100 * p.rows / listing.rows) : 0;
+      const plain = /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && !needsQuote(key);
+      // A key that is not a plain name goes in brackets: attrs.dims['a.b'].
+      const it = { text: plain ? key : `[${lit(key)}]`, label: key, kind: "path", detail: `${ty ? { float: "number", keyword: "string", bool: "bool" }[ty] : "object"}${kids ? " {…}" : ""} · ${share < 1 && p.rows ? "<1" : share}% of rows`, path: p };
+      if (!plain) it.at = jp.from - 1;
+      out.push(it);
+    }
+    return out;
+  }
   function fieldsOf(t) {
     return (t.short?.fields || []).map((f) => ({ text: needsQuote(f.name) ? `"${f.name}"` : f.name, label: f.name, kind: "field", detail: typeName(f) + (t.short.key === f.name ? " · key" : ""), table: t.table }));
   }
   function drawPop(q) {
     clear(pop, items.map((it, i) => {
       const r = h("div", { class: "it" + (i === sel ? " on" : ""), role: "option", "aria-selected": String(i === sel) },
-        h("span", { class: "k k-" + it.kind }, { field: "f", table: "t", fn: "ƒ", kw: "k", param: ":" }[it.kind]),
+        h("span", { class: "k k-" + it.kind }, { field: "f", table: "t", fn: "ƒ", kw: "k", param: ":", path: "." }[it.kind]),
         h("span", { class: "l" }, mark(it.label, q)), h("span", { class: "d" }, it.detail));
       r.onmousedown = (e) => { e.preventDefault(); sel = i; accept(); };
       r.onmousemove = () => { if (sel !== i) { sel = i; [...pop.children].forEach((c, j) => c.classList.toggle("on", j === i)); } };
@@ -225,7 +275,7 @@ export function editor({ value = "", onChange, onRun, onExplain, catalog = () =>
     closePop();
     const nextCh = ta.value[ta.selectionStart];
     const text = it.fn && nextCh !== "(" ? it.text + "()" : it.text;
-    insert(text, from, ta.selectionStart);
+    insert(text, it.at ?? from, ta.selectionStart);
     if (it.fn && nextCh !== "(") { const p = ta.selectionStart - 1; ta.setSelectionRange(p, p); }
     signature();
   }

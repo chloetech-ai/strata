@@ -962,6 +962,9 @@ impl Db {
     /// [`crate::query::compound::MAX_ROWS`] rows each; its answer is held
     /// to [`ExecOptions::max_rows`].
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
+        if let Some(call) = crate::query::paths::Call::of_sql(sql)? {
+            return self.json_paths_at(snap, &call, params, opts).map(|p| p.to_result());
+        }
         let q = qsql::parse_query(sql)?;
         let plan = plan_of(snap, &q, params)?;
         self.run_on(snap, &plan, opts)
@@ -1050,15 +1053,30 @@ impl Db {
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
         let catalog: Vec<&Schema> = snap.schemas().collect();
-        let rs = ops::run_in(
-            plan,
-            &catalog,
-            &mut |leaf| {
-                let view = view_of(leaf.table())?;
-                self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
-            },
-            opts,
-        )?;
+        let mut runner = |leaf: &Plan| {
+            let view = view_of(leaf.table())?;
+            self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
+        };
+        #[allow(unused_mut)]
+        let mut fallback: Option<String> = None;
+        #[cfg(feature = "datafusion")]
+        // A leaf with subqueries has no operators for DataFusion to run.
+        if matches!(opts.engine, crate::query::exec::Engine::DataFusion | crate::query::exec::Engine::DataFusionOnly) && !plan.root.is_leaf() {
+            match crate::query::df::run_in(plan, &catalog, &mut runner, opts)? {
+                crate::query::df::Outcome::Done(rs) => {
+                    if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
+                        return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+                    }
+                    return Ok(rs);
+                }
+                crate::query::df::Outcome::Fallback(why) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
+                crate::query::df::Outcome::Fallback(why) => fallback = Some(why),
+            }
+        }
+        let mut rs = ops::run_in(plan, &catalog, &mut runner, opts)?;
+        if let Some(why) = fallback {
+            rs.stats.plan.insert(0, format!("operators (not datafusion: {why})"));
+        }
         if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
             return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
         }
@@ -1456,6 +1474,25 @@ impl Db {
         }
         let readers = self.readers(snap)?;
         Executor::new(snap, &readers, opts).sid_next(select, f, prefixes)
+    }
+
+    /// The paths listing of a JSON field that `call` asks for
+    /// ([`crate::query::paths`]): each path its objects hold, with its
+    /// rows, types and values, read from the field's terms. `SELECT * FROM
+    /// json_paths('table', 'field')` runs it as a query.
+    pub fn json_paths(&self, call: &crate::query::paths::Call, params: &Params) -> Result<crate::query::paths::Paths> {
+        self.json_paths_at(&self.snapshot(), call, params, &self.exec)
+    }
+
+    /// [`Db::json_paths`] on snapshot `snap`, with options.
+    pub fn json_paths_at(&self, snap: &Snapshot, call: &crate::query::paths::Call, params: &Params, opts: &ExecOptions) -> Result<crate::query::paths::Paths> {
+        let snap = snap.table(&call.table).ok_or_else(|| Error::Query(format!("no such table: {}", call.table)))?;
+        let schema = snap.schema();
+        let f = call.field_of(schema)?;
+        let sql = format!("SELECT COUNT(*) FROM {}{}", qsql::ident(&schema.table), call.filter.as_deref().map(|c| format!(" WHERE {c}")).unwrap_or_default());
+        let select = qsql::bind(&sql, schema, params)?;
+        let readers = self.readers(&snap)?;
+        Executor::new(&snap, &readers, opts).json_paths(&select, f, call)
     }
 
     /// Builds a segment image of `docs` for this schema into `dest` (a new

@@ -4,7 +4,7 @@ mod forward_common;
 
 use forward_common::build;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use strata::forward::{count_range, eval_range, float_key, NumericColumn, NumericKind, RangeIndex, RangeStrategy, BLOCK};
+use strata::forward::{count_range, eval_range, float_key, KeySet, NumericColumn, NumericKind, RangeIndex, RangeStrategy, BLOCK};
 use strata::segment::build::BuildOptions;
 use strata::segment::DocSet;
 use strata::{Document, Field, FieldType, Schema, Value};
@@ -131,6 +131,26 @@ fn check_column(col: &NumericColumn, idx: Option<&RangeIndex>, vals: &[Option<f6
         // Estimates are exact on bucket-aligned ranges and bounded overall.
         let e = col.estimate(lo, hi);
         assert!(e >= 0.0 && e <= col.n_present() as f64 + 1e-6, "estimate {e}");
+    }
+    // Sets of values (an IN list): one pass over the column, and a probe,
+    // against the values one at a time.
+    let present: Vec<f64> = vals.iter().flatten().copied().filter(|v| !v.is_nan()).collect();
+    for size in [0usize, 1, 5, 40, 300] {
+        let picks: Vec<f64> = (0..size)
+            .map(|_| match rng.gen_range(0..3) {
+                0 | 1 if !present.is_empty() => present[rng.gen_range(0..present.len())],
+                _ => (rng.gen::<f64>() - 0.5) * 1e3,
+            })
+            .collect();
+        let set = KeySet::new(picks.iter().filter_map(|&v| col.key_range(v, v)));
+        assert!(set.ranges().windows(2).all(|w| w[0].hi < w[1].lo), "sorted and disjoint");
+        let want: Vec<u32> = vals.iter().enumerate().filter(|(_, v)| v.is_some_and(|v| picks.contains(&v))).map(|(d, _)| d as u32).collect();
+        assert_eq!(col.scan_key_set(&set), DocSet::from_sorted(want.clone(), n), "{size} values");
+        let f = col.filter_key_set(set);
+        assert!(strata::segment::DocFilter::cardinality(&f) <= col.n_present());
+        for d in 0..n {
+            assert_eq!(strata::segment::DocFilter::contains(&f, d), want.binary_search(&d).is_ok(), "doc {d}, {size} values");
+        }
     }
     // Everything but NaN (a bucket shared with NaN counts it too).
     let all = col.estimate(f64::NEG_INFINITY, f64::INFINITY);

@@ -517,9 +517,14 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     let out = dir.join(&local);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let client = reqwest::Client::new();
-    let files = if derives { strata::derive::model_files(&local) } else { strata::embed::model_files(&local) };
-    for file in files {
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+    // Each file's path in the repository, and its name here.
+    let files: Vec<(&str, &str)> = match (derives, cross_encoder::fetch_files(&local)) {
+        (true, _) => strata::derive::model_files(&local).iter().map(|&f| (f, f)).collect(),
+        (false, Some(f)) => f,
+        (false, None) => strata::embed::model_files(&local).iter().map(|&f| (f, f)).collect(),
+    };
+    for (from, file) in files {
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{from}");
         let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;
         let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
         // Written aside and renamed, so that an open model is never
@@ -533,7 +538,8 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     } else if !cross_encoder::is_cross_encoder(&out) {
         strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
     } else if let Err(e) = cross_encoder::CrossEncoder::open(&local, &out) {
-        match cfg!(feature = "bert") {
+        let runs = if out.join(cross_encoder::ONNX).exists() { cfg!(feature = "onnx") } else { cfg!(feature = "bert") };
+        match runs {
             true => return Err(e.to_string()),
             false => tracing::warn!(error = %e, "downloaded a cross-encoder this build cannot run"),
         }

@@ -1,0 +1,201 @@
+//! DataFusion as the engine of plans' operators (`strata::query::df`,
+//! feature `datafusion`) against Strata's own operators
+//! (`strata::query::ops`): the same compound queries (joins, groups over
+//! joined rows, `WITH`, `DISTINCT`, `DISTINCT ON`, sorts, limits, and
+//! expressions over derived rows) give the same rows, keys and scores, in
+//! the same order, on random tables with NULLs; and the queries the
+//! lowering covers do run on DataFusion.
+#![cfg(feature = "datafusion")]
+
+use rand::{Rng, SeedableRng};
+use strata::db::Db;
+use strata::query::exec::{Engine, ExecOptions, ResultSet};
+use strata::query::Params;
+use strata::storage::DbOptions;
+use strata::value::Value;
+use strata::{Field, FieldType, Schema};
+
+const PAPERS: usize = 400;
+const AUTHORS: usize = 40;
+
+fn papers() -> Schema {
+    Schema::new(
+        "papers",
+        vec![
+            Field::new("id", FieldType::Keyword),
+            Field::new("title", FieldType::Text { positions: false }),
+            Field::new("year", FieldType::Int),
+            Field::new("venue", FieldType::Int),
+            Field::new("author", FieldType::Keyword),
+            Field::new("tags", FieldType::Keyword).multi(),
+            Field::new("weight", FieldType::Float),
+            Field::new("cites", FieldType::Int),
+        ],
+        Some("id"),
+    )
+    .unwrap()
+}
+
+/// Papers with NULLs in every column but the key, venues 1 to 12 of which
+/// 1 to 9 exist, authors some of whom are not in the authors table.
+fn open(dir: &std::path::Path) -> Db {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let opts = DbOptions { segment_max_docs: 150, sync: false, ..DbOptions::default() };
+    let db = Db::create(&dir.join("t.strata"), papers(), opts).unwrap();
+    let maybe = |rng: &mut rand::rngs::StdRng, v: Value| if rng.gen_range(0..8) == 0 { Value::Null } else { v };
+    let topics = ["graph search", "vector indexes", "query planning", "learned ranking"];
+    let rows: Vec<Vec<Value>> = (0..PAPERS)
+        .map(|i| {
+            let tags: Vec<Value> = (0..rng.gen_range(0..3)).map(|_| Value::Str(["db", "ir", "ml", "sys"][rng.gen_range(0..4)].into())).collect();
+            let (year, venue, author) = (rng.gen_range(0..35), rng.gen_range(1..=12), rng.gen_range(0..AUTHORS + 5));
+            let (weight, cites) = (rng.gen_range(0..1000) as f64 / 100.0, rng.gen_range(0..50) - 5);
+            vec![
+                Value::Str(format!("p{i:03}")),
+                Value::Str(format!("paper {i} on {}", topics[i % 4])),
+                maybe(&mut rng, Value::Int(1990 + year)),
+                maybe(&mut rng, Value::Int(venue)),
+                maybe(&mut rng, Value::Str(format!("a{author:02}"))),
+                Value::List(tags),
+                maybe(&mut rng, Value::Float(weight)),
+                maybe(&mut rng, Value::Int(cites)),
+            ]
+        })
+        .collect();
+    db.load(rows).unwrap();
+    db.sql("CREATE TABLE authors (id KEYWORD PRIMARY KEY, name KEYWORD, born INT, country KEYWORD)", &Params::new()).unwrap();
+    let countries = ["cl", "us", "de", "jp"];
+    db.load_into(
+        "authors",
+        (0..AUTHORS).map(|i| vec![Value::Str(format!("a{i:02}")), Value::Str(format!("Author {i}")), if i % 7 == 3 { Value::Null } else { Value::Int(1940 + (i as i64 * 37) % 60) }, Value::Str(countries[i % 4].into())]),
+    )
+    .unwrap();
+    db.sql("CREATE TABLE venues (id INT PRIMARY KEY, name KEYWORD, rank FLOAT, field KEYWORD)", &Params::new()).unwrap();
+    db.load_into("venues", (1..=9).map(|v: i64| vec![Value::Int(v), Value::Str(format!("venue{v}")), if v == 4 { Value::Null } else { Value::Float(1.0 + (v % 5) as f64) }, Value::Str(["db", "ir", "ml"][v as usize % 3].into())])).unwrap();
+    db
+}
+
+/// The queries, each with whether DataFusion must run it (or the
+/// operators may, for what the lowering does not cover yet).
+const QUERIES: &[(&str, bool)] = &[
+    // Joins.
+    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, p.year, v.name, v.rank FROM papers p LEFT JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank >= 3 AND p.year > 2000", true),
+    ("SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id WHERE MATCH(p.title, 'graph')", true),
+    ("SELECT p.id, a.name, v.name FROM papers p JOIN authors a ON p.author = a.id LEFT JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, v.id FROM papers p LEFT JOIN venues v ON p.venue = v.id AND v.rank > 2", true),
+    ("SELECT a.id, b.id FROM papers a JOIN papers b ON a.author = b.author AND b.id != a.id WHERE a.year = 2001", true),
+    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id ORDER BY bm25(p.title, 'vector') DESC LIMIT 7", true),
+    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.year DESC, p.id LIMIT 15 OFFSET 5", true),
+    // Groups over joined rows.
+    ("SELECT v.field, COUNT(*), SUM(p.cites), AVG(p.weight), MIN(p.year), MAX(p.id) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field", true),
+    ("SELECT a.country, COUNT(DISTINCT p.venue) AS n, AVG(p.cites) FROM papers p JOIN authors a ON p.author = a.id GROUP BY a.country ORDER BY n DESC, a.country", true),
+    ("SELECT v.name, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.name HAVING n > 30 ORDER BY n DESC", true),
+    ("SELECT COUNT(*), SUM(p.weight), AVG(p.year) FROM papers p JOIN venues v ON p.venue = v.id WHERE v.rank > 100", true),
+    ("SELECT v.field, a.country, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id JOIN authors a ON p.author = a.id GROUP BY v.field, a.country ORDER BY 3 DESC, 1, 2", true),
+    ("SELECT p.year % 5 AS b, COUNT(*) FROM papers p JOIN venues v ON p.venue = v.id GROUP BY b ORDER BY b", true),
+    // WITH and derived tables.
+    ("WITH top AS (SELECT id, venue FROM papers ORDER BY bm25(title, 'graph') DESC LIMIT 50) SELECT v.field, COUNT(*) FROM top t JOIN venues v ON t.venue = v.id GROUP BY v.field", true),
+    ("WITH old AS (SELECT id, author, year FROM papers WHERE year < 2000) SELECT a.id, b.id FROM old a JOIN old b ON a.author = b.author WHERE a.id < b.id", true),
+    ("SELECT field, n FROM (SELECT v.field AS field, COUNT(*) AS n FROM papers p JOIN venues v ON p.venue = v.id GROUP BY v.field) AS t WHERE n > 10 ORDER BY n DESC", true),
+    // DISTINCT and DISTINCT ON.
+    ("SELECT DISTINCT v.field, a.country FROM papers p JOIN venues v ON p.venue = v.id JOIN authors a ON p.author = a.id", true),
+    ("SELECT DISTINCT p.year FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.year DESC NULLS FIRST", true),
+    ("SELECT DISTINCT ON (v.field) v.field, p.id, p.weight FROM papers p JOIN venues v ON p.venue = v.id ORDER BY p.weight DESC, p.id", true),
+    ("SELECT DISTINCT ON (author) author, id, year FROM papers ORDER BY year DESC, id LIMIT 12", true),
+    // Expressions over joined rows.
+    ("SELECT p.id, p.year + p.cites, p.year - v.id, p.cites * v.id, p.cites / v.id, p.cites % 4, -p.cites FROM papers p JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, p.weight * v.rank, p.weight / (v.rank - 2), p.weight + 1 FROM papers p JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, CASE WHEN v.rank > 3 THEN 'high' WHEN v.rank > 1 THEN 'mid' ELSE 'low' END FROM papers p LEFT JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, COALESCE(a.name, p.author, 'none'), LOWER(v.name), UPPER(a.country), LENGTH(p.author) FROM papers p LEFT JOIN venues v ON p.venue = v.id LEFT JOIN authors a ON p.author = a.id", true),
+    ("SELECT p.id, ROUND(p.weight * v.rank, 1), ROUND(p.weight), ABS(p.cites - 20), ln(p.weight), pow(v.rank, 2), least(p.weight, v.rank) FROM papers p JOIN venues v ON p.venue = v.id", true),
+    ("SELECT p.id, v.name || '-' || p.author FROM papers p JOIN venues v ON p.venue = v.id WHERE v.name || p.author LIKE 'venue%a1%' OR (v.name || p.author) ILIKE 'VENUE2%'", true),
+    ("SELECT p.id FROM papers p JOIN venues v ON p.venue = v.id WHERE p.weight BETWEEN 2 AND 5 AND v.field IN ('db', 'ml') AND NOT (p.year IS NULL)", true),
+    ("SELECT p.id, a.born FROM papers p LEFT JOIN authors a ON p.author = a.id WHERE a.born IS NULL ORDER BY p.id DESC LIMIT 20", true),
+    ("SELECT p.id, v.rank FROM papers p JOIN venues v ON p.venue = v.id ORDER BY v.rank NULLS FIRST, p.cites DESC, p.id", true),
+    // Not lowered yet: a multi-valued column as a join key, links, a
+    // subquery in a leaf. They must still answer as the operators do.
+    ("SELECT p.id, a.name FROM papers p JOIN authors a ON p.tags = a.id", false),
+    ("SELECT id FROM papers WHERE venue IN (SELECT id FROM venues WHERE field = 'ir') ORDER BY id", false),
+    // Subqueries in a leaf, over a WITH result or another table.
+    ("WITH ir AS (SELECT id FROM venues WHERE field = 'ir') SELECT p.id, a.name FROM papers p JOIN authors a ON p.author = a.id WHERE p.venue IN (SELECT id FROM ir)", true),
+    ("SELECT p.id, v.name FROM papers p JOIN venues v ON p.venue = v.id WHERE p.year > (SELECT AVG(year) FROM papers) AND EXISTS (SELECT id FROM authors WHERE country = 'cl')", true),
+    ("SELECT DISTINCT tags FROM papers", false),
+];
+
+fn run(db: &Db, sql: &str, engine: Engine) -> ResultSet {
+    let opts = ExecOptions { engine, ..db.exec.clone() };
+    db.query_with(sql, &Params::new(), &opts).unwrap_or_else(|e| panic!("{sql} ({engine:?}): {e}"))
+}
+
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x == y || (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0) || (x.is_nan() && y.is_nan()),
+        (Value::List(x), Value::List(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same_value(a, b)),
+        _ => a == b,
+    }
+}
+
+fn same(sql: &str, want: &ResultSet, got: &ResultSet) {
+    assert_eq!(want.columns, got.columns, "{sql}: columns");
+    assert_eq!(want.rows.len(), got.rows.len(), "{sql}: rows");
+    for (i, (w, g)) in want.rows.iter().zip(&got.rows).enumerate() {
+        assert!(w.len() == g.len() && w.iter().zip(g).all(|(a, b)| same_value(a, b)), "{sql}: row {i}: operators {w:?}, datafusion {g:?}");
+    }
+    assert_eq!(want.keys, got.keys, "{sql}: keys");
+    assert_eq!(want.scores.len(), got.scores.len(), "{sql}: scores");
+    for (i, (w, g)) in want.scores.iter().zip(&got.scores).enumerate() {
+        assert!((w - g).abs() <= 1e-9 * w.abs().max(1.0), "{sql}: score {i}: {w} vs {g}");
+    }
+}
+
+fn on_datafusion(rs: &ResultSet) -> bool {
+    !rs.stats.plan.iter().any(|l| l.starts_with("operators (not datafusion"))
+}
+
+#[test]
+fn datafusion_answers_as_the_operators() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let mut fell_back = Vec::new();
+    for &(sql, must) in QUERIES {
+        let want = run(&db, sql, Engine::Operators);
+        let got = run(&db, sql, Engine::DataFusion);
+        same(sql, &want, &got);
+        if !on_datafusion(&got) {
+            assert!(!must, "{sql}: ran on the operators: {:?}", got.stats.plan.first());
+            fell_back.push(sql);
+        }
+    }
+    assert!(!fell_back.is_empty() || QUERIES.iter().all(|q| q.1));
+}
+
+#[test]
+fn integer_overflow_falls_back_to_a_float() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let sql = "SELECT p.id, p.cites * 9223372036854775807 FROM papers p JOIN venues v ON p.venue = v.id WHERE p.cites > 1";
+    let want = run(&db, sql, Engine::Operators);
+    let got = run(&db, sql, Engine::DataFusion);
+    same(sql, &want, &got);
+    assert!(!on_datafusion(&got), "an integer overflow is the operators' FLOAT");
+    assert!(want.rows.iter().all(|r| matches!(r[1], Value::Float(_))));
+}
+
+#[test]
+fn a_join_past_the_operators_row_cap() {
+    // 1,100 x 1,100 rows on one key: 1,210,000 joined rows, more than the
+    // operators hold.
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::new("l", vec![Field::new("id", FieldType::Int), Field::new("k", FieldType::Int)], Some("id")).unwrap();
+    let db = Db::create(&dir.path().join("big.strata"), schema, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    db.load((0..1_100).map(|i| vec![Value::Int(i), Value::Int(1)])).unwrap();
+    db.sql("CREATE TABLE r (id INT PRIMARY KEY, k INT)", &Params::new()).unwrap();
+    db.load_into("r", (0..1_100).map(|i| vec![Value::Int(i), Value::Int(1)])).unwrap();
+    let sql = "SELECT COUNT(*), SUM(r.id) FROM l JOIN r ON l.k = r.k";
+    let opts = ExecOptions { engine: Engine::Operators, ..db.exec.clone() };
+    assert!(db.query_with(sql, &Params::new(), &opts).is_err(), "the operators refuse more than 1,000,000 joined rows");
+    let got = run(&db, sql, Engine::DataFusion);
+    assert!(on_datafusion(&got));
+    assert_eq!(got.rows, vec![vec![Value::Int(1_210_000), Value::Int(1_100 * (1_099 * 1_100 / 2))]]);
+}
