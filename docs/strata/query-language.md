@@ -836,6 +836,8 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
   - `datafusion-only`: a query DataFusion does not run fails, to find what it lacks.
 
   The operators run what DataFusion does not run yet, and the plan's first line says why. Today that is joins along links, multi-valued columns as sort keys, correlated subqueries, and `maxsim` or `encode` over a subquery.
+
+  strata-server runs them on its engine over its own tables and as a [coordinator](server.md#sharding-one-coordinator-many-shards), which runs them above the rows its shards answer for each single-table query.
 - On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `RIGHT`, `FULL` and `CROSS` joins are not supported.
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.

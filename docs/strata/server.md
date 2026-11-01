@@ -79,7 +79,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 `strata-server import`, `strata-server fetch-model` and `strata-server promote` are subcommands: [loading rows](#loading-rows), [embedded vector fields](#embedded-vector-fields) and [promotion](#replication-a-primary-and-its-replicas).
 
-`STRATA_ENGINE` chooses the engine of [joins, groups and sorts over joined or derived rows](query-language.md#subqueries-with-and-joins). The default, `auto`, uses DataFusion when a query's single-table parts read more than 4,096 rows and Strata's operators below that. The other values are `operators`, `datafusion` and `datafusion-only`. Build with `--no-default-features` to leave DataFusion out of the server.
+`STRATA_ENGINE` chooses the engine of [joins, groups and sorts over joined or derived rows](query-language.md#subqueries-with-and-joins), over a database's own tables and on a coordinator above its shards' rows. The default, `auto`, uses DataFusion when a query's single-table parts read more than 4,096 rows and Strata's operators below that. The other values are `operators`, `datafusion` and `datafusion-only`. Build with `--no-default-features` to leave DataFusion out of the server.
 
 `strata-server upgrade PATH` copies a database written by a version of Strata from before field ids, which this one refuses to serve, into this version's format in its place, and keeps the old one as `PATH.before-field-ids` ([field ids](index.md#wal-memtable-and-snapshots)). Stop the server that has it open first. A database started with `--seq-no` is not copied: create a new one and fill it with `--copy-from`.
 
@@ -501,7 +501,7 @@ curl -s localhost:7700/v1/query -H 'content-type: application/json' -d '{
 
 An operation writes the first table unless it names another (`"table"`), and one batch may write several tables in its transaction. On a coordinator, an operation by key (`delete`, `set`, `add`) on a table placed by a column ([tables on shards](#tables-on-shards)) gives that column's value as `"routing"`, since the key alone does not say which shard holds the row.
 
-A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its plan: operators over single-table queries, all on one snapshot. On a coordinator the operators run there, and each single-table query goes to the shards as its plan (typed from protocol 2, JSON before; see [gRPC](#grpc)). Its plan lines list the single-table queries that ran. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
+A compound query (`WITH`, a subquery, a join, `SELECT DISTINCT`) runs as its plan: operators over single-table queries, all on one snapshot, on the engine `STRATA_ENGINE` chooses ([above](#run-it)). On a coordinator they run there, and each single-table query goes to the shards as its plan (typed from protocol 2, JSON before; see [gRPC](#grpc)). Its plan lines list the single-table queries that ran. A coordinator has no synonym list of its own: start each shard with `--synonyms FILE`.
 
 `set` and `add` change a numeric field in place, without rewriting the row; `upsert_if_newer` writes the row only if its version field is higher than the stored row's, so a feed replayed out of order keeps the newest. Operations see the ones before them in the batch: an `add` after an `upsert` of the same key adds to the upserted value. An `add` to an `INT` field takes an integer and fails on overflow (exact over the whole 64-bit range); one to a `FLOAT` field must stay finite; a missing value counts as 0.
 

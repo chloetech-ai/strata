@@ -24,7 +24,7 @@ use std::rc::Rc;
 use crate::error::{Error, Result};
 use crate::query::agg::{self, Acc, Part};
 use crate::query::compound::MAX_ROWS;
-use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
+use crate::query::exec::{ExecOptions, ExecStats, Leaf, ResultSet};
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::{Agg, CmpOp, Expr, Graph, GraphKind, JoinKey, JoinKind, KeyValue, Node, Plan, SetOp, SortKey};
 use crate::query::logical::Direction;
@@ -36,6 +36,67 @@ use crate::value::Value;
 
 /// Runs one leaf of a plan.
 pub type Runner<'r> = dyn FnMut(&Plan) -> Result<ResultSet> + 'r;
+
+/// Runs a leaf plan for [`run_on_engine`]: its rows, as Arrow columns
+/// ([`Leaf`]) when there are more than the number it is given, which is
+/// `usize::MAX` for the operators.
+pub type LeafRunner<'r> = dyn FnMut(&Plan, usize) -> Result<Leaf> + 'r;
+
+/// Runs `plan` (one that reads, [`Node::uses_operators`]) on the engine
+/// `opts.engine` chooses ([`crate::query::exec::Engine`]): DataFusion
+/// above its leaves where it lowers the plan (feature `datafusion`), and
+/// otherwise the operators ([`run_in`]), which take the leaves DataFusion
+/// already ran rather than run them again; the plan's first line then
+/// says why DataFusion did not answer. A database runs its compound
+/// queries here over its own tables, and a coordinator over its shards'
+/// answers to each leaf.
+pub fn run_on_engine(plan: &Plan, catalog: &[&Schema], runner: &mut LeafRunner, opts: &ExecOptions) -> Result<ResultSet> {
+    #[allow(unused_mut)]
+    let mut fallback: Option<String> = None;
+    #[cfg(feature = "datafusion")]
+    let mut ran = crate::query::df::Ran::default();
+    #[cfg(feature = "datafusion")]
+    // A leaf with subqueries has no operators for DataFusion to run.
+    if opts.engine != crate::query::exec::Engine::Operators && !plan.root.is_leaf() {
+        use crate::query::df::Outcome;
+        match crate::query::df::run_in(plan, catalog, runner, opts)? {
+            Outcome::Done(rs) => return Ok(rs),
+            Outcome::Fallback(why, _) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(err(format!("not run on DataFusion: {why}"))),
+            Outcome::Fallback(why, r) => {
+                fallback = Some(why);
+                ran = r;
+            }
+            Outcome::Small(r) => ran = r,
+        }
+    }
+    // The leaves DataFusion ran are not run again, and the profile keeps
+    // their steps.
+    #[cfg(feature = "datafusion")]
+    let ran_steps = std::mem::take(&mut ran.steps);
+    let mut rows = |leaf: &Plan| {
+        #[cfg(feature = "datafusion")]
+        if let Some(rs) = ran.take(leaf) {
+            return Ok(rs);
+        }
+        match runner(leaf, usize::MAX)? {
+            Leaf::Rows(rs) => Ok(rs),
+            #[cfg(feature = "datafusion")]
+            Leaf::Arrow(_) => Err(err("a leaf gave Arrow columns where rows were asked for")),
+        }
+    };
+    #[allow(unused_mut)]
+    let mut rs = run_in(plan, catalog, &mut rows, opts)?;
+    #[cfg(feature = "datafusion")]
+    if !ran_steps.is_empty() {
+        let mut steps = ran_steps;
+        rs.stats.steps_dropped += crate::query::steps::nest(&mut steps, &rs.stats.steps, 0) as u64;
+        rs.stats.steps = steps;
+    }
+    if let Some(why) = fallback {
+        rs.stats.plan.insert(0, format!("operators (not datafusion: {why})"));
+    }
+    Ok(rs)
+}
 
 /// Rows an ORDER BY with a correlated subquery ranks at most: each row may
 /// run the subquery once.
