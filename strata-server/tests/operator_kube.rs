@@ -233,7 +233,7 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
         }
     };
     bind("data-orders-s0-0", "fixed").await;
-    let e = c.grow_volumes("2Gi").await.unwrap_err();
+    let e = c.grow_volumes("2Gi", true).await.unwrap_err();
     assert!(e.contains("must support resize"), "{e}");
     k.delete("/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s0-0").await.unwrap();
     // (A claim keeps its protection finalizer here: take it off.)
@@ -245,10 +245,11 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     }
     bind("data-orders-s0-0", "grows").await;
     bind("data-orders-s0-1", "grows").await;
-    assert_eq!(c.grow_volumes("2Gi").await.unwrap(), 2);
+    assert_eq!(c.grow_volumes("2Gi", false).await.unwrap(), 2, "two claims are smaller");
+    assert_eq!(c.grow_volumes("2Gi", true).await.unwrap(), 2);
     assert_eq!(get(&k, "/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s0-1").await["spec"]["resources"]["requests"]["storage"], "2Gi");
-    assert_eq!(c.grow_volumes("2Gi").await.unwrap(), 0);
-    assert_eq!(c.grow_volumes("1Gi").await.unwrap(), 0, "a volume never shrinks");
+    assert_eq!(c.grow_volumes("2Gi", true).await.unwrap(), 0);
+    assert_eq!(c.grow_volumes("1Gi", true).await.unwrap(), 0, "a volume never shrinks");
     c.scale_set(1, 2).await.unwrap();
     assert_eq!(get(&k, "/apis/apps/v1/namespaces/db/statefulsets/orders-s1").await["spec"]["replicas"], 2);
     let pvc = json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
@@ -266,10 +267,45 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     let link = kube::Link::with("db/orders", &kube::Options { api: Some(env.url.clone()), token: Some(TOKEN.into()), ca: Some(env.ca.clone()), ..Default::default() }).unwrap();
     let j = link.get().await.unwrap();
     assert_eq!((&j["spec"]["shards"], &j["status"]["phase"], &j["settled"]), (&json!(2), &json!("Creating"), &json!(true)), "{j}");
-    let j = link.change(&kube::Link::sizes(Some(3), Some(2), None).unwrap()).await.unwrap();
+    let first = j["status"]["history"].clone();
+    assert_eq!((first.as_array().map(Vec::len), &first[0]["version"], &first[0]["by"]), (Some(1), &json!(1), &Json::Null), "{first}");
+    assert!(!j["status"]["log"].as_array().unwrap().is_empty(), "{j}");
+    // Who changes it through a coordinator is noted with the version
+    // the change makes, and its version keeps it.
+    let next: operator::Spec = serde_json::from_value(json!({"shards": 3, "replicas": 2, "demo": 300, "storage": {"size": "1Gi"}})).unwrap();
+    let j = link.change(&kube::Link::sizes(Some(3), Some(2), None).unwrap(), &[(kube::CHANGED_BY, format!("roberto {}", next.version()))]).await.unwrap();
     assert_eq!((&j["spec"]["shards"], &j["spec"]["replicas"], &j["spec"]["demo"], &j["settled"]), (&json!(3), &json!(2), &json!(300), &json!(false)), "{j}");
     kube::once(&k, &now().await).await;
-    assert_eq!(link.get().await.unwrap()["settled"], true);
+    let j = link.get().await.unwrap();
+    assert_eq!(j["settled"], true);
+    let h = &j["status"]["history"];
+    assert_eq!((h.as_array().map(Vec::len), &h[1]["version"], &h[1]["by"], &h[1]["spec"]["shards"]), (Some(2), &json!(2), &json!("roberto"), &json!(3)), "{h}");
+    assert_eq!(j["status"]["rollout"]["version"], next.version(), "{j}");
+    // A resume names the hold it lifts; with none, there is nothing to resume.
+    assert!(link.resume().await.unwrap_err().contains("no gate holds the change"));
+    let held = json!({"gate": "p99Ms", "value": 312.0, "limit": 200.0, "atMs": 1234, "text": "search p99 was 312 ms, over its 200 ms limit, for 30 s"});
+    k.merge(&format!("{CLUSTERS}/orders/status"), &json!({"status": {"rollout": {"held": held, "gates": [{"name": "p99Ms", "limit": 200.0, "overSinceMs": 1000}]}}})).await.unwrap();
+    k.merge(&format!("{CLUSTERS}/orders"), &json!({"spec": {"rollout": {"gates": {"p99Ms": 200}}}})).await.unwrap();
+    kube::once(&k, &now().await).await;
+    let kept = now().await["status"]["rollout"]["held"].clone();
+    assert!(kept["atMs"] == 1234 && kept["text"] == held["text"], "a hold stays until it is resumed: {kept}");
+    let j = link.resume().await.unwrap();
+    assert_eq!(j["status"]["rollout"]["held"]["atMs"], 1234);
+    assert_eq!(now().await["metadata"]["annotations"][kube::RESUME], "1234");
+    kube::once(&k, &now().await).await;
+    let r = &now().await["status"]["rollout"];
+    assert!(r["held"].is_null() && r["gates"][0]["overSinceMs"].is_null(), "{r}");
+    // A rollback: the patch back to version 1, its gates kept, held by none.
+    let j = link.get().await.unwrap();
+    let back = kube::Link::rollback(&j, 1).unwrap();
+    let (_, to) = operator::patched(&j["spec"], &back).unwrap();
+    assert_eq!((to.shards, to.replicas, to.rollout.gates.p99_ms), (2, 3, Some(200.0)));
+    link.change(&back, &[(kube::ROLLBACK, to.version())]).await.unwrap();
+    kube::once(&k, &now().await).await;
+    let j = link.get().await.unwrap();
+    let h = &j["status"]["history"];
+    assert_eq!((h.as_array().map(Vec::len), &h[2]["version"], &h[2]["restores"]), (Some(3), &json!(3), &json!(1)), "{h}");
+    assert_eq!((&j["spec"]["shards"], &j["status"]["rollout"]["ungated"]), (&json!(2), &json!(true)), "{j}");
     let gone = kube::Link::with("db/nothing", &kube::Options { api: Some(env.url.clone()), token: Some(TOKEN.into()), ca: Some(env.ca.clone()), ..Default::default() }).unwrap();
     assert!(gone.get().await.unwrap_err().contains("no StrataCluster db/nothing"));
 

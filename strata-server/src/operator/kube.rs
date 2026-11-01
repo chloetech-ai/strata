@@ -512,7 +512,7 @@ impl Platform for Cluster {
         self.kube.delete(&format!("{}/{}-{ordinal}", ns_path(&self.ns, "v1", "pods"), self.set_name(id))).await
     }
 
-    async fn grow_volumes(&self, size: &str) -> Result<usize, String> {
+    async fn grow_volumes(&self, size: &str, apply: bool) -> Result<usize, String> {
         let want = super::quantity(size).ok_or_else(|| format!("the volume size {size:?} is not one Kubernetes reads"))?;
         let sel = format!("app.kubernetes.io/instance={},app.kubernetes.io/component=shard", self.name);
         let path = ns_path(&self.ns, "v1", "persistentvolumeclaims");
@@ -521,7 +521,9 @@ impl Platform for Cluster {
             let has = pvc["spec"]["resources"]["requests"]["storage"].as_str().and_then(super::quantity).unwrap_or(0);
             let Some(name) = pvc["metadata"]["name"].as_str() else { continue };
             if has < want {
-                self.kube.merge(&format!("{path}/{name}"), &json!({"spec": {"resources": {"requests": {"storage": size}}}})).await?;
+                if apply {
+                    self.kube.merge(&format!("{path}/{name}"), &json!({"spec": {"resources": {"requests": {"storage": size}}}})).await?;
+                }
                 grown += 1;
             }
         }
@@ -600,13 +602,51 @@ impl Link {
     }
 
     /// Merges `spec` (a patch of the spec: [`Link::sizes`], or any of its
-    /// fields) into the cluster's: the operator then takes the cluster
-    /// there, one step at a time.
-    pub async fn change(&self, spec: &Json) -> Result<Json, String> {
-        self.kube.merge(&self.path(), &json!({"spec": spec})).await?.ok_or_else(|| format!("no StrataCluster {}/{}", self.namespace, self.name))?;
+    /// fields) into the cluster's, with `notes` among its annotations: the
+    /// operator then takes the cluster there, one step at a time.
+    pub async fn change(&self, spec: &Json, notes: &[(&str, String)]) -> Result<Json, String> {
+        let notes: serde_json::Map<String, Json> = notes.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+        let mut patch = json!({"spec": spec});
+        if !notes.is_empty() {
+            patch["metadata"] = json!({"annotations": notes});
+        }
+        self.kube.merge(&self.path(), &patch).await?.ok_or_else(|| format!("no StrataCluster {}/{}", self.namespace, self.name))?;
+        self.get().await
+    }
+
+    /// The spec patch that takes the cluster back to `version` of its
+    /// `status.history`, its `rollout` kept as it is.
+    pub fn rollback(now: &Json, version: u64) -> Result<Json, String> {
+        let history = now["status"]["history"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let then = history.iter().find(|v| v["version"] == version).ok_or_else(|| {
+            let kept: Vec<String> = history.iter().filter_map(|v| v["version"].as_u64()).map(|v| v.to_string()).collect();
+            format!("no version {version} in the cluster's history (it keeps {})", if kept.is_empty() { "none yet".into() } else { kept.join(", ") })
+        })?;
+        let mut from = now["spec"].clone();
+        if let Some(o) = from.as_object_mut() {
+            o.remove("rollout");
+        }
+        Ok(super::merge_diff(&from, &then["spec"]))
+    }
+
+    /// Lifts the hold a gate put on the change: the operator goes on, and
+    /// its gates count again from now.
+    pub async fn resume(&self) -> Result<Json, String> {
+        let now = self.get().await?;
+        let at = now["status"]["rollout"]["held"]["atMs"].as_u64().ok_or("no gate holds the change: nothing to resume (a pause is lifted with rollout.paused: false)")?;
+        self.kube.merge(&self.path(), &json!({"metadata": {"annotations": {RESUME: at.to_string()}}})).await?;
         self.get().await
     }
 }
+
+/// The annotation that resumes a change a gate held (the hold's `atMs`).
+pub const RESUME: &str = "strata.chloetech.ai/resume";
+/// The annotation that marks a version as a rollback, which no gate
+/// holds ([`super::Spec::version`]).
+pub const ROLLBACK: &str = "strata.chloetech.ai/rollback";
+/// Who made the latest change through a coordinator, and its version
+/// (`name version`).
+pub const CHANGED_BY: &str = "strata.chloetech.ai/changed-by";
 
 /// Runs the operator: installs the CRD (with `install_crd`), then looks
 /// at every `StrataCluster` every `every`, takes each one step toward its
@@ -636,23 +676,40 @@ pub async fn run(o: Options) -> Result<(), String> {
     }
 }
 
-/// One step for one cluster, and its status.
+/// One step for one cluster, and its status: the outcome, what the next
+/// step takes from it (`rollout`), the versions of the spec (`history`)
+/// and the operator's latest messages (`log`).
 pub async fn once(kube: &Kube, c: &Json) -> Outcome {
     let meta = &c["metadata"];
     let (ns, name) = (meta["namespace"].as_str().unwrap_or("default").to_string(), meta["name"].as_str().unwrap_or_default().to_string());
     let spec: Result<Spec, String> = serde_json::from_value(c["spec"].clone()).map_err(|e| format!("spec: {e}"));
-    let out = match spec {
-        Err(e) => Outcome::new(super::Phase::Failed, e),
+    let before: super::Rollout = serde_json::from_value(c["status"]["rollout"].clone()).unwrap_or_default();
+    let note = |k: &str| meta["annotations"][k].as_str();
+    let out = match &spec {
+        Err(e) => super::Outcome { rollout: before, ..super::Outcome::new(super::Phase::Failed, e.clone()) },
         Ok(spec) => {
-            let cluster = Cluster { kube: kube.clone(), ns: ns.clone(), name: name.clone(), uid: meta["uid"].as_str().unwrap_or_default().to_string(), spec };
+            let before = super::noted(before, note(RESUME), note(ROLLBACK), spec);
+            let cluster = Cluster { kube: kube.clone(), ns: ns.clone(), name: name.clone(), uid: meta["uid"].as_str().unwrap_or_default().to_string(), spec: spec.clone() };
             match common(&cluster).await {
-                Err(e) => Outcome::new(super::Phase::Failed, e),
-                Ok(admin) => super::reconcile(&cluster.spec, &cluster, &admin).await,
+                Err(e) => super::Outcome { rollout: before, ..super::Outcome::new(super::Phase::Failed, e) },
+                Ok(admin) => super::reconcile(&cluster.spec, &cluster, &admin, &before).await,
             }
         }
     };
-    let status = json!({"phase": out.phase, "message": out.message, "shards": out.shards, "observedGeneration": meta["generation"]});
-    if c["status"] != status {
+    let now = super::now_ms();
+    let history = match &spec {
+        Ok(spec) => {
+            // Who changed it, if the change came through a coordinator.
+            let by = note(CHANGED_BY).and_then(|b| b.rsplit_once(' ')).filter(|(_, v)| *v == spec.version()).map(|(who, _)| who);
+            super::versions(&c["status"]["history"], spec, meta["generation"].as_u64(), by, now, out.phase == super::Phase::Ready)
+        }
+        Err(_) => c["status"]["history"].clone(),
+    };
+    let status = json!({
+        "phase": out.phase, "message": out.message, "shards": out.shards, "observedGeneration": meta["generation"],
+        "rollout": out.rollout, "history": history, "log": super::logged(&c["status"]["log"], out.phase, &out.message, now),
+    });
+    if !same(&c["status"], &status) {
         if out.phase != super::Phase::Ready || c["status"]["phase"] != "Ready" {
             tracing::info!(cluster = %format!("{ns}/{name}"), phase = ?out.phase, message = %out.message, "reconciled");
         }
@@ -662,6 +719,18 @@ pub async fn once(kube: &Kube, c: &Json) -> Outcome {
         }
     }
     out
+}
+
+/// Whether the status the API server holds is `b`: numbers by value (it
+/// gives 200.0 back as 200) and a null as a field left out (a merge patch
+/// removes a field it sets to null).
+fn same(a: &Json, b: &Json) -> bool {
+    match (a, b) {
+        (Json::Number(x), Json::Number(y)) => x.as_f64() == y.as_f64(),
+        (Json::Array(x), Json::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b)),
+        (Json::Object(x), Json::Object(y)) => x.keys().chain(y.keys()).all(|k| same(x.get(k).unwrap_or(&Json::Null), y.get(k).unwrap_or(&Json::Null))),
+        _ => a == b,
+    }
 }
 
 /// Applies the objects every cluster has, and the coordinators' client.
@@ -772,6 +841,14 @@ mod tests {
         let c = cluster(json!({"demo": 10, "tokenSecret": "admin"}));
         let d = c.coordinator_deployment(&[vec!["a".into()]], 1);
         assert_eq!(names(&d["spec"]["template"]["spec"]["containers"][0]["env"]), [("STRATA_TOKEN".to_string(), "admin".to_string())]);
+    }
+
+    #[test]
+    fn a_status_is_the_same_as_the_api_server_gives_it_back() {
+        assert!(same(&json!({"a": 200, "b": [1, {"c": 2}]}), &json!({"a": 200.0, "b": [1.0, {"c": 2, "d": null}], "e": null})));
+        assert!(!same(&json!({"a": 200}), &json!({"a": 201})));
+        assert!(!same(&json!({"a": [1]}), &json!({"a": [1, 2]})));
+        assert!(!same(&json!({}), &json!({"a": 0})));
     }
 
     #[test]

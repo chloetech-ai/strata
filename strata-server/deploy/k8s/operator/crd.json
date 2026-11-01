@@ -107,6 +107,54 @@
                     "type": "object",
                     "x-kubernetes-preserve-unknown-fields": true
                   },
+                  "rollout": {
+                    "description": "How changes are made: paused, or held by gates on the cluster's live numbers.",
+                    "properties": {
+                      "gates": {
+                        "description": "Limits on live numbers: one over its limit for holdAfterSeconds holds the change until it is resumed.",
+                        "properties": {
+                          "diskUsedRatio": {
+                            "description": "The fullest volume's used share.",
+                            "maximum": 1,
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "errorRatio": {
+                            "description": "The share of searches that fail.",
+                            "maximum": 1,
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "p99Ms": {
+                            "description": "The search p99 the coordinator's clients see, in ms.",
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "replicaBehind": {
+                            "description": "The transactions a replica is behind its primary.",
+                            "minimum": 0,
+                            "type": "number"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "holdAfterSeconds": {
+                        "description": "How long a gate is over its limit before it holds the change (default 30).",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "paused": {
+                        "description": "While true the operator takes no step toward the spec (a copy that lost its data still joins again).",
+                        "type": "boolean"
+                      },
+                      "soakSeconds": {
+                        "description": "How long a copy restarted with new settings serves before the next restarts (default 0).",
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "schema": {
                     "description": "The first table's schema, as strata-server --schema takes it.",
                     "type": "object",

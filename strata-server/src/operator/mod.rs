@@ -90,6 +90,125 @@ pub struct Spec {
     /// More arguments for every coordinator (`--hedge-ms 50`,
     /// `--partial`, ...).
     pub coordinator_args: Vec<String>,
+    /// How changes are made: paused, or held by gates on the cluster's
+    /// live numbers.
+    pub rollout: RolloutSpec,
+}
+
+/// How the operator makes a change (`spec.rollout`). Not part of a
+/// version of the cluster ([`Spec::version`]): pausing, or moving a gate,
+/// changes no server.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RolloutSpec {
+    /// While true the operator takes no step toward the spec: no copy or
+    /// shard is added or removed, no slot moves (a move under way stops
+    /// after its run) and no copy restarts. A copy that comes back
+    /// without its data still joins its shard again.
+    pub paused: bool,
+    /// Limits on the cluster's live numbers: one over its limit for
+    /// `hold_after_seconds` holds the change until it is resumed
+    /// (`POST /v1/admin/kube/resume`) or the spec changes.
+    pub gates: Gates,
+    pub hold_after_seconds: u64,
+    /// How long a copy restarted with new settings serves before the next
+    /// one restarts, so that the gates see it.
+    pub soak_seconds: u64,
+}
+
+impl Default for RolloutSpec {
+    fn default() -> RolloutSpec {
+        RolloutSpec { paused: false, gates: Gates::default(), hold_after_seconds: 30, soak_seconds: 0 }
+    }
+}
+
+/// The limits of `spec.rollout.gates`, each read from [`Numbers`]; none
+/// is set by default.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Gates {
+    /// The search p99 the coordinator's clients see, in milliseconds.
+    pub p99_ms: Option<f64>,
+    /// The share of searches that fail, 0 to 1.
+    pub error_ratio: Option<f64>,
+    /// The transactions a replica is behind its primary.
+    pub replica_behind: Option<f64>,
+    /// The fullest volume's used share, 0 to 1.
+    pub disk_used_ratio: Option<f64>,
+}
+
+impl Gates {
+    /// Each gate's name (its field in the spec) and limit.
+    pub fn limits(&self) -> [(&'static str, Option<f64>); 4] {
+        [("p99Ms", self.p99_ms), ("errorRatio", self.error_ratio), ("replicaBehind", self.replica_behind), ("diskUsedRatio", self.disk_used_ratio)]
+    }
+}
+
+/// What a gate's number is, said in words.
+fn gate_words(name: &str, v: f64) -> String {
+    match name {
+        "p99Ms" => format!("{v:.0} ms"),
+        "errorRatio" | "diskUsedRatio" => {
+            // Two digits that mean something: 64%, 2.5%, 0.01%.
+            let p = v * 100.0;
+            let d = if p >= 10.0 || p <= 0.0 { 0 } else if p >= 1.0 { 1 } else { (1.0 - p.log10().floor()).min(6.0) as usize };
+            let t = format!("{p:.d$}");
+            let t = if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t };
+            format!("{t}%")
+        }
+        "replicaBehind" => format!("{v:.0} transactions"),
+        _ => format!("{v}"),
+    }
+}
+
+fn gate_title(name: &str) -> &'static str {
+    match name {
+        "p99Ms" => "search p99",
+        "errorRatio" => "failed searches",
+        "replicaBehind" => "replica lag",
+        "diskUsedRatio" => "the fullest volume",
+        _ => "a gate",
+    }
+}
+
+/// The cluster's live numbers that the gates read, from the coordinator's
+/// `/v1/cluster`: each over the servers' last sample (two seconds).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Numbers {
+    /// The coordinator's search p99 (or, before it has one, the slowest
+    /// server's).
+    pub p99_ms: Option<f64>,
+    /// The coordinator's share of failed searches (or the worst server's).
+    pub error_ratio: Option<f64>,
+    /// The most transactions a replica is behind, as its primary says.
+    pub replica_behind: Option<f64>,
+    /// The fullest volume of a server that answers.
+    pub disk_used_ratio: Option<f64>,
+}
+
+impl Numbers {
+    pub fn from(cluster: &Json) -> Numbers {
+        let servers: Vec<&Json> = cluster["shards"].as_array().into_iter().flatten().flat_map(|s| s["replicas"].as_array().into_iter().flatten()).filter(|r| r["status"] != "down").collect();
+        let worst = |k: &str| servers.iter().filter_map(|r| r["detail"]["load"][k].as_f64()).reduce(f64::max);
+        let coordinator = &cluster["coordinator"]["load"];
+        Numbers {
+            p99_ms: coordinator["p99_ms"].as_f64().or_else(|| worst("p99_ms")),
+            error_ratio: coordinator["error_ratio"].as_f64().or_else(|| worst("error_ratio")),
+            replica_behind: worst("replica_behind_max"),
+            disk_used_ratio: worst("disk_used_ratio"),
+        }
+    }
+
+    /// The number gate `name` reads.
+    pub fn get(&self, name: &str) -> Option<f64> {
+        match name {
+            "p99Ms" => self.p99_ms,
+            "errorRatio" => self.error_ratio,
+            "replicaBehind" => self.replica_behind,
+            "diskUsedRatio" => self.disk_used_ratio,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,6 +244,7 @@ impl Default for Spec {
             coordinator_resources: None,
             args: Vec::new(),
             coordinator_args: Vec::new(),
+            rollout: RolloutSpec::default(),
         }
     }
 }
@@ -148,10 +268,24 @@ impl Spec {
         }))
     }
 
+    /// The spec but for `rollout`, as a short hash: another one is
+    /// another version of the cluster.
+    pub fn version(&self) -> String {
+        let s = Spec { rollout: RolloutSpec::default(), ..self.clone() };
+        short_hash(&serde_json::to_value(&s).unwrap_or(Json::Null))
+    }
+
     /// What is wrong with it, if anything.
     pub fn check(&self) -> Result<(), String> {
         if self.shards == 0 || self.replicas == 0 || self.coordinators == 0 {
             return Err("shards, replicas and coordinators are 1 or more".into());
+        }
+        for (name, limit) in self.rollout.gates.limits() {
+            match limit {
+                Some(v) if !v.is_finite() || v < 0.0 => return Err(format!("rollout.gates.{name} is a number of 0 or more, not {v}")),
+                Some(v) if v > 1.0 && name.ends_with("Ratio") => return Err(format!("rollout.gates.{name} is a share, 0 to 1, not {v}")),
+                _ => {}
+            }
         }
         if self.shards > 4096 {
             return Err("a cluster has at most 4,096 shards, one a slot".into());
@@ -249,9 +383,9 @@ pub trait Platform {
     /// Restarts copy `ordinal` of set `id` with its set's settings; it
     /// keeps its volume.
     async fn restart(&self, id: u32, ordinal: usize) -> Result<(), String>;
-    /// Grows every copy's volume smaller than `size` to it; how many it
-    /// asked to grow.
-    async fn grow_volumes(&self, size: &str) -> Result<usize, String>;
+    /// The copies' volumes smaller than `size`: how many, each grown to
+    /// it with `apply`.
+    async fn grow_volumes(&self, size: &str, apply: bool) -> Result<usize, String>;
     /// The gRPC URL of copy `ordinal` of set `id`.
     fn url(&self, id: u32, ordinal: usize) -> String;
     /// The set and ordinal of the copy at `url`, if it is one of this
@@ -315,6 +449,8 @@ pub struct Server {
     pub takes_writes: bool,
     /// A primary, or a replica its primary says is in sync.
     pub in_sync: bool,
+    /// How long its process has run, as it says.
+    pub uptime_s: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -328,7 +464,10 @@ pub struct Shard {
 pub struct View {
     pub shards: Vec<Shard>,
     pub moving: bool,
+    /// A job of moves runs on this coordinator (it can be stopped).
+    pub job_running: bool,
     pub can_change: Result<(), String>,
+    pub numbers: Numbers,
 }
 
 impl View {
@@ -348,19 +487,21 @@ impl View {
                         .map(|r| {
                             let url = r["url"].as_str().unwrap_or_default().to_string();
                             let takes_writes = r["takes_writes"] == true;
-                            Server { in_sync: takes_writes || in_sync(&url), up: r["status"] != "down", role: r["role"].as_str().unwrap_or_default().to_string(), takes_writes, url }
+                            let uptime_s = r["detail"]["system"]["uptime_s"].as_f64();
+                            Server { in_sync: takes_writes || in_sync(&url), up: r["status"] != "down", role: r["role"].as_str().unwrap_or_default().to_string(), takes_writes, url, uptime_s }
                         })
                         .collect(),
                     slots: s["slots_held"].as_u64().unwrap_or(0) as usize,
                 }
             })
             .collect();
-        let moving = !moves["moving"].is_null() || moves["job"]["state"] == "running";
+        let job_running = moves["job"]["state"] == "running";
+        let moving = !moves["moving"].is_null() || job_running;
         let can_change = match cluster["changes"]["ok"].as_bool() {
             Some(false) => Err(cluster["changes"]["why"].as_str().unwrap_or("the cluster map cannot change").to_string()),
             _ => Ok(()),
         };
-        Ok(View { shards, moving, can_change })
+        Ok(View { shards, moving, job_running, can_change, numbers: Numbers::from(cluster) })
     }
 }
 
@@ -370,6 +511,9 @@ pub enum Phase {
     Creating,
     /// It changes toward the spec.
     Scaling,
+    /// It would change toward the spec, but the change is paused
+    /// (`spec.rollout.paused`) or held by a gate.
+    Paused,
     /// As the spec says, every server answering.
     Ready,
     /// As the spec says, but servers do not answer.
@@ -385,25 +529,149 @@ pub struct Outcome {
     pub message: String,
     /// The shards: each one's set, slots and servers.
     pub shards: Json,
+    /// What the next call takes from this one (`status.rollout`).
+    pub rollout: Rollout,
 }
 
 impl Outcome {
     fn new(phase: Phase, message: impl Into<String>) -> Outcome {
-        Outcome { phase, message: message.into(), shards: Json::Null }
+        Outcome { phase, message: message.into(), shards: Json::Null, rollout: Rollout::default() }
     }
+}
+
+/// What the operator keeps of a change from one step to the next, in the
+/// resource's status (`status.rollout`), and shows of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Rollout {
+    /// The version of the spec it is about ([`Spec::version`]).
+    pub version: String,
+    /// Each gate set, and since when its number is over its limit.
+    pub gates: Vec<Gate>,
+    /// What holds the change, until it is resumed or the spec changes.
+    pub held: Option<Held>,
+    pub paused: bool,
+    /// A rollback, which no gate holds (its caller says so).
+    pub ungated: bool,
+    /// The copies that run older settings, of `copies`.
+    pub stale: Vec<String>,
+    pub copies: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Gate {
+    /// Its field in `spec.rollout.gates`.
+    pub name: String,
+    pub limit: f64,
+    /// Since when (milliseconds since the epoch) its number is over the
+    /// limit.
+    pub over_since_ms: Option<u64>,
+}
+
+/// A gate that held a change: its number then, and why, in words.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Held {
+    pub gate: String,
+    pub value: f64,
+    pub limit: f64,
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// What stops the next step toward the spec, if anything.
+enum Hold {
+    Go,
+    Paused,
+    /// A hold from an earlier step, or one a gate makes now.
+    Held(Held),
+}
+
+impl Hold {
+    /// The outcome of not taking step `next`, when it is not taken.
+    fn stop(&self, next: &str) -> Option<Outcome> {
+        match self {
+            Hold::Go => None,
+            Hold::Paused => Some(Outcome::new(Phase::Paused, format!("paused (spec.rollout.paused); next: {next}"))),
+            Hold::Held(h) => Some(Outcome::new(Phase::Paused, format!("held: {}; next: {next}", h.text))),
+        }
+    }
+
+    /// The same for a step while a job of slot moves runs: the job stops
+    /// once its move under way ends.
+    async fn stop_moves(&self, admin: &Admin, view: &View, next: &str) -> Result<Option<Outcome>, String> {
+        let Some(mut o) = self.stop(next) else { return Ok(None) };
+        if view.job_running {
+            admin.post("/v1/admin/moves/stop", json!({})).await?;
+            o.message = format!("{}; the slot moves stop once the one under way ends", o.message);
+        }
+        Ok(Some(o))
+    }
+}
+
+/// Milliseconds since the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The gates' clocks once `numbers` is read at `now`, with the hold
+/// carried from `before` (a call for the same version, its gate set as
+/// it was), and the hold a gate makes now: one over its limit for
+/// `hold_after_seconds`. Another version starts every clock again, as
+/// does a resume ([`noted`]).
+pub fn gates(spec: &Spec, numbers: &Numbers, before: &Rollout, now: u64) -> (Rollout, Option<Held>) {
+    let version = spec.version();
+    let same = before.version == version;
+    let gates: Vec<Gate> = spec
+        .rollout
+        .gates
+        .limits()
+        .into_iter()
+        .filter_map(|(name, limit)| {
+            let limit = limit?;
+            let was = before.gates.iter().find(|g| same && g.name == name && g.limit == limit).and_then(|g| g.over_since_ms);
+            let over = numbers.get(name).is_some_and(|v| v > limit);
+            Some(Gate { name: name.into(), limit, over_since_ms: over.then(|| was.unwrap_or(now)) })
+        })
+        .collect();
+    let ungated = before.ungated;
+    // A hold lasts until it is resumed, the version changes, or its gate
+    // is changed.
+    let held = before.held.clone().filter(|h| same && !ungated && gates.iter().any(|g| g.name == h.gate && g.limit == h.limit));
+    let after = spec.rollout.hold_after_seconds.saturating_mul(1000);
+    let trip = match (ungated, &held) {
+        (false, None) => gates.iter().find(|g| g.over_since_ms.is_some_and(|t| now.saturating_sub(t) >= after)).map(|g| {
+            let value = numbers.get(&g.name).unwrap_or(g.limit);
+            let over = now.saturating_sub(g.over_since_ms.unwrap_or(now)) / 1000;
+            let text = format!("{} was {}, over its {} limit, for {over} s", gate_title(&g.name), gate_words(&g.name, value), gate_words(&g.name, g.limit));
+            Held { gate: g.name.clone(), value, limit: g.limit, at_ms: now, text }
+        }),
+        _ => None,
+    };
+    (Rollout { version, gates, held, paused: spec.rollout.paused, ungated, stale: Vec::new(), copies: 0 }, trip)
 }
 
 /// Takes the cluster one step toward `spec`: one change to the platform
 /// or one admin call, or none when it is there (or waits for something).
-/// Called again and again; each call starts from what it finds.
-pub async fn reconcile<P: Platform>(spec: &Spec, p: &P, admin: &Admin) -> Outcome {
-    match step(spec, p, admin).await {
+/// Called again and again; each call starts from what it finds, and from
+/// `before`, the [`Outcome::rollout`] of the call before.
+pub async fn reconcile<P: Platform>(spec: &Spec, p: &P, admin: &Admin, before: &Rollout) -> Outcome {
+    let mut out = match step(spec, p, admin, before).await {
         Ok(o) => o,
         Err(e) => Outcome::new(Phase::Scaling, e),
+    };
+    // A step that read no live numbers keeps what `before` had of this
+    // version; another version starts afresh.
+    if out.rollout.version.is_empty() {
+        let version = spec.version();
+        let kept = if before.version == version || before.version.is_empty() { before.clone() } else { Rollout { ungated: before.ungated, ..Rollout::default() } };
+        out.rollout = Rollout { version, paused: spec.rollout.paused, ..kept };
     }
+    out
 }
 
-async fn step<P: Platform>(spec: &Spec, p: &P, admin: &Admin) -> Result<Outcome, String> {
+async fn step<P: Platform>(spec: &Spec, p: &P, admin: &Admin, before: &Rollout) -> Result<Outcome, String> {
     if let Err(e) = spec.check() {
         return Ok(Outcome::new(Phase::Failed, e));
     }
@@ -430,8 +698,25 @@ async fn step<P: Platform>(spec: &Spec, p: &P, admin: &Admin) -> Result<Outcome,
         Ok(v) => v,
         Err(e) => return Ok(Outcome::new(Phase::Creating, format!("waiting for the coordinator: {e}"))),
     };
-    let mut out = act(spec, p, admin, &sets, &view, &listed, coordinators).await?;
+    let stale = p.stale(spec).await?;
+    let (mut rollout, trip) = gates(spec, &view.numbers, before, now_ms());
+    rollout.stale = stale.iter().map(|&(id, k)| p.url(id, k)).collect();
+    rollout.copies = sets.iter().map(|s| s.replicas).sum();
+    let hold = match rollout.held.clone().or_else(|| trip.clone()) {
+        _ if spec.rollout.paused => Hold::Paused,
+        Some(h) => Hold::Held(h),
+        None => Hold::Go,
+    };
+    let mut out = act(spec, p, admin, &sets, &view, &listed, coordinators, &hold, &stale).await?;
+    match out.phase {
+        // A gate's hold stays once it held a step back.
+        Phase::Paused if !spec.rollout.paused => rollout.held = rollout.held.or(trip),
+        // Nothing is left to hold.
+        Phase::Ready | Phase::Degraded => rollout.held = None,
+        _ => {}
+    }
     out.shards = shards_json(p, &view);
+    out.rollout = rollout;
     Ok(out)
 }
 
@@ -440,8 +725,18 @@ fn set_of_shard<P: Platform>(p: &P, s: &Shard) -> Option<u32> {
     s.servers.iter().find_map(|r| p.set_of(&r.url)).map(|(id, _)| id)
 }
 
-async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view: &View, listed: &[Vec<String>], coordinators: usize) -> Result<Outcome, String> {
+/// The first step toward `spec` of those below, each but the ones that
+/// heal held back by `hold`.
+#[allow(clippy::too_many_arguments)]
+async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view: &View, listed: &[Vec<String>], coordinators: usize, hold: &Hold, stale: &[(u32, usize)]) -> Result<Outcome, String> {
     let scaling = |m: String| Ok(Outcome::new(Phase::Scaling, m));
+    macro_rules! unless_held {
+        ($next:expr) => {
+            if let Some(o) = hold.stop(&$next) {
+                return Ok(o);
+            }
+        };
+    }
     let shard_of: HashMap<u32, usize> = view.shards.iter().enumerate().filter_map(|(i, s)| set_of_shard(p, s).map(|id| (id, i))).collect();
     let in_map: Vec<&str> = view.shards.iter().flat_map(|s| s.servers.iter().map(|r| r.url.as_str())).collect();
     // A copy of a set that serves a shard, which joins it (again) if it is
@@ -451,12 +746,17 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
     // that starts again on a list naming a server the cluster left out for
     // good is refused.
     let gone = |u: &String| !in_map.contains(&u.as_str()) && !p.set_of(u).is_some_and(|(id, k)| kept(id, k));
-    if listed.iter().flatten().any(gone) || coordinators != spec.coordinators {
+    let mend = listed.iter().flatten().any(gone);
+    if mend || coordinators != spec.coordinators {
+        if !mend {
+            unless_held!(format!("{} coordinators, from {coordinators}", spec.coordinators));
+        }
         let now: Vec<Vec<String>> = view.shards.iter().map(|s| s.servers.iter().map(|r| r.url.clone()).collect()).collect();
         p.set_coordinator(&now, spec.coordinators).await?;
         return scaling(format!("updating the coordinators ({}) to the cluster's servers", spec.coordinators));
     }
     if p.coordinator_config().await?.is_some_and(|c| c != spec.coordinator_config()) {
+        unless_held!("restarting the coordinators with the new settings".to_string());
         let now: Vec<Vec<String>> = view.shards.iter().map(|s| s.servers.iter().map(|r| r.url.clone()).collect()).collect();
         p.set_coordinator(&now, spec.coordinators).await?;
         return scaling("restarting the coordinators with the new settings, one at a time".into());
@@ -490,6 +790,9 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
     // Copies per shard.
     for set in sets {
         let Some(&i) = shard_of.get(&set.id) else { continue };
+        if set.replicas != spec.replicas {
+            unless_held!(format!("shard {i}: {} copies, from {}", spec.replicas, set.replicas));
+        }
         if set.replicas < spec.replicas {
             p.scale_set(set.id, spec.replicas).await?;
             return scaling(format!("shard {i}: {} copies, from {}", spec.replicas, set.replicas));
@@ -519,6 +822,7 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
     let n = view.shards.len();
     if spec.shards > n {
         let Some(set) = pending.first() else {
+            unless_held!(format!("a new shard: making its {} copies", spec.replicas));
             let id = sets.iter().map(|s| s.id + 1).max().unwrap_or(0);
             p.create_set(id, spec.replicas, None).await?;
             return scaling(format!("a new shard: making its {} copies", spec.replicas));
@@ -526,6 +830,7 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
         if !set.ready.contains(&0) {
             return scaling(format!("a new shard: waiting for its first copy ({} of {} ready)", set.ready.len(), set.replicas));
         }
+        unless_held!(format!("shard {n} joins the cluster"));
         let mut ready: Vec<usize> = set.ready.iter().copied().filter(|&k| k < set.replicas).collect();
         ready.sort();
         let servers: Vec<String> = ready.iter().map(|&k| p.url(set.id, k)).collect();
@@ -537,12 +842,17 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
         let (i, _) = view.shards.iter().enumerate().max_by_key(|(_, s)| set_of_shard(p, s)).ok_or("no shard")?;
         let s = &view.shards[i];
         if view.moving {
+            if let Some(o) = hold.stop_moves(admin, view, &format!("moving slots off shard {i} ({} left)", s.slots)).await? {
+                return Ok(o);
+            }
             return scaling(format!("moving slots off shard {i} ({} left)", s.slots));
         }
         if s.slots > 0 {
+            unless_held!(format!("draining shard {i} ({} slots)", s.slots));
             admin.post(&format!("/v1/admin/shards/{i}/drain"), json!({})).await?;
             return scaling(format!("draining shard {i}: its {} slots move to the others", s.slots));
         }
+        unless_held!(format!("shard {i} leaves the cluster"));
         admin.delete(&format!("/v1/admin/shards/{i}")).await?;
         return scaling(format!("shard {i} leaves the cluster"));
     }
@@ -552,14 +862,18 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
     }
     // Slots even over the shards.
     if view.moving {
+        if let Some(o) = hold.stop_moves(admin, view, "moving slots between shards").await? {
+            return Ok(o);
+        }
         return scaling("moving slots between shards".into());
     }
     let (lo, hi) = (view.shards.iter().map(|s| s.slots).min().unwrap_or(0), view.shards.iter().map(|s| s.slots).max().unwrap_or(0));
     if hi - lo > 1 {
+        unless_held!(format!("evening out the slots over {n} shards ({lo} to {hi} each)"));
         admin.post("/v1/admin/rebalance", json!({})).await?;
         return scaling(format!("evening out the slots over {n} shards ({lo} to {hi} each)"));
     }
-    if let Some(o) = roll(spec, p, admin, sets, view).await? {
+    if let Some(o) = roll(spec, p, admin, sets, view, hold, stale).await? {
         return Ok(o);
     }
     let down: Vec<&str> = view.shards.iter().flat_map(|s| s.servers.iter().filter(|r| !r.up).map(|r| r.url.as_str())).collect();
@@ -574,26 +888,32 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
 }
 
 /// New settings: each set starts its copies with them, the volumes grow,
-/// and the copies running older settings restart one at a time. The next
-/// restarts only once every copy is back and in sync; a primary is first
-/// handed to a copy of its shard in sync, one that runs the new settings
-/// if there is one. A shard of one copy cannot be handed over: its copy
+/// and the copies running older settings (`stale`) restart one at a time.
+/// The next restarts only once every copy is back and in sync, and the
+/// copies restarted have served `soak_seconds`; a primary is first handed
+/// to a copy of its shard in sync, one that runs the new settings if
+/// there is one. A shard of one copy cannot be handed over: its copy
 /// restarts, and its writes wait for it.
-async fn roll<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view: &View) -> Result<Option<Outcome>, String> {
+async fn roll<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view: &View, hold: &Hold, stale: &[(u32, usize)]) -> Result<Option<Outcome>, String> {
     let scaling = |m: String| Ok(Some(Outcome::new(Phase::Scaling, m)));
     for set in sets {
         if p.configure(set.id, spec).await? {
             return scaling(format!("set {}: new copies start with the new settings", set.id));
         }
     }
-    let grown = p.grow_volumes(&spec.storage.size).await?;
-    if grown > 0 {
-        return scaling(format!("growing {grown} volume{} to {}", if grown == 1 { "" } else { "s" }, spec.storage.size));
+    let small = p.grow_volumes(&spec.storage.size, false).await?;
+    if small > 0 {
+        let what = format!("growing {small} volume{} to {}", if small == 1 { "" } else { "s" }, spec.storage.size);
+        if let Some(o) = hold.stop(&what) {
+            return Ok(Some(o));
+        }
+        p.grow_volumes(&spec.storage.size, true).await?;
+        return scaling(what);
     }
-    let stale = p.stale(spec).await?;
     if stale.is_empty() {
         return Ok(None);
     }
+    let left = |n: usize| format!("{n} {}", if n == 1 { "copy" } else { "copies" });
     // One copy at a time: the last one restarted is back (its pod ready,
     // as the platform says, which knows before the coordinator does) and
     // every copy is caught up with its primary.
@@ -604,13 +924,22 @@ async fn roll<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view
         }
     }
     if !unsettled.is_empty() {
-        return scaling(format!("rolling out the new settings ({} copies left): waiting for {} to be back and caught up", stale.len(), unsettled.join(", ")));
+        return scaling(format!("rolling out the new settings ({} left): waiting for {} to be back and caught up", left(stale.len()), unsettled.join(", ")));
     }
     let fresh = |url: &str| !stale.iter().any(|&(id, k)| p.url(id, k) == url);
+    // And serves a while, for the gates to see it.
+    let soak = spec.rollout.soak_seconds as f64;
+    let young = view.shards.iter().flat_map(|s| &s.servers).filter(|r| fresh(&r.url)).filter_map(|r| Some((r, r.uptime_s?))).filter(|&(_, u)| u < soak).min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((r, _)) = young {
+        return scaling(format!("rolling out the new settings ({} left): {} serves {soak:.0} s with them before the next restarts", left(stale.len()), r.url));
+    }
     let primary = |url: &str| view.shards.iter().any(|s| s.servers.iter().any(|r| r.url == url && r.takes_writes));
     // A replica first, so that each primary can go to a restarted copy.
     let &(id, k) = stale.iter().find(|&&(id, k)| !primary(&p.url(id, k))).unwrap_or(&stale[0]);
     let url = p.url(id, k);
+    if let Some(o) = hold.stop(&format!("restarting {url} with the new settings ({} left)", left(stale.len()))) {
+        return Ok(Some(o));
+    }
     if let Some((i, s)) = view.shards.iter().enumerate().find(|(_, s)| s.servers.iter().any(|r| r.url == url && r.takes_writes)) {
         let mut to: Vec<&Server> = s.servers.iter().filter(|o| o.url != url && o.up && o.in_sync && o.role == "replica").collect();
         to.sort_by_key(|o| !fresh(&o.url));
@@ -620,7 +949,7 @@ async fn roll<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view
         }
     }
     p.restart(id, k).await?;
-    scaling(format!("restarting {url} with the new settings ({} {} left)", stale.len() - 1, if stale.len() == 2 { "copy" } else { "copies" }))
+    scaling(format!("restarting {url} with the new settings ({} left)", left(stale.len() - 1)))
 }
 
 fn shards_json<P: Platform>(p: &P, view: &View) -> Json {
@@ -665,6 +994,86 @@ pub fn patched(now: &Json, patch: &Json) -> Result<(Spec, Spec), String> {
     merge_patch(&mut next, patch);
     let new: Spec = serde_json::from_value(next).map_err(|e| format!("spec: {e}"))?;
     Ok((old, new))
+}
+
+/// The merge patch that takes `from` to `to` (RFC 7386; a null is a
+/// field left out).
+pub fn merge_diff(from: &Json, to: &Json) -> Json {
+    match (from, to) {
+        (Json::Object(a), Json::Object(b)) => {
+            let mut p = serde_json::Map::new();
+            for (k, v) in a {
+                if !v.is_null() && b.get(k).is_none_or(Json::is_null) {
+                    p.insert(k.clone(), Json::Null);
+                }
+            }
+            for (k, v) in b {
+                let was = a.get(k).unwrap_or(&Json::Null);
+                if v.is_null() || was == v {
+                    continue;
+                }
+                p.insert(k.clone(), if was.is_object() && v.is_object() { merge_diff(was, v) } else { merge_diff(&Json::Null, v) });
+            }
+            Json::Object(p)
+        }
+        // A new object: its fields but the null ones.
+        (_, Json::Object(b)) => Json::Object(b.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), merge_diff(&Json::Null, v))).collect()),
+        _ => to.clone(),
+    }
+}
+
+/// How many versions `status.history` keeps.
+pub const VERSIONS: usize = 20;
+
+/// The versions of a cluster (`status.history`, oldest first): `history`
+/// and, when `spec` is another version than its last ([`Spec::version`]),
+/// `spec` as a new one, changed by `by` if known (one that is an earlier
+/// version restores it: a rollback). When `ready` the version runs
+/// everywhere, and its first time so is kept.
+pub fn versions(history: &Json, spec: &Spec, generation: Option<u64>, by: Option<&str>, now: u64, ready: bool) -> Json {
+    let mut h: Vec<Json> = history.as_array().cloned().unwrap_or_default();
+    let version = spec.version();
+    if h.last().is_none_or(|v| v["hash"] != version.as_str()) {
+        let n = h.last().and_then(|v| v["version"].as_u64()).unwrap_or(0) + 1;
+        let restores = h.iter().rev().find(|v| v["hash"] == version.as_str()).and_then(|v| v["version"].as_u64());
+        let mut s = serde_json::to_value(spec).unwrap_or(Json::Null);
+        if let Some(o) = s.as_object_mut() {
+            o.remove("rollout");
+        }
+        h.push(json!({"version": n, "hash": version, "generation": generation, "atMs": now, "by": by, "restores": restores, "spec": s, "readyMs": null}));
+    }
+    if let Some(last) = h.last_mut().filter(|l| ready && l["readyMs"].is_null()) {
+        last["readyMs"] = json!(now);
+    }
+    let skip = h.len().saturating_sub(VERSIONS);
+    Json::Array(h.split_off(skip))
+}
+
+/// How many of the operator's messages `status.log` keeps.
+pub const LOGGED: usize = 50;
+
+/// `log` (`status.log`, oldest first) and `message`, when it is a new one.
+pub fn logged(log: &Json, phase: Phase, message: &str, now: u64) -> Json {
+    let mut l: Vec<Json> = log.as_array().cloned().unwrap_or_default();
+    if l.last().is_none_or(|e| e["message"] != message) {
+        l.push(json!({"atMs": now, "phase": phase, "message": message}));
+    }
+    let skip = l.len().saturating_sub(LOGGED);
+    Json::Array(l.split_off(skip))
+}
+
+/// `before` as the resource's annotations leave it: a resume naming the
+/// hold (its `at_ms`) clears it and starts the gates' clocks again, and a
+/// rollback naming `spec`'s version is held by no gate.
+pub fn noted(mut before: Rollout, resume: Option<&str>, rollback: Option<&str>, spec: &Spec) -> Rollout {
+    if before.held.as_ref().is_some_and(|h| resume == Some(h.at_ms.to_string().as_str())) {
+        before.held = None;
+        for g in &mut before.gates {
+            g.over_since_ms = None;
+        }
+    }
+    before.ungated = rollback == Some(spec.version().as_str());
+    before
 }
 
 /// What changing the spec from `old` to `new` changes, and the steps the
@@ -741,6 +1150,22 @@ pub fn plan(old: &Spec, new: &Spec, shards_now: usize, copies_now: usize) -> Jso
     if shards < shards_now || new.replicas < copies_now {
         warnings.push("what goes is deleted with its volumes once its data has moved".into());
     }
+    let (a, b) = (&old.rollout, &new.rollout);
+    if b.paused != a.paused {
+        steps.push(if b.paused { "the change pauses: the operator takes no step toward the spec until it is resumed" } else { "the change goes on from where it paused" }.into());
+    } else if b.paused && new.version() != old.version() {
+        warnings.push("the change is paused: none of these steps is taken until rollout.paused is false".into());
+    }
+    if b.gates != a.gates || b.hold_after_seconds != a.hold_after_seconds {
+        let set: Vec<String> = b.gates.limits().iter().filter_map(|(k, v)| v.map(|v| format!("{} over {}", gate_title(k), gate_words(k, v)))).collect();
+        steps.push(match set.is_empty() {
+            true => "no gates: nothing holds a change but a pause".into(),
+            false => format!("new gates, no restart: {} for {} s holds a change", set.join(" or "), b.hold_after_seconds),
+        });
+    }
+    if b.soak_seconds != a.soak_seconds {
+        steps.push(format!("each copy restarted with new settings serves {} s before the next restarts", b.soak_seconds));
+    }
     if steps.is_empty() && changes.is_empty() {
         steps.push("nothing: the spec says what it says now".into());
     }
@@ -791,6 +1216,17 @@ pub fn crd() -> Json {
             "coordinatorResources": free("Resources of each coordinator's container."),
             "args": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every server."},
             "coordinatorArgs": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every coordinator."},
+            "rollout": {"type": "object", "description": "How changes are made: paused, or held by gates on the cluster's live numbers.", "properties": {
+                "paused": {"type": "boolean", "description": "While true the operator takes no step toward the spec (a copy that lost its data still joins again)."},
+                "gates": {"type": "object", "description": "Limits on live numbers: one over its limit for holdAfterSeconds holds the change until it is resumed.", "properties": {
+                    "p99Ms": {"type": "number", "minimum": 0, "description": "The search p99 the coordinator's clients see, in ms."},
+                    "errorRatio": {"type": "number", "minimum": 0, "maximum": 1, "description": "The share of searches that fail."},
+                    "replicaBehind": {"type": "number", "minimum": 0, "description": "The transactions a replica is behind its primary."},
+                    "diskUsedRatio": {"type": "number", "minimum": 0, "maximum": 1, "description": "The fullest volume's used share."},
+                }},
+                "holdAfterSeconds": int(0, "How long a gate is over its limit before it holds the change (default 30)."),
+                "soakSeconds": int(0, "How long a copy restarted with new settings serves before the next restarts (default 0)."),
+            }},
         },
     });
     let status = free("What the operator found and does.");
@@ -867,8 +1303,101 @@ mod tests {
         assert_eq!(new.token_secret, None);
         let warnings = p["warnings"].to_string();
         assert!(warnings.contains("no token") && warnings.contains("two copies a shard") && warnings.contains("deleted with its volumes"), "{warnings}");
+        // Pausing and gates restart nothing.
+        let (_, gated) = patched(&serde_json::to_value(&old).unwrap(), &json!({"rollout": {"paused": true, "gates": {"p99Ms": 200}}})).unwrap();
+        let p = plan(&old, &gated, 2, 3);
+        let steps = p["steps"].to_string();
+        assert!(steps.contains("the change pauses") && steps.contains("new gates, no restart: search p99 over 200 ms for 30 s holds a change"), "{steps}");
+        assert_eq!(p["restarts"], false);
         assert_eq!((quantity("1.5Gi"), quantity("10 Gi"), quantity("-1Gi")), (Some(3 << 29), None, None));
         assert_eq!((quantity("10Gi"), quantity("500M"), quantity("2Ti")), (Some(10 << 30), Some(500_000_000), Some(2 << 40)));
+    }
+
+    #[test]
+    fn a_gate_over_its_limit_long_enough_holds_the_change_until_resumed() {
+        let mut spec: Spec = serde_json::from_value(json!({"demo": 1, "rollout": {"gates": {"p99Ms": 200, "diskUsedRatio": 0.9}}})).unwrap();
+        assert_eq!(spec.rollout.hold_after_seconds, 30);
+        let hot = Numbers { p99_ms: Some(312.0), disk_used_ratio: Some(0.5), ..Numbers::default() };
+        // Over its limit, a gate's clock starts; at 30 s it holds.
+        let (r, trip) = gates(&spec, &hot, &Rollout::default(), 1_000);
+        assert!(trip.is_none());
+        assert_eq!(r.gates.iter().map(|g| (g.name.as_str(), g.over_since_ms)).collect::<Vec<_>>(), [("p99Ms", Some(1_000)), ("diskUsedRatio", None)]);
+        let (r, trip) = gates(&spec, &hot, &r, 30_000);
+        assert!(trip.is_none());
+        let (r, trip) = gates(&spec, &hot, &r, 31_000);
+        let h = trip.unwrap();
+        assert_eq!((h.gate.as_str(), h.text.as_str()), ("p99Ms", "search p99 was 312 ms, over its 200 ms limit, for 30 s"));
+        // Back under its limit, the clock stops; but a hold stays until it
+        // is resumed, the version changes or its gate is changed.
+        let cool = Numbers { p99_ms: Some(150.0), ..hot.clone() };
+        let (r2, trip) = gates(&spec, &cool, &r, 32_000);
+        assert!(trip.is_none() && r2.gates[0].over_since_ms.is_none());
+        let held = Rollout { held: Some(h.clone()), ..r.clone() };
+        let (r3, _) = gates(&spec, &cool, &held, 40_000);
+        assert_eq!(r3.held.as_ref(), Some(&h));
+        let resumed = noted(held.clone(), Some("31000"), None, &spec);
+        assert!(resumed.held.is_none() && resumed.gates.iter().all(|g| g.over_since_ms.is_none()), "{resumed:?}");
+        assert_eq!(noted(held.clone(), Some("123"), None, &spec).held.as_ref(), Some(&h), "a resume of another hold");
+        spec.rollout.gates.p99_ms = Some(400.0);
+        assert!(gates(&spec, &hot, &held, 40_000).0.held.is_none(), "its gate changed");
+        spec.rollout.gates.p99_ms = Some(200.0);
+        let other = Spec { image: "strata-server:0.2.0".into(), ..spec.clone() };
+        assert!(gates(&other, &cool, &held, 40_000).0.held.is_none(), "another version");
+        // A pause or a gate is no new version; a rollback is held by no gate.
+        assert_eq!(Spec { rollout: RolloutSpec { paused: true, soak_seconds: 9, ..RolloutSpec::default() }, ..spec.clone() }.version(), spec.version());
+        let back = noted(r.clone(), None, Some(&spec.version()), &spec);
+        assert!(back.ungated && gates(&spec, &hot, &back, 99_000).1.is_none());
+        assert!(!noted(r.clone(), None, Some("another"), &spec).ungated);
+        // What the gates read, from a coordinator's /v1/cluster: its own
+        // p99 and failures, the worst of the servers that answer.
+        let c = json!({"coordinator": {"load": {"p99_ms": 12.5, "error_ratio": 0.0}}, "shards": [{"replicas": [
+            {"status": "up", "detail": {"load": {"p99_ms": 40.0, "disk_used_ratio": 0.4, "replica_behind_max": 3.0}}},
+            {"status": "down", "detail": {"load": {"disk_used_ratio": 0.99}}},
+            {"status": "up", "detail": {"load": {"disk_used_ratio": 0.6}}}]}]});
+        assert_eq!(Numbers::from(&c), Numbers { p99_ms: Some(12.5), error_ratio: Some(0.0), replica_behind: Some(3.0), disk_used_ratio: Some(0.6) });
+        assert_eq!(Numbers::from(&json!({"shards": [{"replicas": [{"status": "up", "detail": {"load": {"p99_ms": 40.0}}}]}]})).p99_ms, Some(40.0));
+        assert_eq!([gate_words("diskUsedRatio", 0.0001), gate_words("errorRatio", 0.025), gate_words("diskUsedRatio", 0.643)], ["0.01%", "2.5%", "64%"]);
+        let bad = |j: Json| serde_json::from_value::<Spec>(j).unwrap().check().unwrap_err();
+        assert!(bad(json!({"demo": 1, "rollout": {"gates": {"errorRatio": 2}}})).contains("a share"));
+        assert!(bad(json!({"demo": 1, "rollout": {"gates": {"p99Ms": -1}}})).contains("0 or more"));
+    }
+
+    #[test]
+    fn each_version_is_kept_and_a_rollback_is_the_patch_back_to_one() {
+        let a: Spec = serde_json::from_value(json!({"demo": 1, "shards": 2, "resources": {"limits": {"cpu": "2"}}})).unwrap();
+        let h = versions(&Json::Null, &a, Some(1), None, 100, false);
+        assert_eq!((h.as_array().unwrap().len(), &h[0]["version"], &h[0]["spec"]["rollout"]), (1, &json!(1), &Json::Null));
+        // The same version, ready: when it first was is kept. A pause is
+        // another generation, not another version.
+        let h = versions(&h, &a, Some(1), None, 200, true);
+        let paused = Spec { rollout: RolloutSpec { paused: true, ..RolloutSpec::default() }, ..a.clone() };
+        let h = versions(&h, &paused, Some(2), None, 300, true);
+        assert_eq!((h.as_array().unwrap().len(), &h[0]["readyMs"]), (1, &json!(200)));
+        let b = Spec { shards: 4, image: "strata-server:0.2.0".into(), resources: Some(json!({"limits": {"cpu": "2", "memory": "4Gi"}})), token_secret: Some("t".into()), ..a.clone() };
+        let h = versions(&h, &b, Some(3), Some("roberto"), 400, false);
+        assert_eq!((&h[1]["version"], &h[1]["by"], &h[1]["restores"], &h[1]["readyMs"]), (&json!(2), &json!("roberto"), &Json::Null, &Json::Null));
+        // Back to version 1: the merge patch that takes the spec there, its
+        // rollout kept; the version it makes restores the first.
+        let now = json!({"spec": serde_json::to_value(&paused).unwrap(), "status": {"history": h}});
+        let now = json!({"spec": {"rollout": now["spec"]["rollout"], "shards": 4, "demo": 1, "image": "strata-server:0.2.0", "tokenSecret": "t", "resources": {"limits": {"cpu": "2", "memory": "4Gi"}}}, "status": now["status"]});
+        let patch = kube::Link::rollback(&now, 1).unwrap();
+        assert_eq!(patch, json!({"shards": 2, "image": "strata-server:dev", "tokenSecret": null, "resources": {"limits": {"memory": null}}, "replicas": 3, "coordinators": 1, "storage": {"size": "10Gi"}, "failoverAfterMs": 3000, "writeAcks": "all", "args": [], "coordinatorArgs": []}));
+        let (_, back) = patched(&now["spec"], &patch).unwrap();
+        assert_eq!(back, paused, "the spec of version 1, still paused");
+        let h = versions(&h, &back, Some(4), None, 500, false);
+        assert_eq!((&h[2]["version"], &h[2]["restores"]), (&json!(3), &json!(1)));
+        assert!(kube::Link::rollback(&now, 9).unwrap_err().contains("no version 9 in the cluster's history (it keeps 1, 2)"));
+        // The last VERSIONS are kept.
+        let mut h = Json::Null;
+        for n in 0..30 {
+            h = versions(&h, &Spec { shards: n + 1, ..a.clone() }, None, None, n as u64, false);
+        }
+        assert_eq!((h.as_array().unwrap().len(), &h[0]["version"]), (VERSIONS, &json!(11)));
+        // The operator's messages, each new one once.
+        let l = logged(&Json::Null, Phase::Scaling, "a", 1);
+        let l = logged(&logged(&l, Phase::Scaling, "a", 2), Phase::Ready, "b", 3);
+        assert_eq!(l, json!([{"atMs": 1, "phase": "Scaling", "message": "a"}, {"atMs": 3, "phase": "Ready", "message": "b"}]));
+        assert_eq!(merge_diff(&json!({"a": 1, "b": {"c": 2}}), &json!({"a": 1, "b": {"c": 2}})), json!({}));
     }
 
     #[test]
