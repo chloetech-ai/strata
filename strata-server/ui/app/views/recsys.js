@@ -5,7 +5,10 @@
 // worked out here per variant (an A/B arm): nDCG, hit rate and MRR at k,
 // labels by position, how many items each variant served, which of the
 // ranking's values tell good rows from the rest, and whether a variant's
-// lead over the control is more than chance.
+// lead over the control is more than chance. Requests that interleaved two
+// rankings (team draft: their rows carry two variants) count as a variant
+// of their own, and their clicks credit each team: which ranking the users
+// preferred, request by request, with a sign test of the wins.
 
 import { h, s, icon, clear, fmt, api, store, toast, empty, seg, failure, drawer, authHeader, sqlBlock, copy, showTip, hideTip, ApiError } from "../core.js";
 import { tables, table as tableOf } from "../catalog.js";
@@ -82,6 +85,33 @@ export function auc(pairs) {
   return (rankSum - npos * (npos + 1) / 2) / (npos * nneg);
 }
 
+/** The two-sided exact sign test of a wins against b (strata::rank_log::sign_test). */
+export function signTest(a, b) {
+  const n = a + b;
+  if (!n) return 1;
+  const half = n * Math.LN2;
+  let lc = 0, tail = 0;
+  for (let i = 0; i <= Math.min(a, b); i++) { if (i > 0) lc += Math.log(n - i + 1) - Math.log(i); tail += Math.exp(lc - half); }
+  return Math.min(1, 2 * tail);
+}
+
+/** The credit of interleaved requests, per pair of rankings, as POST /v1/rank_log/interleaving gives it: a request goes to the team whose shown rows the user acted on more; delta is Chapelle et al.'s (wins of the first + ties / 2) / acted − 0.5. */
+export function interleavingCredit(requests) {
+  const pairs = new Map();
+  for (const q of requests) {
+    if (!q.interleaved) continue;
+    const [a, b] = q.interleaved, key = a + "\u0000" + b;
+    let p = pairs.get(key);
+    if (!p) pairs.set(key, p = { variants: [a, b], requests: 0, acted: 0, wins: [0, 0], ties: 0 });
+    p.requests++;
+    const c = [a, b].map((v) => q.rows.filter((r) => r.shown && r.variant === v && (r.label || 0) > 0).length);
+    if (c[0] + c[1] === 0) continue;
+    p.acted++;
+    if (c[0] > c[1]) p.wins[0]++; else if (c[1] > c[0]) p.wins[1]++; else p.ties++;
+  }
+  return [...pairs.values()].map((p) => ({ ...p, delta: p.acted ? (p.wins[0] + p.ties / 2) / p.acted - 0.5 : 0, p: signTest(p.wins[0], p.wins[1]) }));
+}
+
 /** Everything the view draws, from the exported records. */
 function evaluate(recs, k) {
   const reqs = new Map();
@@ -91,6 +121,12 @@ function evaluate(recs, k) {
     q.rows.push(r);
   }
   const requests = [...reqs.values()];
+  // An interleaved request's rows carry the two rankings' names.
+  for (const q of requests) {
+    const vs = [...new Set(q.rows.filter((r) => r.shown && r.variant != null).map((r) => r.variant))].sort();
+    if (vs.length === 2) { q.interleaved = vs; q.variant = vs.join(" ⇄ "); }
+  }
+  const interleaving = interleavingCredit(requests);
   const names = [...new Set(requests.map((q) => q.variant))].sort();
   const V = new Map(names.map((n, i) => [n, { name: n, color: SERIES[i % SERIES.length], reqs: [], ndcg: [], hit: [], rr: [], gain: [], impressions: 0, positives: 0, items: new Map(), byPos: new Map() }]));
   let maxShown = 0, positives = 0, shownRows = 0;
@@ -124,7 +160,7 @@ function evaluate(recs, k) {
   }).filter((f) => f.auc != null).sort((a, b) => Math.abs(b.auc - 0.5) - Math.abs(a.auc - 0.5));
   const scoreAuc = names.map((n) => ({ name: n, auc: auc(V.get(n).reqs.flatMap((q) => q.shown.map((r) => [r.score, (r.label || 0) > 0]))) }));
   const t0 = Math.min(...requests.map((q) => q.ts)), t1 = Math.max(...requests.map((q) => q.ts));
-  return { requests, variants: [...V.values()], maxShown, positives, shownRows, feats, scoreAuc, t0, t1, records: recs.length };
+  return { requests, variants: [...V.values()], maxShown, positives, shownRows, feats, scoreAuc, t0, t1, records: recs.length, interleaving };
 }
 
 // ---------------------------------------------------------------- the view
@@ -153,6 +189,8 @@ function render(page) {
       h("div", { class: "rx-howto" },
         h("div", { class: "small muted" }, "Over HTTP: add \"log\" to a query, with whom it served and the ranking's A/B arm"),
         sqlBlock(`POST /v1/query\n{"sql": "SELECT id, title FROM docs ORDER BY bm25(body, :q) DESC LIMIT 10",\n "params": {"q": "quiet charger"},\n "log": {"context": "u42", "variant": "b", "candidates": 20}}`),
+        h("div", { class: "small muted" }, "Or show two rankings in one list, interleaved by team draft, each row logged with the ranking that placed it"),
+        sqlBlock(`"log": {"context": "u42", "interleave": {"sql": "SELECT id, title FROM docs ORDER BY bm25(body, :q) * (1 + 0.1 * rating) DESC LIMIT 10", "variants": ["bm25", "rated"]}}`),
         h("div", { class: "small muted" }, "Then keep what the users did in a table of events (user, item, time, action), and this view sets one against the other."))));
   }
 
@@ -317,6 +355,7 @@ function render(page) {
     if (!out) return;
     clear(body,
       scoreboard(),
+      out.interleaving.length ? interleavingCard() : null,
       h("div", { class: "rx-row" }, positionCard(), featureCard()),
       h("div", { class: "rx-row" }, timeCard(), segmentCard()),
       requestsCard());
@@ -357,6 +396,29 @@ function render(page) {
       return h("span", {}, icon("clock"), h("b", {}, " No winner yet"), `: the differences in nDCG@${st.k} are within chance. More traffic narrows them.`);
     })();
     return h("div", { class: "rx-board" }, h("div", { class: "rx-verdict" }, verdict), h("div", { class: "rx-vars" }, cards));
+  }
+
+  function interleavingCard() {
+    const row = (p) => {
+      const [a, b] = p.variants, [wa, wb] = p.wins;
+      const sig = p.p < 0.05 && wa !== wb;
+      const lead = wa > wb ? a : b;
+      const w = (x) => (p.acted ? (x / p.acted) * 100 : 0) + "%";
+      return h("div", { class: "rx-il" },
+        h("div", { class: "rx-il-hd" }, h("b", {}, `${a} ⇄ ${b}`), h("span", { class: "small muted" }, `${fmt.plural(p.requests, "request")} · ${fmt.n(p.acted)} acted on`),
+          h("span", { class: "sep" }),
+          sig ? h("span", { class: "pill ok", title: `Δ = ${fmt.n(p.delta, 3)}; sign test p ${p.p < 0.001 ? "< 0.001" : "= " + fmt.n(p.p, 3)}` }, `users prefer ${lead}`)
+            : h("span", { class: "pill", title: `sign test p = ${fmt.n(p.p, 3)}` }, p.acted ? "no preference yet" : "no clicks yet")),
+        h("div", { class: "rx-il-bar", title: `${a} won ${fmt.n(wa)}, ${b} won ${fmt.n(wb)}, ${fmt.n(p.ties)} ties` },
+          h("i", { class: "a", style: { width: w(wa) } }), h("i", { class: "t", style: { width: w(p.ties) } }), h("i", { class: "b", style: { width: w(wb) } })),
+        h("div", { class: "rx-il-legend small dim" },
+          h("span", {}, h("b", {}, fmt.n(wa)), ` won by ${a}`), h("span", {}, h("b", {}, fmt.n(p.ties)), " ties"), h("span", {}, h("b", {}, fmt.n(wb)), ` won by ${b}`),
+          h("span", { title: "Chapelle et al. (2012): (wins of the first + ties / 2) / requests acted on − 0.5; above 0 favours the first" }, "Δ ", h("b", {}, (p.delta > 0 ? "+" : "") + fmt.n(p.delta, 3))),
+          h("span", { title: "Two-sided sign test of the wins, ties left out" }, "p ", h("b", {}, p.p < 0.001 ? "< 0.001" : fmt.n(p.p, 3)))));
+    };
+    return h("div", { class: "card" },
+      h("div", { class: "hd" }, h("h3", {}, "Interleaved"), h("span", { class: "sub" }, "Two rankings in one list by team draft: a request goes to the ranking whose rows its user acted on more. It sets the two side by side for the same user and query, so it decides with far fewer requests than an A/B test")),
+      h("div", { class: "bd" }, out.interleaving.map(row)));
   }
 
   function positionCard() {

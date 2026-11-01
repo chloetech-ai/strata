@@ -321,7 +321,8 @@ impl Database {
 
     /// Runs a SELECT and logs what it served (`log`: the options as JSON
     /// text, as strata-server's `"log"` takes them); returns its answer as
-    /// `query` does, with the request's id.
+    /// `query` does, with the request's id and an interleaved query's
+    /// teams.
     fn query_logged<'py>(&self, py: Python<'py>, sql: &str, params: Option<&Bound<'py, PyDict>>, log: &str) -> PyResult<Bound<'py, PyDict>> {
         let db = self.get()?;
         let p = params_json(params)?;
@@ -329,6 +330,9 @@ impl Database {
         let l = py.detach(|| Log::from_json(&log).and_then(|log| self::params(&db, &p).and_then(|p| db.query_logged(sql, &p, &log)))).map_err(err)?;
         let d = result_py(py, &l.rs)?;
         d.set_item("request", l.request)?;
+        if !l.teams.is_empty() {
+            d.set_item("teams", l.teams)?;
+        }
         Ok(d)
     }
 

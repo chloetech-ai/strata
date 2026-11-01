@@ -8,9 +8,10 @@
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
 //! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
 //! | `GET /metrics` | | Prometheus text |
-//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?, trace?, profile?}` | rows, and in `stats.steps` the query's timed steps (with `profile`, their CPU time too, and with `trace` or `profile` the request's spans in `trace`); with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?}`) also `request` and `logged` ([`strata::rank_log`]) |
+//! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?, trace?, profile?}` | rows, and in `stats.steps` the query's timed steps (with `profile`, their CPU time too, and with `trace` or `profile` the request's spans in `trace`); with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?, interleave?: {sql, variants?}}`) also `request`, `logged` and, interleaved, `teams` ([`strata::rank_log`]) |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/rank_log/export` | `{table?, since?, until?, events?, history?, window?, grades?}` | NDJSON: one record per logged row ([`strata::rank_log::export`]) |
+//! | `POST /v1/rank_log/interleaving` | the export's body | `{pairs: [{variants, requests, acted, wins, ties, delta, p}], took_ms}`: which of two interleaved rankings the users preferred ([`strata::rank_log::Credit`]) |
 //! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/plan` | `{plan, timeout_ms?, min_seq_no?, min_seq_nos?}` (a plan as `/v1/explain` gives it) | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/import?format=jsonl&table=name` | rows as JSON Lines, JSON, CSV or TSV (of the first table without `table`) | `{written, skipped_fields}` |
@@ -25,6 +26,7 @@
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
 //! | `POST /v1/snapshot` | | `{snapshot, txn, ttl_s}` |
 //! | `POST /v1/agent` | `{question, model?, effort?, api_key?, max_steps?}` | an answer and the steps taken |
+//! | `POST /v1/judge` | `{query, keys, table?, fields?, model?, api_key?}` | `{grades: [{key, grade, error?}], model, usage}`: each row graded 0 to 3 for the query by a Claude model ([`crate::judge`]) |
 //! | `GET /v1/queries` | | `{queries, running}`: the queries running now, the longest first, each with its trace so far |
 //! | `DELETE /v1/queries/:id` | | `{cancelled}`: the query stops at its next check and answers 499 |
 //! | `GET /v1/queries/recent?since=ms&limit=n`, `/v1/queries/slow?limit=n` | | `{queries}`: the latest that ended (or the slow ones), the newest first, each with its trace |
@@ -78,7 +80,7 @@ use crate::auth::{self, Access, Secret};
 use crate::replication::Acks;
 use crate::service::{has_source, After, QueryReq, Service, SqlAnswer, Stream, Written, STREAM_OPS};
 use crate::keys::{self, Principal, Scope};
-use crate::{agent, json as js, obs, profiling, telemetry, ui, ApiError};
+use crate::{agent, json as js, judge, obs, profiling, telemetry, ui, ApiError};
 
 
 /// Why a request failed on the server's side, for [`observe`] to log.
@@ -148,6 +150,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/term_stats", post(term_stats))
         .route("/v1/sid/next", post(sid_next))
         .route("/v1/rank_log/export", post(export_rank_log))
+        .route("/v1/rank_log/interleaving", post(interleaving))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/admin/checkpoint", post(admin_checkpoint))
         .route("/v1/admin/check", post(admin_check))
@@ -164,6 +167,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/moves/stop", post(stop_moves))
         .route("/v1/admin/moves/finish", post(finish_move))
         .route("/v1/agent", post(agent_run))
+        .route("/v1/judge", post(judge))
         .route("/v1/queries", get(live_queries))
         .route("/v1/queries/:id", axum::routing::delete(cancel_query))
         .route("/v1/queries/recent", get(recent_queries))
@@ -300,7 +304,7 @@ fn audited(j: Json, detail: String) -> Response {
 fn route_scope(method: &axum::http::Method, route: &str) -> Scope {
     use axum::http::Method;
     match route {
-        "/v1/write" | "/v1/import" | "/v1/stream" | "/v1/agent" => Scope::Write,
+        "/v1/write" | "/v1/import" | "/v1/stream" | "/v1/agent" | "/v1/judge" => Scope::Write,
         "/v1/export" => Scope::Admin,
         "/v1/synonyms" if method == Method::PUT => Scope::Admin,
         "/v1/alerts/rules" => Scope::Admin,
@@ -462,13 +466,18 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
 }
 
 /// A query run and logged ([`Service::query_logged`]): its answer, with
-/// the request's id (`"request"`) and the log's write (`"logged"`: the
-/// rows, and the write's sequence numbers as a write's answer gives them).
+/// the request's id (`"request"`), an interleaved query's teams
+/// (`"teams"`: per row, the ranking that placed it) and the log's write
+/// (`"logged"`: the rows, and the write's sequence numbers as a write's
+/// answer gives them).
 async fn logged(app: &App, who: &Principal, req: QueryReq, log: &Json) -> Res {
     let log = strata::rank_log::Log::from_json(log)?;
-    let (a, request, w) = app.svc.query_logged(who, req, log).await?;
+    let (a, served, w) = app.svc.query_logged(who, req, log).await?;
     let mut j = answer(&a);
-    j["request"] = json!(request);
+    j["request"] = json!(served.request);
+    if !served.teams.is_empty() {
+        j["teams"] = json!(served.teams);
+    }
     let mut l = json!({"rows": w.rows});
     if let Some(s) = w.seq_no {
         l["seq_no"] = json!(s);
@@ -501,6 +510,18 @@ async fn export_rank_log(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res
     });
     let lines = tokio_stream::wrappers::ReceiverStream::new(rx).map(|j| Ok::<_, std::convert::Infallible>(Bytes::from(format!("{j}\n"))));
     Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], axum::body::Body::from_stream(lines)).into_response())
+}
+
+/// The credit of each pair of interleaved rankings in a log table
+/// ([`strata::rank_log::Credits`]) over an export of it (the body is
+/// `/v1/rank_log/export`'s), from a local database as the export is.
+async fn interleaving(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let x = strata::rank_log::Export::from_json(&b)?;
+    let db = app.svc.local_db().cloned().ok_or_else(|| ApiError::bad("a coordinator does not export a rank log: ask each shard's server"))?;
+    strata::rank_log::check(&*app.svc.table(&x.table).await?)?;
+    let t0 = std::time::Instant::now();
+    let pairs = tokio::task::spawn_blocking(move || db.interleaving_credit(&x)).await.map_err(ApiError::internal)??;
+    Ok(AxJson(json!({"pairs": pairs.iter().map(|c| c.to_json()).collect::<Vec<_>>(), "took_ms": t0.elapsed().as_secs_f64() * 1e3})))
 }
 
 /// A query's answer; one a coordinator gave without some shards says
@@ -1208,6 +1229,19 @@ async fn agent_run(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     app.svc.metrics.agent_run();
     Ok(AxJson(agent::run(&app.svc, req).await?))
+}
+
+/// `POST /v1/judge`: a Claude model's grade of each row for a query
+/// ([`crate::judge`]).
+async fn judge(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let opt = |k: &str| b.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+    let keys = b.get("keys").and_then(|v| v.as_array()).cloned().ok_or_else(|| ApiError::bad("the body needs \"keys\", the rows' keys"))?;
+    let fields = match b.get("fields") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(v) => v.as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).ok_or_else(|| ApiError::bad("fields is a list of field names"))?,
+    };
+    let req = judge::JudgeReq { table: opt("table"), query: body_str(&b, "query")?.to_string(), keys, fields, model: opt("model"), api_key: opt("api_key") };
+    Ok(AxJson(judge::run(&app.svc, req).await?))
 }
 
 type Params = Query<std::collections::HashMap<String, String>>;

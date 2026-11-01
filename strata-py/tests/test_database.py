@@ -470,6 +470,23 @@ def test_the_rank_log(db):
         db.query_logged("SELECT id FROM books WHERE year > 2000")
 
 
+def test_two_rankings_interleaved(db):
+    a = "SELECT id, title FROM books ORDER BY bm25(title, :q) DESC LIMIT 6"
+    b = "SELECT id, title FROM books ORDER BY bm25(title, :q) * (1 + rating) DESC LIMIT 6"
+    ka, kb = db.query(a, q="dragon").keys, db.query(b, q="dragon").keys
+    r = db.query_logged(a, {"q": "dragon"}, context="u1", request="r1", interleave=b, variants=["plain", "rated"])
+    assert r.columns == ["id", "title"] and len(r.keys) == 6 and len(set(r.keys)) == 6
+    assert set(r.teams) <= {"plain", "rated"} and abs(r.teams.count("plain") - r.teams.count("rated")) <= 1
+    # Each row is its team's best row not shown before it.
+    for i, (k, t) in enumerate(zip(r.keys, r.teams)):
+        assert next(x for x in (ka if t == "plain" else kb) if x not in r.keys[:i]) == k
+    # The same request draws the same list.
+    assert db.query_logged(a, {"q": "dragon"}, request="r1", interleave=b, variants=["plain", "rated"]).keys == r.keys
+    records = sorted((x for x in db.export_rank_log() if x["request"] == "r1"), key=lambda x: x["position"])
+    assert [x["row_key"] for x in records] == r.keys and [x["variant"] for x in records] == r.teams
+    assert db.query(a, q="dragon").teams is None
+
+
 def test_columns_added_dropped_and_renamed(tmp_path):
     schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "title", "type": "text"}, {"name": "n", "type": "int"}]}
     path = tmp_path / "items.strata"

@@ -1759,6 +1759,97 @@ async fn agent_runs_queries_and_answers() {
     assert!(r["error"].as_str().unwrap().contains("API key"));
 }
 
+/// Relevance judgments, against a stand-in for the Messages API that
+/// grades a passage 3 if it mentions a tent, answers one passage without
+/// a grade even when asked again, another without one until asked again,
+/// and grades the rest 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_judge_grades_each_row_alone() {
+    use axum::{extract::State, routing::post as route_post, Json as AxJson, Router};
+    #[derive(Clone)]
+    struct Mock {
+        seen: Arc<std::sync::Mutex<Vec<Json>>>,
+        /// The titles of the passage answered without a grade, and of the
+        /// one graded only when asked again.
+        odd: Arc<std::sync::Mutex<(String, String)>>,
+    }
+    async fn messages(State(m): State<Mock>, AxJson(body): AxJson<Json>) -> AxJson<Json> {
+        m.seen.lock().unwrap().push(body.clone());
+        let p = body["messages"][0]["content"].as_str().unwrap().to_string();
+        let passage = p.split("Passage: ").nth(1).unwrap().split("\n\nSplit this problem").next().unwrap().to_lowercase();
+        let (odd, late) = m.odd.lock().unwrap().clone();
+        let again = body["messages"].as_array().unwrap().len() > 1;
+        let text = if passage.contains("tent") {
+            "##final score: 3"
+        } else if passage.contains(&odd.to_lowercase()) {
+            "It depends."
+        } else if passage.contains(&late.to_lowercase()) {
+            if again { "##final score: 2" } else { "The passage is about something else." }
+        } else {
+            "##final score: 0"
+        };
+        AxJson(json!({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn", "usage": {"input_tokens": 300, "output_tokens": 6}}))
+    }
+    let mock = Mock { seen: Arc::new(std::sync::Mutex::new(Vec::new())), odd: Arc::new(std::sync::Mutex::new(Default::default())) };
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = l.local_addr().unwrap();
+    let app = Router::new().route("/v1/messages", route_post(messages)).with_state(mock.clone());
+    tokio::spawn(async move { axum::serve(l, app).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "j.strata", |i| i < 300);
+    let rows = db.query("SELECT id, title, description FROM products LIMIT 300", &Params::new()).unwrap();
+    let text = |i: usize| rows.rows[i].iter().skip(1).map(|v| v.as_str().unwrap_or("").to_lowercase()).collect::<String>();
+    let tent = (0..rows.rows.len()).find(|&i| text(i).contains("tent")).unwrap();
+    let others: Vec<usize> = (0..rows.rows.len()).filter(|&i| !text(i).contains("tent")).collect();
+    let title = |i: usize| rows.rows[i][1].as_str().unwrap().to_string();
+    // Three rows of titles none of which holds another.
+    let distinct = |a: usize, b: usize| !title(a).to_lowercase().contains(&title(b).to_lowercase()) && !title(b).to_lowercase().contains(&title(a).to_lowercase());
+    let other = others[0];
+    let odd = *others.iter().find(|&&i| distinct(i, other)).unwrap();
+    let late = *others.iter().find(|&&i| distinct(i, other) && distinct(i, odd)).unwrap();
+    *mock.odd.lock().unwrap() = (title(odd), title(late));
+    let key = |i: usize| rows.rows[i][0].as_str().unwrap().to_string();
+    let base = http(service(db, &format!("http://{addr}")), None).await;
+    let c = reqwest::Client::new();
+    let keys = json!([key(tent), key(other), "p9999999", key(odd), key(late)]);
+    let (status, r) = post(&c, &format!("{base}/v1/judge"), json!({"query": "a tent for two", "keys": keys})).await;
+    assert_eq!(status, 200, "{r}");
+    let g = r["grades"].as_array().unwrap();
+    // In the order asked, each with its key.
+    assert_eq!(g.iter().map(|x| x["key"].clone()).collect::<Vec<_>>(), keys.as_array().unwrap().clone());
+    assert_eq!((g[0]["grade"].clone(), g[1]["grade"].clone()), (json!(3), json!(0)));
+    assert!(g[2]["grade"].is_null() && g[2]["error"] == "no such row", "{r}");
+    assert!(g[3]["grade"].is_null() && g[3]["error"].as_str().unwrap().contains("no grade"), "{r}");
+    assert_eq!(g[4]["grade"], json!(2), "{r}");
+    assert_eq!(r["fields"], json!(["title", "description"]));
+    assert_eq!(r["prompt"], "umbrela");
+    // Each request counted, those asking again too.
+    assert_eq!(r["usage"]["input_tokens"], 1800);
+    {
+        // One request per row that exists, each with UMBRELA's prompt and
+        // the row's stored text fields, named, and one more for each
+        // answer without a grade, after it.
+        let seen = mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        let again: Vec<&Json> = seen.iter().filter(|b| b["messages"].as_array().unwrap().len() == 3).collect();
+        assert_eq!(again.len(), 2);
+        assert!(again.iter().all(|b| b["messages"][1]["role"] == "assistant" && b["messages"][2]["content"].as_str().unwrap().contains("##final score")));
+        assert_eq!(seen[0]["model"], "claude-haiku-5-5");
+        let p = seen.iter().map(|b| b["messages"][0]["content"].as_str().unwrap().to_string()).find(|p| p.to_lowercase().contains("tent")).unwrap();
+        assert!(p.starts_with("Given a query and a passage, you must provide a score on an integer scale of 0 to 3"), "{p}");
+        assert!(p.contains("Query: a tent for two\nPassage: title: "), "{p}");
+        assert!(p.contains("\ndescription: "), "{p}");
+    }
+    // The fields named are what it reads; a field not stored is refused.
+    let (status, r) = post(&c, &format!("{base}/v1/judge"), json!({"query": "tent", "keys": [key(tent)], "fields": ["title"]})).await;
+    assert_eq!((status, r["fields"].clone()), (200, json!(["title"])), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/judge"), json!({"query": "tent", "keys": [key(tent)], "fields": ["body"]})).await;
+    assert!(status == 400 && r["error"].as_str().unwrap().contains("not stored"), "{r}");
+    let (status, _) = post(&c, &format!("{base}/v1/judge"), json!({"query": "tent", "keys": []})).await;
+    assert_eq!(status, 400);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sparse_and_binary_vector_fields_over_http() {
     use strata::{Field, FieldType, Schema, VectorCodes, VectorIndexKind};
