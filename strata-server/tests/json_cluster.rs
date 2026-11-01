@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use strata::db::{Db, SqlResult};
+use strata::query::paths::Call;
 use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::value::Value;
@@ -113,4 +114,35 @@ async fn paths_through_a_coordinator_answer_as_one_database() {
     // Ordered by a path, across shards.
     let q = "SELECT id, attrs.dims.w FROM items WHERE attrs.dims.w > 0 ORDER BY attrs.dims.w DESC, id LIMIT 7";
     assert_eq!(select(&svc, q).await, local(&one, q), "{q}");
+
+    // The paths listing: each shard's, summed, is the one database's, as
+    // SQL and over HTTP. A few rows change first: deleted, rewritten.
+    for w in ["DELETE FROM items WHERE attrs.color = 'blue' AND name = 'n2'", "UPDATE items SET attrs = '{\"color\": \"teal\", \"tags\": [1, \"a\"]}' WHERE id = 'i007'"] {
+        run(&svc, w).await;
+        local(&one, w);
+    }
+    let call = |prefix: Option<&str>, filter: Option<&str>| Call { table: "items".into(), field: "attrs".into(), prefix: prefix.map(String::from), filter: filter.map(String::from) };
+    for c in [call(None, None), call(Some("dims"), None), call(Some("certs"), Some("name IN ('n1', 'n2')")), call(None, Some("attrs.voltage > 3"))] {
+        let want = one.json_paths(&c, &Params::new()).unwrap();
+        assert!(want.paths.len() > 1 || c.prefix.is_some() && !want.paths.is_empty(), "{c:?}: {want:?}");
+        let got = svc.json_paths(&c, &Params::new(), &After::Any, 0).await.unwrap_or_else(|e| panic!("{c:?}: {}", e.message));
+        assert_eq!(got, want, "{c:?}");
+        assert_eq!(select(&svc, &c.sql()).await, local(&one, &c.sql()), "{}", c.sql());
+    }
+    let paths = one.json_paths(&call(None, None), &Params::new()).unwrap();
+    assert!(paths.paths.iter().any(|p| p.path == "voltage" && p.strings > 0 && p.numbers > 0), "{paths:?}");
+    assert!(paths.paths.iter().any(|p| p.path == "tags" && p.values.as_ref().is_some_and(|v| v.len() == 2)), "{paths:?}");
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(server::serve_http(svc.clone(), l, Access::default()));
+    let c = reqwest::Client::new();
+    let get = |q: &str| c.get(format!("{url}/v1/tables/items/paths?{q}")).send();
+    let j: serde_json::Value = get("field=attrs&path=dims&where=name%20%3D%20%27n1%27").await.unwrap().json().await.unwrap();
+    let want = one.json_paths(&call(Some("dims"), Some("name = 'n1'")), &Params::new()).unwrap().to_json();
+    assert_eq!((&j["rows"], &j["paths"], &j["truncated"], &j["field"]), (&want["rows"], &want["paths"], &want["truncated"], &serde_json::json!("attrs")), "{j}");
+    assert_eq!(j["paths"][0]["keys"], serde_json::json!(["dims"]));
+    for (q, status) in [("", 400), ("field=name", 400), ("field=nope", 400), ("field=attrs&path=a..b", 400)] {
+        assert_eq!(get(q).await.unwrap().status().as_u16(), status, "{q}");
+    }
+    assert_eq!(c.get(format!("{url}/v1/tables/nope/paths?field=attrs")).send().await.unwrap().status().as_u16(), 400);
 }

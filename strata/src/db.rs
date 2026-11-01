@@ -962,6 +962,9 @@ impl Db {
     /// [`crate::query::compound::MAX_ROWS`] rows each; its answer is held
     /// to [`ExecOptions::max_rows`].
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
+        if let Some(call) = crate::query::paths::Call::of_sql(sql)? {
+            return self.json_paths_at(snap, &call, params, opts).map(|p| p.to_result());
+        }
         let q = qsql::parse_query(sql)?;
         let plan = plan_of(snap, &q, params)?;
         self.run_on(snap, &plan, opts)
@@ -1456,6 +1459,25 @@ impl Db {
         }
         let readers = self.readers(snap)?;
         Executor::new(snap, &readers, opts).sid_next(select, f, prefixes)
+    }
+
+    /// The paths listing of a JSON field that `call` asks for
+    /// ([`crate::query::paths`]): each path its objects hold, with its
+    /// rows, types and values, read from the field's terms. `SELECT * FROM
+    /// json_paths('table', 'field')` runs it as a query.
+    pub fn json_paths(&self, call: &crate::query::paths::Call, params: &Params) -> Result<crate::query::paths::Paths> {
+        self.json_paths_at(&self.snapshot(), call, params, &self.exec)
+    }
+
+    /// [`Db::json_paths`] on snapshot `snap`, with options.
+    pub fn json_paths_at(&self, snap: &Snapshot, call: &crate::query::paths::Call, params: &Params, opts: &ExecOptions) -> Result<crate::query::paths::Paths> {
+        let snap = snap.table(&call.table).ok_or_else(|| Error::Query(format!("no such table: {}", call.table)))?;
+        let schema = snap.schema();
+        let f = call.field_of(schema)?;
+        let sql = format!("SELECT COUNT(*) FROM {}{}", qsql::ident(&schema.table), call.filter.as_deref().map(|c| format!(" WHERE {c}")).unwrap_or_default());
+        let select = qsql::bind(&sql, schema, params)?;
+        let readers = self.readers(&snap)?;
+        Executor::new(&snap, &readers, opts).json_paths(&select, f, call)
     }
 
     /// Builds a segment image of `docs` for this schema into `dest` (a new

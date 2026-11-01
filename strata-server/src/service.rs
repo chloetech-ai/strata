@@ -16,6 +16,7 @@ use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
 use strata::query::model::Models;
+use strata::query::paths::{Call, Paths};
 use strata::query::sql::{ident, quoted};
 use strata::query::{bind_command, compound, ops, profile, steps, Command, Params, Select};
 use strata::rank_log::{self, Log};
@@ -1675,6 +1676,14 @@ impl Service {
 
     async fn query_once(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
+        // A JSON field's paths listing: from this database's terms, or a
+        // coordinator's shards' listings summed.
+        if req.plan.is_none() {
+            if let Some(call) = Call::of_sql(&req.sql)? {
+                let res = self.json_paths(&call, &req.params, &req.after, req.timeout_ms).await.map(|p| (p.to_result(), Vec::new()));
+                return self.done(&req.sql, "paths", t0, None, req.shard, (false, req.quiet), res);
+            }
+        }
         let timeout = self.timeout_of(req.timeout_ms);
         // Bound against every table: a query of one table is the
         // executor's, any other a compound plan.
@@ -2194,6 +2203,28 @@ impl Service {
                 Ok(r?)
             }
             Backend::Cluster(c) => c.sid_next(sql, &schema, plan, params, field, prefixes, after, deadline).await,
+        }
+    }
+
+    /// The paths listing `call` asks for ([`strata::query::paths`]): of
+    /// this database's rows, or of every shard's, summed.
+    pub async fn json_paths(self: &Arc<Self>, call: &Call, params: &Params, after: &After, timeout_ms: u64) -> Result<Paths, ApiError> {
+        let t0 = Instant::now();
+        let timeout = self.timeout_of(timeout_ms);
+        let deadline = t0 + timeout;
+        call.field_of(&*self.table(&call.table).await?)?;
+        match &self.backend {
+            Backend::Local(db) => {
+                let snap = self.read_snapshot(db, 0, after, deadline).await?;
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected("paths", t0)) };
+                let db = db.clone();
+                let opts = ExecOptions { deadline: Some(deadline), memory: self.query_memory.clone(), ..db.exec.clone() };
+                let (call, params) = (call.clone(), params.clone());
+                let r = tokio::task::spawn_blocking(move || db.json_paths_at(&snap, &call, &params, &opts)).await.map_err(ApiError::internal)?;
+                drop(permit);
+                Ok(r?)
+            }
+            Backend::Cluster(c) => c.json_paths(call, params, after, deadline).await,
         }
     }
 

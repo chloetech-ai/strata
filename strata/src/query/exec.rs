@@ -804,6 +804,114 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
+    /// The paths listing of JSON field `field` ([`crate::query::paths`])
+    /// that `call` asks for, among the rows `q`'s filter matches, deleted
+    /// rows left out: the segments' terms read in one merge, in term order,
+    /// each counted over those rows, then each path's runs of a type.
+    pub fn json_paths(mut self, q: &Select, field: usize, call: &crate::query::paths::Call) -> Result<crate::query::paths::Paths> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let runs = call.runs();
+        let segs = self.segs.clone();
+        // Per segment with rows to read: its column, the rows (and their
+        // bits, unless they are all of the segment's), the codes of each run.
+        struct Part<'k> {
+            kw: &'k KeywordColumn,
+            set: Arc<DocSet>,
+            words: Option<Vec<u64>>,
+            codes: Vec<std::ops::Range<u32>>,
+        }
+        impl Part<'_> {
+            fn count(&self, code: u32) -> u64 {
+                match &self.words {
+                    None => self.kw.count_code(code) as u64,
+                    Some(w) => self.kw.count_code_in(code, w),
+                }
+            }
+        }
+        let mut parts: Vec<Part> = Vec::new();
+        let mut rows = 0u64;
+        for s in segs.iter() {
+            self.check_deadline()?;
+            let set = self.filter_set(s, &q.filter)?;
+            rows += set.len() as u64;
+            if set.is_empty() {
+                continue;
+            }
+            let kw = self.keyword(s, field)?;
+            let n = kw.n_values() as u32;
+            let codes = runs.iter().map(|(lo, hi)| kw.lower_bound(lo)..hi.as_deref().map_or(n, |h| kw.lower_bound(h))).collect();
+            let words = (set.len() < s.r.n_docs as usize).then(|| set.to_bits());
+            parts.push(Part { kw, set, words, codes });
+        }
+        let mut b = crate::query::paths::Builder::default();
+        let mut read = 0usize;
+        'runs: for r in 0..runs.len() {
+            let mut at: Vec<u32> = parts.iter().map(|p| p.codes[r].start).collect();
+            let mut heap: BinaryHeap<Reverse<(&str, usize)>> = BinaryHeap::new();
+            for (i, p) in parts.iter().enumerate() {
+                if at[i] < p.codes[r].end {
+                    heap.push(Reverse((p.kw.value(at[i]), i)));
+                }
+            }
+            while let Some(Reverse((t, i))) = heap.pop() {
+                let mut n = 0;
+                let mut next = Some(i);
+                while let Some(i) = next {
+                    let p = &parts[i];
+                    n += p.count(at[i]);
+                    at[i] += 1;
+                    if at[i] < p.codes[r].end {
+                        heap.push(Reverse((p.kw.value(at[i]), i)));
+                    }
+                    next = match heap.peek() {
+                        Some(Reverse((u, j))) if *u == t => Some(*j),
+                        _ => None,
+                    };
+                    if next.is_some() {
+                        heap.pop();
+                    }
+                }
+                if n > 0 && !b.term(t, n) {
+                    break 'runs;
+                }
+                read += 1;
+                if read % 4096 == 0 {
+                    self.check_deadline()?;
+                }
+            }
+        }
+        let mut paths = b.finish(rows);
+        // The rows holding a value of each type at each path: the union of
+        // the type's run of terms, per segment.
+        for p in paths.paths.iter_mut() {
+            for k in [crate::json::Kind::Str, crate::json::Kind::Number, crate::json::Kind::Bool] {
+                let (lo, hi) = crate::json::kind_run(&p.path, k);
+                let mut n = 0u64;
+                for part in &parts {
+                    let (a, z) = (part.kw.lower_bound(&lo), part.kw.lower_bound(&hi));
+                    n += match z.saturating_sub(a) {
+                        0 => 0,
+                        1 => part.count(a),
+                        _ => {
+                            let docs = part.kw.docs_codes(&(a..z).collect::<Vec<_>>());
+                            match part.words {
+                                None => docs.len() as u64,
+                                Some(_) => docs.intersect(&part.set).len() as u64,
+                            }
+                        }
+                    };
+                }
+                *p.kind_mut(k) = n;
+            }
+            read += 1;
+            if read % 4096 == 0 {
+                self.check_deadline()?;
+            }
+        }
+        Ok(paths)
+    }
+
     /// The loosest level of `q`'s guard ([`crate::query::logical::Guard`])
     /// and the rows of each level from it to the strictest, over every
     /// segment: those meeting `q`'s filter and that many of the guard's

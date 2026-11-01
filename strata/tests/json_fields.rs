@@ -14,6 +14,7 @@ use serde_json::{json, Value as Json};
 use strata::db::{Db, SqlResult};
 use strata::query::ir::eval::{holds, Ref};
 use strata::query::ir::Expr;
+use strata::query::paths::Call;
 use strata::query::Params;
 use strata::schema::{Field, FieldType, Schema};
 use strata::storage::{DbOptions, Layout, MergePolicy};
@@ -476,6 +477,7 @@ fn run(name: &str, layout: Layout) {
         let all = values(&db);
         assert_eq!(all.len(), rows.len());
         check(&db, &rows, &all, &mut rng, 1500, 200);
+        listings(&db, &rows);
         rows
     };
     // Reopen (the memtable's objects come back from the WAL), flush, merge.
@@ -486,6 +488,19 @@ fn run(name: &str, layout: Layout) {
     db.storage().merge(&MergePolicy { merge_factor: 2, floor_docs: 10_000, ..MergePolicy::default() }).unwrap();
     check(&db, &rows, &all, &mut rng, 300, 30);
     reads(&db, &rows);
+    listings(&db, &rows);
+    // Deleted rows leave the listing, in the segments and the memtable.
+    written(&db, "DELETE FROM t WHERE name = 'n2' OR attrs.color = 'red'");
+    sql(&db, "UPDATE t SET attrs = '{\"color\": \"teal\", \"new\": {\"k\": [1, 2]}}' WHERE id = 'r0001'");
+    let rows: Vec<Row> = rows
+        .into_iter()
+        .filter(|r| !(r.name == "n2" || value_at(&r.attrs, &["color"]) == Value::Str("red".into())))
+        .map(|r| match r.id.as_str() {
+            "r0001" => Row { attrs: Some(json!({"color": "teal", "new": {"k": [1, 2]}})), ..r },
+            _ => r,
+        })
+        .collect();
+    listings(&db, &rows);
 }
 
 #[test]
@@ -594,6 +609,131 @@ fn reads(db: &Db, rows: &[Row]) {
     assert_eq!(got[0][0].as_i64(), Some(hs as i64));
     assert_eq!(got[0][1].as_f64(), ws.iter().cloned().reduce(f64::max));
     assert_eq!(got[0][2].as_f64(), ws.iter().cloned().reduce(f64::min));
+}
+
+/// A path's listing as a model computes it from the objects.
+#[derive(Debug, Default, PartialEq)]
+struct Listed {
+    rows: u64,
+    /// Rows with a string, a number, a boolean there.
+    kinds: [u64; 3],
+    /// Each value (typed: `s:`, `n:`, `b:` and its text) and its rows.
+    values: std::collections::BTreeMap<String, u64>,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+/// A key as a path spells it: dots and backslashes escaped.
+fn escaped(k: &str) -> String {
+    k.chars().flat_map(|c| if c == '.' || c == '\\' { vec!['\\', c] } else { vec![c] }).collect()
+}
+
+/// What one object holds at each path: whether it holds anything there,
+/// its types, its values (each once).
+fn holds_at(j: &Json, path: &str, out: &mut std::collections::BTreeMap<String, ([bool; 3], std::collections::BTreeSet<String>, Vec<f64>)>) {
+    let mut mark = |path: &str, kind: Option<(usize, String)>, x: Option<f64>| {
+        let e = out.entry(path.to_string()).or_default();
+        if let Some((k, v)) = kind {
+            e.0[k] = true;
+            e.1.insert(v);
+        }
+        e.2.extend(x);
+    };
+    match j {
+        Json::Null => {}
+        Json::Object(m) => {
+            if !path.is_empty() {
+                mark(path, None, None);
+            }
+            for (k, v) in m {
+                let child = if path.is_empty() { escaped(k) } else { format!("{path}.{}", escaped(k)) };
+                holds_at(v, &child, out);
+            }
+        }
+        Json::Array(xs) => xs.iter().for_each(|x| holds_at(x, path, out)),
+        Json::String(s) if s.len() > 256 => mark(path, None, None),
+        Json::String(s) => mark(path, Some((0, format!("s:{s}"))), None),
+        Json::Number(n) => {
+            let x = n.as_f64().unwrap();
+            mark(path, Some((1, format!("n:{x}"))), Some(x));
+        }
+        Json::Bool(b) => mark(path, Some((2, format!("b:{b}"))), None),
+    }
+}
+
+fn model_listing<'r>(rows: impl IntoIterator<Item = &'r Row>) -> std::collections::BTreeMap<String, Listed> {
+    let mut out: std::collections::BTreeMap<String, Listed> = Default::default();
+    for r in rows {
+        let mut at = Default::default();
+        if let Some(j) = &r.attrs {
+            holds_at(j, "", &mut at);
+        }
+        for (path, (kinds, values, xs)) in at {
+            let l = out.entry(path).or_default();
+            l.rows += 1;
+            for k in 0..3 {
+                l.kinds[k] += kinds[k] as u64;
+            }
+            for v in values {
+                *l.values.entry(v).or_default() += 1;
+            }
+            for x in xs {
+                l.min = Some(l.min.map_or(x, |m: f64| m.min(x)));
+                l.max = Some(l.max.map_or(x, |m: f64| m.max(x)));
+            }
+        }
+    }
+    out
+}
+
+fn typed(v: &Value) -> String {
+    match v {
+        Value::Str(s) => format!("s:{s}"),
+        Value::Float(x) => format!("n:{x}"),
+        Value::Bool(b) => format!("b:{b}"),
+        v => panic!("{v:?}"),
+    }
+}
+
+/// The listing of `call` is the model's over `rows` (those it reads), and
+/// `SELECT * FROM json_paths(...)` answers it as rows.
+fn listing<'r>(db: &Db, call: &Call, rows: impl IntoIterator<Item = &'r Row> + Clone) {
+    let got = db.json_paths(call, &Params::new()).unwrap_or_else(|e| panic!("{call:?}: {e}"));
+    let n = rows.clone().into_iter().count() as u64;
+    let want: Vec<(String, Listed)> = model_listing(rows)
+        .into_iter()
+        .filter(|(p, _)| call.prefix.as_ref().is_none_or(|q| p == q || p.starts_with(&format!("{q}."))))
+        .collect();
+    assert_eq!(got.rows, n, "{call:?}: rows read");
+    assert!(!got.truncated);
+    assert_eq!(got.paths.iter().map(|p| p.path.clone()).collect::<Vec<_>>(), want.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), "{call:?}: paths");
+    for (g, (path, w)) in got.paths.iter().zip(&want) {
+        let what = format!("{call:?}: {path}");
+        assert_eq!((g.rows, [g.strings, g.numbers, g.bools]), (w.rows, w.kinds), "{what}");
+        assert_eq!((g.min, g.max), (w.min, w.max), "{what}");
+        assert_eq!(g.distinct, Some(w.values.len() as u64), "{what}");
+        let vs = g.values.as_ref().unwrap_or_else(|| panic!("{what}: values"));
+        assert!(vs.windows(2).all(|p| p[0].1 >= p[1].1), "{what}: most rows first");
+        let listed: std::collections::BTreeMap<String, u64> = vs.iter().map(|(v, c)| (typed(v), *c)).collect();
+        assert_eq!(listed, w.values, "{what}");
+    }
+    // As a query: the same listing, as rows.
+    let rs = db.query(&call.sql(), &Params::new()).unwrap();
+    assert_eq!(rs.rows, got.to_result().rows, "{}", call.sql());
+    assert_eq!(strata::query::paths::Paths::from_result(&rs).unwrap(), got);
+}
+
+fn listings(db: &Db, rows: &[Row]) {
+    let call = |prefix: Option<&str>, filter: Option<&str>| Call { table: "t".into(), field: "attrs".into(), prefix: prefix.map(String::from), filter: filter.map(String::from) };
+    listing(db, &call(None, None), rows);
+    listing(db, &call(Some("dims"), None), rows);
+    listing(db, &call(Some("items"), None), rows);
+    listing(db, &call(Some("a\\.b"), None), rows);
+    listing(db, &call(Some("nowhere"), None), rows);
+    listing(db, &call(None, Some("name = 'n1'")), rows.iter().filter(|r| r.name == "n1"));
+    listing(db, &call(Some("dims"), Some("attrs.color IS NOT NULL")), rows.iter().filter(|r| value_at(&r.attrs, &["color"]) != Value::Null));
+    let all = model_listing(rows);
+    assert!(all.len() >= 12 && all["color"].values.len() == 5 && all["dims"].kinds == [0, 0, 0] && all["voltage"].kinds[0] > 0 && all["voltage"].kinds[1] > 0 && all["long"].kinds == [0, 0, 0], "{all:?}");
 }
 
 fn table(path: &std::path::Path) -> Db {
