@@ -11,8 +11,18 @@
 //! * [`shard`]: a shard's copies: votes and elections, a replica taking
 //!   what its primary ships, a primary shipping, counting the copies that
 //!   hold a write, fencing, and its lease on reads.
+//! * [`slots`]: the cluster map: a shard taking a map and checking what is
+//!   routed to it, holding writes to slots moving from it and exporting
+//!   their rows; a coordinator changing the map ([`slots::Change`]) and
+//!   moving slots between shards ([`slots::MoveRun`]).
 //!
-//! The server does not drive these cores yet: [`crate::replication`] still
+//! The server runs [`slots`]: a shard takes maps and checks rows and
+//! epochs with it ([`crate::service::Service::set_slots`]), and a
+//! coordinator changes the map ([`crate::coord::Coordinator::change`]) and
+//! moves slots ([`crate::coord::moves`]) by its steps, which find what the
+//! simulator's [`crate::sim::cluster::Bug`]s put back.
+//!
+//! The server does not drive [`shard`] yet: [`crate::replication`] still
 //! decides as it did, and the cores mirror its decisions so that the
 //! simulator exercises them first, but for three bugs the simulator found,
 //! which the cores fix and [`crate::sim::Bug`] puts back: a replica asks
@@ -22,3 +32,4 @@
 //! holds of an older term past its last ([`crate::sim::db::ModelDb::apply_shipped`]).
 
 pub mod shard;
+pub mod slots;

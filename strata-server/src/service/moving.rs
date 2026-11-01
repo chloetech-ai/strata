@@ -20,6 +20,7 @@ use strata::db::Db;
 use strata::storage::{Mask, Snapshot, SOURCES};
 
 use super::{conflict, Service};
+use crate::cores::slots::Moved;
 use crate::slots::{self, Move, MoveState, SlotMap};
 use crate::{json as js, pb, ApiError};
 
@@ -38,9 +39,8 @@ pub(crate) struct Moving {
     /// Passed (read) by each write to slots moving from this shard until
     /// it commits; a hold takes it (write).
     gate: Arc<tokio::sync::RwLock<()>>,
-    /// The hold [`Service::freeze_slots`] took, and the number of the
-    /// request that last asked for it: the one its time is counted from.
-    frozen: Arc<tokio::sync::Mutex<Option<(u64, tokio::sync::OwnedRwLockWriteGuard<()>)>>>,
+    /// The hold [`Service::freeze_slots`] took.
+    pub(super) frozen: Arc<tokio::sync::Mutex<Option<Frozen>>>,
     holds: AtomicU64,
     /// The last export of slots moving from here: the move, the mask of
     /// its slots, and the version exported, which the next export of
@@ -50,6 +50,19 @@ pub(crate) struct Moving {
     /// until they commit, by number ([`Self::enter`]); a hold waits for
     /// those that came before it.
     entered: Arc<Entered>,
+}
+
+/// A hold on writes to the slots moving from a shard
+/// ([`crate::cores::slots::Hold`]).
+pub(crate) struct Frozen {
+    /// The number of the request that last asked for it: the one its time
+    /// is counted from.
+    id: u64,
+    /// The shard's last transaction when the hold began, which asking for
+    /// it again keeps: an export from then on holds every write to the
+    /// moving slots.
+    pub since: u64,
+    _gate: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 #[derive(Default)]
@@ -106,6 +119,15 @@ impl Moving {
                 return false;
             }
         }
+    }
+
+    /// Whether writes to the slots of `m` (the move copying from this
+    /// shard) have been held, since the shard's transaction `since`, from
+    /// before their last export ([`crate::cores::slots::Hold::covers`]).
+    pub(super) fn covers(&self, m: Option<&Move>, since: Option<u64>) -> bool {
+        let exported = self.exported.lock().unwrap_or_else(|e| e.into_inner());
+        let at = exported.as_ref().filter(|(x, _, _)| Some(x) == m).map(|(_, _, snap)| snap.seq_no().unwrap_or(0));
+        matches!((since, at), (Some(s), Some(e)) if s <= e)
     }
 
     /// The mask of the rows this shard hides, if any.
@@ -233,7 +255,7 @@ impl Service {
             let id = self.moving.holds.fetch_add(1, Ordering::Relaxed) + 1;
             let mut held = self.moving.frozen.lock().await;
             match held.as_mut() {
-                Some((n, _)) => *n = id,
+                Some(f) => f.id = id,
                 None => {
                     let late = || ApiError { status: 503, message: format!("the writes under way to the moving slots did not commit within {} s", FREEZE_WAIT.as_secs()) };
                     let deadline = tokio::time::Instant::now() + FREEZE_WAIT;
@@ -243,7 +265,7 @@ impl Service {
                     if !self.moving.drained(deadline).await {
                         return Err(late());
                     }
-                    *held = Some((id, g));
+                    *held = Some(Frozen { id, since: db.storage().seq_no().map_or(0, |s| s.seq), _gate: g });
                 }
             }
             drop(held);
@@ -251,7 +273,7 @@ impl Service {
             tokio::spawn(async move {
                 tokio::time::sleep(ttl).await;
                 let mut held = frozen.lock().await;
-                if held.as_ref().is_some_and(|(n, _)| *n == id) {
+                if held.as_ref().is_some_and(|f| f.id == id) {
                     tracing::warn!(ttl_s = ttl.as_secs_f64(), "a hold on writes to moving slots ended unasked: its coordinator did not ask again");
                     *held = None;
                 }
@@ -317,11 +339,17 @@ impl Service {
     /// Deletes this shard's rows of moving slots that it holds without
     /// serving them (those it hides): what a move left on the shard the
     /// slots moved from, or what a move given up sent to the shard they
-    /// were to move to. Returns the rows deleted.
+    /// were to move to. The writes under way commit first: a copy checked
+    /// while the move copied would otherwise land after the deletes and
+    /// outlive the move ([`crate::cores::slots::misplaced`]); those after
+    /// are refused. Returns the rows deleted.
     pub async fn cleanup_slots(self: &Arc<Self>) -> Result<u64, ApiError> {
         let db = self.local().cloned().ok_or_else(|| ApiError::bad("a coordinator holds no slots"))?;
         self.takes_writes()?;
         let Some(mask) = self.moving.mask() else { return Ok(0) };
+        if !self.moving.drained(tokio::time::Instant::now() + FREEZE_WAIT).await {
+            return Err(ApiError { status: 503, message: format!("the writes under way here did not commit within {} s: clean up again", FREEZE_WAIT.as_secs()) });
+        }
         let mut deleted = 0;
         loop {
             let (d, m) = (db.clone(), mask.clone());
@@ -329,7 +357,7 @@ impl Service {
             if ops.is_empty() {
                 return Ok(deleted);
             }
-            let n = self.write_ops_as(ops, None, true).await?.rows;
+            let n = self.write_ops_as(ops, None, Moved::Cleanup).await?.rows;
             if n == 0 {
                 return Err(ApiError::internal("deleting the rows of moving slots held here deleted none"));
             }
