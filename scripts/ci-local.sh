@@ -111,6 +111,7 @@ Options:
   --post-status    post the result as commit status `ci-local` on GitHub
   --fail-fast      stop at the first failed job (default: run them all)
   --verbose        show each job's output as it runs (default: the log's tail on failure)
+  --nextest        run the three crates' test suites with cargo-nextest (built once): every binary's tests at once
   --keep-binaries  keep the test executables after each job (default: delete them, as they are most of the disk used)
   --list           list the jobs
   --ci-hashes      print the hashes of ci.yml's jobs, for CI_JOBS
@@ -168,7 +169,7 @@ job_names() { printf '%s\n' "$JOBS" | awk -F'|' 'NF { print $1 }'; }
 # --- options ---------------------------------------------------------------
 
 ARGS=("$@")
-PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 SELECTED=""
+PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 NEXTEST=0 SELECTED=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --pr) PR=${2:?--pr needs a number}; shift ;;
@@ -181,6 +182,7 @@ while [ $# -gt 0 ]; do
         --fail-fast) FAIL_FAST=1 ;;
         --verbose|-v) VERBOSE=1 ;;
         --keep-binaries) KEEP_BINARIES=1 ;;
+        --nextest) NEXTEST=1 ;;
         --setup) SETUP_ONLY=1 ;;
         --list)
             printf '%s\n' "$JOBS" | awk -F'|' 'NF { printf "  %-30s %s\n", $1, $3 }'
@@ -344,8 +346,12 @@ setup_rust() {
     fi
     STABLE_BIN=$RUSTUP_HOME/toolchains/stable-$HOST/bin
     NIGHTLY_BIN=$RUSTUP_HOME/toolchains/$MIRI_TOOLCHAIN-$HOST/bin
-    export PATH=$STABLE_BIN:$PATH
+    export PATH=$STABLE_BIN:$CI_HOME/tools/bin:$PATH
     RUST_VERSION=$(rustc --version | cut -d' ' -f2)
+    if [ "$NEXTEST" = 1 ] && ! cargo nextest --version >/dev/null 2>&1; then
+        echo "Building cargo-nextest into $CI_HOME/tools (once)"
+        cargo install --locked --quiet --root "$CI_HOME/tools" cargo-nextest || die "could not build cargo-nextest"
+    fi
 }
 
 # Python 3.12, as CI's setup-python, in a virtualenv kept between runs.
@@ -361,21 +367,34 @@ setup_python() {
 # Each runs in a subshell of its own in the tree's root, with -e and -x: the
 # log shows every command, and the first failure ends the job.
 
+# A crate's whole test suite, as `cargo test --profile ci`. With --nextest,
+# cargo-nextest runs it: the tests of every test binary at once rather than
+# one binary after another (strata has 137), each test in a process of its
+# own; then the doctests, which nextest does not run.
+crate_tests() {
+    if [ "$NEXTEST" = 1 ]; then
+        cargo nextest run --cargo-profile ci --no-fail-fast "$@"
+        cargo test --profile ci --doc "$@"
+    else
+        cargo test --profile ci "$@"
+    fi
+}
+
 job_test_strata() {
     cd strata
-    cargo test --profile ci --features sqlite
+    crate_tests --features sqlite
     cargo clippy --release --all-targets --features sqlite -- $CLIPPY_LINTS
 }
 
 job_test_engram() {
     cd engram
-    cargo test --profile ci
+    crate_tests
     cargo clippy --release --all-targets -- $CLIPPY_LINTS
 }
 
 job_test_strata_server() {
     cd strata-server
-    cargo test --profile ci
+    crate_tests
     cargo clippy --release --all-targets -- $CLIPPY_LINTS
 }
 
@@ -751,7 +770,7 @@ if [ "$FAILED" = 0 ]; then
         if [ -n "$DRIFT" ]; then
             post_status error "Passed, but ci.yml has changed since ci-local.sh was written: update the script"
         else
-            post_status success "$PASSED/$COUNT jobs passed on $MACHINE, merged into $BASE ${BASE_SHA:0:7}, $(mins $TOTAL) min; $not_covered"
+            post_status success "$PASSED/$COUNT jobs passed on $MACHINE$([ "$NEXTEST" = 1 ] && echo " (nextest)"), merged into $BASE ${BASE_SHA:0:7}, $(mins $TOTAL) min; $not_covered"
         fi
     fi
     if [ "$POST" = 1 ] && [ -z "$DRIFT" ]; then
