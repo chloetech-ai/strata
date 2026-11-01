@@ -338,6 +338,15 @@ On a **multi-vector field** (`VECTOR(d)[]`), `maxsim` is late interaction as Col
 SELECT id, score() FROM pages ORDER BY maxsim(patches, :tokens) DESC LIMIT 5;
 ```
 
+A multi-vector field can also be the vectors of a text's tokens, which a model of late interaction (ColBERT) computes when rows are written: `tok VECTOR(96)[] OPTIONS(embed = 'body', model = 'answerai-colbert-small-v1')` ([a vector a token](server.md#a-vector-a-token)). A query gives the vectors of its own tokens as the parameter (`{"embed": "the text", "field": "tok"}` on the server, `Db::embed_query_in` from Rust). Its usual place is a rerank phase over BM25's best rows, which scores each of them over all its vectors:
+
+```sql
+WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :q) DESC LIMIT 100)
+SELECT id, score() FROM top ORDER BY maxsim(tok, :tokens) DESC LIMIT 10;
+```
+
+On BEIR's SciFact and NFCorpus, `answerai-colbert-small-v1` over BM25's top 20 scores nDCG@10 0.738 and 0.354 (BM25 alone 0.691 and 0.329) in 80–90 ms a query on four cores, most of it encoding the query; that ranks better than the cross-encoder below, in a fifth of its time. The cost is at write: 0.1–0.16 s a document to embed, and a database about 29 times BM25's (half that with `pool_factor = 2`, which scores the same). The [results](results.md#colbert-reranking) have the details.
+
 `dot(a, b)` is the dot product of two vectors as a value, for rows in memory: `SELECT id, dot(emb, :q) FROM h` over a `WITH` result, a join, or a table's own rows. It equals `similarity` to the bit, and in a ranking expression over a table (`ORDER BY bm25(title, :q) + 2 * coalesce(dot(emb, :q), 0) DESC`) it is `similarity(emb, :q)`: `NULL` for a row without a vector.
 
 ### `rrf(s1, s2, …)`: reciprocal rank fusion

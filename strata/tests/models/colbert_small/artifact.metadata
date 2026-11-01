@@ -1,0 +1,12 @@
+{
+  "query_token_id": "[unused0]",
+  "doc_token_id": "[unused1]",
+  "query_token": "[Q]",
+  "doc_token": "[D]",
+  "query_maxlen": 8,
+  "doc_maxlen": 24,
+  "dim": 16,
+  "mask_punctuation": true,
+  "attend_to_mask_tokens": false,
+  "similarity": "cosine"
+}

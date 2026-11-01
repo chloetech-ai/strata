@@ -622,6 +622,12 @@ impl Db {
         if e.dim() != *dim {
             return Err(Error::Schema(format!("model {} makes {}-dimension vectors; field {field} holds {dim}", spec.model, e.dim())));
         }
+        if f.multi && !e.tokens() {
+            return Err(Error::Schema(format!("model {} embeds a text into one vector, and field {field} is a multi-vector field: it needs a model of a vector a token, such as ColBERT (answerai-colbert-small-v1)", spec.model)));
+        }
+        if !f.multi && !e.single() {
+            return Err(Error::Schema(format!("model {} embeds a text into a vector a token: field {field} needs to be a multi-vector field, VECTOR({dim})[]", spec.model)));
+        }
         if let Some(m) = schema.embeds_media(i) {
             let (wants, what) = match schema.fields[m].media {
                 Some(crate::media::MediaKind::Audio) => (Modality::Audio, "sound"),
@@ -635,6 +641,21 @@ impl Db {
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
         all.push(Model { table: schema.table.clone(), field: f.name.clone(), embed: spec.clone(), dim: *dim, model: e });
         Ok(())
+    }
+
+    /// The parameter a query gives for text `text` against embedded field
+    /// `field` of table `table`: the vector of the text as a query by the
+    /// field's model, as `similarity` takes it, or for a multi-vector field
+    /// (`VECTOR(d)[]`) the list of the vectors of its tokens
+    /// ([`Embedder::embed_query_tokens`]), as `maxsim` takes them.
+    pub fn embed_query_in(&self, table: &str, field: &str, text: &str) -> Result<Value> {
+        let schema = self.table(table)?;
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let e = self.embedder_in(table, field).ok_or_else(|| Error::Schema(format!("field {field} has no model here (Db::open_embedders or Db::set_embedder_in)")))?;
+        Ok(match f.multi {
+            true => Value::List(e.embed_query_tokens(text)?.into_iter().map(|v| Value::Vector(v.into())).collect()),
+            false => Value::Vector(e.embed_query(text)?.into()),
+        })
     }
 
     /// The model of embedded field `field` of the first table, if it has one.
@@ -1643,7 +1664,7 @@ fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut
             if matches!(d[f], Value::Null) {
                 let t = schema.embed_text(f, d);
                 if let Some(v) = ahead.and_then(|a| a.get(&t)) {
-                    d[f] = Value::Vector(v.clone());
+                    d[f] = embedded_value(schema, f, v.clone());
                 } else if !t.is_empty() {
                     todo.push(j);
                     texts.push(t);
@@ -1651,7 +1672,7 @@ fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut
             }
         }
         for (j, v) in todo.into_iter().zip(embed_sources(e.as_ref(), schema, f, &texts, files)?) {
-            docs[j][f] = Value::Vector(v.into());
+            docs[j][f] = embedded_value(schema, f, v.into());
         }
     }
     Ok(())
@@ -1673,10 +1694,31 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
     Ok(known)
 }
 
+/// The value of embedded field `f` of `schema` from what [`embed_sources`]
+/// made: the vector, or the vectors of a multi-vector field one after
+/// another (none: no value).
+fn embedded_value(schema: &Schema, f: usize, v: Arc<[f32]>) -> Value {
+    match &schema.fields[f] {
+        field if field.multi => {
+            let FieldType::Vector { dim, .. } = field.ty else { return Value::Null };
+            match v.is_empty() || dim == 0 {
+                true => Value::Null,
+                false => Value::List(v.chunks(dim).map(|c| Value::Vector(c.into())).collect()),
+            }
+        }
+        _ => Value::Vector(v),
+    }
+}
+
 /// The vectors of field `f` of `schema` for `sources` (as
 /// [`Schema::embed_text`] gives them): of the texts, or of the images or
-/// sounds that the MEDIA values name, decoded a batch at a time.
+/// sounds that the MEDIA values name, decoded a batch at a time. A
+/// multi-vector field's are the vectors of each text's tokens, one after
+/// another ([`Embedder::embed_tokens`]).
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
+    if schema.fields[f].multi {
+        return embed_all_tokens(e, sources);
+    }
     let Some(m) = schema.embeds_media(f) else { return embed_all(e, sources) };
     if schema.fields[m].media == Some(crate::media::MediaKind::Audio) {
         return in_sound_batches(&schema.fields[m].name, sources, files, |inputs| e.embed_inputs(inputs));
@@ -1957,11 +1999,15 @@ fn set_rows(
         tt.set(&key, &schema.fields[f].name, v)?;
     }
     derive_known(derivers, schema, &mut p.rewrites, derived, files)?;
-    embed_known(models, schema, &mut p.rewrites, known, files)?;
     // The rest of each row was read back: its multi-vector values were
-    // pooled when they were written.
-    let assigned: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
-    for doc in p.rewrites {
+    // pooled when they were written. A multi-vector field embedded again
+    // (its text changed) is new, as the fields set are.
+    let embedded: Vec<usize> = (0..schema.fields.len()).filter(|&f| schema.fields[f].multi && models.get(f).is_some_and(Option::is_some)).collect();
+    let fresh: Vec<Vec<usize>> = p.rewrites.iter().map(|d| embedded.iter().copied().filter(|&f| matches!(d[f], Value::Null)).collect()).collect();
+    embed_known(models, schema, &mut p.rewrites, known, files)?;
+    let set: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
+    for (doc, fresh) in p.rewrites.into_iter().zip(fresh) {
+        let assigned: Vec<usize> = set.iter().copied().chain(fresh).collect();
         tt.rewrite(doc, &assigned)?;
     }
     Ok(p.rows)
@@ -1974,6 +2020,30 @@ fn not_live(snap: &Snapshot, pk: usize, mut docs: Vec<Document>) -> Vec<Document
     let mut seen = HashSet::new();
     docs.retain(|d| snap.lookup(&d[pk]).is_none() && seen.insert(Part::of(&d[pk])));
     docs
+}
+
+/// `e`'s vectors of the tokens of `texts` ([`Embedder::embed_tokens`]),
+/// each text's one after another, split across the cores as
+/// [`embed_all`] splits them.
+fn embed_all_tokens(e: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+    let threads = if e.parallel() { std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 16).max(1) } else { 1 };
+    let flat = |c: &[&str]| -> Result<Vec<Vec<f32>>> { Ok(e.embed_tokens(c)?.into_iter().map(|vs| vs.concat()).collect()) };
+    let vectors: Vec<Vec<f32>> = if threads == 1 {
+        flat(&refs)?
+    } else {
+        std::thread::scope(|s| {
+            let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || flat(c))).collect();
+            parts.into_iter().map(|p| p.join().expect("embedding thread")).collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    if vectors.len() != texts.len() {
+        return Err(Error::Schema(format!("model {} made the tokens of {} texts of {}", e.name(), vectors.len(), texts.len())));
+    }
+    Ok(vectors)
 }
 
 /// `e`'s vectors of `texts`, split across the cores for a model computed

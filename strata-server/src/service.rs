@@ -1536,6 +1536,9 @@ impl Service {
     /// out), so that the text and the rows are embedded alike, or
     /// `{"embed": {"image": "<base64>"}, "field": "emb"}` (or `"audio"`),
     /// the vector of an image or sound file by a model of that and text.
+    /// The text of a multi-vector field (`VECTOR(d)[]`) embedded by a
+    /// model of its tokens, such as ColBERT, is the list of its tokens'
+    /// vectors, as `maxsim` takes them.
     pub async fn params(self: &Arc<Self>, j: Option<&Json>) -> Result<Params, ApiError> {
         let mut p = Params::new();
         let Some(j) = j.filter(|j| !j.is_null()) else { return Ok(p) };
@@ -1548,7 +1551,9 @@ impl Service {
                     self.vector_of(&table, &o["vector_of"], &field).await?
                 }
                 Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some() || e.get("audio").is_some()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
-                    let (_, field, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
+                    let (table, field, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
+                    // A multi-vector field's model embeds the query's tokens.
+                    let tokens = self.catalog().iter().find(|s| s.table.eq_ignore_ascii_case(&table)).and_then(|s| s.field(&field)).is_some_and(|f| f.multi);
                     let file = match &o["embed"] {
                         Json::String(_) => None,
                         Json::Object(i) if i.len() == 1 => {
@@ -1561,6 +1566,9 @@ impl Service {
                     if let Some((m, _)) = file.as_ref().filter(|(m, _)| !e.modalities().contains(m)) {
                         return Err(ApiError::bad(format!("the model of {field} ({}) does not embed {}", e.name(), strata::embed::modality_name(*m))));
                     }
+                    if tokens && file.is_some() {
+                        return Err(ApiError::bad(format!("{field} is a multi-vector field: its model embeds a text's tokens, not a file")));
+                    }
                     let text = o["embed"].as_str().unwrap_or_default().to_string();
                     let t0 = Instant::now();
                     let core = match tokio::time::timeout(self.timeout, self.embedding.clone().acquire_owned()).await {
@@ -1570,14 +1578,15 @@ impl Service {
                     let v = tokio::task::spawn_blocking(move || {
                         let _core = core;
                         match file {
-                            Some((_, data)) => strata::embed::embed_file(e.as_ref(), &data),
-                            None => e.embed_query(&text),
+                            Some((_, data)) => strata::embed::embed_file(e.as_ref(), &data).map(|v| Value::Vector(v.into())),
+                            None if tokens => e.embed_query_tokens(&text).map(|vs| Value::List(vs.into_iter().map(|v| Value::Vector(v.into())).collect())),
+                            None => e.embed_query(&text).map(|v| Value::Vector(v.into())),
                         }
                     })
                     .await
                     .map_err(ApiError::internal)??;
                     self.metrics.embedded("query", 1, t0.elapsed().as_secs_f64());
-                    Value::Vector(v.into())
+                    v
                 }
                 v => js::param(v)?,
             };
