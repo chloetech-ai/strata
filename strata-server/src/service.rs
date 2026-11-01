@@ -33,6 +33,7 @@ pub const MAX_LEASES: usize = 10_000;
 use crate::coord::Coordinator;
 use crate::idem;
 use crate::replication::{Acks, Follow, Primary, PrimaryOptions, READ_WAIT};
+use crate::cores::slots::{self as core, Moved};
 use crate::slots::{self, SlotMap};
 use crate::metrics::{self, Family, Metrics};
 use crate::alerts::Alerts;
@@ -729,44 +730,43 @@ impl Service {
     }
 
     /// Takes `map`, with this server as its shard `shard`, from a
-    /// coordinator: a map of an older epoch than this shard's is refused
-    /// (409), as is another map of the same epoch. Every row here must be
-    /// in the shard's slots, as no rows move between shards yet: a shard
-    /// loaded by another map, or by the hash before slots, refuses the map
-    /// (409) until it is loaded again. A map that leaves the shard its
-    /// slots (another shard's, or servers, changed) keeps serving
-    /// coordinators that route by the one before. Returns the epoch now
-    /// held.
+    /// coordinator, as [`core::take`] decides: a map of an older epoch than
+    /// this shard's is refused (409), as is another map of the same epoch.
+    /// Every row here must be in the shard's slots under a map that changes
+    /// them, but for the next step of a move, whose rows the coordinator
+    /// moved: a shard loaded by another map, or by the hash before slots,
+    /// refuses the map (409) until it is loaded again. A map that leaves
+    /// the shard its slots (another shard's, or servers, changed) keeps
+    /// serving coordinators that route by the one before. A map that gives
+    /// away the slots moving from here is taken only while writes to them
+    /// were held since their rows were last exported ([`core::flip_ok`]).
+    /// Returns the epoch now held.
     pub async fn set_slots(&self, map: SlotMap, shard: usize) -> Result<u64, ApiError> {
         if shard >= map.shards() {
             return Err(ApiError::bad(format!("shard {shard} of a slot map of {} shards", map.shards())));
         }
         let db = self.local().cloned().ok_or_else(|| ApiError::bad("a coordinator holds no slots"))?;
         let file = self.slots_file.lock().await;
+        // Held until the map is set, so that the hold cannot run out
+        // between the check and the change.
+        let frozen = self.moving.frozen.lock().await;
         let held = self.slots();
-        if let Some((m, s)) = &held {
-            if map.epoch < m.epoch {
-                return Err(conflict(format!("slot map epoch {} is older than this shard's ({}): the coordinator must load the newer map (--slot-map)", map.epoch, m.epoch)));
-            }
-            if map.epoch == m.epoch {
-                return match *m == map && *s == shard {
-                    true => Ok(map.epoch),
-                    false => Err(conflict(format!(
-                        "this shard holds a different slot map of epoch {}, as shard {s} of {}: list the shards as when it was given, or give a map of a higher epoch (--slot-map)",
-                        m.epoch,
-                        m.shards()
-                    ))),
-                };
-            }
-        }
-        let same = held.as_ref().is_some_and(|(m, s)| map.same_slots_as(shard, m, *s));
-        let since = match same {
-            true => self.slots_since.load(Ordering::Relaxed).min(map.epoch),
-            false => map.epoch,
+        // Only a server that takes clients' writes may have taken some to
+        // the moving slots that no export copied: a replica's come from its
+        // primary, and a primary another replaced takes none.
+        let writer = match &self.replication() {
+            Replication::Replica(_) => false,
+            Replication::Primary(p) => p.replaced_by() == 0,
+            Replication::None => true,
         };
-        // A move's next step: the coordinator moved the rows itself.
-        let stepped = held.as_ref().is_some_and(|(m, s)| *s == shard && m.shards() == map.shards() && m.moves_to(&map));
-        if !same && !stepped {
+        let exporting = held.as_ref().and_then(|(m, s)| core::exporting(m, *s)).cloned();
+        let covered = !writer || self.moving.covers(exporting.as_ref(), frozen.as_ref().map(|f| f.since));
+        core::flip_ok(held.as_ref().map(|(m, s)| (m, *s)), &map, shard, covered)?;
+        let (since, check_rows) = match core::take(held.as_ref().map(|(m, s)| (m, *s)), self.slots_since.load(Ordering::Relaxed), &map, shard)? {
+            core::Take::Held => return Ok(map.epoch),
+            core::Take::Keep { since, check_rows } => (since, check_rows),
+        };
+        if check_rows {
             let m = map.clone();
             let elsewhere = tokio::task::spawn_blocking(move || rows_elsewhere(&db, &m, shard)).await.map_err(ApiError::internal)??;
             if let Some((n, key)) = elsewhere {
@@ -789,6 +789,7 @@ impl Service {
         self.slots_since.store(since, Ordering::Relaxed);
         self.hide_residue(&map, shard);
         *held = Some((map, shard));
+        drop(frozen);
         Ok(epoch)
     }
 
@@ -805,46 +806,30 @@ impl Service {
         self.epoch_ok(held.as_ref().map_or(0, |(m, _)| m.epoch), epoch)
     }
 
-    /// [`Self::check_epoch`] against a map of epoch `held` (0: none).
+    /// [`Self::check_epoch`] against a map of epoch `held` (0: none)
+    /// ([`core::epoch_ok`]).
     fn epoch_ok(&self, held: u64, epoch: u64) -> Result<(), ApiError> {
-        if epoch == 0 {
-            return Ok(());
-        }
-        match held {
-            e if e == epoch => Ok(()),
-            e if e > epoch && epoch >= self.slots_since.load(Ordering::Relaxed) => Ok(()),
-            e if e > epoch => Err(conflict(format!("slot map epoch {epoch} is older than this shard's ({e}): the coordinator must load the newer map (--slot-map)"))),
-            0 => Err(ApiError { status: 503, message: format!("{NO_MAP_YET}; the request's is epoch {epoch}") }),
-            e => Err(ApiError { status: 503, message: format!("this shard has slot map epoch {e}, {OLDER_THAN_REQUEST} {epoch}") }),
-        }
+        core::epoch_ok(held, self.slots_since.load(Ordering::Relaxed), epoch)
     }
+
 
     /// Refuses (400) to write a row placed in a slot another shard holds,
     /// when this shard has a slot map: by its key, or by its table's
     /// shard_by value ([`op_place`]), each named by `what` (`key`, or the
-    /// shard_by field's name).
-    /// Rows of slots moving to or from the shard pass with `moved`, as
-    /// the coordinator moving them writes them. A request routed by an
-    /// older map that this one changed since it was checked is refused
-    /// for its coordinator to route it again (409).
-    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = (&'a str, &'a Value)>, moved: bool) -> Result<(), ApiError> {
+    /// shard_by field's name). Rows of moving slots pass as `moved` says
+    /// ([`core::misplaced`]): copied by the coordinator moving them to the
+    /// shard they go to while the move copies, or deleted by one of the
+    /// move's two shards. A request routed by an older map that this one
+    /// changed since it was checked is refused for its coordinator to
+    /// route it again (409).
+    fn check_keys<'a>(&self, keys: impl IntoIterator<Item = (&'a str, &'a Value)>, moved: Moved) -> Result<(), ApiError> {
         let held = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let Some((map, shard)) = &*held else { return Ok(()) };
         for (what, key) in keys {
             let s = slots::slot(key);
-            if map.owner(s) == *shard || (moved && map.takes_moved(*shard, s)) {
-                continue;
+            if let Some(m) = core::misplaced(map, *shard, s, moved, routed()) {
+                return Err(m.error(map, *shard, s, what, &js::to_json(key).to_string()));
             }
-            let e = routed();
-            if e > 0 && e < map.epoch {
-                return Err(conflict(format!("slot map epoch {e} is older than this shard's ({}), under which slot {s} is shard {}'s: the coordinator must load the newer map", map.epoch, map.owner(s))));
-            }
-            return Err(ApiError::bad(format!(
-                "{what} {} is in slot {s}, which shard {} holds under slot map epoch {}, not this shard ({shard}): write through the coordinator",
-                js::to_json(key),
-                map.owner(s),
-                map.epoch
-            )));
         }
         Ok(())
     }
@@ -1284,11 +1269,11 @@ impl Service {
 
     /// Hands a write to the writer thread and waits for its commit. The
     /// writer records `key`'s outcome, even if this future is dropped.
-    /// Writes marked `moved` are rows of moving slots, from the
-    /// coordinator moving them ([`Self::check_keys`]); while slots move
+    /// Writes `moved` are rows of moving slots, copied by the coordinator
+    /// moving them or deleted here ([`Self::check_keys`]); while slots move
     /// from this shard, a write to them, or an UPDATE or DELETE statement,
     /// holds the move's gate until it commits ([`Self::pass_gate`]).
-    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue, moved: bool) -> Result<Written, ApiError> {
+    async fn write(&self, job: WriteJob, deadline: Instant, key: Option<String>, queued: InQueue, moved: Moved) -> Result<Written, ApiError> {
         let tx = self.writes.as_ref().ok_or_else(|| ApiError::internal("no writer for a coordinator"))?;
         // Counted in before it looks at the map, which a move may change.
         let entry = self.moving.enter();
@@ -1305,8 +1290,8 @@ impl Service {
             };
             let statement = matches!(&job, WriteJob::Sql(_)) && places.is_empty();
             let pass = match moved {
-                true => moving::Pass::Entry(entry),
-                false => self.pass_gate(entry, &places, statement).await?,
+                Moved::No => self.pass_gate(entry, &places, statement).await?,
+                Moved::Copy | Moved::Cleanup => moving::Pass::Entry(entry),
             };
             self.check_keys(places.iter().map(|(w, v)| (*w, v)), moved)?;
             pass
@@ -2373,7 +2358,7 @@ impl Service {
         .ok_or_else(|| ApiError::bad("not a write statement"))?;
         // The deadline bounds the wait for the writer, not the embedding.
         let deadline = Instant::now() + self.timeout_of(timeout_ms);
-        let w = self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q, false).await?;
+        let w = self.write(WriteJob::Sql(Box::new(prepared)), deadline, None, q, Moved::No).await?;
         self.replicated(w, self.timeout_of(timeout_ms)).await
     }
 
@@ -2382,12 +2367,13 @@ impl Service {
     /// time may share (see [`writer`]). With an idempotency `key`, a retry
     /// of a request that committed returns its answer unapplied.
     pub async fn write_ops(self: &Arc<Self>, ops: Vec<Json>, key: Option<String>) -> Result<Written, ApiError> {
-        self.write_ops_as(ops, key, false).await
+        self.write_ops_as(ops, key, Moved::No).await
     }
 
-    /// [`Self::write_ops`], of rows of moving slots from the coordinator
-    /// moving them when `moved` ([`Self::write`]).
-    pub async fn write_ops_as(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>, moved: bool) -> Result<Written, ApiError> {
+    /// [`Self::write_ops`], of rows of moving slots copied by the
+    /// coordinator moving them, or deleted here, as `moved` says
+    /// ([`Self::write`]).
+    pub async fn write_ops_as(self: &Arc<Self>, mut ops: Vec<Json>, key: Option<String>, moved: Moved) -> Result<Written, ApiError> {
         let t0 = Instant::now();
         let n = match &self.backend {
             Backend::Local(db) => {

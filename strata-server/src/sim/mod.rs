@@ -30,6 +30,7 @@
 //! glue between the server and the cores until the server drives them.
 
 pub mod check;
+pub mod cluster;
 mod coord;
 mod copy;
 pub mod db;
@@ -47,7 +48,7 @@ use rng::Rng;
 /// Virtual time: microseconds from the run's start.
 pub type Time = u64;
 
-fn us(d: Duration) -> Time {
+pub(crate) fn us(d: Duration) -> Time {
     d.as_micros() as Time
 }
 
@@ -568,8 +569,13 @@ impl Sim {
 /// Runs `seeds`, each as `config` makes it of its seed, on `jobs` threads:
 /// the reports of those that broke a promise, by seed.
 pub fn run_seeds(seeds: std::ops::Range<u64>, config: &(dyn Fn(u64) -> Config + Sync), jobs: usize) -> Vec<Report> {
+    on_threads(seeds, jobs, &|s| Some(run(config(s), false)).filter(|r| !r.ok()))
+}
+
+/// What `run` gives of each of `seeds`, run on `jobs` threads, by seed.
+pub(crate) fn on_threads<T: Send>(seeds: std::ops::Range<u64>, jobs: usize, run: &(dyn Fn(u64) -> Option<T> + Sync)) -> Vec<T> {
     let next = std::sync::atomic::AtomicU64::new(seeds.start);
-    let failed = std::sync::Mutex::new(Vec::new());
+    let found = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..jobs.max(1) {
             scope.spawn(|| loop {
@@ -577,14 +583,13 @@ pub fn run_seeds(seeds: std::ops::Range<u64>, config: &(dyn Fn(u64) -> Config + 
                 if s >= seeds.end {
                     return;
                 }
-                let r = run(config(s), false);
-                if !r.ok() {
-                    failed.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+                if let Some(r) = run(s) {
+                    found.lock().unwrap_or_else(|e| e.into_inner()).push((s, r));
                 }
             });
         }
     });
-    let mut failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
-    failed.sort_by_key(|r| r.seed);
-    failed
+    let mut found = found.into_inner().unwrap_or_else(|e| e.into_inner());
+    found.sort_by_key(|(s, _)| *s);
+    found.into_iter().map(|(_, r)| r).collect()
 }
