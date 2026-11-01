@@ -622,6 +622,12 @@ impl Db {
         if e.dim() != *dim {
             return Err(Error::Schema(format!("model {} makes {}-dimension vectors; field {field} holds {dim}", spec.model, e.dim())));
         }
+        if f.multi && !e.tokens() {
+            return Err(Error::Schema(format!("model {} embeds a text into one vector, and field {field} is a multi-vector field: it needs a model of a vector a token, such as ColBERT (answerai-colbert-small-v1)", spec.model)));
+        }
+        if !f.multi && !e.single() {
+            return Err(Error::Schema(format!("model {} embeds a text into a vector a token: field {field} needs to be a multi-vector field, VECTOR({dim})[]", spec.model)));
+        }
         if let Some(m) = schema.embeds_media(i) {
             let (wants, what) = match schema.fields[m].media {
                 Some(crate::media::MediaKind::Audio) => (Modality::Audio, "sound"),
@@ -635,6 +641,21 @@ impl Db {
         all.retain(|m| !(m.table.eq_ignore_ascii_case(&schema.table) && m.field.eq_ignore_ascii_case(&f.name)));
         all.push(Model { table: schema.table.clone(), field: f.name.clone(), embed: spec.clone(), dim: *dim, model: e });
         Ok(())
+    }
+
+    /// The parameter a query gives for text `text` against embedded field
+    /// `field` of table `table`: the vector of the text as a query by the
+    /// field's model, as `similarity` takes it, or for a multi-vector field
+    /// (`VECTOR(d)[]`) the list of the vectors of its tokens
+    /// ([`Embedder::embed_query_tokens`]), as `maxsim` takes them.
+    pub fn embed_query_in(&self, table: &str, field: &str, text: &str) -> Result<Value> {
+        let schema = self.table(table)?;
+        let f = schema.field(field).ok_or_else(|| Error::Schema(format!("no field {field}")))?;
+        let e = self.embedder_in(table, field).ok_or_else(|| Error::Schema(format!("field {field} has no model here (Db::open_embedders or Db::set_embedder_in)")))?;
+        Ok(match f.multi {
+            true => Value::List(e.embed_query_tokens(text)?.into_iter().map(|v| Value::Vector(v.into())).collect()),
+            false => Value::Vector(e.embed_query(text)?.into()),
+        })
     }
 
     /// The model of embedded field `field` of the first table, if it has one.
@@ -1053,6 +1074,7 @@ impl Db {
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
         let catalog: Vec<&Schema> = snap.schemas().collect();
+        #[cfg_attr(feature = "datafusion", allow(unused_mut))]
         let mut runner = |leaf: &Plan| {
             let view = view_of(leaf.table())?;
             self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
@@ -1060,20 +1082,46 @@ impl Db {
         #[allow(unused_mut)]
         let mut fallback: Option<String> = None;
         #[cfg(feature = "datafusion")]
+        let mut ran = crate::query::df::Ran::default();
+        #[cfg(feature = "datafusion")]
         // A leaf with subqueries has no operators for DataFusion to run.
-        if matches!(opts.engine, crate::query::exec::Engine::DataFusion | crate::query::exec::Engine::DataFusionOnly) && !plan.root.is_leaf() {
-            match crate::query::df::run_in(plan, &catalog, &mut runner, opts)? {
-                crate::query::df::Outcome::Done(rs) => {
+        if opts.engine != crate::query::exec::Engine::Operators && !plan.root.is_leaf() {
+            use crate::query::df::Outcome;
+            let mut leaf_runner = |leaf: &Plan, over: usize| {
+                let view = view_of(leaf.table())?;
+                self.execute_leaf(&view, &leaf.to_select(view.schema())?, &leaves, over)
+            };
+            match crate::query::df::run_in(plan, &catalog, &mut leaf_runner, opts)? {
+                Outcome::Done(rs) => {
                     if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
                         return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
                     }
                     return Ok(rs);
                 }
-                crate::query::df::Outcome::Fallback(why) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
-                crate::query::df::Outcome::Fallback(why) => fallback = Some(why),
+                Outcome::Fallback(why, _) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
+                Outcome::Fallback(why, r) => {
+                    fallback = Some(why);
+                    ran = r;
+                }
+                Outcome::Small(r) => ran = r,
             }
         }
+        // The leaves DataFusion ran are not run again, and the profile
+        // keeps their steps.
+        #[cfg(feature = "datafusion")]
+        let ran_steps = std::mem::take(&mut ran.steps);
+        #[cfg(feature = "datafusion")]
+        let mut runner = move |leaf: &Plan| match ran.take(leaf) {
+            Some(rs) => Ok(rs),
+            None => runner(leaf),
+        };
         let mut rs = ops::run_in(plan, &catalog, &mut runner, opts)?;
+        #[cfg(feature = "datafusion")]
+        if !ran_steps.is_empty() {
+            let mut steps = ran_steps;
+            rs.stats.steps_dropped += crate::query::steps::nest(&mut steps, &rs.stats.steps, 0) as u64;
+            rs.stats.steps = steps;
+        }
         if let Some(why) = fallback {
             rs.stats.plan.insert(0, format!("operators (not datafusion: {why})"));
         }
@@ -1411,13 +1459,26 @@ impl Db {
         let readers = self.readers(snap)?;
         let opened = t0.elapsed();
         let mut rs = Executor::new(snap, &readers, opts).execute(select)?;
-        // Opening segments' readers takes microseconds once they are
-        // cached; a step when it took longer (a cold cache, new segments).
-        if opened.as_micros() >= 20 {
-            let step = crate::query::steps::Step { op: "open readers".into(), detail: format!("{} segments", readers.len()), start_us: crate::query::steps::us_at(t0), us: crate::query::steps::tenth(opened.as_nanos() as f64 / 1e3), ..Default::default() };
-            rs.stats.steps.insert(0, step);
-        }
+        opened_step(&mut rs.stats, t0, opened, readers.len());
         Ok(rs)
+    }
+
+    /// [`Db::execute`] for DataFusion: the rows as Arrow columns when there
+    /// are more than `over` ([`Executor::execute_arrow`]).
+    #[cfg(feature = "datafusion")]
+    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, over: usize) -> Result<crate::query::exec::Leaf> {
+        use crate::query::exec::Leaf;
+        crate::query::steps::epoch();
+        let t0 = std::time::Instant::now();
+        let readers = self.readers(snap)?;
+        let opened = t0.elapsed();
+        let mut leaf = Executor::new(snap, &readers, opts).execute_arrow(select, over)?;
+        let stats = match &mut leaf {
+            Leaf::Rows(rs) => &mut rs.stats,
+            Leaf::Arrow(c) => &mut c.stats,
+        };
+        opened_step(stats, t0, opened, readers.len());
+        Ok(leaf)
     }
 
     /// This database's BM25 statistics for the terms `select` scores with,
@@ -1680,7 +1741,7 @@ fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut
             if matches!(d[f], Value::Null) {
                 let t = schema.embed_text(f, d);
                 if let Some(v) = ahead.and_then(|a| a.get(&t)) {
-                    d[f] = Value::Vector(v.clone());
+                    d[f] = embedded_value(schema, f, v.clone());
                 } else if !t.is_empty() {
                     todo.push(j);
                     texts.push(t);
@@ -1688,7 +1749,7 @@ fn embed_known(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &mut
             }
         }
         for (j, v) in todo.into_iter().zip(embed_sources(e.as_ref(), schema, f, &texts, files)?) {
-            docs[j][f] = Value::Vector(v.into());
+            docs[j][f] = embedded_value(schema, f, v.into());
         }
     }
     Ok(())
@@ -1710,10 +1771,31 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
     Ok(known)
 }
 
+/// The value of embedded field `f` of `schema` from what [`embed_sources`]
+/// made: the vector, or the vectors of a multi-vector field one after
+/// another (none: no value).
+fn embedded_value(schema: &Schema, f: usize, v: Arc<[f32]>) -> Value {
+    match &schema.fields[f] {
+        field if field.multi => {
+            let FieldType::Vector { dim, .. } = field.ty else { return Value::Null };
+            match v.is_empty() || dim == 0 {
+                true => Value::Null,
+                false => Value::List(v.chunks(dim).map(|c| Value::Vector(c.into())).collect()),
+            }
+        }
+        _ => Value::Vector(v),
+    }
+}
+
 /// The vectors of field `f` of `schema` for `sources` (as
 /// [`Schema::embed_text`] gives them): of the texts, or of the images or
-/// sounds that the MEDIA values name, decoded a batch at a time.
+/// sounds that the MEDIA values name, decoded a batch at a time. A
+/// multi-vector field's are the vectors of each text's tokens, one after
+/// another ([`Embedder::embed_tokens`]).
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
+    if schema.fields[f].multi {
+        return embed_all_tokens(e, sources);
+    }
     let Some(m) = schema.embeds_media(f) else { return embed_all(e, sources) };
     if schema.fields[m].media == Some(crate::media::MediaKind::Audio) {
         return in_sound_batches(&schema.fields[m].name, sources, files, |inputs| e.embed_inputs(inputs));
@@ -1994,11 +2076,15 @@ fn set_rows(
         tt.set(&key, &schema.fields[f].name, v)?;
     }
     derive_known(derivers, schema, &mut p.rewrites, derived, files)?;
-    embed_known(models, schema, &mut p.rewrites, known, files)?;
     // The rest of each row was read back: its multi-vector values were
-    // pooled when they were written.
-    let assigned: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
-    for doc in p.rewrites {
+    // pooled when they were written. A multi-vector field embedded again
+    // (its text changed) is new, as the fields set are.
+    let embedded: Vec<usize> = (0..schema.fields.len()).filter(|&f| schema.fields[f].multi && models.get(f).is_some_and(Option::is_some)).collect();
+    let fresh: Vec<Vec<usize>> = p.rewrites.iter().map(|d| embedded.iter().copied().filter(|&f| matches!(d[f], Value::Null)).collect()).collect();
+    embed_known(models, schema, &mut p.rewrites, known, files)?;
+    let set: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
+    for (doc, fresh) in p.rewrites.into_iter().zip(fresh) {
+        let assigned: Vec<usize> = set.iter().copied().chain(fresh).collect();
         tt.rewrite(doc, &assigned)?;
     }
     Ok(p.rows)
@@ -2011,6 +2097,30 @@ fn not_live(snap: &Snapshot, pk: usize, mut docs: Vec<Document>) -> Vec<Document
     let mut seen = HashSet::new();
     docs.retain(|d| snap.lookup(&d[pk]).is_none() && seen.insert(Part::of(&d[pk])));
     docs
+}
+
+/// `e`'s vectors of the tokens of `texts` ([`Embedder::embed_tokens`]),
+/// each text's one after another, split across the cores as
+/// [`embed_all`] splits them.
+fn embed_all_tokens(e: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+    let threads = if e.parallel() { std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 16).max(1) } else { 1 };
+    let flat = |c: &[&str]| -> Result<Vec<Vec<f32>>> { Ok(e.embed_tokens(c)?.into_iter().map(|vs| vs.concat()).collect()) };
+    let vectors: Vec<Vec<f32>> = if threads == 1 {
+        flat(&refs)?
+    } else {
+        std::thread::scope(|s| {
+            let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || flat(c))).collect();
+            parts.into_iter().map(|p| p.join().expect("embedding thread")).collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    if vectors.len() != texts.len() {
+        return Err(Error::Schema(format!("model {} made the tokens of {} texts of {}", e.name(), vectors.len(), texts.len())));
+    }
+    Ok(vectors)
 }
 
 /// `e`'s vectors of `texts`, split across the cores for a model computed
@@ -2106,4 +2216,13 @@ impl DocumentSource for StoredSource {
 fn plan_of(snap: &Snapshot, q: &sqlparser::ast::Query, params: &Params) -> Result<Plan> {
     let catalog: Vec<&Schema> = snap.schemas().collect();
     compound::plan_read_query(q, &catalog, params, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).cloned()))
+}
+
+/// Opening segments' readers takes microseconds once they are cached; a
+/// step when it took longer (a cold cache, new segments).
+fn opened_step(stats: &mut crate::query::exec::ExecStats, t0: std::time::Instant, opened: std::time::Duration, segments: usize) {
+    if opened.as_micros() >= 20 {
+        let step = crate::query::steps::Step { op: "open readers".into(), detail: format!("{segments} segments"), start_us: crate::query::steps::us_at(t0), us: crate::query::steps::tenth(opened.as_nanos() as f64 / 1e3), ..Default::default() };
+        stats.steps.insert(0, step);
+    }
 }

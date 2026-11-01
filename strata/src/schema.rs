@@ -304,7 +304,9 @@ pub struct SemanticId {
 /// field holds), or of the image a MEDIA field holds. Writes that leave
 /// the vector out get it computed, and rewrites that change a source
 /// recompute it; a vector a write supplies is kept as given. Queries embed
-/// their text, or an image, with the same model.
+/// their text, or an image, with the same model. A multi-vector field
+/// (`VECTOR(d)[]`) is the vectors of its text's tokens by a model of late
+/// interaction, such as ColBERT ([`crate::embed::Embedder::embed_tokens`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Embed {
     /// Stored or generated TEXT or KEYWORD fields, or one MEDIA field of
@@ -402,12 +404,19 @@ impl Field {
     /// `v` in the form this field's column stores: a BOOL field's value
     /// as 1 or 0 (from a boolean, 1 or 0, or the text `true`, `false`,
     /// `t`, `f`, `1` or `0`), a TIMESTAMP field's as microseconds since
-    /// the epoch (from a timestamp, that integer, or ISO 8601 text), and a
-    /// boolean given to any other INT or FLOAT field as 1 or 0. Any other
-    /// value is returned as it is, for [`crate::value::validate`] to
-    /// judge.
+    /// the epoch (from a timestamp, that integer, or ISO 8601 text), a
+    /// boolean given to any other INT field as 1 or 0, and a FLOAT field's
+    /// value as a FLOAT, as its column reads it back (an integer or a
+    /// boolean as its double, -0.0 as 0.0). Any other value is returned as
+    /// it is, for [`crate::value::validate`] to judge.
     pub fn store(&self, v: crate::value::Value) -> Result<crate::value::Value> {
         use crate::value::Value;
+        let float = |v: Value| match v {
+            Value::Bool(b) => Value::Float(b as i64 as f64),
+            Value::Int(x) => Value::Float(x as f64),
+            Value::Float(x) if x == 0.0 => Value::Float(0.0),
+            v => v,
+        };
         let bad = |v: &Value, want: Logical| Error::Schema(format!("bad value for {}: {v:?} ({})", self.name, want.expects()));
         const BOOL: Logical = Logical::Bool;
         const TIME: Logical = Logical::Timestamp;
@@ -427,7 +436,7 @@ impl Field {
                 None => return Err(bad(&Value::Str(s), TIME)),
             },
             (Some(Logical::Timestamp), v) => return Err(bad(&v, TIME)),
-            (None, Value::Bool(b)) if matches!(self.ty, FieldType::Int | FieldType::Float) => Value::Int(b as i64),
+            (None, Value::Bool(b)) if self.ty == FieldType::Int => Value::Int(b as i64),
             (None, Value::List(xs)) if self.ty == FieldType::Int => Value::List(
                 xs.into_iter()
                     .map(|x| match x {
@@ -436,6 +445,8 @@ impl Field {
                     })
                     .collect(),
             ),
+            (None, Value::List(xs)) if self.ty == FieldType::Float => Value::List(xs.into_iter().map(float).collect()),
+            (None, v) if self.ty == FieldType::Float => float(v),
             (None, v) => v,
         })
     }
@@ -881,8 +892,8 @@ impl Schema {
         }
         for (i, f) in s.fields.iter().enumerate() {
             if f.is_multi_vector() {
-                if f.embed.is_some() || f.references.is_some() || f.not_null || f.default.is_some() {
-                    return Err(Error::Schema(format!("multi-vector field {} takes its vectors from writes: no embed, references, NOT NULL or default", f.name)));
+                if f.references.is_some() || f.not_null || f.default.is_some() {
+                    return Err(Error::Schema(format!("multi-vector field {} takes its vectors from writes or from a model of its text: no references, NOT NULL or default", f.name)));
                 }
                 if f.pool.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
                     return Err(Error::Schema(format!("field {}: pool is a cosine similarity above 0 and at most 1", f.name)));
@@ -912,6 +923,9 @@ impl Schema {
                 return bad("an embedded field needs source fields and a model".into());
             }
             if let Some(m) = e.from.iter().find_map(|src| s.field(src).filter(|g| g.media.is_some())) {
+                if f.multi {
+                    return bad(format!("a multi-vector field embeds text, a vector a token, not the MEDIA field {}", m.name));
+                }
                 if e.from.len() > 1 {
                     return bad(format!("an embedded field embeds one MEDIA field ({}), or text fields, not both", m.name));
                 }

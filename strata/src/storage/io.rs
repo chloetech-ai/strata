@@ -19,8 +19,10 @@
 //!
 //! Directory entries (creating, renaming and removing a file) count as
 //! durable at once, so the directory layout's crash images do not question
-//! them; its calls can still be failed. Reads are not intercepted: the
-//! engine reads the real file, which holds every write.
+//! them; its calls can still be failed. A file whose last name is removed
+//! or renamed over through here is forgotten, since ext4 gives its inode to
+//! the next file created. Reads are not intercepted: the engine reads the
+//! real file, which holds every write.
 
 use std::fs::File;
 use std::io;
@@ -64,12 +66,18 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     imp::call()?;
-    std::fs::rename(from, to)
+    let replaced = imp::last_name(to).filter(|&k| imp::last_name(from) != Some(k));
+    std::fs::rename(from, to)?;
+    imp::forget(replaced);
+    Ok(())
 }
 
 pub fn remove_file(p: &Path) -> io::Result<()> {
     imp::call()?;
-    std::fs::remove_file(p)
+    let removed = imp::last_name(p);
+    std::fs::remove_file(p)?;
+    imp::forget(removed);
+    Ok(())
 }
 
 #[cfg(feature = "fault-injection")]
@@ -80,6 +88,7 @@ mod imp {
     use std::fs::File;
     use std::io;
     use std::os::unix::fs::FileExt;
+    use std::path::Path;
 
     #[inline]
     pub fn write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
@@ -104,6 +113,14 @@ mod imp {
     pub fn call() -> io::Result<()> {
         Ok(())
     }
+
+    #[inline]
+    pub fn last_name(_: &Path) -> Option<()> {
+        None
+    }
+
+    #[inline]
+    pub fn forget(_: Option<()>) {}
 }
 
 #[cfg(feature = "fault-injection")]
@@ -296,6 +313,27 @@ mod imp {
 
     pub fn call() -> io::Result<()> {
         with(|r| r.count()).map(|_| ())
+    }
+
+    /// The recorder's key for the file at `p` when that is its only name,
+    /// so that removing or replacing the name lets the inode go; `None`
+    /// when not recording.
+    pub fn last_name(p: &Path) -> Option<(u64, u64)> {
+        REC.with(|r| r.borrow().is_some()).then_some(())?;
+        let m = std::fs::symlink_metadata(p).ok()?;
+        (m.is_file() && m.nlink() == 1).then(|| key(&m))
+    }
+
+    /// Forgets a file whose last name is gone. Linux's ext4 gives its inode
+    /// to the next file created (once the file is closed), which is a new
+    /// file, not this one.
+    pub fn forget(k: Option<(u64, u64)>) {
+        let Some(k) = k else { return };
+        REC.with(|r| {
+            if let Some(rec) = r.borrow_mut().as_mut() {
+                rec.files.remove(&k);
+            }
+        });
     }
 
     pub fn write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {

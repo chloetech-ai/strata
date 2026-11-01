@@ -91,7 +91,8 @@ pub struct Config {
     /// parts per million.
     pub promote_ppm: u64,
     /// Bugs put back, each as the server had it before the simulator
-    /// found it: a run with one must find it ([`Bug`]).
+    /// found it and the server was fixed: a run with one must find it
+    /// ([`Bug`]).
     pub bugs: Vec<Bug>,
 }
 
@@ -114,16 +115,21 @@ pub enum Bug {
     /// that wrote nothing in it never takes what a newer primary holds of
     /// an older term.
     RefusesOlderTerms,
+    /// A shard's first replicas grant no votes until a primary has called
+    /// them ([`crate::cores::shard::Replica::open`]): if the first primary
+    /// stops before any of them heard from it, no copy is ever elected.
+    WaitsForAFirstCall,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 3] = [Bug::AsksAKnownTerm, Bug::TakesWritesInALease, Bug::RefusesOlderTerms];
+    pub const ALL: [Bug; 4] = [Bug::AsksAKnownTerm, Bug::TakesWritesInALease, Bug::RefusesOlderTerms, Bug::WaitsForAFirstCall];
 
     pub fn name(self) -> &'static str {
         match self {
             Bug::AsksAKnownTerm => "asks-a-known-term",
             Bug::TakesWritesInALease => "takes-writes-in-a-lease",
             Bug::RefusesOlderTerms => "refuses-older-terms",
+            Bug::WaitsForAFirstCall => "waits-for-a-first-call",
         }
     }
 

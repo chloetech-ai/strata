@@ -428,7 +428,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             tracing::info!(replicas = %o.replicas.join(", "), write_acks = o.write_acks.name(), "primary: ships its writes to its replicas");
             svc.set_replication(Replication::Primary(p));
         } else if o.replica {
-            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open_first(db.clone(), Some(file))?)));
             // Its --replicas: the shard's other copies, the ones a
             // promotion ships to (Service::known_copies).
             svc.promote_options = Some(PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, ..ships });
@@ -707,6 +707,8 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The minute the log store last had a row of load for.
+        let mut minute = crate::telemetry::now_ms() / 60_000;
         loop {
             tick.tick().await;
             let Some(svc) = svc.upgrade() else { return };
@@ -716,6 +718,13 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
                 if !changes.is_empty() {
                     let svc = svc.clone();
                     tokio::spawn(async move { svc.alerts.notify(&changes).await });
+                }
+            }
+            let now = crate::telemetry::now_ms();
+            if now / 60_000 != minute {
+                minute = now / 60_000;
+                if let Some((store, load)) = svc.log_store.as_ref().zip(svc.minute_load(now)) {
+                    store.keep_load(load);
                 }
             }
         }

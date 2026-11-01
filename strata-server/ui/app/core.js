@@ -127,6 +127,7 @@ const ICONS = {
   reset: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
   route: '<circle cx="6" cy="19" r="3"/><circle cx="18" cy="5" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/>',
   rollout: '<path d="M3 12h4l3 7 4-14 3 7h4"/>',
+  autoscale: '<path d="M7 20V6M3.5 9.5 7 6l3.5 3.5"/><path d="M17 4v14M13.5 14.5 17 18l3.5-3.5"/>',
   cloud: '<path d="M7 18h10.5a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.3 9.1 4.5 4.5 0 0 0 7 18z"/>',
 };
 

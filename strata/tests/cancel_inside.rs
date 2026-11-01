@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use strata::db::Db;
 use strata::error::Error;
 use strata::graph::{edges_value, Edge};
-use strata::query::exec::ExecOptions;
+use strata::query::exec::{Engine, ExecOptions};
 use strata::query::Params;
 use strata::storage::DbOptions;
 use strata::value::Value;
@@ -134,7 +134,9 @@ fn joins_stop_inside_a_segment() {
     let dir = tempfile::tempdir().unwrap();
     let db = db(dir.path(), 2_400);
     // Every row meets every row of its `c` (800 each), and none passes
-    // the rest of the join condition.
+    // the rest of the join condition: Strata's operators' join loop
+    // (DataFusion, which the feature `datafusion` would run it on, answers
+    // it in a few milliseconds).
     let join = "SELECT x.id, y.id FROM t x JOIN t y ON x.c = y.c AND x.a < y.a - 2000";
-    stops_midway(&db, join, &ExecOptions::default());
+    stops_midway(&db, join, &ExecOptions { engine: Engine::Operators, ..ExecOptions::default() });
 }

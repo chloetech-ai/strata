@@ -338,6 +338,12 @@ class Database(Search):
         an image or sound file, by a model of that."""
         return self._db.embed(text, field, table, None if image is None else bytes(image), None if audio is None else bytes(audio))
 
+    def embed_tokens(self, text: str, field: str, *, table: str | None = None) -> list[list[float]]:
+        """The vectors of `text`'s tokens as a query, by the model of
+        multi-vector field `field` (a ColBERT model, `VECTOR(d)[]` embedded
+        from text), as `maxsim` takes them."""
+        return self._db.embed_tokens(text, field, table)
+
     def sid_next(self, prefixes: Iterable[str], *, field: str, where: str | None = None, params: Mapping[str, Any] | None = None, table: str | None = None, **kw: Any) -> dict[str, dict[str, int]]:
         """The codes that can follow each prefix of semantic-ID field
         `field` (``""`` for the first number) among the rows SQL condition

@@ -1459,6 +1459,22 @@ impl Database {
         self.publish(c, |_| {})
     }
 
+    /// Drops the terms begun after the last transaction, which hold none,
+    /// for `term`, that of the next transaction, which is not older than
+    /// the last's ([`Database::apply_shipped`]), under the writer lock.
+    fn drop_empty_terms(&self, wal: &mut Wal, term: u64) -> Result<()> {
+        let seq = lock(&self.state).seq;
+        let mut vw = VersionWriter::begin(self);
+        let n = vw.manifest.seq_no.as_mut().expect("numbered");
+        n.terms.retain(|&(_, first)| first <= seq);
+        if n.terms.last().is_none_or(|&(t, _)| t < term) {
+            n.terms.push((term, seq + 1));
+        }
+        n.term = term;
+        let c = vw.commit(wal)?;
+        self.publish(c, |_| {})
+    }
+
     /// The numbered transactions from sequence number `from` on, as they
     /// were logged, up to `max_bytes` of them (at least one), for a replica
     /// to apply ([`Database::apply_shipped`]): none when `from` is past the
@@ -1503,7 +1519,11 @@ impl Database {
     /// number's term): when it is not this database's last
     /// ([`Numbering::last`]), nothing is applied ([`Applied::Mismatch`]).
     /// A transaction with a newer term than this database's raises its
-    /// term first.
+    /// term first. One of an older term than this database's, but not
+    /// older than its last transaction's, drops first the terms this
+    /// database began, or took in a copy ([`Database::install_copy`]),
+    /// after its last transaction: they hold none, and a primary of a newer
+    /// term ships what it holds of an older one past this database's last.
     ///
     /// Each transaction is checked before any is applied: an error for one
     /// that is damaged, does not follow the one before it, or comes from an
@@ -1553,12 +1573,10 @@ impl Database {
             if s.seq != at.seq + 1 {
                 return Err(corrupt(format!("shipped transaction {} does not follow {}", s.seq, at.seq)));
             }
-            if s.term < at.term.max(now.term) {
+            if s.term < at.term {
                 return Err(Error::Schema(format!(
                     "shipped transaction {} has term {}, older than term {}: it comes from a primary that another has replaced",
-                    s.seq,
-                    s.term,
-                    at.term.max(now.term)
+                    s.seq, s.term, at.term
                 )));
             }
             at = s;
@@ -1598,6 +1616,12 @@ impl Database {
         let mut at = now.last();
         let mut failed = None;
         for (s, ops) in shipped {
+            if s.term < lock(&self.state).manifest.seq_no.as_ref().map_or(0, |n| n.term) {
+                if let Err(e) = self.drop_empty_terms(&mut wal, s.term) {
+                    failed = Some(e);
+                    break;
+                }
+            }
             if s.term > lock(&self.state).manifest.seq_no.as_ref().map_or(0, |n| n.term) {
                 if let Err(e) = self.raise_term(&mut wal, s.term) {
                     failed = Some(e);

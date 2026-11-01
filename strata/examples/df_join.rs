@@ -7,10 +7,12 @@
 //! cargo run --release --features datafusion --example df_join -- 1000000
 //! ```
 //!
-//! Prints, per query, the median of three runs (or one run, past ten
-//! seconds): the operators (one thread, as they run), DataFusion on one
-//! partition and on four, and the leaves alone (the single-table scans
-//! every engine runs first). `DF_ONLY=i` runs query `i` alone.
+//! Prints, per query, the median of three runs (more for fast queries,
+//! one past ten seconds): the operators (one thread, as they run), DataFusion on one
+//! partition and on four, the default engine (`auto`: the operators when
+//! the leaves read few rows, DataFusion otherwise) and which it chose,
+//! and the leaves alone (the single-table scans every engine runs first).
+//! `DF_ONLY=i` runs query `i` alone.
 
 use std::time::Instant;
 
@@ -54,12 +56,13 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
-/// The median of three runs, or the first alone when it took over ten
-/// seconds.
+/// The median of three runs (up to 51 while they take under 300 ms in
+/// all), or the first alone when it took over ten seconds.
 fn time(f: &mut dyn FnMut() -> ResultSet) -> (f64, ResultSet) {
     let mut ms = Vec::new();
     let mut last = None;
-    for _ in 0..3 {
+    // Three runs, more (up to 51) while they take under 300 ms in all.
+    while ms.len() < 3 || (ms.len() < 51 && ms.iter().sum::<f64>() < 300.0) {
         let t = Instant::now();
         let rs = f();
         ms.push(t.elapsed().as_secs_f64() * 1e3);
@@ -113,8 +116,9 @@ fn main() {
     eprintln!("loaded 2 x {n} rows in {:.1} s", t.elapsed().as_secs_f64());
     let cpu = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|c| c.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())).unwrap_or_default();
     println!("{n} rows a table; {} cores; {cpu}", std::thread::available_parallelism().map_or(0, |n| n.get()));
-    println!("| query | rows | operators | DataFusion, 1 partition | DataFusion, 4 partitions | leaves alone |");
-    println!("|---|---|---|---|---|---|");
+    println!("| query | rows | operators | DataFusion, 1 partition | DataFusion, 4 partitions | auto, 4 partitions | leaves alone |");
+    println!("|---|---|---|---|---|---|---|");
+    let ms = |t: f64| if t < 10.0 { format!("{t:.1} ms") } else { format!("{t:.0} ms") };
     let only: Option<usize> = std::env::var("DF_ONLY").ok().and_then(|v| v.parse().ok());
     for (qi, (name, sql, leaves)) in QUERIES.iter().enumerate() {
         if only.is_some_and(|o| o != qi) {
@@ -125,7 +129,7 @@ fn main() {
         let (t_ops, want) = match db.query_with(sql, &Params::new(), &ops) {
             Ok(_) => {
                 let (t, rs) = time(&mut || db.query_with(sql, &Params::new(), &ops).expect("operators"));
-                (format!("{t:.0} ms"), Some(rs))
+                (ms(t), Some(rs))
             }
             Err(e) => (format!("fails: {e}"), None),
         };
@@ -141,9 +145,16 @@ fn main() {
                 agree(sql, w, &got);
             }
             rows = got.rows.len();
-            cells.push(format!("{t:.0} ms"));
+            cells.push(ms(t));
         }
+        let o = run(Engine::Auto, 4);
+        let (t, got) = time(&mut || db.query_with(sql, &Params::new(), &o).expect("auto"));
+        if let Some(w) = &want {
+            agree(sql, w, &got);
+        }
+        let engine = if got.stats.plan.iter().any(|l| l.starts_with("datafusion:")) { "DataFusion" } else { "operators" };
+        cells.push(format!("{} ({engine})", ms(t)));
         let leaf_ms: f64 = leaves.iter().map(|l| time(&mut || db.query_with(l, &Params::new(), &run(Engine::Operators, 1)).expect("leaf")).0).sum();
-        println!("| {name} | {rows} | {t_ops} | {} | {} | {leaf_ms:.0} ms |", cells[0], cells[1]);
+        println!("| {name} | {rows} | {t_ops} | {} | {} | {} | {} |", cells[0], cells[1], cells[2], ms(leaf_ms));
     }
 }

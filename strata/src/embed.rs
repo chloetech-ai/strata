@@ -12,12 +12,16 @@
 //! * [`BertEmbedder`] (feature `bert`): a BERT encoder with CLS pooling
 //!   through candle, such as `bge-small-en-v1.5` or
 //!   `snowflake-arctic-embed-m-v1.5`. Better vectors, milliseconds a row.
+//! * [`ColbertEmbedder`] (feature `bert`): ColBERT, a vector a token of
+//!   the text, such as `answerai-colbert-small-v1`, for a multi-vector
+//!   field (`VECTOR(d)[]`) ranked by `maxsim` ([`Embedder::embed_tokens`]).
 //! * [`SiglipEmbedder`] (feature `vision`): SigLIP's image and text
 //!   towers through candle, `siglip-base-patch16-224`. A tenth of a second
 //!   an image on a few cores.
 //! * [`HashEmbedder`]: feature hashing of words (`hash:<dim>`), and of an
 //!   image's colours, for tests and demos without model files; it matches
-//!   words and colours, not meanings.
+//!   words and colours, not meanings. For a multi-vector field each word is
+//!   a vector of its own.
 //!
 //! [`open`] finds a model by the name a schema gives it.
 
@@ -55,6 +59,27 @@ pub trait Embedder: Send + Sync {
     /// once instead.
     fn parallel(&self) -> bool {
         true
+    }
+    /// Whether it embeds a text into one vector ([`Embedder::embed`]): all
+    /// do but a model of tokens only, such as ColBERT.
+    fn single(&self) -> bool {
+        true
+    }
+    /// Whether it embeds a text into a vector a token, for a multi-vector
+    /// field (`VECTOR(d)[]`) that `maxsim` ranks: late interaction, as
+    /// ColBERT scores it ([`Embedder::embed_tokens`]).
+    fn tokens(&self) -> bool {
+        false
+    }
+    /// The vectors of documents' tokens, a list a text, for a model whose
+    /// [`Embedder::tokens`] is true.
+    fn embed_tokens(&self, texts: &[&str]) -> Result<Vec<Vec<Vec<f32>>>> {
+        let _ = texts;
+        Err(model_err(format!("model {} embeds a text into one vector, not one a token: a multi-vector field (VECTOR(d)[]) needs a model of late interaction, such as ColBERT", self.name())))
+    }
+    /// The vectors of a search query's tokens ([`Embedder::embed_tokens`]).
+    fn embed_query_tokens(&self, text: &str) -> Result<Vec<Vec<f32>>> {
+        Ok(self.embed_tokens(&[text])?.pop().unwrap_or_default())
     }
     /// What a model behind an API has asked of it since it opened.
     fn usage(&self) -> Option<Usage> {
@@ -217,6 +242,7 @@ pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[
     ("snowflake-arctic-embed-m-v1.5", "Snowflake/snowflake-arctic-embed-m-v1.5", "BERT, 768 dimensions (feature bert)"),
     ("siglip-base-patch16-224", "google/siglip-base-patch16-224", "SigLIP, images and text, 768 dimensions (feature vision)"),
     ("clap-htsat-unfused", "laion/clap-htsat-unfused", "CLAP, sound and text, 512 dimensions (feature audio)"),
+    ("answerai-colbert-small-v1", "answerdotai/answerai-colbert-small-v1", "ColBERT, a 96-dimension vector a token, for a multi-vector field (feature bert)"),
 ];
 
 /// The dimensions of a model [`open`] knows by name (`hash:N` and hosted
@@ -228,7 +254,7 @@ pub fn known_dim(model: &str) -> Option<usize> {
     if let Some(k) = crate::hosted::known_model(model) {
         return Some(k.dim);
     }
-    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("siglip-base-patch16-224", 768), ("clap-htsat-unfused", 512)];
+    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("siglip-base-patch16-224", 768), ("clap-htsat-unfused", 512), ("answerai-colbert-small-v1", 96)];
     dims.iter().find(|(m, _)| m.eq_ignore_ascii_case(model)).map(|&(_, d)| d)
 }
 
@@ -250,7 +276,7 @@ fn missing_feature(name: &str) -> Option<&'static str> {
     match name {
         n if n.starts_with("siglip") => (!cfg!(feature = "vision")).then_some("vision"),
         n if n.starts_with("clap") => (!cfg!(feature = "audio")).then_some("audio"),
-        n if n.starts_with("bge") || n.starts_with("snowflake") => (!cfg!(feature = "bert")).then_some("bert"),
+        n if n.starts_with("bge") || n.starts_with("snowflake") || n.starts_with("answerai-colbert") => (!cfg!(feature = "bert")).then_some("bert"),
         _ => None,
     }
 }
@@ -328,11 +354,14 @@ pub fn catalog(models: &Path) -> Vec<Listed> {
 }
 
 /// The files the model directory of `name` needs: CLAP's repository
-/// ships its weights as a PyTorch file only.
+/// ships its weights as a PyTorch file only, and a ColBERT checkpoint (a
+/// name with `colbert` in it) has its settings in `artifact.metadata`.
 pub fn model_files(name: &str) -> &'static [&'static str] {
-    match name.starts_with("clap") {
-        true => &["config.json", "tokenizer.json", "pytorch_model.bin"],
-        false => &["config.json", "tokenizer.json", "model.safetensors"],
+    match name {
+        n if n.starts_with("clap") => &["config.json", "tokenizer.json", "pytorch_model.bin"],
+        // A colbert-ai checkpoint: its settings are in artifact.metadata.
+        n if n.to_ascii_lowercase().contains("colbert") => &["config.json", "tokenizer.json", "model.safetensors", "artifact.metadata"],
+        _ => &["config.json", "tokenizer.json", "model.safetensors"],
     }
 }
 
@@ -377,6 +406,12 @@ pub fn open_for(model: &str, dim: Option<usize>, models: &Path) -> Result<Arc<dy
         return Err(model_err(format!("model {model}: no {} (fetch it first)", dir.join("model.safetensors").display())));
     }
     let config: serde_json::Value = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    if config["model_type"] == "bert" && dir.join("artifact.metadata").exists() {
+        #[cfg(feature = "bert")]
+        return Ok(Arc::new(ColbertEmbedder::open(&dir)?));
+        #[cfg(not(feature = "bert"))]
+        return Err(model_err(format!("model {model} is a ColBERT model: build with the `bert` feature")));
+    }
     if config["model_type"] == "bert" {
         #[cfg(feature = "bert")]
         return Ok(Arc::new(BertEmbedder::open(&dir)?));
@@ -564,6 +599,13 @@ impl Embedder for HashEmbedder {
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| self.of_words(t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()))).collect())
     }
+    fn tokens(&self) -> bool {
+        true
+    }
+    /// A vector a word, so that `maxsim` counts the query's words a row has.
+    fn embed_tokens(&self, texts: &[&str]) -> Result<Vec<Vec<Vec<f32>>>> {
+        Ok(texts.iter().map(|t| t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| self.of_words(std::iter::once(w))).collect()).collect())
+    }
     fn modalities(&self) -> &'static [Modality] {
         &[Modality::Text, Modality::Image]
     }
@@ -665,6 +707,176 @@ impl Embedder for BertEmbedder {
     }
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         Ok(self.run(&[format!("{}{text}", Self::QUERY_PREFIX)])?.pop().unwrap_or_default())
+    }
+}
+
+// ---------------------------------------------------------------- colbert
+
+/// ColBERT: a BERT encoder whose every token's output, projected to `dim`
+/// dimensions and scaled to unit length, is a vector of the text, for a
+/// multi-vector field that `maxsim` ranks (late interaction). It reads a
+/// checkpoint of the `colbert-ai` library (`artifact.metadata` beside
+/// `config.json`, `tokenizer.json` and `model.safetensors`, whose
+/// `linear.weight` is the projection), such as
+/// `answerdotai/answerai-colbert-small-v1` (96 dimensions) or
+/// `colbert-ir/colbertv2.0` (128), as the library reads it:
+///
+/// * a document is `[CLS] [D] text [SEP]`, cut to `doc_maxlen` tokens,
+///   and its punctuation's vectors are left out (`mask_punctuation`);
+/// * a query is `[CLS] [Q] text [SEP]`, cut or padded with `[MASK]` to
+///   `query_maxlen` tokens, each of them a vector (query augmentation); the
+///   masks are attended to only if `attend_to_mask_tokens`.
+#[cfg(feature = "bert")]
+pub struct ColbertEmbedder {
+    model: candle_transformers::models::bert::BertModel,
+    /// The projection: `dim` rows of the hidden size.
+    linear: candle_core::Tensor,
+    tokenizer: tokenizers::Tokenizer,
+    cls: u32,
+    sep: u32,
+    mask: u32,
+    pad: u32,
+    query_marker: u32,
+    doc_marker: u32,
+    query_len: usize,
+    doc_len: usize,
+    attend_masks: bool,
+    /// The tokens of ASCII punctuation, whose vectors documents leave out.
+    punctuation: std::collections::HashSet<u32>,
+    dim: usize,
+    name: String,
+}
+
+#[cfg(feature = "bert")]
+impl ColbertEmbedder {
+    pub fn open(dir: &Path) -> Result<ColbertEmbedder> {
+        use candle_nn::VarBuilder;
+        use candle_transformers::models::bert::{BertModel, Config};
+        let e = |x: String| model_err(format!("{}: {x}", dir.display()));
+        let text = std::fs::read_to_string(dir.join("config.json")).map_err(|x| e(x.to_string()))?;
+        let cfg: Config = serde_json::from_str(&text).map_err(|x| e(x.to_string()))?;
+        let config: serde_json::Value = serde_json::from_str(&text).map_err(|x| e(x.to_string()))?;
+        let hidden = config["hidden_size"].as_u64().ok_or_else(|| e("config.json has no hidden_size".into()))? as usize;
+        let positions = config["max_position_embeddings"].as_u64().unwrap_or(512) as usize;
+        let meta = std::fs::read_to_string(dir.join("artifact.metadata")).map_err(|x| e(x.to_string()))?;
+        let meta: serde_json::Value = serde_json::from_str(&meta).map_err(|x| e(format!("artifact.metadata: {x}")))?;
+        let num = |k: &str, default: u64| meta[k].as_u64().unwrap_or(default) as usize;
+        let (dim, query_len, doc_len) = (num("dim", 128), num("query_maxlen", 32), num("doc_maxlen", 180));
+        if let Some(s) = meta["similarity"].as_str().filter(|s| *s != "cosine") {
+            return Err(e(format!("artifact.metadata: similarity {s}: Strata scores ColBERT's cosine")));
+        }
+        if query_len < 4 || doc_len < 4 || query_len > positions || doc_len > positions {
+            return Err(e(format!("artifact.metadata: query_maxlen {query_len} and doc_maxlen {doc_len} are 4 to {positions} tokens")));
+        }
+        let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|x| e(x.to_string()))?;
+        // Texts are cut and padded here, as colbert-ai does.
+        tokenizer.with_truncation(None).map_err(|x| e(x.to_string()))?;
+        tokenizer.with_padding(None);
+        let id = |t: &str| tokenizer.token_to_id(t).ok_or_else(|| e(format!("tokenizer.json has no token {t}")));
+        let (cls, sep, mask, pad) = (id("[CLS]")?, id("[SEP]")?, id("[MASK]")?, id("[PAD]")?);
+        let query_marker = id(meta["query_token_id"].as_str().unwrap_or("[unused0]"))?;
+        let doc_marker = id(meta["doc_token_id"].as_str().unwrap_or("[unused1]"))?;
+        // As colbert-ai: the first token of each ASCII punctuation mark.
+        let punctuation = match meta["mask_punctuation"].as_bool().unwrap_or(true) {
+            true => "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".chars().filter_map(|c| tokenizer.encode(c.to_string(), false).ok()?.get_ids().first().copied()).collect(),
+            false => Default::default(),
+        };
+        let dev = candle_core::Device::Cpu;
+        // SAFETY: the weights file is not modified while mapped.
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], candle_core::DType::F32, &dev) }.map_err(|x| e(x.to_string()))?;
+        let model = BertModel::load(vb.pp("bert"), &cfg).map_err(|x| e(x.to_string()))?;
+        let linear = vb.get((dim, hidden), "linear.weight").map_err(|x| e(format!("linear.weight: {x}")))?;
+        let name = format!("colbert:{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        Ok(ColbertEmbedder {
+            model,
+            linear,
+            tokenizer,
+            cls,
+            sep,
+            mask,
+            pad,
+            query_marker,
+            doc_marker,
+            query_len,
+            doc_len,
+            attend_masks: meta["attend_to_mask_tokens"].as_bool().unwrap_or(false),
+            punctuation,
+            dim,
+            name,
+        })
+    }
+
+    /// `[CLS] marker text [SEP]`, the text cut so that all of it is at most
+    /// `len` tokens: colbert-ai's `". " + text` with its `.` replaced by
+    /// the marker.
+    fn ids(&self, text: &str, len: usize, marker: u32) -> Result<Vec<u32>> {
+        let enc = self.tokenizer.encode(text, false).map_err(|x| model_err(format!("{}: {x}", self.name)))?;
+        let mut ids = Vec::with_capacity(len);
+        ids.extend([self.cls, marker]);
+        ids.extend(enc.get_ids().iter().take(len - 3));
+        ids.push(self.sep);
+        Ok(ids)
+    }
+
+    /// The unit vectors of every position of `seqs` (padded to the
+    /// longest, `attend` saying which positions are attended to).
+    fn run(&self, seqs: &[Vec<u32>], attend: &[Vec<u32>]) -> Result<Vec<Vec<Vec<f32>>>> {
+        use candle_core::Tensor;
+        let attempt = || -> std::result::Result<Vec<Vec<Vec<f32>>>, Box<dyn std::error::Error>> {
+            let len = seqs.iter().map(Vec::len).max().unwrap_or(0);
+            let pad = |v: &Vec<u32>, with: u32| v.iter().copied().chain(std::iter::repeat(with)).take(len).collect::<Vec<u32>>();
+            let dev = candle_core::Device::Cpu;
+            let ids = Tensor::new(seqs.iter().map(|s| pad(s, self.pad)).collect::<Vec<_>>(), &dev)?;
+            let mask = Tensor::new(attend.iter().map(|a| pad(a, 0)).collect::<Vec<_>>(), &dev)?;
+            let types = ids.zeros_like()?;
+            let out = self.model.forward(&ids, &types, Some(&mask))?;
+            let mut v = out.broadcast_matmul(&self.linear.t()?)?.to_vec3::<f32>()?;
+            v.iter_mut().flatten().for_each(|x| normalize(x));
+            Ok(v)
+        };
+        attempt().map_err(|x| model_err(format!("{}: {x}", self.name)))
+    }
+}
+
+#[cfg(feature = "bert")]
+impl Embedder for ColbertEmbedder {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Err(model_err(format!("model {} embeds a text into a vector a token: it is the model of a multi-vector field (VECTOR({})[])", self.name, self.dim)))
+    }
+    fn single(&self) -> bool {
+        false
+    }
+    fn tokens(&self) -> bool {
+        true
+    }
+    fn embed_tokens(&self, texts: &[&str]) -> Result<Vec<Vec<Vec<f32>>>> {
+        let seqs = texts.iter().map(|t| self.ids(t, self.doc_len, self.doc_marker)).collect::<Result<Vec<_>>>()?;
+        // Batches of similar length waste less on padding.
+        let mut order: Vec<usize> = (0..seqs.len()).collect();
+        order.sort_by_key(|&i| seqs[i].len());
+        let mut out = vec![Vec::new(); seqs.len()];
+        for chunk in order.chunks(16) {
+            let batch: Vec<Vec<u32>> = chunk.iter().map(|&i| seqs[i].clone()).collect();
+            let attend: Vec<Vec<u32>> = batch.iter().map(|s| vec![1; s.len()]).collect();
+            for (&i, vs) in chunk.iter().zip(self.run(&batch, &attend)?) {
+                let ids = &seqs[i];
+                out[i] = vs.into_iter().zip(ids).filter(|(_, id)| !self.punctuation.contains(*id)).map(|(v, _)| v).collect();
+            }
+        }
+        Ok(out)
+    }
+    fn embed_query_tokens(&self, text: &str) -> Result<Vec<Vec<f32>>> {
+        let mut ids = self.ids(text, self.query_len, self.query_marker)?;
+        let mut attend = vec![1u32; ids.len()];
+        ids.resize(self.query_len, self.mask);
+        attend.resize(self.query_len, u32::from(self.attend_masks));
+        Ok(self.run(&[ids], &[attend])?.pop().unwrap_or_default())
     }
 }
 

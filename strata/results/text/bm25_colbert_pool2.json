@@ -1,0 +1,88 @@
+{
+  "collections": {
+    "nfcorpus": {
+      "colbert": {
+        "model": "answerai-colbert-small-v1",
+        "pool_factor": 2.0
+      },
+      "db_bytes": 68042768,
+      "docs": 3633,
+      "load_s": 619.530214925,
+      "queries": 323,
+      "variants": {
+        "colbert_rerank100": {
+          "failed": 0,
+          "ms_mean": 93.73520453560371,
+          "ms_p50": 94.66267,
+          "ms_p99": 117.619584,
+          "ndcg10": 0.35935650626257326,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.1667187733878594
+        },
+        "colbert_rerank20": {
+          "failed": 0,
+          "ms_mean": 93.68039174303414,
+          "ms_p50": 92.305313,
+          "ms_p99": 143.055543,
+          "ndcg10": 0.35463704512932365,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.16194327139783793
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.10269205882352944,
+          "ms_p50": 0.090438,
+          "ms_p99": 0.376025,
+          "ndcg10": 0.32943148217697804,
+          "recall10": 0.15643383983134085
+        }
+      }
+    },
+    "scifact": {
+      "colbert": {
+        "model": "answerai-colbert-small-v1",
+        "pool_factor": 2.0
+      },
+      "db_bytes": 96952336,
+      "docs": 5183,
+      "load_s": 882.879286158,
+      "queries": 300,
+      "variants": {
+        "colbert_rerank100": {
+          "failed": 0,
+          "ms_mean": 88.97400160333336,
+          "ms_p50": 88.92499099999999,
+          "ms_p99": 107.64146600000001,
+          "ndcg10": 0.7483576890122831,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.8495555555555556
+        },
+        "colbert_rerank20": {
+          "failed": 0,
+          "ms_mean": 87.89993636,
+          "ms_p50": 86.752694,
+          "ms_p99": 161.81811900000002,
+          "ndcg10": 0.7407361747664802,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.8321111111111111
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.19188076333333345,
+          "ms_p50": 0.168847,
+          "ms_p99": 0.48848800000000003,
+          "ndcg10": 0.6909863461109057,
+          "recall10": 0.8268333333333334
+        }
+      }
+    }
+  },
+  "machine": {
+    "arch": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpus": 4,
+    "os": "linux"
+  },
+  "split": "test",
+  "tag": "colbert_pool2"
+}

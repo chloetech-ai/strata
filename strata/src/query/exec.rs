@@ -253,15 +253,21 @@ pub struct ExecOptions {
 }
 
 /// The engine of a plan's operators ([`crate::query::ops`] or
-/// [`crate::query::df`]).
+/// [`crate::query::df`]). Without the feature `datafusion`, the operators
+/// run every plan, whichever is chosen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Engine {
-    /// Strata's operators, in memory ([`crate::query::ops`]).
-    #[default]
+    /// Strata's operators, in memory ([`crate::query::ops`]): the default
+    /// without the feature `datafusion`.
+    #[cfg_attr(not(feature = "datafusion"), default)]
     Operators,
-    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for the
-    /// plans it lowers; the operators run the others. Without the feature,
-    /// the operators run every plan.
+    /// DataFusion for a plan whose leaves read more than a few thousand
+    /// rows (`query::df::SMALL`), the operators for the others, which
+    /// they answer faster; the default with the feature `datafusion`.
+    #[cfg_attr(feature = "datafusion", default)]
+    Auto,
+    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for every
+    /// plan it lowers; the operators run the others.
     DataFusion,
     /// [`Engine::DataFusion`], and a plan it does not lower fails with
     /// the reason instead of running on the operators (to find what the
@@ -270,14 +276,17 @@ pub enum Engine {
 }
 
 impl Engine {
-    /// `STRATA_ENGINE=datafusion` picks [`Engine::DataFusion`],
-    /// `datafusion-only` [`Engine::DataFusionOnly`]; anything else, or
-    /// nothing, the operators.
+    /// `STRATA_ENGINE`: `operators`, `auto`, `datafusion` or
+    /// `datafusion-only`; anything else, or nothing, the default
+    /// ([`Engine::Auto`] with the feature `datafusion`, the operators
+    /// without).
     pub fn from_env() -> Engine {
         match std::env::var("STRATA_ENGINE").as_deref() {
+            Ok("operators") => Engine::Operators,
+            Ok("auto") => Engine::Auto,
             Ok("datafusion") => Engine::DataFusion,
             Ok("datafusion-only") => Engine::DataFusionOnly,
-            _ => Engine::Operators,
+            _ => Engine::default(),
         }
     }
 }
@@ -418,6 +427,15 @@ pub struct ResultSet {
     pub stats: ExecStats,
 }
 
+/// A search leaf's rows for DataFusion ([`Executor::execute_arrow`]):
+/// as rows, or as Arrow columns.
+#[derive(Debug)]
+pub enum Leaf {
+    Rows(ResultSet),
+    #[cfg(feature = "datafusion")]
+    Arrow(crate::query::arrow::Columns),
+}
+
 /// What a coordinator ranks a shard's rows by, row by row, so that it ranks
 /// the rows of several shards once ([`crate::cluster::merge`]): the inputs
 /// of a fused score (a ranking expression, RRF, a weighted sum), and the
@@ -454,6 +472,43 @@ struct PerGroup {
 enum GroupKey<'k> {
     Str(&'k str),
     Int(i64),
+}
+
+/// What [`Executor::projecting`] reads for a projection.
+struct Projecting {
+    stored: Vec<usize>,
+    features: Vec<Option<Vec<f64>>>,
+    /// Each segment's last decompressed doc store block: rows in docID
+    /// order (a scan) decompress each block once rather than once a row.
+    blocks: HashMap<usize, forward::StoreCache>,
+}
+
+/// A row's value in a column, as the executor finds it: made for it, a
+/// stored field fetched, or a keyword column's text.
+enum Cell<'c> {
+    Value(Value),
+    Ref(&'c Value),
+    Str(&'c str),
+}
+
+impl Cell<'_> {
+    fn into_value(self) -> Value {
+        match self {
+            Cell::Value(v) => v,
+            Cell::Ref(v) => v.clone(),
+            Cell::Str(x) => Value::Str(x.to_string()),
+        }
+    }
+
+    /// About the bytes the value holds ([`crate::query::memory::value_bytes`]).
+    #[cfg(feature = "datafusion")]
+    fn bytes(&self) -> u64 {
+        match self {
+            Cell::Value(v) => crate::query::memory::value_bytes(v),
+            Cell::Ref(v) => crate::query::memory::value_bytes(v),
+            Cell::Str(x) => std::mem::size_of::<Value>() as u64 + x.len() as u64,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1037,7 +1092,24 @@ impl<'a> Executor<'a> {
         Ok(Some(q.at_level(m)))
     }
 
-    pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
+    pub fn execute(self, q: &Select) -> Result<ResultSet> {
+        match self.answer(q, None)? {
+            Leaf::Rows(rs) => Ok(rs),
+            #[cfg(feature = "datafusion")]
+            Leaf::Arrow(_) => unreachable!("rows asked for"),
+        }
+    }
+
+    /// [`Executor::execute`], with the rows as Arrow columns when there are
+    /// more than `over` of them and the query neither groups nor counts
+    /// (nor runs for a coordinator): what DataFusion reads, without the
+    /// rows being made first.
+    #[cfg(feature = "datafusion")]
+    pub fn execute_arrow(self, q: &Select, over: usize) -> Result<Leaf> {
+        self.answer(q, Some(over))
+    }
+
+    fn answer(mut self, q: &Select, arrow_over: Option<usize>) -> Result<Leaf> {
         let m = self.mark();
         let settled = self.settle_guard(q)?;
         if q.guard.is_some() {
@@ -1083,7 +1155,7 @@ impl<'a> Executor<'a> {
                 q.typed(&mut rows);
                 rows
             };
-            return Ok(empty(columns, rows, self.stats));
+            return Ok(Leaf::Rows(empty(columns, rows, self.stats)));
         }
         let has_count = q.projection.iter().any(|(_, p)| *p == Projection::Count);
         if has_count {
@@ -1095,7 +1167,7 @@ impl<'a> Executor<'a> {
             self.step(m, "count", String::new(), Some(n as u64));
             let one = self.opts.shard || (q.offset == 0 && q.limit != Some(0));
             let rows = if one { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
-            return Ok(empty(columns, rows, self.stats));
+            return Ok(Leaf::Rows(empty(columns, rows, self.stats)));
         }
         let m = self.mark();
         let hits = self.ordered_hits(q, self.opts.max_rows)?;
@@ -1104,6 +1176,17 @@ impl<'a> Executor<'a> {
         let skip = if self.opts.shard { 0 } else { q.offset };
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
         let m = self.mark();
+        #[cfg(feature = "datafusion")]
+        if arrow_over.is_some_and(|o| hits.len() > o) && !self.opts.shard {
+            if let Some((arrays, keys)) = self.project_arrow(q, &hits)? {
+                self.step(m, "project", format!("{} column{} into Arrow", columns.len(), if columns.len() == 1 { "" } else { "s" }), Some(hits.len() as u64));
+                let scores = hits.iter().map(|h| h.score).collect();
+                let c = crate::query::arrow::Columns { names: columns, arrays, keys, scores, rows: hits.len(), stats: self.stats };
+                return Ok(Leaf::Arrow(c));
+            }
+        }
+        #[cfg(not(feature = "datafusion"))]
+        let _ = arrow_over;
         let mut rows = self.project(q, &hits)?;
         self.step(m, "project", format!("{} column{}", columns.len(), if columns.len() == 1 { "" } else { "s" }), Some(rows.len() as u64));
         // Shards answer with the stored integers, which the merge types.
@@ -1129,7 +1212,7 @@ impl<'a> Executor<'a> {
             parts.get_or_insert_with(RankParts::default).phases = self.phase_parts(&q.phases, &hits)?;
             self.step(m, "phase values", format!("{} phase{}", q.phases.len(), if q.phases.len() == 1 { "" } else { "s" }), Some(hits.len() as u64));
         }
-        Ok(ResultSet { columns, rows, keys, scores, parts, stats: self.stats })
+        Ok(Leaf::Rows(ResultSet { columns, rows, keys, scores, parts, stats: self.stats }))
     }
 
     /// What the step that finds a query's rows is called, and its order.
@@ -3314,7 +3397,9 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn project(&self, q: &Select, hits: &[Hit]) -> Result<Vec<Vec<Value>>> {
+    /// What projecting `hits` reads besides each row's own cells: the
+    /// stored fields to fetch, and each ranking expression's values.
+    fn projecting(&self, q: &Select, hits: &[Hit]) -> Result<Projecting> {
         if q.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !self.snap.numbers_writes() {
             return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
         }
@@ -3323,13 +3408,14 @@ impl<'a> Executor<'a> {
             .iter()
             .filter_map(|(_, p)| match p {
                 // Vectors live in their index, not the doc store, and a
-                // single-valued KEYWORD's index reads a row's value without
-                // decompressing its stored fields.
+                // single-valued KEYWORD's, INT's or FLOAT's column reads a
+                // row's value without decompressing its stored fields.
                 Projection::Field(i)
                     if self.schema.fields[*i].stored
                         && Some(*i) != self.schema.primary_key
                         && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. })
-                        && !self.keyword_column(*i) =>
+                        && !self.keyword_column(*i)
+                        && !self.numeric_column(*i) =>
                 {
                     Some(*i)
                 }
@@ -3345,43 +3431,117 @@ impl<'a> Executor<'a> {
                 _ => Ok(None),
             })
             .collect::<Result<_>>()?;
+        Ok(Projecting { stored, features, blocks: HashMap::new() })
+    }
+
+    /// The stored fields of hit `h` that the projection reads.
+    fn fetch(&self, p: &mut Projecting, s: &Seg<'a>, h: &Hit) -> Result<Vec<Value>> {
+        Ok(match (s.r.store()?, p.stored.is_empty()) {
+            (Some(store), false) => store.get_fields_cached(h.doc, &p.stored, p.blocks.entry(h.seg).or_default()),
+            _ => Vec::new(),
+        })
+    }
+
+    /// Column `c` (`proj`) of hit `h`, the `r`-th row, whose stored fields
+    /// are `fetched`.
+    fn cell<'c>(&self, p: &Projecting, s: &'c Seg<'a>, h: &Hit, r: usize, c: usize, proj: &Projection, fetched: &'c [Value]) -> Result<Cell<'c>> {
+        Ok(Cell::Value(match proj {
+            Projection::Feature(_) => match p.features[c].as_ref().map(|v| v[r]) {
+                Some(x) if x.is_finite() => Value::Float(x),
+                _ => Value::Null,
+            },
+            // A row without the ordering column's value scores ±inf.
+            Projection::Score if h.score.is_finite() => Value::Float(h.score),
+            Projection::Score => Value::Null,
+            Projection::Count | Projection::Agg { .. } => Value::Null,
+            Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
+            Projection::SeqNo => Value::Int(rowseq::of_view(s.view, h.doc)? as i64),
+            Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
+            Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => self.updates(s, *i).and_then(|u| u.get(*i, h.doc)).cloned().unwrap_or(Value::Null),
+            Projection::Field(i) => match p.stored.iter().position(|x| x == i) {
+                Some(j) => return Ok(fetched.get(j).map_or(Cell::Value(Value::Null), Cell::Ref)),
+                None => return self.unstored_cell(s, *i, h.doc),
+            },
+        }))
+    }
+
+    fn project(&self, q: &Select, hits: &[Hit]) -> Result<Vec<Vec<Value>>> {
+        let mut p = self.projecting(q, hits)?;
         let mut rows = Vec::with_capacity(hits.len());
-        // A segment's last decompressed block: rows in docID order (a scan)
-        // decompress each block once rather than once a row.
-        let mut blocks: HashMap<usize, forward::StoreCache> = HashMap::new();
+        let mut at: Option<Seg<'a>> = None;
         for (r, h) in hits.iter().enumerate() {
-            let s = &self.seg_by_ord(h.seg);
-            let fetched = match (s.r.store()?, stored.is_empty()) {
-                (Some(store), false) => store.get_fields_cached(h.doc, &stored, blocks.entry(h.seg as usize).or_default()),
-                _ => Vec::new(),
-            };
+            if at.as_ref().is_none_or(|s| s.ord != h.seg) {
+                at = Some(self.seg_by_ord(h.seg));
+            }
+            let s = at.as_ref().expect("the hit's segment");
+            let fetched = self.fetch(&mut p, s, h)?;
             let mut row = Vec::with_capacity(q.projection.len());
-            for (c, (_, p)) in q.projection.iter().enumerate() {
-                row.push(match p {
-                    Projection::Feature(_) => match features[c].as_ref().map(|v| v[r]) {
-                        Some(x) if x.is_finite() => Value::Float(x),
-                        _ => Value::Null,
-                    },
-                    // A row without the ordering column's value scores ±inf.
-                    Projection::Score if h.score.is_finite() => Value::Float(h.score),
-                    Projection::Score => Value::Null,
-                    Projection::Count | Projection::Agg { .. } => Value::Null,
-                    Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
-                    Projection::SeqNo => Value::Int(rowseq::of_view(s.view, h.doc)? as i64),
-                    Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
-                    Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => {
-                        self.updates(s, *i).and_then(|u| u.get(*i, h.doc)).cloned().unwrap_or(Value::Null)
-                    }
-                    Projection::Field(i) => match stored.iter().position(|x| x == i) {
-                        Some(j) => fetched.get(j).cloned().unwrap_or(Value::Null),
-                        None => self.unstored_value(s, *i, h.doc),
-                    },
-                });
+            for (c, (_, proj)) in q.projection.iter().enumerate() {
+                row.push(self.cell(&p, s, h, r, c, proj, &fetched)?.into_value());
             }
             self.charge.row(&row)?;
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    /// [`Executor::project`] into Arrow arrays, typed as the answer types
+    /// them ([`Select::typed`]), with the keys' array: `None` when a
+    /// column holds values of more than one type, which only rows can.
+    #[cfg(feature = "datafusion")]
+    fn project_arrow(&self, q: &Select, hits: &[Hit]) -> Result<Option<(Vec<datafusion::arrow::array::ArrayRef>, datafusion::arrow::array::ArrayRef)>> {
+        use crate::query::arrow::Builder;
+        let n = hits.len();
+        let mut p = self.projecting(q, hits)?;
+        let mut cols: Vec<Builder> = q.projection.iter().map(|_| Builder::new()).collect();
+        // The key column, when the projection has one as it is, is the
+        // keys' array too.
+        let pk = q.projection.iter().enumerate().position(|(c, (_, proj))| matches!(proj, Projection::Field(i) if Some(*i) == self.schema.primary_key) && q.types.get(c).copied().flatten().is_none());
+        let mut keys = Builder::new();
+        let mut bytes = 0u64;
+        let mut at: Option<Seg<'a>> = None;
+        for (r, h) in hits.iter().enumerate() {
+            if at.as_ref().is_none_or(|s| s.ord != h.seg) {
+                at = Some(self.seg_by_ord(h.seg));
+            }
+            let s = at.as_ref().expect("the hit's segment");
+            let fetched = self.fetch(&mut p, s, h)?;
+            bytes += 24;
+            for (c, (_, proj)) in q.projection.iter().enumerate() {
+                let b = &mut cols[c];
+                let cell = self.cell(&p, s, h, r, c, proj, &fetched)?;
+                bytes += cell.bytes();
+                let pushed = match (q.types.get(c).copied().flatten(), cell) {
+                    (Some(t), cell) => b.push(t.output(cell.into_value()), n),
+                    (None, Cell::Value(v)) => b.push(v, n),
+                    (None, Cell::Ref(v)) => b.push_ref(v, n),
+                    (None, Cell::Str(x)) => b.push_str(x, n),
+                };
+                if pushed.is_err() {
+                    return Ok(None);
+                }
+            }
+            if pk.is_none() && keys.push(self.key(h), n).is_err() {
+                return Ok(None);
+            }
+            // Counted every 1,024 rows rather than every row.
+            if r % 1024 == 1023 {
+                self.charge.add(std::mem::take(&mut bytes))?;
+            }
+        }
+        self.charge.add(bytes)?;
+        let arrays = match cols.into_iter().map(|b| b.finish(n)).collect::<std::result::Result<Vec<_>, _>>() {
+            Ok(a) => a,
+            Err(_) => return Ok(None),
+        };
+        let keys = match pk {
+            Some(c) => arrays[c].clone(),
+            None => match keys.finish(n) {
+                Ok(k) => k,
+                Err(_) => return Ok(None),
+            },
+        };
+        Ok(Some((arrays, keys)))
     }
 
     /// The value of the ranking expression `score`, which scores each row
@@ -3401,6 +3561,13 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
+    /// Whether the field's values are read from its numeric column: one
+    /// INT or FLOAT a row, which the column holds exactly.
+    fn numeric_column(&self, field: usize) -> bool {
+        let f = &self.schema.fields[field];
+        matches!(f.ty, FieldType::Int | FieldType::Float) && f.indexed && !f.multi
+    }
+
     /// Whether the field's values are read from its keyword column: one
     /// value a row, the value itself (a MEDIA field's column holds its
     /// `sha256`).
@@ -3409,15 +3576,17 @@ impl<'a> Executor<'a> {
         matches!(f.ty, FieldType::Keyword) && f.indexed && !f.multi && f.media.is_none()
     }
 
-    fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
-        match self.schema.fields[field].ty {
+    /// A field read from its index rather than the doc store.
+    fn unstored_cell<'s>(&self, s: &'s Seg<'a>, field: usize, d: DocId) -> Result<Cell<'s>> {
+        Ok(Cell::Value(match self.schema.fields[field].ty {
             FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| v.row_value(d)),
+            FieldType::Int | FieldType::Float if self.numeric_column(field) => s.r.numeric(field)?.map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
-            FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
+            FieldType::Keyword => return Ok(s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Cell::Value(Value::Null), Cell::Str)),
             // A JSON field is always stored.
             FieldType::Text { .. } | FieldType::Sparse | FieldType::Json => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
-        }
+        }))
     }
 }
 

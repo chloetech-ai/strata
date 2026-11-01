@@ -140,7 +140,8 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
             };
             let e = db.embedder_in(&s.table, &field).ok_or_else(|| bad(format!("{field} has no embedding model open (see Database.open's models)")))?;
             match &o["embed"] {
-                Json::String(t) => Value::Vector(e.embed_query(t)?.into()),
+                // A multi-vector field's: the list of the tokens' vectors.
+                Json::String(t) => db.embed_query_in(&s.table, &field, t)?,
                 Json::Object(i) if i.len() == 1 && i.values().all(|v| v.is_string()) => {
                     let (kind, b64) = i.iter().next().expect("one key");
                     let (_, data) = strata::embed::query_file(kind, b64.as_str().unwrap_or_default())?;
@@ -607,7 +608,20 @@ impl Database {
         }
         match py.detach(|| param(&db, &Json::Object(o))).map_err(err)? {
             Value::Vector(v) => Ok(v.to_vec()),
-            _ => unreachable!("an embedding is a vector"),
+            _ => Err(PyValueError::new_err("the field's model embeds a text a vector a token (a multi-vector field): Database.embed_tokens gives them")),
+        }
+    }
+
+    /// The vectors of `text`'s tokens as a query, by the model of
+    /// multi-vector field `field` (ColBERT), as `maxsim` takes them
+    /// ([`Db::embed_query_in`]).
+    #[pyo3(signature = (text, field, table = None))]
+    fn embed_tokens(&self, py: Python<'_>, text: &str, field: &str, table: Option<&str>) -> PyResult<Vec<Vec<f32>>> {
+        let db = self.get()?;
+        let table = table_of(&db, table).map_err(err)?.table.clone();
+        match py.detach(|| db.embed_query_in(&table, field, text)).map_err(err)? {
+            Value::List(vs) => Ok(vs.iter().filter_map(|v| if let Value::Vector(v) = v { Some(v.to_vec()) } else { None }).collect()),
+            _ => Err(PyValueError::new_err(format!("{field} is a field of one vector: Database.embed gives it"))),
         }
     }
 

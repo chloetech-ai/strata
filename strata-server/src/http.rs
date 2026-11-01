@@ -20,7 +20,7 @@
 //! | `GET /v1/export?tables=a,b&fts=false&indexes=false&schemas=false` | | the database as a SQLite file |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
-//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
+//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model; `vectors`, a vector a token, for a multi-vector field's (ColBERT) |
 //! | `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name, and whether each would open here |
 //! | `GET /v1/media/<sha256>` | | the bytes of the file a row's MEDIA value names, by its hash, read as writes read files (`--media-store`, `--media-fetch`); 404 when no row names it, 400 from a coordinator |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
@@ -194,6 +194,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/kube", post(kube_change))
         .route("/v1/admin/kube/plan", post(kube_plan))
         .route("/v1/admin/kube/resume", post(kube_resume))
+        .route("/v1/admin/kube/autoscale/dismiss", post(autoscale_dismiss))
+        .route("/v1/admin/autoscale/replay", post(autoscale_replay))
         .route("/v1/admin/aws", get(aws_status))
         .route("/v1/admin/aws/credentials", put(aws_save).merge(axum::routing::delete(aws_forget)))
         .route("/v1/admin/aws/regions", get(aws_regions))
@@ -966,8 +968,15 @@ async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     let (table, field, _) = app.svc.model(name("table")?, name("field")?)?;
     let p = app.svc.params(Some(&json!({ "v": { "embed": what, "field": field, "table": table } }))).await?;
-    let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
-    Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
+    match p.0.get("v") {
+        Some(strata::value::Value::Vector(v)) => Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] }))),
+        // A multi-vector field's model: a vector a token of the text.
+        Some(strata::value::Value::List(vs)) => {
+            let vectors: Vec<&[f32]> = vs.iter().filter_map(|v| if let strata::value::Value::Vector(v) = v { Some(&v[..]) } else { None }).collect();
+            Ok(AxJson(json!({ "table": table, "field": field, "vectors": vectors })))
+        }
+        _ => Err(ApiError::internal("the text has no vector")),
+    }
 }
 
 /// The file a MEDIA value names, by its SHA-256, for showing it: only a
@@ -1599,6 +1608,97 @@ async fn kube_resume(State(app): State<App>) -> Result<Response, ApiError> {
     let held = l.get().await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?["status"]["rollout"]["held"]["text"].as_str().unwrap_or_default().to_string();
     let j = l.resume().await.map_err(ApiError::bad)?;
     Ok(audited(j, format!("resumed the change of the StrataCluster {}/{}, held as {held}", l.namespace, l.name)))
+}
+
+/// `POST /v1/admin/kube/autoscale/dismiss`: the autoscaler's suggestion
+/// is not made; its rules wait their cooldown before they suggest again.
+async fn autoscale_dismiss(State(app): State<App>) -> Result<Response, ApiError> {
+    let l = kube_link(&app)?;
+    let now = l.get().await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
+    let text = now["status"]["autoscale"]["suggestion"]["text"].as_str().unwrap_or_default().to_string();
+    let j = l.dismiss().await.map_err(ApiError::bad)?;
+    Ok(audited(j, format!("dismissed the autoscaler's suggestion for the StrataCluster {}/{}: {text}", l.namespace, l.name)))
+}
+
+/// The steps of load the servers kept since `since_ms` (each log store's
+/// `load`, a row a server a minute), ten minutes each: the busiest
+/// shard's copies, how busy and how many, and the fullest volume. And
+/// the servers that answered.
+async fn load_steps(app: &App, since_ms: u64) -> Result<(Vec<crate::operator::autoscale::Step>, Json), ApiError> {
+    let sql = "SELECT step, shard, SUM(busy), COUNT(*), MIN(minute), MAX(minute), MAX(disk_used_ratio) FROM load \
+               WHERE ts > :since AND role IN ('primary', 'replica', 'standalone') GROUP BY step, shard LIMIT 10000";
+    let params = strata::query::Params::new().set("since", strata::value::Value::Timestamp(since_ms as i64 * 1000));
+    let timeout = app.svc.timeout_of(0);
+    let store = app.svc.log_store.as_ref();
+    let j = match &app.svc.backend {
+        crate::service::Backend::Cluster(c) => crate::logstore::cluster_query(store, c, sql, &params, timeout).await?,
+        _ => {
+            let store = store.ok_or_else(crate::logstore::none_here)?;
+            let (rs, ms) = store.query(sql, &params, false, timeout).await?;
+            let mut j = js::result(&rs, ms);
+            j["nodes"] = json!([{"node": store.options().node, "rows": rs.rows.len(), "ms": ms}]);
+            j
+        }
+    };
+    // By step: (busy, copies) of each shard, and the fullest volume.
+    let mut by: std::collections::BTreeMap<u64, (f64, f64, Option<f64>)> = Default::default();
+    for r in j["rows"].as_array().into_iter().flatten() {
+        let (Some(step), Some(sum), Some(n)) = (r[0].as_u64(), r[2].as_f64(), r[3].as_f64()) else { continue };
+        let minutes = (r[5].as_f64().unwrap_or(0.0) - r[4].as_f64().unwrap_or(0.0) + 1.0).max(1.0);
+        let (busy, copies) = (sum / n.max(1.0), n / minutes);
+        let e = by.entry(step).or_insert((f64::MIN, 0.0, None));
+        if busy > e.0 {
+            (e.0, e.1) = (busy, copies);
+        }
+        if let Some(d) = r[6].as_f64() {
+            e.2 = Some(e.2.map_or(d, |x: f64| x.max(d)));
+        }
+    }
+    let steps = by.into_iter().map(|(step, (busy, copies, full))| crate::operator::autoscale::Step { at_ms: step * 600_000, busy, copies, full }).collect();
+    Ok((steps, j["nodes"].clone()))
+}
+
+/// `POST /v1/admin/autoscale/replay {"autoscale": rules, "days"?}`: the
+/// rules ([`crate::operator::autoscale`]) on the load the servers kept of
+/// the last `days` (7 at most, the log stores' retention): how busy the
+/// copies would have been, how many there would have been, and each
+/// change, beside the cluster at its size. Nothing is changed. The sizes
+/// it starts from are the `StrataCluster`'s, or the cluster's as it is,
+/// or `sizes` (`{replicas, shards, volume}`).
+async fn autoscale_replay(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    use crate::operator::autoscale::{replay, Autoscale, Sizes};
+    let rules: Autoscale = serde_json::from_value(b.get("autoscale").cloned().unwrap_or(json!({}))).map_err(|e| ApiError::bad(format!("autoscale: {e}")))?;
+    rules.check().map_err(ApiError::bad)?;
+    let days = b.get("days").and_then(Json::as_f64).unwrap_or(7.0);
+    if !(days > 0.0 && days <= 7.0) {
+        return Err(ApiError::bad(format!("days is more than 0 and at most 7 (the log stores keep a week), not {days}")));
+    }
+    let spec = match &app.svc.kube {
+        Some(l) => l.get().await.ok().and_then(|c| serde_json::from_value::<crate::operator::Spec>(c["spec"].clone()).ok()),
+        None => None,
+    };
+    let cluster = app.svc.cluster().await;
+    let shards = cluster["shards"].as_array();
+    let given = &b["sizes"];
+    let n = |k: &str| given[k].as_u64().map(|v| v as usize).filter(|v| *v > 0);
+    let start = Sizes {
+        replicas: n("replicas").or(spec.as_ref().map(|s| s.replicas)).or_else(|| shards?.iter().filter_map(|s| s["replicas"].as_array().map(Vec::len)).max()).unwrap_or(1),
+        shards: n("shards").or(spec.as_ref().map(|s| s.shards)).or_else(|| shards.map(Vec::len)).unwrap_or(1).max(1),
+        volume: given["volume"].as_str().map(String::from).or(spec.as_ref().map(|s| s.storage.size.clone())).unwrap_or_else(|| "10Gi".into()),
+    };
+    let now = crate::telemetry::now_ms();
+    // A step a shard a row: at most 10,000 rows.
+    let days = days.min(10_000.0 / (144.0 * start.shards as f64));
+    let since = now.saturating_sub((days * 86_400_000.0) as u64);
+    let (steps, nodes) = load_steps(&app, since).await?;
+    let mut j = replay(&rules, &steps, &start);
+    j["rules"] = json!(rules.said());
+    j["sizes"] = json!({"replicas": start.replicas, "shards": start.shards, "volume": start.volume});
+    j["sinceMs"] = json!(since);
+    j["days"] = json!(days);
+    j["nodes"] = nodes;
+    j["managed"] = json!(spec.is_some());
+    Ok(AxJson(j))
 }
 
 /// An AWS failure: 400 without credentials or for a region that is no

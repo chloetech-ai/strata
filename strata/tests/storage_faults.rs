@@ -359,3 +359,40 @@ fn in_the_directory_layout_a_failed_call_changes_nothing_but_its_operation() {
 fn in_the_directory_layout_a_full_disk_keeps_what_was_committed() {
     seeds(6, 1).for_each(|s| failing_calls("db.dir", libc::ENOSPC, true, s, ops()));
 }
+
+// Linux's ext4 gives a file's inode to the next file created as soon as
+// the last name of the first is gone. The recorder keys files by inode, so
+// it took such a file for the one before it, and a failing sync rewrote it
+// from that file's content: a sealed log removed after a flush came back as
+// the new log, "damaged at byte 16, and 2 committed transactions follow"
+// (a_full_disk_while_merges_spill_keeps_what_was_committed on CI).
+#[test]
+fn a_file_on_the_inode_of_a_removed_or_replaced_one_is_new_to_the_recorder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let create = |name: &str| std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path(name)).unwrap();
+    let durable = |name: &str| {
+        let f = create(name);
+        io::write_at(&f, &[7; 4096], 0).unwrap();
+        io::sync(&f).unwrap();
+    };
+    // A new file written but not synced, then a sync that fails: the file
+    // holds at most what was written to it.
+    let fresh = |name: &str| {
+        let f = create(name);
+        io::write_at(&f, b"new", 0).unwrap();
+        io::fail_at(Fault { at: io::calls() + 1, errno: libc::EIO, sticky: false, crash: false });
+        assert!(io::sync(&f).is_err());
+        let got = std::fs::read(path(name)).unwrap();
+        assert!(got.len() <= 3 && !got.contains(&7), "{name}: {} bytes, {} of them the removed file's", got.len(), got.iter().filter(|&&b| b == 7).count());
+    };
+    io::arm(1);
+    durable("removed");
+    io::remove_file(&path("removed")).unwrap();
+    fresh("after a removal");
+    durable("replaced");
+    durable("replacement");
+    io::rename(&path("replacement"), &path("replaced")).unwrap();
+    fresh("after a replacement");
+    io::crash();
+}
