@@ -3238,10 +3238,13 @@ impl<'a> Executor<'a> {
             })
             .collect::<Result<_>>()?;
         let mut rows = Vec::with_capacity(hits.len());
+        // A segment's last decompressed block: rows in docID order (a scan)
+        // decompress each block once rather than once a row.
+        let mut blocks: HashMap<usize, forward::StoreCache> = HashMap::new();
         for (r, h) in hits.iter().enumerate() {
             let s = &self.seg_by_ord(h.seg);
             let fetched = match (s.r.store()?, stored.is_empty()) {
-                (Some(store), false) => store.get_fields(h.doc, &stored),
+                (Some(store), false) => store.get_fields_cached(h.doc, &stored, blocks.entry(h.seg as usize).or_default()),
                 _ => Vec::new(),
             };
             let mut row = Vec::with_capacity(q.projection.len());
