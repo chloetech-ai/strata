@@ -20,7 +20,7 @@
 //! | `GET /v1/export?tables=a,b&fts=false&indexes=false&schemas=false` | | the database as a SQLite file |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
-//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
+//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model; `vectors`, a vector a token, for a multi-vector field's (ColBERT) |
 //! | `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name, and whether each would open here |
 //! | `GET /v1/media/<sha256>` | | the bytes of the file a row's MEDIA value names, by its hash, read as writes read files (`--media-store`, `--media-fetch`); 404 when no row names it, 400 from a coordinator |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
@@ -966,8 +966,15 @@ async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     let (table, field, _) = app.svc.model(name("table")?, name("field")?)?;
     let p = app.svc.params(Some(&json!({ "v": { "embed": what, "field": field, "table": table } }))).await?;
-    let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
-    Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
+    match p.0.get("v") {
+        Some(strata::value::Value::Vector(v)) => Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] }))),
+        // A multi-vector field's model: a vector a token of the text.
+        Some(strata::value::Value::List(vs)) => {
+            let vectors: Vec<&[f32]> = vs.iter().filter_map(|v| if let strata::value::Value::Vector(v) = v { Some(&v[..]) } else { None }).collect();
+            Ok(AxJson(json!({ "table": table, "field": field, "vectors": vectors })))
+        }
+        _ => Err(ApiError::internal("the text has no vector")),
+    }
 }
 
 /// The file a MEDIA value names, by its SHA-256, for showing it: only a

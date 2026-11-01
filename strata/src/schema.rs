@@ -304,7 +304,9 @@ pub struct SemanticId {
 /// field holds), or of the image a MEDIA field holds. Writes that leave
 /// the vector out get it computed, and rewrites that change a source
 /// recompute it; a vector a write supplies is kept as given. Queries embed
-/// their text, or an image, with the same model.
+/// their text, or an image, with the same model. A multi-vector field
+/// (`VECTOR(d)[]`) is the vectors of its text's tokens by a model of late
+/// interaction, such as ColBERT ([`crate::embed::Embedder::embed_tokens`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Embed {
     /// Stored or generated TEXT or KEYWORD fields, or one MEDIA field of
@@ -881,8 +883,8 @@ impl Schema {
         }
         for (i, f) in s.fields.iter().enumerate() {
             if f.is_multi_vector() {
-                if f.embed.is_some() || f.references.is_some() || f.not_null || f.default.is_some() {
-                    return Err(Error::Schema(format!("multi-vector field {} takes its vectors from writes: no embed, references, NOT NULL or default", f.name)));
+                if f.references.is_some() || f.not_null || f.default.is_some() {
+                    return Err(Error::Schema(format!("multi-vector field {} takes its vectors from writes or from a model of its text: no references, NOT NULL or default", f.name)));
                 }
                 if f.pool.is_some_and(|p| !(p > 0.0 && p <= 1.0)) {
                     return Err(Error::Schema(format!("field {}: pool is a cosine similarity above 0 and at most 1", f.name)));
@@ -912,6 +914,9 @@ impl Schema {
                 return bad("an embedded field needs source fields and a model".into());
             }
             if let Some(m) = e.from.iter().find_map(|src| s.field(src).filter(|g| g.media.is_some())) {
+                if f.multi {
+                    return bad(format!("a multi-vector field embeds text, a vector a token, not the MEDIA field {}", m.name));
+                }
                 if e.from.len() > 1 {
                     return bad(format!("an embedded field embeds one MEDIA field ({}), or text fields, not both", m.name));
                 }

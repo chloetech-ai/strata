@@ -5,7 +5,9 @@
 //! a brute-force scan; by default it searches binary codes and scores with
 //! SQ8 codes, close to the float32 answer. Rows survive merges, updates
 //! and shards; similar vectors pool at write, by a cosine threshold or a
-//! factor, once; the manifest names the feature.
+//! factor, once; the manifest names the feature. A field can be the
+//! vectors of a text's tokens by a model (ColBERT; here the hash model's
+//! vector a word), embedded at write and again when its text changes.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use strata::cluster;
 use strata::db::{Db, SqlResult};
+use strata::embed::{Embedder, HashEmbedder};
 use strata::query::exec::{ExecOptions, ResultSet};
 use strata::query::stats::TermStats;
 use strata::query::{bind, Params};
@@ -366,10 +369,89 @@ fn multi_vector_fields_refuse_what_they_cannot_do() {
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[] OPTIONS(pool = 0.9, pool_factor = 2))", "not both"),
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3) OPTIONS(pool_factor = 2))", "pool_factor"),
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3) OPTIONS(keep_f32 = true))", "keep_f32"),
-        ("CREATE TABLE z (id KEYWORD PRIMARY KEY, body TEXT, v VECTOR[] OPTIONS(embed = 'body', model = 'hash:16'))", "embed"),
+        ("CREATE TABLE z (id KEYWORD PRIMARY KEY, still MEDIA OPTIONS(kind = 'image'), v VECTOR(16)[] OPTIONS(embed = 'still', model = 'hash:16'))", "not the MEDIA field still"),
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[], sid KEYWORD[] OPTIONS(semantic_id = 'v', codebook = 'c'))", "multi-vector"),
     ] {
         let msg = e(create, &Params::new());
         assert!(msg.contains(what), "{create}: {msg}");
     }
+}
+
+/// The hash model as a model of one vector a text only.
+struct OneVector(HashEmbedder);
+
+impl Embedder for OneVector {
+    fn name(&self) -> String {
+        "one".into()
+    }
+    fn dim(&self) -> usize {
+        self.0.dim
+    }
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
+        self.0.embed(texts)
+    }
+}
+
+#[test]
+fn multi_vector_fields_embed_their_text_a_vector_a_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sql_db(&dir.path().join("d"), "CREATE TABLE d (id KEYWORD PRIMARY KEY, body TEXT, tok VECTOR(64)[] OPTIONS(embed = 'body', model = 'hash:64', index = 'flat', keep_f32 = true))");
+    assert!(db.open_embedders(dir.path()).is_empty());
+    let none = Params::new();
+    db.sql("INSERT INTO d (id, body) VALUES ('a', 'green apples'), ('b', 'red apples'), ('c', 'apple pie'), ('e', '')", &none).unwrap();
+    let hash = HashEmbedder { dim: 64 };
+    let stored = |id: &str| rows(&db, &format!("SELECT tok FROM d WHERE id = '{id}'"), &none).remove(0).remove(0);
+    let want = |text: &str| hash.embed_tokens(&[text]).unwrap().remove(0);
+    assert_eq!(vectors(&stored("a")), want("green apples"), "a vector a word");
+    assert_eq!(vectors(&stored("a")).len(), 2);
+    assert_eq!(stored("e"), Value::Null, "no text, no vectors");
+
+    // A query's words, each matched by its best word in a row: the rows
+    // BM25 finds, ranked again by maxsim.
+    let q = db.embed_query_in("d", "tok", "green apples").unwrap();
+    assert_eq!(vectors(&q).len(), 2);
+    let p = Params::new().set("w", Value::Str("apples".into())).set("q", q);
+    let sql = "WITH top AS (SELECT * FROM d ORDER BY bm25(body, :w) DESC LIMIT 10) SELECT id, score() FROM top ORDER BY maxsim(tok, :q) DESC LIMIT 3";
+    let got = rows(&db, sql, &p);
+    let got: Vec<(String, f64)> = got.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_f64().unwrap())).collect();
+    // (c, "apple pie", is there too if the analyzer stems "apples".)
+    assert_eq!(got.iter().take(2).map(|g| g.0.as_str()).collect::<Vec<_>>(), ["a", "b"], "{got:?}");
+    assert!((got[0].1 - 2.0).abs() < 1e-3, "both words match: {got:?}");
+    assert!((got[1].1 - 1.0).abs() < 0.5, "one word matches: {got:?}");
+
+    // A new text is embedded again; another column's change keeps the vectors.
+    db.sql("UPDATE d SET body = 'green apple pie' WHERE id = 'c'", &none).unwrap();
+    assert_eq!(vectors(&stored("c")), want("green apple pie"));
+    db.sql("INSERT OR REPLACE INTO d (id, body) VALUES ('b', 'red')", &none).unwrap();
+    assert_eq!(vectors(&stored("b")), want("red"));
+    // Vectors a write gives are kept as given.
+    db.sql("INSERT INTO d (id, body, tok) VALUES ('f', 'green', :t)", &Params::new().set("t", Value::List(want("pie").into_iter().map(|v| Value::Vector(v.into())).collect()))).unwrap();
+    assert_eq!(vectors(&stored("f")), want("pie"));
+
+    // A model of one vector a text is refused, and a model of tokens for
+    // a field of one vector.
+    let e = db.set_embedder_in("d", "tok", Arc::new(OneVector(HashEmbedder { dim: 64 }))).unwrap_err().to_string();
+    assert!(e.contains("multi-vector") && e.contains("ColBERT"), "{e}");
+    let e = OneVector(HashEmbedder { dim: 64 }).embed_tokens(&["x"]).unwrap_err().to_string();
+    assert!(e.contains("one vector"), "{e}");
+}
+
+#[test]
+fn token_vectors_pool_when_their_text_is_embedded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sql_db(&dir.path().join("d"), "CREATE TABLE d (id KEYWORD PRIMARY KEY, n INT, body TEXT, tok VECTOR(64)[] OPTIONS(embed = 'body', model = 'hash:64', index = 'flat', keep_f32 = true, pool_factor = 2))");
+    assert!(db.open_embedders(dir.path()).is_empty());
+    let none = Params::new();
+    // Each word twice: a factor of 2 keeps one vector a word.
+    let text = "apple apple pear pear plum plum fig fig";
+    db.sql(&format!("INSERT INTO d (id, n, body) VALUES ('a', 1, '{text}')"), &none).unwrap();
+    let stored = || vectors(&rows(&db, "SELECT tok FROM d WHERE id = 'a'", &none).remove(0).remove(0));
+    let hash = HashEmbedder { dim: 64 };
+    let words = |t: &str| hash.embed_tokens(&[t]).unwrap().remove(0);
+    let close = |got: &[Vec<f32>], want: &[Vec<f32>]| got.len() == want.len() && want.iter().all(|w| got.iter().any(|g| g.iter().zip(w).all(|(a, b)| (a - b).abs() < 1e-5)));
+    assert!(close(&stored(), &words("apple pear plum fig")), "{:?}", stored().len());
+    db.sql("UPDATE d SET n = 2 WHERE id = 'a'", &none).unwrap();
+    assert!(close(&stored(), &words("apple pear plum fig")), "not pooled again");
+    db.sql("UPDATE d SET body = 'kiwi kiwi lime lime' WHERE id = 'a'", &none).unwrap();
+    assert!(close(&stored(), &words("kiwi lime")), "a new text's vectors pool: {}", stored().len());
 }
