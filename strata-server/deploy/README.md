@@ -161,10 +161,17 @@ a set, grows its volumes, and keeps its versions, resumes a hold and rolls
 back on a real API server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
 as `setup-envtest` downloads them).
 
-## On AWS
+## In the cloud
 
-The command center's **AWS** view (an admin key; see
-[the server's docs](../../docs/strata/server.md#on-aws)) writes what runs the
+The command center's **Cloud** view (an admin key; see
+[the server's docs](../../docs/strata/server.md#in-the-cloud)) plans a cluster
+on Amazon EKS or DigitalOcean Kubernetes and writes the files that make it.
+It creates nothing: the commands it gives make the cluster with your own
+tools.
+
+### On AWS
+
+On AWS the view writes what runs the
 operator on EKS: a CloudFormation template (a VPC with public subnets in three
 zones, so no NAT gateway; the EKS cluster with access entries, the key that
 planned it its administrator; a managed node group on Amazon Linux 2023; the
@@ -188,6 +195,36 @@ To delete it, delete the `StrataCluster` and the claims of its volumes first
 (`kubectl -n strata delete pvc --all`): the EBS CSI driver made those
 volumes, not the stack, and they stay and cost otherwise. Then delete the
 stack.
+
+### On DigitalOcean
+
+On DigitalOcean the view writes the body of DOKS's create request (a node
+pool of the size picked, the control plane standard or highly available, no
+automatic upgrades), the operator's manifest, and a `StrataCluster` sized for
+the size picked, its volumes on DOKS's own `do-block-storage` class. It reads
+the sizes, their prices, DOKS's versions and the account's droplet limit with
+the token saved in it, and asks DigitalOcean again before it says a plan would
+be taken. With `doctl` signed in with a token that may create clusters:
+
+```sh
+doctl kubernetes cluster create strata-search --region nyc3 --version 1.37.0-do.2 \
+  --ha=false --auto-upgrade=false --node-pool "name=strata;size=m-4vcpu-32gb;count=3;tag=strata" --wait
+kubectl apply -f strata-search-operator.yaml
+kubectl wait --for condition=established --timeout=180s crd/strataclusters.strata.chloetech.ai
+kubectl apply -f strata-search-cluster.yaml
+```
+
+`doctl` waits for the nodes and points `kubectl` at the new cluster. To
+delete it:
+
+```sh
+kubectl delete -f strata-search-cluster.yaml
+kubectl -n strata delete pvc --all --wait
+doctl kubernetes cluster delete strata-search --dangerous --force
+```
+
+`--dangerous` also deletes the volumes and load balancers the cluster made,
+which would otherwise stay and cost.
 
 ## The fixed layout
 

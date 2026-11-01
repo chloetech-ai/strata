@@ -8,18 +8,25 @@
 //! ([`crate::cluster::rerank_models`]).
 //!
 //! A model is a Hugging Face directory under the models directory, as the
-//! BERT embedders' are ([`crate::embed`]): `config.json` (a
+//! BERT embedders' are ([`crate::embed`]): `config.json`, `tokenizer.json`,
+//! and its weights, `model.onnx` or `model.safetensors`. A `model.onnx`, any
+//! sequence classifier exported to ONNX with one label (int8 ones, as
+//! Hugging Face repositories ship them under `onnx/`, among them), runs
+//! through ONNX Runtime (feature `onnx`) on the CPU, its rows sorted by
+//! length into batches so that little is padding. A `model.safetensors`
+//! runs through candle (feature `bert`), in `f32`: a
 //! `BertForSequenceClassification`, such as `ms-marco-MiniLM-L-6-v2`, or an
 //! `XLMRobertaForSequenceClassification`, such as `bge-reranker-base`, with
-//! one label), `tokenizer.json` and `model.safetensors`. It runs through
-//! candle (feature `bert`), in `f32` on the CPU. The score is the label's
-//! logit, as sentence-transformers' `CrossEncoder.predict` gives it with an
-//! identity activation (`sigmoid()` of it is the probability). The text is
-//! the fields' values joined by a space, NULLs left out, and the query and
-//! text together are cut to 512 tokens, the longer first.
+//! one label. The score is the label's logit, as sentence-transformers'
+//! `CrossEncoder.predict` gives it with an identity activation (`sigmoid()`
+//! of it is the probability). The text is the fields' values joined by a
+//! space, NULLs left out, and the query and text together are cut to
+//! [`MAX_TOKENS`] tokens, the longer first, unless the directory's
+//! `cross_encoder.json` says `{"max_tokens": N}` (at most the model's
+//! length).
 //!
-//! The model's hash, FNV-1a of its three files, goes into the plans that
-//! use it, as a GBDT model's does ([`crate::query::model`]).
+//! The model's hash, FNV-1a of its files, goes into the plans that use it,
+//! as a GBDT model's does ([`crate::query::model`]).
 //!
 //! A model may instead be served elsewhere: a provider's, named
 //! `cohere/rerank-v3.5`, `voyage/rerank-2.5` or
@@ -41,8 +48,20 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::value::Value;
 
-/// The files of a cross-encoder in its directory.
+/// The files of a cross-encoder run by candle, in its directory.
 pub const FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+/// The weights of a cross-encoder run by ONNX Runtime, in its directory
+/// in place of `model.safetensors`.
+pub const ONNX: &str = "model.onnx";
+
+/// A model directory's options for the model ([module docs](self)).
+pub const OPTIONS: &str = "cross_encoder.json";
+
+/// The tokens a query and a row's text are cut to together, unless a
+/// model's options say otherwise: about the length of a passage's first
+/// paragraph, and half the cost of BERT's 512.
+pub const MAX_TOKENS: usize = 256;
 
 /// The built-in cross-encoder ([module docs](self)).
 pub const OVERLAP: &str = "builtin:overlap";
@@ -59,11 +78,29 @@ pub fn is_hosted(name: &str, dir: &Path) -> bool {
 }
 
 /// The files the cross-encoder `name` of `dir` is read from: what a cache
-/// of open models watches for changes.
+/// of open models watches for changes. The options file is among them
+/// whether or not it exists.
 pub fn files(name: &str, dir: &Path) -> Vec<std::path::PathBuf> {
-    match is_hosted(name, dir) {
-        true => vec![dir.join(ENDPOINT)],
-        false => FILES.iter().map(|f| dir.join(f)).collect(),
+    if is_hosted(name, dir) {
+        return vec![dir.join(ENDPOINT)];
+    }
+    let weights = if dir.join(ONNX).exists() { ONNX } else { FILES[2] };
+    [FILES[0], FILES[1], weights, OPTIONS].iter().map(|f| dir.join(f)).collect()
+}
+
+/// The tokens a model's options cut a query and text to ([module docs](self)).
+fn max_tokens(name: &str, dir: &Path) -> Result<usize> {
+    let path = dir.join(OPTIONS);
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(MAX_TOKENS) };
+    let bad = |m: &str| model_err(name, format!("{}: {m}", path.display()));
+    let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| bad(&e.to_string()))?;
+    let o = j.as_object().ok_or_else(|| bad("not an object"))?;
+    if let Some(k) = o.keys().find(|k| *k != "max_tokens") {
+        return Err(bad(&format!("unknown key {k:?} (max_tokens)")));
+    }
+    match o.get("max_tokens") {
+        None => Ok(MAX_TOKENS),
+        Some(v) => v.as_u64().filter(|&n| (8..=1 << 16).contains(&n)).map(|n| n as usize).ok_or_else(|| bad("max_tokens is a number of tokens, from 8")),
     }
 }
 
@@ -71,8 +108,32 @@ pub fn files(name: &str, dir: &Path) -> Vec<std::path::PathBuf> {
 /// Face repository, and what it is.
 pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[
     ("ms-marco-MiniLM-L-6-v2", "cross-encoder/ms-marco-MiniLM-L6-v2", "BERT cross-encoder, 22M parameters, English (feature bert)"),
+    ("ms-marco-MiniLM-L-6-v2-int8", "cross-encoder/ms-marco-MiniLM-L6-v2", "the same in int8, from its repository's ONNX exports (feature onnx)"),
     ("bge-reranker-base", "BAAI/bge-reranker-base", "XLM-RoBERTa cross-encoder, 278M parameters, English and Chinese (feature bert)"),
+    ("gte-reranker-modernbert-base-int8", "Alibaba-NLP/gte-reranker-modernbert-base", "ModernBERT cross-encoder, 149M parameters, English, in int8 (feature onnx)"),
 ];
+
+/// The files `strata-server fetch-model` downloads of the cross-encoder
+/// `name` of [`KNOWN_MODELS`]: each one's path in the repository, and its
+/// name in the model's directory. An int8 model's export is the one made
+/// for this CPU: ARM64's on ARM, AVX-512 VNNI's on an x86-64 that has
+/// VNNI, AVX2's (unsigned activations, which do not saturate without
+/// VNNI) on one that does not.
+pub fn fetch_files(name: &str) -> Option<Vec<(&'static str, &'static str)>> {
+    #[cfg(target_arch = "x86_64")]
+    let vnni = std::arch::is_x86_feature_detected!("avx512vnni");
+    #[cfg(not(target_arch = "x86_64"))]
+    let vnni = false;
+    let onnx = match name {
+        "ms-marco-MiniLM-L-6-v2-int8" if cfg!(target_arch = "aarch64") => "onnx/model_qint8_arm64.onnx",
+        "ms-marco-MiniLM-L-6-v2-int8" if vnni => "onnx/model_qint8_avx512_vnni.onnx",
+        "ms-marco-MiniLM-L-6-v2-int8" => "onnx/model_quint8_avx2.onnx",
+        "gte-reranker-modernbert-base-int8" => "onnx/model_int8.onnx",
+        n if KNOWN_MODELS.iter().any(|m| m.0 == n) => return Some(FILES.iter().map(|&f| (f, f)).collect()),
+        _ => return None,
+    };
+    Some(vec![(FILES[0], FILES[0]), (FILES[1], FILES[1]), (onnx, ONNX)])
+}
 
 /// Whether the model directory `dir` holds a cross-encoder: its
 /// `config.json` names a sequence classifier.
@@ -97,6 +158,8 @@ enum Net {
     Overlap,
     #[cfg(feature = "bert")]
     Bert(bert::Bert),
+    #[cfg(feature = "onnx")]
+    Onnx(onnx::Onnx),
     #[cfg(feature = "hosted")]
     Hosted(crate::hosted::HostedReranker),
 }
@@ -116,18 +179,27 @@ impl CrossEncoder {
             return Self::hosted(name, dir);
         }
         let mut h = Fnv::default();
-        for f in FILES {
-            let path = dir.join(f);
-            let file = std::fs::File::open(&path).map_err(|_| Error::Query(format!("no cross-encoder named {name}: no file {}", path.display())))?;
-            h.read(file)?;
+        for path in files(name, dir) {
+            match std::fs::File::open(&path) {
+                Ok(file) => h.read(file)?,
+                Err(_) if path.ends_with(OPTIONS) => {}
+                Err(_) => return Err(Error::Query(format!("no cross-encoder named {name}: no file {}", path.display()))),
+            }
         }
         let hash = format!("{:016x}", h.0);
+        let max_tokens = max_tokens(name, dir)?;
+        if dir.join(ONNX).exists() {
+            #[cfg(feature = "onnx")]
+            return Ok(CrossEncoder { name: name.into(), hash, net: Net::Onnx(onnx::Onnx::open(dir, max_tokens).map_err(|e| model_err(name, e))?) });
+            #[cfg(not(feature = "onnx"))]
+            return Err(model_err(name, "a model.onnx runs through ONNX Runtime: build Strata with the `onnx` feature"));
+        }
         #[cfg(feature = "bert")]
-        return Ok(CrossEncoder { name: name.into(), hash, net: Net::Bert(bert::Bert::open(name, dir)?) });
+        return Ok(CrossEncoder { name: name.into(), hash, net: Net::Bert(bert::Bert::open(name, dir, max_tokens)?) });
         #[cfg(not(feature = "bert"))]
         {
-            let _ = hash;
-            Err(model_err(name, "a model runs through candle: build Strata with the `bert` feature"))
+            let _ = (hash, max_tokens);
+            Err(model_err(name, "a model.safetensors runs through candle: build Strata with the `bert` feature"))
         }
     }
 
@@ -161,6 +233,17 @@ impl CrossEncoder {
         if let Net::Hosted(m) = &self.net {
             return m.score(query, texts, check);
         }
+        #[cfg(feature = "onnx")]
+        if let Net::Onnx(m) = &self.net {
+            let mut out = vec![0.0; texts.len()];
+            for batch in m.batches(query, texts, BATCH).map_err(|e| model_err(&self.name, e))? {
+                check()?;
+                for (i, x) in m.run(&batch).map_err(|e| model_err(&self.name, e))? {
+                    out[i] = x;
+                }
+            }
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(texts.len());
         for batch in texts.chunks(BATCH) {
             check()?;
@@ -170,6 +253,8 @@ impl CrossEncoder {
                 Net::Bert(m) => out.extend(m.score(query, batch).map_err(|e| model_err(&self.name, e))?),
                 #[cfg(feature = "hosted")]
                 Net::Hosted(_) => unreachable!("scored above"),
+                #[cfg(feature = "onnx")]
+                Net::Onnx(_) => unreachable!("scored above"),
             }
         }
         Ok(out)
@@ -226,6 +311,124 @@ impl Fnv {
                 return Ok(());
             }
             self.0 = buf[..n].iter().fold(self.0, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+mod onnx {
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    use ort::environment::Environment;
+    use ort::session::builder::GraphOptimizationLevel;
+    use ort::session::Session;
+    use ort::value::Tensor;
+    use serde_json::Value as Json;
+
+    type Res<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// ONNX Runtime's environment, made once in a process.
+    fn environment() -> Res<&'static Environment> {
+        static ENV: OnceLock<std::result::Result<Environment, String>> = OnceLock::new();
+        ENV.get_or_init(|| ort::init().with_name("strata").build().map_err(|e| e.to_string())).as_ref().map_err(|e| e.clone().into())
+    }
+
+    /// A sequence classifier exported to ONNX, and its tokenizer.
+    pub struct Onnx {
+        tokenizer: tokenizers::Tokenizer,
+        /// Runs take turns: each runs on every core.
+        session: Mutex<Session>,
+        /// Whether the graph takes `token_type_ids` (BERT's do, XLM-R's not).
+        types: bool,
+        pad: u32,
+    }
+
+    /// Pairs scored in one run: their indices, and their tokens.
+    pub struct Batch {
+        rows: Vec<usize>,
+        encodings: Vec<tokenizers::Encoding>,
+    }
+
+    impl Onnx {
+        /// The model of `dir`, cutting a query and a text to `max_tokens`
+        /// together (or the model's own length, if shorter).
+        pub fn open(dir: &Path, max_tokens: usize) -> Res<Onnx> {
+            let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+            let roberta = c["model_type"].as_str().is_some_and(|t| t.contains("roberta"));
+            let pad = c["pad_token_id"].as_u64().unwrap_or(if roberta { 1 } else { 0 }) as u32;
+            // XLM-RoBERTa's positions start after its padding id.
+            let positions = c["max_position_embeddings"].as_u64().map_or(512, |n| n as usize);
+            let max_tokens = if roberta { positions.saturating_sub(pad as usize + 1) } else { positions }.min(max_tokens);
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let session = Session::builder(environment()?)
+                .map_err(|e| e.to_string())?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| e.to_string())?
+                .with_intra_threads(threads)
+                .map_err(|e| e.to_string())?
+                .commit_from_file(dir.join(super::ONNX))
+                .map_err(|e| format!("model.onnx: {e}"))?;
+            let names: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
+            if let Some(other) = names.iter().find(|n| !["input_ids", "attention_mask", "token_type_ids"].contains(n)) {
+                return Err(format!("model.onnx takes {other:?}: a cross-encoder's graph takes input_ids, attention_mask and token_type_ids").into());
+            }
+            if !names.contains(&"input_ids") || !names.contains(&"attention_mask") {
+                return Err("model.onnx does not take input_ids and attention_mask".into());
+            }
+            let types = names.contains(&"token_type_ids");
+            if session.outputs().is_empty() {
+                return Err("model.onnx has no output".into());
+            }
+            let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|x| format!("tokenizer.json: {x}"))?;
+            tokenizer.with_truncation(Some(tokenizers::TruncationParams { max_length: max_tokens, strategy: tokenizers::TruncationStrategy::LongestFirst, ..Default::default() })).map_err(|x| x.to_string())?;
+            tokenizer.with_padding(None);
+            Ok(Onnx { tokenizer, session: Mutex::new(session), types, pad })
+        }
+
+        /// The pairs of `query` and `texts`, tokenized, in batches of at
+        /// most `size` of about the same length, so that little of a run
+        /// is padding.
+        pub fn batches(&self, query: &str, texts: &[&str], size: usize) -> Res<Vec<Batch>> {
+            // An empty text is no second segment, as transformers'
+            // tokenizers read it.
+            let pairs: Vec<tokenizers::EncodeInput> = texts.iter().map(|t| if t.is_empty() { query.into() } else { (query, *t).into() }).collect();
+            let mut enc: Vec<(usize, tokenizers::Encoding)> = self.tokenizer.encode_batch(pairs, true)?.into_iter().enumerate().collect();
+            enc.sort_by_key(|(i, e)| (e.len(), *i));
+            let mut out = Vec::new();
+            let mut it = enc.into_iter().peekable();
+            while it.peek().is_some() {
+                let (rows, encodings) = it.by_ref().take(size.max(1)).unzip();
+                out.push(Batch { rows, encodings });
+            }
+            Ok(out)
+        }
+
+        /// The logit of each pair of `b`, with its row.
+        pub fn run(&self, b: &Batch) -> Res<Vec<(usize, f64)>> {
+            let (n, len) = (b.encodings.len(), b.encodings.iter().map(|e| e.len()).max().unwrap_or(0));
+            let (mut ids, mut mask, mut types) = (vec![self.pad as i64; n * len], vec![0i64; n * len], vec![0i64; n * len]);
+            for (k, e) in b.encodings.iter().enumerate() {
+                for (j, (&id, &t)) in e.get_ids().iter().zip(e.get_type_ids()).enumerate() {
+                    ids[k * len + j] = id as i64;
+                    mask[k * len + j] = 1;
+                    types[k * len + j] = t as i64;
+                }
+            }
+            let shape = vec![n as i64, len as i64];
+            let tensor = |v: Vec<i64>| Tensor::from_array((shape.clone(), v)).map_err(|e| e.to_string());
+            let (ids, mask) = (tensor(ids)?, tensor(mask)?);
+            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let outputs = match self.types {
+                true => session.run(ort::inputs!["input_ids" => ids, "attention_mask" => mask, "token_type_ids" => tensor(types)?]),
+                false => session.run(ort::inputs!["input_ids" => ids, "attention_mask" => mask]),
+            }
+            .map_err(|e| e.to_string())?;
+            let (_, logits) = outputs[0].try_extract_tensor::<f32>().map_err(|e| format!("the model's output: {e}"))?;
+            if logits.len() != n {
+                return Err(format!("the model gives {} numbers for {n} pairs: a cross-encoder scores with one label", logits.len()).into());
+            }
+            Ok(b.rows.iter().zip(logits).map(|(&i, &x)| (i, x as f64)).collect())
         }
     }
 }
@@ -331,7 +534,7 @@ mod bert {
     }
 
     impl Bert {
-        pub fn open(name: &str, dir: &Path) -> Result<Bert> {
+        pub fn open(name: &str, dir: &Path, max_tokens: usize) -> Result<Bert> {
             let e = |x: String| model_err(name, x);
             let text = std::fs::read_to_string(dir.join("config.json")).map_err(|x| e(x.to_string()))?;
             let c: Json = serde_json::from_str(&text).map_err(|x| e(format!("config.json: {x}")))?;
@@ -394,7 +597,7 @@ mod bert {
             };
             let (pool, classifier) = (pool.map_err(w)?, classifier.map_err(w)?);
             // XLM-RoBERTa's positions start after its padding id.
-            let max_tokens = if roberta { max_positions.saturating_sub(pad as usize + 1) } else { max_positions }.min(512);
+            let max_tokens = if roberta { max_positions.saturating_sub(pad as usize + 1) } else { max_positions }.min(max_tokens);
             let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|x| e(format!("tokenizer.json: {x}")))?;
             tokenizer
                 .with_truncation(Some(tokenizers::TruncationParams { max_length: max_tokens, strategy: tokenizers::TruncationStrategy::LongestFirst, ..Default::default() }))

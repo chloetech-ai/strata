@@ -213,8 +213,9 @@ struct Args {
     /// The most rows a cross-encoder's rerank phase may score, on a
     /// database or a coordinator: a query whose phase asks for more fails
     /// (0: no limit). Twenty abstracts take ms-marco-MiniLM-L-6-v2 about
-    /// 1 s at the median and at most 1.6 s at p99 on four cores, a third of
-    /// the default deadline; a hundred take all of it.
+    /// 1 s at the median and at most 1.3 s at p99 on four cores in f32, a
+    /// quarter of the default deadline; a hundred take about all of it (its
+    /// int8 export, 0.4 s and 2 s).
     #[arg(long, default_value_t = 20)]
     max_rerank: usize,
     /// Memory the running queries may hold together, in MiB: their groups,
@@ -288,12 +289,18 @@ struct Args {
     /// GET /v1/admin/audit).
     #[arg(long)]
     audit_log: Option<PathBuf>,
-    /// The AWS credentials the command center's AWS view saves (default:
+    /// The AWS credentials the command center's cloud view saves (default:
     /// DB.aws.json beside --db, readable by this user only; a coordinator
     /// keeps them in memory without it). Without saved ones, the view uses
     /// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN.
     #[arg(long)]
     aws_file: Option<PathBuf>,
+    /// The DigitalOcean token the command center's cloud view saves
+    /// (default: DB.digitalocean.json beside --db, readable by this user
+    /// only; a coordinator keeps it in memory without it). Without a saved
+    /// one, the view uses DIGITALOCEAN_TOKEN or DIGITALOCEAN_ACCESS_TOKEN.
+    #[arg(long)]
+    digitalocean_file: Option<PathBuf>,
     /// The alert rules' file, JSON (created when the rules are first
     /// edited; default rules in memory without it).
     #[arg(long)]
@@ -638,6 +645,7 @@ async fn main() {
         keys: a.keys,
         audit_log: a.audit_log,
         aws_file: a.aws_file,
+        digitalocean_file: a.digitalocean_file,
         alerts: a.alerts,
         alert_webhook: a.alert_webhook.filter(|u| !u.is_empty()),
         log_store: a.log_store.as_deref().map(|p| (p != "off").then(|| PathBuf::from(p))),
