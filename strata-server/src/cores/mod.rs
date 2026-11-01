@@ -12,13 +12,15 @@
 //!   what its primary ships, a primary shipping, counting the copies that
 //!   hold a write, fencing, and its lease on reads.
 //!
-//! The server does not drive these cores yet: [`crate::replication`] still
-//! decides as it did, and the cores mirror its decisions so that the
-//! simulator exercises them first, but for three bugs the simulator found,
-//! which the cores fix and [`crate::sim::Bug`] puts back: a replica asks
-//! above the newest term a copy told it ([`shard::Replica::heard`]), a
-//! replica promoted by hand waits out the lease of the primary it replaced
+//! The server does not drive these cores yet: [`crate::replication`]
+//! decides on its own, and the cores mirror its decisions so that the
+//! simulator exercises them first. Both fix the three bugs the simulator
+//! found, which [`crate::sim::Bug`] puts back: a replica asks above the
+//! newest term a copy told it ([`shard::Replica::heard`]), a replica
+//! promoted by hand waits out the lease of the primary it replaced
 //! ([`shard::handover_hold`]), and a replica takes what a newer primary
-//! holds of an older term past its last ([`crate::sim::db::ModelDb::apply_shipped`]).
+//! holds of an older term past its last
+//! ([`strata::storage::Database::apply_shipped`], as
+//! [`crate::sim::db::ModelDb::apply_shipped`] models it).
 
 pub mod shard;

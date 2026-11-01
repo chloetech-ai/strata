@@ -322,6 +322,61 @@ fn upsert_one(db: &Db, i: u64) {
     tx.commit().unwrap();
 }
 
+/// A replica that began a term and wrote nothing in it (it was elected,
+/// or installed a copy of a primary that had begun one) takes what a
+/// newer primary holds of an older term past its last: those terms hold
+/// nothing, and are dropped for the transactions shipped, also once it is
+/// opened again. (The cluster simulator found a shard whose replicas
+/// refused them for good.)
+#[test]
+fn a_replica_drops_the_terms_it_wrote_nothing_in_for_its_primary_s() {
+    let dir = tempfile::tempdir().unwrap();
+    for (layout, sync) in [(Layout::SingleFile, false), (Layout::Directory, true)] {
+        let opts = DbOptions { sync, ..options(layout) };
+        let primary = Db::create(&path_for(dir.path(), "p", layout), schema(), opts.clone()).unwrap();
+        let replica_path = path_for(dir.path(), "r", layout);
+        let replica = Db::create(&replica_path, schema(), opts.clone()).unwrap();
+        for db in [&primary, &replica] {
+            db.storage().start_seq_no().unwrap();
+        }
+        for i in 0..3 {
+            upsert_one(&primary, i);
+        }
+        assert_eq!(ship(&primary, &replica, usize::MAX), 3);
+        // Two more of term 1 the replica did not get, and it began terms 2
+        // and 3 with nothing in them; the primary is now of term 4.
+        upsert_one(&primary, 3);
+        upsert_one(&primary, 4);
+        replica.storage().begin_term(2).unwrap();
+        replica.storage().begin_term(3).unwrap();
+        primary.storage().begin_term(4).unwrap();
+        upsert_one(&primary, 5);
+        assert_eq!(ship(&primary, &replica, usize::MAX), 3);
+        assert_eq!(last(&replica), SeqNo { term: 4, seq: 6 });
+        let docs = |db: &Db| db.documents(&db.snapshot()).collect::<Result<Vec<_>, _>>().unwrap().len();
+        assert_eq!(replica.storage().numbering().unwrap(), primary.storage().numbering().unwrap());
+        assert_eq!(primary.storage().numbering().unwrap().terms, [(1, 1), (4, 6)]);
+        assert_eq!(docs(&replica), 6);
+        drop(replica);
+        let replica = Db::open(&replica_path, opts.clone()).unwrap();
+        assert_eq!(replica.storage().numbering().unwrap(), primary.storage().numbering().unwrap(), "opened again");
+        assert_eq!(docs(&replica), 6);
+        // A transaction of a term older than its last's is still refused.
+        let stale = Db::create(&path_for(dir.path(), "s", layout), schema(), opts.clone()).unwrap();
+        stale.storage().start_seq_no().unwrap();
+        for i in 0..7 {
+            upsert_one(&stale, i);
+        }
+        let log = txns(stale.storage().log_from(7, usize::MAX));
+        let e = replica.storage().apply_shipped(last(&replica), &[&*log[0].bytes]).unwrap_err().to_string();
+        assert!(e.contains("older than term 4"), "{e}");
+        assert_eq!(last(&replica), SeqNo { term: 4, seq: 6 });
+        drop((primary, replica, stale));
+        std::fs::remove_dir_all(dir.path()).ok();
+        std::fs::create_dir_all(dir.path()).unwrap();
+    }
+}
+
 /// The ship log keeps the newest transactions up to its bytes, exactly as
 /// they were logged; opening refills it from the WAL, and once a flush has
 /// emptied the WAL it holds the transactions after it. A database that

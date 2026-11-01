@@ -132,9 +132,11 @@ impl Sim {
             }
             self.become_primary(i, core);
         } else {
+            // The first time with --replica; again in the part it keeps.
+            let flags = first && !self.cfg.bugs.contains(&Bug::WaitsForAFirstCall);
             match shard::restart(kept.role.as_ref(), kept.replaced_by.is_some(), true) {
                 Some(Restart::Primary { .. }) => unreachable!("automatic failover starts a primary again as a replica"),
-                _ => self.become_replica(i, kept),
+                _ => self.become_replica(i, kept, flags),
             }
         }
         let after = self.cfg.failover_after;
@@ -145,8 +147,8 @@ impl Sim {
         self.timer(i, every, Timer::Failover);
     }
 
-    fn become_replica(&mut self, i: usize, kept: Kept) {
-        let (r, save) = Replica::open(kept, self.clock(i));
+    fn become_replica(&mut self, i: usize, kept: Kept, flags: bool) {
+        let (r, save) = Replica::open(kept, self.clock(i), flags);
         if let Some(k) = save {
             self.keep(i, &k);
         }
@@ -186,7 +188,7 @@ impl Sim {
         self.note(|| format!("s{i} steps down: a primary of term {term} replaced it"));
         // Its waiting writes were answered when it was fenced.
         let kept = self.copies[i].kept.clone().expect("a primary keeps its part");
-        self.become_replica(i, kept);
+        self.become_replica(i, kept, false);
     }
 
     /// The writes waiting on copy `i`'s primary that may be answered now.
