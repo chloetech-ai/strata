@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>Features · Strata</title>
+<meta name="description" content="Every feature of Strata: full text, columns and JSON, vectors, graphs, ranking, recommendations, SQL and transactions, the server, the cluster and the command center.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="index.html"><i><b></b><b></b><b></b></i>Strata</a>
+  <nav class="nav" aria-label="Site">
+    <a href="features.html" aria-current="page">Features</a>
+    <a href="compare.html">Compare</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="examples.html">Queries</a>
+    <a href="use-cases.html">Use cases</a>
+    <a href="scale.html">Small to big</a>
+  </nav>
+  <div class="top-links"><a href="../">Docs</a><a href="https://github.com/chloetech-ai/strata">GitHub</a></div>
+</div></header>
+<div class="sample-banner gutter"><div class="wrap"><b>Sample</b><span>A draft of the Strata site for review. Status tags say what is on <code>main</code> as of 1 November 2026.</span></div></div>
+
+<main>
+  <div class="gutter"><div class="wrap page-head">
+    <span class="eyebrow">Features</span>
+    <h1>One engine for the database, the search and the ranking</h1>
+    <p class="lede">Each table is indexed four ways at once over the same rows: posting lists for full text, a columnar forward index for structured fields, vector indexes, and graph edges. A cost-based planner chooses, per segment and from exact statistics, how to run each part of a statement.</p>
+    <div class="legend"><span><span class="tag shipped">shipped</span> on main</span><span><span class="tag progress">in progress</span> an open pull request</span><span><span class="tag planned">planned</span> designed, not started</span></div>
+    <nav class="toc" aria-label="Feature families">
+      <a href="#text">Full text</a><a href="#columns">Columns and JSON</a><a href="#vectors">Vectors</a><a href="#graph">Graphs</a><a href="#ranking">Ranking</a><a href="#recs">Recommendations</a><a href="#sql">SQL and storage</a><a href="#server">Server and clients</a><a href="#cluster">Cluster</a><a href="#ops">Command center</a>
+    </nav>
+  </div></div>
+
+  <section class="gutter" id="text"><div class="wrap block">
+    <div class="fam-head"><h2>Full text</h2><span class="fam text">posting lists, BM25</span></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>BM25 and boolean queries</h4><span class="tag shipped">shipped</span></div><p><code>MATCH</code> takes AND, OR, NOT, phrases and groups; <code>bm25()</code> scores. MaxScore and Block-Max WAND skip what cannot reach the top k.</p><a class="more" href="../strata/query-language.html#full-text-match">MATCH</a></div>
+      <div class="feat"><div class="row"><h4>Weighted, required and excluded words</h4><span class="tag shipped">shipped</span></div><p>Word weights, required and excluded words, "x of y" word groups, and <code>AT_LEAST(n, …)</code> over any conditions.</p><a class="more" href="../strata/query-language.html#weights-required-and-excluded-words">Term weights</a></div>
+      <div class="feat"><div class="row"><h4>Typos and synonyms</h4><span class="tag shipped">shipped</span></div><p><code>vacine~</code> finds words within an edit or two; synonym sets expand a query with <code>synonyms =&gt; 1</code>.</p><a class="more" href="../strata/query-language.html#typos-and-synonyms">Typos and synonyms</a></div>
+      <div class="feat"><div class="row"><h4>Autocomplete that tolerates typos</h4><span class="tag shipped">shipped</span></div><p><code>PREFIX(kw, :typed, fuzzy =&gt; 'auto')</code> walks the sorted dictionary as a trie, so its cost follows the values near what was typed.</p><a class="more" href="../strata/query-language.html#prefixes-and-autocomplete">Prefixes</a></div>
+      <div class="feat"><div class="row"><h4>Posting lists from our own study</h4><span class="tag shipped">shipped</span></div><p>Loom and BP128 posting lists. Loom is the size of partitioned Elias-Fano, with 2.4–3.0× faster AND and 3.8–7.7× faster OR.</p><a class="more" href="../posting-lists.html">Posting lists</a></div>
+      <div class="feat"><div class="row"><h4>Analyzers by name and version</h4><span class="tag shipped">shipped</span></div><p><code>english</code> stems and drops stopwords, <code>simple</code> keeps every word. A field records its analyzer, so a version that analyses differently refuses it rather than misread it.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="columns"><div class="wrap block">
+    <div class="fam-head"><h2>Columns and JSON</h2><span class="fam cols">forward index, zone maps</span></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>Typed columns</h4><span class="tag shipped">shipped</span></div><p><code>KEYWORD</code>, <code>INT</code>, <code>FLOAT</code>, <code>BOOL</code>, <code>TIMESTAMP</code> and lists, with <code>NOT NULL</code>, <code>DEFAULT</code> and <code>REFERENCES</code>.</p><a class="more" href="../strata/query-language.html#tables">Tables</a></div>
+      <div class="feat"><div class="row"><h4>Ranges, filters and facets</h4><span class="tag shipped">shipped</span></div><p>Range scans over histograms and zone maps, and <code>GROUP BY</code> over any result for facet counts.</p><a class="more" href="../strata/query-language.html#aggregates">Aggregates</a></div>
+      <div class="feat"><div class="row"><h4>JSON fields</h4><span class="tag shipped">shipped</span></div><p>Keys nobody declared, indexed by path: <code>attrs.voltage &gt;= 5</code>, grouped and sorted; <code>json_paths()</code> lists every path with its counts and types.</p><a class="more" href="../strata/query-language.html#json-fields-keys-no-schema-names">JSON fields</a></div>
+      <div class="feat"><div class="row"><h4>Full text inside JSON</h4><span class="tag progress">in progress</span></div><p>Text values of a JSON field searched with <code>MATCH</code>, and often-used paths promoted to real columns.</p></div>
+      <div class="feat"><div class="row"><h4>Change columns while serving</h4><span class="tag shipped">shipped</span></div><p><code>ALTER TABLE</code> adds, drops and renames columns of tables that hold rows, on one database, its replicas and a cluster.</p><a class="more" href="../strata/query-language.html#changing-a-tables-columns">ALTER TABLE</a></div>
+      <div class="feat"><div class="row"><h4>Clustered, sharded, retained</h4><span class="tag shipped">shipped</span></div><p><code>cluster_by</code> keeps a user's rows together, <code>shard_by</code> places them on one shard, and <code>retain = '400 days'</code> drops old rows at merge.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="vectors"><div class="wrap block">
+    <div class="fam-head"><h2>Vectors</h2><span class="fam vec">HNSW, IVF, 8-bit codes</span></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>HNSW, IVF or exact</h4><span class="tag shipped">shipped</span></div><p>float32, 8-bit or binary codes. HNSW graphs build on 8-bit codes, and merges join their inputs' graphs instead of starting over.</p><a class="more" href="../strata/results.html#vector-indexes">Vector indexes</a></div>
+      <div class="feat"><div class="row"><h4>Filtered search, planned</h4><span class="tag shipped">shipped</span></div><p>Per segment, from exact counts: an exact scan of the matches, the filter inside the HNSW walk, or a post-filter that widens the walk. 1.8–6.1× faster than the best fixed strategy.</p><a class="more" href="../strata/results.html#filtered-vector-search-and-the-planner">The planner</a></div>
+      <div class="feat"><div class="row"><h4>Hybrid fusion</h4><span class="tag shipped">shipped</span></div><p><code>rrf()</code>, and <code>minmax()</code>, <code>tmm()</code> or <code>zscore()</code> in a weighted sum, over BM25, vectors, graphs and columns, under the same filter as their inputs.</p><a class="more" href="../strata/query-language.html#rrfs1-s2--reciprocal-rank-fusion">Fusion</a></div>
+      <div class="feat"><div class="row"><h4>Multi-vector MaxSim</h4><span class="tag shipped">shipped</span></div><p><code>VECTOR(d)[]</code> fields scored by late interaction, as ColBERT and ColPali score them, with token pooling by Ward's linkage.</p><a class="more" href="../strata/query-language.html#maxsimfield-vectors-several-query-vectors">maxsim</a></div>
+      <div class="feat"><div class="row"><h4>MUVERA candidates</h4><span class="tag progress">in progress</span></div><p>Fixed-dimension encodings of multi-vector rows, so late interaction starts from one fast search.</p></div>
+      <div class="feat"><div class="row"><h4>Sparse vectors</h4><span class="tag shipped">shipped</span></div><p><code>SPARSE</code> fields for learned weights such as SPLADE, scored by <code>similarity(field, weights)</code>.</p></div>
+      <div class="feat"><div class="row"><h4>Embeddings on write</h4><span class="tag shipped">shipped</span></div><p>A field says which model embeds which columns: local models, or OpenAI, Cohere, Voyage, Gemini, Mistral, Jina and Ollama. Rows stored before a model opened are filled in later.</p><a class="more" href="../strata/server.html#embedded-vector-fields">Embedded fields</a></div>
+      <div class="feat"><div class="row"><h4>Images and sound</h4><span class="tag shipped">shipped</span></div><p><code>MEDIA</code> fields hold files by reference; SigLIP embeds images and CLAP sound, in one space with text. Captions become searchable text.</p><a class="more" href="../strata/server.html#media-fields">Media fields</a></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="graph"><div class="wrap block">
+    <div class="fam-head"><h2>Graphs</h2><span class="fam graph">edge fields, edge tables</span></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>Edges in rows, or in tables</h4><span class="tag shipped">shipped</span></div><p><code>EDGES</code> fields with labels and weights, or edge tables whose rows are edges, written as events arrive and decayed in place.</p><a class="more" href="../strata/graphs.html">Graphs</a></div>
+      <div class="feat"><div class="row"><h4>Reachability and paths</h4><span class="tag shipped">shipped</span></div><p><code>REACHABLE</code> and <code>PATH</code>, seeded by keys or by any query, restricted by <code>through =&gt;</code>.</p><a class="more" href="../strata/query-language.html#graphs">Graph SQL</a></div>
+      <div class="feat"><div class="row"><h4>Personalized PageRank as a score</h4><span class="tag shipped">shipped</span></div><p><code>ppr()</code> wherever a score goes. Following the citations of the two nearest papers doubles nDCG@20 on arXiv (0.123 to 0.253).</p><a class="more" href="../strata/graphs.html#does-the-graph-help-search">Does it help?</a></div>
+      <div class="feat"><div class="row"><h4>Similarity as edges</h4><span class="tag shipped">shipped</span></div><p>A vector field is a graph too: a row's neighbours are its <code>k</code> most similar rows.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="ranking"><div class="wrap block">
+    <div class="fam-head"><h2>Ranking</h2></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>Ranking expressions</h4><span class="tag shipped">shipped</span></div><p>Any arithmetic of scores and columns, <code>decay()</code> by time or distance, and boosts the top-k loop can still skip on.</p><a class="more" href="../strata/query-language.html#ranking-expressions">Ranking expressions</a></div>
+      <div class="feat"><div class="row"><h4>Rerank phases</h4><span class="tag shipped">shipped</span></div><p>A cheap ranking's top rows, reranked by a costlier one in a <code>WITH</code>, and correlated subqueries that read other rows.</p></div>
+      <div class="feat"><div class="row"><h4>Rank profiles</h4><span class="tag shipped">shipped</span></div><p><code>CREATE RANK PROFILE</code> keeps a ranking with its table, versioned and replicated; queries rank by its name.</p></div>
+      <div class="feat"><div class="row"><h4>LightGBM and XGBoost models</h4><span class="tag shipped">shipped</span></div><p><code>gbdt('model', features…)</code> scores bit for bit as LightGBM and XGBoost do.</p><a class="more" href="../strata/query-language.html#ranking-models-gbdtmodel-features">gbdt</a></div>
+      <div class="feat"><div class="row"><h4>Cross-encoders</h4><span class="tag shipped">shipped</span></div><p>Rerank by a cross-encoder through ONNX Runtime (int8 too) or candle, or by Cohere, Voyage, Jina or your own TEI server.</p><a class="more" href="../strata/query-language.html#cross-encoders-cross_encodermodel-fields-query">cross_encoder</a></div>
+      <div class="feat"><div class="row"><h4>Rank log, interleaving, judgments</h4><span class="tag shipped">shipped</span></div><p>Each query's served rows and features logged for training, team-draft interleaving of two rankings, and relevance judgments by Claude.</p><a class="more" href="../strata/query-language.html#the-rank-log-what-each-query-served">The rank log</a></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="recs"><div class="wrap block">
+    <div class="fam-head"><h2>Recommendations</h2></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>Sequence models in the query</h4><span class="tag shipped">shipped</span></div><p><code>encode('next', history)</code> runs a SASRec-style transformer trained with <code>strata.train</code>, equal to PyTorch's within 2·10⁻⁵.</p><a class="more" href="../strata/query-language.html#sequence-models-encodemodel-history">encode</a></div>
+      <div class="feat"><div class="row"><h4>Items like a user's history</h4><span class="tag shipped">shipped</span></div><p><code>maxsim()</code> over the vectors of a user's last items, or <code>ppr()</code> over what was bought together.</p></div>
+      <div class="feat"><div class="row"><h4>Counted next items</h4><span class="tag shipped">shipped</span></div><p><code>strata.next_items</code> over a table of what came after what, decayed in place without rewriting rows.</p><a class="more" href="../strata/next-items.html">Next items</a></div>
+      <div class="feat"><div class="row"><h4>Semantic IDs</h4><span class="tag shipped">shipped</span></div><p>Residual-quantised codes for each row from its vector, and the next codes of a prefix, for generative retrieval models.</p><a class="more" href="../strata/server.html#semantic-ids">Semantic IDs</a></div>
+      <div class="feat"><div class="row"><h4>Rules in the ranking</h4><span class="tag shipped">shipped</span></div><p><code>MAX 2 PER brand</code>, <code>DISTINCT ON</code>, exclusions by subquery, and <code>min_rows</code> guards, in the same statement.</p></div>
+      <div class="feat"><div class="row"><h4>Evaluation that gates changes</h4><span class="tag shipped">shipped</span></div><p>A recommender gate on a global time split in CI, and a recsys evaluation view in the command center.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="sql"><div class="wrap block">
+    <div class="fam-head"><h2>SQL, storage and transactions</h2></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>SQL</h4><span class="tag shipped">shipped</span></div><p>Joins, subqueries, <code>WITH</code>, <code>DISTINCT ON</code>, aggregates with <code>HAVING</code>, and <code>EXPLAIN</code> with the plan each segment chose.</p><a class="more" href="../strata/query-language.html">Query language</a></div>
+      <div class="feat"><div class="row"><h4>DataFusion for compound plans</h4><span class="tag progress">in progress</span></div><p>Apache DataFusion runs joins and aggregates over Strata's index scans (1M-row joins 2.2–3.8× faster); unions and window functions next.</p></div>
+      <div class="feat"><div class="row"><h4>ACID with snapshot isolation</h4><span class="tag shipped">shipped</span></div><p>Shadow-paged commits and a write-ahead log. Readers never wait for the writer; every crash test recovered a committed prefix.</p><a class="more" href="../strata/index.html#commits-by-shadow-paging">Commits</a></div>
+      <div class="feat"><div class="row"><h4>One file, several tables</h4><span class="tag shipped">shipped</span></div><p>Immutable segments read in place through mmap, in one file or a directory; tables share the file, the log and transactions.</p></div>
+      <div class="feat"><div class="row"><h4>Backups</h4><span class="tag shipped">shipped</span></div><p>Checkpoints copied while the server serves; directory checkpoints share their unchanged segments, for incremental off-site copies.</p><a class="more" href="../strata/server.html#backups">Backups</a></div>
+      <div class="feat"><div class="row"><h4>SQLite in and out</h4><span class="tag shipped">shipped</span></div><p>A SQLite file's tables become Strata tables, and Strata exports to SQLite, from the shell, HTTP or Python.</p><a class="more" href="../strata/sqlite.html">SQLite</a></div>
+      <div class="feat"><div class="row"><h4>Merges that stream</h4><span class="tag progress">in progress</span></div><p>Merges spill sections to disk: on the 2M-passage probe, 7.2 GiB of heap down to 3.9 GiB.</p></div>
+      <div class="feat"><div class="row"><h4>Tested against failure</h4><span class="tag shipped">shipped</span></div><p>Crash tests, simulated power loss, fault injection, fuzzing, Miri over the byte views, and SQLancer's oracles over random SQL.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="server"><div class="wrap block">
+    <div class="fam-head"><h2>Server and clients</h2></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>HTTP JSON and gRPC</h4><span class="tag shipped">shipped</span></div><p>API keys scoped to read, write or admin, TLS, an audit log, deadlines, admission and memory limits.</p><a class="more" href="../strata/server.html#http-api">HTTP API</a></div>
+      <div class="feat"><div class="row"><h4>Writes that hold up</h4><span class="tag shipped">shipped</span></div><p>Conditional writes by sequence number, streams with source offsets, and a Kafka consumer that writes each event once.</p><a class="more" href="../strata/server.html#streams">Streams</a></div>
+      <div class="feat"><div class="row"><h4>Python, both ways</h4><span class="tag shipped">shipped</span></div><p><code>strata.open</code> runs the database in your process; <code>strata.connect</code> is a client of a server with the same methods.</p><a class="more" href="../strata/python.html">Python</a></div>
+      <div class="feat"><div class="row"><h4>Rust and the shell</h4><span class="tag shipped">shipped</span></div><p>The crate itself, and a <code>strata</code> shell that prints the plan it chose.</p></div>
+      <div class="feat"><div class="row"><h4>An agent that answers in SQL</h4><span class="tag shipped">shipped</span></div><p>Ask a question in words; Claude writes and runs read-only SQL against the database and shows it.</p><a class="more" href="../strata/server.html#the-agent">The agent</a></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="cluster"><div class="wrap block">
+    <div class="fam-head"><h2>Cluster</h2></div>
+    <div class="feat-grid">
+      <div class="feat"><div class="row"><h4>Shards behind a coordinator</h4><span class="tag shipped">shipped</span></div><p>Rows placed on shards by slots; the coordinator answers like one database, and hedges slow shards.</p><a class="more" href="../strata/server.html#sharding-one-coordinator-many-shards">Sharding</a></div>
+      <div class="feat"><div class="row"><h4>Slots move while it serves</h4><span class="tag shipped">shipped</span></div><p>Rebalance onto a new shard, or drain one, with queries and writes running.</p><a class="more" href="../strata/server.html#moving-slots">Moving slots</a></div>
+      <div class="feat"><div class="row"><h4>Replicas and failover</h4><span class="tag shipped">shipped</span></div><p>A primary ships its writes; acks from all, a majority or the primary; a shard's copies elect a new primary.</p><a class="more" href="../strata/server.html#failover">Failover</a></div>
+      <div class="feat"><div class="row"><h4>A deterministic simulator</h4><span class="tag shipped">shipped</span></div><p>The cluster's decisions replayed under simulated crashes, pauses and partitions; it found three failover bugs before users did.</p><a class="more" href="../strata/server.html#the-cluster-simulator">Simulator</a></div>
+      <div class="feat"><div class="row"><h4>Kubernetes operator</h4><span class="tag shipped">shipped</span></div><p>A <code>StrataCluster</code> resource: shards, copies, volumes; settings rolled out one copy at a time, with gates and rollback.</p><a class="more" href="../strata/server.html#on-kubernetes">On Kubernetes</a></div>
+      <div class="feat"><div class="row"><h4>Cloud plans with prices</h4><span class="tag shipped">shipped</span></div><p>The Cloud view plans EKS or DigitalOcean Kubernetes from live machine prices and quotas, and writes the files that make it.</p><a class="more" href="../strata/server.html#in-the-cloud">In the cloud</a></div>
+      <div class="feat"><div class="row"><h4>Create and follow from the page</h4><span class="tag progress">in progress</span></div><p>Make, follow and delete a cloud cluster from the Cloud view, behind a typed-name confirmation.</p></div>
+      <div class="feat"><div class="row"><h4>Autoscaling</h4><span class="tag planned">planned</span></div><p>Rules in the operator that add and remove shards and copies, tested by replaying logged traffic.</p></div>
+    </div>
+  </div></section>
+
+  <section class="gutter" id="ops"><div class="wrap block">
+    <div class="fam-head"><h2>Command center</h2></div>
+    <div class="split">
+      <div class="feat-grid">
+        <div class="feat"><div class="row"><h4>Health, topology, alerts</h4><span class="tag shipped">shipped</span></div><p>One server or a whole cluster: what each node is doing, its replicas, alert rules, keys and the audit log.</p></div>
+        <div class="feat"><div class="row"><h4>Profiles and flame graphs</h4><span class="tag shipped">shipped</span></div><p>A query's profile, CPU and memory flame graphs, from any node of a cluster.</p></div>
+        <div class="feat"><div class="row"><h4>Logs kept in Strata</h4><span class="tag shipped">shipped</span></div><p>The server's own logs and queries, stored in Strata and searched with SQL across the cluster.</p></div>
+        <div class="feat"><div class="row"><h4>Workbench and builder</h4><span class="tag shipped">shipped</span></div><p>SQL with completion, charts and plans; a visual query builder; schema designer; imports.</p></div>
+        <div class="feat"><div class="row"><h4>Relevance and recsys labs</h4><span class="tag shipped">shipped</span></div><p>Judged queries, fusion weights picked from them, recsys evaluation, semantic IDs, media search, a graph explorer.</p></div>
+        <div class="feat"><div class="row"><h4>Fleet, rollout, cloud</h4><span class="tag shipped">shipped</span></div><p>A map of the fleet, a query's path through it, a control center, rollouts and cloud plans.</p></div>
+      </div>
+      <figure class="shot"><img src="../assets/img/strata-command-center-topology.png" alt="The command center's topology view of a cluster: a coordinator, shards and their replicas" loading="lazy"><figcaption>The topology of a cluster in the command center. More views on <a href="use-cases.html#demos">Use cases and demos</a>.</figcaption></figure>
+    </div>
+  </div></section>
+</main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div><h4>Strata</h4><p>A search database with SQL, from one file to a cluster. Apache-2.0.</p></div>
+  <div><h4>This site</h4><ul><li><a href="features.html">Features</a></li><li><a href="compare.html">Compare</a></li><li><a href="benchmarks.html">Benchmarks</a></li><li><a href="examples.html">Queries and examples</a></li><li><a href="use-cases.html">Use cases and demos</a></li><li><a href="scale.html">Small to big</a></li></ul></div>
+  <div><h4>Documentation</h4><ul><li><a href="../strata/">Design</a></li><li><a href="../strata/query-language.html">Query language</a></li><li><a href="../strata/server.html">Server and cluster</a></li><li><a href="../strata/python.html">Python</a></li><li><a href="../strata/results.html">Results</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/strata">GitHub</a></li><li><a href="../engram/">Engram</a></li><li><a href="../reproduce.html">Reproducing the results</a></li></ul></div>
+</div></footer>
+<script src="assets/site.js"></script>
+</body>
+</html>
