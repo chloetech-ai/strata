@@ -44,7 +44,17 @@ pub struct Node {
     pub vcpu: u32,
     /// The memory its pods may have, GiB.
     pub alloc_gib: f64,
+    /// The CPU it keeps for itself and the pods every node runs (the
+    /// cloud's networking and agents), which Strata's pods cannot request.
+    pub system_cpu: f64,
 }
+
+/// The CPU requests of the pods besides the copies that may land on the
+/// busiest node: a coordinator (250m), the operator (50m), and one of
+/// the cluster's two CoreDNS (100m).
+const COORDINATOR_CPU: f64 = 0.25;
+const OPERATOR_CPU: f64 = 0.05;
+const COREDNS_CPU: f64 = 0.1;
 
 /// A cluster fitted to its nodes.
 pub struct Fit {
@@ -84,7 +94,11 @@ pub fn fit(cluster: &Json, nodes: u32, node: &Node, volume_gb: u32, storage_clas
     let (coordinator_gib, operator_gib) = (0.5_f64.min(alloc / 8.0), 0.25_f64);
     let spare = alloc - (f64::from(coordinators) * coordinator_gib + operator_gib) / f64::from(nodes.max(1));
     let copy_gib = if per_node > 0 { spare / f64::from(per_node) } else { spare };
-    let copy_cpu = (f64::from(node.vcpu) - 0.25) / f64::from(per_node.max(1));
+    // The coordinators, the operator and CoreDNS go where the scheduler
+    // finds room, so the busiest node is counted with its share of the
+    // coordinators (rounded up) and both of the others.
+    let beside = f64::from(coordinators.div_ceil(nodes.max(1))) * COORDINATOR_CPU + OPERATOR_CPU + COREDNS_CPU;
+    let copy_cpu = (f64::from(node.vcpu) - node.system_cpu - beside).max(0.0) / f64::from(per_node.max(1));
     // Requests a little under each copy's share, so they fit.
     let mib = |g: f64| format!("{}Mi", (g * 1024.0 * 0.9).floor().max(64.0) as u64);
     let milli = |c: f64| format!("{}m", (c * 1000.0 * 0.9).floor().max(50.0) as u64);
@@ -117,6 +131,9 @@ impl Fit {
             w.push(format!("a shard has {} copies and there are {nodes} nodes: some copies of a shard share a node, and losing it loses them", self.replicas));
         } else if self.replicas == 1 {
             w.push("one copy a shard: losing a node loses its shards until the node comes back".into());
+        }
+        if self.copy_cpu < 0.5 {
+            w.push(format!("each copy may request {:.2} CPU after what the nodes keep for themselves: a larger machine or more nodes", self.copy_cpu * 0.9));
         }
         if self.copy_gib < 1.0 {
             w.push(format!("each copy gets {:.1} GiB of memory: search keeps its segments and vectors in the page cache, so a larger machine or more nodes", self.copy_gib));
@@ -193,19 +210,21 @@ mod tests {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
         // 4 shards of 2 copies on 4 nodes of 8 vCPUs and 57.5 GiB: 2 copies a node.
-        let f = fit(&json!({"shards": 4, "replicas": 2}), 4, &Node { vcpu: 8, alloc_gib: 57.5 }, 50, "do-block-storage").unwrap();
+        let f = fit(&json!({"shards": 4, "replicas": 2}), 4, &Node { vcpu: 8, alloc_gib: 57.5, system_cpu: 0.5 }, 50, "do-block-storage").unwrap();
         assert_eq!((f.shards, f.replicas, f.coordinators, f.per_node), (4, 2, 1, 2));
-        assert!((f.copy_gib - (57.5 - (0.5 + 0.25) / 4.0) / 2.0).abs() < 1e-9 && (f.copy_cpu - 3.875).abs() < 1e-9);
+        // Each node keeps half a core, and a coordinator, the operator and
+        // CoreDNS may run beside the copies.
+        assert!((f.copy_gib - (57.5 - (0.5 + 0.25) / 4.0) / 2.0).abs() < 1e-9 && (f.copy_cpu - (8.0 - 0.5 - 0.4) / 2.0).abs() < 1e-9);
         assert_eq!(f.cluster["storage"], json!({"size": "50Gi", "storageClassName": "do-block-storage"}));
         assert_eq!((f.cluster["demo"].as_u64(), f.cluster["image"].as_str()), (Some(10_000), Some(IMAGE)));
         assert_eq!(f.warnings(4), Vec::<String>::new());
         // What was given is kept.
-        let f = fit(&json!({"replicas": 1, "demo": 50, "storage": {"size": "5Gi"}}), 2, &Node { vcpu: 2, alloc_gib: 1.0 }, 10, "gp3").unwrap();
+        let f = fit(&json!({"replicas": 1, "demo": 50, "storage": {"size": "5Gi"}}), 2, &Node { vcpu: 2, alloc_gib: 1.0, system_cpu: 0.25 }, 10, "gp3").unwrap();
         assert_eq!(f.cluster["storage"], json!({"size": "5Gi", "storageClassName": "gp3"}));
         assert_eq!(f.cluster["demo"], 50);
         let w = f.warnings(2).join("; ");
         assert!(w.contains("one copy a shard") && w.contains("GiB of memory"), "{w}");
-        assert!(fit(&json!([]), 2, &Node { vcpu: 2, alloc_gib: 4.0 }, 10, "gp3").is_err());
+        assert!(fit(&json!([]), 2, &Node { vcpu: 2, alloc_gib: 4.0, system_cpu: 0.25 }, 10, "gp3").is_err());
         let y = cluster_yaml("a test", &cluster_objects("search", &json!({"shards": 1}), None));
         assert!(y.starts_with("# a test: kubectl apply -f this file\n---\n") && y.matches("---\n").count() == 2, "{y}");
     }

@@ -1095,57 +1095,11 @@ impl Db {
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
         let catalog: Vec<&Schema> = snap.schemas().collect();
-        #[cfg_attr(feature = "datafusion", allow(unused_mut))]
-        let mut runner = |leaf: &Plan| {
+        let mut runner = |leaf: &Plan, over: usize| {
             let view = view_of(leaf.table())?;
-            self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
+            self.execute_leaf(&view, &leaf.to_select(view.schema())?, &leaves, over)
         };
-        #[allow(unused_mut)]
-        let mut fallback: Option<String> = None;
-        #[cfg(feature = "datafusion")]
-        let mut ran = crate::query::df::Ran::default();
-        #[cfg(feature = "datafusion")]
-        // A leaf with subqueries has no operators for DataFusion to run.
-        if opts.engine != crate::query::exec::Engine::Operators && !plan.root.is_leaf() {
-            use crate::query::df::Outcome;
-            let mut leaf_runner = |leaf: &Plan, over: usize| {
-                let view = view_of(leaf.table())?;
-                self.execute_leaf(&view, &leaf.to_select(view.schema())?, &leaves, over)
-            };
-            match crate::query::df::run_in(plan, &catalog, &mut leaf_runner, opts)? {
-                Outcome::Done(rs) => {
-                    if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
-                        return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
-                    }
-                    return Ok(rs);
-                }
-                Outcome::Fallback(why, _) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
-                Outcome::Fallback(why, r) => {
-                    fallback = Some(why);
-                    ran = r;
-                }
-                Outcome::Small(r) => ran = r,
-            }
-        }
-        // The leaves DataFusion ran are not run again, and the profile
-        // keeps their steps.
-        #[cfg(feature = "datafusion")]
-        let ran_steps = std::mem::take(&mut ran.steps);
-        #[cfg(feature = "datafusion")]
-        let mut runner = move |leaf: &Plan| match ran.take(leaf) {
-            Some(rs) => Ok(rs),
-            None => runner(leaf),
-        };
-        let mut rs = ops::run_in(plan, &catalog, &mut runner, opts)?;
-        #[cfg(feature = "datafusion")]
-        if !ran_steps.is_empty() {
-            let mut steps = ran_steps;
-            rs.stats.steps_dropped += crate::query::steps::nest(&mut steps, &rs.stats.steps, 0) as u64;
-            rs.stats.steps = steps;
-        }
-        if let Some(why) = fallback {
-            rs.stats.plan.insert(0, format!("operators (not datafusion: {why})"));
-        }
+        let rs = ops::run_on_engine(plan, &catalog, &mut runner, opts)?;
         if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
             return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
         }
@@ -1615,6 +1569,13 @@ impl Db {
         let mut rs = Executor::new(snap, &readers, opts).execute(select)?;
         opened_step(&mut rs.stats, t0, opened, readers.len());
         Ok(rs)
+    }
+
+    /// [`Db::execute`] of a compound query's leaf (without the feature
+    /// `datafusion`, its rows).
+    #[cfg(not(feature = "datafusion"))]
+    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, _over: usize) -> Result<crate::query::exec::Leaf> {
+        self.execute(snap, select, opts).map(crate::query::exec::Leaf::Rows)
     }
 
     /// [`Db::execute`] for DataFusion: the rows as Arrow columns when there
