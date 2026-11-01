@@ -23,7 +23,7 @@ use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
 use crate::error::{corrupt, Error, Result};
 use crate::schema::{FieldType, Schema};
 use crate::segment::build::BuildOptions;
-use crate::segment::{DocId, SegmentFile, SegmentWriter};
+use crate::segment::{DocId, SegmentFile, SegmentWriter, Spill, SpillStream};
 use crate::value::{Document, Value};
 
 /// Default uncompressed block size (`forward.store_block`).
@@ -172,7 +172,7 @@ impl StoreBuilder {
             target: super::usize_option(opts, "forward.store_block", DEFAULT_BLOCK)?,
             ids: fields.iter().map(|&(i, _)| schema.id_of(i)).collect(),
             fields,
-            blocks: Blocks { first: Vec::new(), offs: vec![0], raw_len: Vec::new(), data: Vec::new(), rows: Vec::new(), lens: Vec::new() },
+            blocks: Blocks { first: Vec::new(), offs: vec![0], raw_len: Vec::new(), data: Data::Mem(Vec::new()), rows: Vec::new(), lens: Vec::new() },
             n: 0,
             block_start: 0,
         })
@@ -190,6 +190,16 @@ impl StoreBuilder {
         }
     }
 
+    /// Writes the compressed blocks to `spill` as they are made, instead of
+    /// holding them until [`finish`](Self::finish); called before the
+    /// first document.
+    pub fn spill_to(&mut self, spill: &std::sync::Arc<Spill>) -> Result<()> {
+        if self.n == 0 {
+            self.blocks.data = Data::Spill(spill.stream()?);
+        }
+        Ok(())
+    }
+
     /// Writes `store.index` and `store.data`.
     pub fn finish(mut self, out: &mut SegmentWriter) {
         let b = &mut self.blocks;
@@ -205,7 +215,35 @@ impl StoreBuilder {
         w.array(&b.offs);
         w.array(&b.raw_len);
         out.put("store.index", w.finish());
-        out.put("store.data", std::mem::take(&mut b.data));
+        match std::mem::replace(&mut b.data, Data::Mem(Vec::new())) {
+            Data::Mem(v) => out.put("store.data", v),
+            Data::Spill(s) => match s.finish() {
+                Ok((at, crc)) => out.put_spilled("store.data", at, crc),
+                Err(e) => out.fail(e),
+            },
+        }
+    }
+}
+
+/// The compressed blocks: in memory, or written out as they are made.
+enum Data {
+    Mem(Vec<u8>),
+    Spill(SpillStream),
+}
+
+impl Data {
+    fn len(&self) -> usize {
+        match self {
+            Data::Mem(v) => v.len(),
+            Data::Spill(s) => s.len(),
+        }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        match self {
+            Data::Mem(v) => v.extend_from_slice(bytes),
+            Data::Spill(s) => s.extend_from_slice(bytes),
+        }
     }
 }
 
@@ -214,7 +252,7 @@ struct Blocks {
     first: Vec<u32>,
     offs: Vec<u64>,
     raw_len: Vec<u32>,
-    data: Vec<u8>,
+    data: Data,
     /// Rows of the open block and their lengths.
     rows: Vec<u8>,
     lens: Vec<usize>,

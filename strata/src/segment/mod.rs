@@ -25,8 +25,10 @@
 
 pub mod build;
 pub mod filter;
+pub mod spill;
 
 pub use filter::{DocFilter, DocSet};
+pub use spill::{Spill, SpillStream, Spilled};
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -80,6 +82,13 @@ pub trait FieldIndexBuilder: Send {
     fn add(&mut self, doc: DocId, value: &Value) -> Result<()>;
     /// Writes this field's sections.
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()>;
+    /// Keeps what grows with every document added (a vector field's
+    /// float32 rows) in `spill` instead of in memory, where the builder
+    /// can; called before the first document. A builder that cannot
+    /// holds it in memory, as without a spill.
+    fn spill_to(&mut self, _spill: &Arc<Spill>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A builder that writes nothing (placeholder for unimplemented components).
@@ -104,15 +113,49 @@ struct DirEntry {
 }
 
 /// Collects sections and lays them out as a segment image.
+///
+/// A writer made with [`spilling`](Self::spilling) writes each section of
+/// [`spill::MIN_SPILLED`] bytes or more to its [`Spill`] when it is put
+/// and keeps only where it went; [`write_to`](Self::write_to) copies it
+/// into the image, so the image is the same bytes either way.
 pub struct SegmentWriter {
     n_docs: u64,
     /// Name, bytes and crc32 of each section.
-    sections: Vec<(String, Vec<u8>, u32)>,
+    sections: Vec<(String, Body, u32)>,
+    spill: Option<Arc<Spill>>,
+    /// The first failure to spill a section, returned when the image is
+    /// written.
+    failed: Option<std::io::Error>,
+}
+
+/// A section's bytes, in memory or spilled.
+enum Body {
+    Mem(Vec<u8>),
+    Spilled(Spilled),
+}
+
+impl Body {
+    fn len(&self) -> usize {
+        match self {
+            Body::Mem(v) => v.len(),
+            Body::Spilled(s) => s.len(),
+        }
+    }
 }
 
 impl SegmentWriter {
     pub fn new(n_docs: usize) -> Self {
-        SegmentWriter { n_docs: n_docs as u64, sections: Vec::new() }
+        SegmentWriter { n_docs: n_docs as u64, sections: Vec::new(), spill: None, failed: None }
+    }
+
+    /// A writer that spills its sections to `spill` as they are put.
+    pub fn spilling(n_docs: usize, spill: Arc<Spill>) -> Self {
+        SegmentWriter { spill: Some(spill), ..SegmentWriter::new(n_docs) }
+    }
+
+    /// The spill this writer's sections go to, if any.
+    pub fn spill(&self) -> Option<&Arc<Spill>> {
+        self.spill.as_ref()
     }
 
     pub fn n_docs(&self) -> usize {
@@ -122,16 +165,41 @@ impl SegmentWriter {
     /// Adds a section. Names must be unique within the segment.
     pub fn put(&mut self, name: impl Into<String>, data: Vec<u8>) {
         let crc = crc32fast::hash(&data);
-        self.push(name.into(), data, crc);
+        let body = match &self.spill {
+            Some(s) if data.len() >= spill::MIN_SPILLED && self.failed.is_none() => match s.put(&data) {
+                Ok(at) => Body::Spilled(at),
+                Err(e) => {
+                    self.failed = Some(e);
+                    Body::Mem(data)
+                }
+            },
+            _ => Body::Mem(data),
+        };
+        self.push(name.into(), body, crc);
     }
 
-    fn push(&mut self, name: String, data: Vec<u8>, crc: u32) {
+    /// Adds a section already spilled ([`spill::SpillStream::finish`]),
+    /// with its crc32.
+    pub fn put_spilled(&mut self, name: impl Into<String>, data: Spilled, crc: u32) {
+        self.push(name.into(), Body::Spilled(data), crc);
+    }
+
+    /// Records a failure to spill a section, which writing the image
+    /// returns.
+    pub fn fail(&mut self, e: std::io::Error) {
+        self.failed.get_or_insert(e);
+    }
+
+    fn push(&mut self, name: String, data: Body, crc: u32) {
         assert!(!self.sections.iter().any(|(n, ..)| *n == name), "duplicate section {name}");
         self.sections.push((name, data, crc));
     }
 
     /// Adds `other`'s sections after this writer's, in their order.
     pub fn append(&mut self, other: SegmentWriter) {
+        if let Some(e) = other.failed {
+            self.fail(e);
+        }
         for (name, data, crc) in other.sections {
             self.push(name, data, crc);
         }
@@ -146,14 +214,19 @@ impl SegmentWriter {
     pub fn finish(self) -> Vec<u8> {
         let (_, _, total) = self.layout();
         let mut out = Vec::with_capacity(total);
-        self.write_to(&mut out).expect("writing to a Vec cannot fail");
+        self.write_to(&mut out).expect("a segment image written to memory");
         out
     }
 
     /// Streams the image [`finish`](Self::finish) would return to `w`,
-    /// releasing each section once written, so a segment never needs memory
-    /// for two copies of itself. Returns the image length.
-    pub fn write_to(self, w: &mut impl std::io::Write) -> std::io::Result<usize> {
+    /// releasing each section once written (a spilled one is copied from
+    /// its spill), so a segment never needs memory for two copies of
+    /// itself. Returns the image length, or the first failure to spill a
+    /// section.
+    pub fn write_to(mut self, w: &mut impl std::io::Write) -> std::io::Result<usize> {
+        if let Some(e) = self.failed.take() {
+            return Err(e);
+        }
         let (header_len, dir, total) = self.layout();
         let json = serde_json::to_vec(&dir).unwrap();
         let mut header = vec![0u8; header_len];
@@ -165,7 +238,13 @@ impl SegmentWriter {
         let mut pos = header_len;
         for ((_, data, _), e) in self.sections.into_iter().zip(&dir) {
             w.write_all(&vec![0u8; e.offset as usize - pos])?;
-            w.write_all(&data)?;
+            match data {
+                Body::Mem(v) => w.write_all(&v)?,
+                Body::Spilled(s) => {
+                    s.copy_to(w)?;
+                    s.release();
+                }
+            }
             pos = (e.offset + e.len) as usize;
         }
         debug_assert_eq!(pos, total);
@@ -393,6 +472,11 @@ impl SegmentFile {
 
     pub fn section_sizes(&self) -> Vec<(String, usize)> {
         self.sections.iter().map(|(n, s)| (n.clone(), s.len)).collect()
+    }
+
+    /// The bytes of the sections whose names `pick` accepts.
+    pub fn section_bytes(&self, pick: impl Fn(&str) -> bool) -> u64 {
+        self.sections.iter().filter(|(n, _)| pick(n)).map(|(_, s)| s.len as u64).sum()
     }
 
     /// Byte range of a section within the segment image (for I/O accounting).

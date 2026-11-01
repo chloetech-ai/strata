@@ -61,6 +61,9 @@ pub struct MergeStats {
     /// ([`crate::schema::Schema::with_retain`]).
     pub docs_expired: u64,
     pub bytes_written: u64,
+    /// Bytes merges wrote to their spill files as they went, which the
+    /// merged images then copied ([`crate::storage::DbOptions::merge_spill_bytes`]).
+    pub bytes_spilled: u64,
     pub seconds: f64,
     /// Merges the policy selected that were made smaller, or left for
     /// later, to fit the memory budget or after a crash interrupted a merge
@@ -79,8 +82,9 @@ pub struct MergerOptions {
     /// would not fit is made smaller (fewer inputs), or waits for running
     /// ones to finish.
     pub memory_budget: Option<u64>,
-    /// Bytes a second that merges may write, together; `None`: as fast as
-    /// the disk takes them.
+    /// Bytes a second that merges may write, together, to their images and
+    /// their spill files ([`crate::storage::DbOptions::merge_spill_bytes`]);
+    /// `None`: as fast as the disk takes them.
     pub write_bytes_per_sec: Option<u64>,
 }
 

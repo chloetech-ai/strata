@@ -17,10 +17,14 @@
 //!   on. The workload goes on; operations that fail must have changed
 //!   nothing, except the one that left the database refusing writes
 //!   ("poisoned"), which may or may not have reached the disk.
+//!
+//! The same workloads run with every merge spilling its output to disk as
+//! it goes ([`DbOptions::merge_spill_bytes`] 0), whose writes fail too.
 #![cfg(feature = "fault-injection")]
 
 mod storage_util;
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,8 +70,21 @@ struct Run {
     last_flush: Option<(bool, bool)>,
 }
 
+thread_local! {
+    /// The workloads' `merge_spill_bytes`, by default the default's.
+    static SPILL: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
 fn options(src: &Arc<MapSource>, sync: bool) -> DbOptions {
-    DbOptions { sync, memtable_max_docs: 60, segment_max_docs: 150, ..opts(src) }
+    let o = DbOptions { sync, memtable_max_docs: 60, segment_max_docs: 150, ..opts(src) };
+    DbOptions { merge_spill_bytes: SPILL.get().unwrap_or(o.merge_spill_bytes), ..o }
+}
+
+/// Runs `f` with every merge spilling.
+fn spilling(f: impl FnOnce()) {
+    SPILL.set(Some(0));
+    f();
+    SPILL.set(None);
 }
 
 /// Runs `ops` seeded operations on a new database at `path` (in the
@@ -298,6 +315,27 @@ fn failing_calls(name: &str, errno: i32, sticky: bool, seed: u64, ops: usize) {
         }
         assert!(&got == model || poisoned.contains(&&got), "{what}: {} keys, expected {} ({} failed operations)", got.len(), model.len(), run.failed.len());
     }
+}
+
+#[test]
+fn power_loss_while_merges_spill_keeps_every_acknowledged_commit() {
+    spilling(|| seeds(7, 1).for_each(|s| power_loss(true, s, ops())));
+}
+
+#[test]
+fn a_failed_call_while_merges_spill_changes_nothing_but_its_operation() {
+    // The spills' writes are among the calls that fail.
+    let plain = calls_of("db.strata", true, 8, ops());
+    spilling(|| {
+        let spilled = calls_of("db.strata", true, 8, ops());
+        assert!(spilled > plain, "{spilled} calls spilling, {plain} not");
+        seeds(8, 1).for_each(|s| failing_calls("db.strata", libc::EIO, false, s, ops()))
+    });
+}
+
+#[test]
+fn a_full_disk_while_merges_spill_keeps_what_was_committed() {
+    spilling(|| seeds(9, 1).for_each(|s| failing_calls("db.dir", libc::ENOSPC, true, s, ops())));
 }
 
 #[test]
