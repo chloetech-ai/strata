@@ -253,15 +253,21 @@ pub struct ExecOptions {
 }
 
 /// The engine of a plan's operators ([`crate::query::ops`] or
-/// [`crate::query::df`]).
+/// [`crate::query::df`]). Without the feature `datafusion`, the operators
+/// run every plan, whichever is chosen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Engine {
-    /// Strata's operators, in memory ([`crate::query::ops`]).
-    #[default]
+    /// Strata's operators, in memory ([`crate::query::ops`]): the default
+    /// without the feature `datafusion`.
+    #[cfg_attr(not(feature = "datafusion"), default)]
     Operators,
-    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for the
-    /// plans it lowers; the operators run the others. Without the feature,
-    /// the operators run every plan.
+    /// DataFusion for a plan whose leaves read more than a few thousand
+    /// rows (`query::df::SMALL`), the operators for the others, which
+    /// they answer faster; the default with the feature `datafusion`.
+    #[cfg_attr(feature = "datafusion", default)]
+    Auto,
+    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for every
+    /// plan it lowers; the operators run the others.
     DataFusion,
     /// [`Engine::DataFusion`], and a plan it does not lower fails with
     /// the reason instead of running on the operators (to find what the
@@ -270,14 +276,17 @@ pub enum Engine {
 }
 
 impl Engine {
-    /// `STRATA_ENGINE=datafusion` picks [`Engine::DataFusion`],
-    /// `datafusion-only` [`Engine::DataFusionOnly`]; anything else, or
-    /// nothing, the operators.
+    /// `STRATA_ENGINE`: `operators`, `auto`, `datafusion` or
+    /// `datafusion-only`; anything else, or nothing, the default
+    /// ([`Engine::Auto`] with the feature `datafusion`, the operators
+    /// without).
     pub fn from_env() -> Engine {
         match std::env::var("STRATA_ENGINE").as_deref() {
+            Ok("operators") => Engine::Operators,
+            Ok("auto") => Engine::Auto,
             Ok("datafusion") => Engine::DataFusion,
             Ok("datafusion-only") => Engine::DataFusionOnly,
-            _ => Engine::Operators,
+            _ => Engine::default(),
         }
     }
 }

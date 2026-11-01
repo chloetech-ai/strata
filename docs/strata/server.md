@@ -79,6 +79,8 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 
 `strata-server import`, `strata-server fetch-model` and `strata-server promote` are subcommands: [loading rows](#loading-rows), [embedded vector fields](#embedded-vector-fields) and [promotion](#replication-a-primary-and-its-replicas).
 
+`STRATA_ENGINE` chooses the engine of [joins, groups and sorts over joined or derived rows](query-language.md#subqueries-with-and-joins). The default, `auto`, uses DataFusion when a query's single-table parts read more than 4,096 rows and Strata's operators below that. The other values are `operators`, `datafusion` and `datafusion-only`. Build with `--no-default-features` to leave DataFusion out of the server.
+
 `strata-server upgrade PATH` copies a database written by a version of Strata from before field ids, which this one refuses to serve, into this version's format in its place, and keeps the old one as `PATH.before-field-ids` ([field ids](index.md#wal-memtable-and-snapshots)). Stop the server that has it open first. A database started with `--seq-no` is not copied: create a new one and fill it with `--copy-from`.
 
 ## Schemas

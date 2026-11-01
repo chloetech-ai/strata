@@ -31,7 +31,7 @@ maturin develop --release                  # builds the extension into the virtu
 pytest tests                               # the client tests also need strata-server built
 ```
 
-Model2Vec embedding models need nothing more. For the BERT models, build with `--features bert` (`--features accelerate` on a Mac): `maturin develop --release --features bert`, or `MATURIN_PEP517_ARGS="--features bert" pip install ./strata-py`. The extension runs on any CPU of its architecture: Strata picks its SIMD kernels (AVX2, AVX-512, the aarch64 dot product instructions) at run time. `RUSTFLAGS="-C target-cpu=native"` builds one for the building machine only.
+The package includes [DataFusion](query-language.md#subqueries-with-and-joins), which runs joins, groups and sorts over many joined rows (`--no-default-features` leaves it out). Model2Vec embedding models need nothing more. For the BERT models, build with `--features bert` (`--features accelerate` on a Mac): `maturin develop --release --features bert`, or `MATURIN_PEP517_ARGS="--features bert" pip install ./strata-py`. The extension runs on any CPU of its architecture: Strata picks its SIMD kernels (AVX2, AVX-512, the aarch64 dot product instructions) at run time. `RUSTFLAGS="-C target-cpu=native"` builds one for the building machine only.
 
 ## A database in your process
 

@@ -31,6 +31,7 @@
 //! any error of DataFusion's own, so a plan answers here exactly when
 //! DataFusion and the operators agree on what it means.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -56,7 +57,7 @@ use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 
 use crate::error::{Error, Result};
-use crate::query::exec::{ExecOptions, ExecStats, ResultSet};
+use crate::query::exec::{Engine, ExecOptions, ExecStats, ResultSet};
 use crate::query::ir::{Agg, ArithOp, CmpOp, Expr, Func, JoinKind, Node, Plan, SortKey};
 use crate::query::memory::Charge;
 use crate::query::ops::{self, Runner};
@@ -70,14 +71,48 @@ use crate::value::Value;
 pub enum Outcome {
     /// DataFusion answered it.
     Done(ResultSet),
-    /// Not lowered (or DataFusion failed on it): why. The operators run it.
-    Fallback(String),
+    /// Not lowered (or DataFusion failed on it): why. The operators run
+    /// it, with what ran here.
+    Fallback(String, Ran),
+    /// [`Engine::Auto`]: its leaves read at most [`SMALL`] rows before
+    /// DataFusion would run, so the operators, faster on so few, answer
+    /// it, with what ran here.
+    Small(Ran),
 }
 
-/// Why a plan does not run here: not lowered, or a Strata error (a
-/// leaf's, the deadline's, the memory budget's), which the query returns.
+/// What a plan ran here before the operators took it over: its leaves'
+/// rows while they were few (at most [`SMALL`] in all), each with the leaf
+/// plan the operators run for it, so that they do not run it again; and
+/// the steps of the query's profile so far, the leaves' among them (the
+/// rows kept have none, so that no step counts twice).
+#[derive(Debug, Default)]
+pub struct Ran {
+    pub leaves: Vec<(Plan, ResultSet)>,
+    pub steps: Vec<Step>,
+}
+
+impl Ran {
+    /// The rows of `leaf` if it ran here, once.
+    pub fn take(&mut self, leaf: &Plan) -> Option<ResultSet> {
+        let i = self.leaves.iter().position(|(p, _)| p == leaf)?;
+        Some(self.leaves.swap_remove(i).1)
+    }
+}
+
+/// The most rows the leaves of a plan read for [`Engine::Auto`] to leave
+/// it to the operators. DataFusion costs about 1 ms to plan and run a
+/// plan, whatever its size, and the operators about 1-2 µs a row more than
+/// it: on two tables of 1,000 rows a join with a group took 4 ms on the
+/// operators and 6 ms on DataFusion, on two of 10,000 rows 23 ms and
+/// 10 ms (`examples/df_join`, 4-core cloud VM).
+pub const SMALL: usize = 4096;
+
+/// Why a plan does not run here: not lowered, small enough for the
+/// operators ([`Outcome::Small`]), or a Strata error (a leaf's, the
+/// deadline's, the memory budget's), which the query returns.
 enum Fail {
     No(String),
+    Small,
     Err(Error),
 }
 
@@ -117,10 +152,11 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
     let pool = Arc::new(Pool { charge: charge.clone(), limited: opts.memory.is_some(), used: AtomicUsize::new(0), refused: Mutex::new(None) });
     let env = RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc().map_err(|e| Error::Query(format!("datafusion: {e}")))?;
     let ctx = SessionContext::new_with_config_rt(config, env);
-    let mut l = Lower { catalog, runner, opts, ctx, pool, next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge, filter_docs: 0, scored: 0, clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
+    let mut l = Lower { catalog, runner, opts, ctx, pool, next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge, filter_docs: 0, scored: 0, clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0, tables: HashMap::new(), leaf_rows: 0, ran: Vec::new() };
     match l.answer(&plan.root) {
         Ok(rs) => Ok(Outcome::Done(rs)),
-        Err(Fail::No(why)) => Ok(Outcome::Fallback(why)),
+        Err(Fail::No(why)) => Ok(Outcome::Fallback(why, l.ran())),
+        Err(Fail::Small) => Ok(Outcome::Small(l.ran())),
         Err(Fail::Err(e)) => Err(e),
     }
 }
@@ -276,9 +312,20 @@ struct Lower<'a, 'r> {
     clock: Clock,
     prof: Vec<Step>,
     dropped: u64,
+    /// The batch of each memory table in its own order, by name, and the
+    /// column of that order: the rows a scan of it gives.
+    tables: HashMap<String, (String, RecordBatch)>,
+    /// The rows the leaves read, and their rows while those are at most
+    /// [`SMALL`] ([`Ran`]).
+    leaf_rows: usize,
+    ran: Vec<(Plan, ResultSet)>,
 }
 
 impl<'a> Lower<'a, '_> {
+    fn ran(&mut self) -> Ran {
+        Ran { leaves: std::mem::take(&mut self.ran), steps: std::mem::take(&mut self.prof) }
+    }
+
     fn fresh(&mut self, what: &str) -> String {
         self.next += 1;
         format!("__{what}{}", self.next)
@@ -513,6 +560,9 @@ impl<'a> Lower<'a, '_> {
     /// and cancel flag while it runs: past them, the plan is stopped and
     /// the query fails as the operators' would.
     fn collect(&mut self, plan: LogicalPlan) -> R<Vec<RecordBatch>> {
+        if self.opts.engine == Engine::Auto && self.leaf_rows <= SMALL {
+            return Err(Fail::Small);
+        }
         self.opts.check()?;
         *self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let ctx = self.ctx.clone();
@@ -728,8 +778,19 @@ impl<'a> Lower<'a, '_> {
         self.opts.check()?;
         let table = leaf.search().map(|s| s.table.clone()).unwrap_or_default();
         let m = self.clock.mark(&self.prof);
-        let rs = (self.runner)(&Plan::new(leaf))?;
+        let leaf = Plan::new(leaf);
+        let rs = (self.runner)(&leaf)?;
         self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
+        self.leaf_rows = self.leaf_rows.saturating_add(rs.rows.len());
+        match self.leaf_rows <= SMALL {
+            true => {
+                let mut kept = rs.clone();
+                kept.stats.steps = Vec::new();
+                kept.stats.steps_dropped = 0;
+                self.ran.push((leaf, kept));
+            }
+            false => self.ran.clear(),
+        }
         if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, n)) {
             *read = rs.rows.len();
         }
@@ -779,7 +840,7 @@ impl<'a> Lower<'a, '_> {
                 Err(e) => break Err(e),
             };
             let read = self.driver.map_or(0, |(_, _, read)| read);
-            if r.1 >= want || read < cap {
+            if r.1.num_rows() >= want || read < cap {
                 break Ok(r.0);
             }
             cap = cap.saturating_mul(4);
@@ -841,8 +902,23 @@ impl<'a> Lower<'a, '_> {
             mem = mem.with_sort_order(vec![rel.sort_exprs()]);
         }
         let name = self.fresh("t");
+        if sorted {
+            self.tables.insert(name.clone(), (rel.ord[0].col.clone(), batch));
+        }
         let plan = LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(mem)), None)?.build()?;
         Ok(Rel { plan, ..rel })
+    }
+
+    /// The rows of `rel` when it is a whole memory table read in its own
+    /// order, as they are held: no plan to run.
+    fn held(&self, rel: &Rel) -> Option<RecordBatch> {
+        let LogicalPlan::TableScan(t) = &rel.plan else { return None };
+        if !t.filters.is_empty() || t.fetch.is_some() || t.projection.is_some() {
+            return None;
+        }
+        let [o] = rel.ord.as_slice() else { return None };
+        let (ord, batch) = self.tables.get(t.table_name.table())?;
+        (!o.desc && !o.nulls_first && *ord == o.col).then(|| batch.clone())
     }
 
     /// Runs `rel` and keeps its rows in memory, in its order (`WITH`, and
@@ -851,8 +927,11 @@ impl<'a> Lower<'a, '_> {
         self.materialized(rel).map(|(r, _)| r)
     }
 
-    /// [`Lower::materialize`], and how many rows it holds.
-    fn materialized(&mut self, rel: Rel) -> R<(Rel, usize)> {
+    /// [`Lower::materialize`], and the rows it holds.
+    fn materialized(&mut self, rel: Rel) -> R<(Rel, RecordBatch)> {
+        if let Some(batch) = self.held(&rel) {
+            return Ok((rel, batch));
+        }
         let plan = LogicalPlanBuilder::from(rel.plan.clone()).sort(rel.sort_exprs())?.build()?;
         let planned = Arc::new(plan.schema().as_arrow().clone());
         let batches = self.collect(plan)?;
@@ -867,8 +946,8 @@ impl<'a> Lower<'a, '_> {
         arrays.push(Arc::new(UInt64Array::from_iter_values(0..n as u64)));
         let schema = Arc::new(ArrowSchema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(DataFusionError::from)?;
-        let r = self.scan(schema, batch, Rel { ord: vec![Ord { col: ord, desc: false, nulls_first: false }], ..rel })?;
-        Ok((r, n))
+        let r = self.scan(schema, batch.clone(), Rel { ord: vec![Ord { col: ord, desc: false, nulls_first: false }], ..rel })?;
+        Ok((r, batch))
     }
 
     /// `rel` with every column renamed (a `WITH` result read again).
@@ -1019,15 +1098,16 @@ impl<'a> Lower<'a, '_> {
         let r = if right.is_leaf() {
             // As the operators do: the right side read only for the join
             // values the left holds.
-            let (m, left_rows) = self.materialized(l)?;
+            let (m, held) = self.materialized(l)?;
             l = m;
+            let left_rows = held.num_rows();
             // Many values cost the restricted scan more than reading the
             // rows they would cut: the right side is read whole and hashed.
             let whole = left_rows > RESTRICT_ALWAYS
                 && plain(right)
                 && match self.count(right)? {
                     Some(rows) if (left_rows as u64).saturating_mul(RESTRICT_RATIO) > rows => {
-                        let values = self.distinct_keys(&l, keys)?;
+                        let values = self.distinct_keys(&l, &held, keys)?;
                         values > RESTRICT_ALWAYS && (values as u64).saturating_mul(RESTRICT_RATIO) > rows
                     }
                     _ => false,
@@ -1045,12 +1125,7 @@ impl<'a> Lower<'a, '_> {
                 if matches!(e.get_type(l.plan.schema())?, DataType::List(_)) {
                     return no("a join on a multi-valued column");
                 }
-                let v = self.fresh("v");
-                let plan = LogicalPlanBuilder::from(l.plan.clone()).project(vec![e.alias(&v)])?.filter(col(&v).is_not_null())?.distinct()?.build()?;
-                let mut vals = Vec::new();
-                for b in self.collect(plan)? {
-                    vals.extend(values_of(b.column(0))?);
-                }
+                let vals = self.key_values(&l, &held, e)?;
                 let j = ops::output(&k.right)?;
                 let Some(c) = columns.get(j) else { return no(format!("no column {j} in the join's right rows")) };
                 let Expr::Field(f) = &c.expr else { return no("a join key of a scanned table that is not one of its fields") };
@@ -1072,21 +1147,38 @@ impl<'a> Lower<'a, '_> {
     }
 
     /// How many distinct values, NULL aside, the join keys take in the
-    /// rows of `l` (summed over the keys).
-    fn distinct_keys(&mut self, l: &Rel, keys: &[crate::query::ir::JoinKey]) -> R<usize> {
+    /// rows of `l` (summed over the keys), which `held` holds.
+    fn distinct_keys(&mut self, l: &Rel, held: &RecordBatch, keys: &[crate::query::ir::JoinKey]) -> R<usize> {
         let mut total = 0;
         for k in keys {
             let e = self.top(&k.left, &l.cols, l.plan.schema())?;
-            let (v, c) = (self.fresh("v"), self.fresh("n"));
-            let plan = LogicalPlanBuilder::from(l.plan.clone())
-                .project(vec![e.alias(&v)])?
-                .aggregate(Vec::<DExpr>::new(), vec![agg_fn::count_distinct(col(&v)).alias(&c)])?
-                .build()?;
-            for b in self.collect(plan)? {
-                total += values_of(b.column(0))?.first().and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
-            }
+            total += self.key_values(l, held, e)?.len();
         }
         Ok(total)
+    }
+
+    /// The distinct values, NULL aside, of `e` over the rows of `l`, which
+    /// `held` holds, in the order of the rows they first come in, as the
+    /// operators list them: a column's are read from `held`.
+    fn key_values(&mut self, l: &Rel, held: &RecordBatch, e: DExpr) -> R<Vec<Value>> {
+        let column = match &e {
+            DExpr::Column(c) => held.column_by_name(&c.name).cloned(),
+            _ => None,
+        };
+        let all = match column {
+            Some(a) => values_of(&a)?,
+            None => {
+                let v = self.fresh("v");
+                let plan = LogicalPlanBuilder::from(l.plan.clone()).project(vec![e.alias(&v)])?.build()?;
+                let mut vals = Vec::new();
+                for b in self.collect(plan)? {
+                    vals.extend(values_of(b.column(0))?);
+                }
+                vals
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
+        Ok(all.into_iter().filter(|v| !matches!(v, Value::Null) && seen.insert(ops::part(v))).collect())
     }
 
     /// The join of `l` and `r` on `keys` (and `on`).
