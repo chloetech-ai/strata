@@ -132,6 +132,9 @@ pub struct Options {
     pub keys: Option<PathBuf>,
     /// Append every audited request here, as JSON lines.
     pub audit_log: Option<PathBuf>,
+    /// The AWS view's credentials file (default: `<db>.aws.json` beside a
+    /// database; a coordinator keeps them in memory without it).
+    pub aws_file: Option<PathBuf>,
     /// The alert rules' file (default rules, in memory, without it).
     pub alerts: Option<PathBuf>,
     /// Post alerts that fire or resolve to this URL.
@@ -318,6 +321,10 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     svc.max_queued_writes = if o.max_queued_writes > 0 { o.max_queued_writes } else { usize::MAX };
     if o.max_body_mb > 0 {
         svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
+    }
+    let aws = o.aws_file.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::aws::Aws::file_of));
+    if let Some(file) = aws {
+        svc.aws = Arc::new(crate::aws::Aws::open(file)?);
     }
     let keys = o.keys.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(Keys::file_of));
     if let Some(file) = keys {

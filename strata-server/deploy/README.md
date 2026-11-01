@@ -161,6 +161,34 @@ a set, grows its volumes, and keeps its versions, resumes a hold and rolls
 back on a real API server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
 as `setup-envtest` downloads them).
 
+## On AWS
+
+The command center's **AWS** view (an admin key; see
+[the server's docs](../../docs/strata/server.md#on-aws)) writes what runs the
+operator on EKS: a CloudFormation template (a VPC with public subnets in three
+zones, so no NAT gateway; the EKS cluster with access entries, the key that
+planned it its administrator; a managed node group on Amazon Linux 2023; the
+EBS CSI driver through Pod Identity), the operator's manifest, and a
+`StrataCluster` sized for the machines picked, with a gp3 storage class. It
+reads the machines, their prices and the account's quota from AWS with the
+credentials saved in it, has CloudFormation check the template, and creates
+nothing: the commands it gives make the cluster with your `aws` and `kubectl`.
+
+```sh
+aws cloudformation create-stack --region us-east-1 --stack-name strata-search \
+  --template-body file://strata-search.json --capabilities CAPABILITY_IAM
+aws cloudformation wait stack-create-complete --region us-east-1 --stack-name strata-search
+aws eks update-kubeconfig --region us-east-1 --name strata-search
+kubectl apply -f strata-search-operator.yaml
+kubectl wait --for condition=established --timeout=180s crd/strataclusters.strata.chloetech.ai
+kubectl apply -f strata-search-cluster.yaml
+```
+
+To delete it, delete the `StrataCluster` and the claims of its volumes first
+(`kubectl -n strata delete pvc --all`): the EBS CSI driver made those
+volumes, not the stack, and they stay and cost otherwise. Then delete the
+stack.
+
 ## The fixed layout
 
 The rest of this page runs Strata from the manifests under `k8s/` without
