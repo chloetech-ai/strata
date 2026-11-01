@@ -377,7 +377,7 @@ impl Metrics {
             h.render(o, "strata_grpc_request_duration_seconds", &format!("method=\"{method}\""));
         }
 
-        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, reranked, decay, graph, column, facet, aggregate, count, filter, compound, invalid) and outcome (ok, partial, error, timeout, rejected, cancelled).");
+        head(o, "strata_queries_total", "counter", "Queries by kind (bm25, vector, sparse, hybrid, boosted, expression, reranked, decay, graph, column, facet, aggregate, count, filter, compound, paths, invalid) and outcome (ok, partial, error, timeout, rejected, cancelled).");
         for (&(k, outcome), n) in &m.queries {
             let _ = writeln!(o, "strata_queries_total{{kind=\"{k}\",outcome=\"{outcome}\"}} {n}");
         }

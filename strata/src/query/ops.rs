@@ -53,7 +53,7 @@ pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions
 
 /// [`run`] of a plan whose leaves read any tables of `catalog`.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, per: None, plan: Vec::new(), encoded: Vec::new(), clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, per: None, plan: Vec::new(), encoded: Vec::new(), clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0, filter_docs: 0, scored: 0 };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -62,7 +62,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
         keys: keys.unwrap_or_default(),
         scores: rows.scores.unwrap_or_default(),
         parts: None,
-        stats: ExecStats { plan: ops.plan, steps: ops.prof, steps_dropped: ops.dropped, ..ExecStats::default() },
+        stats: ExecStats { plan: ops.plan, filter_docs: ops.filter_docs, scored: ops.scored, steps: ops.prof, steps_dropped: ops.dropped, ..ExecStats::default() },
     })
 }
 
@@ -116,6 +116,9 @@ struct Ops<'a, 'r> {
     clock: Clock,
     prof: Vec<Step>,
     dropped: u64,
+    /// The leaves' rows passing their filters, and scored, summed.
+    filter_docs: u64,
+    scored: u64,
 }
 
 /// What an operator's step is called, and what it works on.
@@ -343,6 +346,8 @@ impl<'a> Ops<'a, '_> {
         }
         self.plan.push(line);
         self.plan.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
+        self.filter_docs += rs.stats.filter_docs;
+        self.scored += rs.stats.scored;
         self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
         for r in &rs.rows {
             self.charge.row(r)?;

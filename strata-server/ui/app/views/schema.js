@@ -10,6 +10,7 @@ import { tables, invalidate, cached, table as tableOf, TYPES, typeMeta, typeBadg
 import { quoteName } from "../sqledit.js";
 import { viewport, draggable } from "./topology.js";
 import { SERIES } from "../charts.js";
+import { pathTree } from "../paths.js";
 
 export default { id: "schema", title: "Schema", icon: "schema", group: "Data", full: true, keywords: "tables fields diagram er entity relationship references edges embeddings create table designer ddl drop", render, onParams };
 
@@ -266,6 +267,10 @@ function diagram(host, bar, { openDesigner }) {
               h("td", {}, h("span", { class: "row nw", style: { gap: "6px" } }, typeBadge(f), h("b", {}, f.name))),
               h("td", { class: "mono small" }, typeMeta(f).label + (f.multi ? "[]" : "")),
               h("td", { class: "small dim" }, fieldNotes(f, sh.key).join(" · ") || h("span", { class: "muted" }, "–")))))))),
+        // Each JSON field's paths, read from its index.
+        (sh.fields || []).filter((f) => f.type === "json" && f.indexed !== false).map((f) => h("section", { class: "card" },
+          h("div", { class: "hd" }, h("h3", {}, h("span", { class: "row nw", style: { gap: "6px" } }, typeBadge(f), `Paths of ${f.name}`)), h("span", { class: "sub" }, "the keys its objects hold, from the index")),
+          h("div", { class: "bd" }, pathTree({ table: t.table, field: f.name })))),
         ls.length ? h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Links")), h("div", { class: "bd stack", style: { gap: "6px" } }, ls.map((l) => h("div", { class: "row nw small" },
           h("span", { style: { width: "18px", borderTop: `2px ${l.kind === "graph" ? "dashed" : "solid"} ${(KIND[l.kind] || KIND.ref).color}` } }),
           h("span", { class: "mono" }, `${l.from.table}${l.from.field ? "." + l.from.field : ""}`), h("span", { class: "muted" }, (KIND[l.kind] || KIND.ref).label), h("span", { class: "mono" }, `${l.to.table}${l.to.field ? "." + l.to.field : ""}`))))) : null,

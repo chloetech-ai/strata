@@ -31,7 +31,10 @@ export const TYPES = {
   sparse: { label: "SPARSE", glyph: "∴", color: "var(--s5)", what: "Learned term weights (SPLADE)" },
   media: { label: "MEDIA", glyph: "▣", color: "var(--s2)", what: "A file by reference: images, sound, video, PDF" },
   edges: { label: "EDGES", glyph: "↗", color: "var(--s8)", what: "Links to other rows: graph walks, PageRank" },
+  json: { label: "JSON", glyph: "{}", color: "var(--s6)", what: "Objects with keys no schema names: filter, group and sort by paths (attrs.color = 'red')" },
 };
+/** The colors of a path's value types, as the paths listing counts them. */
+export const PATH_TYPES = [["string", "var(--s3)"], ["number", "var(--s4)"], ["bool", "var(--s7)"]];
 export const typeMeta = (f) => TYPES[f.type] || { label: String(f.type).toUpperCase(), glyph: "?", color: "var(--muted)", what: "" };
 
 /** A small type badge for a field. */
@@ -79,3 +82,59 @@ export function links(ts = cached()) {
 
 /** A SQL string literal. */
 export const lit = (v) => `'${String(v).replace(/'/g, "''")}'`;
+
+// ------------------------------------------------------------ JSON paths
+
+const pathCache = new Map();   // "table\u0000field" -> {at, value, pending}
+bus.on("token", () => pathCache.clear());
+
+/**
+ * The paths a JSON field's objects hold (GET /v1/tables/:t/paths), at
+ * most a minute old: {rows, paths: [{path, keys, rows, types, distinct,
+ * min, max, values}], truncated}.
+ */
+export async function paths(tableName, field, force = false) {
+  const k = `${tableName}\u0000${field}`;
+  const c = pathCache.get(k);
+  if (c?.value && !force && Date.now() - c.at < 60000) return c.value;
+  if (c?.pending) return c.pending;
+  const pending = api(`/v1/tables/${encodeURIComponent(tableName)}/paths?field=${encodeURIComponent(field)}`)
+    .then((j) => { pathCache.set(k, { at: Date.now(), value: j }); bus.emit("paths", { table: tableName, field }); return j; })
+    .catch((e) => { pathCache.delete(k); throw e; });
+  pathCache.set(k, { ...(c || {}), pending });
+  return pending;
+}
+/** The listing of a JSON field already read, if any. */
+export const cachedPaths = (tableName, field) => pathCache.get(`${tableName}\u0000${field}`)?.value || null;
+
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const RESERVED = /^(select|from|where|order|group|by|limit|table|and|or|not|in|is|null|join|on|as|having|with|case|when|then|else|end|insert|update|delete|values|set|create|drop|primary|key|references|default|distinct|union|all|offset|asc|desc|like|between|exists|true|false)$/i;
+/** How SQL names the path of keys `keys` in JSON field `field`: attrs.dims.w, with a key that is not a plain name in brackets (attrs.dims['a.b']). */
+export function pathSql(field, keys) {
+  const f = IDENT.test(field) && !RESERVED.test(field) ? field : `"${field.replace(/"/g, '""')}"`;
+  return f + keys.map((k) => IDENT.test(k) && !RESERVED.test(k) ? `.${k}` : `[${lit(k)}]`).join("");
+}
+/** The type a path mostly holds, as the field type a query of it reads: keyword, float or bool (null for objects only). */
+export function pathType(p) {
+  const t = p.types || {};
+  const best = Math.max(t.string || 0, t.number || 0, t.bool || 0);
+  if (!best) return null;
+  return (t.number || 0) === best ? "float" : (t.string || 0) === best ? "keyword" : "bool";
+}
+/**
+ * The paths of a table's JSON fields that hold values, as fields a query
+ * can name: {name: "attrs.dims.w", type, sql, path, keys, json, listed}.
+ * Only the listings read already ([`paths`]).
+ */
+export function pathFields(t) {
+  const out = [];
+  for (const f of t?.short?.fields || []) {
+    if (f.type !== "json") continue;
+    const l = cachedPaths(t.table || t.short.table, f.name);
+    for (const p of l?.paths || []) {
+      const type = pathType(p);
+      if (type) out.push({ name: `${f.name}.${p.path}`, type, sql: pathSql(f.name, p.keys), path: p.path, keys: p.keys, json: f.name, listed: p, share: l.rows ? p.rows / l.rows : 0 });
+    }
+  }
+  return out;
+}

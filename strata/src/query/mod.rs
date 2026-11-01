@@ -9,6 +9,7 @@
 //! * [`ir`]: the plan of a statement, in JSON and in `EXPLAIN`.
 //! * [`agg`]: aggregates and groups.
 //! * [`stats`]: collection statistics exchanged with a coordinator.
+//! * [`paths`]: the paths listing of a JSON field (`json_paths(...)`).
 //! * [`memory`]: the memory breaker queries count what they hold against.
 //! * [`steps`]: a query's profile, the timed steps of its execution.
 //! * [`model`]: ranking models (`gbdt()`), read from LightGBM and XGBoost
@@ -30,6 +31,7 @@ pub mod memory;
 pub mod model;
 pub mod ops;
 pub mod parse;
+pub mod paths;
 pub mod plan;
 pub mod profile;
 pub mod pool;

@@ -500,7 +500,7 @@ details.more summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 .ed-pop .it { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
 .ed-pop .it.on { background: var(--accent-soft); }
 .ed-pop .k { width: 18px; height: 18px; display: grid; place-items: center; border-radius: 4px; font: 650 10.5px var(--mono); flex: none; background: var(--surface-3); color: var(--text-2); }
-.ed-pop .k-field { color: var(--s3); } .ed-pop .k-fn { color: var(--fn); } .ed-pop .k-kw { color: var(--kw); } .ed-pop .k-table { color: var(--s1); } .ed-pop .k-param { color: var(--num); }
+.ed-pop .k-field { color: var(--s3); } .ed-pop .k-path { color: var(--s6); } .ed-pop .k-fn { color: var(--fn); } .ed-pop .k-kw { color: var(--kw); } .ed-pop .k-table { color: var(--s1); } .ed-pop .k-param { color: var(--num); }
 .ed-pop .l { font-family: var(--mono); white-space: nowrap; }
 .ed-pop .l b { color: var(--accent); }
 .ed-pop .d { margin-left: auto; color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
@@ -586,6 +586,12 @@ td.sc span { position: relative; }
 .stage .item.sig { border-left: 3px solid var(--c); }
 .stage .item.src { flex-direction: row; align-items: center; gap: 8px; }
 .stage .item .row.nw { gap: 7px; }
+/* A crowded row (a JSON path is a long name) gives way down to widths
+   that still read: the field menu, the operator, the value, the slider. */
+.stage .item .row.nw > select { flex: 0 1 auto; min-width: 56px; }
+.stage .item .row.nw > select:first-of-type { min-width: 110px; }
+.stage .item .row.nw > input.input { flex: 0 1 auto; min-width: 64px; }
+.stage .item .row.nw > input[type=range] { flex: 0 1 120px; min-width: 32px; }
 .stage .item .opts { padding-left: 2px; gap: 14px; }
 .stage .item .opts label { gap: 5px; cursor: pointer; }
 .stage .kind { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--text-2); white-space: nowrap; min-width: 84px; }
@@ -1267,3 +1273,39 @@ button.rx-node:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--
 .cloud-warn .i { color: var(--warn-ink, var(--s4)); flex: none; margin-top: 1px; }
 .cloud-cmds { display: flex; flex-direction: column; gap: 4px; }
 .cloud-cmds code { background: var(--sunken); padding: 3px 8px; border-radius: 4px; overflow-x: auto; white-space: pre; flex: 1; min-width: 0; }
+
+/* A JSON field's paths ([paths.js]): a tree of keys, each with the share
+   of rows holding it, the mix of its value types and what they are. */
+.pt { display: flex; flex-direction: column; gap: 8px; }
+.pt .input[type=search] { width: 220px; }
+.pt-list { display: flex; flex-direction: column; max-height: 52vh; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.pt-row { display: grid; grid-template-columns: minmax(120px, 1.4fr) minmax(60px, 1fr) 40px 56px minmax(90px, 1.3fr); align-items: center; gap: 8px; padding: 5px 10px 5px 4px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.pt-name { display: flex; align-items: center; gap: 2px; min-width: 0; padding-left: calc(var(--d, 0) * 16px); }
+.pt-row:last-child { border-bottom: 0; }
+.pt-row:hover { background: var(--surface-2); }
+.pt-row.on { background: var(--accent-soft); }
+.pt-row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.pt-tog { flex: none; width: 18px; height: 18px; display: grid; place-items: center; border: 0; padding: 0; background: none; color: var(--muted); border-radius: 4px; cursor: pointer; }
+.pt-tog:hover { background: var(--surface-3); color: var(--text); }
+.pt-tog svg { width: 12px; height: 12px; }
+.pt-key { font-size: 12.5px; color: var(--text); }
+.pt-share { height: 7px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
+.pt-share > i { display: block; height: 100%; border-radius: 4px; background: var(--s6); }
+.pt-pct { text-align: right; }
+.pt-mix { display: flex; height: 7px; border-radius: 4px; overflow: hidden; gap: 1px; background: var(--surface-3); }
+.pt-mix > i { display: block; min-width: 3px; }
+.pt-mix > i.obj { flex: 1; background: repeating-linear-gradient(90deg, var(--line-2) 0 3px, transparent 3px 6px); }
+.pt-sum { min-width: 0; }
+.pt-detail { display: flex; flex-direction: column; gap: 8px; padding: 8px 12px 10px 28px; background: var(--surface-2); border-bottom: 1px solid var(--line); }
+.pt-detail code { background: var(--code); padding: 1px 6px; border-radius: 4px; }
+.pt-vals { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 14px; }
+.pt-val { display: grid; grid-template-columns: minmax(60px, 1fr) 70px 38px; gap: 8px; align-items: center; color: inherit; text-decoration: none; padding: 2px 4px; border-radius: 4px; font-size: 12px; }
+.pt-val:hover { background: var(--surface-3); }
+.pt-vbar { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.pt-vbar > i { display: block; height: 100%; }
+@media (max-width: 720px) { .pt-row { grid-template-columns: 1fr 50px 40px; } .pt-row .pt-mix, .pt-row .pt-sum { display: none; } }
+/* The builder's palette: a JSON field's paths under it, each a field. */
+.bld-fields .fi-path { padding-left: 18px; }
+.bld-fields .fi-path .tb { width: 14px; height: 14px; font-size: 11px; }
+.fi-share { width: 34px; height: 5px; border-radius: 3px; background: var(--surface-3); overflow: hidden; flex: none; }
+.fi-share > i { display: block; height: 100%; background: var(--s6); }

@@ -7,6 +7,7 @@
 //! | `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
 //! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
+//! | `GET /v1/tables/:table/paths?field=attrs&path=dims&where=cond` | | `{table, field, rows, paths: [{path, keys, rows, types: {string, number, bool}, distinct, min?, max?, values?: [{value, rows}]}], truncated}`: the paths a JSON field's objects hold ([`strata::query::paths`]), under `path` if given, among the rows `where` matches; from a coordinator, every shard's summed |
 //! | `GET /metrics` | | Prometheus text |
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?, trace?, profile?}` | rows, and in `stats.steps` the query's timed steps (with `profile`, their CPU time too, and with `trace` or `profile` the request's spans in `trace`); with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?, interleave?: {sql, variants?}}`) also `request`, `logged` and, interleaved, `teams` ([`strata::rank_log`]) |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
@@ -129,6 +130,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
         .route("/v1/tables", get(tables))
+        .route("/v1/tables/:table/paths", get(json_paths))
         .route("/v1/config", get(config))
         .route("/metrics", get(metrics))
         .route("/v1/query", post(query))
@@ -404,6 +406,26 @@ async fn schema(State(app): State<App>, Query(q): Query<std::collections::HashMa
 async fn tables(State(app): State<App>) -> AxJson<Json> {
     let tables: Vec<Json> = app.svc.catalog().iter().map(|s| table_json(&app.svc, s)).collect();
     AxJson(json!({"tables": tables}))
+}
+
+/// `GET /v1/tables/:table/paths?field=&path=&where=`: a JSON field's
+/// paths listing ([`strata::query::paths`]).
+async fn json_paths(State(app): State<App>, axum::extract::Path(table): axum::extract::Path<String>, Query(q): Params) -> Res {
+    let t0 = Instant::now();
+    let field = q.get("field").filter(|f| !f.is_empty()).ok_or_else(|| ApiError::bad("name the JSON field: ?field=attrs"))?;
+    let prefix = q.get("path").or_else(|| q.get("prefix")).filter(|p| !p.is_empty() && *p != "$");
+    let call = strata::query::paths::Call {
+        table,
+        field: field.clone(),
+        prefix: prefix.map(|p| strata::json::parse_path(p)).transpose()?,
+        filter: q.get("where").filter(|w| !w.trim().is_empty()).cloned(),
+    };
+    let paths = app.svc.json_paths(&call, &strata::query::Params::new(), &crate::service::After::Any, param_u64(&q, "timeout_ms", 0)?).await?;
+    let mut j = paths.to_json();
+    j["table"] = json!(call.table);
+    j["field"] = json!(call.field);
+    j["took_ms"] = json!(t0.elapsed().as_secs_f64() * 1e3);
+    Ok(AxJson(j))
 }
 
 fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json {

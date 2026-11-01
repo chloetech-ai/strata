@@ -176,6 +176,17 @@ pub(crate) fn json_paths(q: &mut sql::Query, catalog: &[&Schema]) -> Result<()> 
     if schemas.is_empty() {
         return Ok(());
     }
+    // A path the answer has as a column is named as the query wrote it
+    // (`attrs.color`), not by the call it becomes.
+    if let sql::SetExpr::Select(s) = q.body.as_mut() {
+        for item in s.projection.iter_mut() {
+            let SelectItem::UnnamedExpr(e) = item else { continue };
+            if schemas.iter().any(|s| matches!(super::sql::path_column(s, e), Ok(Some(_)))) {
+                let alias = sql::Ident::with_quote('"', e.to_string());
+                *item = SelectItem::ExprWithAlias { expr: e.clone(), alias };
+            }
+        }
+    }
     let mut failed = None;
     let mut rewrite = |e: &mut Expr| {
         if matches!(e, Expr::Function(_)) || failed.is_some() {
