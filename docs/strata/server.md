@@ -862,7 +862,7 @@ The view's read-only keys are not enough to make a cluster:
 - **On AWS**, the keys need `cloudformation:CreateStack`, `DescribeStacks`, `DescribeStackEvents`, `DescribeStackResources` and `DeleteStack`, `eks:DescribeCluster`, and the rights to make and delete what the template holds: a VPC with its subnets, route table and internet gateway, three IAM roles (with `iam:PassRole` on them), the EKS cluster, its access entry, node group and two add-ons (the pod identity agent and the EBS CSI driver). The keys' user or role becomes the cluster's administrator.
 - **On DigitalOcean**, the token must be able to create, read and delete Kubernetes clusters and the volumes they make.
 
-The nodes pull the plan's image (`ghcr.io/chloetech-ai/strata-server:latest` unless changed), so it must be one they can reach.
+The nodes pull the plan's image (`ghcr.io/chloetech-ai/strata-server:latest` unless changed), so it must be one they can reach. The repository's `Image` workflow (`.github/workflows/image.yml`) publishes it: each push to `main` that changes Strata or the server builds it for x86-64 and arm64 (Graviton) and tags it `latest` and the commit's sha, and a run started by hand publishes its branch under its sha. The nodes pull it without credentials once the package is public (the package's settings on GitHub, once, after its first publish); for a private one, give the cluster an image pull secret, or name an image of your own in the plan.
 
 ## Deadlines, admission and metrics
 

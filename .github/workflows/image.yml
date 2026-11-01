@@ -1,0 +1,103 @@
+name: Image
+
+# strata-server's image, for clusters the command center's Cloud view
+# plans: ghcr.io/chloetech-ai/strata-server, for x86-64 and arm64 (AWS
+# Graviton) in one tag.
+#
+# A push to main that changes Strata or the server publishes it as `latest`
+# and as the commit's full sha. A pull request that changes the Dockerfile
+# or this workflow builds both images and publishes nothing, so a broken
+# image shows before it merges. A run started by hand publishes the branch
+# it runs on, as its sha only.
+#
+# Each architecture builds on a runner of its own (GitHub's arm64 runners
+# are free for a public repository, and Rust under emulation would take
+# hours) and is pushed as `<sha>-amd64` and `<sha>-arm64`; the last job
+# joins them under the tags the nodes pull.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "strata/**"
+      - "strata-server/**"
+      - ".github/workflows/image.yml"
+  pull_request:
+    paths:
+      - "strata-server/deploy/Dockerfile"
+      - "strata-server/deploy/Dockerfile.dockerignore"
+      - ".github/workflows/image.yml"
+  workflow_dispatch:
+
+# A newer push to main replaces an older one still building; each pull
+# request keeps one run.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/chloetech-ai/strata-server
+  PUSH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  build:
+    name: image (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: strata-server/deploy/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: ${{ env.PUSH == 'true' }}
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ github.sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=strata-server, its benchmark and engine-compare
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+
+  publish:
+    name: image (publish)
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: One tag for both architectures
+        run: |
+          tags=(-t "$IMAGE:${{ github.sha }}")
+          if [ "${{ github.event_name }}" = push ]; then tags+=(-t "$IMAGE:latest"); fi
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:${{ github.sha }}-amd64" "$IMAGE:${{ github.sha }}-arm64"
+          docker buildx imagetools inspect "$IMAGE:${{ github.sha }}"
