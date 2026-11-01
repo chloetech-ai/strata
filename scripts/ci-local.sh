@@ -71,7 +71,7 @@ SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 # without comments and blank lines (ci_job_hashes).
 CI_JOBS="
 changes 0543cb44ccca
-test eeca5e84d1e9
+test 965ee0a1fac1
 kernels f1d8e09a9818
 vision a264ac583f17
 audio 8159b08f3f6d
@@ -449,6 +449,12 @@ job_test_engram() {
 job_test_strata_server() {
     cd strata-server
     crate_tests
+    # The cluster simulator over more seeds than its tests run (the build
+    # above made strata-sim): the first 3,000 of each world, as on every
+    # change on GitHub, where only Linux runs them.
+    ./target/ci/strata-sim --seeds 0..3000
+    ./target/ci/strata-sim --seeds 0..1000 --drop-ppm 150000
+    ./target/ci/strata-sim --cluster --seeds 0..3000
     cargo clippy --release --all-targets -- $CLIPPY_LINTS
 }
 
