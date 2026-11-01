@@ -47,6 +47,10 @@
 //! field (`VECTOR(d)[]`) embedded from `body` at load by `--colbert` (in
 //! `--models`), a vector a token, pooled by `--colbert-pool` if given, and
 //! `:t` the vectors of the query's tokens, embedded in the timed query.
+//! `colbert_vec<N>`, `colbert_fde<N>` and `colbert_exact` rank every row by
+//! `maxsim(tok, :t)` alone, `N` candidate rows found by a search of the
+//! token vectors (`--colbert-index hnsw` gives them a graph) or of the
+//! rows' MUVERA encodings, or every row scored.
 //! Each collection reports its database's size on disk. Each variant reports
 //! nDCG@10, recall@10 and, when `plain` runs too, the p-value of a paired
 //! randomization test of its nDCG@10 against plain BM25's (10,000
@@ -120,6 +124,10 @@ struct Args {
     /// (`pool_factor`).
     #[arg(long)]
     colbert_pool: Option<f32>,
+    /// The ColBERT field's index of its vectors: `flat` or `hnsw` (for the
+    /// `colbert_vec<N>` variants, which search it).
+    #[arg(long, default_value = "flat")]
+    colbert_index: String,
 }
 
 /// A variant's query on collection `coll` and whether it ranks rank-safe.
@@ -135,6 +143,18 @@ fn query(variant: &str, coll: &str, cross_encoder: &str) -> (String, bool) {
     }
     if let Some(n) = variant.strip_prefix("colbert_rerank").and_then(|n| n.parse().ok()) {
         return (rerank_n("maxsim(tok, :t)", n), true);
+    }
+    // ColBERT alone over every row: its candidates from a search of the
+    // token vectors (`vec`) or of the rows' MUVERA encodings (`fde`), or
+    // every row scored (`exact`).
+    if let Some(n) = variant.strip_prefix("colbert_vec").and_then(|n| n.parse::<usize>().ok()) {
+        return (top10(&format!("maxsim(tok, :t, search => 'vectors', candidates => {n})")), true);
+    }
+    if let Some(n) = variant.strip_prefix("colbert_fde").and_then(|n| n.parse::<usize>().ok()) {
+        return (top10(&format!("maxsim(tok, :t, search => 'encodings', candidates => {n})")), true);
+    }
+    if variant == "colbert_exact" {
+        return (top10("maxsim(tok, :t, search => 'vectors', depth => 100000000, candidates => 100000000)"), true);
     }
     match variant {
         "plain" => (top10("bm25(body, :q, syntax => 'plain')"), true),
@@ -154,7 +174,7 @@ fn query(variant: &str, coll: &str, cross_encoder: &str) -> (String, bool) {
         "plain_r100" => (top100("bm25(body, :q, syntax => 'plain')"), true),
         "all_r100" => (top100("bm25(body, :q, syntax => 'plain', min => '100%')"), true),
         "guard_r100" => (top100("bm25(body, :q, syntax => 'plain', min => 1, min_rows => 100)"), true),
-        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, ce_rerank<N>, colbert_rerank<N>, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
+        v => panic!("unknown variant {v}: plain, fuzzy, boost, strong_boost, either boost with _top100, boost_rerank100, minmax_rerank100, gbdt, gbdt_top100, gbdt_rerank100, ce_rerank<N>, colbert_rerank<N>, colbert_vec<N>, colbert_fde<N>, colbert_exact, words, weight_first, require_first, exclude_last, min2, min50, plain_r100, all_r100 or guard_r100"),
     }
 }
 
@@ -258,11 +278,16 @@ fn main() {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         let mut fields = vec![Field::new("id", FieldType::Keyword), Field::new("body", FieldType::Text { positions: false }), Field::new("importance", FieldType::Float)];
-        let colbert = args.variants.iter().any(|v| v.starts_with("colbert_rerank"));
+        let colbert = args.variants.iter().any(|v| v.starts_with("colbert_"));
         if colbert {
             let models = args.models.as_ref().expect("the colbert variants need --models");
             let dim = strata::embed::open_for(&args.colbert, None, models).unwrap_or_else(|e| panic!("{}: {e}", args.colbert)).dim();
-            let mut tok = Field::new("tok", FieldType::Vector { dim, index: strata::VectorIndexKind::Flat }).multi().embedded(&args.colbert, &["body"]);
+            let index = match args.colbert_index.as_str() {
+                "flat" => strata::VectorIndexKind::Flat,
+                "hnsw" => strata::VectorIndexKind::Hnsw { m: 16, ef_construction: 200 },
+                i => panic!("--colbert-index {i}: flat or hnsw"),
+            };
+            let mut tok = Field::new("tok", FieldType::Vector { dim, index }).multi().embedded(&args.colbert, &["body"]);
             if let Some(f) = args.colbert_pool {
                 tok = tok.pooled_by(f);
             }
@@ -301,7 +326,7 @@ fn main() {
                     let text = text_of(v, text);
                     let t = Instant::now();
                     let mut params = Params::new();
-                    if v.starts_with("colbert_rerank") {
+                    if v.starts_with("colbert_") {
                         params = params.set("t", db.embed_query_in("docs", "tok", &text).unwrap_or_else(|e| panic!("{name}: {e}")));
                     }
                     let got: Vec<String> = match db.query_with(&sql, &params.set("q", Value::Str(text)), &opts) {
@@ -381,7 +406,7 @@ fn main() {
         }
         let mut entry = json!({ "docs": coll.docs.len(), "queries": coll.queries.len(), "load_s": load_s, "db_bytes": disk_bytes(&path), "variants": variants });
         if colbert {
-            entry["colbert"] = json!({ "model": args.colbert, "pool_factor": args.colbert_pool });
+            entry["colbert"] = json!({ "model": args.colbert, "pool_factor": args.colbert_pool, "index": args.colbert_index });
         }
         report.insert(name.clone(), entry);
         drop(db);

@@ -1,0 +1,15 @@
+# examples/fde_probe.rs on the cloud container (Intel Xeon @ 2.80 GHz, 4 cores), 1 Nov 2026: SciFact test queries over their relevant documents plus 700 others, answerai-colbert-small-v1.
+300 queries, 983 docs
+embedded in 617.829921711s; 236 vectors a doc
+dim 96, doc vectors 231882, |mean| 0.904, mean cosine of random pairs 0.819
+exact maxsim nDCG@10 0.8600 over 983 docs
+R8 k4 d16 (2048 dims) plain  : top bucket holds 64% of a doc's vectors; N=10: recall 0.077 nDCG 0.1937 | N=50: recall 0.226 nDCG 0.4312 | N=100: recall 0.352 nDCG 0.5508 | N=200: recall 0.514 nDCG 0.6252 |
+R8 k4 d16 (2048 dims) centred: top bucket holds 22% of a doc's vectors; N=10: recall 0.087 nDCG 0.2605 | N=50: recall 0.253 nDCG 0.4951 | N=100: recall 0.383 nDCG 0.5874 | N=200: recall 0.558 nDCG 0.6852 |
+R8 k3 d16 (1024 dims) plain  : top bucket holds 74% of a doc's vectors; N=10: recall 0.063 nDCG 0.1779 | N=50: recall 0.204 nDCG 0.3645 | N=100: recall 0.321 nDCG 0.4898 | N=200: recall 0.495 nDCG 0.6142 |
+R8 k3 d16 (1024 dims) centred: top bucket holds 31% of a doc's vectors; N=10: recall 0.082 nDCG 0.2243 | N=50: recall 0.230 nDCG 0.4378 | N=100: recall 0.359 nDCG 0.5500 | N=200: recall 0.515 nDCG 0.6398 |
+R8 k5 d16 (4096 dims) plain  : top bucket holds 59% of a doc's vectors; N=10: recall 0.082 nDCG 0.2752 | N=50: recall 0.236 nDCG 0.4659 | N=100: recall 0.370 nDCG 0.5952 | N=200: recall 0.553 nDCG 0.7194 |
+R8 k5 d16 (4096 dims) centred: top bucket holds 17% of a doc's vectors; N=10: recall 0.109 nDCG 0.3867 | N=50: recall 0.279 nDCG 0.5666 | N=100: recall 0.417 nDCG 0.6514 | N=200: recall 0.586 nDCG 0.7318 |
+R20 k5 d16 (10240 dims) plain  : top bucket holds 50% of a doc's vectors; N=10: recall 0.136 nDCG 0.3966 | N=50: recall 0.354 nDCG 0.5740 | N=100: recall 0.486 nDCG 0.6649 | N=200: recall 0.654 nDCG 0.7414 |
+R20 k5 d16 (10240 dims) centred: top bucket holds 17% of a doc's vectors; N=10: recall 0.158 nDCG 0.4728 | N=50: recall 0.363 nDCG 0.6392 | N=100: recall 0.495 nDCG 0.6898 | N=200: recall 0.662 nDCG 0.7646 |
+R16 k4 d32 (8192 dims) plain  : top bucket holds 62% of a doc's vectors; N=10: recall 0.180 nDCG 0.4600 | N=50: recall 0.411 nDCG 0.6559 | N=100: recall 0.554 nDCG 0.7042 | N=200: recall 0.719 nDCG 0.7873 |
+R16 k4 d32 (8192 dims) centred: top bucket holds 22% of a doc's vectors; N=10: recall 0.199 nDCG 0.5364 | N=50: recall 0.434 nDCG 0.6863 | N=100: recall 0.576 nDCG 0.7507 | N=200: recall 0.732 nDCG 0.7921 |

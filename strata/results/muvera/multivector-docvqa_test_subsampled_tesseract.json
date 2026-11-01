@@ -1,0 +1,139 @@
+{
+  "data": {
+    "dataset": "vidore/docvqa_test_subsampled_tesseract",
+    "dim": 128,
+    "float32_bytes_per_page": 542557.184,
+    "model": "vidore/colSmol-256M",
+    "pages": 500,
+    "queries": 500,
+    "vectors_per_page": 1059.682
+  },
+  "layouts": [
+    {
+      "bytes_per_page": 307707.962,
+      "layout": "sq8",
+      "load_s": 91.489780563,
+      "sections_bytes": {
+        "bin": 8477456,
+        "binp": 1040,
+        "fde.f32": 4096000,
+        "fde.hnsw": 64000,
+        "fde.hnsw_upper": 2768,
+        "fde.meta": 183,
+        "fde.sq8": 1024000,
+        "fde.sq8p": 16400,
+        "fdep": 53,
+        "hnsw": 67819648,
+        "hnsw_upper": 2410152,
+        "meta": 225,
+        "owner": 2119364,
+        "rescore": 67819648,
+        "rescorep": 1040,
+        "rows": 2004
+      },
+      "vectors_per_page": 1059.682
+    }
+  ],
+  "machine": {
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "sq8_kernel": "vnni"
+  },
+  "params": {
+    "index": "hnsw m 16, ef_construction 200",
+    "limit": 5,
+    "threads_build": 4,
+    "threads_query": 1
+  },
+  "reference_ndcg_at_5": 0.507315286130053,
+  "runs": [
+    {
+      "layout": "sq8",
+      "mean_ms": 4.669323449999997,
+      "ndcg_at_5": 0.3673234395861602,
+      "p50_ms": 4.103902000000001,
+      "p99_ms": 11.14681,
+      "ranking": "maxsim, 25 candidates, encodings"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 19.85056952,
+      "ndcg_at_5": 0.45214819683179563,
+      "p50_ms": 17.349996,
+      "p99_ms": 41.386767,
+      "ranking": "maxsim, 100 candidates, encodings"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 38.87608493800003,
+      "ndcg_at_5": 0.48933072039061654,
+      "p50_ms": 34.404339,
+      "p99_ms": 98.89941200000001,
+      "ranking": "maxsim, 200 candidates, encodings"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 75.205860452,
+      "ndcg_at_5": 0.5062276386283753,
+      "p50_ms": 68.189751,
+      "p99_ms": 157.01052800000002,
+      "ranking": "maxsim, 400 candidates, encodings"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 13.053564277999994,
+      "ndcg_at_5": 0.5054894981355181,
+      "p50_ms": 11.977842,
+      "p99_ms": 27.552601,
+      "ranking": "maxsim, 25 candidates, vectors"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 24.45249717600001,
+      "ndcg_at_5": 0.5052276386283753,
+      "p50_ms": 22.712974,
+      "p99_ms": 50.061012000000005,
+      "ranking": "maxsim, 100 candidates, vectors"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 40.46387027200001,
+      "ndcg_at_5": 0.5052276386283753,
+      "p50_ms": 37.121124,
+      "p99_ms": 88.325345,
+      "ranking": "maxsim, 200 candidates, vectors"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 39.972577044000005,
+      "ndcg_at_5": 0.5052276386283753,
+      "p50_ms": 35.974213,
+      "p99_ms": 93.38729,
+      "ranking": "maxsim, 400 candidates, vectors"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 2066.1579497919993,
+      "ndcg_at_5": 0.5062276386283753,
+      "p50_ms": 1954.546976,
+      "p99_ms": 3445.506988,
+      "ranking": "maxsim, exact"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 0.019057386,
+      "ndcg_at_5": 0.3613460501531984,
+      "p50_ms": 0.015841,
+      "p99_ms": 0.05812,
+      "ranking": "bm25 over OCR text"
+    },
+    {
+      "layout": "sq8",
+      "mean_ms": 34.61621349200001,
+      "ndcg_at_5": 0.4336862135094879,
+      "p50_ms": 32.377439,
+      "p99_ms": 64.572812,
+      "ranking": "rrf(bm25, maxsim)"
+    }
+  ]
+}
