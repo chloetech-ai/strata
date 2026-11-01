@@ -514,6 +514,10 @@ message Node {
     // The input's rows, each once.
     Node distinct = 13;
     KeyOrder key_order = 14;
+    // 20 to 29: DataFusion's lane C.
+    // The input's rows, each with a column per window function after its
+    // own (plan feature window).
+    Window window = 20;
     // 90 to 99: media, sequences and semantic IDs, lane M.
     // The first row of each group (DISTINCT ON); plan feature distinct_on.
     DistinctOn distinct_on = 90;
@@ -709,6 +713,67 @@ message DistinctOn {
   Node input = 1;
   repeated Expr keys = 2;
   uint64 per = 3;
+}
+
+// The input's rows, in their order, each with a column per function after
+// its own; expressions above name the input's columns, then the
+// functions'.
+message Window {
+  Node input = 1;
+  repeated WindowFn funcs = 2;
+}
+
+// A window function: over the rows with the row's values of `partition`,
+// in the order of `order` (rows that tie in the input's order).
+message WindowFn {
+  enum Kind {
+    ROW_NUMBER = 0;
+    RANK = 1;
+    DENSE_RANK = 2;
+    PERCENT_RANK = 3;
+    CUME_DIST = 4;
+    NTILE = 5;
+    LAG = 6;
+    LEAD = 7;
+    FIRST_VALUE = 8;
+    LAST_VALUE = 9;
+    NTH_VALUE = 10;
+    // An aggregate of the frame (`agg`, and `arg` but for COUNT(*)).
+    AGGREGATE = 11;
+  }
+  Kind kind = 1;
+  // NTILE's buckets, LAG's and LEAD's offset, NTH_VALUE's n.
+  uint64 n = 2;
+  Expr arg = 3;
+  // LAG's and LEAD's value past the partition's ends; absent: NULL.
+  Expr default = 4;
+  AggFn agg = 5;
+  repeated Expr partition = 6;
+  repeated SortKey order = 7;
+  // Absent: with an order, the rows up to the row's last peer, and
+  // without, the whole partition.
+  WindowFrame frame = 8;
+}
+
+// The rows of the partition a framed function reads for a row.
+message WindowFrame {
+  // RANGE (offsets of the one key's value); otherwise ROWS.
+  bool range = 1;
+  FrameBound start = 2;
+  FrameBound end = 3;
+}
+
+message FrameBound {
+  enum Kind {
+    UNBOUNDED_PRECEDING = 0;
+    PRECEDING = 1;
+    CURRENT_ROW = 2;
+    FOLLOWING = 3;
+    UNBOUNDED_FOLLOWING = 4;
+  }
+  Kind kind = 1;
+  // PRECEDING's and FOLLOWING's offset, a literal.
+  Expr offset = 2;
 }
 
 message Exprs { repeated Expr v = 1; }

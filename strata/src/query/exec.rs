@@ -117,7 +117,9 @@ impl SegmentReaders {
         let f = &self.schema.fields[field];
         opened(&self.text[field], || {
             Ok(match f.ty {
+                // A JSON field with text has one beside its terms.
                 FieldType::Text { .. } | FieldType::Sparse if f.indexed => Some(TextFieldReader::open(&self.seg, &f.key())?),
+                FieldType::Json if f.has_text() => Some(TextFieldReader::open(&self.seg, &f.key())?),
                 _ => None,
             })
         })

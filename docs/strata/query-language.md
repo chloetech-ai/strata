@@ -54,10 +54,12 @@ WHERE a.year >= 2020 ORDER BY bm25(a.body, 'mrna vaccine') DESC LIMIT 20;
 
 ```text
 [WITH name AS (SELECT ...), ...]
-SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates>
+SELECT [DISTINCT | DISTINCT ON (<expressions>)] <columns | * | score() | hops() | seq_no() | features() | ranking expressions | aggregates | window functions>
 FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [WHERE <predicate>]
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
+[QUALIFY <predicate over window functions>]
+[WINDOW name AS (<window>), ...]
 [ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]] [MAX k PER <field>]]
 [LIMIT n [OFFSET m]]
 ```
@@ -65,7 +67,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 - **Tables by name.** A database holds one or more [tables](#tables), and a query reads the tables it names (in any case): one, or several joined, read by subqueries or named in `WITH` ([below](#subqueries-with-and-joins)).
 - **Quoted names.** A table or column name in double quotes is the name inside them, so any name can be written: `"order"` (a word SQL reserves), `"doc no"`, `"say ""hi"""` (a quote doubled), and `FROM "papers"` reads papers. Python's [`table()`](python.md#queries-built-in-python) builds queries with no quoting at all.
 - **Strings** are single-quoted, `'sale'`. Where a value goes, a double-quoted `"sale"` is a string too, as SQLite and MySQL read it, and a bare name is an error rather than a string: `WHERE tag = sale` says `no such column: sale`.
-- **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `WINDOW`, `QUALIFY`, `GROUP BY ... WITH ROLLUP` and the like.
+- **Clauses Strata does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `GROUP BY ... WITH ROLLUP` and the like.
 - **`SELECT *`** returns every stored, non-vector column.
 - **`score()`** is the value of the `ORDER BY` score for each row (over a `WITH` result read without an `ORDER BY`, the score the `WITH` ranked its rows by); **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by. A [ranking expression](#features-the-values-a-ranking-read) that scores each row by itself is a column too (`bm25(title, :q) AS t`), and **`features()`** stands for the inputs of the query's ranking.
 - **`ORDER BY`** takes one key, plus an optional tie-break that must be the primary key (or, in a facet query, the group column). Ranking by a score is always best first; a `KEYWORD` or stored `TEXT` column first sorts the rows by its text, `NULL` last either way, which the row evaluator does after reading every row the `WHERE` keeps; `ORDER BY distance(…) ASC` ranks like `similarity(…) DESC`. `MAX k PER field` at its end keeps at most k rows of each value ([below](#at-most-k-rows-of-a-value-max-k-per)).
@@ -125,7 +127,8 @@ SELECT attrs.color, COUNT(*) FROM products GROUP BY attrs.color;
 - **Paths.** `attrs.dims.w` is the key `w` of the object at `dims`; `attrs['a.b']` names a key that holds a dot, and `json_extract(attrs, 'dims.w')` is the same path as a function (`'$.dims.w'` too). In a join, qualify the field: `p.attrs.color`. An array holds its elements at its own path, as a multi-valued field does: `attrs.certs = 'UL'` matches `["CE", "UL"]`, and `{"items": [{"sku": "x"}, {"sku": "y"}]}` holds `x` and `y` at `items.sku`. JSON `null` and an empty array are no value.
 - **Types.** A comparison sees the values of its literal's type only, as if the path were a column of that type: `attrs.voltage > 5` reads the numbers at `voltage` (integers and doubles alike), `attrs.voltage = 'n/a'` its strings, `attrs.ok` and `attrs.ok = TRUE` its booleans. A row with no value of that type there is `NULL` to the comparison, so `NOT (attrs.voltage > 5)` and `attrs.voltage != 5` leave out rows whose voltage is missing or a string, and `IS NULL` finds rows without the path at all. An `IN` list of several types reads each type for its own values. No row is refused for holding a type other rows do not.
 - **Reads.** `SELECT attrs` returns the object as compact JSON text with sorted keys. A path in `SELECT`, `ORDER BY`, `GROUP BY` or an aggregate returns its value, in a column named as the query writes the path (`attrs.dims.w`): a string, an integer, a double or a boolean; a list for an array of values or for several values through an array; an object as its JSON text; `NULL` where the row has none. These are computed over the rows the query finds, in memory (up to a million), as over [joined rows](#subqueries-with-and-joins); a group per value of a list, as for a multi-valued column.
-- **Writes.** A value is a JSON object, given as text (`'{"k": 1}'`), as an object in JSON Lines or the HTTP API, or as a dict from Python; `NULL` is no object. A write is refused, naming the limit, for anything else, for an empty key, and for an object nested more than 16 levels, with a path longer than 256 bytes or with more than 1,000 values and objects. A string longer than 256 bytes is kept and returned, and `IS NOT NULL` sees it, but comparisons do not: its value is not indexed.
+- **Writes.** A value is a JSON object, given as text (`'{"k": 1}'`), as an object in JSON Lines or the HTTP API, or as a dict from Python; `NULL` is no object. A write is refused, naming the limit, for anything else, for an empty key, and for an object nested more than 16 levels, with a path longer than 256 bytes or with more than 1,000 values and objects. A string longer than 256 bytes is kept and returned, and `IS NOT NULL` sees it, but comparisons do not: its value is not indexed (its words are, with [text](#json-fields-keys-no-schema-names)).
+- **Text.** `attrs JSON OPTIONS(text = true)` also indexes the strings of each row's object as text, one a line in path order, long ones included, so `MATCH(attrs, 'charger NOT lamp')` finds rows by the words of any of their strings and `bm25(attrs, 'usb charger')` ranks them as it ranks a `TEXT` field holding the same lines (with a cluster's statistics through a coordinator). Keys, numbers and booleans are not text: a path reads them. The option takes an `analyzer` (`'english'`, the default, or `'simple'`), and the text has positions, so a phrase may span two strings that follow each other. A database with such a field needs the feature `json_text` besides `json`.
 - **The index** is one sorted dictionary per segment of terms `path \0 type value` (strings as UTF-8, numbers in an order-preserving encoding of doubles), so `=` and `IN` read one term's docID list, a range or `LIKE 'p%'` one run of terms, and `IS NOT NULL` the path's own term. A row pays only for the paths it holds, which is what keeps thousands of sparse keys cheap where as many declared columns would each take a slot in every row. A `JSON` field is stored; it cannot be the primary key, multi-valued, have a default, or be generated or the source of a generated or embedded field. A database with a `JSON` field is written in [file format 3](index.md#wal-memtable-and-snapshots) with the feature `json`, and plans that read paths carry the plan feature `json`.
 
 #### Which paths a field holds: `json_paths`
@@ -829,9 +832,49 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
   - `datafusion-only`: a query DataFusion does not run fails, to find what it lacks.
 
   The operators run what DataFusion does not run yet, and the plan's first line says why. Today that is joins along links, multi-valued columns as join keys, groups or sort keys, correlated subqueries, and `maxsim` or `encode` over a subquery.
-- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `UNION`, `INTERSECT`, `EXCEPT`, window functions, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
+- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `UNION`, `INTERSECT`, `EXCEPT`, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
+
+## Window functions
+
+A window function gives each row a value computed over other rows, its *partition*, without folding them into one as `GROUP BY` does: a row's rank among its category's, the value of the row before, a running total, a moving average.
+
+```sql
+-- each paper's rank in its category by citations, and its category's average
+SELECT id, category, cites,
+       RANK() OVER (PARTITION BY category ORDER BY cites DESC) AS r,
+       AVG(cites) OVER (PARTITION BY category) AS avg_cites
+FROM papers WHERE year >= 2020;
+
+-- the three most cited of each category: QUALIFY filters by a window
+SELECT id, category, cites FROM papers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY category ORDER BY cites DESC, id) <= 3;
+
+-- a running total and a moving average of the day before, the day and the day after
+SELECT day, clicks,
+       SUM(clicks) OVER (ORDER BY day) AS total,
+       AVG(clicks) OVER (ORDER BY day ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS smooth,
+       clicks - LAG(clicks) OVER (ORDER BY day) AS change
+FROM daily ORDER BY day;
+
+-- over groups: categories ranked by size, and each one's share
+SELECT category, COUNT(*) AS n, RANK() OVER (ORDER BY COUNT(*) DESC), COUNT(*) / SUM(COUNT(*)) OVER () AS share
+FROM papers GROUP BY category;
+
+-- one window, named once
+SELECT id, ROW_NUMBER() OVER w, LAG(year) OVER w, SUM(cites) OVER (w ROWS 2 PRECEDING)
+FROM papers WINDOW w AS (PARTITION BY category ORDER BY year);
+```
+
+- **Functions.** `ROW_NUMBER()`; `RANK()` and `DENSE_RANK()`; `PERCENT_RANK()` and `CUME_DIST()`, `FLOAT`s; `NTILE(n)`, buckets 1 to n as even as they can be, the first ones a row larger (as SQL says, and PostgreSQL and SQLite do); `LAG(x [, offset [, default]])` and `LEAD(..)`, `x` of the row `offset` rows before or after (1 by default), or `default` (`NULL` without one) past the partition's ends; `FIRST_VALUE(x)`, `LAST_VALUE(x)` and `NTH_VALUE(x, n)` of the row's frame; and the aggregates `COUNT(*)`, `COUNT(x)`, `SUM`, `AVG`, `MIN` and `MAX` of the frame. `NTILE`'s, `NTH_VALUE`'s and `LAG`'s numbers are constants. `COUNT(DISTINCT ..)`, `FILTER (WHERE ..)` and `IGNORE NULLS` are errors.
+- **`OVER (PARTITION BY .. ORDER BY ..)`.** The partition is the rows with equal values of its expressions (`NULL` equal to `NULL`); without `PARTITION BY` it is every row. The window's `ORDER BY` orders the partition, its `NULL`s last unless `NULLS FIRST` as elsewhere; rows whose order keys are all equal are *peers*, and rows that tie keep the order they came in. Both take expressions of the rows (`PARTITION BY year % 10`, `ORDER BY lower(title)`), or over groups of the groups' values and aggregates.
+- **Frames.** `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` and the aggregates read the rows of the row's frame: `ROWS BETWEEN start AND end` counts rows from the row, and `RANGE BETWEEN start AND end` takes the rows whose value of the window's one `ORDER BY` key is within the offsets of the row's (a row without a value has its peers, the other rows without one). The ends are `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW` (in `RANGE`, the row's first or last peer), `n FOLLOWING` and `UNBOUNDED FOLLOWING`, in that order; `ROWS 2 PRECEDING` is `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`. Without a frame, a window with an `ORDER BY` reads from the partition's first row to the row's last peer, so `SUM(x) OVER (ORDER BY day)` is a running total that counts a day's rows together, and a window without one reads the whole partition. The other functions read the partition whatever the frame says. `GROUPS` frames are errors.
+- **Where they go.** A window function is a column of `SELECT`, a key of `ORDER BY`, or part of a condition of **`QUALIFY`**, which filters the rows after the windows are computed and may name a selected window by its alias (`QUALIFY r <= 3`). It is not part of `WHERE`, `GROUP BY` or `HAVING`, which come before, and a window function's argument, partition or order holds no other: compute that one in a subquery in `FROM`. In a grouped query the windows are computed over the groups `HAVING` keeps; `SELECT DISTINCT`, `ORDER BY` and `LIMIT` come after them, so `COUNT(*) OVER () ... LIMIT 5` counts every row.
+- **`WINDOW w AS (..)`** names a window that `OVER w` uses as it is, and that `OVER (w ORDER BY ..)` or `OVER (w ROWS ..)` extends with an order or a frame it lacks; a window may name one before it (`WINDOW w AS (PARTITION BY a), v AS (w ORDER BY b)`).
+- **Engines.** The operators sort each partition in memory; DataFusion runs windows on column batches, sorting and spilling within the query's memory budget, and both answer alike. The operators run a window DataFusion does not lower yet: a `LAG` or `LEAD` whose default is not a constant of the value's type, `FIRST_VALUE` and `LAST_VALUE` over a `RANGE` frame with an offset, `NTH_VALUE` over a `RANGE` frame that starts after the partition's first row, a `RANGE` offset of another type than its key (`0.5` over an `INT`), and windows over multi-valued columns.
+
+The plan's node is `Window` (`Window: RANK() OVER (PARTITION BY category ORDER BY cites DESC)` in `EXPLAIN`, the functions computed after the rows' own columns), and its JSON needs the plan feature `window`; a version of Strata from before it refuses the plan by that name.
 
 ## The first row of each group: DISTINCT ON
 

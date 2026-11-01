@@ -19,7 +19,7 @@ function onParams(r) { const t = r.params.get("table"); if (t && reopen) reopen(
 const uid = () => Math.random().toString(36).slice(2, 9);
 const isNum = (f) => f && (f.type === "int" || f.type === "float");
 const isTime = (f) => f && f.type === "timestamp";
-const searchable = (f) => f && f.type === "text" && f.indexed !== false;
+const searchable = (f) => f && (f.type === "text" || f.type === "json" && f.text) && f.indexed !== false;
 const groupable = (f) => f && (f.type === "keyword" || isNum(f)) && f.indexed !== false;
 const sortableField = (f) => f && (f.type === "keyword" || isNum(f) || isTime(f) || f.type === "bool") && !f.multi;
 const showable = (f) => f && f.type !== "vector" && f.type !== "sparse" && f.stored !== false;

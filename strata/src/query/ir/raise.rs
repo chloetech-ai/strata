@@ -75,6 +75,7 @@ fn name(n: &Node) -> &'static str {
         Node::Distinct { .. } => "Distinct",
         Node::DistinctOn { .. } => "DistinctOn",
         Node::KeyOrder { .. } => "KeyOrder",
+        Node::Window { .. } => "Window",
     }
 }
 
@@ -310,9 +311,9 @@ impl<'a> Raise<'a> {
     fn guard(&mut self, g: &super::Guard) -> Result<logical::Guard> {
         let text_field = |me: &Self, f: u32| -> Result<usize> {
             let i = me.field(f)?;
-            match me.schema.fields[i].ty {
-                FieldType::Text { .. } if me.schema.fields[i].indexed => Ok(i),
-                _ => Err(err(format!("a guard's MATCH or bm25 reads an indexed TEXT field, not {}", me.schema.fields[i].name))),
+            match me.schema.fields[i].has_text() {
+                true => Ok(i),
+                false => Err(err(format!("a guard's MATCH or bm25 reads an indexed TEXT field (or a JSON field with text), not {}", me.schema.fields[i].name))),
             }
         };
         let site = match &g.site {
@@ -447,8 +448,8 @@ impl<'a> Raise<'a> {
             Expr::Match { field, query, expand } => {
                 let f = self.field(*field)?;
                 let fld = &self.schema.fields[f];
-                if !matches!(fld.ty, FieldType::Text { .. }) || !fld.indexed {
-                    return Err(err(format!("MATCH needs an indexed TEXT field, not {}", fld.name)));
+                if !fld.has_text() {
+                    return Err(err(format!("MATCH needs an indexed TEXT field (or a JSON field with text), not {}", fld.name)));
                 }
                 crate::text::query::parse_match_with(query, fld.text_analyzer())?;
                 Pred::Match { field: f, query: query.clone(), expand: *expand }
@@ -777,7 +778,13 @@ impl<'a> Raise<'a> {
                 }
                 Score::Column { field: f }
             }
-            Expr::Bm25 { field, text, opts } => Score::Bm25 { field: self.typed(*field, |t| matches!(t, FieldType::Text { .. }), "bm25", "TEXT")?, text: text.clone(), opts: opts.clone() },
+            Expr::Bm25 { field, text, opts } => {
+                let f = self.typed(*field, |t| matches!(t, FieldType::Text { .. } | FieldType::Json), "bm25", "TEXT")?;
+                if self.schema.fields[f].ty == FieldType::Json && !self.schema.fields[f].has_text() {
+                    return Err(err(format!("bm25 reads a JSON field's strings when it has text (OPTIONS(text = true)), which {} has not", self.schema.fields[f].name)));
+                }
+                Score::Bm25 { field: f, text: text.clone(), opts: opts.clone() }
+            }
             Expr::Similarity { field, vector, opts } => {
                 let f = self.typed(*field, |t| matches!(t, FieldType::Vector { .. }), "similarity", "VECTOR")?;
                 if self.schema.fields[f].multi {

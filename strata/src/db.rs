@@ -1585,6 +1585,7 @@ impl Db {
             for (i, f) in schema.fields.iter().enumerate() {
                 let ok = match f.ty {
                     FieldType::Text { .. } | FieldType::Sparse => r.text(i).map(|_| ()),
+                    FieldType::Json if f.has_text() => r.keyword(i).and_then(|_| r.text(i)).map(|_| ()),
                     FieldType::Keyword | FieldType::Json => r.keyword(i).map(|_| ()),
                     FieldType::Vector { .. } => r.vector(i).map(|_| ()),
                     FieldType::Edges => r.graph(i).map(|_| ()),
