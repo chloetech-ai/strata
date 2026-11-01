@@ -51,6 +51,8 @@ pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn Field
         FieldType::Keyword => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
         // Multi-valued INT fields are indexed as keywords (see keyword.rs).
         FieldType::Int if field.multi => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
+        // A JSON field's terms, which crate::json::JsonBuilder gives it.
+        FieldType::Json => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
         FieldType::Int | FieldType::Float => Ok(Box::new(numeric::NumericBuilder::new(field, opts)?)),
         _ => Err(Error::Schema(format!("field {} has no forward column", field.name))),
     }

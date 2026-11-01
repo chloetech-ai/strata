@@ -5,7 +5,7 @@
 
 use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, NormKind, OnConflict, Plan};
 use crate::error::Result;
-use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors, CROSS_ENCODER_FIRST};
+use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors, CROSS_ENCODER_FIRST};
 use crate::query::rank::Rank;
 use crate::query::sql::{self, Assign, Conflict, Write};
 use crate::schema::{FieldType, Schema};
@@ -105,6 +105,42 @@ impl<'a> Raise<'a> {
             Ok(f)
         } else {
             Err(err(format!("{} has no field {f}", self.schema.table)))
+        }
+    }
+
+    /// The JSON field and path `e` reads, when it is
+    /// `json_extract(field, path [, type])` ([`Func::JsonExtract`]) of an
+    /// indexed JSON field.
+    fn path_of(&self, e: &Expr) -> Result<Option<(usize, String)>> {
+        Ok(self.typed_path_of(e)?.map(|(f, p, _)| (f, p)))
+    }
+
+    /// A JSON field's path that `e` reads, with the type it reads there
+    /// when it names one.
+    fn typed_path_of(&self, e: &Expr) -> Result<Option<(usize, String, Option<crate::json::Kind>)>> {
+        let Expr::Call { func: Func::JsonExtract, args } = e else { return Ok(None) };
+        let (Some(Expr::Field(f)), Some(Expr::Lit(Value::Str(p)))) = (args.first(), args.get(1)) else {
+            return Err(err("a Search's json_extract reads a JSON field at a path given as text"));
+        };
+        let kind = match args.get(2) {
+            None => None,
+            Some(Expr::Lit(Value::Str(k))) => Some(crate::json::Kind::parse(k).ok_or_else(|| err(format!("json_extract's type is 'string', 'number' or 'bool', not {k:?}")))?),
+            Some(k) => return Err(err(format!("json_extract's type is 'string', 'number' or 'bool', not {k:?}"))),
+        };
+        let f = self.field(*f)?;
+        let fld = &self.schema.fields[f];
+        if fld.ty != FieldType::Json || !fld.indexed {
+            return Err(err(format!("a Search filters by paths of indexed JSON fields, not {}", fld.name)));
+        }
+        Ok(Some((f, crate::json::parse_path(p)?, kind)))
+    }
+
+    /// A value a path of type `kind` is compared with: of that type.
+    fn path_lit(&self, kind: Option<crate::json::Kind>, e: &Expr) -> Result<Value> {
+        let v = path_value(self.lit(e)?)?;
+        match (kind, crate::json::Kind::of(&v)) {
+            (Some(k), Some(of)) if k != of => Err(err(format!("json_extract(.., '{}') compared with a {}", k.name(), of.name()))),
+            _ => Ok(v),
         }
     }
 
@@ -329,8 +365,16 @@ impl<'a> Raise<'a> {
             }
             Expr::Or(xs) => Pred::Or(xs.iter().map(|x| self.pred(x)).collect::<Result<_>>()?),
             Expr::AtLeast { need, conds } => Pred::AtLeast { need: *need as usize, items: conds.iter().map(|x| self.pred(x)).collect::<Result<_>>()? },
+            Expr::IsNull(x) if self.path_of(x)?.is_some() => {
+                let (field, path, kind) = self.typed_path_of(x)?.expect("a path");
+                Pred::Not(Box::new(Pred::Path { field, path, test: PathTest::Has(kind) }))
+            }
             Expr::IsNull(x) => Pred::Not(Box::new(Pred::Present { field: self.present_field(x)? })),
             Expr::Not(x) => match &**x {
+                Expr::IsNull(y) if self.path_of(y)?.is_some() => {
+                    let (field, path, kind) = self.typed_path_of(y)?.expect("a path");
+                    Pred::Path { field, path, test: PathTest::Has(kind) }
+                }
                 Expr::IsNull(y) => Pred::Present { field: self.present_field(y)? },
                 // A comparison with NULL is neither true nor false, and so
                 // is its negation.
@@ -340,6 +384,13 @@ impl<'a> Raise<'a> {
                     p.three_valued(&multi)
                 }
             },
+            Expr::Between { expr, lo, hi } if self.path_of(expr)?.is_some() => {
+                let (field, path, kind) = self.typed_path_of(expr)?.expect("a path");
+                let bound = |b: &Option<Box<Expr>>| -> Result<Option<(Value, bool)>> { b.as_ref().map(|b| Ok((self.path_lit(kind, b)?, true))).transpose() };
+                let (lo, hi) = (bound(lo)?, bound(hi)?);
+                crate::json::range_run(&path, lo.as_ref().map(|(v, i)| (v, *i)), hi.as_ref().map(|(v, i)| (v, *i)))?;
+                Pred::Path { field, path, test: PathTest::Range { lo, hi } }
+            }
             Expr::Between { expr, lo, hi } => {
                 let f = self.field_of(expr)?;
                 match self.schema.fields[f].ty {
@@ -364,6 +415,16 @@ impl<'a> Raise<'a> {
                         sql::int_range(f, lo, hi)
                     }
                     _ => return Err(err(format!("BETWEEN needs an INT or FLOAT field, not {}", self.schema.fields[f].name))),
+                }
+            }
+            Expr::In { expr, list } if self.path_of(expr)?.is_some() => {
+                let (field, path, kind) = self.typed_path_of(expr)?.expect("a path");
+                // A NULL is kept for three_valued to read.
+                let values = list.iter().map(|v| self.path_lit(kind, v)).collect::<Result<Vec<_>>>()?;
+                if values.is_empty() {
+                    Pred::False
+                } else {
+                    Pred::Path { field, path, test: PathTest::In(values) }
                 }
             }
             Expr::In { expr, list } => {
@@ -391,6 +452,13 @@ impl<'a> Raise<'a> {
                 }
                 crate::text::query::parse_match_with(query, fld.text_analyzer())?;
                 Pred::Match { field: f, query: query.clone(), expand: *expand }
+            }
+            Expr::Prefix { expr, prefix, edits: 0 } if self.path_of(expr)?.is_some() => {
+                let (field, path, kind) = self.typed_path_of(expr)?.expect("a path");
+                match self.path_lit(kind, prefix)? {
+                    Value::Str(p) => Pred::Path { field, path, test: PathTest::Prefix(p) },
+                    v => return Err(err(format!("PREFIX of a JSON path takes text, not {v:?}"))),
+                }
             }
             Expr::Prefix { expr, prefix, edits } => {
                 let f = self.field_of(expr)?;
@@ -441,6 +509,33 @@ impl<'a> Raise<'a> {
     /// `field op value` (or `value op field`), as the binder reads a
     /// comparison.
     fn comparison(&self, op: CmpOp, left: &Expr, right: &Expr) -> Result<Pred> {
+        let flip = |op: CmpOp| match op {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            o => o,
+        };
+        let path = match (self.typed_path_of(left)?, self.typed_path_of(right)?) {
+            (Some(p), None) => Some((p, right, op)),
+            (None, Some(p)) => Some((p, left, flip(op))),
+            _ => None,
+        };
+        if let Some(((field, path, kind), v, op)) = path {
+            let v = self.path_lit(kind, v)?;
+            if v == Value::Null {
+                return Err(err("a comparison with NULL is never true: use IS NULL"));
+            }
+            let range = |lo: Option<(Value, bool)>, hi: Option<(Value, bool)>| Pred::Path { field, path: path.clone(), test: PathTest::Range { lo, hi } };
+            let p = match op {
+                CmpOp::Eq | CmpOp::Ne => Pred::Path { field, path: path.clone(), test: PathTest::In(vec![v]) },
+                CmpOp::Lt => range(None, Some((v, false))),
+                CmpOp::Le => range(None, Some((v, true))),
+                CmpOp::Gt => range(Some((v, false)), None),
+                CmpOp::Ge => range(Some((v, true)), None),
+            };
+            return Ok(if op == CmpOp::Ne { Pred::Not(Box::new(p)).three_valued(&|f| self.schema.fields[f].multi) } else { p });
+        }
         let (f, v, op) = match (left, right) {
             (Expr::Field(f), v) => (self.field(*f)?, self.lit(v)?, op),
             (v, Expr::Field(f)) => {
@@ -835,8 +930,17 @@ impl<'a> Raise<'a> {
 fn comparison_field(e: &Expr) -> Option<&Expr> {
     match e {
         Expr::Between { expr, .. } | Expr::In { expr, .. } => Some(expr),
-        Expr::Cmp { left, right, .. } => Some(if matches!(**left, Expr::Field(_)) { left } else { right }),
+        Expr::Cmp { left, right, .. } => Some(if matches!(**left, Expr::Field(_) | Expr::Call { func: Func::JsonExtract, .. }) { left } else { right }),
         _ => None,
+    }
+}
+
+/// A value a JSON path is compared with: a string, a number or a boolean
+/// (NULL kept for three-valued logic to read).
+fn path_value(v: Value) -> Result<Value> {
+    match v {
+        v @ (Value::Null | Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_)) => Ok(v),
+        v => Err(err(format!("a JSON path compares with strings, numbers and booleans, not {v:?}"))),
     }
 }
 

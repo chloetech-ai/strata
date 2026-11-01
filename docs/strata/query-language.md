@@ -86,6 +86,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 | `SPARSE` | inverted index of learned term weights (SPLADE and similar) | ordering by `similarity` |
 | `MEDIA` | a file by reference: URI, SHA-256, type, size; a `KEYWORD` index of the hashes | `=`, `IN` on the hash; `GROUP BY` |
 | `EDGES` | out-edge CSR and reverse index per segment | `REACHABLE`, `PATH`, `ppr` |
+| `JSON` | an object's keys no schema names: one sorted dictionary of `path, type, value` terms with a docID list each ([JSON fields](#json-fields-keys-no-schema-names)) | on paths (`attrs.color`): `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `NOT IN`, `LIKE 'p%'`, `PREFIX`, `IS [NOT] NULL`, `IS TRUE`, the path alone |
 
 Predicates combine with `AND`, `OR`, `NOT`, [`AT_LEAST`](#some-of-the-conditions-at_least) and parentheses, across all of these, and [`max_rows`](#as-many-as-fit-min_rows-and-max_rows) lets an `AT_LEAST` choose its count.
 
@@ -104,6 +105,28 @@ A `KEYWORD[]` field may hold the [semantic ID](server.md#semantic-ids) of a vect
 A `SPARSE` value is a JSON object of terms and non-negative weights, `{"tok": 1.25, "##en": 0.4}`, as a learned sparse model (SPLADE, BGE-M3's sparse output, OpenSearch's neural sparse models) writes it. Terms are taken as given, not analysed, and weights are stored in steps of 1/1024.
 
 A `MEDIA` value names a file, `{"uri": "https://cdn.example.com/a.png", "sha256": "…", "mime": "image/png", "bytes": 48213, "width": 640, "height": 480}`, and a write may give only its URI, `'https://cdn.example.com/a.png'`, or its bytes, `'{"data": "<base64>"}'`, for the server to fill in ([media fields](server.md#media-fields)). Its index holds the hash: `image = '9f86d0…'` finds the rows of that file. `OPTIONS(kind = 'image')` takes only images (`'audio'`, `'video'`, `'pdf'`), whose vectors a `VECTOR` field can hold: `emb VECTOR OPTIONS(embed = 'image', model = 'siglip-base-patch16-224')` ([vectors of images](server.md#vectors-of-images)), `sound_emb VECTOR OPTIONS(embed = 'recording', model = 'clap-htsat-unfused')` ([vectors of sound](server.md#vectors-of-sound)), and whose captions or transcripts a `TEXT` field can: `caption TEXT OPTIONS(derive = 'image', model = 'blip-image-captioning-base')`, `transcript TEXT OPTIONS(derive = 'recording', model = 'whisper-small')` ([text from media](server.md#text-from-media)).
+
+
+### JSON fields: keys no schema names
+
+A `JSON` field holds an object whose keys are not declared, for attributes that only a few rows have and that nobody knew when the table was made: a product's `voltage`, `certs` or `dims.w`. A row adds keys by holding them, and filters on any key run from the field's index:
+
+```sql
+CREATE TABLE products (id KEYWORD PRIMARY KEY, title TEXT, attrs JSON);
+INSERT INTO products (id, title, attrs) VALUES
+  ('p1', 'charger', '{"voltage": 5, "certs": ["CE", "UL"], "dims": {"w": 40.5}}'),
+  ('p2', 'lamp', '{"color": "black", "a.b": true}');
+
+SELECT id FROM products WHERE attrs.voltage >= 5 AND attrs.certs = 'UL';
+SELECT id, attrs.dims.w FROM products WHERE attrs.color IN ('black', 'red') ORDER BY attrs.dims.w DESC;
+SELECT attrs.color, COUNT(*) FROM products GROUP BY attrs.color;
+```
+
+- **Paths.** `attrs.dims.w` is the key `w` of the object at `dims`; `attrs['a.b']` names a key that holds a dot, and `json_extract(attrs, 'dims.w')` is the same path as a function (`'$.dims.w'` too). In a join, qualify the field: `p.attrs.color`. An array holds its elements at its own path, as a multi-valued field does: `attrs.certs = 'UL'` matches `["CE", "UL"]`, and `{"items": [{"sku": "x"}, {"sku": "y"}]}` holds `x` and `y` at `items.sku`. JSON `null` and an empty array are no value.
+- **Types.** A comparison sees the values of its literal's type only, as if the path were a column of that type: `attrs.voltage > 5` reads the numbers at `voltage` (integers and doubles alike), `attrs.voltage = 'n/a'` its strings, `attrs.ok` and `attrs.ok = TRUE` its booleans. A row with no value of that type there is `NULL` to the comparison, so `NOT (attrs.voltage > 5)` and `attrs.voltage != 5` leave out rows whose voltage is missing or a string, and `IS NULL` finds rows without the path at all. An `IN` list of several types reads each type for its own values. No row is refused for holding a type other rows do not.
+- **Reads.** `SELECT attrs` returns the object as compact JSON text with sorted keys. A path in `SELECT`, `ORDER BY`, `GROUP BY` or an aggregate returns its value: a string, an integer, a double or a boolean; a list for an array of values or for several values through an array; an object as its JSON text; `NULL` where the row has none. These are computed over the rows the query finds, in memory (up to a million), as over [joined rows](#subqueries-with-and-joins); a group per value of a list, as for a multi-valued column.
+- **Writes.** A value is a JSON object, given as text (`'{"k": 1}'`), as an object in JSON Lines or the HTTP API, or as a dict from Python; `NULL` is no object. A write is refused, naming the limit, for anything else, for an empty key, and for an object nested more than 16 levels, with a path longer than 256 bytes or with more than 1,000 values and objects. A string longer than 256 bytes is kept and returned, and `IS NOT NULL` sees it, but comparisons do not: its value is not indexed.
+- **The index** is one sorted dictionary per segment of terms `path \0 type value` (strings as UTF-8, numbers in an order-preserving encoding of doubles), so `=` and `IN` read one term's docID list, a range or `LIKE 'p%'` one run of terms, and `IS NOT NULL` the path's own term. A row pays only for the paths it holds, which is what keeps thousands of sparse keys cheap where as many declared columns would each take a slot in every row. A `JSON` field is stored; it cannot be the primary key, multi-valued, have a default, or be generated or the source of a generated or embedded field. A database with a `JSON` field is written in [file format 3](index.md#wal-memtable-and-snapshots) with the feature `json`, and plans that read paths carry the plan feature `json`.
 
 ## Some of the conditions: `AT_LEAST`
 

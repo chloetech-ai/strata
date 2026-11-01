@@ -24,7 +24,9 @@
 //!   codes.
 //!
 //! A MEDIA field ([`Field::media`]) is a keyword column of its values'
-//! `sha256`: the doc store keeps the whole value.
+//! `sha256`: the doc store keeps the whole value. A JSON field
+//! ([`crate::schema::FieldType::Json`]) is a multi-valued keyword column of
+//! its objects' terms ([`crate::json`]).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -104,7 +106,9 @@ pub(crate) struct KeywordBuilder {
 impl KeywordBuilder {
     pub fn new(field: &Field, opts: &BuildOptions) -> Result<Self> {
         let rare = super::usize_option(opts, "forward.kw_rare", DEFAULT_RARE)?;
-        Ok(KeywordBuilder { name: field.name.clone(), key: field.key(), rare, ids: HashMap::new(), docs: Vec::new(), multi: field.multi, media: field.media.is_some(), extra: Vec::new() })
+        // A JSON field's column holds each row's terms (crate::json).
+        let multi = field.multi || field.ty == crate::schema::FieldType::Json;
+        Ok(KeywordBuilder { name: field.name.clone(), key: field.key(), rare, ids: HashMap::new(), docs: Vec::new(), multi, media: field.media.is_some(), extra: Vec::new() })
     }
 
     fn id(&mut self, v: &Value) -> Result<u32> {

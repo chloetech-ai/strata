@@ -77,7 +77,16 @@ pub enum FieldType {
     /// [`crate::text::sparse`]). Indexed: a text index of the terms with
     /// the weights as frequencies.
     Sparse,
+    /// A JSON object whose keys the schema does not name, few of them in
+    /// any row (see [`crate::json`]): stored as compact JSON text, and
+    /// indexed as typed terms of its leaves, so queries filter, facet and
+    /// sort by paths (`attrs.color`, `attrs.dims.w`). Makes the database
+    /// format 3 (feature [`JSON`]).
+    Json,
 }
+
+/// The feature of a database with a JSON field ([`FieldType::Json`]).
+pub const JSON: &str = "json";
 
 /// What an INT column's integers stand for (format 3; a database is
 /// written in format 3 only while a table has such a field). Queries and
@@ -937,6 +946,7 @@ impl Schema {
         }
         s.check_media()?;
         s.check_derived()?;
+        s.check_json()?;
         for (i, f) in s.fields.iter_mut().enumerate() {
             // The key always holds a value: saying so needs no feature.
             if s.primary_key == Some(i) {
@@ -1092,6 +1102,29 @@ impl Schema {
         Some((self.field_index(&r.by)?, now.saturating_sub(r.seconds.saturating_mul(1_000_000))))
     }
 
+    /// A JSON field ([`FieldType::Json`]) is stored (merges index it from
+    /// the stored objects), holds one object per row, and is neither the
+    /// key, a reference, a source of other fields nor given a default.
+    fn check_json(&self) -> Result<()> {
+        for (i, f) in self.fields.iter().enumerate() {
+            if f.ty != FieldType::Json {
+                continue;
+            }
+            let bad = |m: &str| Err(Error::Schema(format!("JSON field {}: {m}", f.name)));
+            if !f.stored {
+                return bad("must be stored: merges index it from the stored objects");
+            }
+            if self.primary_key == Some(i) || f.multi || f.references.is_some() || f.default.is_some() || f.logical.is_some() || f.media.is_some() || !f.generated_from.is_empty() {
+                return bad("holds one object per row, and is neither the key, a list, a reference nor given a default");
+            }
+            let source = |g: &Field| g.generated_from.iter().any(|n| n.eq_ignore_ascii_case(&f.name)) || g.embed.as_ref().is_some_and(|e| e.from.iter().any(|n| n.eq_ignore_ascii_case(&f.name)));
+            if let Some(g) = self.fields.iter().find(|g| source(g)) {
+                return bad(&format!("{} cannot be made from it: name a path as a field of its own", g.name));
+            }
+        }
+        Ok(())
+    }
+
     /// Checks the derived fields ([`Field::derive`]): stored TEXT fields of
     /// a MEDIA field's file, with nothing else to say.
     fn check_derived(&self) -> Result<()> {
@@ -1224,8 +1257,8 @@ impl Schema {
     /// The format 3 features this table needs, as the manifest names them:
     /// its fields' [`Logical::feature`], `not_null`, `default`,
     /// `multi_vector`, `semantic_id`, [`Analyzer::feature`], `media`
-    /// ([`Field::media`]) and `derive` ([`Field::derive`]), and its options
-    /// `shard_by`, `cluster_by`, `retain` and `edge_table`
+    /// ([`Field::media`]), `derive` ([`Field::derive`]) and [`JSON`], and
+    /// its options `shard_by`, `cluster_by`, `retain` and `edge_table`
     /// ([`Schema::with_shard_by`], [`Schema::with_cluster_by`],
     /// [`Schema::with_retain`], [`Schema::with_edges`]).
     pub fn features(&self) -> impl Iterator<Item = String> + '_ {
@@ -1239,6 +1272,7 @@ impl Schema {
                 f.media.map(|_| "media"),
                 f.derive.as_ref().map(|_| "derive"),
                 f.added.as_ref().map(|_| ADDED_FIELDS),
+                (f.ty == FieldType::Json).then_some(JSON),
             ];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
@@ -1418,6 +1452,7 @@ pub fn type_name(t: &FieldType) -> &'static str {
         FieldType::Vector { .. } => "VECTOR",
         FieldType::Edges => "EDGES",
         FieldType::Sparse => "SPARSE",
+        FieldType::Json => "JSON",
     }
 }
 
@@ -1445,7 +1480,9 @@ impl Schema {
     /// ```
     ///
     /// Types are `text`, `keyword`, `int`, `float`, `bool`, `timestamp`,
-    /// `vector`, `sparse`, `edges` and `media` (`bool` and `timestamp` hold
+    /// `vector`, `sparse`, `edges`, `json` and `media` (`json` holds an
+    /// object whose keys the schema does not name, and makes the database
+    /// format 3: [`FieldType::Json`]; `bool` and `timestamp` hold
     /// one value, and make the database format 3: [`Logical`]; `media`
     /// holds a file's reference, of the `"kind"` `"image"`, `"audio"`,
     /// `"video"` or `"pdf"` when it says so, and makes the database format
@@ -1621,6 +1658,7 @@ impl Schema {
                     }
                     FieldType::Sparse => ("sparse", true),
                     FieldType::Edges => ("edges", true),
+                    FieldType::Json => ("json", true),
                 };
                 m.insert("type".into(), json!(ty));
                 if f.multi {
@@ -1719,7 +1757,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
             Some(_) => Err(bad(&format!("{k} lists field names"))),
         }
     };
-    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, bool, timestamp, vector, sparse, edges or media)"))?;
+    let ty_name = j.get("type").and_then(J::as_str).ok_or_else(|| bad("needs a \"type\" (text, keyword, int, float, bool, timestamp, vector, sparse, edges, json or media)"))?;
     let mut logical = None;
     let mut media = None;
     if j.get("kind").is_some_and(|k| !k.is_null()) && !ty_name.eq_ignore_ascii_case("media") {
@@ -1741,6 +1779,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
         "float" | "double" | "real" => FieldType::Float,
         "sparse" => FieldType::Sparse,
         "edges" => FieldType::Edges,
+        "json" => FieldType::Json,
         "media" => {
             media = Some(match j.get("kind") {
                 None | Some(J::Null) => MediaKind::Any,
@@ -1771,7 +1810,7 @@ fn short_field(j: &serde_json::Value) -> Result<Field> {
             };
             FieldType::Vector { dim, index }
         }
-        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, bool, timestamp, vector, sparse, edges or media)"))),
+        other => return Err(bad(&format!("unknown type {other:?} (text, keyword, int, float, bool, timestamp, vector, sparse, edges, json or media)"))),
     };
     let is_vector = matches!(ty, FieldType::Vector { .. });
     let mut f = Field::new(name, ty);

@@ -30,11 +30,11 @@ use std::sync::Arc;
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::error::{Error, Result};
-use crate::query::compound::outer_field;
+use crate::query::compound::{func_args, outer_field};
 use crate::query::ir::{ArithOp, CmpOp, Func, NormKind};
 use crate::query::{ddl, ir};
 use crate::query::rank::Rank;
-use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Guard, GuardSite, Having, OrderBy, Opts, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
+use crate::query::logical::{AggFn, Decay, DecayShape, Direction, Expand, GraphKind, GraphQuery, Guard, GuardSite, Having, OrderBy, Opts, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::schema::{Field, FieldType, Logical, Schema};
 use crate::storage::DropOptions;
 use crate::value::Value;
@@ -528,11 +528,145 @@ pub(crate) fn assigned(field: &Field, v: Value) -> Result<Value> {
             crate::text::sparse::parse(&v)?;
             v
         }
-        (FieldType::Vector { .. } | FieldType::Text { .. } | FieldType::Edges | FieldType::Sparse, v) => return Err(err(format!("{} is a {} field: SET cannot give it {v:?}", field.name, field.type_name()))),
+        (FieldType::Json, v @ Value::Str(_)) => crate::json::canonical(v, &field.name).map_err(|e| err(e.to_string()))?,
+        (FieldType::Vector { .. } | FieldType::Text { .. } | FieldType::Edges | FieldType::Sparse | FieldType::Json, v) => return Err(err(format!("{} is a {} field: SET cannot give it {v:?}", field.name, field.type_name()))),
         (_, Value::List(xs)) if field.multi => Value::List(xs.into_iter().map(one).collect::<Result<_>>()?),
         (_, Value::List(xs)) => return Err(err(format!("{} holds one value, not the list {xs:?}", field.name))),
         (_, v) if field.multi => Value::List(vec![one(v)?]),
         (_, v) => one(v)?,
+    })
+}
+
+/// The JSON field of `schema` and the path ([`crate::json::parse_path`])
+/// that `e` names, if it names one: `attrs.dims.w` (or `t.attrs.dims.w`,
+/// the table or an alias first), `attrs['any key']`, or
+/// `json_extract(attrs, 'dims.w')`. `x.y` is column `y` of table or alias
+/// `x` when `y` is a column, else path `y` of JSON field `x`. Each name
+/// is a key, quoted or not (`attrs."a.b"` is the key `a.b`).
+pub(crate) fn path_ref(schema: &Schema, e: &Expr) -> Result<Option<(usize, String)>> {
+    Ok(path_column(schema, e)?.map(|(f, p, _)| (f, p)))
+}
+
+/// [`path_ref`], with the column of the JSON field as `e` names it
+/// (`attrs`, `t.attrs`).
+pub(crate) fn path_column(schema: &Schema, e: &Expr) -> Result<Option<(usize, String, Expr)>> {
+    let json = |id: &sql::Ident| schema.field_index(&id.value).filter(|&f| schema.fields[f].ty == FieldType::Json);
+    let keyed = |f: usize, keys: Vec<String>, column: Expr| -> Result<Option<(usize, String, Expr)>> {
+        let path = crate::json::path_of(&keys);
+        crate::json::parse_path(&path).map(|p| Some((f, p, column)))
+    };
+    match e {
+        Expr::Nested(x) => path_column(schema, x),
+        Expr::CompoundIdentifier(ids) if ids.len() >= 2 => {
+            // `t.attrs`: a column of the table, not a path.
+            let column = ids.len() == 2 && schema.field_index(&ids[1].value).is_some() && json(&ids[0]).is_none();
+            if column {
+                return Ok(None);
+            }
+            match (json(&ids[0]), ids.get(1).and_then(json)) {
+                (Some(f), _) => keyed(f, ids[1..].iter().map(|i| i.value.clone()).collect(), Expr::Identifier(ids[0].clone())),
+                (None, Some(f)) if ids.len() >= 3 => keyed(f, ids[2..].iter().map(|i| i.value.clone()).collect(), Expr::CompoundIdentifier(ids[..2].to_vec())),
+                _ => Ok(None),
+            }
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut skip = 0;
+            let (f, mut keys, column) = match &**root {
+                Expr::Identifier(id) => match (json(id), access_chain.first()) {
+                    (Some(f), _) => (f, Vec::new(), (**root).clone()),
+                    // `t.attrs['k']`, a qualified column and a key.
+                    (None, Some(sql::AccessExpr::Dot(Expr::Identifier(c)))) if json(c).is_some() => {
+                        skip = 1;
+                        (json(c).expect("a JSON field"), Vec::new(), Expr::CompoundIdentifier(vec![id.clone(), c.clone()]))
+                    }
+                    _ => return Ok(None),
+                },
+                r @ Expr::CompoundIdentifier(ids) => match (path_column(schema, r)?, ids.last().and_then(json)) {
+                    (Some((f, p, c)), _) => (f, crate::json::keys(&p), c),
+                    (None, Some(f)) => (f, Vec::new(), r.clone()),
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            for a in &access_chain[skip..] {
+                match a {
+                    sql::AccessExpr::Subscript(sql::Subscript::Index { index: Expr::Value(v) }) => match &v.value {
+                        sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => keys.push(s.clone()),
+                        v => return Err(err(format!("{e}: a JSON path's key in brackets is quoted text ('key'), not {v}"))),
+                    },
+                    sql::AccessExpr::Dot(Expr::Identifier(id)) => keys.push(id.value.clone()),
+                    a => return Err(err(format!("{e}: {a} is not a key of a JSON path (attrs['key'], attrs.key)"))),
+                }
+            }
+            keyed(f, keys, column)
+        }
+        Expr::Function(func) if fname(func) == "json_extract" => {
+            let FunctionArguments::List(list) = &func.args else { return Ok(None) };
+            let args: Vec<&Expr> = list
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Some(x),
+                    _ => None,
+                })
+                .collect();
+            let usage = || err(format!("{e}: json_extract(json_field, 'path' [, 'string' | 'number' | 'bool']) names a path of a JSON field"));
+            let (x, p) = match args.as_slice() {
+                [x, Expr::Value(p)] => (x, p),
+                [x, Expr::Value(p), Expr::Value(k)] if matches!(&k.value, sql::Value::SingleQuotedString(k) if crate::json::Kind::parse(k).is_some()) => (x, p),
+                _ => return Err(usage()),
+            };
+            let f = match x {
+                Expr::Identifier(id) => json(id),
+                Expr::CompoundIdentifier(ids) => ids.last().and_then(json),
+                _ => None,
+            };
+            let Some(f) = f else {
+                // A column of another table of a join, or no JSON field.
+                return match schema.field_index(&name_of(x)).or_else(|| match x {
+                    Expr::CompoundIdentifier(ids) => ids.last().and_then(|i| schema.field_index(&i.value)),
+                    _ => None,
+                }) {
+                    Some(g) => Err(err(format!("{e}: {} is a {} field, not JSON", schema.fields[g].name, schema.fields[g].type_name()))),
+                    None => Ok(None),
+                };
+            };
+            match &p.value {
+                sql::Value::SingleQuotedString(s) | sql::Value::DoubleQuotedString(s) => crate::json::parse_path(s).map(|p| Some((f, p, (*x).clone()))),
+                _ => Err(usage()),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The type `json_extract(field, 'path', 'type')` names.
+fn extract_kind(e: &Expr) -> Option<crate::json::Kind> {
+    match e {
+        Expr::Nested(x) => extract_kind(x),
+        Expr::Function(f) if fname(f) == "json_extract" => match func_args(f).get(2) {
+            Some(Expr::Value(v)) => match &v.value {
+                sql::Value::SingleQuotedString(k) => crate::json::Kind::parse(k),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A path condition read through a type: `IS NULL` asks for a value of
+/// it, and a comparison must be with one (the type of the value it is
+/// compared with, else).
+fn typed_path(p: Pred, k: crate::json::Kind) -> std::result::Result<Pred, crate::json::Kind> {
+    Ok(match p {
+        Pred::Not(q) => Pred::Not(Box::new(typed_path(*q, k)?)),
+        Pred::Path { field, path, test: PathTest::Has(_) } => Pred::Path { field, path, test: PathTest::Has(Some(k)) },
+        Pred::Path { field, path, test } => match test.kinds().into_iter().find(|of| *of != k) {
+            Some(of) => return Err(of),
+            None => Pred::Path { field, path, test },
+        },
+        p => p,
     })
 }
 
@@ -1761,6 +1895,11 @@ impl<'a> Binder<'a> {
     }
 
     fn pred(&self, e: &Expr) -> Result<Pred> {
+        if !matches!(e, Expr::Nested(_) | Expr::UnaryOp { op: sql::UnaryOperator::Not, .. }) {
+            if let Some(p) = self.path_pred(e)? {
+                return Ok(p);
+            }
+        }
         Ok(match e {
             Expr::Nested(inner) => self.pred(inner)?,
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => Pred::And(vec![self.pred(left)?, self.pred(right)?]),
@@ -2089,12 +2228,150 @@ impl<'a> Binder<'a> {
     }
 
     fn field_of(&self, e: &Expr) -> Result<usize> {
+        if let Some((f, path)) = path_ref(self.schema, e)? {
+            return Err(err(format!(
+                "{e} is path {path} of JSON field {}: a condition on it (=, IN, <, BETWEEN, LIKE 'p%', IS NULL) or a column, an order or a group of a query (Db::query)",
+                self.schema.fields[f].name
+            )));
+        }
         let name = match e {
             Expr::Identifier(id) => &id.value,
             Expr::CompoundIdentifier(ids) => &ids.last().unwrap().value,
             _ => return Err(err(format!("expected a column, got {e}"))),
         };
         self.schema.field_index(name).ok_or_else(|| err(format!("no such column: {name}")))
+    }
+
+    /// The JSON field and path `e` names ([`path_ref`]), the field indexed.
+    fn path_of(&self, e: &Expr) -> Result<Option<(usize, String)>> {
+        let Some((f, path)) = path_ref(self.schema, e)? else { return Ok(None) };
+        if !self.schema.fields[f].indexed {
+            return Err(err(format!("{} is not indexed: a condition on its paths reads its index", self.schema.fields[f].name)));
+        }
+        Ok(Some((f, path)))
+    }
+
+    /// A value a JSON path is compared with: a string, a number or a
+    /// boolean, matching values of its type ([`crate::json`]).
+    fn path_value(&self, e: &Expr) -> Result<Value> {
+        match self.literal(e)? {
+            v @ (Value::Str(_) | Value::Int(_) | Value::Bool(_)) => Ok(v),
+            Value::Float(x) if x.is_finite() => Ok(Value::Float(x)),
+            Value::Null => Err(err(format!("{e} is NULL, which no comparison is true of: use IS NULL or IS NOT NULL"))),
+            v => Err(err(format!("a JSON path compares with strings, numbers and booleans, not {v:?}"))),
+        }
+    }
+
+    /// A condition on a JSON field's path, if `e` is one: a comparison,
+    /// `IN`, `BETWEEN`, `LIKE`, `PREFIX`, `IS [NOT] NULL`, or the path
+    /// alone (a boolean, `WHERE attrs.in_stock`).
+    fn path_pred(&self, e: &Expr) -> Result<Option<Pred>> {
+        use BinaryOperator::*;
+        let not = |negated: bool, p: Pred| if negated { Pred::Not(Box::new(p)) } else { p };
+        let path = |x: &Expr| self.path_of(x);
+        let p = match e {
+            Expr::BinaryOp { left, op: op @ (Eq | NotEq | Lt | LtEq | Gt | GtEq), right } => {
+                let (path, lit, op) = match (path(left)?, path(right)?) {
+                    (Some(_), Some(_)) => return Err(err(format!("{e}: a condition compares a JSON path with a value, not another path"))),
+                    (Some(p), None) => (p, right, op.clone()),
+                    (None, Some(p)) => (
+                        p,
+                        left,
+                        match op {
+                            Lt => Gt,
+                            LtEq => GtEq,
+                            Gt => Lt,
+                            GtEq => LtEq,
+                            o => o.clone(),
+                        },
+                    ),
+                    (None, None) => return Ok(None),
+                };
+                let ((field, path), v) = (path, self.path_value(lit)?);
+                let range = |lo, hi| Pred::Path { field, path: path.clone(), test: PathTest::Range { lo, hi } };
+                match op {
+                    Eq => Pred::Path { field, path, test: PathTest::In(vec![v]) },
+                    NotEq => not(true, Pred::Path { field, path, test: PathTest::In(vec![v]) }),
+                    Lt => range(None, Some((v, false))),
+                    LtEq => range(None, Some((v, true))),
+                    Gt => range(Some((v, false)), None),
+                    _ => range(Some((v, true)), None),
+                }
+            }
+            Expr::Between { expr, negated, low, high } => {
+                let Some((field, path)) = path(expr)? else { return Ok(None) };
+                let (lo, hi) = (self.path_value(low)?, self.path_value(high)?);
+                crate::json::range_run(&path, Some((&lo, true)), Some((&hi, true)))?;
+                not(*negated, Pred::Path { field, path, test: PathTest::Range { lo: Some((lo, true)), hi: Some((hi, true)) } })
+            }
+            Expr::IsNull(x) | Expr::IsNotNull(x) => {
+                let Some((field, path)) = path(x)? else { return Ok(None) };
+                not(matches!(e, Expr::IsNull(_)), Pred::Path { field, path, test: PathTest::Has(None) })
+            }
+            Expr::InList { expr, list, negated } => {
+                let Some((field, path)) = path(expr)? else { return Ok(None) };
+                // A list-valued parameter stands for its values; a NULL is
+                // kept, as for a field ([`Pred::three_valued`]).
+                let mut values = Vec::with_capacity(list.len());
+                for v in list {
+                    match as_list(self.literal(v)?) {
+                        Ok(xs) => values.extend(xs),
+                        Err(x) => values.push(x),
+                    }
+                }
+                if let Some(v) = values.iter().find(|v| !matches!(v, Value::Null | Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_))) {
+                    return Err(err(format!("a JSON path compares with strings, numbers and booleans, not {v:?}")));
+                }
+                let p = if values.is_empty() { Pred::False } else { Pred::Path { field, path, test: PathTest::In(values) } };
+                not(*negated, p)
+            }
+            Expr::Like { negated, any: false, expr, pattern, escape_char } => {
+                let Some((field, path)) = path(expr)? else { return Ok(None) };
+                let escape = match escape_char {
+                    None => None,
+                    Some(sql::Value::SingleQuotedString(c)) if c.chars().count() == 1 => c.chars().next(),
+                    Some(c) => return Err(err(format!("LIKE's ESCAPE takes one character, not {c}"))),
+                };
+                let pattern = self.literal(pattern)?;
+                let pattern = pattern.as_str().ok_or_else(|| err("LIKE's pattern must be text"))?;
+                let p = match like_prefix(pattern, escape)? {
+                    LikePrefix::Exact(v) => PathTest::In(vec![Value::Str(v)]),
+                    LikePrefix::Prefix(p) => PathTest::Prefix(p),
+                };
+                not(*negated, Pred::Path { field, path, test: p })
+            }
+            Expr::Function(func) if fname(func) == "prefix" => {
+                let (args, opts) = self.args(func)?;
+                let [x, p] = args.as_slice() else { return Ok(None) };
+                let Some((field, path)) = path(x)? else { return Ok(None) };
+                if !opts.is_empty() {
+                    return Err(err("PREFIX of a JSON path takes no options"));
+                }
+                match self.literal(p)? {
+                    Value::Str(p) => Pred::Path { field, path, test: PathTest::Prefix(p) },
+                    v => return Err(err(format!("PREFIX takes text, not {v:?}"))),
+                }
+            }
+            Expr::IsTrue(x) | Expr::IsFalse(x) => {
+                let Some((field, path)) = path(x)? else { return Ok(None) };
+                Pred::Path { field, path, test: PathTest::In(vec![Value::Bool(matches!(e, Expr::IsTrue(_)))]) }
+            }
+            x => match path(x)? {
+                Some((field, path)) => Pred::Path { field, path, test: PathTest::In(vec![Value::Bool(true)]) },
+                None => return Ok(None),
+            },
+        };
+        // `json_extract(attrs, 'p', 'number')` reads the numbers at `p`.
+        let operand = match e {
+            Expr::BinaryOp { left, right, .. } => if path(left)?.is_some() { left } else { right },
+            Expr::Between { expr: x, .. } | Expr::InList { expr: x, .. } | Expr::Like { expr: x, .. } | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::IsTrue(x) | Expr::IsFalse(x) => x,
+            Expr::Function(func) => func_args(func).into_iter().next().unwrap_or(e),
+            x => x,
+        };
+        Ok(Some(match extract_kind(operand) {
+            Some(k) => typed_path(p, k).map_err(|of| err(format!("{e}: json_extract(.., '{}') is compared with a {}", k.name(), of.name())))?,
+            None => p,
+        }))
     }
 
     fn typed_field(&self, e: &Expr, ok: impl Fn(&FieldType) -> bool, what: &str) -> Result<usize> {
@@ -2264,6 +2541,7 @@ impl<'a> Binder<'a> {
                 crate::text::sparse::parse(&v)?;
                 v
             }
+            (FieldType::Json, v @ Value::Str(_)) => crate::json::canonical(v, &field.name).map_err(|e| err(e.to_string()))?,
             (FieldType::Keyword | FieldType::Int | FieldType::Float, _) if field.multi => Value::List(vec![self.field_value(f, e)?]),
             _ => self.field_value(f, e)?,
         })

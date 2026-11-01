@@ -242,6 +242,24 @@ def test_bool_and_timestamp(tmp_path):
             db.insert({"id": "x", "at": "next week"})
 
 
+def test_json_fields(tmp_path):
+    schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "attrs", "type": "json"}]}
+    with strata.Database.create(tmp_path / "items.strata", schema) as db:
+        assert [f["type"] for f in db.schema["fields"]] == ["keyword", "json"]
+        db.insert([
+            {"id": "a", "attrs": {"color": "red", "dims": {"w": 4}, "certs": ["CE", "UL"]}},
+            {"id": "b", "attrs": '{"color": "blue", "voltage": 5}'},
+            {"id": "c", "attrs": None},
+        ])
+        # Paths filter; a dict is stored as compact JSON text.
+        assert db.query("SELECT id FROM items WHERE attrs.color = :c", c="red").keys == ["a"]
+        assert db.query("SELECT id FROM items WHERE attrs.certs = 'UL' OR attrs.voltage >= 5 ORDER BY id").keys == ["a", "b"]
+        assert db.query("SELECT id FROM items WHERE attrs.color IS NULL").keys == ["c"]
+        assert db.query("SELECT attrs.dims.w AS w, attrs FROM items WHERE id = 'a'")[0] == {"w": 4, "attrs": '{"certs":["CE","UL"],"color":"red","dims":{"w":4}}'}
+        with pytest.raises(strata.StrataError, match="object"):
+            db.insert({"id": "x", "attrs": [1, 2]})
+
+
 def test_not_null_and_default(tmp_path):
     schema = {
         "table": "events",

@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS, CROSS_ENCODER_FIRST};
+use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, PathTest, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS, CROSS_ENCODER_FIRST};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -139,15 +139,22 @@ impl SegmentReaders {
     pub fn keyword(&self, field: usize) -> Result<Option<&KeywordColumn>> {
         let f = &self.schema.fields[field];
         opened(&self.keyword[field], || {
-            // Multi-valued INT fields are keyword columns of int_key strings.
-            if !(f.indexed && (matches!(f.ty, FieldType::Keyword) || matches!(f.ty, FieldType::Int) && f.multi)) {
+            // Multi-valued INT fields are keyword columns of int_key strings,
+            // JSON fields of their objects' terms (crate::json).
+            if !(f.indexed && (matches!(f.ty, FieldType::Keyword | FieldType::Json) || matches!(f.ty, FieldType::Int) && f.multi)) {
                 return Ok(None);
             }
             let mut col = KeywordColumn::open(&self.seg, &f.key())?;
             if col.needs_values() {
                 // Multi-valued fields are stored.
                 let store = self.store()?.ok_or_else(|| crate::error::corrupt(format!("keyword column {}: no stored values to repair it from", f.name)))?;
-                col.repair(&store.field_values(field))?;
+                let mut values = store.field_values(field);
+                if f.ty == FieldType::Json {
+                    for v in values.iter_mut() {
+                        *v = Value::List(crate::json::terms(v)?.into_iter().map(Value::Str).collect());
+                    }
+                }
+                col.repair(&values)?;
             }
             Ok(Some(col))
         })
@@ -1439,6 +1446,7 @@ impl<'a> Executor<'a> {
                 let runs = self.prefix_runs(s, *field, prefix, *edits)?;
                 self.keyword(s, *field)?.docs_prefix(&runs)
             }
+            Pred::Path { field, path, test } => self.path_set(s, *field, path, test)?,
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
@@ -1481,6 +1489,34 @@ impl<'a> Executor<'a> {
         })
     }
 
+    /// The rows of a segment whose JSON field passes `test` at `path`: a
+    /// term's list, or a run of terms' ([`crate::json`]).
+    fn path_set(&self, s: &Seg<'a>, field: usize, path: &str, test: &PathTest) -> Result<DocSet> {
+        let kw = self.keyword(s, field)?;
+        Ok(match test {
+            PathTest::Has(None) => kw.docs(&crate::json::has_term(path)),
+            PathTest::Has(Some(k)) => {
+                let (lo, hi) = crate::json::kind_run(path, *k);
+                let codes: Vec<u32> = (kw.lower_bound(&lo)..kw.lower_bound(&hi)).collect();
+                kw.docs_codes(&codes)
+            }
+            PathTest::In(values) => {
+                let terms: Vec<String> = values.iter().filter_map(|v| crate::json::term(path, v)).collect();
+                kw.docs_in(&terms.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            PathTest::Range { lo, hi } => {
+                let (lo, hi) = crate::json::range_run(path, lo.as_ref().map(|(v, i)| (v, *i)), hi.as_ref().map(|(v, i)| (v, *i)))?;
+                let codes: Vec<u32> = (kw.lower_bound(&lo)..kw.lower_bound(&hi)).collect();
+                kw.docs_codes(&codes)
+            }
+            // No indexed string is longer than the prefix.
+            PathTest::Prefix(p) => match crate::json::term(path, &Value::Str(p.clone())) {
+                Some(prefix) => kw.docs_prefix(&kw.prefix_runs(&prefix, 0)),
+                None => DocSet::empty(s.r.n_docs),
+            },
+        })
+    }
+
     fn materialize_in(&self, s: &Seg<'a>, field: usize, values: &[Value]) -> Result<DocSet> {
         let f = &self.schema.fields[field];
         match f.ty {
@@ -1512,7 +1548,7 @@ impl<'a> Executor<'a> {
             {
                 ProbeNode::Leaf(Box::new(self.materialize(s, p)?))
             }
-            Pred::Present { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            Pred::Present { .. } | Pred::Path { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             Pred::Prefix { field, .. } if self.schema.fields[*field].multi => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             Pred::Prefix { field, prefix, edits } => {
                 let runs = self.prefix_runs(s, *field, prefix, *edits)?;
@@ -3223,7 +3259,8 @@ impl<'a> Executor<'a> {
             FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| v.row_value(d)),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
-            FieldType::Text { .. } | FieldType::Sparse => Value::Null,
+            // A JSON field is always stored.
+            FieldType::Text { .. } | FieldType::Sparse | FieldType::Json => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
         }
     }
@@ -3610,6 +3647,25 @@ impl Estimator for SegEst<'_, '_> {
         let scans = runs.iter().filter(|r| r.len() > forward::PREFIX_LISTS).count();
         let c = &self.ex.opts.costs;
         (!self.ex.schema.fields[field].multi && scans > 0).then(|| scans as f64 * self.n_docs() * c.column_scan + kw.count_prefix(&runs) as f64 * c.emit)
+    }
+    fn path_count(&self, field: usize, path: &str, test: &PathTest) -> f64 {
+        let Some(kw) = self.s.r.keyword(field).ok().flatten() else { return 0.0 };
+        match test {
+            PathTest::Has(None) => kw.count(&crate::json::has_term(path)) as f64,
+            PathTest::Has(Some(k)) => {
+                let (lo, hi) = crate::json::kind_run(path, *k);
+                kw.count_prefix(std::slice::from_ref(&(kw.lower_bound(&lo)..kw.lower_bound(&hi)))) as f64
+            }
+            PathTest::In(values) => values.iter().filter_map(|v| crate::json::term(path, v)).map(|t| kw.count(&t) as f64).sum(),
+            PathTest::Range { lo, hi } => match crate::json::range_run(path, lo.as_ref().map(|(v, i)| (v, *i)), hi.as_ref().map(|(v, i)| (v, *i))) {
+                Ok((lo, hi)) => kw.count_prefix(std::slice::from_ref(&(kw.lower_bound(&lo)..kw.lower_bound(&hi)))) as f64,
+                Err(_) => 0.0,
+            },
+            PathTest::Prefix(p) => match crate::json::term(path, &Value::Str(p.clone())) {
+                Some(prefix) => kw.count_prefix(&kw.prefix_runs(&prefix, 0)) as f64,
+                None => 0.0,
+            },
+        }
     }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {

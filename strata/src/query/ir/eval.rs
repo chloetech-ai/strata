@@ -393,6 +393,18 @@ fn call(func: Func, args: &[Value]) -> Result<Value> {
         Func::Upper => text(|s| Value::Str(s.to_uppercase())),
         Func::Length => text(|s| Value::Int(s.chars().count() as i64)),
         Func::SidAt => crate::sid::sid_at(&one, args.get(1).unwrap_or(&Value::Null)),
+        Func::JsonExtract => {
+            let path = match args.get(1) {
+                Some(Value::Str(p)) => p,
+                v => return Err(err(format!("json_extract's path is text, not {v:?}"))),
+            };
+            let kind = match args.get(2) {
+                None => None,
+                Some(Value::Str(k)) => Some(crate::json::Kind::parse(k).ok_or_else(|| err(format!("json_extract's type is 'string', 'number' or 'bool', not {k:?}")))?),
+                Some(v) => return Err(err(format!("json_extract's type is text, not {v:?}"))),
+            };
+            crate::json::extract(&one, path, kind)
+        }
         // UNKNOWN is not TRUE.
         Func::CountTrue => {
             let mut n = 0;
