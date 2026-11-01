@@ -874,8 +874,12 @@ fn differs(engine: Engine, kind: &str, paid: bool) -> Option<&'static str> {
         ),
         (Engine::Vespa, "bm25" | "bm25 + filter" | "boosted (bm25 × decay)" | "phrase") => Some("weakAnd (Vespa's text query, which keeps the best 100 matches by a cheaper score, then ranks them by BM25)"),
         (Engine::Solr, "typo") => Some("each word~N with Strata's 'auto' edits; the Lucene parser does not stem a fuzzy word, so it is compared with the stemmed terms as typed"),
-        (Engine::Vespa, "sql aggregate") => Some("grouping (no SQL): the 10 largest categories of the filtered rows, those of 1,000 rows or fewer dropped by the client (grouping has no HAVING)"),
-        (Engine::Vespa, "facet") => Some("grouping over the rows whose body contains the word"),
+        (Engine::Vespa, "sql aggregate") => Some(
+            "grouping (no SQL): the 10 largest categories of the filtered rows, those of 1,000 rows or fewer dropped by the client (grouping has no HAVING); precision 1,000, so that every content node sends all its groups and the counts are exact",
+        ),
+        (Engine::Vespa, "facet") => Some(
+            "grouping over the rows whose body contains the word, precision 17 (each content node sends its 17 largest groups, as Elasticsearch's default shard_size of size x 1.5 + 10 does; at Vespa's default precision the counts were wrong in 11 of 60 SciFact facets)",
+        ),
         _ => None,
     }
 }
@@ -1131,7 +1135,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                 }),
                 "boosted (bm25 × decay)" => with(text_query(""), json!({"ranking": "boosted"})),
                 "facet" => json!({
-                    "yql": format!("select * from doc where body contains {} limit 0 | all(group(category) max(5) order(-count()) each(output(count())))", yql_str(&w)),
+                    "yql": format!("select * from doc where body contains {} limit 0 | all(group(category) max(5) precision(17) order(-count()) each(output(count())))", yql_str(&w)),
                 }),
                 "key lookup" => json!({"yql": format!("select * from doc where id contains {}", yql_str(key)), "presentation.summary": "lookup", "ranking": "unranked"}),
                 "phrase" => {
@@ -1144,7 +1148,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                         "ranking": "similar", "input.query(i)": p.item.to_vec()})
                 }
                 "sql aggregate" => json!({
-                    "yql": format!("select * from doc where year >= {year} limit 0 | all(group(category) max(10) order(-count()) each(output(count(), avg(rating))))"),
+                    "yql": format!("select * from doc where year >= {year} limit 0 | all(group(category) max(10) precision(1000) order(-count()) each(output(count(), avg(rating))))"),
                 }),
                 _ => return None,
             };
@@ -1321,12 +1325,15 @@ async fn run(
     let client = reqwest::Client::builder().pool_max_idle_per_host(1024).timeout(Duration::from_secs(30)).build().map_err(s)?;
     let label = label.unwrap_or_else(|| engine.name().to_string());
     let (mut http, mut answers, mut query_ids, mut unavailable, mut differ) = (Vec::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    // What analyze.py needs to score the kinds that are not about a query's text: each request's item and seen keys, or year.
+    let mut probes = BTreeMap::new();
     for &(kind, sql) in KINDS {
         if !only.is_empty() && !only.iter().any(|k| k == kind) {
             continue;
         }
         let mut ids = Vec::new();
         let mut reqs = Vec::new();
+        let mut params = Vec::new();
         if let Some(why) = unsupported(engine, kind) {
             eprintln!("{label:<8} {kind:<24} unavailable: {why}");
             unavailable.insert(kind, why.to_string());
@@ -1340,6 +1347,11 @@ async fn run(
             let probe = Probe { q, key: &keys[k], item: &items[it], seen: &seen, year: 1990 + (i % 30) as i64, paid };
             if let Some((path, body)) = request(engine, kind, sql, &probe) {
                 ids.push(q.id.clone());
+                match kind {
+                    "similar items" => params.push(json!({"item": keys[it], "seen": seen})),
+                    "sql aggregate" => params.push(json!({"year": probe.year})),
+                    _ => {}
+                }
                 reqs.push(Req { url: format!("{}{path}", urls[reqs.len() % urls.len()]), body: serde_json::to_vec(&body).unwrap() });
             }
         }
@@ -1377,6 +1389,9 @@ async fn run(
         }
         answers.insert(kind, got);
         query_ids.insert(kind, ids);
+        if !params.is_empty() {
+            probes.insert(kind, params);
+        }
         let reqs = Arc::new(reqs);
         for &c in concurrency {
             let t = drive(&client, reqs.clone(), c, seconds).await;
@@ -1402,7 +1417,7 @@ async fn run(
     let report = json!({
         "engine": engine.name(), "label": label, "collection": collection, "urls": urls, "queries": queries.len(),
         "params": {"seconds": seconds, "concurrency": concurrency, "candidates": CANDIDATES, "oversample": OVERSAMPLE, "hybrid_depth": DEPTH, "paid": paid},
-        "http": http, "unavailable": unavailable, "differs": differ, "query_ids": query_ids, "answers": answers,
+        "http": http, "unavailable": unavailable, "differs": differ, "query_ids": query_ids, "probes": probes, "answers": answers,
     });
     std::fs::create_dir_all(out).map_err(s)?;
     let path = out.join(format!("run-{}.json", label.replace(' ', "-")));

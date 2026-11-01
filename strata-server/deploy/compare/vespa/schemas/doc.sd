@@ -1,7 +1,8 @@
 # The BEIR collection of engine-compare, as the other engines index it:
 # body analysed by the Lucene chain of linguistics (see services.xml), the
 # structured fields as attributes, and the vectors in an HNSW index of m 16,
-# ef_construction 200, by dot product (full precision, as Solr's).
+# ef_construction 200, by dot product (full precision, as Solr's; paged, so
+# the vectors need not all fit in memory).
 schema doc {
     document doc {
         field id type string {
@@ -50,8 +51,11 @@ schema doc {
         }
         field emb type tensor<float>(x[1024]) {
             indexing: attribute | index
+            # paged: the vectors may be paged out to disk as Lucene's and
+            # Strata's full vectors are (the HNSW graph stays in memory).
             attribute {
                 distance-metric: dotproduct
+                paged
             }
             index {
                 hnsw {
