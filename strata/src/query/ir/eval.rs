@@ -381,7 +381,7 @@ fn arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value> {
 
 /// A scalar function of evaluated arguments; NULL in, NULL out (but for
 /// `coalesce`).
-fn call(func: Func, args: &[Value]) -> Result<Value> {
+pub(crate) fn call(func: Func, args: &[Value]) -> Result<Value> {
     let one = args.first().cloned().unwrap_or(Value::Null);
     let text = |f: fn(&str) -> Value| match &one {
         Value::Str(s) => Ok(f(s)),

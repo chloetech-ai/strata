@@ -48,6 +48,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # Hosted embedding models (`hosted`): blocking HTTPS, with rustls and ring.
 ureq = { version = "3.5", default-features = false, features = ["rustls"], optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "adpcm", "flac", "mp3", "ogg", "vorbis", "aac", "isomp4"], optional = true }
+# DataFusion as the engine of a plan's operators (`datafusion`,
+# `strata::query::df`): joins, groups, sorts and DISTINCT above the search
+# leaves, on Arrow batches. Without its SQL front end, Parquet and
+# compression: Strata keeps its own parser and planner.
+datafusion = { version = "=55.2.0", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [features]
 default = ["embed", "hosted"]
@@ -69,6 +75,9 @@ sqlite = ["dep:rusqlite"]
 baselines = ["dep:rusqlite", "dep:tantivy"]
 # Power losses, full disks and failing syncs for tests (`storage::io`).
 fault-injection = []
+# DataFusion runs plans' operators with `ExecOptions::engine` (or
+# STRATA_ENGINE=datafusion): `strata::query::df`.
+datafusion = ["dep:datafusion", "dep:tokio"]
 
 [[bin]]
 name = "strata-baselines"
@@ -89,6 +98,10 @@ required-features = ["audio"]
 name = "strata-clap-eval"
 path = "src/bin/strata-clap-eval.rs"
 required-features = ["audio"]
+
+[[example]]
+name = "df_join"
+required-features = ["datafusion"]
 
 [dev-dependencies]
 tempfile = "3"

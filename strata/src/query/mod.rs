@@ -20,6 +20,8 @@ pub mod agg;
 pub mod compound;
 pub mod cross_encoder;
 pub mod ddl;
+#[cfg(feature = "datafusion")]
+pub mod df;
 pub mod exec;
 pub mod fusion;
 pub mod ir;

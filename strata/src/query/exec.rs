@@ -246,6 +246,40 @@ pub struct ExecOptions {
     /// [`steps::thread_cpu_us`]), which costs a system call per step; the
     /// steps' wall times are measured either way.
     pub profile: bool,
+    /// What runs a plan's operators above its leaves (joins, `WITH`,
+    /// `DISTINCT`, groups of derived rows): [`Engine::from_env`] by
+    /// default.
+    pub engine: Engine,
+}
+
+/// The engine of a plan's operators ([`crate::query::ops`] or
+/// [`crate::query::df`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Engine {
+    /// Strata's operators, in memory ([`crate::query::ops`]).
+    #[default]
+    Operators,
+    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for the
+    /// plans it lowers; the operators run the others. Without the feature,
+    /// the operators run every plan.
+    DataFusion,
+    /// [`Engine::DataFusion`], and a plan it does not lower fails with
+    /// the reason instead of running on the operators (to find what the
+    /// lowering misses).
+    DataFusionOnly,
+}
+
+impl Engine {
+    /// `STRATA_ENGINE=datafusion` picks [`Engine::DataFusion`],
+    /// `datafusion-only` [`Engine::DataFusionOnly`]; anything else, or
+    /// nothing, the operators.
+    pub fn from_env() -> Engine {
+        match std::env::var("STRATA_ENGINE").as_deref() {
+            Ok("datafusion") => Engine::DataFusion,
+            Ok("datafusion-only") => Engine::DataFusionOnly,
+            _ => Engine::Operators,
+        }
+    }
 }
 
 impl Default for ExecOptions {
@@ -272,6 +306,7 @@ impl Default for ExecOptions {
             max_groups: None,
             memory: None,
             profile: false,
+            engine: Engine::from_env(),
         }
     }
 }
