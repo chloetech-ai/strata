@@ -229,3 +229,56 @@ fn a_join_on_many_keys_reads_its_right_side_whole() {
         assert_eq!(plan_line(&got).contains("restricted to"), restricted, "{sql}: {}", plan_line(&got));
     }
 }
+
+/// Two tables of 1,100 rows on one key: their join holds 1,210,000 rows.
+fn big_join(dir: &std::path::Path) -> Db {
+    let schema = Schema::new("l", vec![Field::new("id", FieldType::Int), Field::new("k", FieldType::Int)], Some("id")).unwrap();
+    let db = Db::create(&dir.join("big.strata"), schema, DbOptions { sync: false, ..DbOptions::default() }).unwrap();
+    db.load((0..1_100).map(|i| vec![Value::Int(i), Value::Int(1)])).unwrap();
+    db.sql("CREATE TABLE r (id INT PRIMARY KEY, k INT)", &Params::new()).unwrap();
+    db.load_into("r", (0..1_100).map(|i| vec![Value::Int(i), Value::Int(1)])).unwrap();
+    db
+}
+
+#[test]
+fn datafusion_memory_counts_against_the_query_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = big_join(dir.path());
+    // A group a joined row: 1,210,000 groups, tens of MiB.
+    let sql = "SELECT COUNT(*) FROM (SELECT l.id, r.id FROM l JOIN r ON l.k = r.k GROUP BY l.id, r.id) t";
+    let budget = strata::query::memory::MemoryBudget::new(1 << 30);
+    let opts = ExecOptions { engine: Engine::DataFusion, memory: Some(budget.clone()), ..db.exec.clone() };
+    let rs = db.query_with(sql, &Params::new(), &opts).unwrap();
+    assert!(on_datafusion(&rs));
+    assert_eq!(rs.rows, vec![vec![Value::Int(1_210_000)]]);
+    assert_eq!(budget.used(), 0, "given back when the query ends");
+    assert_eq!(budget.trips(), 0);
+    // Past a budget of 2 MiB the query fails as the operators' would, with
+    // Strata's memory error, and does not run again on the operators.
+    let small = strata::query::memory::MemoryBudget::new(2 << 20);
+    let opts = ExecOptions { engine: Engine::DataFusion, memory: Some(small.clone()), ..db.exec.clone() };
+    match db.query_with(sql, &Params::new(), &opts) {
+        Err(strata::Error::Memory(m)) => assert!(m.contains("MiB"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(small.trips() >= 1);
+    assert_eq!(small.used(), 0);
+}
+
+#[test]
+fn a_datafusion_plan_stops_at_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = big_join(dir.path());
+    let sql = "SELECT l.id, r.id FROM l JOIN r ON l.k = r.k ORDER BY l.id DESC, r.id DESC LIMIT 5";
+    let opts = ExecOptions { engine: Engine::DataFusion, deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)), ..db.exec.clone() };
+    let t = std::time::Instant::now();
+    match db.query_with(sql, &Params::new(), &opts) {
+        Err(strata::Error::Timeout(_)) => {}
+        Ok(rs) => assert!(t.elapsed() < std::time::Duration::from_millis(30), "answered past the deadline: {:?}", rs.rows),
+        Err(e) => panic!("{e}"),
+    }
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "stopped soon after the deadline: {:?}", t.elapsed());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let opts = ExecOptions { engine: Engine::DataFusion, cancel: Some(cancel), ..db.exec.clone() };
+    assert!(matches!(db.query_with(sql, &Params::new(), &opts), Err(strata::Error::Timeout(_))));
+}

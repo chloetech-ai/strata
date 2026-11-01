@@ -31,7 +31,8 @@
 //! any error of DataFusion's own, so a plan answers here exactly when
 //! DataFusion and the operators agree on what it means.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray,
@@ -43,6 +44,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Column as DfColumn, DFSchema, DataFusionError, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::functions_aggregate::expr_fn as agg_fn;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::Like;
@@ -108,11 +111,78 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// is not lowered here.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<Outcome> {
     let config = SessionConfig::new().with_target_partitions(opts.threads.max(1)).with_batch_size(8192);
-    let mut l = Lower { catalog, runner, opts, ctx: SessionContext::new_with_config(config), next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge: Charge::new(opts.memory.clone()) };
+    let charge = Charge::new(opts.memory.clone());
+    let pool = Arc::new(Pool { charge: charge.clone(), limited: opts.memory.is_some(), used: AtomicUsize::new(0), refused: Mutex::new(None) });
+    let env = RuntimeEnvBuilder::new().with_memory_pool(pool.clone()).build_arc().map_err(|e| Error::Query(format!("datafusion: {e}")))?;
+    let ctx = SessionContext::new_with_config_rt(config, env);
+    let mut l = Lower { catalog, runner, opts, ctx, pool, next: 0, ctes: Vec::new(), driver: None, per: None, lines: Vec::new(), charge };
     match l.answer(&plan.root) {
         Ok(rs) => Ok(Outcome::Done(rs)),
         Err(Fail::No(why)) => Ok(Outcome::Fallback(why)),
         Err(Fail::Err(e)) => Err(e),
+    }
+}
+
+/// DataFusion's memory, counted against the query's [`Charge`] while its
+/// joins, groups and sorts hold it, and given back as they free it. Past
+/// the budget a reservation is refused: a sort or a group that can spill
+/// to disk then spills, and anything else fails the query with Strata's
+/// [`Error::Memory`].
+struct Pool {
+    charge: Charge,
+    limited: bool,
+    used: AtomicUsize,
+    /// The bytes of the last reservation refused.
+    refused: Mutex<Option<u64>>,
+}
+
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pool {{ used: {} }}", self.used.load(AtomicOrdering::Relaxed))
+    }
+}
+
+impl std::fmt::Display for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "strata query memory ({} bytes held)", self.used.load(AtomicOrdering::Relaxed))
+    }
+}
+
+impl MemoryPool for Pool {
+    fn name(&self) -> &str {
+        "strata"
+    }
+
+    fn grow(&self, _: &MemoryReservation, additional: usize) {
+        // Infallible: counted, and the next fallible reservation is refused.
+        self.charge.add_anyway(additional as u64);
+        self.used.fetch_add(additional, AtomicOrdering::Relaxed);
+    }
+
+    fn shrink(&self, _: &MemoryReservation, shrink: usize) {
+        self.charge.sub(shrink as u64);
+        self.used.fetch_sub(shrink, AtomicOrdering::Relaxed);
+    }
+
+    fn try_grow(&self, _: &MemoryReservation, additional: usize) -> datafusion::common::Result<()> {
+        if self.charge.try_add(additional as u64) {
+            self.used.fetch_add(additional, AtomicOrdering::Relaxed);
+            return Ok(());
+        }
+        *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(additional as u64);
+        Err(DataFusionError::ResourcesExhausted(format!("{additional} bytes more than the query memory budget leaves")))
+    }
+
+    fn reserved(&self) -> usize {
+        self.used.load(AtomicOrdering::Relaxed)
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        if self.limited {
+            MemoryLimit::Unknown
+        } else {
+            MemoryLimit::Infinite
+        }
     }
 }
 
@@ -180,6 +250,8 @@ struct Lower<'a, 'r> {
     runner: &'a mut Runner<'r>,
     opts: &'a ExecOptions,
     ctx: SessionContext,
+    /// The memory DataFusion holds, counted against `charge`.
+    pool: Arc<Pool>,
     /// For names: columns, tables.
     next: usize,
     /// The `WITH` results in scope, each held in memory, the innermost
@@ -422,10 +494,35 @@ impl<'a> Lower<'a, '_> {
     /// Runs a plan to its batches, under the query's deadline and cancel
     /// flag (checked before and after: DataFusion's own run is not
     /// interrupted yet).
+    /// Runs `plan` on DataFusion's threads, checking the query's deadline
+    /// and cancel flag while it runs: past them, the plan is stopped and
+    /// the query fails as the operators' would.
     fn collect(&mut self, plan: LogicalPlan) -> R<Vec<RecordBatch>> {
         self.opts.check()?;
+        *self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let ctx = self.ctx.clone();
-        let batches = runtime().block_on(async move { ctx.execute_logical_plan(plan).await?.collect().await })?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = runtime().spawn(async move {
+            let r = async move { ctx.execute_logical_plan(plan).await?.collect().await }.await;
+            let _ = tx.send(r);
+        });
+        let r = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(r) => break r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(e) = self.opts.check() {
+                        task.abort();
+                        return Err(Fail::Err(e));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Fail::Err(Error::Query("datafusion: the plan's task stopped without an answer".into()))),
+            }
+        };
+        let batches = r.map_err(|e| match (e.find_root(), self.pool.refused.lock().unwrap_or_else(|e| e.into_inner()).take()) {
+            // Past the memory budget: the query's answer, as the operators'.
+            (DataFusionError::ResourcesExhausted(_), Some(wanted)) => Fail::Err(self.charge.refuse(self.charge.counted().saturating_add(wanted))),
+            _ => Fail::from(e),
+        })?;
         self.opts.check()?;
         Ok(batches)
     }
