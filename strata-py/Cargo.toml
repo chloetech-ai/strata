@@ -21,6 +21,8 @@ serde_json = "1"
 # (`accelerate`); Model2Vec models need neither.
 bert = ["strata/bert"]
 accelerate = ["strata/accelerate"]
+# Cross-encoders exported to ONNX (`onnx`), run by ONNX Runtime.
+onnx = ["strata/onnx"]
 # Images (`vision`): decoded, and embedded by SigLIP.
 vision = ["strata/vision"]
 # Sound (`audio`): decoded, and transcribed by Whisper.

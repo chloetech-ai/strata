@@ -213,8 +213,9 @@ struct Args {
     /// The most rows a cross-encoder's rerank phase may score, on a
     /// database or a coordinator: a query whose phase asks for more fails
     /// (0: no limit). Twenty abstracts take ms-marco-MiniLM-L-6-v2 about
-    /// 1 s at the median and at most 1.6 s at p99 on four cores, a third of
-    /// the default deadline; a hundred take all of it.
+    /// 1 s at the median and at most 1.3 s at p99 on four cores in f32, a
+    /// quarter of the default deadline; a hundred take about all of it (its
+    /// int8 export, 0.4 s and 2 s).
     #[arg(long, default_value_t = 20)]
     max_rerank: usize,
     /// Memory the running queries may hold together, in MiB: their groups,

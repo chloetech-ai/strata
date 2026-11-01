@@ -42,6 +42,9 @@ candle-transformers = { version = "0.9", optional = true }
 # candle's matrix products, here only to turn on their AVX-512 kernels,
 # which run where the CPU has AVX-512 (checked at run time).
 gemm = { version = "0.19", features = ["x86-v4"], optional = true }
+# ONNX Runtime, for cross-encoders exported to ONNX, int8 ones among them
+# (`onnx`): its static library is downloaded at build time and linked in.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native"], optional = true }
 # Images decoded for SigLIP (`vision`).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
 # Audio decoded for Whisper (`audio`): WAV, FLAC, MP3, Ogg Vorbis, AAC in MP4.
@@ -56,6 +59,8 @@ embed = ["dep:tokenizers"]
 # Mistral, Jina, Ollama, and servers of their APIs (`strata::hosted`).
 hosted = ["dep:ureq"]
 bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:gemm"]
+# Cross-encoders exported to ONNX (`model.onnx`), run by ONNX Runtime.
+onnx = ["embed", "dep:ort"]
 # Images: decoded with the `image` crate, embedded by SigLIP.
 vision = ["bert", "dep:image"]
 # Audio: decoded with symphonia, transcribed by Whisper.
