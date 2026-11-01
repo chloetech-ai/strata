@@ -17,13 +17,17 @@
 //! | `vec.<f>.rows` | u32 offsets, one per row plus one: row `r`'s vectors are `rows[r]..rows[r + 1]` |
 //! | `vec.<f>.owner` | u32 per vector: its row |
 //! | `vec.<f>.rescore`, `.rescorep` | SQ8 codes and their ranges, which score a row exactly, when the search codes are binary |
+//! | `vec.<f>.fdep`, `vec.<f>.fde.*` | each row's MUVERA encoding ([`super::fde`]): its parameters, and the sections of a one-vector field of the encodings (SQ8 codes, HNSW graph, float32) |
 //!
 //! The float32 vectors (`vec.<f>.f32`) are kept only with `keep_f32`: a
 //! 1,030-vector page at 128 dimensions is 527 KB in float32, 132 KB in SQ8
 //! and 16.5 KB in binary codes. Without them a row's vectors read back
 //! (and merge) as their SQ8 values, and scores are SQ8 scores.
 //!
-//! **Search.** Each query vector runs a filtered vector search over the
+//! **Search.** A segment with its rows' encodings runs one filtered search
+//! of them, with the query's encoding: its best [`CANDIDATES`] rows are the
+//! candidates ([`Search::Encodings`]). Otherwise (or with `search =>
+//! 'vectors'`) each query vector runs a filtered vector search over the
 //! vectors ([`DEPTH`] best, with the field's index and strategies); the
 //! rows that own them are the candidates, at most [`CANDIDATES`] of them,
 //! kept by the sum of the best match each query vector found in them.
@@ -49,6 +53,18 @@ pub const DEPTH: usize = 64;
 
 /// Rows scored exactly per segment (`candidates => n`).
 pub const CANDIDATES: usize = 200;
+
+/// Where `maxsim` finds a segment's candidate rows (`search => ...`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Search {
+    /// The rows' encodings where the segment has them, else the vectors.
+    Auto,
+    /// One search of the rows' MUVERA encodings ([`super::fde`]); segments
+    /// without them search their vectors.
+    Encodings,
+    /// One search of the vectors for each query vector.
+    Vectors,
+}
 
 /// The rows of a multi-vector field's vectors, and the vectors of its rows.
 #[derive(Clone, Debug)]

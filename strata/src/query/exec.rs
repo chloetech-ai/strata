@@ -2822,11 +2822,33 @@ impl<'a> Executor<'a> {
             Some("auto") | Some("index") | Some("ivf") | Some("hnsw") | Some("postfilter") | None => vector::Strategy::Auto,
             Some(other) => return Err(err(format!("unknown vector strategy {other}"))),
         };
+        // Candidates from the rows' encodings, when the segment has them,
+        // or from a search of the vectors for each query vector.
+        let search = match opts.get("search").and_then(|v| v.as_str()) {
+            None | Some("auto") => multi::Search::Auto,
+            Some("encodings") => multi::Search::Encodings,
+            Some("vectors") => multi::Search::Vectors,
+            Some(other) => return Err(err(format!("unknown maxsim search {other}: encodings, vectors or auto"))),
+        };
         let name = self.schema.fields[field].name.clone();
         let per = self.per_segment(|ex, s, l| {
             let vr = ex.vector(s, field)?;
             let Some(rows) = vr.rows() else { return Err(err(format!("{name} has one vector per row in segment {}", s.ord))) };
             let f = ex.seg_filter_l(s, p, if *p == Pred::True { FilterMode::None } else { FilterMode::Materialize }, l)?;
+            if let Some((fde, er)) = vr.encodings().filter(|_| search != multi::Search::Vectors) {
+                // One search of the encodings: its best `cap` rows.
+                let mut sp = base.clone();
+                sp.strategy = strategy;
+                let out = er.search(&fde.query(&qs), cap, &sp, f.as_dyn());
+                l.scored += out.stats.candidates as u64;
+                let eqs: Vec<ExactQuery> = qs.iter().map(|q| vr.prepare_exact(q)).collect();
+                let mut hits: Vec<Hit> = out.hits.iter().map(|h| Hit { seg: s.ord, doc: h.doc, score: multi_score(vr, rows, &eqs, h.doc) as f64 }).collect();
+                let scored: usize = out.hits.iter().map(|h| rows.vectors(h.doc).len()).sum();
+                l.scored += (scored * qs.len()) as u64;
+                l.plan.push(format!("seg {}: maxsim({name}) over {} rows: {} candidate rows from one search of their encodings, scored exactly", s.ord, rows.n_rows(), hits.len()));
+                hits.retain(|h| h.score.is_finite());
+                return Ok(merge_top(hits, k));
+            }
             let owners = f.as_dyn().map(|f| multi::OwnerFilter { rows, filter: f, n: vr.n_docs() as usize });
             // Each candidate row's best match per query vector so far.
             let mut found: HashMap<DocId, Vec<f32>> = HashMap::new();

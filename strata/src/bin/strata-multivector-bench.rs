@@ -41,10 +41,11 @@ struct Args {
     /// The encoder's output directory for one dataset.
     #[arg(long)]
     data: PathBuf,
-    /// Layouts: sq8 (the default), f32 (keep_f32), pool-<cosine> (pooled
-    /// by a cosine threshold), ward-<factor> (pooled by Ward's linkage with a
-    /// pool factor).
-    #[arg(long, default_value = "sq8,f32,pool-0.95,pool-0.9,ward-2,ward-3")]
+    /// Layouts: sq8 (the default), f32 (keep_f32), flat (no index of the
+    /// vectors, only of the rows' encodings), pool-<cosine> (pooled by a
+    /// cosine threshold), ward-<factor> (pooled by Ward's linkage with a pool
+    /// factor).
+    #[arg(long, default_value = "sq8,f32,flat,pool-0.95,pool-0.9,ward-2,ward-3")]
     layouts: String,
     /// Candidate caps, comma-separated.
     #[arg(long, default_value = "10,25,50,100,200,400")]
@@ -135,9 +136,10 @@ fn main() {
     println!("{:<10} {:<22} {:>7} {:>8} {:>8} {:>8}", "layout", "ranking", "NDCG@5", "p50 ms", "mean ms", "p99 ms");
     println!("{:<10} {:<22} {:>7.4}", "float32", "maxsim, brute force", reference);
     for layout in a.layouts.split(',') {
-        let mut patches = Field::new("patches", FieldType::Vector { dim, index: VectorIndexKind::Hnsw { m: 16, ef_construction: 200 } }).multi();
+        let index = if layout == "flat" { VectorIndexKind::Flat } else { VectorIndexKind::Hnsw { m: 16, ef_construction: 200 } };
+        let mut patches = Field::new("patches", FieldType::Vector { dim, index }).multi();
         match layout {
-            "sq8" => {}
+            "sq8" | "flat" => {}
             "f32" => patches = patches.keep_f32(),
             l if l.starts_with("pool-") => patches = patches.pooled(l["pool-".len()..].parse().unwrap()),
             l if l.starts_with("ward-") => patches = patches.pooled_by(l["ward-".len()..].parse().unwrap()),
@@ -173,9 +175,18 @@ fn main() {
 
         let schema = snap.schema().clone();
         let exec = ExecOptions { threads: 1, ..ExecOptions::default() };
-        let mut cases: Vec<(String, String)> = caps.iter().map(|c| (format!("maxsim, {c} candidates"), format!("maxsim(patches, :qs, candidates => {c})"))).collect();
+        // Candidates from one search of the rows' encodings, and (but on
+        // the flat layout, which has no index of its vectors) from a search
+        // a query vector.
+        let mut cases: Vec<(String, String)> = Vec::new();
+        for search in ["encodings", "vectors"] {
+            if search == "vectors" && layout == "flat" {
+                continue;
+            }
+            cases.extend(caps.iter().map(|c| (format!("maxsim, {c} candidates, {search}"), format!("maxsim(patches, :qs, candidates => {c}, search => '{search}')"))));
+        }
         if a.exact == "all" || a.exact.split(',').any(|l| l == layout) {
-            cases.push(("maxsim, exact".into(), "maxsim(patches, :qs, depth => 100000000, candidates => 100000000)".into()));
+            cases.push(("maxsim, exact".into(), "maxsim(patches, :qs, depth => 100000000, candidates => 100000000, search => 'vectors')".into()));
         }
         if layout == "sq8" {
             cases.push(("bm25 over OCR text".into(), "bm25(text, :t)".into()));

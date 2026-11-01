@@ -1808,6 +1808,9 @@ impl<'a> Binder<'a> {
                 v.as_f64().filter(|x| *x >= 1.0 && x.fract() == 0.0).ok_or_else(|| err(format!("{k} => a whole number, at least 1")))?;
             }
         }
+        if opts.get("search").is_some_and(|v| !matches!(v.as_str(), Some("auto" | "encodings" | "vectors"))) {
+            return Err(err("search => 'encodings' (one search of the rows' encodings), 'vectors' (one search a query vector) or 'auto'"));
+        }
         if let Some(q) = subquery_of(vs) {
             return Ok(Score::MaxSim { field, vectors: Vectors::Plan(Box::new(self.sub(q, Sub::Vectors)?)), opts: without_norm(opts) });
         }

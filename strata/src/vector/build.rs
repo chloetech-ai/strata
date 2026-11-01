@@ -14,6 +14,8 @@
 //! | `vector.hnsw.build` | `sq8` with SQ8 codes | `sq8`: construction scores with the codes, as search does; `f32`: with float32 rows |
 //! | `vector.threads` | 1 | threads for k-means and graph construction |
 //! | `vector.seed` | fixed | seed for sampling and HNSW levels |
+//! | `vector.fde` | `on` | a multi-vector field's rows also get MUVERA encodings and an HNSW graph of them ([`super::fde`]); `off` for none |
+//! | `vector.fde.reps`, `vector.fde.ksim`, `vector.fde.dproj` | 8, 4, 16 | the encodings' repetitions, hyperplanes and projected dimensions ([`super::fde::FdeParams`]) |
 //!
 //! A field that is not `indexed` gets the forward vectors only (flat).
 
@@ -30,6 +32,7 @@ use crate::vector::hnsw::{self, HnswConfig, HnswView};
 use crate::vector::ivf::{self, IvfConfig};
 use crate::vector::bits::Bits;
 use crate::vector::codes::Quantiser;
+use crate::vector::fde::{Fde, FdeParams};
 use crate::vector::sq8::Sq8;
 use crate::vector::{section, VectorInfo};
 
@@ -126,6 +129,8 @@ pub(crate) struct VectorBuilder {
     /// A multi-vector field's row offsets (`n` counts vectors), and whether
     /// it keeps its float32 vectors.
     multi: Option<(Vec<u32>, bool)>,
+    /// A multi-vector field's encodings of its rows, if it builds them.
+    fde: Option<FdeParams>,
 }
 
 impl VectorBuilder {
@@ -183,6 +188,24 @@ impl VectorBuilder {
             n: 0,
             missing: 0,
             multi: field.is_multi_vector().then(|| (vec![0], field.keep_f32)),
+            fde: match opts.get("vector.fde") {
+                _ if !field.is_multi_vector() || !field.indexed => None,
+                None | Some("on") => {
+                    let d = FdeParams::DEFAULT;
+                    let p = FdeParams {
+                        reps: parse(opts, "vector.fde.reps")?.unwrap_or(d.reps),
+                        ksim: parse(opts, "vector.fde.ksim")?.unwrap_or(d.ksim),
+                        dproj: parse(opts, "vector.fde.dproj")?.unwrap_or(d.dproj),
+                        seed: d.seed,
+                    };
+                    if !(1..=64).contains(&p.reps) || !(1..=10).contains(&p.ksim) || !(1..=4096).contains(&p.dproj) || p.reps * (1 << p.ksim) * p.dproj.min(*dim) > 65_536 {
+                        return Err(Error::Schema(format!("bad encoding options vector.fde.*: reps 1 to 64, ksim 1 to 10, dproj 1 to 4096, at most 65,536 dimensions in all (reps · 2^ksim · dproj)")));
+                    }
+                    Some(p)
+                }
+                Some("off") => None,
+                Some(o) => return Err(Error::Schema(format!("bad value {o:?} for build option vector.fde (on or off)"))),
+            },
         })
     }
 }
@@ -263,7 +286,7 @@ impl FieldIndexBuilder for VectorBuilder {
     }
 
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, mut rows, present, n, missing, multi } = *self;
+        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, mut rows, present, n, missing, multi, fde } = *self;
         let code_stride = code_kind.stride(dim);
         let is_present = |d: u32| present[d as usize / 64] >> (d % 64) & 1 == 1;
         let ids: Vec<u32> = (0..n as u32).filter(|&d| is_present(d)).collect();
@@ -383,6 +406,9 @@ impl FieldIndexBuilder for VectorBuilder {
             }
             out.put(section(&field, "rows"), offsets.iter().flat_map(|o| o.to_le_bytes()).collect());
             out.put(section(&field, "owner"), owner);
+            if let Some(params) = fde {
+                encodings(&field, &view, offsets, params, threads, seed, out)?;
+            }
             // Rows are scored exactly with SQ8 codes when binary codes are
             // searched and the float32 vectors are not kept.
             if !info.f32 && code_kind == VectorCodes::Binary {
@@ -411,4 +437,43 @@ impl FieldIndexBuilder for VectorBuilder {
         }
         Ok(())
     }
+}
+
+/// A multi-vector field's MUVERA encodings ([`super::fde`]): one vector a
+/// row, in the sections of a vector field `<field>.fde` (SQ8 codes searched
+/// by an HNSW graph, float32 to re-rank; rows without vectors have none),
+/// and the encodings' parameters in `vec.<field>.fdep`.
+fn encodings(field: &str, view: &Rows, offsets: &[u32], params: FdeParams, threads: usize, seed: u64, out: &mut SegmentWriter) -> Result<()> {
+    if offsets.last().is_none_or(|&n| n == 0) {
+        return Ok(());
+    }
+    let fde = Fde::new(view.dim, params);
+    let dim = fde.dims();
+    let mut b = VectorBuilder {
+        field: format!("{field}.fde"),
+        dim,
+        stride: strides(dim).0,
+        kind: Kind::Hnsw { m: 16, ef_construction: 200, f32: false },
+        codes: VectorCodes::Sq8,
+        hnsw_max_docs: None,
+        threads,
+        seed,
+        start: Vec::new(),
+        rows: RowBuf::Mem(Vec::new()),
+        present: Vec::new(),
+        n: 0,
+        missing: 0,
+        multi: None,
+        fde: None,
+    };
+    // A segment that spills its sections (a merge) spills the encodings too.
+    if let Some(spill) = out.spill().cloned() {
+        b.spill_to(&spill)?;
+    }
+    for (r, w) in offsets.windows(2).enumerate() {
+        let v = if w[0] == w[1] { Value::Null } else { Value::Vector(fde.row((w[0]..w[1]).map(|i| &view.row(i as usize)[..view.dim])).into()) };
+        b.add(r as DocId, &v)?;
+    }
+    out.put(section(field, "fdep"), serde_json::to_vec(&params).expect("serialisable"));
+    Box::new(b).finish(out)
 }

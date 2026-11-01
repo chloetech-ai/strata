@@ -16,7 +16,8 @@
 //! HNSW (`hnsw`, `hnsw_upper`); see [`ivf`] and [`hnsw`] for the layouts.
 //! [`VectorReader`] views all of them in place. A multi-vector field
 //! (`VECTOR(d)[]`) has the same sections over its vectors rather than its
-//! rows, and maps between the two ([`multi`]).
+//! rows, maps between the two, and one encoding of each row that a single
+//! search finds candidate rows by ([`multi`], [`fde`]).
 //!
 //! **Search** scores SQ8 codes with an int8-quantised query (AVX-512 VNNI or
 //! NEON `usdot`), keeps the best `rerank` candidates and re-ranks them with
@@ -41,6 +42,7 @@ pub mod bits;
 pub mod codes;
 pub mod cost;
 pub mod exact;
+pub mod fde;
 pub mod kernels;
 pub mod multi;
 pub mod sq8;
@@ -307,6 +309,9 @@ pub struct VectorReader {
     /// search codes when they are SQ8).
     rescore: Option<(Slice<u8>, Sq8)>,
     multi: Option<multi::Rows>,
+    /// A multi-vector field's encodings of its rows and their reader
+    /// ([`fde`]).
+    fde: Option<(fde::Fde, Box<VectorReader>)>,
     present: Option<Slice<u64>>,
     ivf: Option<IvfView>,
     hnsw: Option<HnswView>,
@@ -380,6 +385,18 @@ impl VectorReader {
             VectorCodes::Binary => Quantiser::Bits(Bits { mean: a, spread: b }),
         };
         let multi = info.rows.map(|r| multi::Rows::open(seg, field, r, n)).transpose()?;
+        let fde = match (&multi, seg.section(&section(field, "fdep"))?) {
+            (Some(_), Some(p)) => {
+                let params: fde::FdeParams = serde_json::from_slice(&p).map_err(corrupt)?;
+                let f = fde::Fde::new(dim, params);
+                let r = VectorReader::open(seg, &format!("{field}.fde"))?;
+                if r.dim() != f.dims() || r.rows().is_some() {
+                    return Err(corrupt(format!("vector field {field}: encodings do not match their parameters")));
+                }
+                Some((f, Box::new(r)))
+            }
+            _ => None,
+        };
         let rescore = match (&quant, info.f32) {
             (_, true) => None,
             (Quantiser::Sq8(sq), false) => Some((codes.clone(), sq.clone())),
@@ -424,7 +441,7 @@ impl VectorReader {
             other => return Err(corrupt(format!("unknown vector index {other}"))),
         }
         let shape = IndexShape { n: n - info.missing, kind: info.index.clone(), nlist: info.nlist.unwrap_or(1), hnsw_m: info.m.unwrap_or(16) };
-        Ok(VectorReader { info, vectors, codes, quant, rescore, multi, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse, absent: false })
+        Ok(VectorReader { info, vectors, codes, quant, rescore, multi, fde, present, ivf, hnsw, shape, cost: CostModel::default(), io_hints: false, hnsw_filter: HnswFilterMode::Traverse, absent: false })
     }
 
     /// The reader of an [`absent_meta`] header: no row has a vector.
@@ -441,6 +458,7 @@ impl VectorReader {
             quant,
             rescore: None,
             multi: None,
+            fde: None,
             present: Some(Slice::Owned(vec![0u64; info.n.div_ceil(64)])),
             ivf: None,
             hnsw: None,
@@ -509,6 +527,13 @@ impl VectorReader {
     /// A multi-vector field's rows, by vector and vector by row.
     pub fn rows(&self) -> Option<&multi::Rows> {
         self.multi.as_ref()
+    }
+
+    /// A multi-vector field's encodings of its rows ([`fde`]): how a query
+    /// encodes itself, and the reader of the rows' encodings (one vector a
+    /// row). Segments built without them have none.
+    pub fn encodings(&self) -> Option<(&fde::Fde, &VectorReader)> {
+        self.fde.as_ref().map(|(f, r)| (f, &**r))
     }
 
     /// Whether the float32 vectors are kept ([`VectorInfo::f32`]).

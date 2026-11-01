@@ -152,6 +152,44 @@ fn maxsim_over_rows_equals_brute_force() {
     }
 }
 
+/// `maxsim` finds its candidates by one search of the rows' MUVERA
+/// encodings, where segments have them: about as many of the best rows as
+/// a search a query vector finds, filtered alike; segments built without
+/// encodings, or a query that asks, search the vectors.
+#[test]
+fn maxsim_finds_candidates_by_the_rows_encodings() {
+    let docs = pages(1500, 5);
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "e.strata", &docs, schema(strata::schema::DEFAULT_HNSW, false));
+    let opts = DbOptions { segment_max_docs: 300, sync: false, build: strata::segment::build::BuildOptions::default().set("vector.fde", "off"), ..DbOptions::default() };
+    let plain = Db::create(&dir.path().join("v.strata"), schema(strata::schema::DEFAULT_HNSW, false), opts).unwrap();
+    plain.load(docs.iter().map(|d| d.0.clone())).unwrap();
+    let encoded = |db: &Db| db.snapshot().segments().iter().filter(|s| s.file.section_sizes().iter().any(|(n, _)| n.ends_with(".fdep"))).count();
+    assert_eq!(encoded(&db), db.snapshot().segments().len());
+    assert_eq!(encoded(&plain), 0, "vector.fde = off builds none");
+    let mut rng = StdRng::seed_from_u64(6);
+    let (mut by_enc, mut by_vec, mut total) = (0, 0, 0);
+    for i in 0..40 {
+        let qs = queries(&docs, &mut rng, 8);
+        let p = Params::new().set("qs", list(&qs));
+        let filter = if i % 2 == 0 { "" } else { "WHERE year >= 2012" };
+        let keep = |d: &Document| filter.is_empty() || d[3].as_i64().unwrap() >= 2012;
+        let q = |search: &str| format!("SELECT id, score() FROM pages {filter} ORDER BY maxsim(patches, :qs, candidates => 50{search}) DESC LIMIT 10");
+        let want = brute(&docs, &qs, keep, 10);
+        let enc = ranked(&db.query(&q(""), &p).unwrap());
+        let vec = ranked(&db.query(&q(", search => 'vectors'"), &p).unwrap());
+        assert_eq!(ranked(&plain.query(&q(", search => 'encodings'"), &p).unwrap()), ranked(&plain.query(&q(""), &p).unwrap()), "no encodings: the vectors are searched");
+        assert!(enc.iter().all(|(id, _)| keep(&docs.iter().find(|d| d.0[0].as_str() == Some(id)).unwrap().0)), "the filter holds");
+        by_enc += recall(&enc, &want);
+        by_vec += recall(&vec, &want);
+        total += want.len();
+    }
+    assert!(by_enc as f64 >= 0.9 * total as f64, "encodings: recall@10 {by_enc}/{total} (vectors {by_vec})");
+    let r = db.query("SELECT id FROM pages ORDER BY maxsim(patches, :qs) DESC LIMIT 5", &Params::new().set("qs", list(&queries(&docs, &mut rng, 4)))).unwrap();
+    assert!(r.stats.plan.iter().any(|l| l.contains("one search of their encodings")), "{:?}", r.stats.plan);
+    assert!(db.query("SELECT id FROM pages ORDER BY maxsim(patches, :qs, search => 'rows') DESC LIMIT 5", &Params::new().set("qs", list(&queries(&docs, &mut rng, 2)))).is_err());
+}
+
 #[test]
 fn sq8_scores_without_float32_are_close() {
     let docs = pages(1500, 3);
@@ -161,7 +199,8 @@ fn sq8_scores_without_float32_are_close() {
     // SQ8 codes to score with instead of float32.
     let sections = |db: &Db| {
         let snap = db.snapshot();
-        snap.segments()[0].file.section_sizes().into_iter().map(|s| strata::segment::label(snap.schema(), &s.0)).filter(|n| n.starts_with("vec.patches")).collect::<Vec<_>>()
+        // The vectors' sections, not their rows' encodings.
+        snap.segments()[0].file.section_sizes().into_iter().map(|s| strata::segment::label(snap.schema(), &s.0)).filter(|n| n.starts_with("vec.patches") && !n.starts_with("vec.patches.fde")).collect::<Vec<_>>()
     };
     assert!(sections(&db).iter().any(|n| n.ends_with(".rescore")) && !sections(&db).iter().any(|n| n.ends_with(".f32")), "{:?}", sections(&db));
     assert!(sections(&f32db).iter().any(|n| n.ends_with(".f32")) && !sections(&f32db).iter().any(|n| n.ends_with(".rescore")), "{:?}", sections(&f32db));
