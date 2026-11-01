@@ -198,6 +198,12 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/aws/machines", get(aws_machines))
         .route("/v1/admin/aws/plan", post(aws_plan))
         .route("/v1/admin/aws/validate", post(aws_validate))
+        .route("/v1/admin/digitalocean", get(do_status))
+        .route("/v1/admin/digitalocean/token", put(do_save).merge(axum::routing::delete(do_forget)))
+        .route("/v1/admin/digitalocean/regions", get(do_regions))
+        .route("/v1/admin/digitalocean/machines", get(do_machines))
+        .route("/v1/admin/digitalocean/plan", post(do_plan))
+        .route("/v1/admin/digitalocean/validate", post(do_validate))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -1576,7 +1582,7 @@ fn aws_error(e: String) -> ApiError {
     ApiError { status: if e.starts_with("no AWS credentials") || e.contains("is not a region") { 400 } else { 502 }, message: e }
 }
 
-/// The AWS view's state: the credentials as far as they may be shown (the
+/// The cloud view's AWS state: the credentials as far as they may be shown (the
 /// key id masked; never the secret nor the session token).
 async fn aws_status(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.aws.status())
@@ -1645,6 +1651,83 @@ async fn aws_validate(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result
     let (p, mut j) = aws_planned(&app, b).await?;
     j["validated"] = match app.svc.aws.validate(&p.region, &j["template"]).await {
         Ok(v) => json!({"ok": true, "answer": v}),
+        Err(e) => json!({"ok": false, "error": e}),
+    };
+    Ok(AxJson(j))
+}
+
+/// A DigitalOcean failure: 400 without a token or for a region that is no
+/// region's name, else 502 (DigitalOcean's answer).
+fn do_error(e: String) -> ApiError {
+    ApiError { status: if e.starts_with("no DigitalOcean token") || e.contains("is not a region") || e.starts_with("DOKS does not run") { 400 } else { 502 }, message: e }
+}
+
+/// The cloud view's DigitalOcean state: the token as far as it may be
+/// shown (masked).
+async fn do_status(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.digitalocean.status())
+}
+
+/// `{"token"}`: checked with DigitalOcean (`GET /v2/account`), then kept on
+/// this server. Answers whose it is.
+async fn do_save(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let token = b["token"].as_str().ok_or_else(|| ApiError::bad("the body is {\"token\": \"dop_v1_...\"}"))?.to_string();
+    let masked = crate::aws::mask(token.trim());
+    let who = who(w);
+    let a = app.svc.digitalocean.set(token, &who.name).await.map_err(|e| ApiError { status: if e.starts_with("write ") { 500 } else { 400 }, message: e })?;
+    let mut j = app.svc.digitalocean.status();
+    j["account"] = json!(a);
+    Ok(audited(j, format!("saved the DigitalOcean token {masked} (team {}, account {})", a.team, a.uuid)))
+}
+
+async fn do_forget(State(app): State<App>) -> Result<Response, ApiError> {
+    let was = app.svc.digitalocean.forget().map_err(ApiError::internal)?;
+    let detail = match &was {
+        Some(k) => format!("forgot the DigitalOcean token {k}"),
+        None => "forgot the DigitalOcean token (none was saved)".into(),
+    };
+    Ok(audited(json!({"forgot": was, "status": app.svc.digitalocean.status()}), detail))
+}
+
+async fn do_regions(State(app): State<App>) -> Result<AxJson<Json>, ApiError> {
+    Ok(AxJson(json!({"regions": app.svc.digitalocean.regions().await.map_err(do_error)?})))
+}
+
+/// `?region=` (default nyc3), `&fresh=1` to fetch again: the sizes a DOKS
+/// node may be there with their prices, DOKS's versions and the account's
+/// droplets.
+async fn do_machines(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<AxJson<Json>, ApiError> {
+    let region = q.get("region").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| "nyc3".into());
+    let fresh = q.get("fresh").is_some_and(|v| v != "0" && v != "false");
+    let cat = app.svc.digitalocean.catalog(&region, fresh).await.map_err(do_error)?;
+    let mut j = json!(&*cat);
+    let recommended: Vec<&str> = crate::digitalocean::recommended(&cat.machines).iter().map(|m| m.name.as_str()).collect();
+    j["recommended"] = json!(recommended);
+    Ok(AxJson(j))
+}
+
+/// A plan of a cluster on DOKS ([`crate::digitalocean::plan`]). Creates
+/// nothing.
+async fn do_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<AxJson<Json>, ApiError> {
+    let p: crate::digitalocean::plan::Plan = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+    let cat = app.svc.digitalocean.catalog(&p.region, false).await.map_err(do_error)?;
+    Ok(AxJson(crate::digitalocean::plan::plan(&p, &cat).map_err(ApiError::bad)?))
+}
+
+/// The plan, and DigitalOcean's answers now: the account, the region,
+/// the size, the version and the droplet limit, fetched again. Creates
+/// nothing.
+async fn do_validate(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<AxJson<Json>, ApiError> {
+    let p: crate::digitalocean::plan::Plan = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+    let d = &app.svc.digitalocean;
+    let cat = d.catalog(&p.region, true).await.map_err(do_error)?;
+    let mut j = crate::digitalocean::plan::plan(&p, &cat).map_err(ApiError::bad)?;
+    let token = d.token().map(|(t, _)| t).ok_or_else(|| do_error("no DigitalOcean token".into()))?;
+    j["validated"] = match d.account(&token).await {
+        Ok(a) => {
+            let checks = crate::digitalocean::plan::checks(&p, &cat, &a.status);
+            json!({"ok": checks.iter().all(|c| c["ok"] == true), "checks": checks})
+        }
         Err(e) => json!({"ok": false, "error": e}),
     };
     Ok(AxJson(j))

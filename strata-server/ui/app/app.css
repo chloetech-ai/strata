@@ -1219,47 +1219,51 @@ button.rx-node:hover { border-color: var(--accent); box-shadow: 0 0 0 3px var(--
 .ro-srv.p { box-shadow: inset 0 0 0 1.5px var(--accent); color: var(--text); }
 
 /* AWS: credentials, machines by price and memory, and the plan */
-.aws-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-bottom: 14px; align-items: start; }
-@media (max-width: 900px) { .aws-top { grid-template-columns: minmax(0, 1fr); } }
-.aws-top + div, .aws-top + div + div { margin-bottom: 14px; }
-.aws-form { gap: 8px; max-width: 460px; }
-.aws-field { gap: 3px; }
-.aws-field .input, .aws-field .select { width: 100%; }
-.aws-quota { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
-.aws-quota.bad { border-color: color-mix(in srgb, var(--crit) 50%, var(--line)); background: var(--crit-soft); }
-.aws-quota .barbox { height: 6px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
-.aws-quota .bar { height: 100%; border-radius: 3px; }
-.aws-chart { width: 100%; height: auto; max-height: 340px; display: block; }
-.aws-grid { stroke: var(--line); stroke-width: 1; }
-.aws-ax { font-size: 10.5px; fill: var(--muted); font-variant-numeric: tabular-nums; }
-.aws-dot { stroke-width: 1.5; cursor: pointer; opacity: .9; transition: r .1s; }
-.aws-dot:hover, .aws-dot:focus-visible { opacity: 1; stroke-width: 2.5; outline: none; }
-.aws-dot.on { stroke: var(--text) !important; stroke-width: 2.5; opacity: 1; }
-.aws-rec { fill: none; stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 2 2; pointer-events: none; }
-.aws-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; }
-.aws-sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid; box-sizing: border-box; flex: none; }
-.aws-sw.ring { border: 1px dashed var(--text-2); width: 12px; height: 12px; }
-.aws-controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: flex-end; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
-.aws-step { display: flex; flex-direction: column; gap: 3px; }
-.aws-step .row b { min-width: 34px; text-align: center; }
-.aws-plan { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; align-items: start; }
-@media (max-width: 900px) { .aws-plan { grid-template-columns: minmax(0, 1fr); } }
-.aws-plan h4, .card h4 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-.aws-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
-.aws-node { border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 8px; display: flex; flex-direction: column; gap: 6px; background: var(--surface-2); }
-.aws-node .barbox { height: 5px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
-.aws-node .bar { height: 100%; background: var(--s3); }
-.aws-copies { display: flex; flex-wrap: wrap; gap: 4px; min-height: 22px; }
-.aws-copy { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--c) 18%, var(--surface)); border: 1px solid var(--c); color: var(--text); }
-.aws-copy small { margin-left: 2px; color: var(--muted); }
-.aws-totals { display: flex; gap: 18px; flex-wrap: wrap; font-size: 18px; }
-.aws-stack { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--surface-3); }
-.aws-stack > span { display: block; height: 100%; }
-.aws-line { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
-.aws-line > span:first-child { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
-.aws-line > span:first-child .aws-sw { transform: translateY(1px); }
-.aws-line > span:last-child { white-space: nowrap; }
-.aws-warn { gap: 6px; padding: 8px 10px; border-radius: var(--r-sm); background: var(--warn-soft, var(--surface-2)); border: 1px solid color-mix(in srgb, var(--warn, var(--s4)) 45%, var(--line)); }
-.aws-warn .i { color: var(--warn-ink, var(--s4)); flex: none; margin-top: 1px; }
-.aws-cmds { display: flex; flex-direction: column; gap: 4px; }
-.aws-cmds code { background: var(--sunken); padding: 3px 8px; border-radius: 4px; overflow-x: auto; white-space: pre; flex: 1; min-width: 0; }
+/* The machines' filters go under the title when they do not fit beside it. */
+.cloud-machines > .hd { flex-wrap: wrap; row-gap: 6px; }
+.cloud-machines > .hd .sub { white-space: nowrap; }
+.cloud-machines > .hd .tools { flex-wrap: wrap; justify-content: flex-end; }
+.cloud-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-bottom: 14px; align-items: start; }
+@media (max-width: 900px) { .cloud-top { grid-template-columns: minmax(0, 1fr); } }
+.cloud-top + div, .cloud-top + div + div { margin-bottom: 14px; }
+.cloud-form { gap: 8px; max-width: 460px; }
+.cloud-field { gap: 3px; }
+.cloud-field .input, .cloud-field .select { width: 100%; }
+.cloud-quota { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); }
+.cloud-quota.bad { border-color: color-mix(in srgb, var(--crit) 50%, var(--line)); background: var(--crit-soft); }
+.cloud-quota .barbox { height: 6px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
+.cloud-quota .bar { height: 100%; border-radius: 3px; }
+.cloud-chart { width: 100%; height: auto; max-height: 340px; display: block; }
+.cloud-grid { stroke: var(--line); stroke-width: 1; }
+.cloud-ax { font-size: 10.5px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.cloud-dot { stroke-width: 1.5; cursor: pointer; opacity: .9; transition: r .1s; }
+.cloud-dot:hover, .cloud-dot:focus-visible { opacity: 1; stroke-width: 2.5; outline: none; }
+.cloud-dot.on { stroke: var(--text) !important; stroke-width: 2.5; opacity: 1; }
+.cloud-rec { fill: none; stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 2 2; pointer-events: none; }
+.cloud-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.cloud-sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid; box-sizing: border-box; flex: none; }
+.cloud-sw.ring { border: 1px dashed var(--text-2); width: 12px; height: 12px; }
+.cloud-controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: flex-end; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.cloud-step { display: flex; flex-direction: column; gap: 3px; }
+.cloud-step .row b { min-width: 34px; text-align: center; }
+.cloud-plan { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .cloud-plan { grid-template-columns: minmax(0, 1fr); } }
+.cloud-plan h4, .card h4 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.cloud-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.cloud-node { border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 8px; display: flex; flex-direction: column; gap: 6px; background: var(--surface-2); }
+.cloud-node .barbox { height: 5px; background: var(--surface-3); border-radius: 3px; overflow: hidden; }
+.cloud-node .bar { height: 100%; background: var(--s3); }
+.cloud-copies { display: flex; flex-wrap: wrap; gap: 4px; min-height: 22px; }
+.cloud-copy { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--c) 18%, var(--surface)); border: 1px solid var(--c); color: var(--text); }
+.cloud-copy small { margin-left: 2px; color: var(--muted); }
+.cloud-totals { display: flex; gap: 18px; flex-wrap: wrap; font-size: 18px; }
+.cloud-stack { display: flex; height: 12px; border-radius: 6px; overflow: hidden; background: var(--surface-3); }
+.cloud-stack > span { display: block; height: 100%; }
+.cloud-line { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.cloud-line > span:first-child { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.cloud-line > span:first-child .cloud-sw { transform: translateY(1px); }
+.cloud-line > span:last-child { white-space: nowrap; }
+.cloud-warn { gap: 6px; padding: 8px 10px; border-radius: var(--r-sm); background: var(--warn-soft, var(--surface-2)); border: 1px solid color-mix(in srgb, var(--warn, var(--s4)) 45%, var(--line)); }
+.cloud-warn .i { color: var(--warn-ink, var(--s4)); flex: none; margin-top: 1px; }
+.cloud-cmds { display: flex; flex-direction: column; gap: 4px; }
+.cloud-cmds code { background: var(--sunken); padding: 3px 8px; border-radius: 4px; overflow-x: auto; white-space: pre; flex: 1; min-width: 0; }

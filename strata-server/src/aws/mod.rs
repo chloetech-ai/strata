@@ -1,4 +1,4 @@
-//! AWS for the command center's AWS view: the account's credentials, kept
+//! AWS for the command center's cloud view: the account's credentials, kept
 //! on the server and never answered back, the machines of a region with
 //! their prices and the account's quota, and the plan of an EKS cluster
 //! for Strata ([`stack`]).
@@ -231,7 +231,7 @@ impl Aws {
     }
 
     fn need(&self) -> Result<Creds, String> {
-        self.creds().map(|(c, _)| c).ok_or_else(|| "no AWS credentials: save an access key in the AWS view (PUT /v1/admin/aws/credentials)".into())
+        self.creds().map(|(c, _)| c).ok_or_else(|| "no AWS credentials: save an access key in the Cloud view (PUT /v1/admin/aws/credentials)".into())
     }
 
     /// The host of a service's endpoint in a region.
@@ -517,7 +517,7 @@ fn error_text(body: &str) -> String {
 
 /// Writes `bytes` to `path` readable by its owner only, through a
 /// temporary file renamed over it.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
     {

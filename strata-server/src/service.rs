@@ -209,8 +209,11 @@ pub struct Service {
     pub keys: Arc<Keys>,
     pub audit: Audit,
     pub alerts: Alerts,
-    /// The AWS view's credentials and machine catalogues ([`crate::aws`]).
+    /// The cloud view's AWS credentials and machine catalogues ([`crate::aws`]).
     pub aws: Arc<crate::aws::Aws>,
+    /// The cloud view's DigitalOcean token and size catalogues
+    /// ([`crate::digitalocean`]).
+    pub digitalocean: Arc<crate::digitalocean::DigitalOcean>,
     /// The server's log store ([`crate::logstore`]): its log lines and the
     /// queries it answered, in a Strata database of their own (`None`:
     /// `--log-store off`, or a coordinator without one).
@@ -362,6 +365,7 @@ impl Service {
             audit: Audit::new(None).expect("an audit log in memory"),
             alerts: Alerts::new(None, None).expect("the default alert rules"),
             aws: Arc::new(crate::aws::Aws::memory()),
+            digitalocean: Arc::new(crate::digitalocean::DigitalOcean::memory()),
             log_store: None,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
