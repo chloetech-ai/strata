@@ -9,6 +9,16 @@
 #   scripts/ci-local.sh --pr 203 --post-status   # a pull request's head, from GitHub
 #   scripts/ci-local.sh test-strata miri         # some jobs only
 #   scripts/ci-local.sh --list                   # the jobs and what each runs
+#   scripts/ci-local.sh --fast                   # quicker, and less like GitHub
+#
+# A whole run is slower than GitHub's, which spreads the jobs over 17
+# runners: on an 8-core M2 with warm caches it took 70 minutes, against 27
+# for the same commit on GitHub (1 November 2026). CI compiles Strata in
+# about ten feature sets, and a Mac builds them one after another. It is
+# for some jobs while working on a change, a pull request GitHub has not
+# got to, or a check of what GitHub cannot run. --fast runs the crates'
+# test suites with cargo-nextest, two jobs at once, and only the jobs a
+# change can affect.
 #
 # It runs on macOS (Apple silicon) and on Linux. On a Mac every job runs on
 # macOS, the ones GitHub runs on Linux only included, and so:
@@ -22,6 +32,11 @@
 # - The Kafka consumer's test needs a broker: --kafka starts Redpanda in
 #   Docker for it. Without it the test is skipped, as on GitHub's macOS
 #   runners.
+# - Miri interprets x86-64 Linux, as on GitHub: it runs neither the NEON
+#   intrinsics nor the inline assembly Strata compiles in on aarch64.
+# - The tests' temporary files are on a RAM disk (--no-ramdisk keeps them on
+#   the disk): a durable sync takes 20 ms on a Mac's SSD, and Strata's
+#   tests sync at every commit.
 #
 # A push to main still runs GitHub's whole matrix, Linux and macOS, so what a
 # Mac cannot test is tested after the merge.
