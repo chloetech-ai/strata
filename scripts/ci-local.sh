@@ -60,7 +60,7 @@ test eeca5e84d1e9
 kernels f1d8e09a9818
 vision a264ac583f17
 audio 8159b08f3f6d
-datafusion 0ea5425507fc
+datafusion 9014670457da
 faults 0b4761a7c6c6
 relevance-gate 6b458f48b0c7
 relevance-gate-cross-encoder ba45bc8b551d
@@ -470,7 +470,7 @@ job_datafusion() {
     cd strata
     cargo test --profile ci --features datafusion --test datafusion_engine
     cargo test --profile ci --features datafusion,sqlite --test window_functions --test set_operations
-    STRATA_ENGINE=datafusion cargo test --profile ci --features datafusion --test compound_queries --test joins_across_tables --test operators --test distinct_on --test per_cap --test one_evaluator --test sql_tables --test correlated --test query_memory --test plan_ir --test json_fields
+    STRATA_ENGINE=datafusion cargo test --profile ci --features datafusion --test compound_queries --test joins_across_tables --test operators --test distinct_on --test per_cap --test one_evaluator --test sql_tables --test correlated --test query_memory --test plan_ir --test json_fields --test json_columns
     cargo clippy --profile ci --features datafusion --all-targets -- $CLIPPY_LINTS
 }
 
