@@ -53,7 +53,7 @@ target/release/strata-server --demo 20000 --db products.strata   # a demo catalo
 | `--max-concurrent N` | 64 | queries running at once; more wait for a slot until their deadline |
 | `--max-result-window N` | 10000 | the most rows a query may reach, OFFSET included ([limits](#limits)); 0: no limit |
 | `--max-groups N` | 65536 | the most groups a GROUP BY may make ([limits](#limits)); 0: no limit |
-| `--max-rerank N` | 20 | the most rows a [cross-encoder](query-language.md#cross-encoders-cross_encodermodel-fields-query)'s rerank phase may score, on a database or a coordinator; 0: no limit |
+| `--max-rerank N` | 20 | the most rows a [cross-encoder](query-language.md#cross-encoders-cross_encodermodel-fields-query)'s rerank phase may score, on a database or a coordinator, whether the model runs here or is served elsewhere; 0: no limit |
 | `--query-memory-mb N` | a third of the cgroup memory limit, or of RAM | memory the running queries may hold together ([limits](#limits)); 0: no limit |
 | `--max-queued-writes N` | 1024 | write requests held at once; more are refused with 429 ([limits](#limits)); 0: no limit |
 | `--max-body-mb N` | 256 | the largest body of a write or an import, and of a gRPC message; other requests take up to 16 MiB |
@@ -206,6 +206,7 @@ The model can be computed here (the table below) or sit behind an API, such as `
 | `hash:N` | hashed bag of words, *N* dimensions | no files; tests and the demo |
 | `ms-marco-MiniLM-L-6-v2` | a [cross-encoder](query-language.md#cross-encoders-cross_encodermodel-fields-query) (BERT, 22M parameters, English), not an embedding model | build with `--features bert` |
 | `bge-reranker-base` | a cross-encoder (XLM-RoBERTa, 278M parameters, English and Chinese) | build with `--features bert`; larger and slower |
+| `cohere/rerank-v3.5`, `voyage/rerank-2.5`, `jina/jina-reranker-v2-base-multilingual` | cross-encoders served by Cohere, Voyage AI and Jina AI (any of their models by name), or a server of one's own named by `<models>/<name>/endpoint.json` (TEI, vLLM) | nothing to fetch; the key in `COHERE_API_KEY`, `VOYAGE_API_KEY` or `JINA_API_KEY` ([served elsewhere](query-language.md#cross-encoders-cross_encodermodel-fields-query)) |
 
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 

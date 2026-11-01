@@ -118,6 +118,50 @@ until the fixture is rewritten (`STRATA_RECSYS_GATE=update python gate.py
 --ratings ...`) and the pull request says why. Semantic IDs (generative
 retrieval) and a GBDT reranker are not in the gate yet.
 
+### A global time split
+
+Leave-one-out leaks the future: the sources learn from other users'
+ratings made after a user's test rating, and rank items that did not exist
+yet at its time, which every model Ji et al. tested exploits ("A Critical
+Study on Data Leakage in Recommender System Offline Evaluation", TOIS 2023).
+So the gate also runs a global time split
+([`strata/tests/fixtures/recsys_gate_time.json`](../../tests/fixtures/recsys_gate_time.json)):
+one cutoff for every user, the time by which 90% of the ratings were made
+(2000-12-29 23:43:34 UTC). The sources learn from the ratings before it
+only; the candidates are the 3,678 items rated before it, without the
+user's own; and each of the 1,178 users with ratings on both sides is
+asked for their first rating after it, given everything before (2 more
+users, whose next item was new, are left out). Its model,
+[`strata/tests/fixtures/recsys/ml1m-time`](../../tests/fixtures/recsys/ml1m-time),
+is trained the same way on the ratings before the cutoff only (`gate.py
+--protocol time --train 300 --epochs 70`: 70 epochs, 2 hours 35 minutes
+on the container while other work ran; the best epoch, 69, kept). Measured on
+the cloud container (Intel Xeon @ 2.10GHz, 4 cores), 2026-10-31, and a
+second run gave the same to every digit:
+
+| source | Recall@10 | @50 | @100 | NDCG@10 | coverage@10 | query p50 |
+|---|---|---|---|---|---|---|
+| popularity (baseline, Python) | 0.0586 | 0.1944 | 0.2869 | 0.0301 | 0.040 | |
+| item-kNN, 100 neighbours (baseline, Python) | 0.0484 | 0.1324 | 0.1935 | 0.0238 | 0.083 | |
+| `encode()`, the user's last 200 events with times | **0.1579** | **0.3447** | **0.4457** | **0.0850** | 0.204 | 4.0 ms |
+| `ppr()` over what came after what, seeded by the last 5 items | 0.0594 | 0.1511 | 0.2148 | 0.0293 | 0.362 | 59 ms |
+| `strata.next_items`, counts after the last two items | 0.0390 | 0.1231 | 0.1834 | 0.0198 | **0.550** | 3.9 ms |
+| `maxsim()` to the last 20 items' vectors | 0.0238 | 0.1095 | 0.1672 | 0.0100 | 0.355 | 2.7 ms |
+
+Every number is lower than under leave-one-out, as the leak predicts, and
+the order changes: the sequence model still ranks first, at 2.7 times
+popularity's Recall@10, but PageRank over the transitions now ties
+popularity (one user in 1,178 apart) and the counts fall below it.
+Popularity is the stronger baseline here and item-kNN the weaker, the
+reverse of leave-one-out. The counts
+and PageRank learned which item follows which from the same ratings in
+both protocols; under leave-one-out much of that was the test users' own
+future. A source is held to beating both baselines only when its
+Recall@10 does by more than the tolerance (`encode` here; `encode`,
+`ppr` and `next_items` under leave-one-out), so a tie does not fail the
+gate on one user. `python gate.py` checks both protocols, `--protocol
+loo` or `--protocol time` one.
+
 ## The model alone
 
 `strata-encode-bench` (`strata/src/bin/strata-encode-bench.rs`) runs a
@@ -146,5 +190,5 @@ python eval.py --data ml-1m --dir ~/data/seq/ml-1m --out . --max-minutes 95 --no
 python eval.py --data beauty --dir ~/data/seq/beauty --out . --max-len 50
 python eval.py --data beauty --dir ~/data/seq/beauty --out . --max-len 50 --no-time --tag=-no-time
 cargo run --release --bin strata-encode-bench -- <work>/models/ml1m
-python gate.py --ratings ~/data/seq/ml-1m/ratings.dat       # the CI gate (--train 60 retrains its model)
+python gate.py --ratings ~/data/seq/ml-1m/ratings.dat       # the CI gate, both protocols (--protocol time --train 300 --epochs 70 retrains the time split's model)
 ```

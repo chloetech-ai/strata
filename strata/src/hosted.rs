@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 #[cfg(feature = "hosted")]
 mod client;
 #[cfg(feature = "hosted")]
-pub use client::HostedEmbedder;
+pub use client::{HostedEmbedder, HostedReranker};
 
 /// Query texts whose vectors a model keeps.
 pub const QUERY_CACHE: usize = 4096;
@@ -103,16 +103,19 @@ struct Provider {
     concurrency: usize,
     /// The name of the parameter that asks for fewer dimensions.
     dim_param: &'static str,
+    /// Its cross-encoders' API, if it has one: the path under `base`, the
+    /// wire format, and the texts a request carries at most.
+    rerank: Option<(&'static str, RerankApi, usize)>,
 }
 
 const PROVIDERS: &[Provider] = &[
-    Provider { prefix: "openai", api: Api::OpenAi, base: "https://api.openai.com/v1", base_env: "OPENAI_BASE_URL", keys: &["OPENAI_API_KEY"], key_header: "authorization", batch: 256, batch_chars: 400_000, max_chars: 24_000, concurrency: 4, dim_param: "dimensions" },
-    Provider { prefix: "cohere", api: Api::Cohere, base: "https://api.cohere.com", base_env: "COHERE_BASE_URL", keys: &["COHERE_API_KEY", "CO_API_KEY"], key_header: "authorization", batch: 96, batch_chars: usize::MAX, max_chars: usize::MAX, concurrency: 4, dim_param: "output_dimension" },
-    Provider { prefix: "voyage", api: Api::Voyage, base: "https://api.voyageai.com/v1", base_env: "VOYAGE_BASE_URL", keys: &["VOYAGE_API_KEY"], key_header: "authorization", batch: 128, batch_chars: 300_000, max_chars: usize::MAX, concurrency: 4, dim_param: "output_dimension" },
-    Provider { prefix: "gemini", api: Api::Gemini, base: "https://generativelanguage.googleapis.com/v1beta", base_env: "GEMINI_BASE_URL", keys: &["GEMINI_API_KEY", "GOOGLE_API_KEY"], key_header: "x-goog-api-key", batch: 100, batch_chars: usize::MAX, max_chars: 8_000, concurrency: 4, dim_param: "outputDimensionality" },
-    Provider { prefix: "mistral", api: Api::OpenAi, base: "https://api.mistral.ai/v1", base_env: "MISTRAL_BASE_URL", keys: &["MISTRAL_API_KEY"], key_header: "authorization", batch: 64, batch_chars: 32_000, max_chars: 24_000, concurrency: 4, dim_param: "output_dimension" },
-    Provider { prefix: "jina", api: Api::Jina, base: "https://api.jina.ai/v1", base_env: "JINA_BASE_URL", keys: &["JINA_API_KEY"], key_header: "authorization", batch: 128, batch_chars: 400_000, max_chars: usize::MAX, concurrency: 4, dim_param: "dimensions" },
-    Provider { prefix: "ollama", api: Api::Ollama, base: "http://localhost:11434", base_env: "OLLAMA_HOST", keys: &[], key_header: "authorization", batch: 32, batch_chars: usize::MAX, max_chars: usize::MAX, concurrency: 2, dim_param: "dimensions" },
+    Provider { prefix: "openai", api: Api::OpenAi, base: "https://api.openai.com/v1", base_env: "OPENAI_BASE_URL", keys: &["OPENAI_API_KEY"], key_header: "authorization", batch: 256, batch_chars: 400_000, max_chars: 24_000, concurrency: 4, dim_param: "dimensions", rerank: None },
+    Provider { prefix: "cohere", api: Api::Cohere, base: "https://api.cohere.com", base_env: "COHERE_BASE_URL", keys: &["COHERE_API_KEY", "CO_API_KEY"], key_header: "authorization", batch: 96, batch_chars: usize::MAX, max_chars: usize::MAX, concurrency: 4, dim_param: "output_dimension", rerank: Some(("/v2/rerank", RerankApi::Cohere, 1000)) },
+    Provider { prefix: "voyage", api: Api::Voyage, base: "https://api.voyageai.com/v1", base_env: "VOYAGE_BASE_URL", keys: &["VOYAGE_API_KEY"], key_header: "authorization", batch: 128, batch_chars: 300_000, max_chars: usize::MAX, concurrency: 4, dim_param: "output_dimension", rerank: Some(("/rerank", RerankApi::Voyage, 1000)) },
+    Provider { prefix: "gemini", api: Api::Gemini, base: "https://generativelanguage.googleapis.com/v1beta", base_env: "GEMINI_BASE_URL", keys: &["GEMINI_API_KEY", "GOOGLE_API_KEY"], key_header: "x-goog-api-key", batch: 100, batch_chars: usize::MAX, max_chars: 8_000, concurrency: 4, dim_param: "outputDimensionality", rerank: None },
+    Provider { prefix: "mistral", api: Api::OpenAi, base: "https://api.mistral.ai/v1", base_env: "MISTRAL_BASE_URL", keys: &["MISTRAL_API_KEY"], key_header: "authorization", batch: 64, batch_chars: 32_000, max_chars: 24_000, concurrency: 4, dim_param: "output_dimension", rerank: None },
+    Provider { prefix: "jina", api: Api::Jina, base: "https://api.jina.ai/v1", base_env: "JINA_BASE_URL", keys: &["JINA_API_KEY"], key_header: "authorization", batch: 128, batch_chars: 400_000, max_chars: usize::MAX, concurrency: 4, dim_param: "dimensions", rerank: Some(("/rerank", RerankApi::Jina, 1000)) },
+    Provider { prefix: "ollama", api: Api::Ollama, base: "http://localhost:11434", base_env: "OLLAMA_HOST", keys: &[], key_header: "authorization", batch: 32, batch_chars: usize::MAX, max_chars: usize::MAX, concurrency: 2, dim_param: "dimensions", rerank: None },
 ];
 
 /// What Strata knows of a hosted model: its dimensions, whether it makes
@@ -240,83 +243,30 @@ impl Endpoint {
     /// to ask for a field's fewer dimensions), `batch`, `batch_chars`,
     /// `max_chars`, `concurrency`, `retries` and `timeout_s`.
     pub fn from_config(name: &str, config: Option<&J>, env: &dyn Fn(&str) -> Option<String>) -> Result<Endpoint> {
-        let bad = |m: String| Error::Schema(format!("model {name}: {m}"));
         let empty = J::Object(Default::default());
-        let c = config.unwrap_or(&empty);
-        if !c.is_object() {
-            return Err(bad("endpoint.json is not an object".into()));
-        }
-        let known_keys = ["api", "url", "base_url", "model", "dim", "key_env", "key_header", "headers", "document_prefix", "query_prefix", "dimensions", "batch", "batch_chars", "max_chars", "concurrency", "retries", "timeout_s"];
-        if let Some(k) = c.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known_keys.contains(&k.as_str())) {
-            return Err(bad(format!("endpoint.json: unknown key {k:?} (one of {})", known_keys.join(", "))));
-        }
-        let text = |k: &str| -> Result<Option<String>> {
-            match c.get(k) {
-                None | Some(J::Null) => Ok(None),
-                Some(J::String(s)) => Ok(Some(s.clone())),
-                Some(_) => Err(bad(format!("endpoint.json: {k} is a string"))),
-            }
-        };
-        let count = |k: &str| -> Result<Option<usize>> {
-            match c.get(k) {
-                None | Some(J::Null) => Ok(None),
-                Some(v) => v.as_u64().filter(|&n| n > 0).map(|n| Some(n as usize)).ok_or_else(|| bad(format!("endpoint.json: {k} is a positive number"))),
-            }
-        };
+        let c = Conf { name, c: config.unwrap_or(&empty) };
+        c.check(&["api", "url", "base_url", "model", "dim", "key_env", "key_header", "headers", "document_prefix", "query_prefix", "dimensions", "batch", "batch_chars", "max_chars", "concurrency", "retries", "timeout_s"])?;
         let prov = provider(name);
-        let api = match text("api")? {
-            Some(a) => Api::parse(&a).ok_or_else(|| bad(format!("endpoint.json: api {a:?} is one of openai, cohere, voyage, gemini, jina, ollama")))?,
-            None => prov.map(|(p, _)| p.api).ok_or_else(|| bad("endpoint.json needs \"api\" (openai, cohere, voyage, gemini, jina or ollama), as the name has no provider's prefix".into()))?,
+        let api = match c.text("api")? {
+            Some(a) => Api::parse(&a).ok_or_else(|| c.bad(format!("endpoint.json: api {a:?} is one of openai, cohere, voyage, gemini, jina, ollama")))?,
+            None => prov.map(|(p, _)| p.api).ok_or_else(|| c.bad("endpoint.json needs \"api\" (openai, cohere, voyage, gemini, jina or ollama), as the name has no provider's prefix".into()))?,
         };
         // A provider's defaults, or those of the API's own provider.
         let p = prov.map(|(p, _)| p).unwrap_or_else(|| PROVIDERS.iter().find(|p| p.api == api).expect("every API has a provider"));
-        let model = match text("model")? {
-            Some(m) => m,
-            None => match prov {
-                Some((_, m)) => m.to_string(),
-                None => name.rsplit('/').next().unwrap_or(name).to_string(),
-            },
-        };
-        let path = |m: &str| match api {
+        let model = c.model(prov)?;
+        let path = match api {
             Api::OpenAi | Api::Voyage | Api::Jina => "/embeddings".to_string(),
             Api::Cohere => "/v2/embed".to_string(),
-            Api::Gemini => format!("/models/{m}:batchEmbedContents"),
+            Api::Gemini => format!("/models/{model}:batchEmbedContents"),
             Api::Ollama => "/api/embed".to_string(),
         };
-        let env_base = env(p.base_env).filter(|b| !b.trim().is_empty()).map(|b| base_url(&b));
-        let (url, own_server) = match (text("url")?, text("base_url")?) {
-            (Some(u), _) => (u, true),
-            (None, Some(b)) => (format!("{}{}", base_url(&b), path(&model)), true),
-            (None, None) => match env_base {
-                Some(b) => (format!("{b}{}", path(&model)), true),
-                None => (format!("{}{}", p.base, path(&model)), false),
-            },
-        };
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err(bad(format!("{url} is not an http: or https: URL")));
-        }
-        let (key, key_from) = match text("key_env")? {
-            Some(var) => (env(&var).filter(|k| !k.is_empty()), format!("${var}")),
-            None => (p.keys.iter().find_map(|v| env(v).filter(|k| !k.is_empty())), p.keys.iter().map(|k| format!("${k}")).collect::<Vec<_>>().join(" or ")),
-        };
-        // A provider's own service needs its secret; a server of its API
-        // named by URL may take none.
-        if key.is_none() && !p.keys.is_empty() && !own_server {
-            return Err(bad(format!("set {key_from} to the provider's API key (or {} for a server of its API that takes none)", p.base_env)));
-        }
-        if key.is_none() && text("key_env")?.is_some() {
-            return Err(bad(format!("{key_from} is not set")));
-        }
+        let (url, own_server) = c.url(Some(p), &path, env)?;
+        let (key, key_from) = c.key(Some(p), own_server, env)?;
         let k = known_model(name).or_else(|| known_model(&format!("{}/{model}", p.prefix)));
-        let headers = match c.get("headers") {
-            None | Some(J::Null) => Vec::new(),
-            Some(J::Object(o)) => o.iter().map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())).ok_or_else(|| bad(format!("endpoint.json: header {k} is a string")))).collect::<Result<_>>()?,
-            Some(_) => return Err(bad("endpoint.json: headers is an object of strings".into())),
-        };
-        let shortens = match c.get("dimensions") {
+        let shortens = match c.c.get("dimensions") {
             None | Some(J::Null) => k.is_some_and(|k| k.shortens),
             Some(J::Bool(b)) => *b,
-            Some(_) => return Err(bad("endpoint.json: dimensions is true or false".into())),
+            Some(_) => return Err(c.bad("endpoint.json: dimensions is true or false".into())),
         };
         Ok(Endpoint {
             name: name.to_string(),
@@ -324,24 +274,255 @@ impl Endpoint {
             url,
             model,
             key,
-            key_header: text("key_header")?.unwrap_or_else(|| p.key_header.to_string()).to_ascii_lowercase(),
+            key_header: c.text("key_header")?.unwrap_or_else(|| p.key_header.to_string()).to_ascii_lowercase(),
             key_from,
-            native_dim: count("dim")?.or(k.map(|k| k.dim)),
+            native_dim: c.count("dim")?.or(k.map(|k| k.dim)),
             shortens,
             dim_param: p.dim_param.to_string(),
-            document_prefix: text("document_prefix")?.unwrap_or_else(|| k.map_or("", |k| k.document_prefix).to_string()),
-            query_prefix: text("query_prefix")?.unwrap_or_else(|| k.map_or("", |k| k.query_prefix).to_string()),
-            batch: count("batch")?.unwrap_or(p.batch),
-            batch_chars: count("batch_chars")?.unwrap_or(p.batch_chars),
-            max_chars: count("max_chars")?.unwrap_or(p.max_chars),
-            concurrency: count("concurrency")?.unwrap_or(p.concurrency),
-            retries: match c.get("retries") {
-                None | Some(J::Null) => 6,
-                Some(v) => v.as_u64().ok_or_else(|| bad("endpoint.json: retries is a number".into()))? as u32,
-            },
-            timeout: Duration::from_secs(count("timeout_s")?.unwrap_or(60) as u64),
-            headers,
+            document_prefix: c.text("document_prefix")?.unwrap_or_else(|| k.map_or("", |k| k.document_prefix).to_string()),
+            query_prefix: c.text("query_prefix")?.unwrap_or_else(|| k.map_or("", |k| k.query_prefix).to_string()),
+            batch: c.count("batch")?.unwrap_or(p.batch),
+            batch_chars: c.count("batch_chars")?.unwrap_or(p.batch_chars),
+            max_chars: c.count("max_chars")?.unwrap_or(p.max_chars),
+            concurrency: c.count("concurrency")?.unwrap_or(p.concurrency),
+            retries: c.retries()?,
+            timeout: Duration::from_secs(c.count("timeout_s")?.unwrap_or(60) as u64),
+            headers: c.headers()?,
         })
+    }
+}
+
+/// The wire format of a hosted cross-encoder's API ([`RerankEndpoint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RerankApi {
+    /// `{"model", "query", "documents": [..]}`, answered with
+    /// `{"results": [{"index", "relevance_score"}]}`: Cohere's
+    /// `POST /v2/rerank`, and the `/rerank` of vLLM, Infinity and LiteLLM.
+    Cohere,
+    /// Jina AI's `POST /v1/rerank`: Cohere's shape, asked not to send the
+    /// texts back.
+    Jina,
+    /// Voyage AI's `POST /v1/rerank`, answered with
+    /// `{"data": [{"index", "relevance_score"}]}`.
+    Voyage,
+    /// Hugging Face Text Embeddings Inference's `POST /rerank`, with
+    /// `{"query", "texts", "raw_scores": true, "truncate": true}`,
+    /// answered with `[{"index", "score"}]`: the model's logit, as a
+    /// cross-encoder run here gives it.
+    Tei,
+}
+
+impl RerankApi {
+    pub fn parse(s: &str) -> Option<RerankApi> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "cohere" | "vllm" | "infinity" | "litellm" => RerankApi::Cohere,
+            "jina" => RerankApi::Jina,
+            "voyage" => RerankApi::Voyage,
+            "tei" => RerankApi::Tei,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether `name` is a hosted cross-encoder's by its prefix (`cohere/...`,
+/// `voyage/...`, `jina/...`).
+pub fn is_reranker_name(name: &str) -> bool {
+    provider(name).is_some_and(|(p, _)| p.rerank.is_some())
+}
+
+/// Where and how a hosted cross-encoder is called: one of a provider's, as
+/// `cohere/rerank-v3.5`, `voyage/rerank-2.5` or
+/// `jina/jina-reranker-v2-base-multilingual`, or a server of one of their
+/// APIs or of TEI's that a model directory's `endpoint.json` names (a GPU
+/// serving a model too slow for a CPU).
+#[derive(Clone)]
+pub struct RerankEndpoint {
+    pub name: String,
+    pub api: RerankApi,
+    pub url: String,
+    pub model: String,
+    pub key: Option<String>,
+    pub key_header: String,
+    pub key_from: String,
+    /// Texts a request carries at most.
+    pub batch: usize,
+    /// Characters of a text sent at most.
+    pub max_chars: usize,
+    pub concurrency: usize,
+    /// Tries after the first, on a rate limit or a server's failure.
+    pub retries: u32,
+    pub timeout: Duration,
+    pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for RerankEndpoint {
+    /// Everything but the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankEndpoint").field("name", &self.name).field("api", &self.api).field("url", &self.url).field("model", &self.model).field("key", &self.key.as_ref().map(|_| "<set>")).field("batch", &self.batch).finish_non_exhaustive()
+    }
+}
+
+impl RerankEndpoint {
+    /// The endpoint of the cross-encoder a query names `name`, as
+    /// [`Endpoint::from_config`] reads an embedding model's: `endpoint.json`
+    /// may give `api` (`cohere`, `jina`, `voyage`, or a server's: `vllm`,
+    /// `infinity` and `litellm` take Cohere's shape at `/rerank`, `tei`
+    /// TEI's; needed when the name has no provider's prefix), `url` or
+    /// `base_url` (a server's needs one), `model`, `key_env`,
+    /// `key_header`, `headers`, `batch`, `max_chars`, `concurrency`,
+    /// `retries` and `timeout_s`. A query waits on it, so the default
+    /// timeout is 10 s and a failed request is tried twice more.
+    pub fn from_config(name: &str, config: Option<&J>, env: &dyn Fn(&str) -> Option<String>) -> Result<RerankEndpoint> {
+        let empty = J::Object(Default::default());
+        let c = Conf { name, c: config.unwrap_or(&empty) };
+        c.check(&["api", "url", "base_url", "model", "key_env", "key_header", "headers", "batch", "max_chars", "concurrency", "retries", "timeout_s"])?;
+        let prov = provider(name).filter(|(p, _)| p.rerank.is_some());
+        let (api, p) = match c.text("api")? {
+            Some(a) => {
+                let api = RerankApi::parse(&a).ok_or_else(|| c.bad(format!("endpoint.json: api {a:?} is one of cohere, jina, voyage, vllm, infinity, litellm, tei")))?;
+                // The defaults of the name's provider, or of the provider
+                // the API is named for; none for a server's own (vLLM,
+                // Infinity, LiteLLM, TEI).
+                let p = prov.map(|(p, _)| p).filter(|p| p.rerank.is_some_and(|r| r.1 == api)).or_else(|| PROVIDERS.iter().find(|p| p.prefix.eq_ignore_ascii_case(&a) && p.rerank.is_some()));
+                (api, p)
+            }
+            None => match prov {
+                Some((p, _)) => (p.rerank.expect("a reranking provider").1, Some(p)),
+                None => return Err(c.bad("endpoint.json needs \"api\" (cohere, jina, voyage, vllm, infinity, litellm or tei), as the name has no reranking provider's prefix".into())),
+            },
+        };
+        let model = c.model(prov)?;
+        let (path, batch) = match p.and_then(|p| p.rerank) {
+            Some((path, _, batch)) => (path, batch),
+            None => ("/rerank", 32),
+        };
+        let (url, own_server) = c.url(p, path, env)?;
+        let (key, key_from) = c.key(p, own_server, env)?;
+        Ok(RerankEndpoint {
+            name: name.to_string(),
+            api,
+            url,
+            model,
+            key,
+            key_header: c.text("key_header")?.unwrap_or_else(|| p.map_or("authorization", |p| p.key_header).to_string()).to_ascii_lowercase(),
+            key_from,
+            batch: c.count("batch")?.unwrap_or(batch),
+            max_chars: c.count("max_chars")?.unwrap_or(usize::MAX),
+            concurrency: c.count("concurrency")?.unwrap_or(4),
+            retries: match c.c.get("retries") {
+                None | Some(J::Null) => 2,
+                Some(_) => c.retries()?,
+            },
+            timeout: Duration::from_secs(c.count("timeout_s")?.unwrap_or(10) as u64),
+            headers: c.headers()?,
+        })
+    }
+}
+
+/// An `endpoint.json` being read, its errors naming the model.
+struct Conf<'a> {
+    name: &'a str,
+    c: &'a J,
+}
+
+impl Conf<'_> {
+    fn bad(&self, m: String) -> Error {
+        Error::Schema(format!("model {}: {m}", self.name))
+    }
+
+    /// Refuses a file that is not an object of `known` keys.
+    fn check(&self, known: &[&str]) -> Result<()> {
+        if !self.c.is_object() {
+            return Err(self.bad("endpoint.json is not an object".into()));
+        }
+        if let Some(k) = self.c.as_object().into_iter().flat_map(|o| o.keys()).find(|k| !known.contains(&k.as_str())) {
+            return Err(self.bad(format!("endpoint.json: unknown key {k:?} (one of {})", known.join(", "))));
+        }
+        Ok(())
+    }
+
+    fn text(&self, k: &str) -> Result<Option<String>> {
+        match self.c.get(k) {
+            None | Some(J::Null) => Ok(None),
+            Some(J::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(self.bad(format!("endpoint.json: {k} is a string"))),
+        }
+    }
+
+    fn count(&self, k: &str) -> Result<Option<usize>> {
+        match self.c.get(k) {
+            None | Some(J::Null) => Ok(None),
+            Some(v) => v.as_u64().filter(|&n| n > 0).map(|n| Some(n as usize)).ok_or_else(|| self.bad(format!("endpoint.json: {k} is a positive number"))),
+        }
+    }
+
+    fn retries(&self) -> Result<u32> {
+        match self.c.get("retries") {
+            None | Some(J::Null) => Ok(6),
+            Some(v) => Ok(v.as_u64().ok_or_else(|| self.bad("endpoint.json: retries is a number".into()))? as u32),
+        }
+    }
+
+    fn headers(&self) -> Result<Vec<(String, String)>> {
+        match self.c.get("headers") {
+            None | Some(J::Null) => Ok(Vec::new()),
+            Some(J::Object(o)) => o.iter().map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())).ok_or_else(|| self.bad(format!("endpoint.json: header {k} is a string")))).collect(),
+            Some(_) => Err(self.bad("endpoint.json: headers is an object of strings".into())),
+        }
+    }
+
+    /// The API's name of the model: `model`, else the name without the
+    /// provider's prefix, else its last part.
+    fn model(&self, prov: Option<(&Provider, &str)>) -> Result<String> {
+        Ok(match self.text("model")? {
+            Some(m) => m,
+            None => match prov {
+                Some((_, m)) => m.to_string(),
+                None => self.name.rsplit('/').next().unwrap_or(self.name).to_string(),
+            },
+        })
+    }
+
+    /// The URL requests go to, and whether it is a server of the API's
+    /// rather than the provider's own service: `url`, else `base_url` or
+    /// the provider's base URL variable with `path` added, else the
+    /// provider's service. Without a provider, `url` or `base_url` is
+    /// needed.
+    fn url(&self, p: Option<&Provider>, path: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<(String, bool)> {
+        let env_base = p.and_then(|p| env(p.base_env)).filter(|b| !b.trim().is_empty()).map(|b| base_url(&b));
+        let (url, own) = match (self.text("url")?, self.text("base_url")?) {
+            (Some(u), _) => (u, true),
+            (None, Some(b)) => (format!("{}{path}", base_url(&b)), true),
+            (None, None) => match (env_base, p) {
+                (Some(b), _) => (format!("{b}{path}"), true),
+                (None, Some(p)) => (format!("{}{path}", p.base), false),
+                (None, None) => return Err(self.bad("endpoint.json needs \"url\" (or \"base_url\"): where the server listens".into())),
+            },
+        };
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(self.bad(format!("{url} is not an http: or https: URL")));
+        }
+        Ok((url, own))
+    }
+
+    /// The secret and where it was looked for: `key_env`, else the
+    /// provider's variables. A provider's own service needs its secret; a
+    /// server of its API named by URL may take none.
+    fn key(&self, p: Option<&Provider>, own_server: bool, env: &dyn Fn(&str) -> Option<String>) -> Result<(Option<String>, String)> {
+        let keys = p.map_or(&[][..], |p| p.keys);
+        let (key, key_from) = match self.text("key_env")? {
+            Some(var) => (env(&var).filter(|k| !k.is_empty()), format!("${var}")),
+            None => (keys.iter().find_map(|v| env(v).filter(|k| !k.is_empty())), keys.iter().map(|k| format!("${k}")).collect::<Vec<_>>().join(" or ")),
+        };
+        if let (None, Some(p), false) = (&key, p, own_server) {
+            if !p.keys.is_empty() {
+                return Err(self.bad(format!("set {key_from} to the provider's API key (or {} for a server of its API that takes none)", p.base_env)));
+            }
+        }
+        if key.is_none() && self.text("key_env")?.is_some() {
+            return Err(self.bad(format!("{key_from} is not set")));
+        }
+        Ok((key, key_from))
     }
 }
 
@@ -409,4 +590,51 @@ mod tests {
         let e = Endpoint::from_config("custom", Some(&c), &env(&[("K", "sekrit")])).unwrap();
         assert!(!format!("{e:?}").contains("sekrit"));
     }
+
+    #[test]
+    fn rerankers_by_prefix_and_by_file() {
+        let e = RerankEndpoint::from_config("cohere/rerank-v3.5", None, &env(&[("CO_API_KEY", "c")])).unwrap();
+        assert_eq!((e.api, e.url.as_str(), e.model.as_str(), e.key.as_deref(), e.batch), (RerankApi::Cohere, "https://api.cohere.com/v2/rerank", "rerank-v3.5", Some("c"), 1000));
+        let e = RerankEndpoint::from_config("voyage/rerank-2.5", None, &env(&[("VOYAGE_API_KEY", "v")])).unwrap();
+        assert_eq!((e.api, e.url.as_str(), e.timeout, e.retries), (RerankApi::Voyage, "https://api.voyageai.com/v1/rerank", Duration::from_secs(10), 2));
+        let e = RerankEndpoint::from_config("jina/jina-reranker-v2-base-multilingual", None, &env(&[("JINA_API_KEY", "j")])).unwrap();
+        assert_eq!((e.api, e.url.as_str(), e.model.as_str()), (RerankApi::Jina, "https://api.jina.ai/v1/rerank", "jina-reranker-v2-base-multilingual"));
+        assert!(is_reranker_name("cohere/rerank-v3.5") && is_reranker_name("Voyage/rerank-2"));
+        assert!(!is_reranker_name("openai/text-embedding-3-small") && !is_reranker_name("ms-marco-MiniLM-L-6-v2") && !is_reranker_name("cohere/"));
+        let e = RerankEndpoint::from_config("voyage/rerank-2.5", None, &env(&[])).unwrap_err().to_string();
+        assert!(e.contains("$VOYAGE_API_KEY") && e.contains("VOYAGE_BASE_URL"), "{e}");
+        // A provider's base URL variable names a server of its API.
+        let e = RerankEndpoint::from_config("cohere/rerank-v3.5", None, &env(&[("COHERE_BASE_URL", "http://proxy:4000/")])).unwrap();
+        assert_eq!((e.url.as_str(), e.key.as_deref()), ("http://proxy:4000/v2/rerank", None));
+    }
+
+    #[test]
+    fn reranking_servers_of_ones_own() {
+        // TEI on a GPU: no provider's key goes to it, and requests carry
+        // TEI's default batch.
+        let c = json!({"api": "tei", "url": "http://gpu:8080/rerank"});
+        let e = RerankEndpoint::from_config("bge-reranker-v2-m3", Some(&c), &env(&[("COHERE_API_KEY", "c")])).unwrap();
+        assert_eq!((e.api, e.url.as_str(), e.key.as_deref(), e.batch, e.model.as_str()), (RerankApi::Tei, "http://gpu:8080/rerank", None, 32, "bge-reranker-v2-m3"));
+        let c = json!({"api": "tei", "base_url": "http://gpu:8080/", "key_env": "TEI_KEY", "batch": 64, "timeout_s": 3});
+        let e = RerankEndpoint::from_config("team/bge", Some(&c), &env(&[("TEI_KEY", "t")])).unwrap();
+        assert_eq!((e.url.as_str(), e.key.as_deref(), e.batch, e.timeout, e.model.as_str()), ("http://gpu:8080/rerank", Some("t"), 64, Duration::from_secs(3), "bge"));
+        assert!(!format!("{e:?}").contains("\"t\""));
+        let c = json!({"api": "tei"});
+        assert!(RerankEndpoint::from_config("bge", Some(&c), &env(&[])).unwrap_err().to_string().contains("needs \"url\""));
+        // vLLM, Infinity and LiteLLM answer in Cohere's shape at /rerank.
+        let c = json!({"api": "vllm", "base_url": "http://gpu:8000", "model": "BAAI/bge-reranker-v2-m3"});
+        let e = RerankEndpoint::from_config("bge-m3", Some(&c), &env(&[])).unwrap();
+        assert_eq!((e.api, e.url.as_str(), e.model.as_str(), e.key), (RerankApi::Cohere, "http://gpu:8000/rerank", "BAAI/bge-reranker-v2-m3", None));
+        // Cohere's API by name takes its defaults, and its key.
+        let c = json!({"api": "cohere", "model": "rerank-v3.5"});
+        let e = RerankEndpoint::from_config("ours", Some(&c), &env(&[("COHERE_API_KEY", "c")])).unwrap();
+        assert_eq!((e.url.as_str(), e.key.as_deref()), ("https://api.cohere.com/v2/rerank", Some("c")));
+        let c = json!({"url": "http://gpu/rerank"});
+        assert!(RerankEndpoint::from_config("ours", Some(&c), &env(&[])).unwrap_err().to_string().contains("needs \"api\""));
+        let c = json!({"api": "openai", "url": "http://gpu/rerank"});
+        assert!(RerankEndpoint::from_config("ours", Some(&c), &env(&[])).unwrap_err().to_string().contains("is one of cohere"));
+        let c = json!({"api": "tei", "url": "http://gpu/rerank", "dim": 3});
+        assert!(RerankEndpoint::from_config("ours", Some(&c), &env(&[])).unwrap_err().to_string().contains("unknown key \"dim\""));
+    }
+
 }
