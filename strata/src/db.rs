@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
 use crate::media::{Media, Resolver};
 use crate::query::agg::Part;
-use crate::query::exec::{ExecOptions, ExecStats, Executor, ResultSet, SegmentReaders};
+use crate::query::exec::{ExecOptions, ExecStats, Executor, Leaf, ResultSet, SegmentReaders};
 use crate::query::ir::eval::{self, Ref};
 use crate::query::ir::Plan;
 use crate::query::model::Models;
@@ -1056,6 +1056,32 @@ impl Db {
     /// reads its own table and may hold up to
     /// [`crate::query::compound::MAX_ROWS`] rows.
     fn run_on(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions) -> Result<ResultSet> {
+        match self.run_leaf_on(snap, plan, opts, None)? {
+            Leaf::Rows(rs) => Ok(rs),
+            #[cfg(feature = "datafusion")]
+            Leaf::Arrow(_) => unreachable!("rows asked for"),
+        }
+    }
+
+    /// [`Db::query`], its answer as Arrow columns where the executor makes
+    /// them (feature `datafusion`): a query of one table, that neither
+    /// groups nor counts, has its rows' columns read from its segments into
+    /// Arrow arrays ([`Leaf::Arrow`], [`Db::execute_leaf`]) without being
+    /// made rows first. Any other answer is its rows ([`Leaf::Rows`]).
+    #[cfg(feature = "datafusion")]
+    pub fn query_leaf(&self, sql: &str, params: &Params) -> Result<Leaf> {
+        let snap = self.snapshot();
+        if let Some(call) = crate::query::paths::Call::of_sql(sql)? {
+            return self.json_paths_at(&snap, &call, params, &self.exec).map(|p| Leaf::Rows(p.to_result()));
+        }
+        let q = qsql::parse_query(sql)?;
+        let plan = plan_of(&snap, &q, params)?;
+        self.run_leaf_on(&snap, &plan, &self.exec, Some(0))
+    }
+
+    /// [`Db::run_on`], a plan of one table's rows as Arrow columns when
+    /// there are more than `arrow` of them.
+    fn run_leaf_on(&self, snap: &Snapshot, plan: &Plan, opts: &ExecOptions, arrow: Option<usize>) -> Result<Leaf> {
         profile::check_plan(plan, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).map(|p| p.hash())))?;
         let opened;
         let plan = match plan.root.has_models() {
@@ -1070,7 +1096,11 @@ impl Db {
         let view_of = |table: &str| snap.table(table).ok_or_else(|| Error::Query(format!("no such table: {table}")));
         if !plan.root.uses_operators() {
             let view = view_of(plan.table())?;
-            return self.execute(&view, &plan.to_select(view.schema())?, opts);
+            let select = plan.to_select(view.schema())?;
+            return match arrow {
+                Some(over) => self.execute_leaf(&view, &select, opts, over),
+                None => self.execute(&view, &select, opts).map(Leaf::Rows),
+            };
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
         let catalog: Vec<&Schema> = snap.schemas().collect();
@@ -1082,7 +1112,7 @@ impl Db {
         if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
             return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
         }
-        Ok(rs)
+        Ok(Leaf::Rows(rs))
     }
 
     /// Runs a plan ([`crate::query::ir`]) on the table it names: a read
@@ -1420,15 +1450,14 @@ impl Db {
     /// [`Db::execute`] of a compound query's leaf (without the feature
     /// `datafusion`, its rows).
     #[cfg(not(feature = "datafusion"))]
-    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, _over: usize) -> Result<crate::query::exec::Leaf> {
-        self.execute(snap, select, opts).map(crate::query::exec::Leaf::Rows)
+    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, _over: usize) -> Result<Leaf> {
+        self.execute(snap, select, opts).map(Leaf::Rows)
     }
 
     /// [`Db::execute`] for DataFusion: the rows as Arrow columns when there
     /// are more than `over` ([`Executor::execute_arrow`]).
     #[cfg(feature = "datafusion")]
-    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, over: usize) -> Result<crate::query::exec::Leaf> {
-        use crate::query::exec::Leaf;
+    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, over: usize) -> Result<Leaf> {
         crate::query::steps::epoch();
         let t0 = std::time::Instant::now();
         let readers = self.readers(snap)?;

@@ -115,6 +115,29 @@ The answer is a `Result`:
 | `result.stats` | what the engine did |
 | `result.to_pandas()` | a DataFrame (with pandas installed) |
 
+`query_arrow(sql, params)` runs a `SELECT` as `query` does and answers with its columns as Arrow arrays, an `ArrowResult`, without making a Python object of each value; a query of one table that neither groups nor counts reads its columns from the database's segments straight into the arrays. pyarrow, polars, pandas and DuckDB read the arrays where the database wrote them, without copying them, through the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html):
+
+```python
+r = db.query_arrow("SELECT id, year, rating FROM books WHERE year >= :y", y=1950)
+r.to_pyarrow()            # a pyarrow Table
+r.to_polars()             # a polars DataFrame (without pyarrow)
+r.to_pandas()             # a pandas DataFrame of the Arrow columns (pandas.ArrowDtype); arrow_dtypes=False copies them into numpy
+pyarrow.table(r)          # any library that reads Arrow streams reads r
+duckdb.sql("SELECT avg(rating) FROM r")
+```
+
+| Strata | Arrow |
+|---|---|
+| `int` | `int64` |
+| `float` | `float64` |
+| `keyword`, `text`, `json` | `string` (a JSON value as its text) |
+| `bool` | `bool` |
+| `timestamp` | `timestamp[us, tz=UTC]` |
+| `vector` | `list<float32>` |
+| a `multi` field | `list<int64>` or `list<string>` |
+
+A computed column has the type of its values: a column of only NULLs (or of no rows) is `null`, and one of integers and floats `float64`. Values of other types mixed in one column (a `CASE` that answers a number in some rows and text in others) are not one Arrow array: `query_arrow` raises `StrataError` naming the column, and `query` answers it. `r.columns`, `len(r)` and `r.stats` are as a `Result`'s. `query_arrow` comes with the package's default feature `datafusion`; `Client` has none, as a server answers in JSON.
+
 `search(text, limit=10, where=None, columns="*", mode="auto")` writes the query for the common case. It ranks by BM25 over the text fields (the generated ones if the table has any, such as a combined `body`, else every indexed text field) fused by reciprocal rank with the similarity of the first embedded vector field whose model is open; `mode="text"` or `"vector"` uses one side only. `where` adds a condition, [built in Python](#queries-built-in-python) or in SQL with `params` for its placeholders:
 
 ```python

@@ -448,6 +448,23 @@ fn a_leaf_s_arrow_columns_hold_what_its_rows_hold() {
         // Over as many rows as it has, the leaf gives rows.
         assert!(matches!(db.execute_leaf(&view, &select, &db.exec, rs.rows.len()).unwrap(), Leaf::Rows(_)), "{sql}");
     }
+
+    // Db::query_leaf answers a query of one table with Arrow columns, and
+    // a grouped query or a join with its rows, as Db::query answers them.
+    for sql in queries {
+        let rs = db.query(sql, &none).unwrap();
+        let Leaf::Arrow(c) = db.query_leaf(sql, &none).unwrap() else { panic!("{sql}: rows, not Arrow columns") };
+        assert_eq!((&c.names, c.rows), (&rs.columns, rs.rows.len()), "{sql}");
+        let want = arrow::columns_of(rs.rows, rs.columns.len()).unwrap();
+        for (i, (w, g)) in want.iter().zip(&c.arrays).enumerate() {
+            assert_eq!(w.to_data(), g.to_data(), "{sql}: column {}", rs.columns[i]);
+        }
+    }
+    for sql in ["SELECT k, COUNT(*) FROM t GROUP BY k", "SELECT a.id, b.id FROM t a JOIN t b ON a.k = b.k WHERE a.n = 3 AND b.n = 4"] {
+        let Leaf::Rows(rs) = db.query_leaf(sql, &none).unwrap() else { panic!("{sql}: Arrow columns, not rows") };
+        assert!(!rs.rows.is_empty(), "{sql}");
+        assert_eq!(rs.rows, db.query(sql, &none).unwrap().rows, "{sql}");
+    }
 }
 
 // Multi-valued INT and KEYWORD columns, with empty lists, NULLs, a value
