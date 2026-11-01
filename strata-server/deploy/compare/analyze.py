@@ -3,17 +3,21 @@
 
     python3 analyze.py REPORTS_DIR BEIR_DIR/quora > tables.md
 
-Reads run-<engine>.json (timings and answers), load-<engine>.json and
-build-strata-s<i>.json (load time and index size) and cpu.jsonl from
-REPORTS_DIR, and the collection from BEIR_DIR/quora, and prints Markdown
-tables: load time and index size; latency and throughput per kind; and the
-quality of each engine's answers:
+Reads run-<label>.json (timings and answers), writes-<engine>.json, stream-<engine>.json, load-<engine>.json,
+build-strata-s<i>.json and disk-vespa.jsonl (load time and index size) and
+cpu.jsonl from REPORTS_DIR, and the collection from BEIR_DIR/quora, and
+prints Markdown tables: load time and index size; latency and throughput per
+kind; and the quality of each engine's answers:
 
 - recall@10 of the vector kinds against an exact search (dot product over
-  every document, with the filter for "vector + filter");
-- nDCG@10 against Quora's relevance judgments, for every ranked kind;
+  every document, with the filter for "vector + filter", and for "similar
+  items" the item's vector, rated 3 or more, minus the keys it was seen with);
+- nDCG@10 against Quora's relevance judgments, for every kind ranked for a
+  query's text;
+- how many SQL aggregates equal the true answer, computed from the documents;
 - overlap@10 with Strata's answers, for every ranked kind, and how many
-  facet and key-lookup answers equal Strata's.
+  facet and key-lookup answers equal Strata's (facets up to the order of
+  values with the same count).
 
 Writes REPORTS_DIR/summary.json with the same numbers. Needs numpy.
 """
@@ -30,16 +34,34 @@ import numpy as np
 # 3 CPUs and, if present, at another (compare.sh run with SHARD_CPU and
 # COORD_CPU set, the report renamed run-strata-<split>.json and its CPU lines
 # moved to cpu-strata-<split>.jsonl).
+# es-trial: Elasticsearch's hybrid retrievers under its trial licence
+# (compare.sh trial, then run es --paid --label es-trial).
 RUNS = [
     ("strata", "Strata"),
     ("strata-coord500m", "Strata, 0.5-CPU coordinator"),
     ("es", "Elasticsearch"),
+    ("es-trial", "Elasticsearch, trial licence"),
+    ("os", "OpenSearch"),
     ("solr", "Solr"),
+    ("vespa", "Vespa"),
 ]
 ENGINES = [k for k, _ in RUNS]
 NAMES = dict(RUNS)
-RANKED = ["bm25", "bm25 + filter", "vector", "vector + filter", "hybrid (RRF)", "hybrid (weighted)", "boosted (bm25 × decay)"]
-KINDS = RANKED + ["facet", "key lookup"]
+# Ranked for a query's text: scored against Quora's judgments.
+TEXT_RANKED = [
+    "bm25",
+    "bm25 + filter",
+    "phrase",
+    "typo",
+    "prefix",
+    "vector",
+    "vector + filter",
+    "hybrid (RRF)",
+    "hybrid (weighted)",
+    "boosted (bm25 × decay)",
+]
+RANKED = TEXT_RANKED + ["similar items"]
+KINDS = RANKED + ["facet", "key lookup", "sql aggregate"]
 
 
 def load_json(p):
@@ -79,6 +101,88 @@ def exact_top10(beir, qids, filtered):
         best_s = np.take_along_axis(cand_s, top, 1)
         best_i = np.take_along_axis(cand_i, top, 1)
     return {qid: {ids[j] for j in best_i[k]} for k, qid in enumerate(qids)}
+
+
+def exact_similar(beir, probes):
+    """The 10 documents nearest each probe's item, rated 3 or more, minus its seen keys."""
+    meta = json.loads((beir / "meta.json").read_text())
+    n, dim = meta["docs"], meta["dim"]
+    docs = np.memmap(beir / "doc_vecs.f32", dtype=np.float32, mode="r", shape=(n, dim))
+    ids, ratings = [], np.empty(n, dtype=np.float32)
+    with open(beir / "docs.jsonl") as f:
+        for i, line in enumerate(f):
+            d = json.loads(line)
+            ids.append(d["id"])
+            ratings[i] = d["rating"]
+    row = {k: i for i, k in enumerate(ids)}
+    q = np.stack([np.asarray(docs[row[p["item"]]]) for p in probes])
+    step = 65536
+    best_s = np.full((len(probes), 10), -np.inf, dtype=np.float32)
+    best_i = np.zeros((len(probes), 10), dtype=np.int64)
+    seen = [np.array([row[k] for k in p["seen"]]) for p in probes]
+    for start in range(0, n, step):
+        s = q @ np.asarray(docs[start : start + step]).T
+        s[:, ratings[start : start + step] < 3] = -np.inf
+        for k, sk in enumerate(seen):
+            s[k, sk[(sk >= start) & (sk < start + s.shape[1])] - start] = -np.inf
+        cand_s = np.concatenate([best_s, s], axis=1)
+        cand_i = np.concatenate([best_i, np.arange(start, start + s.shape[1])[None, :].repeat(len(probes), 0)], axis=1)
+        top = np.argpartition(-cand_s, 10, axis=1)[:, :10]
+        best_s = np.take_along_axis(cand_s, top, 1)
+        best_i = np.take_along_axis(cand_i, top, 1)
+    return [{ids[j] for j, sc in zip(best_i[k], best_s[k]) if sc > -np.inf} for k in range(len(probes))]
+
+
+def true_aggregates(beir, years):
+    """SELECT category, COUNT(*), AVG(rating) FROM docs WHERE year >= :y GROUP BY
+    category HAVING COUNT(*) > 1000 ORDER BY 2 DESC LIMIT 10, for each year:
+    the ten rows, and the rows that tie with the tenth's count."""
+    rows = []
+    with open(beir / "docs.jsonl") as f:
+        for line in f:
+            d = json.loads(line)
+            rows.append((d["year"], d["category"], d["rating"]))
+    out = {}
+    for y in set(years):
+        g = {}
+        for yr, c, r in rows:
+            if yr >= y:
+                n, t = g.get(c, (0, 0.0))
+                g[c] = (n + 1, t + r)
+        top = sorted(((c, n, t / n) for c, (n, t) in g.items() if n > 1000), key=lambda x: -x[1])
+        cut = top[9][1] if len(top) > 10 else None
+        out[y] = (top[:10], [x for x in top if cut is not None and x[1] == cut])
+    return out
+
+
+def same_aggregate(rows, truth):
+    """Whether an engine's rows are the true answer: the same counts in order, each
+    category with its count (any of the tied ones at the tenth), averages within 1e-5
+    (engines that keep ratings as 32-bit floats average them in other last digits)."""
+    top, ties = truth
+    got = []
+    for r in rows:
+        if len(r) < 3:
+            return False
+        got.append((str(r[0]), int(r[1]), float(r[2])))
+    if [n for _, n, _ in got] != [n for _, n, _ in top]:
+        return False
+    allowed = {c: (n, a) for c, n, a in top + ties}
+    if len({c for c, _, _ in got}) != len(got):
+        return False
+    return all(c in allowed and allowed[c][0] == n and abs(allowed[c][1] - a) <= 1e-5 * max(1.0, abs(a)) for c, n, a in got)
+
+
+def same_facet(a, b):
+    """Whether two facets' (value, count) rows are the same answer: the same
+    counts in order, and the same values above the last count (values that
+    tie may come in any order, and those tied at the cut may differ)."""
+    if [r[1] for r in a] != [r[1] for r in b]:
+        return False
+    if not a:
+        return True
+    cut = a[-1][1]
+    return {(r[0], r[1]) for r in a if r[1] > cut} == {(r[0], r[1]) for r in b if r[1] > cut}
 
 
 def qrels(beir):
@@ -133,11 +237,22 @@ def main():
         docs = sum(b["docs"] for b in builds)
         summary["load"]["strata"] = {"total_s": total, "index_bytes": size, "docs": docs, "shards": builds}
         print(f"| Strata | {total:.0f} | read {sum(b['read_s'] for b in builds):.0f} + build {sum(b['build_s'] for b in builds):.0f} | (built) | (built as one) | {size / 1e9:.2f} | {docs:,} |")
-    for e in ["es", "solr"]:
+    for e in ["es", "os", "solr", "vespa"]:
         l = load_json(rep / f"load-{e}.json")
         if l:
-            summary["load"][e] = {k: l.get(k) for k in ["total_s", "ingest_s", "refresh_s", "merge_s", "index_bytes", "indexed_docs", "segments", "json_bytes"]}
-            print(f"| {NAMES[e]} | {l['total_s']:.0f} | send {l['ingest_s']:.0f} | {l['refresh_s']:.0f} | {l['merge_s']:.0f} | {l['index_bytes'] / 1e9:.2f} | {l['indexed_docs']:,} |")
+            if e == "vespa":
+                # compare.sh: du of each content node's documents directory, once proton had flushed.
+                disk = [json.loads(x) for x in open(rep / "disk-vespa.jsonl")] if (rep / "disk-vespa.jsonl").exists() else []
+                l["index_bytes"] = sum(d["documents_bytes"] for d in disk) if disk else None
+                l["tls_bytes"] = sum(d["tls_bytes"] for d in disk) if disk else None
+                l["indexed_docs"] = l.get("searchable_docs")
+            summary["load"][e] = {k: l.get(k) for k in ["total_s", "ingest_s", "refresh_s", "merge_s", "index_bytes", "tls_bytes", "indexed_docs", "segments", "json_bytes"]}
+            size = f"{l['index_bytes'] / 1e9:.2f}" if l.get("index_bytes") is not None else "–"
+            if l.get("tls_bytes"):
+                size += f" (+ {l['tls_bytes'] / 1e9:.2f} transaction log)"
+            searchable, merged = (f"{l['refresh_s']:.0f}", f"{l['merge_s']:.0f}") if e != "vespa" else ("on write", "(on its own)")
+            docs = f"{l['indexed_docs']:,}" if l.get("indexed_docs") is not None else "–"
+            print(f"| {NAMES[e]} | {l['total_s']:.0f} | send {l['ingest_s']:.0f} | {searchable} | {merged} | {size} | {docs} |")
 
     # Latency and throughput.
     def http(e, kind, c):
@@ -178,8 +293,13 @@ def main():
     print("\nErrors during the timed runs: " + ", ".join(f"{NAMES[e]} {n}" for e, n in errors.items()))
 
     # Quality.
-    vec_qids = runs[next(iter(runs))]["query_ids"]["vector"]
-    truth = {"vector": exact_top10(beir, vec_qids, False), "vector + filter": exact_top10(beir, vec_qids, True)}
+    vec_qids = next((r["query_ids"]["vector"] for r in runs.values() if "vector" in r["query_ids"]), None)
+    truth = {"vector": exact_top10(beir, vec_qids, False), "vector + filter": exact_top10(beir, vec_qids, True)} if vec_qids else {}
+    # Every engine is sent the same items and years (they depend on the query's position only).
+    probes = next((r["probes"]["similar items"] for r in runs.values() if "similar items" in r.get("probes", {})), None)
+    similar = exact_similar(beir, probes) if probes else None
+    years = next((r["probes"]["sql aggregate"] for r in runs.values() if "sql aggregate" in r.get("probes", {})), None)
+    aggregates = true_aggregates(beir, [p["year"] for p in years]) if years else None
     strata = runs.get("strata")
     quality = {}
     for e, r in ((e, runs[e]) for e in scored):
@@ -192,7 +312,16 @@ def main():
             if kind in truth:
                 found = [len(set(a["keys"] or []) & truth[kind][qid]) for a, qid in zip(ans, qids)]
                 q["recall_at_10"] = sum(found) / (10 * len(found))
-            if kind in RANKED:
+            if kind == "similar items" and similar:
+                mine = r["probes"]["similar items"]
+                assert [p["item"] for p in mine] == [p["item"] for p in probes], f"{e}: other items than the first run's"
+                found = [len(set(a["keys"] or []) & t) / max(1, min(10, len(t))) for a, t in zip(ans, similar)]
+                q["recall_at_10"] = sum(found) / len(found)
+            if kind == "sql aggregate" and aggregates:
+                mine = r["probes"]["sql aggregate"]
+                q["true_answers"] = sum(same_aggregate(rows_of(a), aggregates[p["year"]]) for a, p in zip(ans, mine))
+                q["of"] = len(ans)
+            if kind in TEXT_RANKED:
                 scores = [ndcg10(a["keys"] or [], rel[qid]) for a, qid in zip(ans, qids) if qid in rel]
                 scores = [x for x in scores if x is not None]
                 q["ndcg_at_10"] = sum(scores) / len(scores) if scores else None
@@ -202,8 +331,11 @@ def main():
                 if kind in RANKED:
                     ov = [len(set(a["keys"] or []) & set(b["keys"] or [])) / max(1, len(b["keys"] or [])) for a, b in pairs]
                     q["overlap_with_strata"] = sum(ov) / len(ov) if ov else None
+                elif kind == "sql aggregate":
+                    # Scored against the true answer above (averages differ in their last digits between engines).
+                    pass
                 elif kind == "facet":
-                    q["same_as_strata"] = sum(rows_of(a) == rows_of(b) for a, b in pairs)
+                    q["same_as_strata"] = sum(same_facet(rows_of(a), rows_of(b)) for a, b in pairs)
                     q["of"] = len(pairs)
                 else:
                     q["same_as_strata"] = sum((a["keys"] or []) == (b["keys"] or []) for a, b in pairs)
@@ -212,6 +344,7 @@ def main():
     summary["quality"] = quality
 
     print("\n## Answers: recall@10 against an exact search, nDCG@10 against Quora's judgments\n")
+    print("Unavailable kinds are n/a; recall is for the kinds an exact search can answer.\n")
     print("| kind | " + " | ".join(f"{NAMES[e]} recall | {NAMES[e]} nDCG" for e in scored) + " |")
     print("|---|" + "---|---|" * len(scored))
     for kind in RANKED:
@@ -220,12 +353,21 @@ def main():
             q = quality[e].get(kind)
             cells += [fmt(q.get("recall_at_10"), 3) if q else "n/a", fmt(q.get("ndcg_at_10"), 3) if q else "n/a"]
         print(f"| {kind} | " + " | ".join(cells) + " |")
+    if aggregates:
+        print("\n## SQL aggregates equal to the true answer\n")
+        print("| " + " | ".join(NAMES[e] for e in scored) + " |")
+        print("|" + "---|" * len(scored))
+        cells = []
+        for e in scored:
+            q = quality[e].get("sql aggregate")
+            cells.append(f"{q['true_answers']} of {q['of']}" if q and "true_answers" in q else "n/a")
+        print("| " + " | ".join(cells) + " |")
     if strata:
         others = [e for e in scored if e != "strata"]
         print("\n## Agreement with Strata's answers\n")
         print("| kind | " + " | ".join(NAMES[e] for e in others) + " |")
         print("|---|" + "---|" * len(others))
-        for kind in KINDS:
+        for kind in (k for k in KINDS if k != "sql aggregate"):
             cells = []
             for e in others:
                 q = quality[e].get(kind)
@@ -237,21 +379,84 @@ def main():
                     cells.append(f"{q.get('same_as_strata')} of {q.get('of')} equal")
             print(f"| {kind} | " + " | ".join(cells) + " |")
 
+    # Writes (engine-compare writes): documents a second and latency per phase and clients, and how soon a write is found.
+    wr = {e: load_json(rep / f"writes-{e}.json") for e in ENGINES}
+    wr = {e: w for e, w in wr.items() if w}
+    if wr:
+        summary["writes"] = wr
+        print("\n## Writes: documents a second, and latency in ms (p50 / p99)\n")
+        print("| phase | clients | " + " | ".join(f"{NAMES[e]} docs/s | {NAMES[e]} ms" for e in wr) + " |")
+        print("|---|---|" + "---|---|" * len(wr))
+        keys = []
+        for w in wr.values():
+            for row in w["writes"]:
+                if (row["phase"], row["concurrency"]) not in keys:
+                    keys.append((row["phase"], row["concurrency"]))
+        for phase, c in keys:
+            cells = []
+            for w in wr.values():
+                row = next((r for r in w["writes"] if (r["phase"], r["concurrency"]) == (phase, c)), None)
+                if row:
+                    err = f" ({row['errors']} errors)" if row["errors"] else ""
+                    cells += [fmt(row["docs_per_s"], 0), f"{row['p50_ms']:.2f} / {row['p99_ms']:.2f}{err}"]
+                else:
+                    cells += ["n/a", "n/a"]
+            print(f"| {phase} | {c} | " + " | ".join(cells) + " |")
+        print("\n## How soon a written document is found (ms from the write's start)\n")
+        print("| engine | searchable | write returned (p50) | found (p50) | found (p90) | found (max) |")
+        print("|---|---|---|---|---|---|")
+        for e, w in wr.items():
+            v = w["visible"]
+            print(f"| {NAMES[e]} | {w['params']['searchable']} | {v['ack_p50_ms']:.1f} | {v['visible_p50_ms']:.1f} | {v['visible_p90_ms']:.1f} | {v['visible_max_ms']:.1f} |")
+
+    # Streams (engine-compare stream): each rate's lag, the top speed, and the crash test.
+    st = {e: load_json(rep / f"stream-{e}.json") for e in ENGINES}
+    st = {e: x for e, x in st.items() if x}
+    if st:
+        summary["stream"] = st
+        print("\n## Streams through Redpanda: documents written a second, and lag in ms from when a document was due (p50 / p99)\n")
+        print("| phase | " + " | ".join(f"{NAMES[e]} docs/s | {NAMES[e]} lag" for e in st) + " |")
+        print("|---|" + "---|---|" * len(st))
+        names = []
+        for x in st.values():
+            for row in x["phases"]:
+                if row["phase"] not in names and row["phase"] != "before the crash":
+                    names.append(row["phase"])
+        for name in names:
+            cells = []
+            for x in st.values():
+                row = next((r for r in x["phases"] if r["phase"] == name), None)
+                if row:
+                    behind = "" if row["kept_up"] or name == "flat out" else " (fell behind)"
+                    cells += [fmt(row["written_per_s"], 0), f"{row['lag_p50_ms']:.0f} / {row['lag_p99_ms']:.0f}{behind}"]
+                else:
+                    cells += ["not run", "not run"]
+            print(f"| {name} | " + " | ".join(cells) + " |")
+        print("\nLag includes reading the topic (Redpanda's part, the same for every engine, is the 'read' column below).\n")
+        print("| engine | what written means | read lag p50 (ms) | crash: events written again | documents lost |")
+        print("|---|---|---|---|---|")
+        for e, x in st.items():
+            first = x["phases"][0]
+            r = x["restart"]
+            print(f"| {NAMES[e]} | {x['params']['written_means']} | {fmt(first.get('fetch_lag_p50_ms'), 0)} | {r['written_again']} ({r['how']}) | {r['lost']} |")
+
     # CPU used during each run, from the containers' cgroups.
     cpu_lines = [json.loads(l) for l in open(rep / "cpu.jsonl")] if (rep / "cpu.jsonl").exists() else []
     for e in ENGINES:
         extra = rep / f"cpu-{e}.jsonl"
         if e.startswith("strata-") and extra.exists():
-            cpu_lines += [dict(json.loads(l), engine=e, pod=f"{json.loads(l)['pod']} ({e[len('strata-'):]})") for l in open(extra)]
+            cpu_lines += [dict(json.loads(l), engine=e, label=e, pod=f"{json.loads(l)['pod']} ({e[len('strata-'):]})") for l in open(extra)]
     if cpu_lines:
         print("\n## CPU used by each engine's containers (cgroup cpu.stat)\n")
         print("| engine | phase | pod | CPU seconds | wall seconds | average cores | throttled (s) |")
         print("|---|---|---|---|---|---|---|")
         for e in ENGINES:
-            for phase, (tb, ta) in [("load", ("load-before", "load-after")), ("timed run", ("before", "after"))]:
-                for pod in sorted({l["pod"] for l in cpu_lines if l["engine"] == e}):
-                    b = [l for l in cpu_lines if l["pod"] == pod and l["tag"] == tb]
-                    a = [l for l in cpu_lines if l["pod"] == pod and l["tag"] == ta]
+            for phase, (tb, ta) in [("load", ("load-before", "load-after")), ("timed run", ("before", "after")), ("writes", ("writes-before", "writes-after")), ("stream", ("stream-before", "stream-after"))]:
+                # Lines written before runs had labels name the run by its engine.
+                mine = [l for l in cpu_lines if l.get("label", l["engine"]) == e]
+                for pod in sorted({l["pod"] for l in mine}):
+                    b = [l for l in mine if l["pod"] == pod and l["tag"] == tb]
+                    a = [l for l in mine if l["pod"] == pod and l["tag"] == ta]
                     if not a or not b:
                         continue
                     b, a = b[-1], a[-1]

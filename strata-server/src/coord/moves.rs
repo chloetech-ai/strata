@@ -21,6 +21,7 @@ use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::cores::slots::{MoveRun, MoveStep, HOLD_RENEW, HOLD_TTL};
+use crate::service::RETRY_AFTER;
 use crate::slots::SLOTS;
 
 /// Slots a planned move takes at most: a sixteenth of the cluster, so that
@@ -29,6 +30,11 @@ pub const MOVE_SLOTS: usize = 256;
 
 /// Rows per chunk of an export.
 const EXPORT_ROWS: u32 = 1_000;
+
+/// How long a chunk is sent again while the shard it goes to is behind on
+/// its flushes (429) before the move fails: as long as a chunk of the
+/// export may take to come.
+const BUSY_WAIT: Duration = Duration::from_secs(120);
 
 /// The moves this coordinator runs, and the last job's account.
 #[derive(Default)]
@@ -90,6 +96,9 @@ struct Step {
     phase: &'static str,
     rows: u64,
     rounds: u32,
+    /// Chunks the shard they go to refused while behind on its flushes
+    /// (429), each sent again a second later.
+    busy: u32,
     /// How long writes to its slots were held.
     held_ms: Option<f64>,
     ms: Option<f64>,
@@ -113,7 +122,7 @@ impl Job {
             .map(|s| {
                 json!({
                     "from": s.from, "to": s.to, "slots": slots::runs(s.slots.iter().copied()), "count": s.slots.len(),
-                    "phase": s.phase, "rows": s.rows, "rounds": s.rounds, "held_ms": s.held_ms, "ms": s.ms, "error": s.error,
+                    "phase": s.phase, "rows": s.rows, "rounds": s.rounds, "busy": s.busy, "held_ms": s.held_ms, "ms": s.ms, "error": s.error,
                 })
             })
             .collect();
@@ -187,7 +196,7 @@ impl Coordinator {
         if let Some(m) = self.map().and_then(|m| m.moving().cloned()) {
             return Err(ApiError { status: 409, message: format!("slots are moving already, from shard {} to {} ({}): finish that move first (POST /v1/admin/moves/finish)", m.from, m.to, m.state.name()) });
         }
-        let steps: Vec<Step> = plan.into_iter().map(|(slots, from, to)| Step { from, to, slots, phase: "planned", rows: 0, rounds: 0, held_ms: None, ms: None, error: None }).collect();
+        let steps: Vec<Step> = plan.into_iter().map(|(slots, from, to)| Step { from, to, slots, phase: "planned", rows: 0, rounds: 0, busy: 0, held_ms: None, ms: None, error: None }).collect();
         let state = if steps.is_empty() { "done" } else { "running" };
         let now = strata::timestamp::now();
         *lock(&self.moves.job) = Some(Job { kind: kind.to_string(), steps, started: now, finished: (state == "done").then_some(now), state, error: None });
@@ -387,7 +396,25 @@ impl Coordinator {
             }
             let t = self.topo();
             let r = pb::WriteRequest { ops_json: chunk.ops_json, epoch: t.epoch(), moved: true, ..Default::default() };
-            self.write(&t, mv.to, r, CLUSTER_PROTOCOL).await?;
+            // A shard behind on its flushes refuses writes (429) until it
+            // catches up, as a shard just added does while the first
+            // chunks of a move build its indexes: the chunk waits and goes
+            // again, as a client is told to, rather than failing the move.
+            let give_up = Instant::now() + BUSY_WAIT;
+            loop {
+                match self.write(&t, mv.to, r.clone(), CLUSTER_PROTOCOL).await {
+                    Err(e) if e.status == 429 && Instant::now() + RETRY_AFTER < give_up => {
+                        if let Some(k) = k {
+                            self.step(k, |s| s.busy += 1);
+                        }
+                        tokio::time::sleep(RETRY_AFTER).await;
+                    }
+                    a => {
+                        a?;
+                        break;
+                    }
+                }
+            }
             rows += chunk.rows;
             if let Some(k) = k {
                 self.step(k, |s| s.rows += chunk.rows);

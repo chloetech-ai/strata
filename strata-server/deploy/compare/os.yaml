@@ -1,0 +1,58 @@
+# OpenSearch: node __I__ of a 2-node cluster, each node master-eligible
+# and holding data (one primary shard of the index each, no replicas), with
+# the same CPU and memory as a data pod of the other engines. The index
+# lives on the node's own disk (emptyDir), as Solr's and Strata's do.
+# compare.sh writes os-0 and os-1 from this file, each on its own node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: os
+  namespace: compare
+spec:
+  clusterIP: None
+  # Names resolve before a node is ready: the nodes find each other by name.
+  publishNotReadyAddresses: true
+  selector: {app: os}
+  ports:
+    - {name: http, port: 9200}
+    - {name: transport, port: 9300}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: os-__I__
+  namespace: compare
+  labels: {app: os, engine: os}
+spec:
+  hostname: os-__I__
+  subdomain: os
+  nodeName: __NODE__
+  containers:
+    - name: os
+      image: opensearchproject/opensearch:3.9.0
+      imagePullPolicy: IfNotPresent
+      env:
+        - {name: node.name, value: os-__I__}
+        - {name: cluster.name, value: compare}
+        - {name: discovery.seed_hosts, value: "os-0.os,os-1.os"}
+        - {name: cluster.initial_cluster_manager_nodes, value: "os-0,os-1"}
+        - {name: network.host, value: "0.0.0.0"}
+        - {name: DISABLE_SECURITY_PLUGIN, value: "true"}
+        - {name: DISABLE_INSTALL_DEMO_CONFIG, value: "true"}
+        - {name: cluster.routing.allocation.disk.threshold_enabled, value: "false"}
+        # Half the pod's memory, as Elasticsearch's; the rest for the page cache.
+        - {name: OPENSEARCH_JAVA_OPTS, value: "-Xms1536m -Xmx1536m"}
+      ports:
+        - {name: http, containerPort: 9200}
+        - {name: transport, containerPort: 9300}
+      readinessProbe:
+        httpGet: {path: "/_cluster/health?local=true", port: http}
+        periodSeconds: 5
+      resources:
+        requests: {cpu: __CPU__, memory: __MEM__}
+        limits: {cpu: __CPU__, memory: __MEM__}
+      volumeMounts:
+        - {name: data, mountPath: /usr/share/opensearch/data}
+  volumes:
+    - name: data
+      emptyDir: {}

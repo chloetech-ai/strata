@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- One node holding everything: for checking the package. The cluster's
+     package (vespa-cluster/services.xml, written by compare.sh) has a
+     container node and two content nodes. -->
+<services version="1.0">
+    <container id="default" version="1.0">
+        <component id="linguistics" class="com.yahoo.language.lucene.LuceneLinguistics" bundle="lucene-linguistics">
+            <config name="com.yahoo.language.lucene.lucene-analysis">
+                <configDir>linguistics</configDir>
+                <analysis>
+                    <item key="profile=strata;language=en">
+                        <tokenizer>
+                            <name>pattern</name>
+                            <conf><item key="pattern">[^\p{L}\p{N}\p{M}]+</item></conf>
+                        </tokenizer>
+                        <tokenFilters>
+                            <item><name>lowercase</name></item>
+                            <item><name>asciiFolding</name></item>
+                            <item><name>stop</name><conf><item key="words">classic-stopwords.txt</item></conf></item>
+                            <item><name>snowballPorter</name><conf><item key="language">English</item></conf></item>
+                        </tokenFilters>
+                    </item>
+                    <item key="profile=strata_query;language=en">
+                        <tokenizer>
+                            <name>pattern</name>
+                            <conf><item key="pattern">[^\p{L}\p{N}\p{M}]+</item></conf>
+                        </tokenizer>
+                        <tokenFilters>
+                            <item><name>lowercase</name></item>
+                            <item><name>asciiFolding</name></item>
+                            <item><name>stop</name><conf><item key="words">query-stopwords.txt</item></conf></item>
+                            <item><name>stop</name><conf><item key="words">classic-stopwords.txt</item></conf></item>
+                            <item><name>snowballPorter</name><conf><item key="language">English</item></conf></item>
+                        </tokenFilters>
+                    </item>
+                </analysis>
+            </config>
+        </component>
+        <search/>
+        <document-api/>
+        <document-processing/>
+    </container>
+    <content id="docs" version="1.0">
+        <min-redundancy>1</min-redundancy>
+        <tuning>
+            <!-- The laptop's disk is fuller than Vespa's default 75% feed block. -->
+            <resource-limits>
+                <disk>0.98</disk>
+                <memory>0.9</memory>
+            </resource-limits>
+        </tuning>
+        <documents>
+            <document type="doc" mode="index"/>
+        </documents>
+        <nodes>
+            <node hostalias="node1" distribution-key="0"/>
+        </nodes>
+    </content>
+</services>

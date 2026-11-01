@@ -1,0 +1,52 @@
+# Vespa: pod __I__ of the cluster of vespa/package.sh. vespa-0 runs the
+# config server, the cluster controller and the stateless container that
+# answers queries and takes documents (as Strata's coordinator does, on the
+# clients' node); vespa-1 and vespa-2 are the content nodes, one on each
+# data worker. Vespa asks for 4 GB per node; the budget is the other
+# engines' (3 CPUs and 6 GiB in all), so the check is turned off.
+# compare.sh writes vespa-0 .. vespa-2 from this file.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vespa
+  namespace: compare
+spec:
+  clusterIP: None
+  # Names resolve before a node is ready: the nodes find each other by name.
+  publishNotReadyAddresses: true
+  selector: {app: vespa}
+  ports:
+    - {name: http, port: 8080}
+    - {name: config, port: 19071}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vespa-__I__
+  namespace: compare
+  labels: {app: vespa, engine: vespa}
+spec:
+  hostname: vespa-__I__
+  subdomain: vespa
+  nodeName: __NODE__
+  containers:
+    - name: vespa
+      image: vespaengine/vespa:8.778.45
+      imagePullPolicy: IfNotPresent
+      args: [__ROLE__]
+      env:
+        - {name: VESPA_CONFIGSERVERS, value: vespa-0.vespa.compare.svc.cluster.local}
+        - {name: VESPA_IGNORE_NOT_ENOUGH_MEMORY, value: "true"}
+        - {name: VESPA_CONFIGSERVER_JVMARGS, value: "-Xms128m -Xmx384m"}
+        - {name: VESPA_CONFIGPROXY_JVMARGS, value: "-Xms32m -Xmx64m"}
+      ports:
+        - {name: http, containerPort: 8080}
+        - {name: config, containerPort: 19071}
+      resources:
+        requests: {cpu: __CPU__, memory: __MEM__}
+        limits: {cpu: __CPU__, memory: __MEM__}
+      volumeMounts:
+        - {name: var, mountPath: /opt/vespa/var}
+  volumes:
+    - name: var
+      emptyDir: {}
