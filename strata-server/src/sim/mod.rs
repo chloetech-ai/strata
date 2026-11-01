@@ -3,10 +3,11 @@
 //! A run is drawn from a seed ([`Config::of`]): three or five copies of a
 //! shard with automatic failover, two coordinators whose clients write,
 //! read and now and then promote a copy by hand, and faults. The network
-//! delays, reorders and drops calls and cuts copies apart (both ways or
-//! one way); copies crash and start again, their clocks run a little apart,
-//! and, when a run does not sync its commits, a crash loses what was not
-//! synced. The copies run the protocol's decisions as [`crate::cores`]
+//! delays, reorders and drops calls, cuts copies apart (both ways or one
+//! way) and slows some links down for a while; copies crash and start
+//! again, pause (a stalled process: what reaches it waits, its clock runs
+//! on), their clocks run a little apart, and, when a run does not sync
+//! its commits, a crash loses what was not synced. The copies run the protocol's decisions as [`crate::cores`]
 //! makes them, on a model of their databases ([`db`]); the simulator does
 //! their I/O, one event at a time in virtual time, every choice drawn from
 //! the seed, so that a seed replays exactly ([`Report::fingerprint`]).
@@ -27,7 +28,8 @@
 //!
 //! What the simulator does not see: the database's own threads (flushes,
 //! merges) and its files, which the fault-injection tests cover, and the
-//! glue between the server and the cores until the server drives them.
+//! I/O the server does around the cores ([`crate::replication`]), which
+//! its replication and failover tests cover.
 
 pub mod check;
 pub mod cluster;
@@ -84,9 +86,12 @@ pub struct Config {
     pub faults_for: Duration,
     pub settle: Duration,
     pub quiet: Duration,
-    /// The mean time between crashes and between cuts of the network.
+    /// The mean times between crashes, cuts of the network, pauses of a
+    /// node and links slowed down (zero: no pauses, no slow links).
     pub crash_every: Duration,
     pub cut_every: Duration,
+    pub pause_every: Duration,
+    pub slow_every: Duration,
     /// The chance of a client's operation being a promotion by hand, in
     /// parts per million.
     pub promote_ppm: u64,
@@ -167,6 +172,11 @@ impl Config {
             cut_every: r.ms(500, 6000),
             promote_ppm: r.below(5_000),
             bugs: Vec::new(),
+            // Drawn last, so that the draws above give what they gave
+            // before pauses and slow links; each in half the seeds, so that
+            // the runs without them (which find other bugs) stay as many.
+            pause_every: if r.below(2) == 0 { Duration::ZERO } else { r.ms(1000, 10_000) },
+            slow_every: if r.below(2) == 0 { Duration::ZERO } else { r.ms(1000, 10_000) },
         }
     }
 }
@@ -262,6 +272,12 @@ enum Event {
     /// `one_way`), until `Heal`.
     Cut { from: Vec<usize>, to: Vec<usize>, one_way: bool },
     Heal,
+    /// Node `i` stops for `d`: what reaches it waits until then, and its
+    /// clock runs on.
+    Pause { i: usize, d: Time },
+    /// Calls from `from` to each of `to` (and back, unless `one_way`) take
+    /// up to `extra` longer, for `lasts`.
+    Slow { from: usize, to: Vec<usize>, one_way: bool, extra: Time, lasts: Time },
     /// The faults end.
     Settle,
     /// The clients stop.
@@ -281,6 +297,11 @@ pub struct Sim {
     calls: BTreeMap<u64, Call>,
     next_call: u64,
     cut: BTreeSet<(usize, usize)>,
+    /// Links slowed down: how much longer a call takes, at most, and until
+    /// when.
+    slow: BTreeMap<(usize, usize), (Time, Time)>,
+    /// Until when each node is paused.
+    paused: Vec<Time>,
     faults: bool,
     quiet: bool,
     pub(crate) history: History,
@@ -312,6 +333,7 @@ impl Sim {
         let mut rng = Rng::new(cfg.seed);
         let copies = (0..cfg.copies).map(|i| copy::Copy::new(i, &cfg, &mut rng)).collect();
         let coords = (0..cfg.coordinators).map(|_| coord::Coord::new(&cfg)).collect();
+        let nodes = cfg.copies + cfg.coordinators;
         Sim {
             history: History::new(cfg.copies),
             cfg,
@@ -325,6 +347,8 @@ impl Sim {
             calls: BTreeMap::new(),
             next_call: 0,
             cut: BTreeSet::new(),
+            slow: BTreeMap::new(),
+            paused: vec![0; nodes],
             faults: true,
             quiet: false,
             trace: trace.then(Vec::new),
@@ -390,6 +414,34 @@ impl Sim {
             self.at(t + lasts, Event::Heal);
             t += lasts + us(r.ms(10, 2 * self.cfg.cut_every.as_millis() as u64));
         }
+        let mut t = us(r.part_of(self.cfg.pause_every));
+        while !self.cfg.pause_every.is_zero() && t < until {
+            let i = r.below(self.nodes() as u64) as usize;
+            // Now and then about as long as a primary's silence that has
+            // its replicas elect another, or its lease on reads.
+            let after = self.cfg.failover_after.as_millis() as u64;
+            let d = match r.below(4) {
+                0 => us(r.ms(after / 2, after * 3 / 2)),
+                _ => us(r.ms(5, 1500)),
+            };
+            self.at(t, Event::Pause { i, d });
+            t += us(r.ms(10, 2 * self.cfg.pause_every.as_millis() as u64));
+        }
+        let mut t = us(r.part_of(self.cfg.slow_every));
+        while !self.cfg.slow_every.is_zero() && t < until {
+            let n = self.nodes();
+            let from = r.below(n as u64) as usize;
+            // To one other node, or to every other.
+            let to: Vec<usize> = match r.below(2) {
+                0 => vec![(from + 1 + r.below(n as u64 - 1) as usize) % n],
+                _ => (0..n).filter(|&x| x != from).collect(),
+            };
+            let one_way = r.below(3) == 0;
+            let extra = us(r.ms(20, 3000));
+            let lasts = us(r.ms(200, 8000));
+            self.at(t, Event::Slow { from, to, one_way, extra, lasts });
+            t += lasts + us(r.ms(10, 2 * self.cfg.slow_every.as_millis() as u64));
+        }
         self.at(until, Event::Settle);
         self.at(us(self.cfg.faults_for + self.cfg.settle).saturating_sub(us(self.cfg.quiet)), Event::Quiet);
     }
@@ -428,16 +480,21 @@ impl Sim {
         self.copies.get(i).map_or(0, |c| c.inc)
     }
 
-    /// How long a message takes: usually a fraction of a millisecond, now
-    /// and then far longer while faults run.
-    fn delay(&mut self) -> Time {
+    /// How long a message from `from` to `to` takes: usually a fraction
+    /// of a millisecond, now and then far longer while faults run, and up
+    /// to the link's extra while it is slowed down.
+    fn delay(&mut self, from: usize, to: usize) -> Time {
         let base = self.rng.between(50, 600);
         let spike = match self.rng.below(1000) {
             0..=29 => self.rng.between(1_000, 20_000),
             30..=32 if self.faults => self.rng.between(50_000, 1_500_000),
             _ => 0,
         };
-        base + spike
+        let slow = match self.slow.get(&(from, to)) {
+            Some(&(extra, until)) if until > self.now => self.rng.between(extra / 4, extra),
+            _ => 0,
+        };
+        base + spike + slow
     }
 
     fn send(&mut self, from: usize, to: usize, msg: Msg) {
@@ -445,7 +502,7 @@ impl Sim {
             self.mix(0xd409);
             return;
         }
-        let d = if from == to { self.rng.between(5, 50) } else { self.delay() };
+        let d = if from == to { self.rng.between(5, 50) } else { self.delay(from, to) };
         self.at(self.now + d, Event::Deliver { to, msg });
     }
 
@@ -472,6 +529,14 @@ impl Sim {
     }
 
     fn handle(&mut self, e: Event) {
+        // A paused node takes what reaches it once it goes on.
+        if let Event::Deliver { to: i, .. } | Event::Timer { at: i, .. } = &e {
+            if self.paused[*i] > self.now {
+                let t = self.paused[*i];
+                self.at(t, e);
+                return;
+            }
+        }
         self.events += 1;
         self.mix(self.now);
         match e {
@@ -506,6 +571,7 @@ impl Sim {
             Event::Crash(i) => {
                 if self.faults && self.copies[i].up {
                     self.note(|| format!("s{i} crashes"));
+                    self.paused[i] = 0;
                     self.crash(i);
                 }
             }
@@ -535,10 +601,30 @@ impl Sim {
                 }
                 self.cut.clear();
             }
+            Event::Pause { i, d } => {
+                if self.faults && (i >= self.cfg.copies || self.copies[i].up) {
+                    self.note(|| format!("node {i} pauses for {} ms", d / 1000));
+                    self.paused[i] = self.paused[i].max(self.now + d);
+                }
+            }
+            Event::Slow { from, to, one_way, extra, lasts } => {
+                if !self.faults {
+                    return;
+                }
+                self.note(|| format!("calls between node {from} and {to:?}{} take up to {} ms longer for {} ms", if one_way { " (one way)" } else { "" }, extra / 1000, lasts / 1000));
+                let until = self.now + lasts;
+                for &b in &to {
+                    self.slow.insert((from, b), (extra, until));
+                    if !one_way {
+                        self.slow.insert((b, from), (extra, until));
+                    }
+                }
+            }
             Event::Settle => {
                 self.note(|| "faults end: the network heals and every copy starts again".to_string());
                 self.faults = false;
                 self.cut.clear();
+                self.slow.clear();
                 for i in 0..self.cfg.copies {
                     if !self.copies[i].up {
                         self.boot(i);
