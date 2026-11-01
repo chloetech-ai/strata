@@ -111,6 +111,7 @@ Options:
   --post-status    post the result as commit status `ci-local` on GitHub
   --fail-fast      stop at the first failed job (default: run them all)
   --verbose        show each job's output as it runs (default: the log's tail on failure)
+  --keep-binaries  keep the test executables after each job (default: delete them, as they are most of the disk used)
   --list           list the jobs
   --ci-hashes      print the hashes of ci.yml's jobs, for CI_JOBS
   --setup          install the toolchains and the virtualenv, run nothing
@@ -167,7 +168,7 @@ job_names() { printf '%s\n' "$JOBS" | awk -F'|' 'NF { print $1 }'; }
 # --- options ---------------------------------------------------------------
 
 ARGS=("$@")
-PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 SELECTED=""
+PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 SELECTED=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --pr) PR=${2:?--pr needs a number}; shift ;;
@@ -179,6 +180,7 @@ while [ $# -gt 0 ]; do
         --post-status) POST=1 ;;
         --fail-fast) FAIL_FAST=1 ;;
         --verbose|-v) VERBOSE=1 ;;
+        --keep-binaries) KEEP_BINARIES=1 ;;
         --setup) SETUP_ONLY=1 ;;
         --list)
             printf '%s\n' "$JOBS" | awk -F'|' 'NF { printf "  %-30s %s\n", $1, $3 }'
@@ -235,6 +237,9 @@ cleanup() {
 if [ "$SETUP_ONLY" = 1 ]; then
     CI_LOCAL_TREE=$(git rev-parse --show-toplevel 2>/dev/null) || die "run it from a clone of the repository"
 elif [ -z "$CI_LOCAL_TREE" ]; then
+    # The run checks out other commits in work/: bash would read the rest of
+    # this file from under itself.
+    case "$SELF" in "$WORK"/*) die "run it from a clone of your own, not from $WORK" ;; esac
     # One run at a time, and none while a benchmark holds the machine.
     if [ -e "$PAUSE" ]; then
         echo "Waiting: $PAUSE exists (a benchmark has the machine)."
@@ -607,6 +612,19 @@ run_job() {
     if [ "$VERBOSE" = 1 ]; then printf '  %-42s %s\n' "$name" "$result"; else echo "$result"; fi
     printf '  %-42s %s\n' "$name" "$result" >>"$RUN_DIR/run.log"
     [ "$rc" = 0 ] || [ "$VERBOSE" = 1 ] || tail -n 40 "$log" | sed 's/^/      | /'
+    [ "$KEEP_BINARIES" = 1 ] || prune_tests
+}
+
+# The test executables a job linked: most of a target directory (strata's
+# hundred test binaries each hold all of Strata), and linked again after any
+# change to the crate, so keeping them saves little. The compiled
+# dependencies stay; so does every release build, which later jobs run, and
+# Miri's, which runs beside the jobs.
+prune_tests() {
+    find strata/target strata-server/target engram/target strata-py/target \
+        \( -path '*/release' -o -path '*/miri-*' \) -prune -o \
+        -path '*/deps/*' -type f -perm -u+x ! -name '*.*' -exec rm -f {} + 2>/dev/null
+    return 0
 }
 
 start_miri() {
