@@ -981,7 +981,12 @@ impl<'a> Planner<'a> {
     }
 
     fn body(&self, q: &sql::Query) -> Result<Planned> {
-        let sql::SetExpr::Select(s) = q.body.as_ref() else { return Err(err("UNION, INTERSECT and EXCEPT are not supported")) };
+        let s = match q.body.as_ref() {
+            sql::SetExpr::Select(s) => s,
+            sql::SetExpr::SetOperation { .. } | sql::SetExpr::Query(_) => return self.set_query(q),
+            sql::SetExpr::Values(_) => return Err(err("VALUES lists an INSERT's rows; a query selects them FROM a table")),
+            b => return Err(err(format!("this form of query is not supported: {b}"))),
+        };
         if s.from.len() != 1 {
             return Err(err("FROM takes one table; join others with JOIN ... ON"));
         }
@@ -1003,6 +1008,74 @@ impl<'a> Planner<'a> {
             TableFactor::Derived { .. } => self.join(q, s),
             t => Err(err(format!("unsupported FROM: {t}"))),
         }
+    }
+
+    /// A query that takes queries' rows together (`UNION`, `INTERSECT`,
+    /// `EXCEPT`, [`ir::Node::SetOp`]), or a query in parentheses. Its
+    /// `ORDER BY` and `LIMIT` read its rows as a derived table's:
+    /// `SELECT * FROM (..) ORDER BY .. LIMIT ..`, so they name its columns,
+    /// which are its first query's.
+    fn set_query(&self, q: &sql::Query) -> Result<Planned> {
+        let sql::Query { with: _, body, order_by, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
+        if let Some(c) = super::sql::unsupported_query_clause(fetch, locks, for_clause, settings, format_clause, pipe_operators) {
+            return Err(err(format!("{c} is not supported")));
+        }
+        if order_by.is_some() || limit_clause.is_some() {
+            let mut outer = super::sql::parse_query("SELECT * FROM (SELECT 1) AS __set")?;
+            let sql::SetExpr::Select(s) = outer.body.as_mut() else { unreachable!("a SELECT") };
+            let TableFactor::Derived { subquery, .. } = &mut s.from[0].relation else { unreachable!("a derived table") };
+            *subquery = Box::new(sql::Query { with: None, order_by: None, limit_clause: None, ..q.clone() });
+            outer.order_by = order_by.clone();
+            outer.limit_clause = limit_clause.clone();
+            return self.body(&outer);
+        }
+        match body.as_ref() {
+            sql::SetExpr::Query(_) => self.side(body),
+            sql::SetExpr::SetOperation { op, set_quantifier, left, right } => {
+                let all = match set_quantifier {
+                    sql::SetQuantifier::All => true,
+                    sql::SetQuantifier::Distinct | sql::SetQuantifier::None => false,
+                    by_name => return Err(err(format!("{op} {by_name} is not supported: select the columns in the same order on both sides"))),
+                };
+                let kind = match op {
+                    sql::SetOperator::Union => ir::SetOp::Union,
+                    sql::SetOperator::Intersect => ir::SetOp::Intersect,
+                    sql::SetOperator::Except | sql::SetOperator::Minus => ir::SetOp::Except,
+                };
+                let l = self.side(left)?;
+                let r = self.side(right)?;
+                if l.columns.len() != r.columns.len() {
+                    return Err(err(format!(
+                        "{}: the query before it selects {} column{} and the one after {}; both sides of a {} select as many",
+                        kind.name(),
+                        l.columns.len(),
+                        if l.columns.len() == 1 { "" } else { "s" },
+                        r.columns.len(),
+                        kind.name()
+                    )));
+                }
+                let multi = l.multi.iter().zip(&r.multi).map(|(a, b)| *a || *b).collect();
+                Ok(Planned { node: ir::Node::SetOp { op: kind, all, left: Box::new(l.node), right: Box::new(r.node) }, columns: l.columns, keyed: None, multi })
+            }
+            _ => unreachable!("a set operation or a query"),
+        }
+    }
+
+    /// A side of a set operation, or a query in parentheses, as a query
+    /// of its own: [`plan_query`] rewrote the paths and windows of the
+    /// queries it reached, which are not these.
+    fn side(&self, b: &sql::SetExpr) -> Result<Planned> {
+        let mut q = match b {
+            sql::SetExpr::Query(q) => q.clone(),
+            b => {
+                let mut q = super::sql::parse_query("SELECT 1")?;
+                q.body = Box::new(b.clone());
+                q
+            }
+        };
+        json_paths(&mut q, self.catalog)?;
+        inline_windows(&mut q)?;
+        self.query(&q)
     }
 
     /// A SELECT over a table: a leaf, its subqueries planned within it.

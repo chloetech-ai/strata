@@ -60,6 +60,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 [GROUP BY <columns> [HAVING <predicate over aggregates>]]
 [QUALIFY <predicate over window functions>]
 [WINDOW name AS (<window>), ...]
+[{UNION | INTERSECT | EXCEPT} [ALL] SELECT ...]
 [ORDER BY <score, column or aggregate> [ASC | DESC] [NULLS FIRST | LAST] [, <tie-break> [ASC | DESC]] [MAX k PER <field>]]
 [LIMIT n [OFFSET m]]
 ```
@@ -834,7 +835,7 @@ Each plans into operators over the single-table queries above ([`EXPLAIN`](#expl
   - `datafusion-only`: a query DataFusion does not run fails, to find what it lacks.
 
   The operators run what DataFusion does not run yet, and the plan's first line says why. Today that is joins along links, multi-valued columns as join keys, groups or sort keys, correlated subqueries, and `maxsim` or `encode` over a subquery.
-- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `UNION`, `INTERSECT`, `EXCEPT`, and `RIGHT`, `FULL` and `CROSS` joins are not supported.
+- On the operators, each single-table query, `WITH` result and side of a join holds at most 1,000,000 rows. On DataFusion they hold as many rows as the query's memory budget allows, and past it sorts and groups spill to disk. `RIGHT`, `FULL` and `CROSS` joins are not supported.
 
 The executor's plan lines (`--plan`, `/v1/explain`'s `plan`) list each single-table query that ran, with its rows and its own plan.
 
@@ -877,6 +878,35 @@ FROM papers WINDOW w AS (PARTITION BY category ORDER BY year);
 - **Engines.** The operators sort each partition in memory; DataFusion runs windows on column batches, sorting and spilling within the query's memory budget, and both answer alike. The operators run a window DataFusion does not lower yet: a `LAG` or `LEAD` whose default is not a constant of the value's type, `FIRST_VALUE` and `LAST_VALUE` over a `RANGE` frame with an offset, `NTH_VALUE` over a `RANGE` frame that starts after the partition's first row, a `RANGE` offset of another type than its key (`0.5` over an `INT`), and windows over multi-valued columns.
 
 The plan's node is `Window` (`Window: RANK() OVER (PARTITION BY category ORDER BY cites DESC)` in `EXPLAIN`, the functions computed after the rows' own columns), and its JSON needs the plan feature `window`; a version of Strata from before it refuses the plan by that name.
+
+## UNION, INTERSECT and EXCEPT
+
+A set operation takes the rows of two queries together: `UNION` the rows of either, `INTERSECT` those of both, `EXCEPT` those of the first that the second lacks.
+
+```sql
+-- the categories of 2024's papers and of the reviews' papers, each once
+SELECT category FROM papers WHERE year = 2024 UNION SELECT category FROM reviews;
+
+-- every row of both, repeats kept, ranked together
+SELECT id, cites AS n FROM papers WHERE cites > 100
+UNION ALL
+SELECT id, downloads FROM preprints WHERE downloads > 1000
+ORDER BY n DESC LIMIT 10;
+
+-- the venues 2023 had and 2024 lost
+SELECT venue FROM papers WHERE year = 2023 EXCEPT SELECT venue FROM papers WHERE year = 2024;
+
+-- a side ordered and cut on its own, in parentheses
+(SELECT id FROM papers ORDER BY cites DESC LIMIT 5) UNION ALL (SELECT id FROM preprints ORDER BY downloads DESC LIMIT 5);
+```
+
+- **Columns.** Both sides select as many columns, matched by place, and the answer's columns are named as the first side's. Rows are equal when each of their values is, `NULL` equal to `NULL` and an `INT` equal to the `FLOAT` of its value.
+- **`ALL`.** Without it each row comes once. With it, `UNION ALL` keeps every row of both sides; `INTERSECT ALL` keeps a row as many times as both sides have it, the fewer of the two counts; `EXCEPT ALL` as many times as the first side has it more than the second.
+- **Order.** `INTERSECT` comes before `UNION` and `EXCEPT`, which go left to right, and parentheses group sides: `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`. `ORDER BY`, `LIMIT` and `OFFSET` at the end apply to the whole and name its columns; a side in parentheses takes its own. Without an `ORDER BY` the rows come in the sides' order: `UNION ALL` the first side's rows, then the second's; `UNION` those rows each where it first comes; `INTERSECT` and `EXCEPT` rows of the first side in its order, the first ones of rows equal to one another.
+- **Anywhere a query goes**: a `WITH` result, a derived table `FROM (SELECT .. UNION ..) d`, or a subquery `x IN (SELECT .. UNION ..)`, and each side may group, join, rank, or compute windows. `UNION BY NAME` is an error.
+- **Engines.** Both answer alike. The operators run a set operation DataFusion does not lower: one whose sides give a column different types (an `INT` and a `FLOAT`), and `INTERSECT`, `EXCEPT` or `UNION` without `ALL` of a multi-valued column.
+
+The plan's node is `SetOp` (`Union`, `Intersect all` and so on in `EXPLAIN`, the sides below it), and its JSON needs the plan feature `set_ops`; a version of Strata from before it refuses the plan by that name.
 
 ## The first row of each group: DISTINCT ON
 
