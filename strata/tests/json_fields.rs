@@ -564,6 +564,10 @@ fn reads(db: &Db, rows: &[Row]) {
         let text = r.attrs.as_ref().map_or(Value::Null, |j| Value::Str(j.to_string()));
         assert_eq!(g[7], text, "{}: stored as compact JSON with sorted keys", r.id);
     }
+    // A path's column is named as the query writes it; one named by AS
+    // keeps its name.
+    let SqlResult::Rows(r) = db.sql("SELECT attrs.dims.w, attrs['a.b'], attrs.color AS c, COUNT(*) FROM t GROUP BY attrs.dims.w, attrs['a.b'], attrs.color", &Params::new()).unwrap() else { panic!("rows") };
+    assert_eq!(r.columns, ["attrs.dims.w", "attrs['a.b']", "c", "COUNT(*)"]);
 
     // GROUP BY a path: a group per value, NULL for rows without one.
     let mut want: std::collections::BTreeMap<String, i64> = Default::default();

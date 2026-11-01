@@ -26,6 +26,7 @@ pub const FILES: &[(&str, &str, &str)] = &[
     ("main.js", JS, include_str!("../ui/app/main.js")),
     ("sqledit.js", JS, include_str!("../ui/app/sqledit.js")),
     ("catalog.js", JS, include_str!("../ui/app/catalog.js")),
+    ("paths.js", JS, include_str!("../ui/app/paths.js")),
     ("results.js", JS, include_str!("../ui/app/results.js")),
     ("profile.js", JS, include_str!("../ui/app/profile.js")),
     ("flame.js", JS, include_str!("../ui/app/flame.js")),
