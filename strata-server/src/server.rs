@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::{self, Access};
 use crate::coord::{CoordOptions, Coordinator};
+use crate::cores::shard::{self, Restart};
 use crate::replication::{self, Acks, Follow, Primary, PrimaryOptions};
 use crate::service::{shard_of, AgentConfig, Backend, Replication, Service};
 use crate::alerts::Alerts;
@@ -408,19 +409,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         // until its shard's copies elect one: another may have been
         // elected while it was down.
         let elects = o.failover_after_ms > 0 && svc.slots().is_some_and(|(m, s)| m.replicas().get(s).is_some_and(|c| c.len() > 1));
-        if let (Some(replication::KeptRole::Primary { .. }), false, true) = (&kept.0, kept.1, elects) {
-            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
-            tracing::info!("was its shard's primary: starts as a replica, until its shard's copies elect one (--failover-after-ms)");
-        } else if let (Some(replication::KeptRole::Primary { replicas, acks }), false) = &kept {
-            let opts = PrimaryOptions { replicas: replicas.clone(), acks: *acks, ..ships };
+        let was_primary = matches!(kept.0, Some(replication::KeptRole::Primary { .. })) && !kept.1;
+        if let Some(Restart::Primary { replicas, acks }) = shard::restart(kept.0.as_ref(), kept.1, elects) {
+            let opts = PrimaryOptions { replicas: replicas.clone(), acks, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
             tracing::info!(replicas = %replicas.join(", "), write_acks = acks.name(), "primary, as kept beside the database: ships its writes to its replicas");
             svc.set_replication(Replication::Primary(p));
         } else if kept.0.is_some() {
             svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
-            match kept.1 {
-                true => tracing::info!("replica: a primary of a newer term replaced this one, which follows it"),
-                false => tracing::info!("replica, as kept beside the database: applies the writes its primary ships"),
+            match (was_primary, kept.1) {
+                (true, _) => tracing::info!("was its shard's primary: starts as a replica, until its shard's copies elect one (--failover-after-ms)"),
+                (false, true) => tracing::info!("replica: a primary of a newer term replaced this one, which follows it"),
+                (false, false) => tracing::info!("replica, as kept beside the database: applies the writes its primary ships"),
             }
         } else if (!o.replicas.is_empty() && !o.replica) || o.promote {
             let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };

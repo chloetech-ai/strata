@@ -21,10 +21,12 @@
 /strata/tests/fixtures/format*/   @rkonow
 
 # The shard protocol and replication between servers, and the decisions
-# the server takes the cluster map and moves slots by (cores/slots.rs).
+# the server replicates by (cores/shard.rs) and takes the cluster map and
+# moves slots by (cores/slots.rs).
 /strata-server/proto/             @rkonow
 /strata-server/src/replication.rs @rkonow
 /strata-server/src/slots.rs       @rkonow
+/strata-server/src/cores/shard.rs @rkonow
 /strata-server/src/cores/slots.rs @rkonow
 
 # Authentication and authorization.

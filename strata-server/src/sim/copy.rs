@@ -573,7 +573,7 @@ impl Sim {
                 }
                 let asked = self.copies[i].election.as_ref().and_then(|e| e.asked.as_ref());
                 let hold = match (by_hand, self.cfg.bugs.contains(&Bug::TakesWritesInALease)) {
-                    (true, false) => shard::handover_hold(asked, &elected, opts.lease),
+                    (true, false) => shard::handover_hold(asked, Some(&elected), opts.lease),
                     _ => Duration::ZERO,
                 };
                 if !hold.is_zero() {

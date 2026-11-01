@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{conflict, Replication, Service};
+use crate::cores::shard::Failover;
 use crate::replication::{Follow, PrimaryOptions, STICKY};
 use crate::{pb, ApiError};
 
@@ -90,7 +91,8 @@ impl Service {
 
     /// Runs automatic failover while the server serves, when
     /// [`Self::failover_after`] is set: a replica whose primary is silent
-    /// asks to be elected, and a replaced primary steps down.
+    /// asks to be elected, and a replaced primary steps down, when the
+    /// core says ([`Failover`]).
     pub fn start_failover(self: &Arc<Self>) {
         let after = self.failover_after;
         if after.is_zero() {
@@ -98,19 +100,18 @@ impl Service {
         }
         let me = Arc::downgrade(self);
         tokio::spawn(async move {
-            let every = (after / 8).max(Duration::from_millis(10));
-            let mut next = Instant::now() + jitter(after);
+            let mut f = Failover::new(after, Instant::now(), jitter(after));
             loop {
-                tokio::time::sleep(every).await;
+                tokio::time::sleep(f.every()).await;
                 let Some(svc) = me.upgrade() else { return };
-                svc.fail_over(after, &mut next).await;
+                svc.fail_over(&mut f).await;
             }
         });
     }
 
-    /// One look of [`Self::start_failover`]: an election not before
-    /// `next`, which a lost one moves on.
-    async fn fail_over(&self, after: Duration, next: &mut Instant) {
+    /// One look of [`Self::start_failover`]: an election when `fo` says
+    /// it is due, which moves the next on.
+    async fn fail_over(&self, fo: &mut Failover) {
         let f = match self.replication() {
             Replication::Primary(p) if p.replaced_by() > 0 => return self.step_down().await,
             Replication::Replica(f) => f,
@@ -118,19 +119,19 @@ impl Service {
         };
         let Some((map, shard)) = self.slots() else { return };
         let copies = map.replicas().get(shard).cloned().unwrap_or_default();
-        if copies.len() < 2 || f.silent_for() < after || Instant::now() < *next {
+        if !fo.due(copies.len(), f.silent_for(), Instant::now()) {
             return;
         }
         let _one = self.promoting.lock().await;
         // Promoted meanwhile, or its primary called.
-        if !matches!(self.replication(), Replication::Replica(_)) || f.silent_for() < after {
+        if !matches!(self.replication(), Replication::Replica(_)) || f.silent_for() < fo.after {
             return;
         }
-        *next = Instant::now() + after / 2 + jitter(after);
+        fo.started(Instant::now(), jitter(fo.after));
         let mut opts = self.primary_options();
         tracing::warn!(silent_ms = f.silent_for().as_millis() as u64, "its primary is silent: asking its shard's copies to elect this replica");
         // A copy that does not answer within the delay is taken for down.
-        let ask = PrimaryOptions { call_timeout: opts.call_timeout.min(after.max(Duration::from_millis(200))), ..opts.clone() };
+        let ask = PrimaryOptions { call_timeout: fo.call_timeout(opts.call_timeout), ..opts.clone() };
         let won = match f.campaign(&copies, &ask, false).await {
             Ok(e) => e,
             Err(e) => {

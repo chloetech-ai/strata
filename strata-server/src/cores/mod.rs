@@ -22,11 +22,12 @@
 //! moves slots ([`crate::coord::moves`]) by its steps, which find what the
 //! simulator's [`crate::sim::cluster::Bug`]s put back.
 //!
-//! The server does not drive [`shard`] yet: [`crate::replication`]
-//! decides on its own, and the core mirrors its decisions so that the
-//! simulator exercises them first. Both fix the bugs the simulator found,
-//! which [`crate::sim::Bug`] puts back: a shard's first copies vote from
-//! the start ([`shard::Replica::open`]), a replica asks above the
+//! The server runs [`shard`] too: [`crate::replication`] carries out its
+//! steps for a replica and a primary, [`crate::service`]'s failover looks
+//! when [`shard::Failover`] says, and a server starts again in the part
+//! [`shard::restart`] gives it. Both cores fix the bugs the simulator
+//! found, which [`crate::sim::Bug`] puts back: a shard's first copies vote
+//! from the start ([`shard::Replica::open`]), a replica asks above the
 //! newest term a copy told it ([`shard::Replica::heard`]), a replica
 //! promoted by hand waits out the lease of the primary it replaced
 //! ([`shard::handover_hold`]), and a replica takes what a newer primary
