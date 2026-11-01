@@ -36,6 +36,41 @@
    ]
   },
   {
+   "slug": "s-2vcpu-4gb",
+   "memory": 4096,
+   "vcpus": 2,
+   "disk": 80,
+   "transfer": 4.0,
+   "price_monthly": 24,
+   "price_hourly": 0.03571,
+   "regions": [
+    "ams3",
+    "blr1",
+    "fra1",
+    "lon1",
+    "nyc1",
+    "nyc2",
+    "nyc3",
+    "sfo2",
+    "sfo3",
+    "sgp1",
+    "syd1",
+    "tor1"
+   ],
+   "available": true,
+   "description": "Basic",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 80,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
    "slug": "s-4vcpu-8gb",
    "memory": 8192,
    "vcpus": 4,
@@ -380,6 +415,6 @@
  ],
  "links": {},
  "meta": {
-  "total": 12
+  "total": 13
  }
 }
