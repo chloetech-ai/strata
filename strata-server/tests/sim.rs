@@ -63,8 +63,10 @@ fn finds_with(bug: Bug, within: u64, of: impl Fn(u64) -> Config + Sync) -> Optio
 }
 
 // A promotion by hand that takes writes inside the replaced primary's
-// lease (`Bug::TakesWritesInALease`) broke a read in one seed of 20,000:
-// the unit tests of `cores::shard` check its fix.
+// lease (`Bug::TakesWritesInALease`) broke a read in one seed of 20,000,
+// and in one of 5,000 at `--promote-ppm 100000` with pauses and slow links
+// in every seed: too few for a test here, the unit tests of `cores::shard`
+// check its fix.
 
 #[test]
 fn a_stalled_election_is_found_again() {

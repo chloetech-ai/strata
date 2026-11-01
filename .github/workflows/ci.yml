@@ -123,6 +123,37 @@ jobs:
       - name: Tests
         working-directory: ${{ matrix.crate }}
         run: cargo test --profile ci ${{ matrix.crate == 'strata' && '--features sqlite' || '' }}
+      # The cluster simulator over more seeds than its tests run (`cargo
+      # test` built strata-sim): the first 3,000 of each world on every
+      # change, and in the nightly run and a run started by hand 30,000 of
+      # each that no run checked before, a new range each day. A seed
+      # replays exactly: `strata-sim --seed N --trace` (with `--cluster`
+      # for the second world) shows what happened in it.
+      - name: Simulator seeds
+        if: matrix.crate == 'strata-server' && runner.os == 'Linux'
+        working-directory: strata-server
+        shell: bash
+        env:
+          NEW_SEEDS: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          n=3000
+          from=0
+          if [ "$NEW_SEEDS" = true ]; then
+            n=30000
+            from=$(( 1000000 + $(date -u +%s) / 86400 * n ))
+          fi
+          status=0
+          sim() {
+            echo "strata-sim $*"
+            if ! ./target/ci/strata-sim "$@" | tee "$RUNNER_TEMP/sim.out"; then
+              status=1
+              { echo "### strata-sim $*"; echo '```'; tail -n 60 "$RUNNER_TEMP/sim.out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+          sim --seeds "$from..$((from + n))"
+          sim --seeds "$from..$((from + n / 3))" --drop-ppm 150000
+          sim --cluster --seeds "$from..$((from + n))"
+          exit $status
       # Compiler warnings and clippy's correctness and suspicious lints fail
       # the build; style, complexity and performance lints are advice.
       - name: Clippy
