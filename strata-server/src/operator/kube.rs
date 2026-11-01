@@ -281,8 +281,11 @@ impl Cluster {
                 "podManagementPolicy": "Parallel",
                 "selector": {"matchLabels": labels},
                 "persistentVolumeClaimRetentionPolicy": {"whenDeleted": "Retain", "whenScaled": "Delete"},
+                // The operator restarts the copies, one at a time, when their
+                // settings change ([`super::reconcile`]).
+                "updateStrategy": {"type": "OnDelete"},
                 "template": {
-                    "metadata": {"labels": labels},
+                    "metadata": {"labels": labels, "annotations": {CONFIG: s.server_config()}},
                     "spec": {
                         "terminationGracePeriodSeconds": 30,
                         // Copies of a shard on different nodes, when there are.
@@ -308,6 +311,7 @@ impl Cluster {
         if s.token_secret.is_none() {
             args.push("--no-token".into());
         }
+        args.extend(s.coordinator_args.iter().cloned());
         let mut env = self.coordinator_token_env();
         env.push(json!({"name": "STRATA_KUBE_CLUSTER", "value": format!("{}/{}", self.ns, self.name)}));
         let mut container = json!({
@@ -324,7 +328,7 @@ impl Cluster {
         }
         json!({
             "apiVersion": "apps/v1", "kind": "Deployment", "metadata": self.meta(&format!("{}-coordinator", self.name), labels.clone()),
-            "spec": {"replicas": replicas, "selector": {"matchLabels": labels}, "template": {"metadata": {"labels": labels}, "spec": {"serviceAccountName": self.coordinator_account(), "containers": [container]}}},
+            "spec": {"replicas": replicas, "selector": {"matchLabels": labels}, "template": {"metadata": {"labels": labels, "annotations": {CONFIG: s.coordinator_config()}}, "spec": {"serviceAccountName": self.coordinator_account(), "containers": [container]}}},
         })
     }
 
@@ -368,6 +372,18 @@ eval "exec strata-server \"\$@\" $STRATA_ARGS"
 "#;
 
 /// A variable read from key `token` of Secret `secret`.
+/// The annotation of a pod template, and so of its pods, that holds the
+/// settings they start with ([`Spec::server_config`]).
+const CONFIG: &str = "strata.chloetech.ai/config";
+
+/// The demo shard (`i/n`) a set's live template loads, if it does.
+fn demo_of(set: &Json) -> Option<(usize, usize)> {
+    let env = set["spec"]["template"]["spec"]["containers"][0]["env"].as_array()?;
+    let v = env.iter().find(|e| e["name"] == "STRATA_DEMO_SHARD")?["value"].as_str()?;
+    let (i, n) = v.split_once('/')?;
+    Some((i.parse().ok()?, n.parse().ok()?))
+}
+
 fn secret_env(name: &str, secret: &str) -> Json {
     json!({"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": "token"}}})
 }
@@ -451,6 +467,67 @@ impl Platform for Cluster {
         self.kube.apply(&self.coordinator_path(), &self.coordinator_deployment(shards, replicas)).await.map(|_| ())
     }
 
+    async fn coordinator_config(&self) -> Result<Option<String>, String> {
+        let Some(d) = self.kube.get(&self.coordinator_path()).await? else { return Ok(None) };
+        Ok(Some(d["spec"]["template"]["metadata"]["annotations"][CONFIG].as_str().unwrap_or_default().to_string()))
+    }
+
+    async fn configure(&self, id: u32, spec: &Spec) -> Result<bool, String> {
+        let path = format!("{}/{}", self.sets_path(), self.set_name(id));
+        let Some(set) = self.kube.get(&path).await? else { return Ok(false) };
+        let want = spec.server_config();
+        if set["spec"]["template"]["metadata"]["annotations"][CONFIG] == want.as_str() && set["spec"]["updateStrategy"]["type"] == "OnDelete" {
+            return Ok(false);
+        }
+        // The template only: a set's volume claims cannot change, and its
+        // copies restart when the operator says.
+        let replicas = set["spec"]["replicas"].as_u64().unwrap_or(0) as usize;
+        let with = Cluster { kube: self.kube.clone(), ns: self.ns.clone(), name: self.name.clone(), uid: self.uid.clone(), spec: spec.clone() };
+        let fresh = with.statefulset(id, replicas, demo_of(&set));
+        let patch = json!({"spec": {"updateStrategy": {"type": "OnDelete", "rollingUpdate": null}, "template": fresh["spec"]["template"]}});
+        self.kube.merge(&path, &patch).await?;
+        Ok(true)
+    }
+
+    async fn stale(&self, spec: &Spec) -> Result<Vec<(u32, usize)>, String> {
+        let sel = format!("app.kubernetes.io/instance={},app.kubernetes.io/component=shard", self.name);
+        let want = spec.server_config();
+        let label = format!("{GROUP}/set");
+        let mut out = Vec::new();
+        for pod in self.kube.list(&ns_path(&self.ns, "v1", "pods"), &sel).await? {
+            if pod["metadata"]["annotations"][CONFIG] == want.as_str() || !pod["metadata"]["deletionTimestamp"].is_null() {
+                continue;
+            }
+            let Some(id) = pod["metadata"]["labels"][&label].as_str().and_then(|v| v.parse::<u32>().ok()) else { continue };
+            let prefix = format!("{}-", self.set_name(id));
+            if let Some(k) = pod["metadata"]["name"].as_str().and_then(|n| n.strip_prefix(&prefix)).and_then(|k| k.parse::<usize>().ok()) {
+                out.push((id, k));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    async fn restart(&self, id: u32, ordinal: usize) -> Result<(), String> {
+        self.kube.delete(&format!("{}/{}-{ordinal}", ns_path(&self.ns, "v1", "pods"), self.set_name(id))).await
+    }
+
+    async fn grow_volumes(&self, size: &str) -> Result<usize, String> {
+        let want = super::quantity(size).ok_or_else(|| format!("the volume size {size:?} is not one Kubernetes reads"))?;
+        let sel = format!("app.kubernetes.io/instance={},app.kubernetes.io/component=shard", self.name);
+        let path = ns_path(&self.ns, "v1", "persistentvolumeclaims");
+        let mut grown = 0;
+        for pvc in self.kube.list(&path, &sel).await? {
+            let has = pvc["spec"]["resources"]["requests"]["storage"].as_str().and_then(super::quantity).unwrap_or(0);
+            let Some(name) = pvc["metadata"]["name"].as_str() else { continue };
+            if has < want {
+                self.kube.merge(&format!("{path}/{name}"), &json!({"spec": {"resources": {"requests": {"storage": size}}}})).await?;
+                grown += 1;
+            }
+        }
+        Ok(grown)
+    }
+
     fn url(&self, id: u32, ordinal: usize) -> String {
         format!("http://{}-{ordinal}.{}.{}.svc:7701", self.set_name(id), self.servers_service(), self.ns)
     }
@@ -522,9 +599,10 @@ impl Link {
         Ok(Json::Object(spec))
     }
 
-    /// Merges `spec` (from [`Link::sizes`]) into the cluster's: the
-    /// operator then takes the cluster there, one step at a time.
-    pub async fn scale(&self, spec: &Json) -> Result<Json, String> {
+    /// Merges `spec` (a patch of the spec: [`Link::sizes`], or any of its
+    /// fields) into the cluster's: the operator then takes the cluster
+    /// there, one step at a time.
+    pub async fn change(&self, spec: &Json) -> Result<Json, String> {
         self.kube.merge(&self.path(), &json!({"spec": spec})).await?.ok_or_else(|| format!("no StrataCluster {}/{}", self.namespace, self.name))?;
         self.get().await
     }
@@ -630,6 +708,10 @@ mod tests {
         assert_eq!(get("STRATA_DEMO_SHARD").unwrap()["value"], "1/2");
         assert_eq!(get("STRATA_ARGS").unwrap()["value"], "'--max-rows' '5'\\''0'");
         assert_eq!(get("STRATA_TOKEN").unwrap()["valueFrom"]["secretKeyRef"]["name"], "t");
+        // New settings reach a copy when the operator restarts it: its pod
+        // carries the hash of the settings it started with.
+        assert_eq!(s["spec"]["updateStrategy"], json!({"type": "OnDelete"}));
+        assert_eq!(s["spec"]["template"]["metadata"]["annotations"][CONFIG], json!(c.spec.server_config()));
         // A set added later loads nothing.
         let later = c.statefulset(2, 3, None);
         assert!(later["spec"]["template"]["spec"]["containers"][0]["env"].as_array().unwrap().iter().all(|e| e["name"] != "STRATA_DEMO"));
@@ -637,11 +719,13 @@ mod tests {
 
     #[test]
     fn the_coordinators_are_given_every_shards_servers() {
-        let c = cluster(json!({"demo": 10}));
+        let c = cluster(json!({"demo": 10, "coordinatorArgs": ["--hedge-ms", "40"]}));
         let d = c.coordinator_deployment(&[vec!["a".into(), "b".into()], vec!["c".into()]], 2);
         let args = &d["spec"]["template"]["spec"]["containers"][0]["args"];
         assert_eq!(args[1], "a|b,c");
         assert!(args.as_array().unwrap().contains(&json!("--no-token")));
+        assert_eq!(args.as_array().unwrap()[args.as_array().unwrap().len() - 2..], [json!("--hedge-ms"), json!("40")]);
+        assert_eq!(d["spec"]["template"]["metadata"]["annotations"][CONFIG], json!(c.spec.coordinator_config()));
         assert_eq!(d["spec"]["replicas"], 2);
         let (svc, front) = (&c.common()[1].1, &c.common()[2].1);
         assert_eq!((&svc["spec"]["clusterIP"], &svc["spec"]["publishNotReadyAddresses"]), (&json!("None"), &json!(true)));

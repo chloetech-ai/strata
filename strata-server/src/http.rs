@@ -189,7 +189,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/system", get(system))
         .route("/v1/cluster", get(cluster))
         .route("/v1/kube", get(kube))
-        .route("/v1/admin/kube", post(kube_scale))
+        .route("/v1/admin/kube", post(kube_change))
+        .route("/v1/admin/kube/plan", post(kube_plan))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -1475,19 +1476,57 @@ async fn kube(State(app): State<App>) -> Res {
     }
 }
 
-/// `POST /v1/admin/kube {"shards"?, "replicas"?, "coordinators"?}`:
-/// changes the `StrataCluster`'s sizes; the operator then makes the change.
-async fn kube_scale(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
-    let l = app.svc.kube.as_ref().ok_or_else(|| ApiError::bad("this coordinator is not run by the Kubernetes operator: change the cluster with /v1/admin/shards"))?;
+/// The spec patch a `POST /v1/admin/kube` or `/v1/admin/kube/plan` body
+/// asks for: `{"spec": {...}}` (any of the spec's fields), or the sizes
+/// alone (`{"shards"?, "replicas"?, "coordinators"?}`).
+fn kube_patch(b: &Json) -> Result<Json, ApiError> {
+    if let Some(spec) = b.get("spec") {
+        return match spec {
+            Json::Object(_) => Ok(spec.clone()),
+            _ => Err(ApiError::bad("spec is an object: the StrataCluster's spec fields to change")),
+        };
+    }
     let n = |k: &str| match b.get(k) {
         None | Some(Json::Null) => Ok(None),
         Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| ApiError::bad(format!("{k} is a number"))),
     };
-    let (shards, replicas, coordinators) = (n("shards")?, n("replicas")?, n("coordinators")?);
-    let spec = crate::operator::kube::Link::sizes(shards, replicas, coordinators).map_err(ApiError::bad)?;
-    let j = l.scale(&spec).await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
-    let said: Vec<String> = [("shards", shards), ("copies per shard", replicas), ("coordinators", coordinators)].iter().filter_map(|(k, v)| v.map(|v| format!("{v} {k}"))).collect();
-    Ok(audited(j, format!("asked the operator for {} ({}/{})", said.join(", "), l.namespace, l.name)))
+    crate::operator::kube::Link::sizes(n("shards")?, n("replicas")?, n("coordinators")?).map_err(ApiError::bad)
+}
+
+/// The `StrataCluster`'s spec now, and the plan of changing it by `patch`.
+async fn kube_planned(l: &crate::operator::kube::Link, patch: &Json) -> Result<(Json, Json), ApiError> {
+    let now = l.get().await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
+    let (old, new) = crate::operator::patched(&now["spec"], patch).map_err(ApiError::bad)?;
+    let plan = crate::operator::plan(&old, &new, old.shards, old.replicas);
+    Ok((now, plan))
+}
+
+fn kube_link(app: &App) -> Result<&crate::operator::kube::Link, ApiError> {
+    app.svc.kube.as_ref().ok_or_else(|| ApiError::bad("this coordinator is not run by the Kubernetes operator: change the cluster with /v1/admin/shards"))
+}
+
+/// `POST /v1/admin/kube/plan {"spec": {...}}`: what changing the
+/// `StrataCluster`'s spec so would change, the operator's steps for it and
+/// what to know first ([`crate::operator::plan`]); nothing is changed.
+async fn kube_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    let l = kube_link(&app)?;
+    let (_, plan) = kube_planned(l, &kube_patch(&b)?).await?;
+    Ok(AxJson(plan))
+}
+
+/// `POST /v1/admin/kube {"spec": {...}}` (or the sizes alone): changes the
+/// `StrataCluster`'s spec, checked as the operator would; the operator
+/// then makes the change.
+async fn kube_change(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let l = kube_link(&app)?;
+    let patch = kube_patch(&b)?;
+    let (_, plan) = kube_planned(l, &patch).await?;
+    if let Some(why) = plan["refused"].as_str() {
+        return Err(ApiError::bad(why.to_string()));
+    }
+    let j = l.change(&patch).await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
+    let said: Vec<String> = plan["changes"].as_array().into_iter().flatten().map(|c| format!("{} {} -> {}", c["field"].as_str().unwrap_or("?"), c["from"], c["to"])).collect();
+    Ok(audited(j, format!("changed the StrataCluster {}/{}: {}", l.namespace, l.name, if said.is_empty() { "nothing".into() } else { said.join(", ") })))
 }
 
 async fn routes(State(app): State<App>) -> AxJson<Json> {

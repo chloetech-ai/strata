@@ -18,7 +18,12 @@
 //! - a pod that comes back without its volume (its node was replaced)
 //!   leaves its shard and joins again, and is sent a copy of the primary;
 //! - the coordinator's `--shards` list is kept naming servers of the
-//!   cluster, so that a coordinator that starts again finds it.
+//!   cluster, so that a coordinator that starts again finds it;
+//! - other settings (image, arguments, resources, failover, write acks,
+//!   tokens): each set starts its copies with the new ones, and the copies
+//!   running older ones restart one at a time, each shard's primary handed
+//!   to a copy already restarted first, and the next only once every copy
+//!   is back and caught up; a bigger volume grows each copy's claim.
 //!
 //! What it does goes through [`Platform`] (Kubernetes objects, in
 //! [`kube`]; processes on one machine in the tests) and [`Admin`] (the
@@ -82,6 +87,9 @@ pub struct Spec {
     pub coordinator_resources: Option<Json>,
     /// More arguments for every server.
     pub args: Vec<String>,
+    /// More arguments for every coordinator (`--hedge-ms 50`,
+    /// `--partial`, ...).
+    pub coordinator_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,11 +124,30 @@ impl Default for Spec {
             resources: None,
             coordinator_resources: None,
             args: Vec::new(),
+            coordinator_args: Vec::new(),
         }
     }
 }
 
 impl Spec {
+    /// The settings every server starts with, as a short hash: a copy
+    /// started with another hash runs older settings, and is restarted.
+    pub fn server_config(&self) -> String {
+        short_hash(&json!({
+            "image": self.image, "imagePullPolicy": self.image_pull_policy, "args": self.args, "resources": self.resources,
+            "failoverAfterMs": self.failover_after_ms, "writeAcks": self.write_acks,
+            "tokenSecret": self.token_secret, "clusterTokenSecret": self.cluster_token_secret,
+        }))
+    }
+
+    /// The settings every coordinator starts with, as a short hash.
+    pub fn coordinator_config(&self) -> String {
+        short_hash(&json!({
+            "image": self.image, "imagePullPolicy": self.image_pull_policy, "resources": self.coordinator_resources,
+            "args": self.coordinator_args, "tokenSecret": self.token_secret, "clusterTokenSecret": self.cluster_token_secret,
+        }))
+    }
+
     /// What is wrong with it, if anything.
     pub fn check(&self) -> Result<(), String> {
         if self.shards == 0 || self.replicas == 0 || self.coordinators == 0 {
@@ -157,6 +184,35 @@ impl Spec {
     }
 }
 
+/// The first 12 hex digits of the SHA-256 of `j`'s text.
+fn short_hash(j: &Json) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(j.to_string().as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A volume size as Kubernetes writes it (`10Gi`, `500M`, `1T`), in bytes.
+pub fn quantity(q: &str) -> Option<u128> {
+    let q = q.trim();
+    let at = q.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(q.len());
+    let (n, unit) = q.split_at(at);
+    let n: f64 = n.parse().ok()?;
+    let m: u128 = match unit {
+        "" => 1,
+        "Ki" => 1 << 10,
+        "Mi" => 1 << 20,
+        "Gi" => 1 << 30,
+        "Ti" => 1 << 40,
+        "Pi" => 1 << 50,
+        "k" => 1_000,
+        "M" => 1_000_000,
+        "G" => 1_000_000_000,
+        "T" => 1_000_000_000_000,
+        "P" => 1_000_000_000_000_000,
+        _ => return None,
+    };
+    (n >= 0.0).then(|| (n * m as f64) as u128)
+}
+
 /// A set of copies of one shard (a StatefulSet): its id, how many copies
 /// it asks for, and the ordinals of those ready.
 #[derive(Clone, Debug, PartialEq)]
@@ -181,6 +237,21 @@ pub trait Platform {
     /// were made.
     async fn coordinator(&self) -> Result<Option<(Vec<Vec<String>>, usize)>, String>;
     async fn set_coordinator(&self, shards: &[Vec<String>], replicas: usize) -> Result<(), String>;
+    /// The settings the coordinators were started with
+    /// ([`Spec::coordinator_config`]), if they were made.
+    async fn coordinator_config(&self) -> Result<Option<String>, String>;
+    /// Makes set `id` start its copies with `spec`'s settings, without
+    /// restarting those that run; true when it changed.
+    async fn configure(&self, id: u32, spec: &Spec) -> Result<bool, String>;
+    /// The copies (set and ordinal) running with other settings than
+    /// `spec`'s.
+    async fn stale(&self, spec: &Spec) -> Result<Vec<(u32, usize)>, String>;
+    /// Restarts copy `ordinal` of set `id` with its set's settings; it
+    /// keeps its volume.
+    async fn restart(&self, id: u32, ordinal: usize) -> Result<(), String>;
+    /// Grows every copy's volume smaller than `size` to it; how many it
+    /// asked to grow.
+    async fn grow_volumes(&self, size: &str) -> Result<usize, String>;
     /// The gRPC URL of copy `ordinal` of set `id`.
     fn url(&self, id: u32, ordinal: usize) -> String;
     /// The set and ordinal of the copy at `url`, if it is one of this
@@ -242,6 +313,8 @@ pub struct Server {
     pub up: bool,
     pub role: String,
     pub takes_writes: bool,
+    /// A primary, or a replica its primary says is in sync.
+    pub in_sync: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,19 +336,23 @@ impl View {
         let shards = cluster["shards"].as_array().ok_or_else(|| format!("the coordinator's /v1/cluster has no shards: {cluster}"))?;
         let shards = shards
             .iter()
-            .map(|s| Shard {
-                servers: s["replicas"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|r| Server {
-                        url: r["url"].as_str().unwrap_or_default().to_string(),
-                        up: r["status"] != "down",
-                        role: r["role"].as_str().unwrap_or_default().to_string(),
-                        takes_writes: r["takes_writes"] == true,
-                    })
-                    .collect(),
-                slots: s["slots_held"].as_u64().unwrap_or(0) as usize,
+            .map(|s| {
+                let copies = s["replicas"].as_array().map(Vec::as_slice).unwrap_or_default();
+                // Whether each replica is in sync, as its primary says.
+                let primary = copies.iter().find(|r| r["takes_writes"] == true);
+                let said = primary.and_then(|p| p["detail"]["health"]["replication"]["replicas"].as_array());
+                let in_sync = |url: &str| said.is_some_and(|rs| rs.iter().any(|x| x["url"] == url && x["in_sync"] == true));
+                Shard {
+                    servers: copies
+                        .iter()
+                        .map(|r| {
+                            let url = r["url"].as_str().unwrap_or_default().to_string();
+                            let takes_writes = r["takes_writes"] == true;
+                            Server { in_sync: takes_writes || in_sync(&url), up: r["status"] != "down", role: r["role"].as_str().unwrap_or_default().to_string(), takes_writes, url }
+                        })
+                        .collect(),
+                    slots: s["slots_held"].as_u64().unwrap_or(0) as usize,
+                }
             })
             .collect();
         let moving = !moves["moving"].is_null() || moves["job"]["state"] == "running";
@@ -379,6 +456,11 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
         p.set_coordinator(&now, spec.coordinators).await?;
         return scaling(format!("updating the coordinators ({}) to the cluster's servers", spec.coordinators));
     }
+    if p.coordinator_config().await?.is_some_and(|c| c != spec.coordinator_config()) {
+        let now: Vec<Vec<String>> = view.shards.iter().map(|s| s.servers.iter().map(|r| r.url.clone()).collect()).collect();
+        p.set_coordinator(&now, spec.coordinators).await?;
+        return scaling("restarting the coordinators with the new settings, one at a time".into());
+    }
     if let Err(why) = &view.can_change {
         return Ok(Outcome::new(Phase::Failed, format!("the cluster map cannot change: {why}")));
     }
@@ -477,6 +559,9 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
         admin.post("/v1/admin/rebalance", json!({})).await?;
         return scaling(format!("evening out the slots over {n} shards ({lo} to {hi} each)"));
     }
+    if let Some(o) = roll(spec, p, admin, sets, view).await? {
+        return Ok(o);
+    }
     let down: Vec<&str> = view.shards.iter().flat_map(|s| s.servers.iter().filter(|r| !r.up).map(|r| r.url.as_str())).collect();
     let short = view.shards.iter().enumerate().filter(|(_, s)| s.servers.len() < spec.replicas).map(|(i, _)| i.to_string()).collect::<Vec<_>>();
     if !down.is_empty() {
@@ -486,6 +571,56 @@ async fn act<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view:
         return Ok(Outcome::new(Phase::Scaling, format!("shards {} wait for copies to start", short.join(", "))));
     }
     Ok(Outcome::new(Phase::Ready, format!("{n} shards of {} copies", spec.replicas)))
+}
+
+/// New settings: each set starts its copies with them, the volumes grow,
+/// and the copies running older settings restart one at a time. The next
+/// restarts only once every copy is back and in sync; a primary is first
+/// handed to a copy of its shard in sync, one that runs the new settings
+/// if there is one. A shard of one copy cannot be handed over: its copy
+/// restarts, and its writes wait for it.
+async fn roll<P: Platform>(spec: &Spec, p: &P, admin: &Admin, sets: &[Set], view: &View) -> Result<Option<Outcome>, String> {
+    let scaling = |m: String| Ok(Some(Outcome::new(Phase::Scaling, m)));
+    for set in sets {
+        if p.configure(set.id, spec).await? {
+            return scaling(format!("set {}: new copies start with the new settings", set.id));
+        }
+    }
+    let grown = p.grow_volumes(&spec.storage.size).await?;
+    if grown > 0 {
+        return scaling(format!("growing {grown} volume{} to {}", if grown == 1 { "" } else { "s" }, spec.storage.size));
+    }
+    let stale = p.stale(spec).await?;
+    if stale.is_empty() {
+        return Ok(None);
+    }
+    // One copy at a time: the last one restarted is back (its pod ready,
+    // as the platform says, which knows before the coordinator does) and
+    // every copy is caught up with its primary.
+    let mut unsettled: Vec<String> = sets.iter().flat_map(|s| (0..s.replicas).filter(|k| !s.ready.contains(k)).map(|k| p.url(s.id, k))).collect();
+    for r in view.shards.iter().flat_map(|s| &s.servers).filter(|r| !r.up || !r.in_sync) {
+        if !unsettled.contains(&r.url) {
+            unsettled.push(r.url.clone());
+        }
+    }
+    if !unsettled.is_empty() {
+        return scaling(format!("rolling out the new settings ({} copies left): waiting for {} to be back and caught up", stale.len(), unsettled.join(", ")));
+    }
+    let fresh = |url: &str| !stale.iter().any(|&(id, k)| p.url(id, k) == url);
+    let primary = |url: &str| view.shards.iter().any(|s| s.servers.iter().any(|r| r.url == url && r.takes_writes));
+    // A replica first, so that each primary can go to a restarted copy.
+    let &(id, k) = stale.iter().find(|&&(id, k)| !primary(&p.url(id, k))).unwrap_or(&stale[0]);
+    let url = p.url(id, k);
+    if let Some((i, s)) = view.shards.iter().enumerate().find(|(_, s)| s.servers.iter().any(|r| r.url == url && r.takes_writes)) {
+        let mut to: Vec<&Server> = s.servers.iter().filter(|o| o.url != url && o.up && o.in_sync && o.role == "replica").collect();
+        to.sort_by_key(|o| !fresh(&o.url));
+        if let Some(to) = to.first() {
+            admin.post(&format!("/v1/admin/shards/{i}/promote"), json!({"url": to.url})).await?;
+            return scaling(format!("shard {i}: handing the primary over from {url} to {}, before {url} restarts with the new settings", to.url));
+        }
+    }
+    p.restart(id, k).await?;
+    scaling(format!("restarting {url} with the new settings ({} {} left)", stale.len() - 1, if stale.len() == 2 { "copy" } else { "copies" }))
 }
 
 fn shards_json<P: Platform>(p: &P, view: &View) -> Json {
@@ -499,6 +634,135 @@ fn shards_json<P: Platform>(p: &P, view: &View) -> Json {
             })
             .collect(),
     )
+}
+
+/// `target` with `patch` merged in (RFC 7386: a null removes a field, an
+/// object merges, anything else replaces).
+pub fn merge_patch(target: &mut Json, patch: &Json) {
+    match patch {
+        Json::Object(p) => {
+            if !target.is_object() {
+                *target = json!({});
+            }
+            let t = target.as_object_mut().expect("an object");
+            for (k, v) in p {
+                if v.is_null() {
+                    t.remove(k);
+                } else {
+                    merge_patch(t.entry(k.clone()).or_insert(Json::Null), v);
+                }
+            }
+        }
+        _ => *target = patch.clone(),
+    }
+}
+
+/// The spec `now` (a `StrataCluster`'s, as stored) with `patch` merged in,
+/// both read as specs.
+pub fn patched(now: &Json, patch: &Json) -> Result<(Spec, Spec), String> {
+    let old: Spec = serde_json::from_value(if now.is_null() { json!({}) } else { now.clone() }).map_err(|e| format!("the cluster's spec: {e}"))?;
+    let mut next = if now.is_null() { json!({}) } else { now.clone() };
+    merge_patch(&mut next, patch);
+    let new: Spec = serde_json::from_value(next).map_err(|e| format!("spec: {e}"))?;
+    Ok((old, new))
+}
+
+/// What changing the spec from `old` to `new` changes, and the steps the
+/// operator takes for it, in its order, with what to know before (for
+/// `POST /v1/admin/kube/plan`). `shards_now` and `copies_now` are what the
+/// cluster has; `refused` says why the change cannot be made.
+pub fn plan(old: &Spec, new: &Spec, shards_now: usize, copies_now: usize) -> Json {
+    let o = serde_json::to_value(old).unwrap_or(Json::Null);
+    let n = serde_json::to_value(new).unwrap_or(Json::Null);
+    let mut changes = Vec::new();
+    diff("", &o, &n, &mut changes);
+    let (mut steps, mut warnings, mut refused) = (Vec::<String>::new(), Vec::<String>::new(), None::<String>);
+    if let Err(e) = new.check() {
+        refused = Some(e);
+    }
+    let (from, to) = (quantity(&old.storage.size), quantity(&new.storage.size));
+    if let (Some(a), Some(b)) = (from, to) {
+        if b < a {
+            refused = Some(format!("a volume only grows: {} is smaller than {}", new.storage.size, old.storage.size));
+        }
+    } else if to.is_none() {
+        refused = Some(format!("the volume size {:?} is not one Kubernetes reads (10Gi, 500Mi, 1Ti)", new.storage.size));
+    }
+    if new.coordinators != old.coordinators {
+        steps.push(format!("{} coordinators, from {}", new.coordinators, old.coordinators));
+    }
+    if new.coordinator_config() != old.coordinator_config() {
+        steps.push("the coordinators restart with the new settings, one at a time (Kubernetes rolls the Deployment)".into());
+    }
+    let shards = new.shards;
+    if new.replicas > copies_now {
+        steps.push(format!("each shard's set grows to {} copies; each new copy joins its shard and is sent a copy of the primary ({} new servers)", new.replicas, (new.replicas - copies_now) * shards_now));
+    } else if new.replicas < copies_now {
+        steps.push(format!("the highest copy of each shard leaves it (a primary is handed over first) and its volume is deleted, down to {} copies ({} servers fewer)", new.replicas, (copies_now - new.replicas) * shards_now));
+    }
+    if shards > shards_now {
+        let k = shards - shards_now;
+        steps.push(format!("{k} new shard{} of {} copies start and join the cluster", if k == 1 { "" } else { "s" }, new.replicas));
+        let moved = crate::slots::SLOTS - crate::slots::SLOTS / shards * shards_now;
+        steps.push(format!("the slots even out: about {} of the {} move to the new shard{}, a run at a time, while the cluster serves", moved.min(crate::slots::SLOTS), crate::slots::SLOTS, if k == 1 { "" } else { "s" }));
+    } else if shards < shards_now {
+        let k = shards_now - shards;
+        steps.push(format!("the {} newest shard{} drain{} (each one's slots move to the others), leave{} the cluster, and their volumes are deleted", k, if k == 1 { "" } else { "s" }, if k == 1 { "s" } else { "" }, if k == 1 { "s" } else { "" }));
+    }
+    if new.server_config() != old.server_config() {
+        let copies = shards * new.replicas;
+        steps.push(format!("every server restarts with the new settings, one at a time ({copies} restarts): each primary is handed to a copy already restarted first, and the next waits until every copy is back and caught up"));
+    }
+    if let (Some(a), Some(b)) = (from, to) {
+        if b > a {
+            steps.push(format!("each copy's volume grows from {} to {} (the storage class must allow it)", old.storage.size, new.storage.size));
+        }
+    }
+    if new.storage.storage_class_name != old.storage.storage_class_name {
+        warnings.push("a new storage class applies to the volumes made from now on: the copies that run keep theirs".into());
+    }
+    if new.schema != old.schema || new.demo != old.demo {
+        warnings.push("the first table's schema (or the demo) makes new servers only: change the tables that exist through the coordinator (ALTER TABLE)".into());
+    }
+    if new.replicas == 1 {
+        warnings.push("one copy a shard: losing its server loses the shard until it is back, and its writes stop".into());
+    } else if new.replicas == 2 && new.write_acks != "primary" {
+        warnings.push("two copies a shard: while one is down, its shard stops taking writes (a write waits for a majority, and one of two is not)".into());
+    }
+    if new.failover_after_ms == 0 && new.replicas > 1 {
+        warnings.push("failover by hand: when a primary fails, its shard takes no writes until someone makes a replica its primary".into());
+    }
+    if new.write_acks == "primary" && new.replicas > 1 {
+        warnings.push("a write is answered once the primary has it: a failover may lose the last writes its replicas had not received".into());
+    }
+    if new.token_secret.is_none() {
+        warnings.push("no token: anything that reaches the pods may read, write and change the cluster".into());
+    }
+    if shards < shards_now || new.replicas < copies_now {
+        warnings.push("what goes is deleted with its volumes once its data has moved".into());
+    }
+    if steps.is_empty() && changes.is_empty() {
+        steps.push("nothing: the spec says what it says now".into());
+    }
+    json!({"changes": changes, "steps": steps, "warnings": warnings, "refused": refused, "restarts": new.server_config() != old.server_config(), "spec": n})
+}
+
+/// The leaves where `a` and `b` differ, as `{field, from, to}` with dotted
+/// paths.
+fn diff(at: &str, a: &Json, b: &Json, out: &mut Vec<Json>) {
+    match (a, b) {
+        (Json::Object(x), Json::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                let p = if at.is_empty() { k.clone() } else { format!("{at}.{k}") };
+                diff(&p, x.get(k).unwrap_or(&Json::Null), y.get(k).unwrap_or(&Json::Null), out);
+            }
+        }
+        _ if a != b => out.push(json!({"field": at, "from": a, "to": b})),
+        _ => {}
+    }
 }
 
 /// The `StrataCluster` custom resource definition.
@@ -526,6 +790,7 @@ pub fn crd() -> Json {
             "resources": free("Resources of each server's container."),
             "coordinatorResources": free("Resources of each coordinator's container."),
             "args": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every server."},
+            "coordinatorArgs": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every coordinator."},
         },
     });
     let status = free("What the operator found and does.");
@@ -574,6 +839,36 @@ mod tests {
         serde_json::from_value::<Spec>(json!({"demo": 1, "clusterTokenSecret": "c", "tokenSecret": "t"})).unwrap().check().unwrap();
         let s: Spec = serde_json::from_value(json!({"demo": 30})).unwrap();
         assert_eq!(strata::schema::Schema::from_json(&s.schema_json()).unwrap(), crate::demo::schema(30));
+    }
+
+    #[test]
+    fn a_plan_says_what_a_change_does_and_refuses_what_cannot_be() {
+        let old: Spec = serde_json::from_value(json!({"shards": 2, "demo": 100, "tokenSecret": "t"})).unwrap();
+        let (_, new) = patched(&serde_json::to_value(&old).unwrap(), &json!({"shards": 4, "args": ["--slow-ms", "50"], "storage": {"size": "20Gi"}, "coordinatorArgs": ["--hedge-ms", "40"]})).unwrap();
+        let p = plan(&old, &new, 2, 3);
+        assert!(p["refused"].is_null(), "{p}");
+        let fields: Vec<&str> = p["changes"].as_array().unwrap().iter().map(|c| c["field"].as_str().unwrap()).collect();
+        assert_eq!(fields, ["args", "coordinatorArgs", "shards", "storage.size"]);
+        let steps = p["steps"].to_string();
+        for want in ["coordinators restart", "2 new shards", "about 2048 of the 4096 move", "every server restarts", "(12 restarts)", "from 10Gi to 20Gi"] {
+            assert!(steps.contains(want), "{want}: {steps}");
+        }
+        assert_eq!(p["restarts"], true);
+        assert!(p["warnings"].as_array().unwrap().is_empty(), "{p}");
+        // What cannot be: a smaller volume, a size Kubernetes does not read,
+        // a spec that does not check.
+        let refused = |patch: Json| plan(&old, &patched(&serde_json::to_value(&old).unwrap(), &patch).unwrap().1, 2, 3)["refused"].as_str().unwrap_or_default().to_string();
+        assert!(refused(json!({"storage": {"size": "5Gi"}})).contains("only grows"));
+        assert!(refused(json!({"storage": {"size": "lots"}})).contains("not one Kubernetes reads"));
+        assert!(refused(json!({"shards": 0})).contains("1 or more"));
+        // A null takes a field back to its default; fewer copies warn.
+        let (_, new) = patched(&serde_json::to_value(&old).unwrap(), &json!({"tokenSecret": null, "replicas": 2})).unwrap();
+        let p = plan(&old, &new, 2, 3);
+        assert_eq!(new.token_secret, None);
+        let warnings = p["warnings"].to_string();
+        assert!(warnings.contains("no token") && warnings.contains("two copies a shard") && warnings.contains("deleted with its volumes"), "{warnings}");
+        assert_eq!((quantity("1.5Gi"), quantity("10 Gi"), quantity("-1Gi")), (Some(3 << 29), None, None));
+        assert_eq!((quantity("10Gi"), quantity("500M"), quantity("2Ti")), (Some(10 << 30), Some(500_000_000), Some(2 << 40)));
     }
 
     #[test]
