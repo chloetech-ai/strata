@@ -5,7 +5,11 @@
 //! flushed), then the table's memtable as in-memory segments built with
 //! `build_segment`, one per memtable chunk. Building those is the only
 //! expensive step: it runs outside the state lock, a full chunk's segment
-//! is built once, and the last chunk's is rebuilt only after it grows.
+//! is built once, and the last chunk's, which every write changes, is
+//! built only when a query first needs its indexes ([`Snapshot::segments`]
+//! and what reads through it), once per snapshot. A read by key
+//! ([`Snapshot::find`]) reads that chunk's documents instead, so writes
+//! and reads by key never build it.
 //! While a snapshot is alive it *pins* its txn, so pages it can reach are
 //! not reused.
 //!
@@ -16,7 +20,8 @@
 use std::alloc::Layout;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::postings::bytes::OwnedBytes;
 
@@ -29,7 +34,7 @@ use crate::storage::lock;
 use crate::storage::manifest::RankProfile;
 use crate::storage::pk::PkIndex;
 use crate::storage::rowseq;
-use crate::storage::state::{SegHandle, State};
+use crate::storage::state::{Chunk, SegHandle, State};
 use crate::storage::updates::{Updates, SEQ};
 use crate::value::{Document, Value};
 
@@ -63,7 +68,7 @@ pub(crate) struct SnapInner {
     numbered: bool,
     /// The number of the last transaction it holds (0 unnumbered).
     seq: u64,
-    tables: Vec<TableView>,
+    tables: Vec<TableSlot>,
     /// Mappings the on-disk segments point into.
     maps: Vec<OwnedBytes>,
     path: PathBuf,
@@ -81,6 +86,96 @@ struct TableView {
     n_live: u64,
 }
 
+impl TableView {
+    /// This view with `tail`'s segment after its own.
+    fn with_tail(&self, tail: &Tail) -> TableView {
+        let seg = tail.segment(&self.schema);
+        let p = &tail.part;
+        let mut v = self.clone();
+        v.pks.push(seg.pk);
+        v.segments.push(SegmentView { id: seg.id, file: seg.file, live: p.live.clone().map(|l| l as Arc<dyn DocFilter>), n_live: p.n_live, in_memory: true, updates: p.updates.clone() });
+        v.n_live += p.n_live as u64;
+        v
+    }
+}
+
+/// One table of a snapshot: its view, whose memtable's last chunk is
+/// built as a segment only when a query first needs it.
+struct TableSlot {
+    /// The table's on-disk segments and the memtable chunks already built.
+    base: TableView,
+    /// The memtable's last chunk, while it is not built.
+    tail: Option<Tail>,
+    /// `base` and the tail's segment, once built.
+    full: OnceLock<TableView>,
+}
+
+impl TableSlot {
+    fn built(view: TableView) -> TableSlot {
+        TableSlot { base: view, tail: None, full: OnceLock::new() }
+    }
+
+    /// The whole view, the tail's segment built if it was not.
+    fn view(&self) -> &TableView {
+        match &self.tail {
+            None => &self.base,
+            Some(t) => self.full.get_or_init(|| self.base.with_tail(t)),
+        }
+    }
+
+    fn n_live(&self) -> u64 {
+        self.base.n_live + self.tail.as_ref().map_or(0, |t| t.part.n_live as u64)
+    }
+}
+
+/// The last chunk of a table's memtable, not built yet: its documents, and
+/// how to build its segment.
+pub(crate) struct Tail {
+    pub part: MemPart,
+    pub opts: Arc<BuildOptions>,
+    /// The latest tail segment built, shared with the table's state so that
+    /// the next snapshot of the same chunk takes it.
+    pub cache: Arc<Mutex<Option<MemSeg>>>,
+}
+
+impl Tail {
+    fn segment(&self, schema: &Schema) -> MemSeg {
+        let p = &self.part;
+        if let Some(s) = lock(&self.cache).as_ref().filter(|s| (s.gen, s.chunk, s.len) == (p.gen, p.chunk, p.len)) {
+            return s.clone();
+        }
+        let seg = build_memseg(schema, &self.opts, p, next_mem_id());
+        *lock(&self.cache) = Some(seg.clone());
+        seg
+    }
+
+    /// Position `j` of the chunk's documents, if live.
+    fn live(&self, j: usize) -> bool {
+        self.part.live.as_ref().is_none_or(|l| l.contains(j as DocId))
+    }
+}
+
+/// Ids of in-memory segments have this bit set.
+pub(crate) const MEM_ID: u64 = 1 << 63;
+
+static NEXT_MEM_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh id for an in-memory segment, unique in the process.
+pub(crate) fn next_mem_id() -> u64 {
+    MEM_ID | NEXT_MEM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Where a snapshot found the live row of a primary key ([`Snapshot::find`]).
+pub enum Found<'a> {
+    /// In the memtable's last chunk, not built: the document as written,
+    /// with values set in place since applied, and its sequence number (0
+    /// unnumbered).
+    Memtable { doc: Document, seq: u64 },
+    /// Document `doc` of segment `seg` (an ordinal of
+    /// [`Snapshot::segments`]), whose stored fields are read from `view`.
+    Segment { seg: usize, doc: DocId, view: &'a SegmentView },
+}
+
 impl Snapshot {
     pub(crate) fn of(inner: Arc<SnapInner>) -> Snapshot {
         Snapshot { inner, table: 0 }
@@ -92,8 +187,18 @@ impl Snapshot {
         self.inner.numbered
     }
 
-    fn view(&self) -> &TableView {
+    fn slot(&self) -> &TableSlot {
         &self.inner.tables[self.table]
+    }
+
+    fn view(&self) -> &TableView {
+        self.slot().view()
+    }
+
+    /// The view without the memtable's last chunk when that is not built:
+    /// what needs no index of that chunk reads it.
+    fn base(&self) -> &TableView {
+        &self.slot().base
     }
 
     /// The txn this snapshot reflects.
@@ -138,18 +243,18 @@ impl Snapshot {
 
     /// The schema of the table this snapshot looks at.
     pub fn schema(&self) -> &Schema {
-        &self.view().schema
+        &self.base().schema
     }
 
     /// [`Snapshot::schema`] as the table holds it, shared by snapshots
     /// until the table's schema changes.
     pub(crate) fn shared_schema(&self) -> &Arc<Schema> {
-        &self.view().schema
+        &self.base().schema
     }
 
     /// The rank profiles of the table this snapshot looks at, by name.
     pub fn rank_profiles(&self) -> &[RankProfile] {
-        &self.view().profiles
+        &self.base().profiles
     }
 
     /// Its rank profile named `name` (any case).
@@ -159,24 +264,24 @@ impl Snapshot {
 
     /// The same version, looking at the table named `name` (any case).
     pub fn table(&self, name: &str) -> Option<Snapshot> {
-        let t = self.inner.tables.iter().position(|t| t.schema.table.eq_ignore_ascii_case(name))?;
+        let t = self.inner.tables.iter().position(|t| t.base.schema.table.eq_ignore_ascii_case(name))?;
         Some(Snapshot { inner: self.inner.clone(), table: t })
     }
 
     /// The same version, looking at the table with this id.
     pub(crate) fn table_by_id(&self, id: u32) -> Option<Snapshot> {
-        let t = self.inner.tables.iter().position(|t| t.id == id)?;
+        let t = self.inner.tables.iter().position(|t| t.base.id == id)?;
         Some(Snapshot { inner: self.inner.clone(), table: t })
     }
 
     /// The schemas of every table at this version, in creation order.
     pub fn schemas(&self) -> impl Iterator<Item = &Schema> {
-        self.inner.tables.iter().map(|t| &*t.schema)
+        self.inner.tables.iter().map(|t| &*t.base.schema)
     }
 
     /// The segments of every table at this version.
     pub(crate) fn all_segments(&self) -> impl Iterator<Item = &SegmentView> {
-        self.inner.tables.iter().flat_map(|t| &t.segments)
+        self.inner.tables.iter().flat_map(|t| &t.view().segments)
     }
 
     /// On-disk segments (oldest first), then the memtable's in-memory
@@ -186,7 +291,7 @@ impl Snapshot {
     }
 
     pub fn n_live_docs(&self) -> u64 {
-        self.view().n_live
+        self.slot().n_live()
     }
 
     /// The primary-key index of segment `seg` (`None` without a primary key).
@@ -204,6 +309,63 @@ impl Snapshot {
             let mut docs = pk.lookup_all(key);
             docs.find(|&d| segs[i].live.as_ref().is_none_or(|l| l.contains(d))).map(|d| (i, d))
         })
+    }
+
+    /// The live row with primary key `key`, found without building the
+    /// memtable's last chunk: its documents are read as written, newest
+    /// first, then the segments' key indexes are probed, newest first.
+    /// `None` also in a table without a primary key.
+    pub fn find(&self, key: &Value) -> Option<Found<'_>> {
+        let slot = self.slot();
+        let pk = slot.base.schema.primary_key?;
+        if let Some(t) = &slot.tail {
+            let p = &t.part;
+            let same = |v: &Value| match (v, key) {
+                (Value::Str(a), Value::Str(b)) => a == b,
+                (Value::Int(a), Value::Int(b)) => a == b,
+                _ => false,
+            };
+            if let Some(j) = (0..p.len).rev().find(|&j| same(&p.docs[j][pk]) && t.live(j)) {
+                let mut doc = p.docs[j].clone();
+                if let Some(u) = &p.updates {
+                    u.apply(j as DocId, &mut doc);
+                }
+                let seq = match &p.seqs {
+                    Some(s) => crate::storage::state::mem_seq(p.updates.as_deref().unwrap_or(&Updates::default()), s, j as u32),
+                    None => 0,
+                };
+                return Some(Found::Memtable { doc, seq });
+            }
+        }
+        let v = &slot.base;
+        (0..v.segments.len()).rev().find_map(|i| {
+            let pk = v.pks[i].as_ref()?;
+            let mut docs = pk.lookup_all(key);
+            let seg = &v.segments[i];
+            docs.find(|&d| seg.live.as_ref().is_none_or(|l| l.contains(d))).map(|d| Found::Segment { seg: i, doc: d, view: seg })
+        })
+    }
+
+    /// The same version, through which rows that [`Snapshot::find`] found
+    /// in segments are read without building the memtable's last chunk:
+    /// its segments are those `find` probes (a prefix of
+    /// [`Snapshot::segments`]), and the chunk's rows, which `find` reads
+    /// as written, are not in it. This snapshot itself when the chunk is
+    /// built already, or there is none.
+    pub fn found_view(&self) -> Snapshot {
+        if self.inner.tables.iter().all(|t| t.tail.is_none() || t.full.get().is_some()) {
+            return self.clone();
+        }
+        let tables = self.inner.tables.iter().map(|t| TableSlot::built(t.full.get().unwrap_or(&t.base).clone())).collect();
+        let i = &self.inner;
+        let inner = SnapInner { txn: i.txn, numbered: i.numbered, seq: i.seq, tables, maps: i.maps.clone(), path: i.path.clone(), _pin: i._pin.pins.pin(i._pin.txn) };
+        Snapshot { inner: Arc::new(inner), table: self.table }
+    }
+
+    /// The sequence number of document `doc` of segment `seg` (0 for rows
+    /// from before numbering, or a database that does not number writes).
+    pub fn row_seq_of(seg: &SegmentView, doc: DocId) -> Result<u64> {
+        Ok(row_seq(seg, rowseq::Seqs::of(&seg.file)?.as_ref(), doc))
     }
 
     /// Like [`lookup`](Self::lookup), for a borrowed key (graph traversals
@@ -235,7 +397,7 @@ impl Snapshot {
         let mut tables = Vec::with_capacity(self.inner.tables.len());
         let mut present = std::collections::HashSet::new();
         for t in &self.inner.tables {
-            let mut t = t.clone();
+            let mut t = t.view().clone();
             let place = t.schema.shard_by_field().or(t.schema.primary_key);
             if let Some(place) = place {
                 for (seg, pk) in t.segments.iter_mut().zip(&t.pks) {
@@ -254,7 +416,7 @@ impl Snapshot {
                 }
                 t.n_live = t.segments.iter().map(|s| s.n_live as u64).sum();
             }
-            tables.push(t);
+            tables.push(TableSlot::built(t));
         }
         mask.forget_except(&present);
         let i = &self.inner;
@@ -506,7 +668,10 @@ pub(crate) struct MemPart {
     pub gen: u64,
     pub chunk: usize,
     pub len: usize,
-    pub docs: Arc<Vec<Document>>,
+    pub docs: Arc<Chunk>,
+    /// The memtable's last chunk, still filling: built only when a query
+    /// needs it ([`Tail`]).
+    pub last: bool,
     pub live: Option<Arc<LiveDocs>>,
     pub n_live: u32,
     /// Already built, if the cache held this prefix.
@@ -524,6 +689,7 @@ pub(crate) struct TableCapture {
     profiles: Arc<Vec<RankProfile>>,
     disk: Vec<(Arc<SegHandle>, Option<Arc<LiveDocs>>, u32, Option<Arc<Updates>>)>,
     pub mem: Vec<MemPart>,
+    tail_cache: Arc<Mutex<Option<MemSeg>>>,
 }
 
 /// Everything a snapshot needs, taken under the state lock.
@@ -589,14 +755,19 @@ impl State {
                     f
                 }));
             }
-            let seg = table.memsegs.get(k).and_then(|s| s.as_ref()).filter(|s| (s.gen, s.len) == (gen, len)).cloned();
+            let mut seg = table.memsegs.get(k).and_then(|s| s.as_ref()).filter(|s| (s.gen, s.len) == (gen, len)).cloned();
+            if seg.is_none() {
+                seg = lock(&table.tail).as_ref().filter(|s| (s.gen, s.chunk, s.len) == (gen, k, len)).cloned();
+            }
             let docs = table.mem.chunks[k].clone();
             let first = k * table.mem.chunk;
+            let last = k + 1 == n_chunks && len < table.mem.chunk;
             let updates = Some(table.mem.updates.slice(first as DocId, len as u32)).filter(|u| !u.is_empty()).map(Arc::new);
-            let seqs = (numbered && seg.is_none()).then(|| (first..first + len).map(|p| table.mem.seqs.get(p).copied().unwrap_or(0)).collect());
-            mem.push(MemPart { table: table.id, gen, chunk: k, len, docs, live, n_live: (len - n_deleted) as u32, seg, updates, seqs });
+            // The tail's numbers are read by key too, built or not.
+            let seqs = (numbered && (seg.is_none() || last)).then(|| (first..first + len).map(|p| table.mem.seqs.get(p).copied().unwrap_or(0)).collect());
+            mem.push(MemPart { table: table.id, gen, chunk: k, len, docs, last, live, n_live: (len - n_deleted) as u32, seg, updates, seqs });
         }
-        TableCapture { id: table.id, schema: table.schema.clone(), profiles: table.profiles.clone(), disk, mem }
+        TableCapture { id: table.id, schema: table.schema.clone(), profiles: table.profiles.clone(), disk, mem, tail_cache: table.tail.clone() }
     }
 
     /// The cached segment of the first `len` documents of chunk `k` of
@@ -634,17 +805,22 @@ pub(crate) fn page_aligned(image: &[u8]) -> OwnedBytes {
 pub(crate) fn build_memseg(schema: &Schema, opts: &BuildOptions, part: &MemPart, id: u64) -> MemSeg {
     // The documents were validated when they were written, so a failure
     // here is a bug in an index builder.
-    let image = rowseq::build(schema, &part.docs[..part.len], part.seqs.as_deref(), opts).expect("building a memtable segment");
+    let docs = part.docs.to_vec(part.len);
+    let image = rowseq::build(schema, &docs, part.seqs.as_deref(), opts).expect("building a memtable segment");
     let file = SegmentFile::open(OwnedBytes::new(PageAligned::new(&image))).expect("memtable segment opens");
     let pk = PkIndex::open(&file).expect("memtable pk index");
     MemSeg { gen: part.gen, chunk: part.chunk, len: part.len, id, file, pk }
 }
 
 impl Capture {
-    pub(crate) fn assemble(self, path: PathBuf) -> SnapInner {
+    /// The snapshot, from what was captured once every memtable chunk but
+    /// each table's last one is built; that one is built with `opts` when
+    /// a query needs it.
+    pub(crate) fn assemble(self, path: PathBuf, opts: &Arc<BuildOptions>) -> SnapInner {
         let mut maps: Vec<OwnedBytes> = Vec::new();
         let mut tables = Vec::with_capacity(self.tables.len());
         for t in self.tables {
+            let mut tail = None;
             let mut segments = Vec::with_capacity(t.disk.len() + t.mem.len());
             let mut pks = Vec::with_capacity(t.disk.len() + t.mem.len());
             for (h, live, n_live, updates) in t.disk {
@@ -662,7 +838,11 @@ impl Capture {
                 });
             }
             for m in t.mem {
-                let seg = m.seg.expect("memtable segment built before assembly");
+                let Some(seg) = m.seg.clone() else {
+                    assert!(m.last, "memtable segment built before assembly");
+                    tail = Some(Tail { part: m, opts: opts.clone(), cache: t.tail_cache.clone() });
+                    continue;
+                };
                 pks.push(seg.pk);
                 segments.push(SegmentView {
                     id: seg.id,
@@ -674,7 +854,8 @@ impl Capture {
                 });
             }
             let n_live = segments.iter().map(|s| s.n_live as u64).sum();
-            tables.push(TableView { id: t.id, schema: t.schema, profiles: t.profiles, segments, pks, n_live });
+            let base = TableView { id: t.id, schema: t.schema, profiles: t.profiles, segments, pks, n_live };
+            tables.push(TableSlot { base, tail, full: OnceLock::new() });
         }
         SnapInner { txn: self.txn, numbered: self.numbered, seq: self.seq, tables, maps, path, _pin: self.pin }
     }

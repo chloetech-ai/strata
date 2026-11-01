@@ -451,6 +451,21 @@ pub(crate) fn keyed_rows(schema: &Schema, keys: Vec<Value>) -> Result<Select> {
     Ok(Select { projection, filter, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types, guard: None, per: None })
 }
 
+/// The fields `SELECT *` answers, by position: the stored ones but
+/// vectors.
+pub fn star_fields(schema: &Schema) -> impl Iterator<Item = usize> + '_ {
+    schema.fields.iter().enumerate().filter(|(_, f)| f.stored && !matches!(f.ty, FieldType::Vector { .. })).map(|(i, _)| i)
+}
+
+/// A query of fields `fields` (positions) of the rows with no key, typed
+/// as an answer types them: what reads by key project the rows they find
+/// with ([`crate::db::Db::get_many_at`]).
+pub(crate) fn fields_select(schema: &Schema, fields: &[usize]) -> Select {
+    let projection: Vec<(String, Projection)> = fields.iter().map(|&i| (schema.fields[i].name.clone(), Projection::Field(i))).collect();
+    let types = projection_types(schema, &projection);
+    Select { projection, filter: Pred::False, order: None, group_by: Vec::new(), having: None, tiebreak: None, phases: Vec::new(), limit: None, offset: 0, graphs: Vec::new(), types, guard: None, per: None }
+}
+
 fn every_field(schema: &Schema) -> Vec<(String, Projection)> {
     schema.fields.iter().enumerate().map(|(i, f)| (f.name.clone(), Projection::Field(i))).collect()
 }
@@ -955,11 +970,7 @@ impl<'a> Binder<'a> {
                 sql::SelectItem::UnnamedExpr(e) => (e, None),
                 sql::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
                 sql::SelectItem::Wildcard(_) => {
-                    for (i, f) in self.schema.fields.iter().enumerate() {
-                        if f.stored && !matches!(f.ty, FieldType::Vector { .. }) {
-                            projection.push((f.name.clone(), Projection::Field(i)));
-                        }
-                    }
+                    projection.extend(star_fields(self.schema).map(|i| (self.schema.fields[i].name.clone(), Projection::Field(i))));
                     continue;
                 }
                 _ => return Err(err("unsupported select item")),

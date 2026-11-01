@@ -252,6 +252,13 @@ pub struct ExecOptions {
     /// `DISTINCT`, groups of derived rows): [`Engine::from_env`] by
     /// default.
     pub engine: Engine,
+    /// The time (microseconds since the epoch) at which rows of a table
+    /// with `expire_by` ([`crate::schema::Schema::with_expire_by`]) have
+    /// expired if their time is at or before it: `None` takes the time the
+    /// query starts. A coordinator gives its shards one time.
+    pub now: Option<i64>,
+    /// Keep expired rows: what deletes them looks for them with it.
+    pub expired: bool,
 }
 
 /// The engine of a plan's operators ([`crate::query::ops`] or
@@ -318,6 +325,8 @@ impl Default for ExecOptions {
             memory: None,
             profile: false,
             engine: Engine::from_env(),
+            now: None,
+            expired: false,
         }
     }
 }
@@ -653,6 +662,12 @@ pub struct Executor<'a> {
     clock: Clock,
 }
 
+/// The rows of a table that have not expired at `now`: those without a
+/// time in its `expire_by` field `f`, or with a later one.
+pub fn unexpired(f: usize, now: i64) -> Pred {
+    Pred::Or(vec![Pred::Not(Box::new(Pred::Present { field: f })), Pred::IntRange { field: f, lo: now.saturating_add(1), hi: i64::MAX }])
+}
+
 /// Searches with their synonyms and typos resolved to indexed terms.
 #[derive(Default)]
 struct Expanded {
@@ -777,6 +792,20 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// `q` without the rows that have expired ([`ExecOptions::now`]), unless
+    /// its table has no `expire_by` or [`ExecOptions::expired`] keeps them.
+    fn unexpired<'q>(&self, q: &'q Select) -> std::borrow::Cow<'q, Select> {
+        match self.schema.expire_field() {
+            Some(f) if !self.opts.expired => {
+                let now = self.opts.now.unwrap_or_else(crate::timestamp::now);
+                let mut q = q.clone();
+                q.filter = Pred::And(vec![std::mem::replace(&mut q.filter, Pred::True), unexpired(f, now)]);
+                std::borrow::Cow::Owned(q)
+            }
+            _ => std::borrow::Cow::Borrowed(q),
+        }
+    }
+
     /// A step begins ([`steps`]).
     fn mark(&self) -> Mark {
         self.clock.mark(&self.stats.steps)
@@ -860,6 +889,8 @@ impl<'a> Executor<'a> {
     /// children of a prefix are found by jumping through the field's
     /// sorted dictionary, past each child's own children.
     pub fn sid_next(mut self, q: &Select, field: usize, prefixes: &[String]) -> Result<Vec<Vec<(String, u64)>>> {
+        let unexpired = self.unexpired(q);
+        let q = unexpired.as_ref();
         let mut counts: Vec<std::collections::BTreeMap<u32, u64>> = vec![Default::default(); prefixes.len()];
         let segs = self.segs.clone();
         for s in segs.iter() {
@@ -901,6 +932,8 @@ impl<'a> Executor<'a> {
     /// rows left out: the segments' terms read in one merge, in term order,
     /// each counted over those rows, then each path's runs of a type.
     pub fn json_paths(mut self, q: &Select, field: usize, call: &crate::query::paths::Call) -> Result<crate::query::paths::Paths> {
+        let unexpired = self.unexpired(q);
+        let q = unexpired.as_ref();
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let runs = call.runs();
@@ -1010,6 +1043,13 @@ impl<'a> Executor<'a> {
     /// items, deleted rows left out. No levels when the guard has no items
     /// to count (a `bm25` text without optional words).
     pub fn guard_counts(&mut self, q: &Select) -> Result<(usize, Vec<u64>)> {
+        let unexpired = self.unexpired(q);
+        self.level_counts(unexpired.as_ref())
+    }
+
+    /// [`Executor::guard_counts`] of a query whose expired rows are left
+    /// out already.
+    fn level_counts(&mut self, q: &Select) -> Result<(usize, Vec<u64>)> {
         let Some(g) = &q.guard else { return Ok((0, Vec::new())) };
         // A bm25 site's options, and its MATCH filter at level m.
         let bm25 = |m: Option<usize>| -> Result<(usize, Option<String>)> {
@@ -1084,7 +1124,7 @@ impl<'a> Executor<'a> {
         if self.opts.shard {
             return Err(err("a guarded query (min_rows, max_rows) runs on shards at the level its coordinator chose"));
         }
-        let (n, counts) = self.guard_counts(q)?;
+        let (n, counts) = self.level_counts(q)?;
         if counts.is_empty() {
             self.stats.plan.push("guard: no items to count".into());
             return Ok(Some(q.at_level(n)));
@@ -1092,6 +1132,15 @@ impl<'a> Executor<'a> {
         let m = g.level(n, &counts);
         self.stats.plan.push(g.line(n, &counts, m));
         Ok(Some(q.at_level(m)))
+    }
+
+    /// The rows of `q`'s projection at these places (segment ordinal and
+    /// docID), in their order, as [`Executor::execute`] would give them
+    /// before typing them ([`Select::typed`]): what reads by key fetch
+    /// once they have found their rows ([`crate::db::Db::get_many_at`]).
+    pub fn rows_at(self, q: &Select, at: &[(usize, DocId)]) -> Result<Vec<Vec<Value>>> {
+        let hits: Vec<Hit> = at.iter().map(|&(seg, doc)| Hit { seg, doc, score: f64::NAN }).collect();
+        self.project(q, &hits)
     }
 
     pub fn execute(self, q: &Select) -> Result<ResultSet> {
@@ -1112,6 +1161,8 @@ impl<'a> Executor<'a> {
     }
 
     fn answer(mut self, q: &Select, arrow_over: Option<usize>) -> Result<Leaf> {
+        let unexpired = self.unexpired(q);
+        let q = unexpired.as_ref();
         let m = self.mark();
         let settled = self.settle_guard(q)?;
         if q.guard.is_some() {
