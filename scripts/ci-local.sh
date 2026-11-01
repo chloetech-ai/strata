@@ -296,9 +296,12 @@ elif [ -z "$CI_LOCAL_TREE" ]; then
     fi
     next=$WORK/scripts/ci-local.sh
     [ -f "$next" ] || next=$SELF
+    # A copy of its own: bash reads a script as it goes, so an edit or a
+    # checkout of the file during the hour of a run would change its end.
+    cp "$next" "$CI_HOME/ci-local.run.sh"
     export CI_LOCAL_TREE=$WORK CI_LOCAL_HEAD=$HEAD_SHA CI_LOCAL_BASE=$BASE_SHA CI_LOCAL_SLUG=$SLUG CI_LOCAL_PR=$PR
     # exec keeps the pid that `running` holds.
-    exec bash "$next" "${ARGS[@]}"
+    exec bash "$CI_HOME/ci-local.run.sh" "${ARGS[@]}"
 fi
 
 # --- 2. the run, in the tree ---------------------------------------------
@@ -635,17 +638,35 @@ signal_tree() {
     for p in $list; do kill -"$1" "$p" 2>/dev/null; done
 }
 
-# The test executables a job ran: most of a target directory (each of
-# strata's test binaries holds all of Strata), and linked again after any
-# change to their crate, so keeping them saves little. Only those its log
-# names go (cargo test's Running lines, nextest's list), so that a job in the
-# other lane keeps its own; compiled dependencies and release builds stay.
+# The executables a job linked, tests and the crates' tools (strata's are
+# 50 to 115 MB each, one set per feature set): most of a target directory,
+# and linked again after any change to their crate, so keeping them saves
+# little. Compiled dependencies, release builds and Miri's stay.
+prune_dirs() {
+    find "$@" \( -path '*/release' -o -path '*/miri-*' \) -prune -o \
+        -path '*/deps/*' -type f -perm -u+x ! -name '*.*' -exec rm -f {} + 2>/dev/null
+    return 0
+}
+
+# After a job: with one lane, every crate's; with two, the target directories
+# only this lane's jobs link into (strata's for lane 1, engram's and the
+# Python package's for lane 2), and in strata-server's, which both use, the
+# test executables the job's log names (cargo test's Running lines,
+# nextest's list). The rest goes when the run ends.
 prune_job() {
     local rel crate
+    if [ "$LANES" = 1 ]; then
+        prune_dirs strata/target strata-server/target engram/target strata-py/target
+        return 0
+    fi
+    case "$LANE" in
+        1) prune_dirs strata/target ;;
+        2) prune_dirs engram/target strata-py/target ;;
+    esac
     { sed -n 's/^ *Running .* (\(target\/[^)]*\))$/\1/p' "$1"; cat "$1.binaries" 2>/dev/null; } | sort -u | while read -r rel; do
         case "$rel" in
             /*) rm -f "$rel" ;;
-            *) for crate in strata strata-server engram strata-py; do rm -f "$crate/$rel"; done ;;
+            *) rm -f "strata-server/$rel" ;;
         esac
     done
     return 0
@@ -688,6 +709,7 @@ run_job() {
 # so with lane-N.paused; the supervisor freezes Miri once every lane waits.
 run_lane() {
     local lane=$1 name
+    LANE=$lane
     for name in $(job_names); do
         [ "$name" = miri ] && continue
         selected "$name" && affected "$name" || continue
@@ -856,6 +878,7 @@ else
         LANE_PIDS="$LANE_PIDS $!"
     done
     supervise
+    [ "$KEEP_BINARIES" = 1 ] || prune_dirs strata/target strata-server/target engram/target strata-py/target
     finish_miri
 fi
 
