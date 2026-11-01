@@ -77,12 +77,13 @@ from .build import (
 from ._strata import StrataError
 from .client import Client
 from .ngrams import next_items
-from .result import Result
+from .result import ArrowResult, Result
 
 __all__ = [
     "Database",
     "Client",
     "Result",
+    "ArrowResult",
     "StrataError",
     "open",
     "connect",
@@ -251,6 +252,13 @@ class Database(Search):
     def query(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> Result:
         """Runs a SELECT."""
         return Result._of(self._db.query(sql, _params(params, kw)))
+
+    def query_arrow(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> ArrowResult:
+        """Runs a SELECT: its answer as Arrow columns, which pyarrow,
+        polars and pandas read without copying (`ArrowResult`)."""
+        if not hasattr(self._db, "query_arrow"):
+            raise StrataError("this build of strata has no Arrow: build it with the feature datafusion (the default)")
+        return ArrowResult(self._db.query_arrow(sql, _params(params, kw)))
 
     def sql(self, sql: str, params: Mapping[str, Any] | None = None, **kw: Any) -> Result | int:
         """Runs any statement: a SELECT's `Result`, or the number of rows an

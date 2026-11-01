@@ -15,12 +15,17 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.30", features = ["abi3-py310"] }
 strata = { path = "../strata", features = ["sqlite"] }
 serde_json = "1"
+# Answers as Arrow (`Database.query_arrow`), handed to Python through the
+# Arrow C stream interface: the Arrow that DataFusion, and so Strata, uses.
+arrow-array = { version = "59", default-features = false, features = ["ffi"], optional = true }
+arrow-schema = { version = "59", default-features = false, features = ["ffi"], optional = true }
 
 [features]
 default = ["datafusion"]
 # DataFusion as the engine of joins, groups and sorts over a few thousand
 # rows or more (`strata::query::df`); the default engine picks it by size.
-datafusion = ["strata/datafusion"]
+# Answers as Arrow tables (`Database.query_arrow`) come with it.
+datafusion = ["strata/datafusion", "dep:arrow-array", "dep:arrow-schema"]
 # BERT embedding models (`bert`), with Apple's Accelerate on a Mac
 # (`accelerate`); Model2Vec models need neither.
 bert = ["strata/bert"]

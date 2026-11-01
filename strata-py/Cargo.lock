@@ -167,6 +167,7 @@ dependencies = [
  "chrono-tz",
  "half",
  "hashbrown 0.17.1",
+ "libc",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -307,6 +308,7 @@ version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e87acb0c6bf6237fca7a50d7b51e801c98a18a5fe6f3bb34f7d77b85ca165388"
 dependencies = [
+ "bitflags 2.13.2",
  "serde_core",
  "serde_json",
 ]
@@ -3658,6 +3660,8 @@ dependencies = [
 name = "strata-py"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "pyo3",
  "serde_json",
  "strata",

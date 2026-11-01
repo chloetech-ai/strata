@@ -7,6 +7,9 @@
 //! API ([`strata::ingest`]). Every call that reads or writes the database
 //! releases the GIL.
 
+#[cfg(feature = "datafusion")]
+mod arrow;
+
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -306,6 +309,16 @@ impl Database {
         let p = params_json(params)?;
         let rs = py.detach(|| self::params(&db, &p).and_then(|p| db.query(sql, &p))).map_err(err)?;
         result_py(py, &rs)
+    }
+
+    /// Runs a SELECT; returns its answer as Arrow columns, which Python
+    /// libraries take without copying them (feature `datafusion`).
+    #[cfg(feature = "datafusion")]
+    #[pyo3(signature = (sql, params = None))]
+    fn query_arrow(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyDict>>) -> PyResult<arrow::Arrow> {
+        let db = self.get()?;
+        let p = params_json(params)?;
+        py.detach(|| self::params(&db, &p).and_then(|p| db.query_leaf(sql, &p)).and_then(arrow::Arrow::of)).map_err(err)
     }
 
     /// Runs any statement: a SELECT's answer as `query` gives it, or the
@@ -715,6 +728,8 @@ fn upgrade(py: Python<'_>, path: PathBuf) -> PyResult<Option<(PathBuf, usize, u6
 #[pymodule]
 fn _strata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
+    #[cfg(feature = "datafusion")]
+    m.add_class::<arrow::Arrow>()?;
     m.add_function(wrap_pyfunction!(train_codebook, m)?)?;
     m.add_function(wrap_pyfunction!(upgrade, m)?)?;
     m.add("StrataError", m.py().get_type::<StrataError>())?;
