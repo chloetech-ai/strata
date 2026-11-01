@@ -64,15 +64,7 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
         return Err(Error::Query(format!("ranking model {m} is not open on the coordinator: it opens a plan's models from its models directory")));
     }
     let columns: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
-    let mut stats = ExecStats::default();
-    for (i, s) in shards.iter().enumerate() {
-        stats.filter_docs += s.stats.filter_docs;
-        stats.scored += s.stats.scored;
-        stats.reranked += s.stats.reranked;
-        stats.plan.extend(s.stats.plan.iter().map(|l| format!("shard {i}: {l}")));
-        // Each shard's steps, which its caller put on one clock.
-        stats.nest(&s.stats, 0);
-    }
+    let mut stats = shards_stats(&shards);
     let empty = |rows, stats| ResultSet { columns: columns.clone(), rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats };
     // Groups and aggregates: each shard returns its groups with partial
     // aggregates.
@@ -178,6 +170,68 @@ pub fn merge(q: &Select, shards: Vec<ResultSet>) -> Result<ResultSet> {
     }
     q.typed(&mut out.rows);
     Ok(out)
+}
+
+/// The statistics of the shards' answers, summed, their plan lines and
+/// steps (on one clock, as their caller put them) each shard's in turn.
+fn shards_stats(shards: &[ResultSet]) -> ExecStats {
+    let mut stats = ExecStats::default();
+    for (i, s) in shards.iter().enumerate() {
+        stats.filter_docs += s.stats.filter_docs;
+        stats.scored += s.stats.scored;
+        stats.reranked += s.stats.reranked;
+        stats.plan.extend(s.stats.plan.iter().map(|l| format!("shard {i}: {l}")));
+        stats.nest(&s.stats, 0);
+    }
+    stats
+}
+
+/// [`merge`] of the shards' answers to `q`, a query that [`concatenates`],
+/// which answered with Arrow columns: `shards` holds each answer's
+/// statistics (and the rows of those that answered rows), `columns` the
+/// Arrow answers. The rows one after another, the LIMIT and OFFSET
+/// applied, or `None` where one answered rows (it could not make its
+/// columns, of values of several types) or the columns' types differ
+/// ([`crate::query::arrow::concat_columns`]): the rows are then asked
+/// for again.
+#[cfg(feature = "datafusion")]
+pub fn merge_columns(q: &Select, shards: &[ResultSet], columns: Vec<Option<crate::query::arrow::Columns>>) -> Result<Option<crate::query::arrow::Columns>> {
+    use crate::query::arrow::{self, Columns};
+    let names: Vec<String> = q.projection.iter().map(|(n, _)| n.clone()).collect();
+    let mut parts: Vec<Columns> = Vec::with_capacity(columns.len());
+    for (s, c) in shards.iter().zip(columns) {
+        match c {
+            Some(c) if c.names.len() == names.len() => parts.push(c),
+            Some(c) => return Err(err(format!("a shard answered {} columns for {}", c.names.len(), names.len()))),
+            // A shard without rows answers no columns.
+            None if s.rows.is_empty() => {}
+            None => return Ok(None),
+        }
+    }
+    let stats = shards_stats(shards);
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let Some(mut all) = arrow::concat_columns(parts, stats)? else { return Ok(None) };
+    all.names = names;
+    Ok(Some(all.slice(q.offset, q.limit)))
+}
+
+/// Whether [`merge`] puts the shards' answers to `q` one after another, a
+/// LIMIT and OFFSET aside: a query without an order, groups, aggregates,
+/// a count, rerank phases, graphs, a guard or scores, as the leaves of a
+/// compound query that reads a table whole often are. Their shards may
+/// answer with Arrow columns ([`crate::query::arrow::concat_columns`]).
+pub fn concatenates(q: &Select) -> bool {
+    q.order.is_none()
+        && q.group_by.is_empty()
+        && q.having.is_none()
+        && q.phases.is_empty()
+        && q.graphs.is_empty()
+        && q.guard.is_none()
+        && q.per.is_none()
+        && !agg::is_general(q, |_| false)
+        && !q.projection.iter().any(|(_, p)| matches!(p, Projection::Count | Projection::Agg { .. } | Projection::Score))
 }
 
 /// Whether `q` scores BM25 (a `bm25` leaf of its ranking, alone or in an

@@ -44,7 +44,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanBuilder, Float64Array, Float64Builder, Int64Builder, UInt64Array,
 };
 use datafusion::arrow::compute::kernels::numeric;
-use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Column as DfColumn, DFSchema, DataFusionError, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
@@ -2233,60 +2233,10 @@ fn slices(batch: &RecordBatch, n: usize) -> Vec<RecordBatch> {
     (0..rows).step_by(n).map(|at| batch.slice(at, n.min(rows - at))).collect()
 }
 
-/// The values of an Arrow array, as Strata gives them.
+/// The values of an Arrow array, as Strata gives them
+/// ([`arrow::values_of`]).
 fn values_of(a: &ArrayRef) -> R<Vec<Value>> {
-    use datafusion::arrow::datatypes as t;
-    let n = a.len();
-    let mut out = Vec::with_capacity(n);
-    macro_rules! each {
-        ($arr:expr, $f:expr) => {{
-            let arr = $arr;
-            for i in 0..n {
-                out.push(if arr.is_null(i) { Value::Null } else { $f(arr.value(i)) });
-            }
-        }};
-    }
-    match a.data_type() {
-        DataType::Null => out.resize(n, Value::Null),
-        DataType::Boolean => each!(a.as_boolean(), Value::Bool),
-        DataType::Int8 => each!(a.as_primitive::<t::Int8Type>(), |x| Value::Int(x as i64)),
-        DataType::Int16 => each!(a.as_primitive::<t::Int16Type>(), |x| Value::Int(x as i64)),
-        DataType::Int32 => each!(a.as_primitive::<t::Int32Type>(), |x| Value::Int(x as i64)),
-        DataType::Int64 => each!(a.as_primitive::<t::Int64Type>(), Value::Int),
-        DataType::UInt8 => each!(a.as_primitive::<t::UInt8Type>(), |x| Value::Int(x as i64)),
-        DataType::UInt16 => each!(a.as_primitive::<t::UInt16Type>(), |x| Value::Int(x as i64)),
-        DataType::UInt32 => each!(a.as_primitive::<t::UInt32Type>(), |x| Value::Int(x as i64)),
-        DataType::UInt64 => each!(a.as_primitive::<t::UInt64Type>(), |x: u64| i64::try_from(x).map_or(Value::Float(x as f64), Value::Int)),
-        DataType::Float32 => each!(a.as_primitive::<t::Float32Type>(), |x| Value::Float(x as f64)),
-        DataType::Float64 => each!(a.as_primitive::<t::Float64Type>(), Value::Float),
-        // An exact sum: an INT where it fits, else a FLOAT.
-        DataType::Decimal128(_, 0) => each!(a.as_primitive::<t::Decimal128Type>(), |x: i128| i64::try_from(x).map_or(Value::Float(x as f64), Value::Int)),
-        DataType::Decimal128(_, s) => {
-            let s = *s as i32;
-            each!(a.as_primitive::<t::Decimal128Type>(), |x: i128| Value::Float(x as f64 / 10f64.powi(s)))
-        }
-        DataType::Utf8 => each!(a.as_string::<i32>(), |s: &str| Value::Str(s.to_string())),
-        DataType::LargeUtf8 => each!(a.as_string::<i64>(), |s: &str| Value::Str(s.to_string())),
-        DataType::Utf8View => each!(a.as_string_view(), |s: &str| Value::Str(s.to_string())),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => each!(a.as_primitive::<t::TimestampMicrosecondType>(), Value::Timestamp),
-        DataType::List(f) => {
-            let list = a.as_list::<i32>();
-            let vector = matches!(f.data_type(), DataType::Float32);
-            for i in 0..n {
-                if list.is_null(i) {
-                    out.push(Value::Null);
-                    continue;
-                }
-                let inner = list.value(i);
-                out.push(match vector {
-                    true => Value::Vector(inner.as_primitive::<t::Float32Type>().values().iter().copied().collect()),
-                    false => Value::List(values_of(&inner)?),
-                });
-            }
-        }
-        t => return no(format!("an answer column of type {t}")),
-    }
-    Ok(out)
+    Ok(arrow::values_of(a)?)
 }
 
 /// The values of the arguments, row by row.

@@ -483,6 +483,12 @@ message QueryRequest {
   // coordinator sends it to its shards with the query that asked it. A
   // server that does not know the field answers the steps without them.
   bool profile = 15;
+  // Protocol 10: a leaf of a coordinator's compound query that DataFusion
+  // runs above the shards, whose answers the coordinator puts one after
+  // another (no order, groups or scores: strata::cluster::concatenates):
+  // answer its rows as Arrow columns (QueryResponse.arrow) where they can
+  // be, and as rows otherwise.
+  bool arrow = 16;
 }
 
 // A plan (strata::query::ir): a statement as a tree of operators over typed
@@ -1180,6 +1186,12 @@ message QueryResponse {
   double took_ms = 7;
   // With hold: the lease on the snapshot the query read.
   uint64 snapshot = 8;
+  // With QueryRequest.arrow: the rows as one Arrow IPC stream, its columns
+  // named by their places: one for each of `columns`, then the rows' keys,
+  // then their scores (FLOAT, or NULL for none); rows, keys and scores are
+  // then empty. Empty when the rows are answered as rows: none, or values of
+  // several types in a column.
+  bytes arrow = 9;
 }
 
 message TermStatsResponse {
