@@ -305,11 +305,12 @@ unset RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_TARGET_DIR
 # target the kernels job runs under Rosetta; Miri's nightly when it runs.
 find_rustup() {
     local r
-    for r in "$(command -v rustup 2>/dev/null)" "$CI_HOME/bin/rustup"; do
+    # Homebrew's rustup is keg-only: not on PATH unless linked.
+    for r in "$(command -v rustup 2>/dev/null)" /opt/homebrew/opt/rustup/bin/rustup /usr/local/opt/rustup/bin/rustup "$CI_HOME/bin/rustup"; do
         [ -n "$r" ] && "$r" --version >/dev/null 2>&1 && { echo "$r"; return 0; }
     done
-    # Homebrew's rustup formula installs only rustup-init, which is rustup
-    # when it runs under that name.
+    # Older Homebrew formulas install only rustup-init, which is rustup when
+    # it runs under that name.
     mkdir -p "$CI_HOME/bin"
     for r in /opt/homebrew/opt/rustup/bin/rustup-init /usr/local/opt/rustup/bin/rustup-init "$CI_HOME/bin/rustup-init"; do
         if [ -x "$r" ]; then
@@ -531,12 +532,21 @@ job_python() {
 }
 
 # Miri, on the pinned nightly, with no RUSTFLAGS (a portable build: Miri has
-# no CPUID). Each part has a target directory of its own, so that the three
-# run at once, each on one thread as Miri does.
+# no CPUID), interpreting x86-64 Linux as on GitHub whatever the machine: on
+# aarch64 Strata's NEON kernels are compiled in unconditionally, and Miri
+# runs neither their intrinsics nor their inline assembly. Each part has a
+# target directory of its own, so that the three run at once, each on one
+# thread as Miri does.
+MIRI_TARGET=x86_64-unknown-linux-gnu
+miri() {
+    local dir=$1 sub=$2
+    shift 2
+    PATH=$NIGHTLY_BIN:$PATH RUSTFLAGS="" MIRIFLAGS=-Zmiri-disable-isolation CARGO_TARGET_DIR=target/$dir \
+        cargo miri "$sub" --target "$MIRI_TARGET" "$@"
+}
 miri_part() {
     cd strata
-    PATH=$NIGHTLY_BIN:$PATH RUSTFLAGS="" MIRIFLAGS=-Zmiri-disable-isolation CARGO_TARGET_DIR=target/miri-$1 \
-        cargo miri test --no-default-features --lib -- $2
+    miri "miri-$1" test --no-default-features --lib -- $2
 }
 
 # --- running them ----------------------------------------------------------
@@ -602,7 +612,7 @@ run_job() {
 start_miri() {
     local i=0 label tests
     # The sysroot first, once: the three parts would each build it.
-    (cd strata && PATH=$NIGHTLY_BIN:$PATH cargo miri setup) >"$RUN_DIR/miri-setup.log" 2>&1 \
+    (cd strata && miri miri-1 setup) >"$RUN_DIR/miri-setup.log" 2>&1 \
         || { record "miri (setup)" failure 0; FAILED=1; echo "  miri: the sysroot did not build ($RUN_DIR/miri-setup.log)"; return; }
     while IFS='|' read -r label tests; do
         i=$((i + 1))
