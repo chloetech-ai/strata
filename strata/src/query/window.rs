@@ -154,7 +154,7 @@ fn values(rows: &[Vec<Value>], sorted: &[usize], w: &WindowFn, keys: &[&[Value]]
                     bounds.iter().map(|&(lo, hi)| match lo.checked_add(*k as usize - 1).filter(|&j| j < hi) { Some(j) => arg(a, j), None => Ok(Value::Null) }).collect::<Result<_>>()?
                 }
                 WindowFunc::Agg(a) => {
-                    let new = || Acc::new(&Projection::Agg { func: a.func, field: 0 });
+                    let new = || Acc::new(&Projection::Agg { func: a.func, of: crate::query::logical::Col::Field(0) });
                     let mut add = |acc: &mut Acc, at: usize| -> Result<()> {
                         tick()?;
                         match &a.arg {

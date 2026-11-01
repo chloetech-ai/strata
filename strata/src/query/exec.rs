@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, PathTest, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS, CROSS_ENCODER_FIRST};
+use crate::query::logical::{Col, Decay, Expand, GuardSite, OrderBy, Opts, PathCol, PathTest, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS, CROSS_ENCODER_FIRST};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -77,6 +77,11 @@ impl Numeric {
 
 fn cells<T>(n: usize) -> Vec<OnceLock<T>> {
     (0..n).map(|_| OnceLock::new()).collect()
+}
+
+/// Row `d`'s stored value of JSON field `field` (NULL without a doc store).
+fn object(store: Option<&DocStore>, field: usize, d: DocId, cache: &mut forward::StoreCache) -> Result<Value> {
+    Ok(store.and_then(|st| st.get_fields_cached(d, &[field], cache).pop()).unwrap_or(Value::Null))
 }
 
 fn opened<'r, T>(cell: &'r OnceLock<Opened<T>>, open: impl FnOnce() -> Result<Option<T>>) -> Result<Option<&'r T>> {
@@ -170,6 +175,13 @@ impl SegmentReaders {
                 _ => None,
             })
         })
+    }
+
+    /// Whether the terms of JSON field `field` include marks
+    /// ([`crate::json::mark_term`]); a segment written before them reads
+    /// the value of every row holding a path from its object.
+    pub fn json_marks(&self, field: usize) -> bool {
+        self.seg.has(&crate::json::marks_section(&self.schema.fields[field].key()))
     }
 
     pub fn store(&self) -> Result<Option<&DocStore>> {
@@ -691,6 +703,29 @@ fn unresolved() -> Error {
     err("a subquery's condition reached the executor before the subquery ran; run the query's plan with operators")
 }
 
+/// The order of rows by their values of a path (`ORDER BY attrs.price`),
+/// as the operators' Sort orders values: by [`agg::cmp`], NULL last
+/// unless `nulls_first`, in either direction.
+pub fn path_order(a: &Value, b: &Value, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => if nulls_first { Ordering::Less } else { Ordering::Greater },
+        (false, true) => if nulls_first { Ordering::Greater } else { Ordering::Less },
+        (false, false) if desc => agg::cmp(a, b).reverse(),
+        (false, false) => agg::cmp(a, b),
+    }
+}
+
+/// [`keep_best`] of rows with their values.
+fn keep_best_values(v: &mut Vec<(Value, Hit)>, k: usize, better: impl Fn(&(Value, Hit), &(Value, Hit)) -> std::cmp::Ordering) {
+    if k > 0 && k < v.len() {
+        v.select_nth_unstable_by(k - 1, &better);
+        let cut = v[k - 1].clone();
+        v.retain(|c| better(c, &cut) != std::cmp::Ordering::Greater);
+    }
+}
+
 /// Keeps the rows of `v` that `better` puts among its first `k`, and every
 /// row tied with the `k`-th (all of them when `k` is 0 or `v` has no more).
 fn keep_best<T: Copy>(v: &mut Vec<T>, k: usize, better: impl Fn(&T, &T) -> std::cmp::Ordering) {
@@ -1196,8 +1231,12 @@ impl<'a> Executor<'a> {
             let needed = agg::needed(q);
             let m = self.mark();
             let general = agg::is_general(q, |f| self.facet_field(f));
-            let groups = if general { self.aggregate(q, &needed)? } else { self.facets(q, q.group_by[0], &needed)? };
-            let by = q.group_by.iter().map(|&f| self.field_name(f).to_string()).collect::<Vec<_>>().join(", ");
+            let groups = match (general, q.group_by[..].first()) {
+                (false, Some(&Col::Path(p))) => self.path_facets(q, &q.paths[p], &needed)?,
+                (false, Some(&Col::Field(f))) => self.facets(q, f, &needed)?,
+                _ => self.aggregate(q, &needed)?,
+            };
+            let by = q.group_by.iter().map(|&c| self.col_name(q, c)).collect::<Vec<_>>().join(", ");
             self.step(m, if general { "aggregate" } else { "facet" }, if by.is_empty() { "every row".into() } else { format!("by {by}") }, Some(groups.map.len() as u64));
             // Shards return every group with partial aggregates, for the
             // coordinator to combine.
@@ -1277,6 +1316,7 @@ impl<'a> Executor<'a> {
         match &q.order {
             None => ("scan", format!("rows WHERE keeps{cut}")),
             Some(OrderBy::Score { score: Score::Column { field }, desc, .. }) => ("order", format!("by {} {}{cut}", self.field_name(*field), if *desc { "DESC" } else { "ASC" })),
+            Some(OrderBy::Path { path, desc, .. }) => ("order", format!("by {} {}{cut}", self.col_name(q, Col::Path(*path)), if *desc { "DESC" } else { "ASC" })),
             Some(OrderBy::Score { score, .. }) => match Rank::of(score, 0) {
                 Some(rank) => ("rank", format!("by {}{cut}", rank.explain(&self.schema))),
                 None => ("rank", format!("by {}{cut}", self.leaf_label(score).0)),
@@ -1423,8 +1463,62 @@ impl<'a> Executor<'a> {
             }
             Some(OrderBy::Score { score, .. }) if Rank::of(score, 0).is_some() => return Err(err("a ranking expression is ordered DESC (negate it to rank the smallest first)")),
             Some(OrderBy::Score { .. }) => return Err(err("relevance scores can only be ordered DESC")),
+            Some(OrderBy::Path { path, desc, nulls_first }) => {
+                let pc = q.paths.get(*path).ok_or_else(|| err("ORDER BY names a path the query does not read"))?.clone();
+                self.by_path(&pc, *desc, *nulls_first, &q.filter, want, q.tiebreak.as_ref())?
+            }
             Some(_) => return Err(err("ORDER BY COUNT(*) needs GROUP BY")),
         })
+    }
+
+    /// The rows of the filter in the order of their values of path `pc`,
+    /// as the operators' Sort orders values ([`path_order`]), rows tied on
+    /// it by key (`ORDER BY attrs.price, id`) or in index order; with a
+    /// LIMIT, the first `want`. Each row's value is read from the path's
+    /// terms ([`Self::path_values`]).
+    fn by_path(&mut self, pc: &PathCol, desc: bool, nulls_first: bool, p: &Pred, want: Option<usize>, tb: Option<&Tiebreak>) -> Result<Vec<Hit>> {
+        let order = |a: &(Value, Hit), b: &(Value, Hit)| path_order(&a.0, &b.0, desc, nulls_first);
+        let mut cands: Vec<(Value, Hit)> = Vec::new();
+        let mut cut_at = want.map_or(usize::MAX, |k| (2 * k).max(4096));
+        let segs = self.segs.clone();
+        let mut tick = self.ticker();
+        for s in segs.iter() {
+            self.check_deadline()?;
+            let set = self.filter_set(s, p)?;
+            let pv = self.path_values(s, pc, &set)?;
+            for d in set.iter() {
+                tick.tick()?;
+                let v = pv.get(d);
+                self.charge.room(&mut cands)?;
+                cands.push((v.clone(), Hit { seg: s.ord, doc: d, score: 0.0 }));
+                self.stats.scored += 1;
+                if cands.len() >= cut_at {
+                    keep_best_values(&mut cands, want.unwrap_or(0), order);
+                    cut_at = cut_at.max(2 * cands.len());
+                }
+            }
+        }
+        if let Some(k) = want {
+            keep_best_values(&mut cands, k, order);
+        }
+        let key_desc = match tb {
+            Some(Tiebreak::Key { desc }) => Some(*desc),
+            _ => None,
+        };
+        let mut keyed: Vec<((Value, Hit), Value)> = cands.into_iter().map(|c| { let k = if key_desc.is_some() { self.key(&c.1) } else { Value::Null }; (c, k) }).collect();
+        keyed.sort_by(|a, b| {
+            order(&a.0, &b.0).then_with(|| match key_desc {
+                Some(kd) => {
+                    let c = cmp_values(&a.1, &b.1);
+                    if kd { c.reverse() } else { c }
+                }
+                None => (a.0 .1.seg, a.0 .1.doc).cmp(&(b.0 .1.seg, b.0 .1.doc)),
+            })
+        });
+        if let Some(k) = want {
+            keyed.truncate(k);
+        }
+        Ok(keyed.into_iter().map(|((_, h), _)| h).collect())
     }
 
     /// The cap of a `MAX k PER` ([`Select::per`]) that the executor keeps
@@ -2618,10 +2712,39 @@ impl<'a> Executor<'a> {
         Ok((q, stats))
     }
 
-    /// Whether facets can count `field`'s values (a keyword column).
-    fn facet_field(&self, field: usize) -> bool {
+    /// Whether facets can count a column's values: a keyword column's, or
+    /// a path's, from its terms.
+    fn facet_field(&self, c: Col) -> bool {
+        let Col::Field(field) = c else { return true };
         let f = &self.schema.fields[field];
         f.ty == FieldType::Keyword || (f.ty == FieldType::Int && f.multi)
+    }
+
+    /// A column's name, for steps.
+    fn col_name(&self, q: &Select, c: Col) -> String {
+        match c {
+            Col::Field(f) => self.field_name(f).to_string(),
+            Col::Path(p) => q.paths.get(p).map_or("?".into(), |pc| format!("{}.{}", self.field_name(pc.field), pc.path)),
+        }
+    }
+
+    /// Path `pc`'s values over the rows of `set` in segment `s`, from the
+    /// field's terms and the objects of the rows they do not give.
+    fn path_values(&mut self, s: &Seg<'a>, pc: &PathCol, set: &DocSet) -> Result<crate::json::PathValues> {
+        let kw = self.keyword(s, pc.field)?;
+        let marks = s.r.json_marks(pc.field);
+        let store = s.r.store()?;
+        let mut cache = forward::StoreCache::default();
+        let pv = crate::json::PathValues::read(kw, marks, &pc.path, pc.kind, set, |d| object(store, pc.field, d, &mut cache))?;
+        self.note_objects(s, pc, pv.objects_read);
+        Ok(pv)
+    }
+
+    /// A step's note of the rows a path's values were read from objects for.
+    fn note_objects(&mut self, s: &Seg<'a>, pc: &PathCol, n: usize) {
+        if n > 0 {
+            self.stats.plan.push(format!("seg {}: {} rows' {}.{} read from their objects", s.ord, n, self.field_name(pc.field), pc.path));
+        }
     }
 
     /// Document `d`'s values of `field` for aggregates: one for a
@@ -2651,14 +2774,37 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    /// Document `d`'s values of column `c` for aggregates
+    /// ([`Self::agg_values`]); of a path, from `paths` (each path's values
+    /// over the segment's rows): each of a list's, the distinct ones for a
+    /// group (`key`), as the operators' aggregate reads them.
+    #[allow(clippy::too_many_arguments)]
+    fn col_values(&self, s: &Seg<'a>, c: Col, d: DocId, multi: &HashMap<usize, HashMap<DocId, Vec<u32>>>, paths: &HashMap<usize, crate::json::PathValues>, key: bool, out: &mut Vec<Value>) -> Result<()> {
+        let p = match c {
+            Col::Field(f) => return self.agg_values(s, f, d, multi, out),
+            Col::Path(p) => p,
+        };
+        out.clear();
+        match paths.get(&p).map(|pv| pv.get(d)) {
+            None | Some(Value::Null) => {}
+            Some(Value::List(xs)) if key => {
+                let mut seen = std::collections::HashSet::new();
+                out.extend(xs.iter().filter(|x| seen.insert(agg::Part::group(x))).cloned());
+            }
+            Some(Value::List(xs)) => out.extend(xs.iter().cloned()),
+            Some(v) => out.push(v.clone()),
+        }
+        Ok(())
+    }
+
     /// Groups and aggregates, document by document (anything beyond a
     /// facet's counts).
     fn aggregate(&mut self, q: &Select, needed: &[Projection]) -> Result<agg::Groups> {
-        let mut fields: Vec<usize> = q.group_by.clone();
+        let mut cols: Vec<Col> = q.group_by.clone();
         for p in needed {
-            if let Projection::Agg { field, .. } = p {
-                if !fields.contains(field) {
-                    fields.push(*field);
+            if let Projection::Agg { of, .. } = p {
+                if !cols.contains(of) {
+                    cols.push(*of);
                 }
             }
         }
@@ -2674,7 +2820,16 @@ impl<'a> Executor<'a> {
             self.stats.plan.push(format!("seg {}: aggregate {} rows into groups of {}", s.ord, set.len(), q.group_by.len()));
             // Multi-valued fields: each document's value codes, from the postings.
             let mut multi: HashMap<usize, HashMap<DocId, Vec<u32>>> = HashMap::new();
-            for &f in &fields {
+            let mut paths: HashMap<usize, crate::json::PathValues> = HashMap::new();
+            for &c in &cols {
+                let f = match c {
+                    Col::Field(f) => f,
+                    Col::Path(p) => {
+                        let pv = self.path_values(s, &q.paths[p], &set)?;
+                        paths.insert(p, pv);
+                        continue;
+                    }
+                };
                 if self.schema.fields[f].multi {
                     let kw = self.keyword(s, f)?;
                     let mut m: HashMap<DocId, Vec<u32>> = HashMap::new();
@@ -2693,18 +2848,18 @@ impl<'a> Executor<'a> {
                 // group values.
                 let mut keys: Vec<Vec<agg::Part>> = vec![Vec::new()];
                 for &g in &q.group_by {
-                    self.agg_values(s, g, d, &multi, &mut gv)?;
+                    self.col_values(s, g, d, &multi, &paths, true, &mut gv)?;
                     if gv.is_empty() {
                         gv.push(Value::Null);
                     }
-                    keys = keys.into_iter().flat_map(|k| gv.iter().map(move |v| [k.clone(), vec![agg::Part::of(v)]].concat())).collect();
+                    keys = keys.into_iter().flat_map(|k| gv.iter().map(move |v| [k.clone(), vec![agg::Part::group(v)]].concat())).collect();
                 }
                 for key in keys {
                     let accs = groups.entry(key, needed)?;
                     for (a, p) in accs.iter_mut().zip(needed) {
                         match p {
-                            Projection::Agg { field, .. } => {
-                                self.agg_values(s, *field, d, &multi, &mut vals)?;
+                            Projection::Agg { of, .. } => {
+                                self.col_values(s, *of, d, &multi, &paths, false, &mut vals)?;
                                 for v in &vals {
                                     let more = a.add(v);
                                     if more > 0 {
@@ -3416,6 +3571,36 @@ impl<'a> Executor<'a> {
         Ok(groups)
     }
 
+    /// The groups of one path and their counts ([`Self::facets`] of a
+    /// path), from its terms' postings: only the rows the terms do not
+    /// give are read, from their objects.
+    fn path_facets(&mut self, q: &Select, pc: &PathCol, needed: &[Projection]) -> Result<agg::Groups> {
+        let mut groups = agg::Groups::limited(self.opts.max_groups);
+        groups.charge = self.charge.clone();
+        let segs = self.segs.clone();
+        for s in segs.iter() {
+            self.check_deadline()?;
+            let m = self.mark();
+            let set = self.filter_set(s, &q.filter)?;
+            let kw = self.keyword(s, pc.field)?;
+            let marks = s.r.json_marks(pc.field);
+            let store = s.r.store()?;
+            let mut cache = forward::StoreCache::default();
+            let (counts, objects) = crate::json::PathValues::counts(kw, marks, &pc.path, pc.kind, &set, |d| object(store, pc.field, d, &mut cache))?;
+            self.stats.plan.push(format!("seg {}: facet of a path's terms over {} docs", s.ord, set.len()));
+            self.note_objects(s, pc, objects);
+            for (v, c) in counts {
+                for a in groups.entry(vec![agg::Part::group(&v)], needed)? {
+                    if let agg::Acc::Count(n) = a {
+                        *n += c as i64;
+                    }
+                }
+            }
+            self.seg_step(m, s, Some(set.len() as u64));
+        }
+        Ok(groups)
+    }
+
     // ---- output ----------------------------------------------------------
 
     fn key(&self, h: &Hit) -> Value {
@@ -3456,7 +3641,7 @@ impl<'a> Executor<'a> {
         if q.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !self.snap.numbers_writes() {
             return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
         }
-        let stored: Vec<usize> = q
+        let mut stored: Vec<usize> = q
             .projection
             .iter()
             .filter_map(|(_, p)| match p {
@@ -3472,9 +3657,13 @@ impl<'a> Executor<'a> {
                 {
                     Some(*i)
                 }
+                // A path of the rows of a page is read from their objects.
+                Projection::Path(p) => Some(q.paths[*p].field),
                 _ => None,
             })
             .collect();
+        let mut seen = std::collections::HashSet::new();
+        stored.retain(|f| seen.insert(*f));
         // Each ranking expression's value of every row, column by column.
         let features: Vec<Option<Vec<f64>>> = q
             .projection
@@ -3497,7 +3686,7 @@ impl<'a> Executor<'a> {
 
     /// Column `c` (`proj`) of hit `h`, the `r`-th row, whose stored fields
     /// are `fetched`.
-    fn cell<'c>(&self, p: &Projecting, s: &'c Seg<'a>, h: &Hit, r: usize, c: usize, proj: &Projection, fetched: &'c [Value]) -> Result<Cell<'c>> {
+    fn cell<'c>(&self, q: &Select, p: &Projecting, s: &'c Seg<'a>, h: &Hit, r: usize, c: usize, proj: &Projection, fetched: &'c [Value]) -> Result<Cell<'c>> {
         Ok(Cell::Value(match proj {
             Projection::Feature(_) => match p.features[c].as_ref().map(|v| v[r]) {
                 Some(x) if x.is_finite() => Value::Float(x),
@@ -3515,6 +3704,11 @@ impl<'a> Executor<'a> {
                 Some(j) => return Ok(fetched.get(j).map_or(Cell::Value(Value::Null), Cell::Ref)),
                 None => return self.unstored_cell(s, *i, h.doc),
             },
+            Projection::Path(path) => {
+                let pc = &q.paths[*path];
+                let j = p.stored.iter().position(|x| *x == pc.field);
+                crate::json::extract(j.and_then(|j| fetched.get(j)).unwrap_or(&Value::Null), &pc.path, pc.kind)?
+            }
         }))
     }
 
@@ -3530,7 +3724,7 @@ impl<'a> Executor<'a> {
             let fetched = self.fetch(&mut p, s, h)?;
             let mut row = Vec::with_capacity(q.projection.len());
             for (c, (_, proj)) in q.projection.iter().enumerate() {
-                row.push(self.cell(&p, s, h, r, c, proj, &fetched)?.into_value());
+                row.push(self.cell(q, &p, s, h, r, c, proj, &fetched)?.into_value());
             }
             self.charge.row(&row)?;
             rows.push(row);
@@ -3562,7 +3756,7 @@ impl<'a> Executor<'a> {
             bytes += 24;
             for (c, (_, proj)) in q.projection.iter().enumerate() {
                 let b = &mut cols[c];
-                let cell = self.cell(&p, s, h, r, c, proj, &fetched)?;
+                let cell = self.cell(q, &p, s, h, r, c, proj, &fetched)?;
                 bytes += cell.bytes();
                 let pushed = match (q.types.get(c).copied().flatten(), cell) {
                     (Some(t), cell) => b.push(t.output(cell.into_value()), n),

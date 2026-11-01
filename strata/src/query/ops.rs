@@ -1210,7 +1210,7 @@ impl<'a> Ops<'a, '_> {
         let rows = self.node(input, what)?;
         let keys: Vec<Expr> = keys.iter().map(|k| self.resolved(k)).collect::<Result<_>>()?;
         let args: Vec<Option<Expr>> = aggs.iter().map(|a| a.arg.as_ref().map(|x| self.resolved(x)).transpose()).collect::<Result<_>>()?;
-        let new_accs = || aggs.iter().map(|a| Acc::new(&Projection::Agg { func: a.func, field: 0 })).collect::<Vec<_>>();
+        let new_accs = || aggs.iter().map(|a| Acc::new(&Projection::Agg { func: a.func, of: crate::query::logical::Col::Field(0) })).collect::<Vec<_>>();
         let mut at: HashMap<Vec<Part>, usize> = HashMap::new();
         let mut groups: Vec<(Vec<Value>, Vec<Acc>)> = Vec::new();
         for r in &rows.rows {
@@ -1224,7 +1224,7 @@ impl<'a> Ops<'a, '_> {
                     Ok(match value(k, r)? {
                         Value::List(xs) => {
                             let mut seen = HashSet::new();
-                            let xs: Vec<Value> = xs.into_iter().filter(|x| seen.insert(Part::of(x))).collect();
+                            let xs: Vec<Value> = xs.into_iter().filter(|x| seen.insert(Part::group(x))).collect();
                             if xs.is_empty() { vec![Value::Null] } else { xs }
                         }
                         v => vec![v],
@@ -1235,7 +1235,7 @@ impl<'a> Ops<'a, '_> {
             let mut pick = vec![0usize; each.len()];
             loop {
                 let vals: Vec<Value> = each.iter().zip(&pick).map(|(vs, &i)| vs[i].clone()).collect();
-                let key: Vec<Part> = vals.iter().map(Part::of).collect();
+                let key: Vec<Part> = vals.iter().map(Part::group).collect();
                 let g = match at.get(&key) {
                     Some(&g) => g,
                     None => {

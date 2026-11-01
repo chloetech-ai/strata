@@ -614,6 +614,16 @@ impl KeywordColumn {
         }
     }
 
+    /// The documents with value `code`, in order, into `out` (cleared
+    /// first).
+    pub fn docs_code_into(&self, code: u32, out: &mut Vec<DocId>) {
+        out.clear();
+        match self.list(code) {
+            List::Rare(d) => out.extend_from_slice(d),
+            List::Pyramid(p) => p.decode_into(out),
+        }
+    }
+
     /// Documents with a value (multi-valued: at least one).
     pub fn present(&self) -> DocSet {
         DocSet::from_bits(self.codes.scan_bits(super::KeyRange { lo: i64::MIN, hi: i64::MAX }), self.n as u32)

@@ -1579,6 +1579,7 @@ impl Db {
                     filter: crate::query::logical::Pred::IntRange { field: f, lo: i64::MIN, hi: now },
                     order: None,
                     group_by: Vec::new(),
+                    paths: Vec::new(),
                     having: None,
                     tiebreak: None,
                     phases: Vec::new(),
