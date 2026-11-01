@@ -178,6 +178,12 @@ pub(crate) struct Coord {
     clients: Vec<Option<Op>>,
     syncing: Option<Syncing>,
     changing: Option<Changing>,
+    /// The map of its last change that a server may hold though none said
+    /// so ([`Change::in_doubt`]), and while a change gives a map, that map;
+    /// kept when it crashes, unless [`super::Config::forgetful`].
+    doubt: Option<SlotMap>,
+    /// The newest epoch a server said it holds at its last sync.
+    heard: u64,
     queued: VecDeque<(MapFn, Vec<String>, Asker)>,
     job: Option<Job>,
     renew_token: u64,
@@ -193,6 +199,8 @@ impl Coord {
             clients: vec![None; cfg.clients],
             syncing: None,
             changing: None,
+            doubt: None,
+            heard: 0,
             queued: VecDeque::new(),
             job: None,
             renew_token: 0,
@@ -477,7 +485,8 @@ impl Sim {
             self.coords[j].queued.push_back((f, first, asker));
             return;
         }
-        let (mut change, step) = Change::new(&first);
+        let (mut change, step) = Change::new(&first, self.coords[j].doubt.clone());
+        change.forgets_doubt = self.cfg.bugs.contains(&super::Bug::GivesAnEpochTwice);
         change.keeps_untaken = self.cfg.bugs.contains(&super::Bug::RoutesByAMapNoServerTook);
         change.skips_source = self.cfg.bugs.contains(&super::Bug::ChangesAroundTheSource);
         self.coords[j].changing = Some(Changing { change, f, asker });
@@ -488,6 +497,9 @@ impl Sim {
         match step {
             ChangeStep::Sync => self.sync(j, Some(Waiter::Change)),
             ChangeStep::Give { map, to } => {
+                if !self.cfg.forgetful {
+                    self.coords[j].doubt = Some(map.clone());
+                }
                 let timeout = self.cfg.call_timeout;
                 for (shard, u) in to {
                     if let Some(s) = server_of(&u) {
@@ -497,6 +509,7 @@ impl Sim {
             }
             ChangeStep::Done(r) => {
                 let Some(ch) = self.coords[j].changing.take() else { return };
+                self.coords[j].doubt = ch.change.in_doubt();
                 let r = r.map(|(m, _)| m);
                 match &r {
                     Ok(m) => {
@@ -525,10 +538,12 @@ impl Sim {
 
     fn change_synced(&mut self, j: usize) {
         let map = self.coords[j].map.clone();
+        let heard = self.coords[j].heard;
         let Some(ch) = self.coords[j].changing.as_mut() else { return };
         let f = ch.f.clone();
         // The server of the move's shard `from` under the map synced to.
         let source = |m: &crate::slots::Move| map.replicas().get(m.from).and_then(|rs| rs.first()).cloned();
+        ch.change.heard(heard);
         let step = ch.change.synced(Some(&map), &|m| f.apply(m), &source);
         self.change_step(j, step);
     }
@@ -793,6 +808,9 @@ impl Sim {
         k.inc += 1;
         k.syncing = None;
         k.changing = None;
+        if self.cfg.forgetful {
+            k.doubt = None;
+        }
         k.queued.clear();
         k.job = None;
         k.renew_token += 1;
@@ -827,7 +845,9 @@ impl Sim {
                 if sy.left > 0 {
                     return;
                 }
-                match sy.newest {
+                let newest = sy.newest;
+                self.coords[j].heard = newest.map_or(0, |(e, _)| e);
+                match newest {
                     Some((_, k)) => self.call_from(j, k, Req::HeldMap, Duration::from_secs(5), Purpose::SyncMap),
                     None => self.synced(j),
                 }

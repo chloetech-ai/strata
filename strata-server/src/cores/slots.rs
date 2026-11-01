@@ -343,7 +343,10 @@ enum Stage {
 /// none other if one of them does not take it. A change another
 /// coordinator made meanwhile (a server holds another map of that epoch or
 /// newer) is taken up and the change made again on it,
-/// [`CHANGE_TRIES`] times at most.
+/// [`CHANGE_TRIES`] times at most. A map the coordinator gave in a change
+/// that failed, which a server may hold though none said so
+/// ([`Change::in_doubt`]), is given again first, and the change made from
+/// it once a server takes it.
 #[derive(Clone, Debug)]
 pub struct Change {
     first: Vec<String>,
@@ -355,6 +358,22 @@ pub struct Change {
     missed: Vec<String>,
     raced: Option<String>,
     took: usize,
+    /// Whether a server did not answer for `next` (it may hold it).
+    unanswered: bool,
+    /// The newest epoch a server said it holds at the last sync, and how
+    /// many syncs could not fetch a map that new.
+    heard: u64,
+    behind: u32,
+    doubt: Option<SlotMap>,
+    /// Whether `next` is the map in doubt, given again.
+    redoing: bool,
+    /// The map in doubt, once a server took it.
+    base: Option<SlotMap>,
+    /// Makes the next change from the map synced to although a server may
+    /// hold a newer one the coordinator gave, as the server did before the
+    /// simulator found that the map then forks
+    /// ([`crate::sim::cluster::Bug::GivesAnEpochTwice`]).
+    pub forgets_doubt: bool,
     /// Routes by a map no server took, as the server did before the
     /// simulator found that the next change then forks the map
     /// ([`crate::sim::cluster::Bug::RoutesByAMapNoServerTook`]).
@@ -367,10 +386,49 @@ pub struct Change {
 
 impl Change {
     /// A change whose servers of `first` take the map before any other is
-    /// given it.
-    pub fn new(first: &[String]) -> (Change, ChangeStep) {
-        let c = Change { first: first.to_vec(), tries: 0, next: None, firsts: Vec::new(), rest: Vec::new(), stage: Stage::Syncing, missed: Vec::new(), raced: None, took: 0, keeps_untaken: false, skips_source: false };
+    /// given it, by a coordinator whose last change left `doubt` (its
+    /// [`Self::in_doubt`]).
+    pub fn new(first: &[String], doubt: Option<SlotMap>) -> (Change, ChangeStep) {
+        let c = Change {
+            first: first.to_vec(),
+            tries: 0,
+            next: None,
+            firsts: Vec::new(),
+            rest: Vec::new(),
+            stage: Stage::Syncing,
+            missed: Vec::new(),
+            raced: None,
+            took: 0,
+            unanswered: false,
+            heard: 0,
+            behind: 0,
+            doubt,
+            redoing: false,
+            base: None,
+            forgets_doubt: false,
+            keeps_untaken: false,
+            skips_source: false,
+        };
         (c, ChangeStep::Sync)
+    }
+
+    /// Once the change failed, the map it gave that a server may hold
+    /// though the coordinator does not route by it: one took it, or one
+    /// did not answer (the answer came late, or was lost). The
+    /// coordinator's next change gives it again before any other map: one
+    /// of the same epoch would fork the map (two servers holding different
+    /// maps of one epoch, neither ever taking the other's), and one newer,
+    /// made from the map before, would undo a change the servers may act
+    /// on (a flip the server slots move from took, and the others then
+    /// learned of).
+    pub fn in_doubt(&self) -> Option<SlotMap> {
+        self.doubt.clone().filter(|_| !self.forgets_doubt)
+    }
+
+    /// The newest epoch a server said it holds at the sync just made: the
+    /// change is not made from an older map ([`Self::synced`]).
+    pub fn heard(&mut self, epoch: u64) {
+        self.heard = epoch;
     }
 
     /// The map being given.
@@ -398,16 +456,44 @@ impl Change {
     /// under which reads miss the moving rows and a move given up deletes
     /// them).
     pub fn synced(&mut self, now: Option<&SlotMap>, f: &dyn Fn(&SlotMap) -> Result<SlotMap, String>, source: &dyn Fn(&Move) -> Option<String>) -> ChangeStep {
-        let Some(now) = now else {
-            return self.done(Err(ApiError::bad("a coordinator routing by the hash before slots (a shard from before protocol 4) cannot change the cluster")));
+        let now = match (now, &self.base) {
+            (Some(n), Some(b)) if b.epoch > n.epoch => b.clone(),
+            (Some(n), _) => n.clone(),
+            (None, Some(b)) => b.clone(),
+            (None, None) => return self.done(Err(ApiError::bad("a coordinator routing by the hash before slots (a shard from before protocol 4) cannot change the cluster"))),
         };
-        let next = match f(now) {
+        // A server holds a newer map than the sync could fetch: a change
+        // made from an older one would fork the map (its epoch is one a
+        // server holds another map of).
+        if self.heard > now.epoch {
+            self.behind += 1;
+            if self.behind >= CHANGE_TRIES {
+                let (heard, epoch) = (self.heard, now.epoch);
+                return self.done(Err(unavailable(format!("a server holds cluster map epoch {heard}, newer than the epoch {epoch} this coordinator could fetch, and a change made from an older map would fork it: try again"))));
+            }
+            self.stage = Stage::Syncing;
+            return ChangeStep::Sync;
+        }
+        if let Some(x) = self.doubt.clone().filter(|_| !self.forgets_doubt) {
+            if x.epoch > now.epoch {
+                self.redoing = true;
+                return self.give(x, &now, source);
+            }
+            // Taken, or another map came after it.
+            self.doubt = None;
+        }
+        let next = match f(&now) {
             Ok(m) => m,
             Err(e) => return self.done(Err(ApiError::bad(e))),
         };
         if next.epoch <= now.epoch {
             return self.done(Err(ApiError::internal("a change must raise the map's epoch")));
         }
+        self.give(next, &now, source)
+    }
+
+    /// Gives `next`, made from `now`.
+    fn give(&mut self, next: SlotMap, now: &SlotMap, source: &dyn Fn(&Move) -> Option<String>) -> ChangeStep {
         let mut first = self.first.clone();
         if let Some(src) = now.moving().filter(|m| m.state == MoveState::Copying && !self.skips_source).and_then(source) {
             first.retain(|u| *u != src);
@@ -422,6 +508,7 @@ impl Change {
         self.missed.clear();
         self.raced = None;
         self.took = 0;
+        self.unanswered = false;
         self.give_next_first(0)
     }
 
@@ -432,10 +519,42 @@ impl Change {
             return ChangeStep::Give { map: next, to: vec![f.clone()] };
         }
         if self.rest.is_empty() {
-            return self.done(Ok((next, Vec::new())));
+            return self.landed(next, Vec::new());
         }
         self.stage = Stage::Rest { waiting: self.rest.iter().map(|(_, u)| u.clone()).collect() };
         ChangeStep::Give { map: next, to: self.rest.clone() }
+    }
+
+    /// `next` is made: the change is, or, the map in doubt taken, the
+    /// change is made from it.
+    fn landed(&mut self, next: SlotMap, missed: Vec<String>) -> ChangeStep {
+        self.doubt = None;
+        if std::mem::take(&mut self.redoing) {
+            self.base = Some(next);
+            self.stage = Stage::Syncing;
+            return ChangeStep::Sync;
+        }
+        self.done(Ok((next, missed)))
+    }
+
+    /// `next` is not made, as `e` says.
+    fn failed(&mut self, e: ApiError) -> ChangeStep {
+        if self.took > 0 || self.unanswered {
+            self.doubt = self.next.clone();
+            if self.redoing {
+                let epoch = self.next.as_ref().map_or(0, |m| m.epoch);
+                return self.done(Err(unavailable(format!("cluster map epoch {epoch}, given before and maybe taken, reached no server that answered, so no other map is made: {}", e.message))));
+            }
+            return self.done(Err(e));
+        }
+        if std::mem::take(&mut self.redoing) {
+            // No server holds the map in doubt: the change is made from the
+            // map synced to.
+            self.doubt = None;
+            self.stage = Stage::Syncing;
+            return ChangeStep::Sync;
+        }
+        self.done(Err(e))
     }
 
     /// Another coordinator's change came first: this one is made again on
@@ -468,13 +587,17 @@ impl Change {
                     Given::Missed(_) if tries < FIRST_TRIES => {
                         // A map given again is taken again: an answer lost
                         // is asked for again.
+                        self.unanswered = true;
                         self.stage = Stage::First { k, tries: tries + 1 };
                         let next = self.next.clone().expect("a map to give");
                         return Some(ChangeStep::Give { map: next, to: vec![self.firsts[k].clone()] });
                     }
-                    Given::Missed(why) => why,
+                    Given::Missed(why) => {
+                        self.unanswered = true;
+                        why
+                    }
                 };
-                Some(self.done(Err(unavailable(format!("{url} did not take cluster map epoch {epoch} first, so no server was given it: {why}")))))
+                Some(self.failed(unavailable(format!("{url} did not take cluster map epoch {epoch} first, so no other server was given it: {why}"))))
             }
             Stage::Rest { mut waiting } => {
                 if !waiting.remove(url) {
@@ -483,7 +606,11 @@ impl Change {
                 match g {
                     Given::Took => self.took += 1,
                     Given::Raced(why) => self.raced = Some(format!("{url}: {why}")),
-                    Given::Refused(why) | Given::Missed(why) => self.missed.push(format!("{url}: {why}")),
+                    Given::Refused(why) => self.missed.push(format!("{url}: {why}")),
+                    Given::Missed(why) => {
+                        self.unanswered = true;
+                        self.missed.push(format!("{url}: {why}"));
+                    }
                 }
                 if !waiting.is_empty() {
                     self.stage = Stage::Rest { waiting };
@@ -498,9 +625,9 @@ impl Change {
                 // next change would be made from it, and fork the map from
                 // the one the servers hold.
                 if self.took == 0 && !self.keeps_untaken {
-                    return Some(self.done(Err(unavailable(format!("no server took cluster map epoch {}: {}", next.epoch, missed.join("; "))))));
+                    return Some(self.failed(unavailable(format!("no server took cluster map epoch {}: {}", next.epoch, missed.join("; ")))));
                 }
-                Some(self.done(Ok((next, missed))))
+                Some(self.landed(next, missed))
             }
             Stage::Syncing | Stage::Done => None,
         }
@@ -1007,7 +1134,7 @@ mod tests {
     #[test]
     fn a_change_gives_the_first_servers_the_map_first_and_retries_a_race() {
         let m1 = map(2);
-        let (mut c, s) = Change::new(&["s1".to_string()]);
+        let (mut c, s) = Change::new(&["s1".to_string()], None);
         assert!(matches!(s, ChangeStep::Sync));
         let f = |m: &SlotMap| m.start_move(&[0], 1);
         let ChangeStep::Give { map: next, to } = c.synced(Some(&m1), &f, &no_source) else { panic!() };
@@ -1024,19 +1151,19 @@ mod tests {
         let Some(ChangeStep::Done(Err(e))) = Some(c.synced(Some(&other), &f, &no_source)) else { panic!() };
         assert_eq!(e.status, 400);
         // A first server that refuses stops the change.
-        let (mut c, _) = Change::new(&["s0".to_string()]);
+        let (mut c, _) = Change::new(&["s0".to_string()], None);
         c.synced(Some(&m1), &f, &no_source);
         let Some(ChangeStep::Done(Err(e))) = c.answered("s0", Given::Refused("no".into())) else { panic!() };
         assert_eq!(e.status, 503);
         // Those after the first that miss it get it later.
-        let (mut c, _) = Change::new(&[]);
+        let (mut c, _) = Change::new(&[], None);
         let ChangeStep::Give { to, .. } = c.synced(Some(&m1), &f, &no_source) else { panic!() };
         assert_eq!(to.len(), 2);
         assert!(c.answered("s0", Given::Took).is_none());
         let Some(ChangeStep::Done(Ok((m, missed)))) = c.answered("s1", Given::Missed("down".into())) else { panic!() };
         assert_eq!((m.epoch, missed.len()), (2, 1));
         // A map no server took is not made.
-        let (mut c, _) = Change::new(&[]);
+        let (mut c, _) = Change::new(&[], None);
         c.synced(Some(&m1), &f, &no_source);
         assert!(c.answered("s0", Given::Missed("down".into())).is_none());
         let Some(ChangeStep::Done(Err(e))) = c.answered("s1", Given::Missed("down".into())) else { panic!() };
@@ -1044,12 +1171,82 @@ mod tests {
         // While slots copy, the server they move from takes any change
         // first, before the servers asked to.
         let copying = m1.start_move(&[0], 1).unwrap();
-        let (mut c, _) = Change::new(&["s1".to_string()]);
+        let (mut c, _) = Change::new(&["s1".to_string()], None);
         let source = |m: &Move| Some(format!("s{}", m.from));
         let ChangeStep::Give { to, .. } = c.synced(Some(&copying), &|m: &SlotMap| m.set_servers(1, vec!["s1".into()]), &source) else { panic!() };
         assert_eq!(to, vec![(0, "s0".to_string())]);
         let Some(ChangeStep::Give { to, .. }) = c.answered("s0", Given::Took) else { panic!() };
         assert_eq!(to, vec![(1, "s1".to_string())]);
+    }
+
+    #[test]
+    fn a_map_no_server_answered_for_is_given_again_before_another() {
+        let m1 = map(2);
+        let f = |m: &SlotMap| m.start_move(&[0], 1);
+        let g = |m: &SlotMap| m.set_servers(1, vec!["s1".into()]);
+        let (mut c, _) = Change::new(&[], None);
+        let ChangeStep::Give { map: x, .. } = c.synced(Some(&m1), &f, &no_source) else { panic!() };
+        assert!(c.answered("s0", Given::Missed("no answer".into())).is_none());
+        let Some(ChangeStep::Done(Err(_))) = c.answered("s1", Given::Missed("no answer".into())) else { panic!() };
+        assert_eq!(c.in_doubt().as_ref(), Some(&x), "a server may hold it");
+        // Synced to the map before (the answers still slow), the next change
+        // gives that map again first, then makes its own from it.
+        let (mut c, _) = Change::new(&[], Some(x.clone()));
+        let ChangeStep::Give { map, .. } = c.synced(Some(&m1), &g, &no_source) else { panic!() };
+        assert_eq!(map, x);
+        assert!(c.answered("s0", Given::Took).is_none());
+        let Some(ChangeStep::Sync) = c.answered("s1", Given::Missed("no answer".into())) else { panic!() };
+        let ChangeStep::Give { map: y, .. } = c.synced(Some(&m1), &g, &no_source) else { panic!() };
+        assert_eq!(y, g(&x).unwrap(), "made from the map given again");
+        c.answered("s0", Given::Took);
+        let Some(ChangeStep::Done(Ok((made, _)))) = c.answered("s1", Given::Took) else { panic!() };
+        assert!(made.epoch == 3 && c.in_doubt().is_none());
+        // Still unanswered: no other map is made.
+        let (mut c, _) = Change::new(&[], Some(x.clone()));
+        c.synced(Some(&m1), &g, &no_source);
+        c.answered("s0", Given::Missed("no answer".into()));
+        let Some(ChangeStep::Done(Err(e))) = c.answered("s1", Given::Missed("no answer".into())) else { panic!() };
+        assert!(e.status == 503 && c.in_doubt() == Some(x.clone()), "{e:?}");
+        // Refused by every server it was given to: no server holds it.
+        let (mut c, _) = Change::new(&[], Some(x.clone()));
+        c.synced(Some(&m1), &g, &no_source);
+        c.answered("s0", Given::Refused("no".into()));
+        let Some(ChangeStep::Sync) = c.answered("s1", Given::Refused("no".into())) else { panic!() };
+        let ChangeStep::Give { map: y, .. } = c.synced(Some(&m1), &g, &no_source) else { panic!() };
+        assert_eq!(y, g(&m1).unwrap());
+        // Synced to it, or past it: nothing to give again.
+        let (mut c, _) = Change::new(&[], Some(x.clone()));
+        let ChangeStep::Give { map: y, .. } = c.synced(Some(&x), &g, &no_source) else { panic!() };
+        assert_eq!(y, g(&x).unwrap());
+        // As the server made it before: another map of the epoch given,
+        // which a server holding that one refuses, and the map forks.
+        let (mut c, _) = Change::new(&[], Some(x.clone()));
+        c.forgets_doubt = true;
+        let ChangeStep::Give { map: y, .. } = c.synced(Some(&m1), &g, &no_source) else { panic!() };
+        assert_eq!(y.epoch, x.epoch);
+        assert_eq!(take(Some((&x, 0)), 1, &y, 0).unwrap_err().status, 409);
+    }
+
+    #[test]
+    fn a_change_is_not_made_from_a_map_older_than_one_a_server_holds() {
+        let m1 = map(2);
+        let g = |m: &SlotMap| m.set_servers(1, vec!["s1".into()]);
+        let (mut c, _) = Change::new(&[], None);
+        // A server said it holds epoch 2, which the sync could not fetch.
+        for _ in 1..CHANGE_TRIES {
+            c.heard(2);
+            assert!(matches!(c.synced(Some(&m1), &g, &no_source), ChangeStep::Sync), "synced again");
+        }
+        c.heard(2);
+        let ChangeStep::Done(Err(e)) = c.synced(Some(&m1), &g, &no_source) else { panic!() };
+        assert!(e.status == 503 && e.message.contains("epoch 2"), "{e:?}");
+        // Fetched, or none newer: made.
+        let (mut c, _) = Change::new(&[], None);
+        c.heard(2);
+        c.synced(Some(&m1), &g, &no_source);
+        c.heard(1);
+        let ChangeStep::Give { map, .. } = c.synced(Some(&m1), &g, &no_source) else { panic!() };
+        assert_eq!(map.epoch, 2);
     }
 
     #[test]

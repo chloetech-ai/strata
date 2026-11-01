@@ -527,6 +527,10 @@ pub struct Coordinator {
     topo: RwLock<Arc<Topology>>,
     /// Held while this coordinator changes the cluster map.
     changing: tokio::sync::Mutex<()>,
+    /// The map of the last change, which failed, that a server may hold
+    /// though none said so: the next change gives it again first
+    /// ([`core::Change::in_doubt`]).
+    doubt: Mutex<Option<SlotMap>>,
     /// The newest map epoch a server said it holds, and what wakes the
     /// watcher to take it up ([`Coordinator::watch`]).
     newer: AtomicU64,
@@ -786,6 +790,7 @@ impl Coordinator {
         Ok(Coordinator {
             topo: RwLock::new(Arc::new(topo)),
             changing: tokio::sync::Mutex::new(()),
+            doubt: Mutex::new(None),
             newer: AtomicU64::new(0),
             wake: Arc::new(tokio::sync::Notify::new()),
             schema,
@@ -2262,6 +2267,11 @@ impl Coordinator {
     /// up the newest when it is newer than the one routed by. Returns
     /// whether it did.
     pub async fn sync(&self) -> bool {
+        self.sync_heard().await.0
+    }
+
+    /// [`Self::sync`], and the newest map epoch a server said it holds.
+    async fn sync_heard(&self) -> (bool, u64) {
         let t = self.topo();
         let asks = t.replicas.iter().flatten().map(|r| {
             let mut c = r.client.clone();
@@ -2272,9 +2282,11 @@ impl Coordinator {
                 Some((said.epoch, said.protocol, c))
             }
         });
-        let newest = join_all(asks).await.into_iter().flatten().filter(|(e, p, _)| *e > t.epoch() && *p >= CLUSTER_PROTOCOL).max_by_key(|(e, ..)| *e);
-        let Some((_, _, mut c)) = newest else { return false };
-        match tokio::time::timeout(Duration::from_secs(5), held_map(&mut c)).await {
+        let said: Vec<_> = join_all(asks).await.into_iter().flatten().collect();
+        let heard = said.iter().map(|(e, ..)| *e).max().unwrap_or(0);
+        let newest = said.into_iter().filter(|(e, p, _)| *e > t.epoch() && *p >= CLUSTER_PROTOCOL).max_by_key(|(e, ..)| *e);
+        let Some((_, _, mut c)) = newest else { return (false, heard) };
+        let took = match tokio::time::timeout(Duration::from_secs(5), held_map(&mut c)).await {
             Ok(Ok(Some((m, _)))) => match self.install(m) {
                 Ok(()) => self.topo().epoch() > t.epoch(),
                 Err(e) => {
@@ -2283,7 +2295,8 @@ impl Coordinator {
                 }
             },
             _ => false,
-        }
+        };
+        (took, heard)
     }
 
     /// Follows the cluster map the servers hold, every [`WATCH_EVERY`] and
@@ -2311,16 +2324,19 @@ impl Coordinator {
     /// answers again, but for those of `first`, and while slots copy the
     /// server they move from, which take it one at a time before any other
     /// is given it, or the change is not made. A map no server took is not
-    /// routed by (503). Returns the new map and the servers that did not
-    /// take it.
+    /// routed by (503); when a server did not answer for it, the next
+    /// change gives it again before making its own, as that server may hold
+    /// it. Returns the new map and the servers that did not take it.
     pub async fn change(&self, f: impl Fn(&SlotMap) -> Result<SlotMap, String>, first: &[String]) -> Result<(SlotMap, Vec<String>), ApiError> {
         let _one = self.changing.lock().await;
-        let (mut change, mut step) = core::Change::new(first);
+        let doubt = self.doubt.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (mut change, mut step) = core::Change::new(first, doubt);
         let mut t = self.topo();
         loop {
             step = match step {
                 core::ChangeStep::Sync => {
-                    self.sync().await;
+                    let (_, heard) = self.sync_heard().await;
+                    change.heard(heard);
                     t = self.topo();
                     if t.replicas.iter().flatten().any(|r| (1..CLUSTER_PROTOCOL).contains(&r.protocol.load(Ordering::Relaxed))) {
                         return Err(ApiError::bad(format!("changing the cluster needs every server to speak protocol {CLUSTER_PROTOCOL}: upgrade them first")));
@@ -2373,6 +2389,7 @@ impl Coordinator {
                     next.ok_or_else(|| ApiError::internal("a change of the cluster map waits for no answer"))?
                 }
                 core::ChangeStep::Done(r) => {
+                    *self.doubt.lock().unwrap_or_else(|e| e.into_inner()) = change.in_doubt();
                     let (next, missed) = r?;
                     self.install(next.clone())?;
                     if !missed.is_empty() {

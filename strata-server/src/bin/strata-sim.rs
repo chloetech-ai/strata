@@ -6,6 +6,8 @@
 //! strata-sim --seeds 0..2000 --bug asks-a-known-term   # a bug it found, put back
 //! strata-sim --cluster --seeds 0..1000 # a cluster's map changing and slots moving
 //! strata-sim --cluster --racing        # both coordinators changing the map
+//! strata-sim --cluster --forgetful     # coordinators forget, crashing, the map they may have given
+//! strata-sim --no-pauses --no-slow-links   # without those two faults
 //! ```
 //!
 //! A seed that fails is run again to check that it replays exactly (the
@@ -13,6 +15,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use strata_server::sim::{self, cluster, Bug, Config};
 
@@ -55,7 +58,10 @@ fn main() {
     let mut promote_ppm = None;
     let mut drop_ppm = None;
     let mut world_cluster = false;
+    let mut pauses = true;
+    let mut slow_links = true;
     let mut racing = false;
+    let mut forgetful = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -91,7 +97,10 @@ fn main() {
                 i += 1;
             }
             "--cluster" => world_cluster = true,
+            "--no-pauses" => pauses = false,
+            "--no-slow-links" => slow_links = false,
             "--racing" => racing = true,
+            "--forgetful" => forgetful = true,
             "--trace" => trace = true,
             "--verbose" | "-v" => verbose = true,
             _ => usage(),
@@ -100,11 +109,26 @@ fn main() {
     }
     let config = |s: u64| {
         let c = Config::of(s);
-        Config { bugs: bugs.clone(), promote_ppm: promote_ppm.unwrap_or(c.promote_ppm), drop_ppm: drop_ppm.unwrap_or(c.drop_ppm), ..c }
+        Config {
+            bugs: bugs.clone(),
+            promote_ppm: promote_ppm.unwrap_or(c.promote_ppm),
+            drop_ppm: drop_ppm.unwrap_or(c.drop_ppm),
+            pause_every: if pauses { c.pause_every } else { Duration::ZERO },
+            slow_every: if slow_links { c.slow_every } else { Duration::ZERO },
+            ..c
+        }
     };
     let cluster_config = |s: u64| {
         let c = cluster::Config::of(s);
-        cluster::Config { racing, bugs: cluster_bugs.clone(), drop_ppm: drop_ppm.unwrap_or(c.drop_ppm), ..c }
+        cluster::Config {
+            racing,
+            forgetful,
+            bugs: cluster_bugs.clone(),
+            drop_ppm: drop_ppm.unwrap_or(c.drop_ppm),
+            pause_every: if pauses { c.pause_every } else { Duration::ZERO },
+            slow_every: if slow_links { c.slow_every } else { Duration::ZERO },
+            ..c
+        }
     };
     let run = |s: u64, trace: bool| -> Found {
         match world_cluster {
@@ -173,6 +197,6 @@ fn print_report(r: &Found) {
 
 fn usage() -> ! {
     let bugs: Vec<&str> = Bug::ALL.iter().map(|b| b.name()).chain(cluster::Bug::ALL.iter().map(|b| b.name())).collect();
-    eprintln!("usage: strata-sim [--seeds A..B | --seed N] [--trace] [--jobs N] [--verbose] [--promote-ppm N] [--drop-ppm N] [--bug {}] [--cluster [--racing]]", bugs.join(" | "));
+    eprintln!("usage: strata-sim [--seeds A..B | --seed N] [--trace] [--jobs N] [--verbose] [--promote-ppm N] [--drop-ppm N] [--no-pauses] [--no-slow-links] [--bug {}] [--cluster [--racing] [--forgetful]]", bugs.join(" | "));
     std::process::exit(2)
 }

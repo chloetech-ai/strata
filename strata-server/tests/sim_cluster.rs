@@ -5,11 +5,14 @@
 //!
 //! `STRATA_SIM_CLUSTER_SEEDS=A..B` runs those seeds instead of the first
 //! few hundred; `strata-sim --cluster --seed N --trace` shows what happened
-//! in one. Two coordinators changing the map at once (`--racing`) can still
-//! fork it, which only one place ordering the changes ends: their seeds are
-//! not checked here, but for a bug they find.
+//! in one. Two coordinators changing the map at once (`--racing`), and a
+//! coordinator that forgets when it crashes a map it gave that a server may
+//! hold (`--forgetful`, as the server's does), can still fork it, which
+//! only one place ordering the changes ends: their seeds are not checked
+//! here, but for a bug they find.
 
 use std::ops::Range;
+use std::time::Duration;
 
 use strata_server::sim::cluster::{self, Bug, Config, Report};
 
@@ -58,7 +61,12 @@ fn a_cluster_seed_replays_exactly() {
 /// The first seed below `within` that breaks a promise with `bug` put
 /// back, looking a hundred seeds at a time.
 fn finds(bug: Bug, within: u64) -> Option<Report> {
-    let config = |s| Config { bugs: vec![bug], ..Config::of(s) };
+    finds_with(bug, within, Config::of)
+}
+
+/// [`finds`], with each seed's configuration from `of`.
+fn finds_with(bug: Bug, within: u64, of: impl Fn(u64) -> Config + Sync) -> Option<Report> {
+    let config = |s| Config { bugs: vec![bug], ..of(s) };
     (0..within).step_by(100).find_map(|a| cluster::run_seeds(a..(a + 100).min(within), &config, jobs()).into_iter().next())
 }
 
@@ -76,8 +84,22 @@ fn a_late_copy_of_a_move_given_up_is_found_again() {
 
 #[test]
 fn a_change_given_around_the_source_of_a_move_is_found_again() {
-    let r = finds(Bug::ChangesAroundTheSource, 1500).expect("a seed whose map forks while slots copy");
-    assert!(r.stats.split_epochs > 0 && r.violations.iter().any(|v| v.contains("misses write")), "{:?} {:?}", r.violations, r.stats);
+    let r = finds(Bug::ChangesAroundTheSource, 1500).expect("a seed that leaves the source of a move behind");
+    assert!(r.violations.iter().any(|v| v.contains("did not settle")), "{:?} {:?}", r.violations, r.stats);
+}
+
+/// Links slowed down in every seed, not in half of them: the answer to a
+/// change comes too late more often.
+fn slowed(s: u64) -> Config {
+    let c = Config::of(s);
+    let slow_every = if c.slow_every.is_zero() { Duration::from_millis(1000 + s % 9000) } else { c.slow_every };
+    Config { slow_every, ..c }
+}
+
+#[test]
+fn a_change_made_again_at_an_epoch_given_is_found_again() {
+    let r = finds_with(Bug::GivesAnEpochTwice, 1000, slowed).expect("a seed whose map forks after a change no server answered");
+    assert!(r.stats.split_epochs > 0 && r.violations.iter().any(|v| v.contains("did not settle")), "{:?} {:?}", r.violations, r.stats);
 }
 
 /// Found only with both coordinators changing the map: a seed that breaks
