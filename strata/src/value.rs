@@ -97,10 +97,37 @@ pub type Document = Vec<Value>;
 /// [`validate`]s it. Writes call this; documents read back hold the
 /// stored form.
 pub fn conform(schema: &Schema, doc: &mut Document) -> Result<()> {
+    conform_as(schema, doc, Pooling::All)
+}
+
+/// Which multi-vector values of a document a write pools
+/// ([`crate::vector::multi::pooled`]): its new values. A row read back and
+/// written again keeps the vectors it has, which were pooled when they were
+/// written: pooling by a factor would shrink them again.
+#[derive(Clone, Copy, Debug)]
+pub enum Pooling<'a> {
+    /// Every value is new.
+    All,
+    /// None is (a primary's rows replayed on a replica).
+    None,
+    /// The fields at these positions are new (those an UPDATE assigns; the
+    /// rest of the row was read back).
+    Fields(&'a [usize]),
+}
+
+/// [`conform`], pooling the multi-vector values `pooling` names.
+pub fn conform_as(schema: &Schema, doc: &mut Document, pooling: Pooling) -> Result<()> {
     let typed = |v: &Value| matches!(v, Value::Bool(_) | Value::Timestamp(_));
-    for (f, v) in schema.fields.iter().zip(doc.iter_mut()) {
+    for (i, (f, v)) in schema.fields.iter().zip(doc.iter_mut()).enumerate() {
         if f.is_multi_vector() {
             *v = crate::vector::multi::normalize(f, std::mem::replace(v, Value::Null))?;
+            if match pooling {
+                Pooling::All => true,
+                Pooling::None => false,
+                Pooling::Fields(new) => new.contains(&i),
+            } {
+                *v = crate::vector::multi::pooled(f, std::mem::replace(v, Value::Null));
+            }
             continue;
         }
         if f.logical.is_some() || typed(v) || matches!(v, Value::List(xs) if xs.iter().any(typed)) {

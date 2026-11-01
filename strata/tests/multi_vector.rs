@@ -4,8 +4,8 @@
 //! row. With every vector searched and every candidate row scored it equals
 //! a brute-force scan; by default it searches binary codes and scores with
 //! SQ8 codes, close to the float32 answer. Rows survive merges, updates
-//! and shards; similar vectors pool at write; the manifest names the
-//! feature.
+//! and shards; similar vectors pool at write, by a cosine threshold or a
+//! factor, once; the manifest names the feature.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -320,6 +320,36 @@ fn similar_vectors_pool_at_write() {
 }
 
 #[test]
+fn vectors_pool_by_a_factor_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p");
+    let db = sql_db(&path, "CREATE TABLE p (id KEYWORD PRIMARY KEY, title TEXT, patches VECTOR(2)[] OPTIONS(index = 'flat', keep_f32 = true, pool_factor = 2))");
+    let none = Params::new();
+    // Four pairs of near copies: a factor of 2 keeps one vector a pair.
+    let pairs = "ARRAY[ARRAY[1.0, 0.0], ARRAY[1.0, 0.01], ARRAY[0.0, 1.0], ARRAY[0.01, 1.0], ARRAY[-1.0, 0.0], ARRAY[-1.0, 0.01], ARRAY[0.0, -1.0], ARRAY[0.01, -1.0]]";
+    db.sql(&format!("INSERT INTO p (id, title, patches) VALUES ('a', 'one', {pairs})"), &none).unwrap();
+    let stored = |db: &Db| vectors(&rows(db, "SELECT patches FROM p WHERE id = 'a'", &none)[0][0]);
+    let pooled = stored(&db);
+    assert_eq!(pooled.len(), 4, "{pooled:?}");
+    for (v, want) in pooled.iter().zip([[1.0, 0.005], [0.005, 1.0], [-1.0, 0.005], [0.005, -1.0]]) {
+        assert!((v[0] - want[0]).abs() < 1e-3 && (v[1] - want[1]).abs() < 1e-3, "{pooled:?}");
+    }
+    // An UPDATE of another column rewrites the row with the vectors it
+    // has: they are not pooled again. One that sets them pools the new.
+    db.sql("UPDATE p SET title = 'two' WHERE id = 'a'", &none).unwrap();
+    assert_eq!(stored(&db), pooled, "a row read back is not pooled again");
+    db.sql(&format!("UPDATE p SET patches = {pairs} WHERE id = 'a'"), &none).unwrap();
+    assert_eq!(stored(&db), pooled);
+    db.sql(&format!("INSERT OR REPLACE INTO p (id, title, patches) VALUES ('a', 'three', {pairs})"), &none).unwrap();
+    assert_eq!(stored(&db), pooled);
+    // The schema keeps the option.
+    drop(db);
+    let db = Db::open(&path, DbOptions { layout: Layout::Directory, sync: false, ..DbOptions::default() }).unwrap();
+    let t = db.storage().table("p").unwrap();
+    assert_eq!(t.fields[2].pool_factor, Some(2.0));
+}
+
+#[test]
 fn multi_vector_fields_refuse_what_they_cannot_do() {
     let dir = tempfile::tempdir().unwrap();
     let db = sql_db(&dir.path().join("p"), "CREATE TABLE p (id KEYWORD PRIMARY KEY, title TEXT, patches VECTOR(3)[] OPTIONS(index = 'flat'), one VECTOR(3) OPTIONS(index = 'flat'))");
@@ -331,6 +361,10 @@ fn multi_vector_fields_refuse_what_they_cannot_do() {
     assert!(e("INSERT INTO p (id, patches) VALUES ('x', ARRAY[ARRAY[1.0, 0.0]])", &q).contains("3"));
     for (create, what) in [
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[] OPTIONS(pool = 1.5))", "pool"),
+        ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[] OPTIONS(pool_factor = 1))", "pool_factor is above 1"),
+        ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[] OPTIONS(pool_factor = 'two'))", "pool_factor"),
+        ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[] OPTIONS(pool = 0.9, pool_factor = 2))", "not both"),
+        ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3) OPTIONS(pool_factor = 2))", "pool_factor"),
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3) OPTIONS(keep_f32 = true))", "keep_f32"),
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, body TEXT, v VECTOR[] OPTIONS(embed = 'body', model = 'hash:16'))", "embed"),
         ("CREATE TABLE z (id KEYWORD PRIMARY KEY, v VECTOR(3)[], sid KEYWORD[] OPTIONS(semantic_id = 'v', codebook = 'c'))", "multi-vector"),

@@ -28,6 +28,11 @@
 //! rows that own them are the candidates, at most [`CANDIDATES`] of them,
 //! kept by the sum of the best match each query vector found in them.
 //! Each candidate is then scored exactly over all its vectors.
+//!
+//! **Pooling.** A field may merge each row's vectors when the row is
+//! written: those whose cosine similarity is at least `pool` ([`pool`]), or
+//! about one in every `pool_factor` by Ward's linkage ([`ward`]). Only new
+//! values are pooled ([`crate::value::Pooling`]).
 
 use std::sync::Arc;
 
@@ -142,19 +147,34 @@ pub fn normalize(field: &Field, v: Value) -> Result<Value> {
     if items.is_empty() {
         return Ok(Value::Null);
     }
-    let mut vs = items.into_iter().map(one).collect::<Result<Vec<_>>>()?;
-    if let Some(min) = field.pool {
-        vs = pool(&vs, min);
-    }
+    let vs = items.into_iter().map(one).collect::<Result<Vec<_>>>()?;
     Ok(Value::List(vs.into_iter().map(Value::Vector).collect()))
+}
+
+/// A [`normalize`]d value pooled as `field` asks at write: by cosine
+/// similarity ([`Field::pool`], [`pool`]) or by Ward's linkage with a pool
+/// factor ([`Field::pool_factor`], [`ward`]). Writes pool their new values
+/// only ([`crate::value::conform_as`]): a row read back and written again,
+/// the rest of a row an UPDATE rewrites or a primary's rows on a replica,
+/// keeps the vectors it has.
+pub fn pooled(field: &Field, v: Value) -> Value {
+    let (Value::List(items), true) = (&v, field.pool.is_some() || field.pool_factor.is_some()) else { return v };
+    let vs: Vec<Arc<[f32]>> = items.iter().filter_map(|x| if let Value::Vector(v) = x { Some(v.clone()) } else { None }).collect();
+    if vs.len() != items.len() {
+        return v;
+    }
+    let out = match (field.pool, field.pool_factor) {
+        (Some(min), _) => pool(&vs, min),
+        (None, Some(f)) => ward(&vs, f),
+        (None, None) => vs,
+    };
+    Value::List(out.into_iter().map(Value::Vector).collect())
 }
 
 /// Token pooling: merges the two most similar groups of `vs` (by the cosine
 /// of their means) while that cosine is at least `min_cos`. A group's
 /// vector is the mean of its members, scaled to their mean length. No two
-/// of the results are that similar, so pooling them again keeps them: a
-/// row read back and written again (an update, a merge) is not pooled
-/// twice.
+/// of the results are that similar, so pooling them again keeps them.
 pub fn pool(vs: &[Arc<[f32]>], min_cos: f32) -> Vec<Arc<[f32]>> {
     let n = vs.len();
     if n < 2 {
@@ -224,6 +244,148 @@ pub fn pool(vs: &[Arc<[f32]>], min_cos: f32) -> Vec<Arc<[f32]>> {
         .collect()
 }
 
+/// The largest pool factor ([`Field::pool_factor`]).
+pub const MAX_POOL_FACTOR: f32 = 64.0;
+
+/// Rows of more vectors than this are pooled by [`ward`] this many (or
+/// fewer, in equal parts) at a time, in their order: the clustering keeps
+/// a matrix of the distances between a part's groups.
+pub const WARD_PART: usize = 2048;
+
+/// Hierarchical token pooling (Clavié, Chaffin and Adams 2024): clusters
+/// `vs` into `⌈n / factor⌉` groups by Ward's linkage over their directions
+/// (each group's cost is the squared distances of its members' unit vectors
+/// from their mean, so the closest directions merge first, and large groups
+/// grow more slowly than small ones) and keeps one vector per group: the
+/// mean of its members, scaled to their mean length, as [`pool`] does. The
+/// groups keep the order of their first members.
+///
+/// The clustering is the nearest-neighbour chain over a matrix of Ward
+/// distances updated by Lance and Williams' formula, which builds the same
+/// tree as merging the closest pair again and again in `O(n²)` time; the
+/// tree is then cut where `⌈n / factor⌉` groups remain. Clavié et al.
+/// cluster the rows of the cosine distance matrix instead of the vectors;
+/// both put together the tokens of nearly the same direction.
+pub fn ward(vs: &[Arc<[f32]>], factor: f32) -> Vec<Arc<[f32]>> {
+    let n = vs.len();
+    if n > WARD_PART {
+        let parts = n.div_ceil(WARD_PART);
+        let size = n.div_ceil(parts);
+        return vs.chunks(size).flat_map(|c| ward(c, factor)).collect();
+    }
+    let target = ((n as f64 / factor.max(1.0) as f64).ceil() as usize).max(1);
+    if n <= target {
+        return vs.to_vec();
+    }
+    let norm = |v: &[f32]| dot_f32(v, v).sqrt();
+    let units: Vec<Vec<f32>> = vs
+        .iter()
+        .map(|v| {
+            let l = norm(v);
+            v.iter().map(|x| if l > 0.0 { x / l } else { 0.0 }).collect()
+        })
+        .collect();
+    // d[i·n + j]: the Ward distance of groups i and j, twice the growth of
+    // the squared distances from the mean their merge would make; for two
+    // vectors, their squared distance.
+    let mut d = vec![0f32; n * n];
+    for i in 0..n {
+        let ii = dot_f32(&units[i], &units[i]);
+        for j in i + 1..n {
+            let x = (ii + dot_f32(&units[j], &units[j]) - 2.0 * dot_f32(&units[i], &units[j])).max(0.0);
+            d[i * n + j] = x;
+            d[j * n + i] = x;
+        }
+    }
+    let mut size = vec![1f32; n];
+    let mut alive = vec![true; n];
+    // Merges: (distance, a member of each group).
+    let mut merges: Vec<(f32, usize, usize)> = Vec::with_capacity(n - 1);
+    let mut chain: Vec<usize> = Vec::with_capacity(n);
+    for _ in 1..n {
+        loop {
+            if chain.is_empty() {
+                chain.push(alive.iter().position(|&a| a).expect("two groups left"));
+            }
+            let a = *chain.last().expect("chain");
+            let prev = chain.len().checked_sub(2).map(|i| chain[i]);
+            // a's nearest group; on a tie the one before it on the chain,
+            // else the first, so the chain cannot cycle.
+            let mut best = prev.map_or((f32::INFINITY, usize::MAX), |p| (d[a * n + p], p));
+            for j in 0..n {
+                if alive[j] && j != a && Some(j) != prev && d[a * n + j] < best.0 {
+                    best = (d[a * n + j], j);
+                }
+            }
+            let b = best.1;
+            if Some(b) != prev {
+                chain.push(b);
+                continue;
+            }
+            chain.truncate(chain.len() - 2);
+            merges.push((best.0, a, b));
+            let (keep, gone) = (a.min(b), a.max(b));
+            let (sa, sb) = (size[a], size[b]);
+            let dab = d[a * n + b];
+            for k in 0..n {
+                if alive[k] && k != a && k != b {
+                    let sk = size[k];
+                    let x = ((sa + sk) * d[k * n + a] + (sb + sk) * d[k * n + b] - sk * dab) / (sa + sb + sk);
+                    d[keep * n + k] = x;
+                    d[k * n + keep] = x;
+                }
+            }
+            size[keep] = sa + sb;
+            alive[gone] = false;
+            break;
+        }
+    }
+    // The tree's merges from the closest, until `target` groups remain.
+    merges.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for &(_, a, b) in &merges[..n - target] {
+        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+        parent[ra.max(rb)] = ra.min(rb);
+    }
+    let dim = vs[0].len();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut slot = vec![usize::MAX; n];
+    for i in 0..n {
+        let r = root(&mut parent, i);
+        if slot[r] == usize::MAX {
+            slot[r] = groups.len();
+            groups.push((i, Vec::new()));
+        }
+        groups[slot[r]].1.push(i);
+    }
+    groups
+        .into_iter()
+        .map(|(first, members)| {
+            if members.len() == 1 {
+                return vs[first].clone();
+            }
+            let mut sum = vec![0f32; dim];
+            let mut len = 0f32;
+            for &m in &members {
+                for (s, x) in sum.iter_mut().zip(vs[m].iter()) {
+                    *s += x;
+                }
+                len += norm(&vs[m]);
+            }
+            let l = norm(&sum);
+            let scale = if l > 0.0 { len / members.len() as f32 / l } else { 0.0 };
+            sum.iter().map(|x| x * scale).collect::<Vec<f32>>().into()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +424,88 @@ mod tests {
         assert_eq!(pool(&pooled, 0.95), pooled, "pooled vectors pool to themselves");
         assert_eq!(pool(&vs, 1.0).len(), vs.len(), "only equal directions merge at 1");
         assert_eq!(pool(&vs[..1], 0.5), vs[..1].to_vec());
+    }
+
+    /// Ward's clustering by merging the cheapest pair again and again,
+    /// from scratch each time: the groups `ward` should find.
+    fn ward_by_brute_force(vs: &[Arc<[f32]>], target: usize) -> Vec<Vec<usize>> {
+        let unit: Vec<Vec<f64>> = vs
+            .iter()
+            .map(|v| {
+                let l = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                v.iter().map(|&x| x as f64 / l).collect()
+            })
+            .collect();
+        let mut groups: Vec<Vec<usize>> = (0..vs.len()).map(|i| vec![i]).collect();
+        let mean = |g: &[usize]| -> Vec<f64> { (0..unit[0].len()).map(|d| g.iter().map(|&i| unit[i][d]).sum::<f64>() / g.len() as f64).collect() };
+        while groups.len() > target {
+            let mut best = (f64::INFINITY, 0, 0);
+            for a in 0..groups.len() {
+                for b in a + 1..groups.len() {
+                    let (ma, mb) = (mean(&groups[a]), mean(&groups[b]));
+                    let (na, nb) = (groups[a].len() as f64, groups[b].len() as f64);
+                    let cost = na * nb / (na + nb) * ma.iter().zip(&mb).map(|(x, y)| (x - y) * (x - y)).sum::<f64>();
+                    if cost < best.0 {
+                        best = (cost, a, b);
+                    }
+                }
+            }
+            let gone = groups.remove(best.2);
+            groups[best.1].extend(gone);
+            groups[best.1].sort();
+        }
+        groups.sort();
+        groups
+    }
+
+    #[test]
+    fn ward_pooling_finds_the_groups_merging_the_closest_pairs_finds() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for (n, dim, factor) in [(9, 4, 2.0), (40, 8, 3.0), (64, 16, 2.0), (31, 3, 4.0), (100, 32, 1.5)] {
+            let vs: Vec<Arc<[f32]>> = (0..n).map(|_| unit(&mut rng, dim)).collect();
+            let target = (n as f32 / factor).ceil() as usize;
+            let want = ward_by_brute_force(&vs, target);
+            let got = ward(&vs, factor);
+            assert_eq!(got.len(), target, "n {n}, factor {factor}");
+            // Each pooled vector is its group's mean direction at unit length.
+            for (g, v) in want.iter().zip(&got) {
+                let mut sum = vec![0f32; dim];
+                for &i in g {
+                    for d in 0..dim {
+                        sum[d] += vs[i][d];
+                    }
+                }
+                let l = dot_f32(&sum, &sum).sqrt();
+                let cos = dot_f32(&sum, v) / l / dot_f32(v, v).sqrt();
+                assert!(cos > 0.9999 && (dot_f32(v, v).sqrt() - 1.0).abs() < 1e-4, "n {n}: group {g:?}: cos {cos}");
+            }
+        }
+    }
+
+    #[test]
+    fn ward_pooling_keeps_near_copies_together_and_small_rows_whole() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let dim = 16;
+        // Ten directions, each written four times with a little noise:
+        // a factor of 4 keeps one vector per direction.
+        let base: Vec<Arc<[f32]>> = (0..10).map(|_| unit(&mut rng, dim)).collect();
+        let vs: Vec<Arc<[f32]>> = base
+            .iter()
+            .flat_map(|b| (0..4).map(|_| Arc::from(b.iter().map(|x| x + rng.gen_range(-0.02f32..0.02)).collect::<Vec<f32>>())).collect::<Vec<_>>())
+            .collect();
+        let pooled = ward(&vs, 4.0);
+        assert_eq!(pooled.len(), 10);
+        for (p, b) in pooled.iter().zip(&base) {
+            assert!(dot_f32(b, p) / dot_f32(p, p).sqrt() > 0.999, "groups keep their first member's order");
+        }
+        // Two vectors at a factor of 2 merge; one stays; 3 at 2 make 2.
+        assert_eq!(ward(&vs[..2], 2.0).len(), 1);
+        assert_eq!(ward(&vs[..1], 2.0), vs[..1].to_vec());
+        assert_eq!(ward(&vs[..3], 2.0).len(), 2);
+        assert_eq!(ward(&vs, 1.0), vs, "a factor of 1 keeps every vector");
+        // Rows longer than a part are pooled a part at a time.
+        let long: Vec<Arc<[f32]>> = (0..WARD_PART + 10).map(|_| unit(&mut rng, 4)).collect();
+        assert_eq!(ward(&long, 2.0).len(), (WARD_PART + 10).div_ceil(2) + 1);
     }
 
     #[test]
