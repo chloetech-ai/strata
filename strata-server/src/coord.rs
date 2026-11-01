@@ -94,7 +94,8 @@ use crate::metrics::Family;
 use crate::pb::{self, strata_client::StrataClient};
 use crate::service::{is_mark, op_place, op_schema, op_source, After, QueryReq, Written};
 use crate::replication::Acks;
-use crate::slots::{self, hash_shard_of, SlotMap};
+use crate::cores::slots as core;
+use crate::slots::{self, hash_shard_of, Move, SlotMap};
 use crate::{json as js, plan_pb, ApiError};
 
 mod moves;
@@ -2301,102 +2302,86 @@ impl Coordinator {
         });
     }
 
-    /// Changes the cluster map: `f` makes the next map from the newest,
-    /// which every server of the next map is given, and the coordinator
-    /// routes by it. One change at a time here; a change another
-    /// coordinator made meanwhile (a server holds another map of that
-    /// epoch) is taken up and `f` runs again on it, three times at most.
-    /// A server that does not answer is given the map when it answers
-    /// again, but for those of `first`, which take it before any other is
-    /// given it, or the change is not made. Returns the new map and the
-    /// servers that did not take it.
+    /// Changes the cluster map, as [`core::Change`] decides: `f` makes the
+    /// next map from the newest, which every server of the next map is
+    /// given, and the coordinator routes by it. One change at a time here;
+    /// a change another coordinator made meanwhile (a server holds another
+    /// map of that epoch) is taken up and `f` runs again on it, three times
+    /// at most. A server that does not answer is given the map when it
+    /// answers again, but for those of `first`, and while slots copy the
+    /// server they move from, which take it one at a time before any other
+    /// is given it, or the change is not made. A map no server took is not
+    /// routed by (503). Returns the new map and the servers that did not
+    /// take it.
     pub async fn change(&self, f: impl Fn(&SlotMap) -> Result<SlotMap, String>, first: &[String]) -> Result<(SlotMap, Vec<String>), ApiError> {
         let _one = self.changing.lock().await;
-        for _ in 0..3 {
-            self.sync().await;
-            let t = self.topo();
-            let now = t.slots.clone().ok_or_else(|| ApiError::bad("a coordinator routing by the hash before slots (a shard from before protocol 4) cannot change the cluster"))?;
-            if t.replicas.iter().flatten().any(|r| (1..CLUSTER_PROTOCOL).contains(&r.protocol.load(Ordering::Relaxed))) {
-                return Err(ApiError::bad(format!("changing the cluster needs every server to speak protocol {CLUSTER_PROTOCOL}: upgrade them first")));
-            }
-            let now = match now.replicas().is_empty() {
-                true => now.with_replicas(t.groups()).map_err(ApiError::internal)?,
-                false => now,
+        let (mut change, mut step) = core::Change::new(first);
+        let mut t = self.topo();
+        loop {
+            step = match step {
+                core::ChangeStep::Sync => {
+                    self.sync().await;
+                    t = self.topo();
+                    if t.replicas.iter().flatten().any(|r| (1..CLUSTER_PROTOCOL).contains(&r.protocol.load(Ordering::Relaxed))) {
+                        return Err(ApiError::bad(format!("changing the cluster needs every server to speak protocol {CLUSTER_PROTOCOL}: upgrade them first")));
+                    }
+                    let now = match t.slots.clone() {
+                        Some(m) if m.replicas().is_empty() => Some(m.with_replicas(t.groups()).map_err(ApiError::internal)?),
+                        other => other,
+                    };
+                    // The primary of the shard slots copy from (its one
+                    // server, unreplicated), which holds their writes for
+                    // the flip, as the move job finds it.
+                    let source = |m: &Move| {
+                        let rs = t.replicas.get(m.from)?;
+                        let k = self.newest_primary(&t, m.from).or_else(|| rs.iter().all(|r| r.role() == pb::Role::Standalone).then_some(0))?;
+                        rs.get(k).map(|r| r.url.clone())
+                    };
+                    change.synced(now.as_ref(), &f, &source)
+                }
+                core::ChangeStep::Give { map, to } => {
+                    let staged = Topology::new(map.replicas().to_vec(), Some(map.clone()), Some(&t), &self.opts)?;
+                    let wait = Duration::from_secs(if change.giving_first() { 30 } else { 60 });
+                    let answers = join_all(to.iter().map(|(i, url)| {
+                        let rep = staged.replicas.get(*i).and_then(|rs| rs.iter().find(|r| r.url == *url)).cloned();
+                        let map = &map;
+                        async move {
+                            let Some(rep) = rep else { return (url, core::Given::Missed("not among the map's servers".into())) };
+                            let mut c = rep.client.clone();
+                            let a = match tokio::time::timeout(wait, give_slots(&mut c, map, *i)).await {
+                                Ok(Ok(_)) => Ok(()),
+                                Ok(Err(e)) => Err(ApiError { status: if e.code() == Code::FailedPrecondition { 409 } else { ApiError::from(e.clone()).status }, message: e.message().to_string() }),
+                                Err(_) => Err(ApiError { status: 504, message: format!("no answer within {} s", wait.as_secs()) }),
+                            };
+                            // Refused: another coordinator gave a map of this
+                            // epoch or newer, or the server refuses this one.
+                            let holds = match &a {
+                                Err(e) if e.status == 409 => held_map(&mut c).await.ok().flatten().map(|(m, _)| m),
+                                _ => None,
+                            };
+                            (url, core::given(a, holds.as_ref(), map))
+                        }
+                    }))
+                    .await;
+                    let mut next = None;
+                    for (url, g) in answers {
+                        if let core::Given::Raced(why) = &g {
+                            tracing::warn!(epoch = map.epoch, refused = %format!("{url}: {why}"), "another change of the cluster map came first: trying again on it");
+                        }
+                        next = change.answered(url, g).or(next);
+                    }
+                    next.ok_or_else(|| ApiError::internal("a change of the cluster map waits for no answer"))?
+                }
+                core::ChangeStep::Done(r) => {
+                    let (next, missed) = r?;
+                    self.install(next.clone())?;
+                    if !missed.is_empty() {
+                        tracing::warn!(epoch = next.epoch, missed = %missed.join("; "), "servers that did not take the new cluster map get it when they answer again");
+                    }
+                    return Ok((next, missed));
+                }
             };
-            let next = f(&now).map_err(ApiError::bad)?;
-            if next.epoch <= now.epoch {
-                return Err(ApiError::internal("a change must raise the map's epoch"));
-            }
-            let staged = Topology::new(next.replicas().to_vec(), Some(next.clone()), Some(&t), &self.opts)?;
-            let mut raced = None;
-            let (firsts, rest): (Vec<(usize, &Arc<Replica>)>, Vec<(usize, &Arc<Replica>)>) = staged.replicas.iter().enumerate().flat_map(|(i, rs)| rs.iter().map(move |r| (i, r))).partition(|(_, r)| first.contains(&r.url));
-            for (i, r) in firsts {
-                let mut c = r.client.clone();
-                let mut why = None;
-                // A map given again is taken again: an answer lost is asked
-                // for again.
-                for _ in 0..3 {
-                    match tokio::time::timeout(Duration::from_secs(30), give_slots(&mut c, &next, i)).await {
-                        Ok(Ok(_)) => {
-                            why = None;
-                            break;
-                        }
-                        Ok(Err(e)) if e.code() == Code::FailedPrecondition => {
-                            match held_map(&mut c).await {
-                                Ok(Some((m, _))) if m.epoch >= next.epoch && m != next => raced = Some(format!("{}: {}", r.url, e.message())),
-                                _ => why = Some(e.message().to_string()),
-                            }
-                            break;
-                        }
-                        Ok(Err(e)) => why = Some(e.message().to_string()),
-                        Err(_) => why = Some("no answer within 30 s".into()),
-                    }
-                }
-                if raced.is_some() {
-                    break;
-                }
-                if let Some(why) = why {
-                    return Err(ApiError { status: 503, message: format!("{} did not take cluster map epoch {} first, so no server was given it: {why}", r.url, next.epoch) });
-                }
-            }
-            if let Some(why) = raced {
-                tracing::warn!(epoch = next.epoch, refused = %why, "another change of the cluster map came first: trying again on it");
-                continue;
-            }
-            let answers = join_all(rest.into_iter().map(|(i, r)| {
-                let mut c = r.client.clone();
-                let next = &next;
-                async move { (r, tokio::time::timeout(Duration::from_secs(60), give_slots(&mut c, next, i)).await) }
-            }))
-            .await;
-            let mut missed = Vec::new();
-            for (r, a) in answers {
-                match a {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) if e.code() == Code::FailedPrecondition => {
-                        // Another coordinator gave a map of this epoch or
-                        // newer, or the server refuses this one.
-                        let mut c = r.client.clone();
-                        match held_map(&mut c).await {
-                            Ok(Some((m, _))) if m.epoch >= next.epoch && m != next => raced = Some(format!("{}: {}", r.url, e.message())),
-                            _ => missed.push(format!("{}: {}", r.url, e.message())),
-                        }
-                    }
-                    Ok(Err(e)) => missed.push(format!("{}: {}", r.url, e.message())),
-                    Err(_) => missed.push(format!("{}: no answer within 60 s", r.url)),
-                }
-            }
-            if let Some(why) = raced {
-                tracing::warn!(epoch = next.epoch, refused = %why, "another change of the cluster map came first: trying again on it");
-                continue;
-            }
-            self.install(next.clone())?;
-            if !missed.is_empty() {
-                tracing::warn!(epoch = next.epoch, missed = %missed.join("; "), "servers that did not take the new cluster map get it when they answer again");
-            }
-            return Ok((next, missed));
         }
-        Err(ApiError { status: 409, message: "other changes of the cluster map kept coming first: try again".into() })
     }
 
     /// What a server new to the cluster says: its protocol, part in

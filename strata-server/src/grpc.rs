@@ -14,6 +14,7 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::pb::{self, value::Kind};
+use crate::cores::slots::Moved;
 use crate::service::{After, QueryReq, Service, Stream};
 use crate::keys::{self, KeySet, Principal, Scope};
 use crate::{obs, plan_pb, ApiError};
@@ -380,7 +381,7 @@ impl pb::strata_server::Strata for Grpc {
             let w = if !r.ops_json.is_empty() {
                 let ops: Vec<serde_json::Value> = from_json(&r.ops_json, "write operations")?;
                 let key = Some(r.idempotency_key).filter(|k| !k.is_empty());
-                svc.write_ops_as(ops, key, r.moved).await?
+                svc.write_ops_as(ops, key, if r.moved { Moved::Copy } else { Moved::No }).await?
             } else if r.moved {
                 return Err(ApiError::bad("rows of moving slots come as write operations (ops_json), not SQL"));
             } else {

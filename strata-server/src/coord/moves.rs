@@ -13,26 +13,19 @@
 //! shard the slots were to go to deletes what it was sent.
 //!
 //! One move at a time in the cluster; a job (several moves) runs in the
-//! background, and [`Coordinator::moves`] says how it does.
+//! background, and [`Coordinator::moves`] says how it does. What a move
+//! does next is [`crate::cores::slots::MoveRun`]'s to decide, which the
+//! simulator runs too; this module carries out its steps.
 
 use std::sync::atomic::AtomicBool;
 
 use super::*;
-use crate::slots::{Move, MoveState, SLOTS};
+use crate::cores::slots::{MoveRun, MoveStep, HOLD_RENEW, HOLD_TTL};
+use crate::slots::SLOTS;
 
 /// Slots a planned move takes at most: a sixteenth of the cluster, so that
 /// a move's copy, and the hold at its end, stay short.
 pub const MOVE_SLOTS: usize = 256;
-
-/// Rounds of copying what changed before writes are held for the last.
-const CATCH_UP_ROUNDS: u32 = 8;
-
-/// Changed rows few enough to copy while writes are held.
-const CATCH_UP_ROWS: u64 = 2_000;
-
-/// How long a hold lasts unless asked for again, and how often it is.
-const HOLD_TTL: Duration = Duration::from_secs(30);
-const HOLD_RENEW: Duration = Duration::from_secs(10);
 
 /// Rows per chunk of an export.
 const EXPORT_ROWS: u32 = 1_000;
@@ -260,28 +253,8 @@ impl Coordinator {
     /// Moves `slots` to shard `to` (step `k` of the job): whether they
     /// moved (false: given up, and the rows sent deleted).
     async fn run_move(&self, slots: &[usize], to: usize, k: usize) -> Result<bool, ApiError> {
-        let (map, _) = self.change(|m| m.start_move(slots, to), &[]).await?;
-        let mv = map.moving().cloned().ok_or_else(|| ApiError::internal("a started move is not in the map"))?;
-        let flipped = Move { state: MoveState::Cleaning, ..mv.clone() };
-        match self.copy_and_flip(&mv, k).await {
-            Ok(()) => {
-                self.step(k, |s| s.phase = "cleaning");
-                self.settle(&flipped).await?;
-                Ok(true)
-            }
-            Err(e) => {
-                // The flip may have been taken although its answer was lost.
-                self.sync().await;
-                if self.map().and_then(|m| m.moving().cloned()).is_some_and(|m| same_move(&m, &mv) && m.state == MoveState::Cleaning) {
-                    self.step(k, |s| s.phase = "cleaning");
-                    self.settle(&flipped).await?;
-                    return Ok(true);
-                }
-                tracing::warn!(error = %e.message, "giving up a slot move");
-                self.give_up(&mv).await?;
-                Err(e)
-            }
-        }
+        let (run, step) = MoveRun::new(slots.to_vec(), to);
+        self.drive(run, step, Some(k)).await
     }
 
     /// Finishes the move in the cluster map that no job here runs (one a
@@ -293,107 +266,107 @@ impl Coordinator {
             return Err(ApiError { status: 409, message: "a job of moves runs here: it finishes its own moves (stop it with POST /v1/admin/moves/stop)".into() });
         };
         self.sync().await;
-        let Some(mv) = self.map().and_then(|m| m.moving().cloned()) else { return Ok(json!({"finished": null})) };
-        let state = mv.state;
-        match state {
-            MoveState::Cleaning => self.settle(&mv).await?,
-            MoveState::Copying | MoveState::Aborting => self.give_up(&mv).await?,
-        }
-        Ok(json!({"finished": {"from": mv.from, "to": mv.to, "slots": mv.ranges(), "was": state.name(), "moved": state == MoveState::Cleaning}}))
+        let Some(now) = self.map() else { return Ok(json!({"finished": null})) };
+        let Some(mv) = now.moving().cloned() else { return Ok(json!({"finished": null})) };
+        let Some((run, step)) = MoveRun::finish(&now) else { return Ok(json!({"finished": null})) };
+        let moved = self.drive(run, step, None).await?;
+        Ok(json!({"finished": {"from": mv.from, "to": mv.to, "slots": mv.ranges(), "was": mv.state.name(), "moved": moved}}))
     }
 
-    /// Gives up `mv`: the map says so (aborting), the shard the slots were
-    /// to go to deletes what it was sent, and the move ends.
-    async fn give_up(&self, mv: &Move) -> Result<(), ApiError> {
-        let moving = |m: &SlotMap| m.moving().filter(|x| same_move(x, mv)).cloned();
-        if self.map().as_ref().and_then(moving).is_some_and(|m| m.state == MoveState::Copying) {
-            self.change(|m| if moving(m).is_some_and(|x| x.state == MoveState::Copying) { m.abort_move() } else { Err("the move changed meanwhile".into()) }, &[]).await?;
-            // A hold on writes it left ends now rather than in its time.
-            let t = self.topo();
-            if let Ok(src) = self.primary(&t, mv.from).await {
-                if let Err(e) = self.hold(mv.from, src.unwrap_or(0), true).await {
-                    tracing::warn!(error = %e.message, "could not end the hold on writes to slots no longer moving: it ends by itself");
+    /// Carries out a move's steps from `step`, answering `run` with what
+    /// each did, until it ends (step `k` of the job, if any, shows where it
+    /// is): whether its slots moved.
+    async fn drive(&self, mut run: MoveRun, mut step: MoveStep, k: Option<usize>) -> Result<bool, ApiError> {
+        // The server of the shard the slots leave that their rows come
+        // from, and holds writes to them: its primary.
+        let mut src: Option<usize> = None;
+        let mut renewing: Option<Renewing> = None;
+        let mut held: Option<Instant> = None;
+        let show = |run: &MoveRun| {
+            if let Some(k) = k {
+                let (phase, rounds) = (run.phase().name(), run.rounds());
+                self.step(k, |s| {
+                    s.phase = phase;
+                    s.rounds = rounds;
+                });
+            }
+        };
+        loop {
+            show(&run);
+            let mv = run.moving().cloned();
+            match (run.renewing(), renewing.is_some(), &mv) {
+                (true, false, Some(mv)) => {
+                    renewing = Some(self.renew_hold(mv.from, src.unwrap_or(0)));
+                    held = held.or(Some(Instant::now()));
                 }
+                (false, true, _) => renewing = None,
+                _ => {}
             }
+            let started = || mv.clone().ok_or_else(|| ApiError::internal("a step of a move that has not started"));
+            step = match step {
+                MoveStep::Change { edit, first_from } => {
+                    let first: Vec<String> = match (first_from, &mv, src) {
+                        (true, Some(m), Some(s)) => self.topo().replicas.get(m.from).and_then(|rs| rs.get(s)).map(|r| r.url.clone()).into_iter().collect(),
+                        _ => Vec::new(),
+                    };
+                    let r = self.change(|m| edit.apply(m), &first).await.map(|(m, _)| m);
+                    run.changed(r, self.map().as_ref())
+                }
+                MoveStep::Source => {
+                    let mv = started()?;
+                    let r = self.primary(&self.topo(), mv.from).await.map(|s| src = Some(s.unwrap_or(0)));
+                    run.found(r)
+                }
+                MoveStep::Cleanup { shard } => {
+                    let t = self.topo();
+                    run.cleaned(self.cleanup(&t, shard).await)
+                }
+                MoveStep::Export { changes } => {
+                    let mv = started()?;
+                    run.exported(self.export_round(&mv, src.unwrap_or(0), changes, k).await)
+                }
+                MoveStep::Hold => {
+                    let mv = started()?;
+                    run.held(self.hold(mv.from, src.unwrap_or(0), false).await)
+                }
+                MoveStep::Thaw => {
+                    let mv = started()?;
+                    renewing = None;
+                    if let (Some(k), Some(h)) = (k, held.take()) {
+                        let ms = h.elapsed().as_secs_f64() * 1e3;
+                        self.step(k, |s| s.held_ms = Some(ms));
+                    }
+                    // A move another coordinator left: its source is the
+                    // primary now.
+                    let at = match src {
+                        Some(s) => Some(s),
+                        None => self.primary(&self.topo(), mv.from).await.ok().map(|s| s.unwrap_or(0)),
+                    };
+                    match at {
+                        Some(s) => {
+                            if let Err(e) = self.hold(mv.from, s, true).await {
+                                tracing::warn!(error = %e.message, "could not end the hold on writes to the moving slots: it ends by itself");
+                            }
+                        }
+                        None => tracing::warn!("could not find the server holding writes to the moving slots: its hold ends by itself"),
+                    }
+                    run.thawed()
+                }
+                MoveStep::Sync => {
+                    tracing::warn!("a step of a slot move failed: giving it up, unless its flip was taken");
+                    self.sync().await;
+                    run.synced(self.map().as_ref())
+                }
+                MoveStep::Done(r) => return r,
+            };
         }
-        self.settle(&Move { state: MoveState::Aborting, ..mv.clone() }).await
-    }
-
-    /// Ends `mv` (cleaning or aborting): the shard holding rows of its
-    /// slots that it does not serve deletes them, then the map drops it.
-    async fn settle(&self, mv: &Move) -> Result<(), ApiError> {
-        let t = self.topo();
-        let holder = if mv.state == MoveState::Cleaning { mv.from } else { mv.to };
-        self.cleanup(&t, holder).await?;
-        self.change(
-            |m| match m.moving() {
-                Some(x) if same_move(x, mv) && x.state != MoveState::Copying => m.end_move(),
-                _ => Err("the move ended meanwhile".into()),
-            },
-            &[],
-        )
-        .await
-        .map(|_| ())
-        .or_else(|e| if self.map().is_some_and(|m| m.moving().is_none_or(|x| !same_move(x, mv))) { Ok(()) } else { Err(e) })
-    }
-
-    /// Copies the rows of `mv`'s slots to the shard they move to, holds the
-    /// writes to them for the last changes, and gives them to it in the
-    /// map.
-    async fn copy_and_flip(&self, mv: &Move, k: usize) -> Result<(), ApiError> {
-        let t = self.topo();
-        let src = self.primary(&t, mv.from).await?.unwrap_or(0);
-        let src_url = t.replicas[mv.from][src].url.clone();
-        // What an earlier try sent the shard they move to.
-        self.cleanup(&t, mv.to).await?;
-        self.step(k, |s| s.phase = "copying");
-        let (rows, frozen) = self.export_round(mv, src, false, k).await?;
-        let mut renewing = None;
-        let mut held = None;
-        if frozen {
-            // The shard cannot tell what changed: writes were held from the
-            // start.
-            held = Some(Instant::now());
-            renewing = Some(self.renew_hold(mv.from, src));
-        } else {
-            let mut last = rows;
-            let mut rounds = 0;
-            while last > CATCH_UP_ROWS && rounds < CATCH_UP_ROUNDS {
-                self.step(k, |s| s.phase = "catching up");
-                last = self.export_round(mv, src, true, k).await?.0;
-                rounds += 1;
-                self.step(k, |s| s.rounds = rounds);
-            }
-            self.step(k, |s| s.phase = "holding writes");
-            self.hold(mv.from, src, false).await?;
-            held = held.or(Some(Instant::now()));
-            renewing = renewing.or(Some(self.renew_hold(mv.from, src)));
-            self.export_round(mv, src, true, k).await?;
-        }
-        self.step(k, |s| s.phase = "flipping");
-        let flipped = self
-            .change(
-                |m| match m.moving() {
-                    Some(x) if same_move(x, mv) && x.state == MoveState::Copying => m.flip_move(),
-                    _ => Err("the move changed while its rows were copied".into()),
-                },
-                std::slice::from_ref(&src_url),
-            )
-            .await;
-        drop(renewing);
-        if let Err(e) = self.hold(mv.from, src, true).await {
-            tracing::warn!(error = %e.message, "could not end the hold on writes to moved slots: it ends by itself");
-        }
-        let held_ms = held.map(|h| h.elapsed().as_secs_f64() * 1e3);
-        self.step(k, |s| s.held_ms = held_ms);
-        flipped.map(|_| ())
     }
 
     /// One export of `mv`'s slots from server `src` of the shard they
     /// leave (every row, or what changed since the export before), written
     /// to the shard they move to: the rows sent, and whether the shard
     /// they leave holds their writes.
-    async fn export_round(&self, mv: &Move, src: usize, changes: bool, k: usize) -> Result<(u64, bool), ApiError> {
+    async fn export_round(&self, mv: &Move, src: usize, changes: bool, k: Option<usize>) -> Result<(u64, bool), ApiError> {
         let t = self.topo();
         let rep = t.replicas.get(mv.from).and_then(|rs| rs.get(src)).ok_or_else(|| ApiError::internal("the shard slots move from changed places"))?;
         let mut c = rep.client.clone();
@@ -416,7 +389,9 @@ impl Coordinator {
             let r = pb::WriteRequest { ops_json: chunk.ops_json, epoch: t.epoch(), moved: true, ..Default::default() };
             self.write(&t, mv.to, r, CLUSTER_PROTOCOL).await?;
             rows += chunk.rows;
-            self.step(k, |s| s.rows += chunk.rows);
+            if let Some(k) = k {
+                self.step(k, |s| s.rows += chunk.rows);
+            }
         }
     }
 
@@ -463,11 +438,6 @@ impl Coordinator {
         }
         Ok(deleted)
     }
-}
-
-/// Whether `a` and `b` are the same move (in any state).
-fn same_move(a: &Move, b: &Move) -> bool {
-    a.from == b.from && a.to == b.to && a.slots == b.slots
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

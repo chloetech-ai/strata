@@ -14,6 +14,7 @@ use strata::storage::DbOptions;
 use strata::value::Value;
 use strata_server::auth::Access;
 use strata_server::coord::Coordinator;
+use strata_server::cores::slots::Moved;
 use strata_server::keys::Principal;
 use strata_server::replication::{self, Acks, KeptRole, PrimaryOptions};
 use strata_server::service::{shard_of, After, AgentConfig, Backend, QueryReq, Service};
@@ -574,7 +575,7 @@ async fn unnumbered_shards_move_and_a_move_left_is_given_up() {
         }
         let ops: Vec<serde_json::Value> = serde_json::from_slice(&chunk.ops_json).unwrap();
         sent += ops.len();
-        s1.write_ops_as(ops, None, true).await.unwrap();
+        s1.write_ops_as(ops, None, Moved::Copy).await.unwrap();
         // Half of it.
         if sent >= 20 {
             break;
