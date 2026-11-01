@@ -288,12 +288,18 @@ struct Args {
     /// GET /v1/admin/audit).
     #[arg(long)]
     audit_log: Option<PathBuf>,
-    /// The AWS credentials the command center's AWS view saves (default:
+    /// The AWS credentials the command center's cloud view saves (default:
     /// DB.aws.json beside --db, readable by this user only; a coordinator
     /// keeps them in memory without it). Without saved ones, the view uses
     /// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN.
     #[arg(long)]
     aws_file: Option<PathBuf>,
+    /// The DigitalOcean token the command center's cloud view saves
+    /// (default: DB.digitalocean.json beside --db, readable by this user
+    /// only; a coordinator keeps it in memory without it). Without a saved
+    /// one, the view uses DIGITALOCEAN_TOKEN or DIGITALOCEAN_ACCESS_TOKEN.
+    #[arg(long)]
+    digitalocean_file: Option<PathBuf>,
     /// The alert rules' file, JSON (created when the rules are first
     /// edited; default rules in memory without it).
     #[arg(long)]
@@ -638,6 +644,7 @@ async fn main() {
         keys: a.keys,
         audit_log: a.audit_log,
         aws_file: a.aws_file,
+        digitalocean_file: a.digitalocean_file,
         alerts: a.alerts,
         alert_webhook: a.alert_webhook.filter(|u| !u.is_empty()),
         log_store: a.log_store.as_deref().map(|p| (p != "off").then(|| PathBuf::from(p))),
