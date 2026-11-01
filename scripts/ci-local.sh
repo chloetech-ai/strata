@@ -111,6 +111,8 @@ Options:
   --post-status    post the result as commit status `ci-local` on GitHub
   --fail-fast      stop at the first failed job (default: run them all)
   --verbose        show each job's output as it runs (default: the log's tail on failure)
+  --fast           --nextest, --lanes 2, and only the jobs the change can affect (main tested the rest)
+  --lanes N        run the jobs in N lanes at once (1 or 2; default 1)
   --nextest        run the three crates' test suites with cargo-nextest (built once): every binary's tests at once
   --keep-binaries  keep the test executables after each job (default: delete them, as they are most of the disk used)
   --list           list the jobs
@@ -169,7 +171,7 @@ job_names() { printf '%s\n' "$JOBS" | awk -F'|' 'NF { print $1 }'; }
 # --- options ---------------------------------------------------------------
 
 ARGS=("$@")
-PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 NEXTEST=0 SELECTED=""
+PR="" REF=HEAD BASE=main MERGE=1 ALL=0 KAFKA=0 POST=0 FAIL_FAST=0 VERBOSE=0 SETUP_ONLY=0 KEEP_BINARIES=0 NEXTEST=0 LANES=1 ONLY_AFFECTED=0 SELECTED=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --pr) PR=${2:?--pr needs a number}; shift ;;
@@ -183,6 +185,8 @@ while [ $# -gt 0 ]; do
         --verbose|-v) VERBOSE=1 ;;
         --keep-binaries) KEEP_BINARIES=1 ;;
         --nextest) NEXTEST=1 ;;
+        --lanes) LANES=${2:?--lanes needs 1 or 2}; shift ;;
+        --fast) NEXTEST=1 LANES=2 ONLY_AFFECTED=1 ;;
         --setup) SETUP_ONLY=1 ;;
         --list)
             printf '%s\n' "$JOBS" | awk -F'|' 'NF { printf "  %-30s %s\n", $1, $3 }'
@@ -203,6 +207,7 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+case "$LANES" in 1|2) ;; *) die "--lanes takes 1 or 2" ;; esac
 [ -n "$SELECTED" ] || SELECTED=$(job_names | tr '\n' ' ')
 selected() { case " $SELECTED " in *" $1 "*) return 0 ;; esac; return 1; }
 FULL=1
@@ -231,7 +236,7 @@ post_status() {
 FINISHED=0 HEAD_SHA=""
 cleanup() {
     local p
-    for p in $MIRI_PIDS; do signal_tree CONT "$p"; signal_tree TERM "$p"; done
+    for p in $MIRI_PIDS $LANE_PIDS; do signal_tree CONT "$p"; signal_tree TERM "$p"; done
     [ "$FINISHED" = 1 ] || post_status error "Interrupted"
     rm -f "$CI_HOME/running" "$CI_HOME/paused"
 }
@@ -373,6 +378,9 @@ setup_python() {
 # own; then the doctests, which nextest does not run.
 crate_tests() {
     if [ "$NEXTEST" = 1 ]; then
+        # The test binaries, for prune_job (listing builds them).
+        cargo nextest list --cargo-profile ci "$@" --message-format json \
+            | python3 -c 'import json, sys; [print(s["binary-path"]) for s in json.load(sys.stdin)["rust-suites"].values()]' >"$JOB_LOG.binaries"
         cargo nextest run --cargo-profile ci --no-fail-fast "$@"
         cargo test --profile ci --doc "$@"
     else
@@ -574,10 +582,21 @@ miri_part() {
 }
 
 # --- running them ----------------------------------------------------------
+#
+# The jobs run in lanes: one by default, the jobs one after another; with
+# --lanes 2 (or --fast) two, so that while one lane links, runs a
+# single-threaded step or waits on a download, the other has the cores.
+# Lane 2 has the jobs that build outside strata/target. Miri runs beside the
+# lanes. Each job's outcome is a line of $RUN_DIR/results.
 
-RESULTS="" MIRI_PIDS="" FAILED=0
-record() { RESULTS="$RESULTS$1|$2|$3
-"; }
+MIRI_PIDS="" LANE_PIDS=""
+LANE2_JOBS="test-engram test-strata-server server-smoke python"
+record() { printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$RUN_DIR/results"; }
+failed_any() { [ -f "$RUN_DIR/results" ] && grep -qv '|success|' "$RUN_DIR/results"; }
+lane_of() {
+    if [ "$LANES" -ge 2 ]; then case " $LANE2_JOBS " in *" $1 "*) echo 2; return ;; esac; fi
+    echo 1
+}
 
 # The pids of a process's descendants, children first.
 descendants() { local p; for p in $(pgrep -P "$1" 2>/dev/null); do echo "$p"; descendants "$p"; done; }
@@ -588,30 +607,33 @@ signal_tree() {
     for p in $list; do kill -"$1" "$p" 2>/dev/null; done
 }
 
-wait_if_paused() {
-    [ -e "$PAUSE" ] || return 0
-    local p
-    for p in $MIRI_PIDS; do signal_tree STOP "$p"; done
-    date '+%Y-%m-%dT%H:%M:%S%z' >"$CI_HOME/paused"
-    say "Paused: $PAUSE exists. Going on once it is removed."
-    while [ -e "$PAUSE" ]; do sleep 10; done
-    rm -f "$CI_HOME/paused"
-    for p in $MIRI_PIDS; do signal_tree CONT "$p"; done
-    say "Resumed."
+# The test executables a job ran: most of a target directory (each of
+# strata's test binaries holds all of Strata), and linked again after any
+# change to their crate, so keeping them saves little. Only those its log
+# names go (cargo test's Running lines, nextest's list), so that a job in the
+# other lane keeps its own; compiled dependencies and release builds stay.
+prune_job() {
+    local rel crate
+    { sed -n 's/^ *Running .* (\(target\/[^)]*\))$/\1/p' "$1"; cat "$1.binaries" 2>/dev/null; } | sort -u | while read -r rel; do
+        case "$rel" in
+            /*) rm -f "$rel" ;;
+            *) for crate in strata strata-server engram strata-py; do rm -f "$crate/$rel"; done ;;
+        esac
+    done
+    return 0
 }
 
 run_job() {
     local name=$1 fn=job_$(echo "$1" | tr - _) log=$RUN_DIR/$1.log start rc secs result
-    wait_if_paused
     if [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; then
         say "$(printf '  %-42s not run: less than %s GB free' "$name" "$MIN_FREE_GB")"
         record "$name" "not run (disk)" 0
-        FAILED=1
         return
     fi
-    if [ "$VERBOSE" = 1 ]; then echo "  $name"; else printf '  %-42s ' "$name"; fi
+    # One lane: the job's name while it runs, its outcome on the same line.
+    [ "$LANES" = 1 ] && [ "$VERBOSE" = 0 ] && printf '  %-42s ' "$name"
     start=$(now)
-    JOB_DIR=$RUN_DIR
+    JOB_DIR=$RUN_DIR JOB_LOG=$log
     if [ "$VERBOSE" = 1 ]; then
         (set -e -x; "$fn") 2>&1 | tee "$log"
         rc=${PIPESTATUS[0]}
@@ -626,31 +648,65 @@ run_job() {
     else
         result="FAILED  $(mins $secs) min  ($log)"
         record "$name" failure "$secs"
-        FAILED=1
     fi
-    if [ "$VERBOSE" = 1 ]; then printf '  %-42s %s\n' "$name" "$result"; else echo "$result"; fi
+    if [ "$LANES" = 1 ] && [ "$VERBOSE" = 0 ]; then echo "$result"; else printf '  %-42s %s\n' "$name" "$result"; fi
     printf '  %-42s %s\n' "$name" "$result" >>"$RUN_DIR/run.log"
     [ "$rc" = 0 ] || [ "$VERBOSE" = 1 ] || tail -n 40 "$log" | sed 's/^/      | /'
-    [ "$KEEP_BINARIES" = 1 ] || prune_tests
+    [ "$KEEP_BINARIES" = 1 ] || prune_job "$log"
 }
 
-# The test executables a job linked: most of a target directory (strata's
-# hundred test binaries each hold all of Strata), and linked again after any
-# change to the crate, so keeping them saves little. The compiled
-# dependencies stay; so does every release build, which later jobs run, and
-# Miri's, which runs beside the jobs.
-prune_tests() {
-    find strata/target strata-server/target engram/target strata-py/target \
-        \( -path '*/release' -o -path '*/miri-*' \) -prune -o \
-        -path '*/deps/*' -type f -perm -u+x ! -name '*.*' -exec rm -f {} + 2>/dev/null
-    return 0
+# A lane's jobs in order. Before each, it waits while $PAUSE exists, saying
+# so with lane-N.paused; the supervisor freezes Miri once every lane waits.
+run_lane() {
+    local lane=$1 name
+    for name in $(job_names); do
+        [ "$name" = miri ] && continue
+        selected "$name" && affected "$name" || continue
+        [ "$(lane_of "$name")" = "$lane" ] || continue
+        [ "$FAIL_FAST" = 1 ] && failed_any && break
+        if [ -e "$PAUSE" ]; then
+            touch "$RUN_DIR/lane-$lane.paused"
+            while [ -e "$PAUSE" ]; do sleep 5; done
+            rm -f "$RUN_DIR/lane-$lane.paused"
+        fi
+        run_job "$name"
+    done
+    touch "$RUN_DIR/lane-$lane.done"
+}
+
+supervise() {
+    local frozen=0 alive idle lane p
+    while :; do
+        alive=0
+        for p in $LANE_PIDS $MIRI_PIDS; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ "$alive" = 1 ] || break
+        if [ -e "$PAUSE" ] && [ "$frozen" = 0 ]; then
+            idle=1
+            for lane in $(seq 1 "$LANES"); do
+                [ -e "$RUN_DIR/lane-$lane.paused" ] || [ -e "$RUN_DIR/lane-$lane.done" ] || idle=0
+            done
+            if [ "$idle" = 1 ]; then
+                for p in $MIRI_PIDS; do signal_tree STOP "$p"; done
+                date '+%Y-%m-%dT%H:%M:%S%z' >"$CI_HOME/paused"
+                frozen=1
+                say "Paused: $PAUSE exists. Going on once it is removed."
+            fi
+        elif [ ! -e "$PAUSE" ] && [ "$frozen" = 1 ]; then
+            rm -f "$CI_HOME/paused"
+            for p in $MIRI_PIDS; do signal_tree CONT "$p"; done
+            frozen=0
+            say "Resumed."
+        fi
+        sleep 5
+    done
+    wait
 }
 
 start_miri() {
     local i=0 label tests
     # The sysroot first, once: the three parts would each build it.
     (cd strata && miri miri-1 setup) >"$RUN_DIR/miri-setup.log" 2>&1 \
-        || { record "miri (setup)" failure 0; FAILED=1; echo "  miri: the sysroot did not build ($RUN_DIR/miri-setup.log)"; return; }
+        || { record "miri (setup)" failure 0; say "  miri: the sysroot did not build ($RUN_DIR/miri-setup.log)"; return; }
     while IFS='|' read -r label tests; do
         i=$((i + 1))
         {
@@ -662,14 +718,11 @@ start_miri() {
     done <<EOF
 $MIRI_PARTS
 EOF
-    echo "  miri: its three parts run beside the other jobs"
 }
 
 finish_miri() {
     local i=0 label tests rc secs
     [ -n "$MIRI_PIDS" ] || return 0
-    echo "  waiting for Miri"
-    for p in $MIRI_PIDS; do wait "$p"; done
     while IFS='|' read -r label tests; do
         i=$((i + 1))
         read -r rc secs <"$RUN_DIR/miri-$i.rc"
@@ -679,7 +732,6 @@ finish_miri() {
         else
             say "$(printf '  %-42s FAILED  %s min  (%s)' "miri ($label)" "$(mins "$secs")" "$RUN_DIR/miri-$i.log")"
             record "miri ($label)" failure "$secs"
-            FAILED=1
             [ "$VERBOSE" = 1 ] || tail -n 40 "$RUN_DIR/miri-$i.log" | sed 's/^/      | /'
         fi
     done <<EOF
@@ -687,6 +739,27 @@ $MIRI_PARTS
 EOF
     MIRI_PIDS=""
 }
+
+# --fast runs only the jobs a change can affect: a job whose crate, and the
+# crates it builds on, are as on main runs main's code, which main's own run
+# tested. strata, ci.yml and this script reach every job; anything outside
+# the four crates' directories but docs and Markdown is taken to as well.
+AFFECTED=""
+find_affected() {
+    local f all=0
+    for f in $(git diff --name-only "$BASE_SHA" HEAD); do
+        case "$f" in
+            docs/*|*.md) ;;
+            engram/*|install.sh) AFFECTED="$AFFECTED test-engram" ;;
+            strata-py/*) AFFECTED="$AFFECTED python" ;;
+            strata-server/*) AFFECTED="$AFFECTED test-strata-server server-smoke python audio vision" ;;
+            *) all=1 ;;
+        esac
+    done
+    [ "$all" = 1 ] && AFFECTED=$(job_names | tr '\n' ' ')
+    return 0
+}
+affected() { [ "$ONLY_AFFECTED" = 1 ] || return 0; case " $AFFECTED " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # The run itself.
 
@@ -733,25 +806,41 @@ fi
 if [ "$CODE" = false ]; then
     say "  Only docs/ and Markdown files changed: every job is skipped, as on GitHub."
 else
-    selected miri && start_miri
-    for name in $(job_names); do
-        [ "$name" = miri ] && continue
-        selected "$name" || continue
-        run_job "$name"
-        if [ "$FAILED" = 1 ] && [ "$FAIL_FAST" = 1 ]; then break; fi
+    if [ "$ONLY_AFFECTED" = 1 ]; then
+        find_affected
+        main_ci=$(gh api "repos/$SLUG/commits/$BASE_SHA/check-runs?check_name=CI%20result" --jq '[.check_runs[] | .conclusion // .status][0] // "none"' 2>/dev/null || echo unknown)
+        case "$main_ci" in
+            success|in_progress|queued) ;;
+            *)
+                say "  $BASE ${BASE_SHA:0:7}'s own CI result is $main_ci: running every job."
+                AFFECTED=$(job_names | tr '\n' ' ') ;;
+        esac
+        for name in $(job_names); do
+            selected "$name" && ! affected "$name" && record "$name" "skipped (unchanged)" 0
+        done
+        say "  Jobs the change can affect:$(for n in $(job_names); do selected "$n" && affected "$n" && printf ' %s' "$n"; done)"
+    fi
+    selected miri && affected miri && start_miri
+    for lane in $(seq 1 "$LANES"); do
+        run_lane "$lane" &
+        LANE_PIDS="$LANE_PIDS $!"
     done
-    wait_if_paused
+    supervise
     finish_miri
 fi
 
 TOTAL=$(($(now) - RUN_START))
-PASSED=$(printf '%s' "$RESULTS" | grep -c '|success|')
-COUNT=$(printf '%s' "$RESULTS" | grep -c '|')
+touch "$RUN_DIR/results"
+PASSED=$(grep -c '|success|' "$RUN_DIR/results")
+SKIPPED=$(grep -c '|skipped' "$RUN_DIR/results")
+COUNT=$(grep -c '|' "$RUN_DIR/results")
+FAILED=0
+grep -v -e '|success|' -e '|skipped' "$RUN_DIR/results" | grep -q . && FAILED=1
 {
     echo "head ${HEAD_SHA}"
     echo "base ${BASE_SHA} ($BASE, merged: $MERGE)"
-    echo "machine $MACHINE, $OS $(uname -m), Rust $RUST_VERSION"
-    printf '%s' "$RESULTS" | awk -F'|' '{ printf "%-40s %-16s %6.1f min\n", $1, $2, $3 / 60 }'
+    echo "machine $MACHINE, $OS $(uname -m), Rust $RUST_VERSION, lanes $LANES, nextest $NEXTEST"
+    awk -F'|' '{ printf "%-40s %-20s %6.1f min\n", $1, $2, $3 / 60 }' "$RUN_DIR/results"
     echo "total $(mins $TOTAL) min"
 } >"$RUN_DIR/summary.txt"
 
@@ -766,11 +855,11 @@ if [ "$FAILED" = 0 ]; then
         say "CI result: passed (only documentation changed)"
         post_status success "Only documentation changed: nothing to build"
     else
-        say "CI result: passed, $PASSED of $COUNT jobs, $(mins $TOTAL) min"
+        say "CI result: passed, $PASSED of $COUNT jobs$([ "$SKIPPED" -gt 0 ] && echo " ($SKIPPED skipped: unchanged since $BASE)"), $(mins $TOTAL) min"
         if [ -n "$DRIFT" ]; then
             post_status error "Passed, but ci.yml has changed since ci-local.sh was written: update the script"
         else
-            post_status success "$PASSED/$COUNT jobs passed on $MACHINE$([ "$NEXTEST" = 1 ] && echo " (nextest)"), merged into $BASE ${BASE_SHA:0:7}, $(mins $TOTAL) min; $not_covered"
+            post_status success "$PASSED/$COUNT jobs passed$([ "$SKIPPED" -gt 0 ] && echo ", $SKIPPED unchanged") on $MACHINE$([ "$NEXTEST" = 1 ] && echo ", nextest"), merged into $BASE ${BASE_SHA:0:7}, $(mins $TOTAL) min; $not_covered"
         fi
     fi
     if [ "$POST" = 1 ] && [ -z "$DRIFT" ]; then
@@ -780,7 +869,7 @@ if [ "$FAILED" = 0 ]; then
     fi
     exit 0
 else
-    failed=$(printf '%s' "$RESULTS" | awk -F'|' '$2 != "success" { printf "%s%s", sep, $1; sep = ", " }')
+    failed=$(awk -F'|' '$2 != "success" && $2 !~ /^skipped/ { printf "%s%s", sep, $1; sep = ", " }' "$RUN_DIR/results")
     say "CI result: FAILED ($failed), $(mins $TOTAL) min"
     post_status failure "Failed on $MACHINE: $failed"
     exit 1
