@@ -192,6 +192,12 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/kube", post(kube_change))
         .route("/v1/admin/kube/plan", post(kube_plan))
         .route("/v1/admin/kube/resume", post(kube_resume))
+        .route("/v1/admin/aws", get(aws_status))
+        .route("/v1/admin/aws/credentials", put(aws_save).merge(axum::routing::delete(aws_forget)))
+        .route("/v1/admin/aws/regions", get(aws_regions))
+        .route("/v1/admin/aws/machines", get(aws_machines))
+        .route("/v1/admin/aws/plan", post(aws_plan))
+        .route("/v1/admin/aws/validate", post(aws_validate))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -1562,6 +1568,86 @@ async fn kube_resume(State(app): State<App>) -> Result<Response, ApiError> {
     let held = l.get().await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?["status"]["rollout"]["held"]["text"].as_str().unwrap_or_default().to_string();
     let j = l.resume().await.map_err(ApiError::bad)?;
     Ok(audited(j, format!("resumed the change of the StrataCluster {}/{}, held as {held}", l.namespace, l.name)))
+}
+
+/// An AWS failure: 400 without credentials or for a region that is no
+/// region's name, else 502 (AWS's answer).
+fn aws_error(e: String) -> ApiError {
+    ApiError { status: if e.starts_with("no AWS credentials") || e.contains("is not a region") { 400 } else { 502 }, message: e }
+}
+
+/// The AWS view's state: the credentials as far as they may be shown (the
+/// key id masked; never the secret nor the session token).
+async fn aws_status(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.aws.status())
+}
+
+/// `{"access_key_id", "secret_access_key", "session_token"?, "region"}`:
+/// checked with AWS (STS), then kept on this server. Answers who they are.
+async fn aws_save(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let c: crate::aws::Creds = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("the body is {{access_key_id, secret_access_key, session_token?, region}}: {e}")))?;
+    let key = crate::aws::mask(&c.access_key_id);
+    let who = who(w);
+    // Refused or malformed credentials are the caller's; failing to write them, ours.
+    let i = app.svc.aws.set(c, &who.name).await.map_err(|e| ApiError { status: if e.starts_with("write ") { 500 } else { 400 }, message: e })?;
+    let mut j = app.svc.aws.status();
+    j["identity"] = json!(i);
+    Ok(audited(j, format!("saved the AWS credentials {key} (account {}, {})", i.account, i.arn)))
+}
+
+async fn aws_forget(State(app): State<App>) -> Result<Response, ApiError> {
+    let was = app.svc.aws.forget().map_err(ApiError::internal)?;
+    let detail = match &was {
+        Some(k) => format!("forgot the AWS credentials {k}"),
+        None => "forgot the AWS credentials (none were saved)".into(),
+    };
+    Ok(audited(json!({"forgot": was, "status": app.svc.aws.status()}), detail))
+}
+
+async fn aws_regions(State(app): State<App>) -> Result<AxJson<Json>, ApiError> {
+    Ok(AxJson(json!({"regions": app.svc.aws.regions().await.map_err(aws_error)?})))
+}
+
+/// `?region=` (default: the credentials' region), `&fresh=1` to fetch
+/// again: the region's machines with their prices, and the account's
+/// quotas there.
+async fn aws_machines(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<AxJson<Json>, ApiError> {
+    let region = match q.get("region").filter(|r| !r.is_empty()) {
+        Some(r) => r.clone(),
+        None => app.svc.aws.creds().map(|(c, _)| c.region).ok_or_else(|| aws_error("no AWS credentials: save an access key in the AWS view (PUT /v1/admin/aws/credentials)".into()))?,
+    };
+    let fresh = q.get("fresh").is_some_and(|v| v != "0" && v != "false");
+    let cat = app.svc.aws.catalog(&region, fresh).await.map_err(aws_error)?;
+    let mut j = json!(&*cat);
+    let recommended: Vec<&str> = crate::aws::catalog::recommended(&cat.machines).iter().map(|m| m.name.as_str()).collect();
+    j["recommended"] = json!(recommended);
+    Ok(AxJson(j))
+}
+
+async fn aws_planned(app: &App, b: Json) -> Result<(crate::aws::stack::Plan, Json), ApiError> {
+    let p: crate::aws::stack::Plan = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+    let cat = app.svc.aws.catalog(&p.region, false).await.map_err(aws_error)?;
+    let who = app.svc.aws.principal().await.map_err(aws_error)?;
+    let j = crate::aws::stack::plan(&p, &cat, &who).map_err(ApiError::bad)?;
+    Ok((p, j))
+}
+
+/// A plan of a cluster on EKS ([`crate::aws::stack`]): where its copies
+/// go, its cost, its warnings, its CloudFormation template and its
+/// StrataCluster. Creates nothing.
+async fn aws_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<AxJson<Json>, ApiError> {
+    Ok(AxJson(aws_planned(&app, b).await?.1))
+}
+
+/// The plan, and CloudFormation's check of its template (free; creates
+/// nothing).
+async fn aws_validate(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<AxJson<Json>, ApiError> {
+    let (p, mut j) = aws_planned(&app, b).await?;
+    j["validated"] = match app.svc.aws.validate(&p.region, &j["template"]).await {
+        Ok(v) => json!({"ok": true, "answer": v}),
+        Err(e) => json!({"ok": false, "error": e}),
+    };
+    Ok(AxJson(j))
 }
 
 async fn routes(State(app): State<App>) -> AxJson<Json> {

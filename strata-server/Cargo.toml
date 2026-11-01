@@ -36,6 +36,8 @@ backtrace = "0.3"
 tempfile = "3"
 # API keys are kept as the SHA-256 of their secrets (`keys`).
 sha2 = "0.10"
+# AWS answers in XML (EC2: instance types, regions, spot prices; `aws`).
+roxmltree = "0.20"
 
 # CPU profiles (`profiler`): every thread's stack, sampled on SIGPROF.
 [target.'cfg(unix)'.dependencies]
