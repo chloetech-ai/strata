@@ -36,8 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Float32Builder, Float64Array, Float64Builder, Int64Array, Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondArray,
-    TimestampMicrosecondBuilder, UInt64Array,
+    Array, ArrayRef, AsArray, Float64Array, Float64Builder, Int64Builder, UInt64Array,
 };
 use datafusion::arrow::compute::kernels::numeric;
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
@@ -57,14 +56,19 @@ use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionConfig;
 
 use crate::error::{Error, Result};
-use crate::query::exec::{Engine, ExecOptions, ExecStats, ResultSet};
+use crate::query::arrow::{self, Columns, Mixed};
+use crate::query::exec::{Engine, ExecOptions, ExecStats, Leaf, ResultSet};
 use crate::query::ir::{Agg, ArithOp, CmpOp, Expr, Func, JoinKind, Node, Plan, SortKey};
 use crate::query::memory::Charge;
-use crate::query::ops::{self, Runner};
+use crate::query::ops;
 use crate::query::steps::{self, Clock, Step};
 use crate::query::AggFn;
 use crate::schema::Schema;
 use crate::value::Value;
+
+/// Runs a leaf plan for DataFusion: its rows, as Arrow columns
+/// ([`Leaf::Arrow`]) when there are more than the number it is given.
+pub type Runner<'r> = dyn FnMut(&Plan, usize) -> Result<Leaf> + 'r;
 
 /// What [`run_in`] made of a plan.
 #[derive(Debug)]
@@ -119,6 +123,12 @@ enum Fail {
 impl From<Error> for Fail {
     fn from(e: Error) -> Fail {
         Fail::Err(e)
+    }
+}
+
+impl From<Mixed> for Fail {
+    fn from(m: Mixed) -> Fail {
+        Fail::No(m.0)
     }
 }
 
@@ -737,16 +747,16 @@ impl<'a> Lower<'a, '_> {
             columns: vec![crate::query::ir::Column { name: "n".into(), expr: Expr::Output(0) }],
         };
         self.opts.check()?;
-        let n = match (self.runner)(&Plan::new(count)) {
-            Ok(rs) => rs.rows.first().and_then(|r| r.first()).and_then(Value::as_i64).map(|n| n.max(0) as u64),
-            Err(_) => None,
+        let n = match (self.runner)(&Plan::new(count), usize::MAX) {
+            Ok(Leaf::Rows(rs)) => rs.rows.first().and_then(|r| r.first()).and_then(Value::as_i64).map(|n| n.max(0) as u64),
+            Ok(Leaf::Arrow(_)) | Err(_) => None,
         };
         self.opts.check()?;
         Ok(n)
     }
 
-    fn leaf(&mut self, n: &Node, what: &str, restrict: Vec<Expr>) -> R<Rel> {
-        let mut leaf = self.prepared(n)?;
+    fn leaf(&mut self, node: &Node, what: &str, restrict: Vec<Expr>) -> R<Rel> {
+        let mut leaf = self.prepared(node)?;
         let restricted = restrict.iter().map(|c| if let Expr::In { list, .. } = c { list.len() } else { 0 }).max().unwrap_or(0);
         if !restrict.is_empty() {
             let s = leaf.search_mut().expect("a leaf");
@@ -759,7 +769,7 @@ impl<'a> Lower<'a, '_> {
             s.filter = if conds.len() == 1 { conds.pop().expect("a condition") } else { Expr::And(conds) };
         }
         // The scan a LIMIT over joins grows.
-        let driven = self.driver.filter(|(p, ..)| std::ptr::eq(*p, n)).map(|(_, cap, _)| cap);
+        let driven = self.driver.filter(|(p, ..)| std::ptr::eq(*p, node)).map(|(_, cap, _)| cap);
         if let Some(cap) = driven {
             let Node::Project { input, .. } = &mut leaf else { unreachable!("a leaf") };
             match input.as_mut() {
@@ -770,7 +780,7 @@ impl<'a> Lower<'a, '_> {
                 }
             }
         }
-        if let Some(cap) = self.per.filter(|(p, _)| std::ptr::eq(*p, n)).map(|(_, c)| c) {
+        if let Some(cap) = self.per.filter(|(p, _)| std::ptr::eq(*p, node)).map(|(_, c)| c) {
             if let Some(s) = leaf.search_mut() {
                 s.per = Some(cap);
             }
@@ -779,38 +789,64 @@ impl<'a> Lower<'a, '_> {
         let table = leaf.search().map(|s| s.table.clone()).unwrap_or_default();
         let m = self.clock.mark(&self.prof);
         let leaf = Plan::new(leaf);
-        let rs = (self.runner)(&leaf)?;
-        self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
-        self.leaf_rows = self.leaf_rows.saturating_add(rs.rows.len());
-        match self.leaf_rows <= SMALL {
-            true => {
-                let mut kept = rs.clone();
-                kept.stats.steps = Vec::new();
-                kept.stats.steps_dropped = 0;
-                self.ran.push((leaf, kept));
+        // With `auto`, rows while the leaves read few, for the operators to
+        // take over without running them again; Arrow columns past that.
+        let over = match self.opts.engine {
+            Engine::Auto => SMALL.saturating_sub(self.leaf_rows),
+            _ => 0,
+        };
+        let (n, stats, rel) = match (self.runner)(&leaf, over)? {
+            Leaf::Rows(rs) => {
+                self.leaf_rows = self.leaf_rows.saturating_add(rs.rows.len());
+                match self.leaf_rows <= SMALL {
+                    true => {
+                        let mut kept = rs.clone();
+                        kept.stats.steps = Vec::new();
+                        kept.stats.steps_dropped = 0;
+                        self.ran.push((leaf, kept));
+                    }
+                    false => self.ran.clear(),
+                }
+                for r in &rs.rows {
+                    self.charge.row(r)?;
+                }
+                let n = rs.rows.len();
+                let keys = (rs.keys.len() == n).then_some(rs.keys);
+                let scores = (rs.scores.len() == n).then_some(rs.scores);
+                let width = rs.columns.len().max(rs.rows.first().map_or(0, Vec::len));
+                let arrays = arrow::columns_of(rs.rows, width)?;
+                let keys = keys.map(arrow::column_of).transpose()?;
+                (n, rs.stats, (rs.columns, arrays, keys, scores))
             }
-            false => self.ran.clear(),
-        }
-        if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, n)) {
-            *read = rs.rows.len();
+            Leaf::Arrow(c) => {
+                // Not kept for the operators, which run the leaf again
+                // if they take the plan over.
+                self.leaf_rows = self.leaf_rows.saturating_add(c.rows);
+                if self.leaf_rows > SMALL {
+                    self.ran.clear();
+                }
+                self.charge.add(c.bytes())?;
+                let Columns { names, arrays, keys, scores, rows, stats } = c;
+                let scores = (scores.len() == rows).then_some(scores);
+                (rows, stats, (names, arrays, Some(keys), scores))
+            }
+        };
+        self.dropped += steps::nest(&mut self.prof, &stats.steps, 0) as u64 + stats.steps_dropped;
+        if let Some((_, _, read)) = self.driver.as_mut().filter(|(p, ..)| std::ptr::eq(*p, node)) {
+            *read = n;
         }
         // The leaf as the plan has it, as the operators' lines give it.
-        let text: Vec<String> = Plan::new(n.clone()).explain(self.catalog).iter().map(|l| l.trim().to_string()).collect();
-        let mut line = format!("{what}: {} rows: {}", rs.rows.len(), text.join(" / "));
+        let text: Vec<String> = Plan::new(node.clone()).explain(self.catalog).iter().map(|l| l.trim().to_string()).collect();
+        let mut line = format!("{what}: {n} rows: {}", text.join(" / "));
         if restricted > 0 {
             line += &format!(" (restricted to {restricted} join values)");
         }
         self.lines.push(line);
-        self.lines.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
-        self.filter_docs += rs.stats.filter_docs;
-        self.scored += rs.stats.scored;
-        for r in &rs.rows {
-            self.charge.row(r)?;
-        }
-        let n = rs.rows.len();
-        let keys = (rs.keys.len() == n).then_some(rs.keys);
-        let scores = (rs.scores.len() == n).then_some(rs.scores);
-        let rel = self.memory(rs.columns, rs.rows, keys, scores)?;
+        self.lines.extend(stats.plan.iter().map(|l| format!("  {l}")));
+        self.filter_docs += stats.filter_docs;
+        self.scored += stats.scored;
+        let (names, arrays, keys, scores) = rel;
+        let rel = self.memory(names, arrays, keys, scores, n)?;
         if self.clock.wrap(&mut self.prof, m, "leaf", format!("{what}: {table}"), Some(n as u64)).is_none() {
             self.dropped += 1;
         }
@@ -850,25 +886,24 @@ impl<'a> Lower<'a, '_> {
         r
     }
 
-    /// Rows as a memory table: a column per value of a row, then the keys,
+    /// A leaf's `n` rows as a memory table: its columns, then the keys,
     /// the scores, and their position.
-    fn memory(&mut self, names: Vec<String>, rows: Vec<Vec<Value>>, keys: Option<Vec<Value>>, scores: Option<Vec<f64>>) -> R<Rel> {
-        let width = names.len().max(rows.first().map_or(0, Vec::len));
+    fn memory(&mut self, names: Vec<String>, arrays: Vec<ArrayRef>, keys: Option<ArrayRef>, scores: Option<Vec<f64>>, n: usize) -> R<Rel> {
+        let width = arrays.len();
         let mut fields = Vec::new();
-        let mut arrays: Vec<ArrayRef> = Vec::new();
         let mut cols = Vec::with_capacity(width);
-        for a in columns_of(&rows, width)? {
+        let mut all: Vec<ArrayRef> = Vec::with_capacity(width + 3);
+        for a in arrays {
             let name = self.fresh("c");
             fields.push(Field::new(&name, a.data_type().clone(), true));
-            arrays.push(a);
+            all.push(a);
             cols.push(name);
         }
         let key = match keys {
-            Some(k) => {
+            Some(a) => {
                 let name = self.fresh("key");
-                let a = column_of(&k)?;
                 fields.push(Field::new(&name, a.data_type().clone(), true));
-                arrays.push(a);
+                all.push(a);
                 Some(name)
             }
             None => None,
@@ -877,16 +912,16 @@ impl<'a> Lower<'a, '_> {
             Some(s) => {
                 let name = self.fresh("score");
                 fields.push(Field::new(&name, DataType::Float64, true));
-                arrays.push(Arc::new(Float64Array::from(s)));
+                all.push(Arc::new(Float64Array::from(s)));
                 Score::Col(name)
             }
             None => Score::None,
         };
         let ord = self.fresh("ord");
         fields.push(Field::new(&ord, DataType::UInt64, false));
-        arrays.push(Arc::new(UInt64Array::from_iter_values(0..rows.len() as u64)));
+        all.push(Arc::new(UInt64Array::from_iter_values(0..n as u64)));
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(DataFusionError::from)?;
+        let batch = RecordBatch::try_new(schema.clone(), all).map_err(DataFusionError::from)?;
         let mut names = names;
         names.resize(width, String::new());
         let ords = vec![Ord { col: ord, desc: false, nulls_first: false }];
@@ -1135,8 +1170,9 @@ impl<'a> Lower<'a, '_> {
             }
             match none {
                 true => {
-                    let names = columns.iter().map(|c| c.name.clone()).collect();
-                    self.memory(names, Vec::new(), None, None)?
+                    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                    let arrays = arrow::columns_of(Vec::new(), names.len())?;
+                    self.memory(names, arrays, None, None, 0)?
                 }
                 false => self.leaf(right, "join", restrict)?,
             }
@@ -1619,200 +1655,6 @@ fn slices(batch: &RecordBatch, n: usize) -> Vec<RecordBatch> {
         return vec![batch.clone()];
     }
     (0..rows).step_by(n).map(|at| batch.slice(at, n.min(rows - at))).collect()
-}
-
-/// What Arrow type holds a column's values.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Kind {
-    Null,
-    Int,
-    Float,
-    Str,
-    Bool,
-    Time,
-    Vector,
-    IntList,
-    StrList,
-    /// A list without values: of either.
-    List,
-}
-
-fn kind_of(v: &Value) -> R<Kind> {
-    Ok(match v {
-        Value::Null => Kind::Null,
-        Value::Int(_) => Kind::Int,
-        Value::Float(_) => Kind::Float,
-        Value::Str(_) => Kind::Str,
-        Value::Bool(_) => Kind::Bool,
-        Value::Timestamp(_) => Kind::Time,
-        Value::Vector(_) => Kind::Vector,
-        Value::List(xs) => {
-            let mut k = Kind::List;
-            for x in xs {
-                let kx = match x {
-                    Value::Int(_) => Kind::IntList,
-                    Value::Str(_) => Kind::StrList,
-                    v => return no(format!("a list holding {v:?}")),
-                };
-                if k != Kind::List && k != kx {
-                    return no("a list of INT and text values");
-                }
-                k = kx;
-            }
-            k
-        }
-    })
-}
-
-/// One column being built a row at a time: typed by its first value that
-/// is not NULL. Lists and vectors are left to [`array_of`].
-enum Col {
-    Nulls(usize),
-    Int(Int64Builder),
-    Float(Float64Builder),
-    Str(StringBuilder),
-    Bool(BooleanBuilder),
-    Time(TimestampMicrosecondBuilder),
-    Other,
-}
-
-impl Col {
-    /// The array of `n` rows; `other` builds a column of lists or vectors.
-    fn finish(self, n: usize, other: impl FnOnce() -> R<ArrayRef>) -> R<ArrayRef> {
-        Ok(match self {
-            Col::Nulls(_) => Arc::new(datafusion::arrow::array::NullArray::new(n)),
-            Col::Int(mut b) => Arc::new(b.finish()),
-            Col::Float(mut b) => Arc::new(b.finish()),
-            Col::Str(mut b) => Arc::new(b.finish()),
-            Col::Bool(mut b) => Arc::new(b.finish()),
-            Col::Time(mut b) => Arc::new(b.finish()),
-            Col::Other => other()?,
-        })
-    }
-
-    fn push(&mut self, v: &Value, n: usize) -> R<()> {
-        match (&mut *self, v) {
-            (Col::Other, _) => {}
-            (Col::Nulls(k), Value::Null) => *k += 1,
-            (Col::Nulls(k), v) => {
-                let k = *k;
-                *self = match v {
-                    Value::Int(_) => Col::Int(Int64Builder::with_capacity(n)),
-                    Value::Float(_) => Col::Float(Float64Builder::with_capacity(n)),
-                    Value::Str(_) => Col::Str(StringBuilder::with_capacity(n, n * 8)),
-                    Value::Bool(_) => Col::Bool(BooleanBuilder::with_capacity(n)),
-                    Value::Timestamp(_) => Col::Time(TimestampMicrosecondBuilder::with_capacity(n)),
-                    _ => Col::Other,
-                };
-                for _ in 0..k {
-                    self.push(&Value::Null, n)?;
-                }
-                self.push(v, n)?;
-            }
-            (Col::Int(b), Value::Int(x)) => b.append_value(*x),
-            (Col::Float(b), Value::Float(x)) => b.append_value(*x),
-            (Col::Str(b), Value::Str(x)) => b.append_value(x),
-            (Col::Bool(b), Value::Bool(x)) => b.append_value(*x),
-            (Col::Time(b), Value::Timestamp(x)) => b.append_value(*x),
-            (Col::Int(b), Value::Null) => b.append_null(),
-            (Col::Float(b), Value::Null) => b.append_null(),
-            (Col::Str(b), Value::Null) => b.append_null(),
-            (Col::Bool(b), Value::Null) => b.append_null(),
-            (Col::Time(b), Value::Null) => b.append_null(),
-            (_, v) => return no(format!("a column of values of several types, {v:?} among them")),
-        }
-        Ok(())
-    }
-}
-
-/// Columns `0..width` of `rows` as Arrow arrays, in one pass over the
-/// rows: a column of one type each, NULLs aside.
-fn columns_of(rows: &[Vec<Value>], width: usize) -> R<Vec<ArrayRef>> {
-    let n = rows.len();
-    let mut cols: Vec<Col> = (0..width).map(|_| Col::Nulls(0)).collect();
-    for r in rows {
-        for (i, c) in cols.iter_mut().enumerate() {
-            c.push(r.get(i).unwrap_or(&Value::Null), n)?;
-        }
-    }
-    cols.into_iter().enumerate().map(|(i, c)| c.finish(n, || array_of(rows.iter().map(|r| r.get(i).unwrap_or(&Value::Null))))).collect()
-}
-
-/// `values` as one Arrow array ([`columns_of`] of one column).
-fn column_of(values: &[Value]) -> R<ArrayRef> {
-    let n = values.len();
-    let mut c = Col::Nulls(0);
-    for v in values {
-        c.push(v, n)?;
-    }
-    c.finish(n, || array_of(values.iter()))
-}
-
-/// The values of one column as an Arrow array of their one type.
-fn array_of<'v>(values: impl Iterator<Item = &'v Value> + Clone) -> R<ArrayRef> {
-    let mut kind = Kind::Null;
-    for v in values.clone() {
-        let k = kind_of(v)?;
-        kind = match (kind, k) {
-            (a, Kind::Null) => a,
-            (Kind::Null, b) => b,
-            (Kind::List, b @ (Kind::IntList | Kind::StrList | Kind::List)) | (b @ (Kind::IntList | Kind::StrList), Kind::List) => b,
-            (a, b) if a == b => a,
-            (a, b) => return no(format!("a column of {a:?} and {b:?} values")),
-        };
-    }
-    let n = values.clone().count();
-    Ok(match kind {
-        Kind::Null => Arc::new(datafusion::arrow::array::NullArray::new(n)),
-        Kind::Int => Arc::new(values.map(|v| v.as_i64()).collect::<Int64Array>()),
-        Kind::Float => Arc::new(values.map(|v| if let Value::Float(x) = v { Some(*x) } else { None }).collect::<Float64Array>()),
-        Kind::Str => {
-            let mut b = StringBuilder::new();
-            values.for_each(|v| b.append_option(v.as_str()));
-            Arc::new(b.finish())
-        }
-        Kind::Bool => Arc::new(values.map(|v| if let Value::Bool(x) = v { Some(*x) } else { None }).collect::<BooleanArray>()),
-        Kind::Time => Arc::new(values.map(|v| if let Value::Timestamp(x) = v { Some(*x) } else { None }).collect::<TimestampMicrosecondArray>()),
-        Kind::Vector => {
-            let mut b = ListBuilder::new(Float32Builder::new());
-            for v in values {
-                match v {
-                    Value::Vector(x) => {
-                        b.values().append_slice(x);
-                        b.append(true);
-                    }
-                    _ => b.append(false),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        Kind::IntList => {
-            let mut b = ListBuilder::new(Int64Builder::new());
-            for v in values {
-                match v {
-                    Value::List(xs) => {
-                        xs.iter().for_each(|x| b.values().append_option(x.as_i64()));
-                        b.append(true);
-                    }
-                    _ => b.append(false),
-                }
-            }
-            Arc::new(b.finish())
-        }
-        Kind::StrList | Kind::List => {
-            let mut b = ListBuilder::new(StringBuilder::new());
-            for v in values {
-                match v {
-                    Value::List(xs) => {
-                        xs.iter().for_each(|x| b.values().append_option(x.as_str()));
-                        b.append(true);
-                    }
-                    _ => b.append(false),
-                }
-            }
-            Arc::new(b.finish())
-        }
-    })
 }
 
 /// The values of an Arrow array, as Strata gives them.

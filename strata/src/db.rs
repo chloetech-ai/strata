@@ -1074,6 +1074,7 @@ impl Db {
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
         let catalog: Vec<&Schema> = snap.schemas().collect();
+        #[cfg_attr(feature = "datafusion", allow(unused_mut))]
         let mut runner = |leaf: &Plan| {
             let view = view_of(leaf.table())?;
             self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
@@ -1086,7 +1087,11 @@ impl Db {
         // A leaf with subqueries has no operators for DataFusion to run.
         if opts.engine != crate::query::exec::Engine::Operators && !plan.root.is_leaf() {
             use crate::query::df::Outcome;
-            match crate::query::df::run_in(plan, &catalog, &mut runner, opts)? {
+            let mut leaf_runner = |leaf: &Plan, over: usize| {
+                let view = view_of(leaf.table())?;
+                self.execute_leaf(&view, &leaf.to_select(view.schema())?, &leaves, over)
+            };
+            match crate::query::df::run_in(plan, &catalog, &mut leaf_runner, opts)? {
                 Outcome::Done(rs) => {
                     if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
                         return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
@@ -1454,13 +1459,26 @@ impl Db {
         let readers = self.readers(snap)?;
         let opened = t0.elapsed();
         let mut rs = Executor::new(snap, &readers, opts).execute(select)?;
-        // Opening segments' readers takes microseconds once they are
-        // cached; a step when it took longer (a cold cache, new segments).
-        if opened.as_micros() >= 20 {
-            let step = crate::query::steps::Step { op: "open readers".into(), detail: format!("{} segments", readers.len()), start_us: crate::query::steps::us_at(t0), us: crate::query::steps::tenth(opened.as_nanos() as f64 / 1e3), ..Default::default() };
-            rs.stats.steps.insert(0, step);
-        }
+        opened_step(&mut rs.stats, t0, opened, readers.len());
         Ok(rs)
+    }
+
+    /// [`Db::execute`] for DataFusion: the rows as Arrow columns when there
+    /// are more than `over` ([`Executor::execute_arrow`]).
+    #[cfg(feature = "datafusion")]
+    pub fn execute_leaf(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions, over: usize) -> Result<crate::query::exec::Leaf> {
+        use crate::query::exec::Leaf;
+        crate::query::steps::epoch();
+        let t0 = std::time::Instant::now();
+        let readers = self.readers(snap)?;
+        let opened = t0.elapsed();
+        let mut leaf = Executor::new(snap, &readers, opts).execute_arrow(select, over)?;
+        let stats = match &mut leaf {
+            Leaf::Rows(rs) => &mut rs.stats,
+            Leaf::Arrow(c) => &mut c.stats,
+        };
+        opened_step(stats, t0, opened, readers.len());
+        Ok(leaf)
     }
 
     /// This database's BM25 statistics for the terms `select` scores with,
@@ -2198,4 +2216,13 @@ impl DocumentSource for StoredSource {
 fn plan_of(snap: &Snapshot, q: &sqlparser::ast::Query, params: &Params) -> Result<Plan> {
     let catalog: Vec<&Schema> = snap.schemas().collect();
     compound::plan_read_query(q, &catalog, params, &|t, name| snap.table(t).and_then(|v| v.rank_profile(name).cloned()))
+}
+
+/// Opening segments' readers takes microseconds once they are cached; a
+/// step when it took longer (a cold cache, new segments).
+fn opened_step(stats: &mut crate::query::exec::ExecStats, t0: std::time::Instant, opened: std::time::Duration, segments: usize) {
+    if opened.as_micros() >= 20 {
+        let step = crate::query::steps::Step { op: "open readers".into(), detail: format!("{segments} segments"), start_us: crate::query::steps::us_at(t0), us: crate::query::steps::tenth(opened.as_nanos() as f64 / 1e3), ..Default::default() };
+        stats.steps.insert(0, step);
+    }
 }
