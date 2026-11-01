@@ -5,7 +5,7 @@ mod forward_common;
 
 use forward_common::build;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use strata::forward::{DocStore, KeywordColumn, NumericColumn, RangeIndex};
+use strata::forward::{DocStore, KeywordColumn, NumericColumn, RangeIndex, StoreCache};
 use strata::segment::build::{build_segment, BuildOptions};
 use strata::segment::SegmentFile;
 use strata::{data, Document, Field, FieldType, Schema, Value, VectorIndexKind};
@@ -74,6 +74,19 @@ fn random_documents_round_trip() {
             let fields: Vec<usize> = (0..rng.gen_range(0..5)).map(|_| rng.gen_range(0..schema.fields.len())).collect();
             let want: Vec<Value> = fields.iter().map(|&f| expected(&schema, &docs[d])[f].clone()).collect();
             assert_eq!(store.get_fields(d as u32, &fields), want);
+        }
+        // Through a block cache: in docID order (each block decompressed
+        // once), then in random order (the cache changes blocks).
+        let all: Vec<usize> = (0..schema.fields.len()).collect();
+        let mut cache = StoreCache::default();
+        for (d, doc) in docs.iter().enumerate() {
+            assert_eq!(store.get_fields_cached(d as u32, &all, &mut cache), expected(&schema, doc), "doc {d}, cached");
+        }
+        for _ in 0..200.min(n) {
+            let d = rng.gen_range(0..n);
+            let fields: Vec<usize> = (0..rng.gen_range(0..5)).map(|_| rng.gen_range(0..schema.fields.len())).collect();
+            let want: Vec<Value> = fields.iter().map(|&f| expected(&schema, &docs[d])[f].clone()).collect();
+            assert_eq!(store.get_fields_cached(d as u32, &fields, &mut cache), want, "doc {d}, cached");
         }
         let (compressed, raw) = store.byte_sizes();
         assert!(n == 0 || compressed < raw, "{compressed} vs {raw}");

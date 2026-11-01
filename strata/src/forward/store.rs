@@ -238,6 +238,15 @@ impl Blocks {
     }
 }
 
+/// The last block [`DocStore::get_fields_cached`] decompressed, and where
+/// each of its rows lies.
+#[derive(Debug, Default)]
+pub struct StoreCache {
+    block: Option<usize>,
+    data: Vec<u8>,
+    rows: Vec<(usize, usize)>,
+}
+
 /// A zero-copy view of a segment's doc store.
 #[derive(Clone, Debug)]
 pub struct DocStore {
@@ -359,6 +368,38 @@ impl DocStore {
         let b = self.first.partition_point(|&f| f <= d) - 1;
         let block = self.decompress(b);
         self.decode(&block, (d - self.first[b]) as usize, fields).unwrap_or_else(|| panic!("corrupt doc store block {b}"))
+    }
+
+    /// [`Self::get_fields`], keeping the decompressed block in `cache` for
+    /// the next call: documents read in docID order decompress each block
+    /// once, where `get_fields` decompresses a block a document (a block
+    /// holds hundreds of small rows).
+    ///
+    /// # Panics
+    /// If `d` is out of range or its block is corrupt.
+    pub fn get_fields_cached(&self, d: DocId, fields: &[usize], cache: &mut StoreCache) -> Vec<Value> {
+        assert!((d as usize) < self.n, "document {d} out of range");
+        let b = self.first.partition_point(|&f| f <= d) - 1;
+        if cache.block != Some(b) {
+            cache.block = None;
+            cache.data = self.decompress(b);
+            cache.rows.clear();
+            let parsed = (|| {
+                let mut pos = 0;
+                let n_rows = get_varint(&cache.data, &mut pos)? as usize;
+                let lens = (0..n_rows).map(|_| get_varint(&cache.data, &mut pos)).collect::<Option<Vec<u64>>>()?;
+                for l in lens {
+                    let end = pos.checked_add(l as usize).filter(|&e| e <= cache.data.len())?;
+                    cache.rows.push((pos, end));
+                    pos = end;
+                }
+                Some(())
+            })();
+            parsed.unwrap_or_else(|| panic!("corrupt doc store block {b}"));
+            cache.block = Some(b);
+        }
+        let row = cache.rows.get((d - self.first[b]) as usize).and_then(|&(a, z)| self.decode_row(&cache.data[a..z], fields));
+        row.unwrap_or_else(|| panic!("corrupt doc store block {b}"))
     }
 
     fn decompress(&self, b: usize) -> Vec<u8> {

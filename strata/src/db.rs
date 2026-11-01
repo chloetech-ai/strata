@@ -1050,15 +1050,30 @@ impl Db {
         }
         let leaves = ExecOptions { max_rows: None, ..opts.clone() };
         let catalog: Vec<&Schema> = snap.schemas().collect();
-        let rs = ops::run_in(
-            plan,
-            &catalog,
-            &mut |leaf| {
-                let view = view_of(leaf.table())?;
-                self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
-            },
-            opts,
-        )?;
+        let mut runner = |leaf: &Plan| {
+            let view = view_of(leaf.table())?;
+            self.execute(&view, &leaf.to_select(view.schema())?, &leaves)
+        };
+        #[allow(unused_mut)]
+        let mut fallback: Option<String> = None;
+        #[cfg(feature = "datafusion")]
+        // A leaf with subqueries has no operators for DataFusion to run.
+        if matches!(opts.engine, crate::query::exec::Engine::DataFusion | crate::query::exec::Engine::DataFusionOnly) && !plan.root.is_leaf() {
+            match crate::query::df::run_in(plan, &catalog, &mut runner, opts)? {
+                crate::query::df::Outcome::Done(rs) => {
+                    if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
+                        return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
+                    }
+                    return Ok(rs);
+                }
+                crate::query::df::Outcome::Fallback(why) if opts.engine == crate::query::exec::Engine::DataFusionOnly => return Err(Error::Query(format!("not run on DataFusion: {why}"))),
+                crate::query::df::Outcome::Fallback(why) => fallback = Some(why),
+            }
+        }
+        let mut rs = ops::run_in(plan, &catalog, &mut runner, opts)?;
+        if let Some(why) = fallback {
+            rs.stats.plan.insert(0, format!("operators (not datafusion: {why})"));
+        }
         if let Some(max) = opts.max_rows.filter(|&m| rs.rows.len() > m) {
             return Err(Error::Query(format!("the query matches more than {max} rows, the most a query returns; add a LIMIT")));
         }

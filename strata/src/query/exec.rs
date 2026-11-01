@@ -246,6 +246,40 @@ pub struct ExecOptions {
     /// [`steps::thread_cpu_us`]), which costs a system call per step; the
     /// steps' wall times are measured either way.
     pub profile: bool,
+    /// What runs a plan's operators above its leaves (joins, `WITH`,
+    /// `DISTINCT`, groups of derived rows): [`Engine::from_env`] by
+    /// default.
+    pub engine: Engine,
+}
+
+/// The engine of a plan's operators ([`crate::query::ops`] or
+/// [`crate::query::df`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Engine {
+    /// Strata's operators, in memory ([`crate::query::ops`]).
+    #[default]
+    Operators,
+    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for the
+    /// plans it lowers; the operators run the others. Without the feature,
+    /// the operators run every plan.
+    DataFusion,
+    /// [`Engine::DataFusion`], and a plan it does not lower fails with
+    /// the reason instead of running on the operators (to find what the
+    /// lowering misses).
+    DataFusionOnly,
+}
+
+impl Engine {
+    /// `STRATA_ENGINE=datafusion` picks [`Engine::DataFusion`],
+    /// `datafusion-only` [`Engine::DataFusionOnly`]; anything else, or
+    /// nothing, the operators.
+    pub fn from_env() -> Engine {
+        match std::env::var("STRATA_ENGINE").as_deref() {
+            Ok("datafusion") => Engine::DataFusion,
+            Ok("datafusion-only") => Engine::DataFusionOnly,
+            _ => Engine::Operators,
+        }
+    }
 }
 
 impl Default for ExecOptions {
@@ -272,6 +306,7 @@ impl Default for ExecOptions {
             max_groups: None,
             memory: None,
             profile: false,
+            engine: Engine::from_env(),
         }
     }
 }
@@ -1527,10 +1562,15 @@ impl<'a> Executor<'a> {
             }
             _ => {
                 let num = self.numeric(s, field)?;
-                let mut acc = DocSet::empty(s.r.n_docs);
-                for v in values {
-                    acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
-                }
+                let acc = if values.len() > MANY_VALUES {
+                    num.col().scan_key_set(&key_set(num.col(), values))
+                } else {
+                    let mut acc = DocSet::empty(s.r.n_docs);
+                    for v in values {
+                        acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
+                    }
+                    acc
+                };
                 Ok(self.patch(s, field, acc, |v| values.iter().any(|x| num_eq(v, x))))
             }
         }
@@ -1563,6 +1603,10 @@ impl<'a> Executor<'a> {
                 FieldType::Keyword => {
                     let vs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
                     ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_in(&vs)))
+                }
+                _ if values.len() > MANY_VALUES => {
+                    let col = self.numeric(s, *field)?.col();
+                    ProbeNode::Leaf(Box::new(col.filter_key_set(key_set(col, values))))
                 }
                 _ => {
                     let col = self.numeric(s, *field)?.col();
@@ -3194,10 +3238,13 @@ impl<'a> Executor<'a> {
             })
             .collect::<Result<_>>()?;
         let mut rows = Vec::with_capacity(hits.len());
+        // A segment's last decompressed block: rows in docID order (a scan)
+        // decompress each block once rather than once a row.
+        let mut blocks: HashMap<usize, forward::StoreCache> = HashMap::new();
         for (r, h) in hits.iter().enumerate() {
             let s = &self.seg_by_ord(h.seg);
             let fetched = match (s.r.store()?, stored.is_empty()) {
-                (Some(store), false) => store.get_fields(h.doc, &stored),
+                (Some(store), false) => store.get_fields_cached(h.doc, &stored, blocks.entry(h.seg as usize).or_default()),
                 _ => Vec::new(),
             };
             let mut row = Vec::with_capacity(q.projection.len());
@@ -3708,6 +3755,18 @@ fn num_eq(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         _ => a.as_f64().zip(b.as_f64()).is_some_and(|(x, y)| x == y),
     }
+}
+
+/// Above this many values a numeric `IN` reads the column once and checks
+/// each key against them all ([`forward::KeySet`]), rather than looking
+/// each value up: a lookup reads or unions a set of the segment's size, so
+/// a value at a time is quadratic (a join restricted to a million keys
+/// took two minutes).
+const MANY_VALUES: usize = 32;
+
+/// The keys of `values` in `col`.
+fn key_set(col: &NumericColumn, values: &[Value]) -> forward::KeySet {
+    forward::KeySet::new(values.iter().filter_map(|v| value_keys(col, v)))
 }
 
 /// The keys of column `col` equal to the number `v`.
