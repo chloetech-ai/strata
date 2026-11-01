@@ -771,6 +771,20 @@ impl Series {
     }
 }
 
+/// The load over `points` (a minute's, say): the mean `qps` and `cpu`
+/// (cores busy), the slowest `p99_ms` and the latest `disk_used_ratio`;
+/// `None` without points.
+pub fn load_of(points: &[Arc<Json>]) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
+    if points.is_empty() {
+        return None;
+    }
+    let n = points.len() as f64;
+    let mean = |k: &str| points.iter().filter_map(|p| p[k].as_f64()).sum::<f64>() / n;
+    let p99 = points.iter().filter_map(|p| p["p99_ms"].as_f64()).reduce(f64::max);
+    let disk = points.iter().rev().find_map(|p| p["disk_used_ratio"].as_f64());
+    Some((mean("qps"), mean("cpu"), p99, disk))
+}
+
 /// The rates between samples `a` and `b`, and `b`'s gauges.
 fn point(a: &Sample, b: &Sample) -> Json {
     let secs = match (a.at, b.at) {

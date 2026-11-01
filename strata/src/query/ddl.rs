@@ -20,11 +20,12 @@
 //! Types are `TEXT`, `KEYWORD`, `INT` (or `INTEGER`, `BIGINT`), `FLOAT` (or
 //! `DOUBLE`, `REAL`), `BOOL` (or `BOOLEAN`), `TIMESTAMP` (microseconds,
 //! UTC; or `TIMESTAMPTZ`, `DATETIME`), `VECTOR(dimensions)`, `SPARSE`,
-//! `EDGES` and `MEDIA` (a file's reference, [`crate::media`]; `OPTIONS(kind
+//! `EDGES`, `JSON` (an object of keys the schema does not name,
+//! [`crate::json`]; or `JSONB`) and `MEDIA` (a file's reference, [`crate::media`]; `OPTIONS(kind
 //! = 'image')`, `'audio'`, `'video'` or `'pdf'` says what file); `KEYWORD[]`
 //! and `INT[]` hold lists, and `VECTOR(dimensions)[]` several vectors per
 //! row (options `keep_f32`, `pool` and `pool_factor` besides a vector's,
-//! [`crate::vector::multi`]). A table with a BOOL, TIMESTAMP or MEDIA column
+//! [`crate::vector::multi`]). A table with a BOOL, TIMESTAMP, JSON or MEDIA column
 //! makes the database format 3 ([`crate::storage::manifest`]). `OPTIONS(...)` takes the options of
 //! the schema's short JSON form ([`crate::schema::Schema::from_json`]):
 //! `positions`, `stored` and `indexed` (true or false), `from` (the fields
@@ -83,7 +84,7 @@ fn err(m: impl Into<String>) -> Error {
 const CREATE_FORM: &str = "CREATE TABLE [IF NOT EXISTS] name (column TYPE [PRIMARY KEY] [NOT NULL] [DEFAULT value] [REFERENCES table] [OPTIONS(...)], ..., [PRIMARY KEY (column)], [FOREIGN KEY (column) REFERENCES table]) [OPTIONS(shard_by = 'column', cluster_by = 'column', retain = '400 days', retain_by = 'column', edges = 'src, dst, w')]";
 /// The options of a table, in `OPTIONS(...)` after its columns.
 const TABLE_OPTIONS: [&str; 5] = ["shard_by", "cluster_by", "retain", "retain_by", "edges"];
-const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES or MEDIA, KEYWORD[] or INT[] for lists, and VECTOR(dimensions)[] for several vectors per row";
+const TYPES: &str = "TEXT, KEYWORD, INT, FLOAT, BOOL, TIMESTAMP, VECTOR(dimensions), SPARSE, EDGES, JSON or MEDIA, KEYWORD[] or INT[] for lists, and VECTOR(dimensions)[] for several vectors per row";
 
 /// The table a `CREATE TABLE` statement makes, and whether it says `IF NOT
 /// EXISTS`. `tables` are the database's tables, which references name.
@@ -366,7 +367,7 @@ fn field(name: &str, ty: &DataType, mut opts: Map<String, J>) -> Result<J> {
     let (ty, multi, dim) = column_type(ty).map_err(bad)?;
     let allowed: &[&str] = match ty {
         "text" => &["positions", "stored", "indexed", "from", "analyzer", "derive", "model"],
-        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor"],
+        "vector" if multi => &["indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "keep_f32", "pool", "pool_factor", "embed", "model"],
         "vector" => &["stored", "indexed", "dim", "index", "m", "ef_construction", "nlist", "codes", "embed", "model"],
         "media" => &["stored", "indexed", "kind"],
         "keyword" if multi => &["stored", "indexed", "semantic_id", "codebook"],
@@ -478,6 +479,7 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
         return match (n.as_str(), args.as_slice()) {
             ("keyword", []) => Ok(("keyword", false, None)),
             ("sparse", []) => Ok(("sparse", false, None)),
+            ("json", []) => Ok(("json", false, None)),
             ("edges", []) => Ok(("edges", false, None)),
             ("media", []) => Ok(("media", false, None)),
             ("vector", []) => Ok(("vector", false, None)),
@@ -495,6 +497,7 @@ fn column_type(t: &DataType) -> std::result::Result<(&'static str, bool, Option<
         "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIME" => Ok(("timestamp", false, None)),
         "DATE" => Err(format!("{t} is not a type here: a TIMESTAMP holds dates (as midnight UTC) and times")),
         "FLOAT" | "DOUBLE" | "REAL" | "DOUBLE PRECISION" | "FLOAT64" => Ok(("float", false, None)),
+        "JSON" | "JSONB" => Ok(("json", false, None)),
         s if s.starts_with("VARCHAR") || s.starts_with("CHAR") || s.starts_with("STRING") => {
             Err(format!("{t} is not a type here: use TEXT for text searched by its words, KEYWORD for exact values"))
         }

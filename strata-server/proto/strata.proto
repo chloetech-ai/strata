@@ -956,6 +956,9 @@ enum Func {
   FUNC_SID_AT = 16;
   // The number of TRUE conditions (plan feature "at_least").
   FUNC_COUNT_TRUE = 17;
+  // json_extract(field, 'path' [, 'string' | 'number' | 'bool']): the
+  // values at a path of a JSON field (plan feature "json").
+  FUNC_JSON_EXTRACT = 18;
 }
 
 message Match {

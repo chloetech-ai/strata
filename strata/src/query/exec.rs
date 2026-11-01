@@ -16,7 +16,7 @@ use crate::forward::{self, DocStore, KeyRange, KeywordColumn, NumericColumn, Ran
 use crate::graph::GraphReader;
 use crate::query::agg;
 use crate::query::memory::{Charge, MemoryBudget};
-use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS, CROSS_ENCODER_FIRST};
+use crate::query::logical::{Decay, Expand, GuardSite, OrderBy, Opts, PathTest, Phase, Pred, Projection, Score, Select, Tiebreak, Vectors, MAX_QUERY_VECTORS, CROSS_ENCODER_FIRST};
 use crate::query::plan::{CostModel, Estimator, FilterMode, Planner, VectorStrategy};
 use crate::query::rank::{Interval, Rank};
 use crate::query::stats::{FieldStats, TermStats};
@@ -139,15 +139,22 @@ impl SegmentReaders {
     pub fn keyword(&self, field: usize) -> Result<Option<&KeywordColumn>> {
         let f = &self.schema.fields[field];
         opened(&self.keyword[field], || {
-            // Multi-valued INT fields are keyword columns of int_key strings.
-            if !(f.indexed && (matches!(f.ty, FieldType::Keyword) || matches!(f.ty, FieldType::Int) && f.multi)) {
+            // Multi-valued INT fields are keyword columns of int_key strings,
+            // JSON fields of their objects' terms (crate::json).
+            if !(f.indexed && (matches!(f.ty, FieldType::Keyword | FieldType::Json) || matches!(f.ty, FieldType::Int) && f.multi)) {
                 return Ok(None);
             }
             let mut col = KeywordColumn::open(&self.seg, &f.key())?;
             if col.needs_values() {
                 // Multi-valued fields are stored.
                 let store = self.store()?.ok_or_else(|| crate::error::corrupt(format!("keyword column {}: no stored values to repair it from", f.name)))?;
-                col.repair(&store.field_values(field))?;
+                let mut values = store.field_values(field);
+                if f.ty == FieldType::Json {
+                    for v in values.iter_mut() {
+                        *v = Value::List(crate::json::terms(v)?.into_iter().map(Value::Str).collect());
+                    }
+                }
+                col.repair(&values)?;
             }
             Ok(Some(col))
         })
@@ -239,6 +246,49 @@ pub struct ExecOptions {
     /// [`steps::thread_cpu_us`]), which costs a system call per step; the
     /// steps' wall times are measured either way.
     pub profile: bool,
+    /// What runs a plan's operators above its leaves (joins, `WITH`,
+    /// `DISTINCT`, groups of derived rows): [`Engine::from_env`] by
+    /// default.
+    pub engine: Engine,
+}
+
+/// The engine of a plan's operators ([`crate::query::ops`] or
+/// [`crate::query::df`]). Without the feature `datafusion`, the operators
+/// run every plan, whichever is chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Engine {
+    /// Strata's operators, in memory ([`crate::query::ops`]): the default
+    /// without the feature `datafusion`.
+    #[cfg_attr(not(feature = "datafusion"), default)]
+    Operators,
+    /// DataFusion for a plan whose leaves read more than a few thousand
+    /// rows (`query::df::SMALL`), the operators for the others, which
+    /// they answer faster; the default with the feature `datafusion`.
+    #[cfg_attr(feature = "datafusion", default)]
+    Auto,
+    /// DataFusion (feature `datafusion`, [`crate::query::df`]), for every
+    /// plan it lowers; the operators run the others.
+    DataFusion,
+    /// [`Engine::DataFusion`], and a plan it does not lower fails with
+    /// the reason instead of running on the operators (to find what the
+    /// lowering misses).
+    DataFusionOnly,
+}
+
+impl Engine {
+    /// `STRATA_ENGINE`: `operators`, `auto`, `datafusion` or
+    /// `datafusion-only`; anything else, or nothing, the default
+    /// ([`Engine::Auto`] with the feature `datafusion`, the operators
+    /// without).
+    pub fn from_env() -> Engine {
+        match std::env::var("STRATA_ENGINE").as_deref() {
+            Ok("operators") => Engine::Operators,
+            Ok("auto") => Engine::Auto,
+            Ok("datafusion") => Engine::DataFusion,
+            Ok("datafusion-only") => Engine::DataFusionOnly,
+            _ => Engine::default(),
+        }
+    }
 }
 
 impl Default for ExecOptions {
@@ -265,6 +315,7 @@ impl Default for ExecOptions {
             max_groups: None,
             memory: None,
             profile: false,
+            engine: Engine::from_env(),
         }
     }
 }
@@ -376,6 +427,15 @@ pub struct ResultSet {
     pub stats: ExecStats,
 }
 
+/// A search leaf's rows for DataFusion ([`Executor::execute_arrow`]):
+/// as rows, or as Arrow columns.
+#[derive(Debug)]
+pub enum Leaf {
+    Rows(ResultSet),
+    #[cfg(feature = "datafusion")]
+    Arrow(crate::query::arrow::Columns),
+}
+
 /// What a coordinator ranks a shard's rows by, row by row, so that it ranks
 /// the rows of several shards once ([`crate::cluster::merge`]): the inputs
 /// of a fused score (a ranking expression, RRF, a weighted sum), and the
@@ -412,6 +472,43 @@ struct PerGroup {
 enum GroupKey<'k> {
     Str(&'k str),
     Int(i64),
+}
+
+/// What [`Executor::projecting`] reads for a projection.
+struct Projecting {
+    stored: Vec<usize>,
+    features: Vec<Option<Vec<f64>>>,
+    /// Each segment's last decompressed doc store block: rows in docID
+    /// order (a scan) decompress each block once rather than once a row.
+    blocks: HashMap<usize, forward::StoreCache>,
+}
+
+/// A row's value in a column, as the executor finds it: made for it, a
+/// stored field fetched, or a keyword column's text.
+enum Cell<'c> {
+    Value(Value),
+    Ref(&'c Value),
+    Str(&'c str),
+}
+
+impl Cell<'_> {
+    fn into_value(self) -> Value {
+        match self {
+            Cell::Value(v) => v,
+            Cell::Ref(v) => v.clone(),
+            Cell::Str(x) => Value::Str(x.to_string()),
+        }
+    }
+
+    /// About the bytes the value holds ([`crate::query::memory::value_bytes`]).
+    #[cfg(feature = "datafusion")]
+    fn bytes(&self) -> u64 {
+        match self {
+            Cell::Value(v) => crate::query::memory::value_bytes(v),
+            Cell::Ref(v) => crate::query::memory::value_bytes(v),
+            Cell::Str(x) => std::mem::size_of::<Value>() as u64 + x.len() as u64,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -797,6 +894,114 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
+    /// The paths listing of JSON field `field` ([`crate::query::paths`])
+    /// that `call` asks for, among the rows `q`'s filter matches, deleted
+    /// rows left out: the segments' terms read in one merge, in term order,
+    /// each counted over those rows, then each path's runs of a type.
+    pub fn json_paths(mut self, q: &Select, field: usize, call: &crate::query::paths::Call) -> Result<crate::query::paths::Paths> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let runs = call.runs();
+        let segs = self.segs.clone();
+        // Per segment with rows to read: its column, the rows (and their
+        // bits, unless they are all of the segment's), the codes of each run.
+        struct Part<'k> {
+            kw: &'k KeywordColumn,
+            set: Arc<DocSet>,
+            words: Option<Vec<u64>>,
+            codes: Vec<std::ops::Range<u32>>,
+        }
+        impl Part<'_> {
+            fn count(&self, code: u32) -> u64 {
+                match &self.words {
+                    None => self.kw.count_code(code) as u64,
+                    Some(w) => self.kw.count_code_in(code, w),
+                }
+            }
+        }
+        let mut parts: Vec<Part> = Vec::new();
+        let mut rows = 0u64;
+        for s in segs.iter() {
+            self.check_deadline()?;
+            let set = self.filter_set(s, &q.filter)?;
+            rows += set.len() as u64;
+            if set.is_empty() {
+                continue;
+            }
+            let kw = self.keyword(s, field)?;
+            let n = kw.n_values() as u32;
+            let codes = runs.iter().map(|(lo, hi)| kw.lower_bound(lo)..hi.as_deref().map_or(n, |h| kw.lower_bound(h))).collect();
+            let words = (set.len() < s.r.n_docs as usize).then(|| set.to_bits());
+            parts.push(Part { kw, set, words, codes });
+        }
+        let mut b = crate::query::paths::Builder::default();
+        let mut read = 0usize;
+        'runs: for r in 0..runs.len() {
+            let mut at: Vec<u32> = parts.iter().map(|p| p.codes[r].start).collect();
+            let mut heap: BinaryHeap<Reverse<(&str, usize)>> = BinaryHeap::new();
+            for (i, p) in parts.iter().enumerate() {
+                if at[i] < p.codes[r].end {
+                    heap.push(Reverse((p.kw.value(at[i]), i)));
+                }
+            }
+            while let Some(Reverse((t, i))) = heap.pop() {
+                let mut n = 0;
+                let mut next = Some(i);
+                while let Some(i) = next {
+                    let p = &parts[i];
+                    n += p.count(at[i]);
+                    at[i] += 1;
+                    if at[i] < p.codes[r].end {
+                        heap.push(Reverse((p.kw.value(at[i]), i)));
+                    }
+                    next = match heap.peek() {
+                        Some(Reverse((u, j))) if *u == t => Some(*j),
+                        _ => None,
+                    };
+                    if next.is_some() {
+                        heap.pop();
+                    }
+                }
+                if n > 0 && !b.term(t, n) {
+                    break 'runs;
+                }
+                read += 1;
+                if read % 4096 == 0 {
+                    self.check_deadline()?;
+                }
+            }
+        }
+        let mut paths = b.finish(rows);
+        // The rows holding a value of each type at each path: the union of
+        // the type's run of terms, per segment.
+        for p in paths.paths.iter_mut() {
+            for k in [crate::json::Kind::Str, crate::json::Kind::Number, crate::json::Kind::Bool] {
+                let (lo, hi) = crate::json::kind_run(&p.path, k);
+                let mut n = 0u64;
+                for part in &parts {
+                    let (a, z) = (part.kw.lower_bound(&lo), part.kw.lower_bound(&hi));
+                    n += match z.saturating_sub(a) {
+                        0 => 0,
+                        1 => part.count(a),
+                        _ => {
+                            let docs = part.kw.docs_codes(&(a..z).collect::<Vec<_>>());
+                            match part.words {
+                                None => docs.len() as u64,
+                                Some(_) => docs.intersect(&part.set).len() as u64,
+                            }
+                        }
+                    };
+                }
+                *p.kind_mut(k) = n;
+            }
+            read += 1;
+            if read % 4096 == 0 {
+                self.check_deadline()?;
+            }
+        }
+        Ok(paths)
+    }
+
     /// The loosest level of `q`'s guard ([`crate::query::logical::Guard`])
     /// and the rows of each level from it to the strictest, over every
     /// segment: those meeting `q`'s filter and that many of the guard's
@@ -887,7 +1092,24 @@ impl<'a> Executor<'a> {
         Ok(Some(q.at_level(m)))
     }
 
-    pub fn execute(mut self, q: &Select) -> Result<ResultSet> {
+    pub fn execute(self, q: &Select) -> Result<ResultSet> {
+        match self.answer(q, None)? {
+            Leaf::Rows(rs) => Ok(rs),
+            #[cfg(feature = "datafusion")]
+            Leaf::Arrow(_) => unreachable!("rows asked for"),
+        }
+    }
+
+    /// [`Executor::execute`], with the rows as Arrow columns when there are
+    /// more than `over` of them and the query neither groups nor counts
+    /// (nor runs for a coordinator): what DataFusion reads, without the
+    /// rows being made first.
+    #[cfg(feature = "datafusion")]
+    pub fn execute_arrow(self, q: &Select, over: usize) -> Result<Leaf> {
+        self.answer(q, Some(over))
+    }
+
+    fn answer(mut self, q: &Select, arrow_over: Option<usize>) -> Result<Leaf> {
         let m = self.mark();
         let settled = self.settle_guard(q)?;
         if q.guard.is_some() {
@@ -933,7 +1155,7 @@ impl<'a> Executor<'a> {
                 q.typed(&mut rows);
                 rows
             };
-            return Ok(empty(columns, rows, self.stats));
+            return Ok(Leaf::Rows(empty(columns, rows, self.stats)));
         }
         let has_count = q.projection.iter().any(|(_, p)| *p == Projection::Count);
         if has_count {
@@ -945,7 +1167,7 @@ impl<'a> Executor<'a> {
             self.step(m, "count", String::new(), Some(n as u64));
             let one = self.opts.shard || (q.offset == 0 && q.limit != Some(0));
             let rows = if one { vec![vec![Value::Int(n); columns.len()]] } else { Vec::new() };
-            return Ok(empty(columns, rows, self.stats));
+            return Ok(Leaf::Rows(empty(columns, rows, self.stats)));
         }
         let m = self.mark();
         let hits = self.ordered_hits(q, self.opts.max_rows)?;
@@ -954,6 +1176,17 @@ impl<'a> Executor<'a> {
         let skip = if self.opts.shard { 0 } else { q.offset };
         let hits: Vec<Hit> = hits.into_iter().skip(skip).collect();
         let m = self.mark();
+        #[cfg(feature = "datafusion")]
+        if arrow_over.is_some_and(|o| hits.len() > o) && !self.opts.shard {
+            if let Some((arrays, keys)) = self.project_arrow(q, &hits)? {
+                self.step(m, "project", format!("{} column{} into Arrow", columns.len(), if columns.len() == 1 { "" } else { "s" }), Some(hits.len() as u64));
+                let scores = hits.iter().map(|h| h.score).collect();
+                let c = crate::query::arrow::Columns { names: columns, arrays, keys, scores, rows: hits.len(), stats: self.stats };
+                return Ok(Leaf::Arrow(c));
+            }
+        }
+        #[cfg(not(feature = "datafusion"))]
+        let _ = arrow_over;
         let mut rows = self.project(q, &hits)?;
         self.step(m, "project", format!("{} column{}", columns.len(), if columns.len() == 1 { "" } else { "s" }), Some(rows.len() as u64));
         // Shards answer with the stored integers, which the merge types.
@@ -979,7 +1212,7 @@ impl<'a> Executor<'a> {
             parts.get_or_insert_with(RankParts::default).phases = self.phase_parts(&q.phases, &hits)?;
             self.step(m, "phase values", format!("{} phase{}", q.phases.len(), if q.phases.len() == 1 { "" } else { "s" }), Some(hits.len() as u64));
         }
-        Ok(ResultSet { columns, rows, keys, scores, parts, stats: self.stats })
+        Ok(Leaf::Rows(ResultSet { columns, rows, keys, scores, parts, stats: self.stats }))
     }
 
     /// What the step that finds a query's rows is called, and its order.
@@ -1439,6 +1672,7 @@ impl<'a> Executor<'a> {
                 let runs = self.prefix_runs(s, *field, prefix, *edits)?;
                 self.keyword(s, *field)?.docs_prefix(&runs)
             }
+            Pred::Path { field, path, test } => self.path_set(s, *field, path, test)?,
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
@@ -1481,6 +1715,34 @@ impl<'a> Executor<'a> {
         })
     }
 
+    /// The rows of a segment whose JSON field passes `test` at `path`: a
+    /// term's list, or a run of terms' ([`crate::json`]).
+    fn path_set(&self, s: &Seg<'a>, field: usize, path: &str, test: &PathTest) -> Result<DocSet> {
+        let kw = self.keyword(s, field)?;
+        Ok(match test {
+            PathTest::Has(None) => kw.docs(&crate::json::has_term(path)),
+            PathTest::Has(Some(k)) => {
+                let (lo, hi) = crate::json::kind_run(path, *k);
+                let codes: Vec<u32> = (kw.lower_bound(&lo)..kw.lower_bound(&hi)).collect();
+                kw.docs_codes(&codes)
+            }
+            PathTest::In(values) => {
+                let terms: Vec<String> = values.iter().filter_map(|v| crate::json::term(path, v)).collect();
+                kw.docs_in(&terms.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            PathTest::Range { lo, hi } => {
+                let (lo, hi) = crate::json::range_run(path, lo.as_ref().map(|(v, i)| (v, *i)), hi.as_ref().map(|(v, i)| (v, *i)))?;
+                let codes: Vec<u32> = (kw.lower_bound(&lo)..kw.lower_bound(&hi)).collect();
+                kw.docs_codes(&codes)
+            }
+            // No indexed string is longer than the prefix.
+            PathTest::Prefix(p) => match crate::json::term(path, &Value::Str(p.clone())) {
+                Some(prefix) => kw.docs_prefix(&kw.prefix_runs(&prefix, 0)),
+                None => DocSet::empty(s.r.n_docs),
+            },
+        })
+    }
+
     fn materialize_in(&self, s: &Seg<'a>, field: usize, values: &[Value]) -> Result<DocSet> {
         let f = &self.schema.fields[field];
         match f.ty {
@@ -1491,10 +1753,15 @@ impl<'a> Executor<'a> {
             }
             _ => {
                 let num = self.numeric(s, field)?;
-                let mut acc = DocSet::empty(s.r.n_docs);
-                for v in values {
-                    acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
-                }
+                let acc = if values.len() > MANY_VALUES {
+                    num.col().scan_key_set(&key_set(num.col(), values))
+                } else {
+                    let mut acc = DocSet::empty(s.r.n_docs);
+                    for v in values {
+                        acc = acc.union(&forward::eval_keys(num.col(), num.index(), value_keys(num.col(), v), self.opts.range));
+                    }
+                    acc
+                };
                 Ok(self.patch(s, field, acc, |v| values.iter().any(|x| num_eq(v, x))))
             }
         }
@@ -1512,7 +1779,7 @@ impl<'a> Executor<'a> {
             {
                 ProbeNode::Leaf(Box::new(self.materialize(s, p)?))
             }
-            Pred::Present { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
+            Pred::Present { .. } | Pred::Path { .. } => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             Pred::Prefix { field, .. } if self.schema.fields[*field].multi => ProbeNode::Leaf(Box::new(self.materialize(s, p)?)),
             Pred::Prefix { field, prefix, edits } => {
                 let runs = self.prefix_runs(s, *field, prefix, *edits)?;
@@ -1527,6 +1794,10 @@ impl<'a> Executor<'a> {
                 FieldType::Keyword => {
                     let vs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
                     ProbeNode::Leaf(Box::new(self.keyword(s, *field)?.filter_in(&vs)))
+                }
+                _ if values.len() > MANY_VALUES => {
+                    let col = self.numeric(s, *field)?.col();
+                    ProbeNode::Leaf(Box::new(col.filter_key_set(key_set(col, values))))
                 }
                 _ => {
                     let col = self.numeric(s, *field)?.col();
@@ -3126,7 +3397,9 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn project(&self, q: &Select, hits: &[Hit]) -> Result<Vec<Vec<Value>>> {
+    /// What projecting `hits` reads besides each row's own cells: the
+    /// stored fields to fetch, and each ranking expression's values.
+    fn projecting(&self, q: &Select, hits: &[Hit]) -> Result<Projecting> {
         if q.projection.iter().any(|(_, p)| *p == Projection::SeqNo) && !self.snap.numbers_writes() {
             return Err(Error::Query("seq_no(): the database does not number its writes (Database::start_seq_no)".into()));
         }
@@ -3135,13 +3408,14 @@ impl<'a> Executor<'a> {
             .iter()
             .filter_map(|(_, p)| match p {
                 // Vectors live in their index, not the doc store, and a
-                // single-valued KEYWORD's index reads a row's value without
-                // decompressing its stored fields.
+                // single-valued KEYWORD's, INT's or FLOAT's column reads a
+                // row's value without decompressing its stored fields.
                 Projection::Field(i)
                     if self.schema.fields[*i].stored
                         && Some(*i) != self.schema.primary_key
                         && !matches!(self.schema.fields[*i].ty, FieldType::Vector { .. })
-                        && !self.keyword_column(*i) =>
+                        && !self.keyword_column(*i)
+                        && !self.numeric_column(*i) =>
                 {
                     Some(*i)
                 }
@@ -3157,40 +3431,117 @@ impl<'a> Executor<'a> {
                 _ => Ok(None),
             })
             .collect::<Result<_>>()?;
+        Ok(Projecting { stored, features, blocks: HashMap::new() })
+    }
+
+    /// The stored fields of hit `h` that the projection reads.
+    fn fetch(&self, p: &mut Projecting, s: &Seg<'a>, h: &Hit) -> Result<Vec<Value>> {
+        Ok(match (s.r.store()?, p.stored.is_empty()) {
+            (Some(store), false) => store.get_fields_cached(h.doc, &p.stored, p.blocks.entry(h.seg).or_default()),
+            _ => Vec::new(),
+        })
+    }
+
+    /// Column `c` (`proj`) of hit `h`, the `r`-th row, whose stored fields
+    /// are `fetched`.
+    fn cell<'c>(&self, p: &Projecting, s: &'c Seg<'a>, h: &Hit, r: usize, c: usize, proj: &Projection, fetched: &'c [Value]) -> Result<Cell<'c>> {
+        Ok(Cell::Value(match proj {
+            Projection::Feature(_) => match p.features[c].as_ref().map(|v| v[r]) {
+                Some(x) if x.is_finite() => Value::Float(x),
+                _ => Value::Null,
+            },
+            // A row without the ordering column's value scores ±inf.
+            Projection::Score if h.score.is_finite() => Value::Float(h.score),
+            Projection::Score => Value::Null,
+            Projection::Count | Projection::Agg { .. } => Value::Null,
+            Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
+            Projection::SeqNo => Value::Int(rowseq::of_view(s.view, h.doc)? as i64),
+            Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
+            Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => self.updates(s, *i).and_then(|u| u.get(*i, h.doc)).cloned().unwrap_or(Value::Null),
+            Projection::Field(i) => match p.stored.iter().position(|x| x == i) {
+                Some(j) => return Ok(fetched.get(j).map_or(Cell::Value(Value::Null), Cell::Ref)),
+                None => return self.unstored_cell(s, *i, h.doc),
+            },
+        }))
+    }
+
+    fn project(&self, q: &Select, hits: &[Hit]) -> Result<Vec<Vec<Value>>> {
+        let mut p = self.projecting(q, hits)?;
         let mut rows = Vec::with_capacity(hits.len());
+        let mut at: Option<Seg<'a>> = None;
         for (r, h) in hits.iter().enumerate() {
-            let s = &self.seg_by_ord(h.seg);
-            let fetched = match (s.r.store()?, stored.is_empty()) {
-                (Some(store), false) => store.get_fields(h.doc, &stored),
-                _ => Vec::new(),
-            };
+            if at.as_ref().is_none_or(|s| s.ord != h.seg) {
+                at = Some(self.seg_by_ord(h.seg));
+            }
+            let s = at.as_ref().expect("the hit's segment");
+            let fetched = self.fetch(&mut p, s, h)?;
             let mut row = Vec::with_capacity(q.projection.len());
-            for (c, (_, p)) in q.projection.iter().enumerate() {
-                row.push(match p {
-                    Projection::Feature(_) => match features[c].as_ref().map(|v| v[r]) {
-                        Some(x) if x.is_finite() => Value::Float(x),
-                        _ => Value::Null,
-                    },
-                    // A row without the ordering column's value scores ±inf.
-                    Projection::Score if h.score.is_finite() => Value::Float(h.score),
-                    Projection::Score => Value::Null,
-                    Projection::Count | Projection::Agg { .. } => Value::Null,
-                    Projection::Hops(g) => self.hops_of(*g, h.seg, h.doc).map_or(Value::Null, |x| Value::Int(x as i64)),
-                    Projection::SeqNo => Value::Int(rowseq::of_view(s.view, h.doc)? as i64),
-                    Projection::Field(i) if Some(*i) == self.schema.primary_key => self.key(h),
-                    Projection::Field(i) if self.updates(s, *i).is_some_and(|u| u.get(*i, h.doc).is_some()) => {
-                        self.updates(s, *i).and_then(|u| u.get(*i, h.doc)).cloned().unwrap_or(Value::Null)
-                    }
-                    Projection::Field(i) => match stored.iter().position(|x| x == i) {
-                        Some(j) => fetched.get(j).cloned().unwrap_or(Value::Null),
-                        None => self.unstored_value(s, *i, h.doc),
-                    },
-                });
+            for (c, (_, proj)) in q.projection.iter().enumerate() {
+                row.push(self.cell(&p, s, h, r, c, proj, &fetched)?.into_value());
             }
             self.charge.row(&row)?;
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    /// [`Executor::project`] into Arrow arrays, typed as the answer types
+    /// them ([`Select::typed`]), with the keys' array: `None` when a
+    /// column holds values of more than one type, which only rows can.
+    #[cfg(feature = "datafusion")]
+    fn project_arrow(&self, q: &Select, hits: &[Hit]) -> Result<Option<(Vec<datafusion::arrow::array::ArrayRef>, datafusion::arrow::array::ArrayRef)>> {
+        use crate::query::arrow::Builder;
+        let n = hits.len();
+        let mut p = self.projecting(q, hits)?;
+        let mut cols: Vec<Builder> = q.projection.iter().map(|_| Builder::new()).collect();
+        // The key column, when the projection has one as it is, is the
+        // keys' array too.
+        let pk = q.projection.iter().enumerate().position(|(c, (_, proj))| matches!(proj, Projection::Field(i) if Some(*i) == self.schema.primary_key) && q.types.get(c).copied().flatten().is_none());
+        let mut keys = Builder::new();
+        let mut bytes = 0u64;
+        let mut at: Option<Seg<'a>> = None;
+        for (r, h) in hits.iter().enumerate() {
+            if at.as_ref().is_none_or(|s| s.ord != h.seg) {
+                at = Some(self.seg_by_ord(h.seg));
+            }
+            let s = at.as_ref().expect("the hit's segment");
+            let fetched = self.fetch(&mut p, s, h)?;
+            bytes += 24;
+            for (c, (_, proj)) in q.projection.iter().enumerate() {
+                let b = &mut cols[c];
+                let cell = self.cell(&p, s, h, r, c, proj, &fetched)?;
+                bytes += cell.bytes();
+                let pushed = match (q.types.get(c).copied().flatten(), cell) {
+                    (Some(t), cell) => b.push(t.output(cell.into_value()), n),
+                    (None, Cell::Value(v)) => b.push(v, n),
+                    (None, Cell::Ref(v)) => b.push_ref(v, n),
+                    (None, Cell::Str(x)) => b.push_str(x, n),
+                };
+                if pushed.is_err() {
+                    return Ok(None);
+                }
+            }
+            if pk.is_none() && keys.push(self.key(h), n).is_err() {
+                return Ok(None);
+            }
+            // Counted every 1,024 rows rather than every row.
+            if r % 1024 == 1023 {
+                self.charge.add(std::mem::take(&mut bytes))?;
+            }
+        }
+        self.charge.add(bytes)?;
+        let arrays = match cols.into_iter().map(|b| b.finish(n)).collect::<std::result::Result<Vec<_>, _>>() {
+            Ok(a) => a,
+            Err(_) => return Ok(None),
+        };
+        let keys = match pk {
+            Some(c) => arrays[c].clone(),
+            None => match keys.finish(n) {
+                Ok(k) => k,
+                Err(_) => return Ok(None),
+            },
+        };
+        Ok(Some((arrays, keys)))
     }
 
     /// The value of the ranking expression `score`, which scores each row
@@ -3210,6 +3561,13 @@ impl<'a> Executor<'a> {
             .collect())
     }
 
+    /// Whether the field's values are read from its numeric column: one
+    /// INT or FLOAT a row, which the column holds exactly.
+    fn numeric_column(&self, field: usize) -> bool {
+        let f = &self.schema.fields[field];
+        matches!(f.ty, FieldType::Int | FieldType::Float) && f.indexed && !f.multi
+    }
+
     /// Whether the field's values are read from its keyword column: one
     /// value a row, the value itself (a MEDIA field's column holds its
     /// `sha256`).
@@ -3218,14 +3576,17 @@ impl<'a> Executor<'a> {
         matches!(f.ty, FieldType::Keyword) && f.indexed && !f.multi && f.media.is_none()
     }
 
-    fn unstored_value(&self, s: &Seg<'a>, field: usize, d: DocId) -> Value {
-        match self.schema.fields[field].ty {
+    /// A field read from its index rather than the doc store.
+    fn unstored_cell<'s>(&self, s: &'s Seg<'a>, field: usize, d: DocId) -> Result<Cell<'s>> {
+        Ok(Cell::Value(match self.schema.fields[field].ty {
             FieldType::Vector { .. } => s.r.vector(field).ok().flatten().map_or(Value::Null, |v| v.row_value(d)),
+            FieldType::Int | FieldType::Float if self.numeric_column(field) => s.r.numeric(field)?.map_or(Value::Null, |n| n.col().get(d)),
             FieldType::Int | FieldType::Float => s.r.numeric(field).ok().flatten().map_or(Value::Null, |n| n.col().get(d)),
-            FieldType::Keyword => s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Value::Null, |v| Value::Str(v.to_string())),
-            FieldType::Text { .. } | FieldType::Sparse => Value::Null,
+            FieldType::Keyword => return Ok(s.r.keyword(field).ok().flatten().and_then(|k| k.value_of_doc(d)).map_or(Cell::Value(Value::Null), Cell::Str)),
+            // A JSON field is always stored.
+            FieldType::Text { .. } | FieldType::Sparse | FieldType::Json => Value::Null,
             FieldType::Edges => s.r.graph(field).ok().flatten().map_or(Value::Null, |g| g.edges_value(d)),
-        }
+        }))
     }
 }
 
@@ -3611,6 +3972,25 @@ impl Estimator for SegEst<'_, '_> {
         let c = &self.ex.opts.costs;
         (!self.ex.schema.fields[field].multi && scans > 0).then(|| scans as f64 * self.n_docs() * c.column_scan + kw.count_prefix(&runs) as f64 * c.emit)
     }
+    fn path_count(&self, field: usize, path: &str, test: &PathTest) -> f64 {
+        let Some(kw) = self.s.r.keyword(field).ok().flatten() else { return 0.0 };
+        match test {
+            PathTest::Has(None) => kw.count(&crate::json::has_term(path)) as f64,
+            PathTest::Has(Some(k)) => {
+                let (lo, hi) = crate::json::kind_run(path, *k);
+                kw.count_prefix(std::slice::from_ref(&(kw.lower_bound(&lo)..kw.lower_bound(&hi)))) as f64
+            }
+            PathTest::In(values) => values.iter().filter_map(|v| crate::json::term(path, v)).map(|t| kw.count(&t) as f64).sum(),
+            PathTest::Range { lo, hi } => match crate::json::range_run(path, lo.as_ref().map(|(v, i)| (v, *i)), hi.as_ref().map(|(v, i)| (v, *i))) {
+                Ok((lo, hi)) => kw.count_prefix(std::slice::from_ref(&(kw.lower_bound(&lo)..kw.lower_bound(&hi)))) as f64,
+                Err(_) => 0.0,
+            },
+            PathTest::Prefix(p) => match crate::json::term(path, &Value::Str(p.clone())) {
+                Some(prefix) => kw.count_prefix(&kw.prefix_runs(&prefix, 0)) as f64,
+                None => 0.0,
+            },
+        }
+    }
     fn in_count(&self, field: usize, values: &[Value]) -> f64 {
         if let Some(kw) = self.s.r.keyword(field).ok().flatten() {
             return values.iter().filter_map(forward::key_of).map(|v| kw.count(&v) as f64).sum();
@@ -3652,6 +4032,18 @@ fn num_eq(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         _ => a.as_f64().zip(b.as_f64()).is_some_and(|(x, y)| x == y),
     }
+}
+
+/// Above this many values a numeric `IN` reads the column once and checks
+/// each key against them all ([`forward::KeySet`]), rather than looking
+/// each value up: a lookup reads or unions a set of the segment's size, so
+/// a value at a time is quadratic (a join restricted to a million keys
+/// took two minutes).
+const MANY_VALUES: usize = 32;
+
+/// The keys of `values` in `col`.
+fn key_set(col: &NumericColumn, values: &[Value]) -> forward::KeySet {
+    forward::KeySet::new(values.iter().filter_map(|v| value_keys(col, v)))
 }
 
 /// The keys of column `col` equal to the number `v`.

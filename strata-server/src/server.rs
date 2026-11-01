@@ -132,9 +132,16 @@ pub struct Options {
     pub keys: Option<PathBuf>,
     /// Append every audited request here, as JSON lines.
     pub audit_log: Option<PathBuf>,
-    /// The AWS view's credentials file (default: `<db>.aws.json` beside a
+    /// The cloud view's AWS credentials file (default: `<db>.aws.json` beside a
     /// database; a coordinator keeps them in memory without it).
     pub aws_file: Option<PathBuf>,
+    /// The cloud view's DigitalOcean token file (default:
+    /// `<db>.digitalocean.json` beside a database; in memory on a
+    /// coordinator without it).
+    pub digitalocean_file: Option<PathBuf>,
+    /// The clusters the cloud view made (default: `<db>.cloud.json` beside
+    /// a database; in memory on a coordinator without it).
+    pub cloud_file: Option<PathBuf>,
     /// The alert rules' file (default rules, in memory, without it).
     pub alerts: Option<PathBuf>,
     /// Post alerts that fire or resolve to this URL.
@@ -326,6 +333,18 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if let Some(file) = aws {
         svc.aws = Arc::new(crate::aws::Aws::open(file)?);
     }
+    let digitalocean = o.digitalocean_file.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::digitalocean::DigitalOcean::file_of));
+    if let Some(file) = digitalocean {
+        svc.digitalocean = Arc::new(crate::digitalocean::DigitalOcean::open(file)?);
+    }
+    let cloud = o.cloud_file.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::cloud::clusters::Clusters::file_of));
+    if let Some(file) = cloud {
+        svc.clouds = Arc::new(crate::cloud::clusters::Clusters::open(file)?);
+        // Clusters on their way when the server stopped go on.
+        if svc.clouds.list().iter().any(|m| !matches!(m.phase, crate::cloud::clusters::Phase::Deleted | crate::cloud::clusters::Phase::Failed)) {
+            svc.clouds.start(svc.aws.clone(), svc.digitalocean.clone());
+        }
+    }
     let keys = o.keys.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(Keys::file_of));
     if let Some(file) = keys {
         svc.keys = Arc::new(Keys::open(file)?);
@@ -498,9 +517,14 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     let out = dir.join(&local);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let client = reqwest::Client::new();
-    let files = if derives { strata::derive::model_files(&local) } else { strata::embed::model_files(&local) };
-    for file in files {
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+    // Each file's path in the repository, and its name here.
+    let files: Vec<(&str, &str)> = match (derives, cross_encoder::fetch_files(&local)) {
+        (true, _) => strata::derive::model_files(&local).iter().map(|&f| (f, f)).collect(),
+        (false, Some(f)) => f,
+        (false, None) => strata::embed::model_files(&local).iter().map(|&f| (f, f)).collect(),
+    };
+    for (from, file) in files {
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{from}");
         let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;
         let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
         // Written aside and renamed, so that an open model is never
@@ -514,7 +538,8 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     } else if !cross_encoder::is_cross_encoder(&out) {
         strata::embed::open(&local, dir).map_err(|e| e.to_string())?;
     } else if let Err(e) = cross_encoder::CrossEncoder::open(&local, &out) {
-        match cfg!(feature = "bert") {
+        let runs = if out.join(cross_encoder::ONNX).exists() { cfg!(feature = "onnx") } else { cfg!(feature = "bert") };
+        match runs {
             true => return Err(e.to_string()),
             false => tracing::warn!(error = %e, "downloaded a cross-encoder this build cannot run"),
         }
@@ -682,6 +707,8 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The minute the log store last had a row of load for.
+        let mut minute = crate::telemetry::now_ms() / 60_000;
         loop {
             tick.tick().await;
             let Some(svc) = svc.upgrade() else { return };
@@ -691,6 +718,13 @@ pub fn spawn_sampler(svc: &Arc<Service>) {
                 if !changes.is_empty() {
                     let svc = svc.clone();
                     tokio::spawn(async move { svc.alerts.notify(&changes).await });
+                }
+            }
+            let now = crate::telemetry::now_ms();
+            if now / 60_000 != minute {
+                minute = now / 60_000;
+                if let Some((store, load)) = svc.log_store.as_ref().zip(svc.minute_load(now)) {
+                    store.keep_load(load);
                 }
             }
         }

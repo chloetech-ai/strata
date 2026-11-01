@@ -4,7 +4,7 @@ mod forward_common;
 
 use forward_common::build;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use strata::forward::{count_range, eval_range, float_key, NumericColumn, NumericKind, RangeIndex, RangeStrategy, BLOCK};
+use strata::forward::{count_range, eval_range, float_key, KeySet, NumericColumn, NumericKind, RangeIndex, RangeStrategy, BLOCK};
 use strata::segment::build::BuildOptions;
 use strata::segment::DocSet;
 use strata::{Document, Field, FieldType, Schema, Value};
@@ -132,6 +132,26 @@ fn check_column(col: &NumericColumn, idx: Option<&RangeIndex>, vals: &[Option<f6
         let e = col.estimate(lo, hi);
         assert!(e >= 0.0 && e <= col.n_present() as f64 + 1e-6, "estimate {e}");
     }
+    // Sets of values (an IN list): one pass over the column, and a probe,
+    // against the values one at a time.
+    let present: Vec<f64> = vals.iter().flatten().copied().filter(|v| !v.is_nan()).collect();
+    for size in [0usize, 1, 5, 40, 300] {
+        let picks: Vec<f64> = (0..size)
+            .map(|_| match rng.gen_range(0..3) {
+                0 | 1 if !present.is_empty() => present[rng.gen_range(0..present.len())],
+                _ => (rng.gen::<f64>() - 0.5) * 1e3,
+            })
+            .collect();
+        let set = KeySet::new(picks.iter().filter_map(|&v| col.key_range(v, v)));
+        assert!(set.ranges().windows(2).all(|w| w[0].hi < w[1].lo), "sorted and disjoint");
+        let want: Vec<u32> = vals.iter().enumerate().filter(|(_, v)| v.is_some_and(|v| picks.contains(&v))).map(|(d, _)| d as u32).collect();
+        assert_eq!(col.scan_key_set(&set), DocSet::from_sorted(want.clone(), n), "{size} values");
+        let f = col.filter_key_set(set);
+        assert!(strata::segment::DocFilter::cardinality(&f) <= col.n_present());
+        for d in 0..n {
+            assert_eq!(strata::segment::DocFilter::contains(&f, d), want.binary_search(&d).is_ok(), "doc {d}, {size} values");
+        }
+    }
     // Everything but NaN (a bucket shared with NaN counts it too).
     let all = col.estimate(f64::NEG_INFINITY, f64::INFINITY);
     let nan = vals.iter().flatten().filter(|v| v.is_nan()).count() as f64;
@@ -223,4 +243,47 @@ fn zone_maps_prune_sorted_columns() {
     assert!(p.boundary.len() <= 1);
     let est = col.estimate(0.0, 50_000.0);
     assert!((est - 50_001.0).abs() < 1.0, "estimate {est}");
+}
+
+/// A query reads a single-valued INT or FLOAT field from its column rather
+/// than its stored row, and gets what was written: integers to the last
+/// bit, and a FLOAT field's values as FLOATs whether or not it has a
+/// column (an integer written to one is stored as its double, and -0.0 as
+/// 0.0, as the column reads them).
+#[test]
+fn a_query_reads_numbers_from_their_columns_as_written() {
+    use strata::db::Db;
+    use strata::query::exec::ExecOptions;
+    use strata::query::Params;
+    use strata::storage::DbOptions;
+    let mut plain = Field::new("g", FieldType::Float);
+    plain.indexed = false;
+    let fields = vec![Field::new("id", FieldType::Keyword), Field::new("i", FieldType::Int), Field::new("f", FieldType::Float), plain];
+    let schema = Schema::new("t", fields, Some("id")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("n.strata"), schema, DbOptions::default()).unwrap();
+    let row = |id: &str, i: Value, f: Value| vec![Value::Str(id.into()), i, f.clone(), f];
+    let written = [
+        row("a", Value::Int(i64::MIN), Value::Int(3)),
+        row("b", Value::Int(i64::MAX), Value::Float(-0.0)),
+        row("c", Value::Int(i64::MAX - 1), Value::Float(0.1)),
+        row("d", Value::Null, Value::Bool(true)),
+        row("e", Value::Int(-7), Value::Null),
+    ];
+    let want = |id: &str, i: Value, f: Value| vec![Value::Str(id.into()), i, f.clone(), f];
+    let expected = vec![
+        want("a", Value::Int(i64::MIN), Value::Float(3.0)),
+        want("b", Value::Int(i64::MAX), Value::Float(0.0)),
+        want("c", Value::Int(i64::MAX - 1), Value::Float(0.1)),
+        want("d", Value::Null, Value::Float(1.0)),
+        want("e", Value::Int(-7), Value::Null),
+    ];
+    // In a segment, then also in memory.
+    db.load(written[..3].to_vec()).unwrap();
+    db.storage().flush().unwrap();
+    db.load(written[3..].to_vec()).unwrap();
+    let rs = db.query_with("SELECT id, i, f, g FROM t ORDER BY id", &Params::new(), &ExecOptions::default()).unwrap();
+    assert_eq!(rs.rows, expected);
+    let signs: Vec<bool> = rs.rows.iter().filter_map(|r| r[2].as_f64()).map(f64::is_sign_negative).collect();
+    assert_eq!(signs, [false, false, false, false]);
 }

@@ -35,6 +35,8 @@ backtrace = "0.3"
 # SQLite files sent to `/v1/import` and written for `/v1/export`.
 tempfile = "3"
 # API keys are kept as the SHA-256 of their secrets (`keys`).
+# A new cluster's CA, and EKS's tokens (the cloud view).
+base64 = "0.23"
 sha2 = "0.10"
 # AWS answers in XML (EC2: instance types, regions, spot prices; `aws`).
 roxmltree = "0.20"
@@ -44,10 +46,16 @@ roxmltree = "0.20"
 pprof = { version = "0.15", default-features = false }
 
 [features]
+default = ["datafusion"]
+# DataFusion as the engine of joins, groups and sorts over a few thousand
+# rows or more (`strata::query::df`); the default engine picks it by size.
+datafusion = ["strata/datafusion"]
 # BERT embedding models (bge-small-en-v1.5, snowflake-arctic-embed-m-v1.5) through candle.
 bert = ["strata/bert"]
 # `bert` with matrix products in Apple's Accelerate framework (macOS only).
 accelerate = ["strata/accelerate"]
+# Cross-encoders exported to ONNX, int8 ones among them, run by ONNX Runtime.
+onnx = ["strata/onnx"]
 # Images: decoded, and embedded by SigLIP (siglip-base-patch16-224).
 vision = ["strata/vision"]
 # Sound: decoded (WAV, FLAC, MP3, Ogg Vorbis, AAC), and transcribed by
@@ -59,7 +67,8 @@ tonic-build = "0.12"
 protox = "0.7"
 
 [dev-dependencies]
-base64 = "0.23"
+# The operator's manifests read in a test, to keep src/cloud/install.rs the same.
+serde_yaml = "0.9"
 # PNGs written by the tests of `vision`.
 image = { version = "0.25", default-features = false, features = ["png"] }
 

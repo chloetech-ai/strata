@@ -247,6 +247,7 @@ fn expr(e: &Expr) -> E {
                 Func::Dot => pb::Func::Dot,
                 Func::SidAt => pb::Func::SidAt,
                 Func::CountTrue => pb::Func::CountTrue,
+                Func::JsonExtract => pb::Func::JsonExtract,
             } as i32,
             args: args.iter().map(ex).collect(),
         }),
@@ -599,6 +600,7 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
                 pb::Func::Dot => Func::Dot,
                 pb::Func::SidAt => Func::SidAt,
                 pb::Func::CountTrue => Func::CountTrue,
+                pb::Func::JsonExtract => Func::JsonExtract,
             };
             Expr::Call { func, args: from_exprs(c.args)? }
         }

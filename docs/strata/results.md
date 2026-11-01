@@ -104,26 +104,68 @@ Plain BM25 moves little except on ArguAna (+0.052), whose queries are whole argu
 
 ### Cross-encoder reranking
 
-BM25's top 100 ranked again by the cross-encoder `ms-marco-MiniLM-L-6-v2` in a second phase (`cross_encoder()`, ranking 7b), over every test query, with `strata-bm25-eval --variants plain,ce_rerank100`; p is the paired randomization test of nDCG@10 against BM25 over the queries (10,000 rounds). Results: `strata/results/text/bm25_ce_quality.json`; that run shared the cloud container with builds, so its query times are not latencies.
+BM25's top rows ranked again by the cross-encoder `ms-marco-MiniLM-L-6-v2` in a second phase (`cross_encoder()`, ranking 7b), over every test query, with `strata-bm25-eval --variants plain,ce_rerank<N>`; p is the paired randomization test of nDCG@10 against BM25 over the queries (10,000 rounds). The text and query of a pair are cut to 256 tokens together (before, to 512, the model's length), in `f32` through candle (`--features bert`) or in int8 through ONNX Runtime (`--features onnx`, the model's own int8 export for AVX-512 VNNI). Results: `strata/results/text/bm25_ce_quality*.json` and, for 512 tokens and the top 20, the relevance gate's `strata/tests/fixtures/relevance_gate_cross_encoder.json` before this change.
 
-| | SciFact | NFCorpus | ArguAna |
+| nDCG@10 | SciFact | NFCorpus | ArguAna |
 |---|---|---|---|
-| nDCG@10, BM25 | 0.691 | 0.329 | 0.362 |
-| nDCG@10, reranked | 0.687 (p = 0.79) | 0.352 (p < 0.001) | 0.312 (p < 0.001) |
-| recall@10, BM25 | 0.827 | 0.156 | 0.758 |
-| recall@10, reranked | 0.803 | 0.162 | 0.666 |
+| BM25 | 0.691 | 0.329 | 0.362 |
+| top 100, `f32`, 512 tokens | 0.687 (p = 0.79) | 0.352 (p < 0.001) | 0.312 (p < 0.001) |
+| top 20, `f32`, 512 tokens | 0.691 | 0.351 | |
+| top 20, `f32`, 256 tokens | 0.683 (p = 0.56) | 0.349 (p < 0.001) | 0.366 (p = 0.52) |
+| top 20, int8, 256 tokens | 0.684 (p = 0.58) | 0.348 (p = 0.001) | 0.364 (p = 0.78) |
 
-The model, trained on MS MARCO's web questions, helps on NFCorpus's medical questions, not on SciFact's scientific claims, and hurts on ArguAna, where each query is a whole argument and the document to find is its counterargument, a task unlike answering a question. The BEIR paper measured the same reranking at 0.311 on ArguAna. The relevance gate keeps a cheaper variant, BM25's top 20 reranked on SciFact and NFCorpus (`strata/tests/fixtures/relevance_gate_cross_encoder.json`).
+The model, trained on MS MARCO's web questions, helps on NFCorpus's medical questions, not on SciFact's scientific claims, and hurts on ArguAna when it ranks 100 rows: each query there is a whole argument and the document to find is its counterargument, a task unlike answering a question (the BEIR paper measured the same reranking at 0.311). Twenty rows keep BM25's ranking on ArguAna. The int8 model scores within 0.002 of `f32`; the 256-token cut costs 0.008 on SciFact's top 20 and 0.002 on NFCorpus's. The relevance gate keeps the top 20 on SciFact and NFCorpus.
 
-Latency, alone on the cloud container (Intel Xeon @ 2.30 GHz, 4 cores, Linux), the first 50 test queries of each collection (`bm25_ce_latency.json`), ms:
+Latency, alone on the cloud container (Intel Xeon @ 2.80 GHz, AVX-512 VNNI, 4 cores, Linux), the first 50 test queries of each collection (`bm25_ce_latency*.json`), ms:
 
 | p50 / p99 | SciFact | NFCorpus | ArguAna |
 |---|---|---|---|
-| BM25 | 0.07 / 1.19 | 0.04 / 0.65 | 1.10 / 8.32 |
-| top 20 reranked | 997 / 1,320 | 872 / 1,151 | 1,000 / 1,645 |
-| top 100 reranked | 4,789 / 5,866 | 4,512 / 5,380 | 5,225 / 7,269 |
+| BM25 | 0.1 / 1.7 | 0.1 / 0.9 | 1.0 / 6.4 |
+| top 20, `f32` (candle), 512 tokens | 1,397 / 1,863 | 1,324 / 1,689 | 1,551 / 2,291 |
+| top 20, `f32` (candle), 256 tokens | 990 / 1,234 | 905 / 1,191 | 990 / 1,292 |
+| top 20, `f32` (ONNX Runtime), 256 tokens | 563 / 1,091 | 539 / 1,008 | 572 / 1,066 |
+| top 20, int8 (ONNX Runtime), 256 tokens | 427 / 726 | 413 / 654 | 372 / 621 |
+| top 100, `f32` (candle), 512 tokens | 6,852 / 8,461 | 6,448 / 7,805 | 7,966 / 11,595 |
+| top 100, `f32` (candle), 256 tokens | 4,483 / 5,159 | 4,397 / 5,234 | 4,777 / 5,730 |
+| top 100, `f32` (ONNX Runtime), 256 tokens | 2,887 / 4,021 | 2,724 / 3,194 | 2,701 / 3,050 |
+| top 100, int8 (ONNX Runtime), 256 tokens | 1,953 / 2,186 | 1,804 / 2,179 | 1,798 / 2,091 |
+| top 20, `gte-reranker-modernbert-base`, int8, 256 tokens | 2,861 / 3,997 | 2,652 / 3,797 | 2,682 / 3,917 |
 
-About 50 ms a row on four cores. A server's `--max-rerank` defaults to 20 rows, whose p99 is a third of its default 5 s deadline; the top 100's median is about the whole deadline.
+About 50 ms a row in `f32` through candle and 20 ms in int8. Cutting at 256 tokens rather than 512 takes about a third off; ONNX Runtime alone takes about 40% off `f32` (the same scores, from the repository's `onnx/model.onnx`), and int8 a quarter to a third more. A server's `--max-rerank` defaults to 20 rows, whose p99 in `f32` is a quarter of its default 5 s deadline; in int8 the top 100 fits in half of it. `gte-reranker-modernbert-base` (149M parameters, ModernBERT) costs six to seven times as much as the int8 MiniLM; on those 50 queries its top 20 scored nDCG@10 0.791, 0.328 and 0.361 against BM25's 0.796, 0.324 and 0.321 (p = 0.85, 0.82, 0.30), no better than the MiniLM's 0.769, 0.368 and 0.334 there.
+
+### ColBERT reranking
+
+BM25's top rows ranked again by late interaction instead: a multi-vector field embedded from the text when rows are written by `answerai-colbert-small-v1` (ColBERT, 33M parameters, a 96-dimension vector for each token of the text, its punctuation left out, cut at 300 tokens), `tok VECTOR(96)[] OPTIONS(embed = 'body', model = 'answerai-colbert-small-v1')`, and `ORDER BY maxsim(tok, :t)` in a second phase, `:t` the vectors of the query's tokens (padded with masks to 32). Over every test query, with `strata-bm25-eval --variants plain,colbert_rerank<N>` (`--colbert-pool 2` for `pool_factor = 2`), the model run through candle in `f32` (`--features bert`), the field flat and scored with its 8-bit codes; each query's time includes encoding the query. Alone on the cloud container (Intel Xeon @ 2.80 GHz, AVX-512 VNNI, 4 cores, Linux). Results: `strata/results/text/bm25_colbert*.json`.
+
+| nDCG@10 | SciFact | NFCorpus | ArguAna |
+|---|---|---|---|
+| BM25 | 0.691 | 0.329 | 0.362 |
+| top 20, ColBERT | 0.738 (p < 0.001) | 0.354 (p < 0.001) | 0.357 (p = 0.32) |
+| top 100, ColBERT | 0.742 (p < 0.001) | 0.359 (p < 0.001) | 0.336 (p < 0.001) |
+| top 20, ColBERT, `pool_factor = 2` | 0.741 (p < 0.001) | 0.355 (p < 0.001) | |
+| top 100, ColBERT, `pool_factor = 2` | 0.748 (p < 0.001) | 0.359 (p < 0.001) | |
+| top 20, cross-encoder, int8, 256 tokens (above) | 0.684 (p = 0.58) | 0.348 (p = 0.001) | 0.364 (p = 0.78) |
+
+| p50 / p99, ms | SciFact | NFCorpus | ArguAna |
+|---|---|---|---|
+| BM25 | 0.2 / 0.4 | 0.1 / 0.2 | 1.7 / 5.3 |
+| top 20, ColBERT | 79 / 102 | 86 / 112 | 96 / 120 |
+| top 100, ColBERT | 83 / 107 | 96 / 129 | 104 / 133 |
+| top 20, ColBERT, `pool_factor = 2` | 87 / 162 | 92 / 143 | |
+| top 100, ColBERT, `pool_factor = 2` | 89 / 108 | 95 / 118 | |
+
+| what the field costs | SciFact | NFCorpus | ArguAna |
+|---|---|---|---|
+| documents | 5,183 | 3,633 | 8,674 |
+| database, BM25 alone | 6.3 MB | 4.6 MB | 8.1 MB |
+| database with the field | 187 MB | 131 MB | 229 MB |
+| the same, `pool_factor = 2` | 97 MB | 68 MB | |
+| load, embedding included | 788 s | 579 s | 911 s |
+| the same, `pool_factor = 2` | 883 s | 620 s | |
+
+On SciFact and NFCorpus, ColBERT ranks BM25's top 20 better than the cross-encoder does (0.738 against 0.684 and 0.354 against 0.348), in a fifth of the int8 cross-encoder's time (its p50 above, measured on the first 50 queries: 427 and 413 ms). Ranking 100 rows costs only 4 to 10 ms more than 20, so most of a query's time is encoding the query itself, one pass of the model over 32 tokens. On ArguAna, as with the cross-encoder, 100 rows hurt: the document to find is the query's counterargument, and 20 rows keep BM25's ranking (p = 0.32).
+
+The price is paid when rows are written. Embedding every token takes 0.1 to 0.16 s a document on the four cores, and the field makes the database 28 to 30 times BM25's: about 35 KB a document on SciFact and NFCorpus, whose documents mostly reach the 300-token cut, and 25 KB on ArguAna. `pool_factor = 2` (Ward's linkage, as for [multi-vector fields](#multi-vector-fields)) halves the field and scores the same or better here, 0.748 on SciFact's top 100; the clustering adds about a tenth to the load. Its p50 query times, in a separate run, are within 8 ms of the unpooled ones, because encoding the query dominates them.
 
 ## Hybrid ranking
 

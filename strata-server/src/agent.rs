@@ -51,6 +51,7 @@ fn field_line(svc: &Service, f: &strata::Field, i: usize) -> String {
         FieldType::Vector { dim, .. } => format!("VECTOR({dim})"),
         FieldType::Edges => "EDGES".to_string(),
         FieldType::Sparse => "SPARSE (learned term weights)".to_string(),
+        FieldType::Json => "JSON (an object of keys no schema names: filter by paths, attrs.color = 'red', attrs.dims.w > 5, attrs['a.b'])".to_string(),
     };
     let mut notes = Vec::new();
     if svc.first_table().primary_key == Some(i) {

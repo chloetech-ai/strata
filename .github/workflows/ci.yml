@@ -225,6 +225,36 @@ jobs:
         working-directory: strata-server
         run: cargo clippy --profile ci --features audio -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
 
+  # DataFusion as the engine of plans' operators (feature `datafusion`,
+  # strata::query::df): the differential test against Strata's own
+  # operators, the compound-query suites again with DataFusion as the
+  # engine (STRATA_ENGINE=datafusion: a plan it does not lower runs on the
+  # operators), and clippy over the feature's code.
+  datafusion:
+    name: DataFusion engine (feature datafusion)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: CPU model
+        id: cpu
+        run: echo "model=$(grep -e 'model name' -e '^flags' /proc/cpuinfo | sort -u | cksum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: strata
+          key: datafusion-${{ steps.cpu.outputs.model }}
+      - name: Strata
+        working-directory: strata
+        run: |
+          cargo test --profile ci --features datafusion --test datafusion_engine
+          STRATA_ENGINE=datafusion cargo test --profile ci --features datafusion --test compound_queries --test joins_across_tables --test operators --test distinct_on --test per_cap --test one_evaluator --test sql_tables --test correlated --test query_memory --test plan_ir --test json_fields
+          cargo clippy --profile ci --features datafusion --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
   # Power losses, full disks and failing syncs at every write of a storage
   # workload (storage::io, tests/storage_faults.rs). A job of its own: after
   # the strata tests, it took the macOS job past its hour.
@@ -487,7 +517,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [changes, test, kernels, vision, audio, faults, relevance-gate, relevance-gate-cross-encoder, miri, server-smoke, python]
+    needs: [changes, test, kernels, vision, audio, datafusion, faults, relevance-gate, relevance-gate-cross-encoder, miri, server-smoke, python]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -40,6 +40,10 @@ pub trait Estimator {
     fn prefix_count(&self, _field: usize, _prefix: &str, _edits: u8) -> f64 {
         self.n_docs()
     }
+    /// Documents whose JSON field passes `test` at `path` ([`Pred::Path`]).
+    fn path_count(&self, _field: usize, _path: &str, _test: &crate::query::logical::PathTest) -> f64 {
+        self.n_docs()
+    }
     /// Nanoseconds to materialise a prefix, if the index can estimate it
     /// (otherwise its matches' postings).
     fn prefix_cost(&self, _field: usize, _prefix: &str, _edits: u8) -> Option<f64> {
@@ -179,6 +183,11 @@ impl<E: Estimator> Planner<'_, E> {
                 let card = self.est.prefix_count(*field, prefix, *edits).min(n);
                 let cost = self.est.prefix_cost(*field, prefix, *edits).unwrap_or(card * (c.posting + c.emit));
                 PredEstimate { card, mat_cost: c.leaf + cost, probe_cost: c.probe_keyword, probeable: true }
+            }
+            // Terms' lists, as IN and a prefix read them.
+            Pred::Path { field, path, test } => {
+                let card = self.est.path_count(*field, path, test).min(n);
+                PredEstimate { card, mat_cost: c.leaf + card * (c.posting + c.emit), probe_cost: c.probe_keyword, probeable: true }
             }
             Pred::Graph { id } => {
                 // Already computed: materialising is a copy, probing a lookup.

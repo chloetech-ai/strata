@@ -35,9 +35,9 @@ mod store;
 
 pub use blocks::{KeyRange, BLOCK, SUPER};
 pub use keyword::{int_key, int_of_key, key_of, CodeSetFilter, PREFIX_LISTS, FacetStrategy, KeywordColumn, KeywordFilter, KeywordSizes, DEFAULT_RARE};
-pub use numeric::{float_key, ColumnRangeFilter, Histogram, NumericColumn, NumericKind, DEFAULT_BUCKETS, MAX_SCALE};
+pub use numeric::{float_key, ColumnRangeFilter, Histogram, KeySet, KeySetFilter, NumericColumn, NumericKind, DEFAULT_BUCKETS, MAX_SCALE};
 pub use range::{choose_range_strategy, count_keys, count_range, eval_keys, eval_range, range_costs, range_costs_keys, RangeIndex, RangePlan, RangeStrategy};
-pub use store::{DocStore, StoreBuilder, DEFAULT_BLOCK};
+pub use store::{DocStore, StoreBuilder, StoreCache, DEFAULT_BLOCK};
 
 use crate::error::{Error, Result};
 use crate::schema::{Field, FieldType, Schema};
@@ -51,6 +51,8 @@ pub fn field_builder(field: &Field, opts: &BuildOptions) -> Result<Box<dyn Field
         FieldType::Keyword => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
         // Multi-valued INT fields are indexed as keywords (see keyword.rs).
         FieldType::Int if field.multi => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
+        // A JSON field's terms, which crate::json::JsonBuilder gives it.
+        FieldType::Json => Ok(Box::new(keyword::KeywordBuilder::new(field, opts)?)),
         FieldType::Int | FieldType::Float => Ok(Box::new(numeric::NumericBuilder::new(field, opts)?)),
         _ => Err(Error::Schema(format!("field {} has no forward column", field.name))),
     }

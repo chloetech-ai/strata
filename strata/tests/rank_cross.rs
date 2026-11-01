@@ -302,3 +302,145 @@ mod models {
         assert_ne!(now.scores, a.scores, "SQL ranks with the new model");
     }
 }
+
+/// The references a test model's scores are checked against: `name`'s
+/// scores in cross_reference.json (transformers) or, for the names
+/// make_cross_onnx.py writes, in cross_onnx_reference.json (ONNX Runtime in
+/// Python, and transformers with the pairs cut short).
+#[cfg(any(feature = "bert", feature = "onnx"))]
+fn reference(name: &str) -> (Vec<(String, String)>, Vec<f64>) {
+    let read = |f: &str| -> serde_json::Value { serde_json::from_slice(&std::fs::read(models_dir().join(f)).unwrap()).unwrap() };
+    let pairs = read("cross_reference.json")["pairs"].as_array().unwrap().iter().map(|p| (p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string())).collect();
+    let (base, onnx) = (read("cross_reference.json"), read("cross_onnx_reference.json"));
+    let scores = base["scores"].get(name).or_else(|| onnx["scores"].get(name)).unwrap_or_else(|| panic!("no reference {name}"));
+    (pairs, scores.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect())
+}
+
+/// The largest difference, relative to the score or 1, between the scores
+/// of the cross-encoder `name` of `models` and `want`, one pair at a time
+/// and every text of a query in one batch.
+#[cfg(any(feature = "bert", feature = "onnx"))]
+fn differences(models: &Path, name: &str, pairs: &[(String, String)], want: &[f64]) -> (f64, f64) {
+    let m = strata::query::model::Models::default().cross_encoder(models, name).unwrap();
+    let (mut one, mut batched) = (0f64, 0f64);
+    for ((q, t), w) in pairs.iter().zip(want) {
+        let alone = m.score(q, &[t.as_str()], &mut || Ok(())).unwrap()[0];
+        let texts: Vec<&str> = pairs.iter().filter(|p| p.0 == *q).map(|p| p.1.as_str()).collect();
+        let all = m.score(q, &texts, &mut || Ok(())).unwrap();
+        let together = all[texts.iter().position(|x| *x == t.as_str()).unwrap()];
+        one = one.max((alone - w).abs() / w.abs().max(1.0));
+        batched = batched.max((together - w).abs() / w.abs().max(1.0));
+    }
+    (one, batched)
+}
+
+/// A copy of model `from` of tests/models as `<dir>/models/ce`, with
+/// `options` as its cross_encoder.json if given.
+#[cfg(any(feature = "bert", feature = "onnx"))]
+fn copy_model(dir: &Path, from: &str, options: Option<&str>) -> PathBuf {
+    let models = dir.join("models");
+    std::fs::create_dir_all(models.join("ce")).unwrap();
+    for f in std::fs::read_dir(models_dir().join(from)).unwrap() {
+        let f = f.unwrap().path();
+        std::fs::copy(&f, models.join("ce").join(f.file_name().unwrap())).unwrap();
+    }
+    if let Some(o) = options {
+        std::fs::write(models.join("ce").join(strata::query::cross_encoder::OPTIONS), o).unwrap();
+    }
+    models
+}
+
+/// The pairs are cut to the tokens a model's options say.
+#[cfg(feature = "bert")]
+#[test]
+fn a_models_options_cut_its_pairs_shorter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pairs, want) = reference("ce_bert@16");
+    let models = copy_model(dir.path(), "ce_bert", Some(r#"{"max_tokens": 16}"#));
+    let (one, batched) = differences(&models, "ce", &pairs, &want);
+    assert!(one <= 1e-5 && batched <= 1e-5, "{one} {batched}");
+    // Another cut is another model.
+    let m = strata::query::model::Models::default();
+    let short = m.cross_encoder(&models, "ce").unwrap().hash.clone();
+    std::fs::write(models.join("ce").join(strata::query::cross_encoder::OPTIONS), r#"{"max_tokens": 32}"#).unwrap();
+    assert_ne!(m.cross_encoder(&models, "ce").unwrap().hash, short);
+    for (bad, says) in [(r#"{"max_tokens": 2}"#, "from 8"), (r#"{"max_len": 16}"#, "unknown key \"max_len\""), ("[16]", "not an object")] {
+        std::fs::write(models.join("ce").join(strata::query::cross_encoder::OPTIONS), bad).unwrap();
+        let e = m.cross_encoder(&models, "ce").err().expect("refused").to_string();
+        assert!(e.contains(says), "{bad}: {e}");
+    }
+}
+
+/// Models exported to ONNX score as transformers does, and an int8 one as
+/// ONNX Runtime in Python does (tests/models/make_cross_onnx.py).
+#[cfg(feature = "onnx")]
+mod onnx_models {
+    use super::*;
+
+    #[test]
+    fn exports_score_as_transformers_does() {
+        for (name, base) in [("ce_bert_onnx", "ce_bert"), ("ce_xlmr_onnx", "ce_xlmr")] {
+            let (pairs, want) = reference(base);
+            let (one, batched) = differences(&models_dir(), name, &pairs, &want);
+            eprintln!("{name}: largest difference from transformers {one:e} alone, {batched:e} in batches");
+            assert!(one <= 1e-5 && batched <= 1e-5, "{name}: {one} {batched}");
+            // As candle does, from the same weights.
+            let m = strata::query::model::Models::default().cross_encoder(&models_dir(), name).unwrap();
+            assert_eq!(m.hash.len(), 16);
+        }
+    }
+
+    #[test]
+    fn an_int8_model_scores_as_onnx_runtime_does() {
+        let (pairs, want) = reference("ce_bert_int8");
+        let (one, batched) = differences(&models_dir(), "ce_bert_int8", &pairs, &want);
+        eprintln!("ce_bert_int8: largest difference from ONNX Runtime in Python {one:e} alone, {batched:e} in batches");
+        // A batch's activations are quantized together, so a pair's score
+        // moves a little with the pairs it runs with.
+        assert!(one <= 1e-3 && batched <= 0.05, "{one} {batched}");
+        // And near the model it was quantized from.
+        let (pairs, want) = reference("ce_bert");
+        let (one, _) = differences(&models_dir(), "ce_bert_int8", &pairs, &want);
+        assert!(one <= 0.1, "{one}");
+    }
+
+    #[test]
+    fn an_exports_options_cut_its_pairs_shorter() {
+        let dir = tempfile::tempdir().unwrap();
+        for (from, base) in [("ce_bert_onnx", "ce_bert@16"), ("ce_xlmr_onnx", "ce_xlmr@16")] {
+            let (pairs, want) = reference(base);
+            let models = copy_model(dir.path(), from, Some(r#"{"max_tokens": 16}"#));
+            let (one, batched) = differences(&models, "ce", &pairs, &want);
+            assert!(one <= 1e-5 && batched <= 1e-5, "{from}: {one} {batched}");
+        }
+    }
+
+    #[test]
+    fn an_onnx_model_reranks_in_a_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = docs();
+        let db = create(&dir.path().join("db.strata"), &models_dir(), &docs);
+        let params = Params::new().set("t", Value::Str(words(&docs, 9)));
+        let sql = |m: &str| format!("WITH top AS (SELECT * FROM docs ORDER BY bm25(body, :t) DESC LIMIT 40) SELECT id, title, text FROM top ORDER BY cross_encoder('{m}', title, text, :t) DESC LIMIT 10");
+        let got = query(&db, &sql("ce_bert_onnx"), &params);
+        // Each row's score is the model's of its text alone.
+        let m = strata::query::model::Models::default().cross_encoder(&models_dir(), "ce_bert_onnx").unwrap();
+        let t = words(&docs, 9);
+        for (r, s) in got.rows.iter().zip(&got.scores) {
+            let text = [&r[1], &r[2]].iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+            let alone = m.score(&t, &[text.as_str()], &mut || Ok(())).unwrap()[0];
+            assert!((alone - s).abs() <= 1e-5, "{alone} {s}");
+        }
+        assert!(got.scores.windows(2).all(|w| w[0] >= w[1]));
+        assert!(got.stats.plan.join("\n").contains("rerank 40 rows by cross_encoder('ce_bert_onnx', title, text)"));
+    }
+}
+
+/// Without ONNX Runtime, a model.onnx is refused, saying which feature
+/// runs it.
+#[cfg(not(feature = "onnx"))]
+#[test]
+fn an_onnx_model_needs_the_onnx_feature() {
+    let e = strata::query::model::Models::default().cross_encoder(&models_dir(), "ce_bert_int8").err().expect("refused").to_string();
+    assert!(e.contains("build Strata with the `onnx` feature"), "{e}");
+}

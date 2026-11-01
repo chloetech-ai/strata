@@ -101,6 +101,37 @@ pub fn sign(r: &Request, key_id: &str, secret: &str, token: Option<&str>, region
     out
 }
 
+/// A presigned GET of `path` on `host`: the query string, `params` and
+/// the signature's own (`X-Amz-*`, the signature last), signing `headers`
+/// beside `host`, valid `expires` seconds from `amz_date`. EKS takes one of
+/// STS's `GetCallerIdentity` as a token ([`super::Aws::eks_token`]).
+#[allow(clippy::too_many_arguments)]
+pub fn presign(host: &str, path: &str, params: &[(&str, String)], headers: &[(&str, &str)], key_id: &str, secret: &str, token: Option<&str>, region: &str, service: &str, amz_date: &str, expires: u32) -> String {
+    let day = &amz_date[..8];
+    let scope = format!("{day}/{region}/{service}/aws4_request");
+    let mut h: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string())).collect();
+    h.push(("host".into(), host.into()));
+    h.sort();
+    let signed = h.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let mut p: Vec<(&str, String)> = params.to_vec();
+    p.extend([
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", format!("{key_id}/{scope}")),
+        ("X-Amz-Date", amz_date.to_string()),
+        ("X-Amz-Expires", expires.to_string()),
+        ("X-Amz-SignedHeaders", signed.clone()),
+    ]);
+    if let Some(t) = token {
+        p.push(("X-Amz-Security-Token", t.to_string()));
+    }
+    let q = query(&p);
+    let canonical_headers: String = h.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let creq = format!("GET\n{path}\n{q}\n{canonical_headers}\n{signed}\n{}", sha256_hex(b""));
+    let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(creq.as_bytes()));
+    let sig = hex(&hmac(&signing_key(secret, day, region, service), to_sign.as_bytes()));
+    format!("{q}&X-Amz-Signature={sig}")
+}
+
 /// `YYYYMMDDTHHMMSSZ` of a time in milliseconds since 1970 (UTC).
 pub fn amz_date(ms: u64) -> String {
     let secs = ms / 1000;
@@ -158,6 +189,22 @@ mod tests {
         let h = sign(&get(""), KEY, SECRET, Some(token), "us-east-1", "service", DATE);
         assert!(h.iter().any(|(k, v)| k == "x-amz-security-token" && v == token));
         assert!(h[2].1.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date;x-amz-security-token, "), "{h:?}");
+    }
+
+    #[test]
+    fn presigned_urls_are_the_ones_botocore_makes() {
+        // `aws eks get-token`'s URL for the cluster strata-search, made by
+        // botocore 1.43 with the test suite's keys, with and without a
+        // session token: the same signature.
+        let sign = |token: Option<&str>| {
+            let q = presign("sts.us-east-1.amazonaws.com", "/", &[("Action", "GetCallerIdentity".into()), ("Version", "2011-06-15".into())], &[("x-k8s-aws-id", "strata-search")], "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", token, "us-east-1", "sts", "20261101T054937Z", 60);
+            q.rsplit_once("X-Amz-Signature=").map(|(_, s)| s.to_string()).unwrap()
+        };
+        assert_eq!(sign(None), "61ba6f3c68defa101f4905e350dcbb7f0bf7d64a1516298eb93538fbcc64ef76");
+        assert_eq!(sign(Some("SESSION-TOKEN/with+chars=")), "fdfe962eaf2946abef5c989f9b4df71d53d0611eec2ac318a8f6dfe14e6131c0");
+        let q = presign("sts.us-east-1.amazonaws.com", "/", &[("Action", "GetCallerIdentity".into())], &[("x-k8s-aws-id", "c")], "AKIDEXAMPLE", "s", Some("t/+="), "us-east-1", "sts", "20261101T054937Z", 60);
+        assert!(q.starts_with("Action=GetCallerIdentity&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20261101%2Fus-east-1%2Fsts%2Faws4_request&"), "{q}");
+        assert!(q.contains("&X-Amz-Security-Token=t%2F%2B%3D&X-Amz-SignedHeaders=host%3Bx-k8s-aws-id&X-Amz-Signature="), "{q}");
     }
 
     #[test]

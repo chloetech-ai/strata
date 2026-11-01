@@ -64,9 +64,9 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 22] = [
+pub const FEATURES: [&str; 23] = [
     OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE,
-    SCORE_NORMS,
+    SCORE_NORMS, JSON,
 ];
 
 /// The feature of a plan with operators over rows in memory: a join,
@@ -164,6 +164,11 @@ pub const PER_CAP: &str = "per_cap";
 /// The feature of a plan that turns a history into a vector with a
 /// sequence model ([`Expr::Encode`]).
 pub const ENCODE: &str = "encode";
+
+/// The feature of a plan that reads a path of a JSON field
+/// ([`Func::JsonExtract`]): to filter by it, which a Search reads from the
+/// field's terms ([`crate::json`]), or as a value of rows.
+pub const JSON: &str = "json";
 
 /// A statement as a tree of operators ([module docs](self)).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -503,6 +508,13 @@ pub enum Func {
     /// How many of its arguments, conditions, are TRUE (UNKNOWN counts
     /// as not); needs [`AT_LEAST`].
     CountTrue,
+    /// The value at path `args[1]` (text, as [`crate::json::parse_path`]
+    /// spells it) of a JSON field's object `args[0]`
+    /// ([`crate::json::extract`]); with `args[2]`, a type (`'string'`,
+    /// `'number'`, `'bool'`), only values of that type, which is what a
+    /// comparison with a value of the type reads. A Search's filter on it
+    /// reads the field's terms. Needs [`JSON`].
+    JsonExtract,
 }
 
 impl Func {
@@ -527,6 +539,7 @@ impl Func {
             Func::Dot => "dot",
             Func::SidAt => "sid_at",
             Func::CountTrue => "count_true",
+            Func::JsonExtract => "json_extract",
         }
     }
 
@@ -558,6 +571,7 @@ impl Func {
             Func::Pow | Func::Dot | Func::SidAt => n == 2,
             Func::Clamp => n == 3,
             Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue => n >= 1,
+            Func::JsonExtract => n == 2 || n == 3,
         };
         match (ok, self) {
             (true, _) => Ok(()),
@@ -566,6 +580,7 @@ impl Func {
             (_, Func::SidAt) => Err("two arguments: a semantic ID and a number of levels"),
             (_, Func::Clamp) => Err("three arguments: a value, its least and its greatest"),
             (_, Func::Coalesce | Func::Least | Func::Greatest | Func::CountTrue) => Err("at least one argument"),
+            (_, Func::JsonExtract) => Err("two or three arguments: a JSON field, a path, and a type"),
             _ => Err("one argument"),
         }
     }
@@ -583,7 +598,7 @@ impl Func {
         }
         let x = args.first().copied().unwrap_or(f64::NAN);
         let r = match self {
-            Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt => f64::NAN,
+            Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt | Func::JsonExtract => f64::NAN,
             Func::Abs => x.abs(),
             Func::Round => {
                 let d = args.get(1).map_or(0.0, |d| d.clamp(-30.0, 30.0).trunc());
@@ -1697,10 +1712,16 @@ impl Plan {
         if root.ranks_by_expression() {
             features.push(RANK_EXPRESSIONS.to_string());
         }
-        let mut sid_at = false;
-        root.visit_exprs(&mut |e| sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. }));
+        let (mut sid_at, mut json) = (false, false);
+        root.visit_exprs(&mut |e| {
+            sid_at |= matches!(e, Expr::Call { func: Func::SidAt, .. });
+            json |= matches!(e, Expr::Call { func: Func::JsonExtract, .. });
+        });
         if sid_at {
             features.push(SEMANTIC_ID.to_string());
+        }
+        if json {
+            features.push(JSON.to_string());
         }
         if root.has_phases() {
             features.push(RANK_PHASES.to_string());

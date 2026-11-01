@@ -287,13 +287,13 @@ fn infos(db: &Db, ids: &[u64]) -> Vec<SegmentInfo> {
         .segments
         .iter()
         .filter(|s| ids.contains(&s.id))
-        .map(|s| SegmentInfo { id: s.id, n_docs: s.n_docs, n_live: s.n_docs - s.n_deleted, bytes: s.bytes })
+        .map(|s| SegmentInfo { id: s.id, n_docs: s.n_docs, n_live: s.n_docs - s.n_deleted, bytes: s.bytes, spilled: 0 })
         .collect()
 }
 
 /// The merge memory the database estimates for segments `ids`.
 fn estimate(db: &Db, ids: &[u64]) -> u64 {
-    merge_memory(&infos(db, ids), build_threads(&options(Layout::SingleFile).build).unwrap())
+    merge_memory(&infos(db, ids), build_threads(&options(Layout::SingleFile).build).unwrap(), options(Layout::SingleFile).merge_spill_bytes)
 }
 
 #[test]

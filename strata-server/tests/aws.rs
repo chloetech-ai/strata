@@ -1,4 +1,4 @@
-//! The AWS view's routes against a stand-in for AWS: credentials checked
+//! The cloud view's AWS routes against a stand-in for AWS: credentials checked
 //! with STS and kept readable by their owner only, the secret in no answer
 //! and no audit entry, machines with their prices and quotas, a plan and
 //! CloudFormation's check of its template, and only an administrator

@@ -85,7 +85,10 @@ fn parse(sql_text: &str) -> Result<Box<sql::Query>> {
 /// Whether `sql` needs this layer; anything else binds as one SELECT.
 pub fn is_compound(sql_text: &str, schema: &Schema) -> bool {
     match super::parse::parse(sql_text) {
-        Ok(stmts) => matches!(stmts.as_slice(), [sql::Statement::Query(q)] if needs(q, schema)),
+        Ok(mut stmts) => match stmts.as_mut_slice() {
+            [sql::Statement::Query(q)] => json_paths(q, &[schema]).is_ok() && needs(q, schema),
+            _ => false,
+        },
         Err(_) => false,
     }
 }
@@ -100,7 +103,7 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         return true;
     }
     let sql::SetExpr::Select(s) = q.body.as_ref() else { return true };
-    if s.from.len() != 1 || !s.from[0].joins.is_empty() || s.distinct.is_some() || per_capped(q) || computes_columns(q, s) {
+    if s.from.len() != 1 || !s.from[0].joins.is_empty() || s.distinct.is_some() || per_capped(q) || computes_columns(q, s) || reads_paths(q, s) {
         return true;
     }
     match &s.from[0].relation {
@@ -134,6 +137,124 @@ pub(crate) fn needs(q: &sql::Query, schema: &Schema) -> bool {
         }
     }
     found
+}
+
+/// Whether a SELECT reads a JSON field's path ([`json_paths`]) outside its
+/// WHERE (a column, an order, a group, `HAVING`): the row evaluator reads
+/// it from the rows' objects, where WHERE's conditions on paths are the
+/// scan's, read from the field's terms.
+fn reads_paths(q: &sql::Query, s: &sql::Select) -> bool {
+    let mut found = false;
+    let mut check = |e: &Expr| walk(e, &mut |x| found |= matches!(x, Expr::Function(f) if fname(f) == "json_extract"));
+    for e in distinct_on(s) {
+        check(e);
+    }
+    for item in &s.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            check(e);
+        }
+    }
+    s.having.iter().for_each(&mut check);
+    if let sql::GroupByExpr::Expressions(es, _) = &s.group_by {
+        es.iter().for_each(&mut check);
+    }
+    if let Some(sql::OrderBy { kind: sql::OrderByKind::Expressions(es), .. }) = &q.order_by {
+        es.iter().for_each(|o| check(&o.expr));
+    }
+    found
+}
+
+/// `q` with each path of a JSON field of the tables it reads (`attrs.color`,
+/// `a.attrs.dims.w`, `attrs['any key']`; [`super::sql::path_ref`]) written
+/// as the call it stands for, `json_extract(attrs, 'color')`
+/// ([`ir::Func::JsonExtract`]): the binder reads a condition on one from
+/// the field's terms, and the row evaluator reads one from the rows'
+/// objects. Queries of tables without a JSON field are left as they are.
+pub(crate) fn json_paths(q: &mut sql::Query, catalog: &[&Schema]) -> Result<()> {
+    let tables = super::tables::read_by(q);
+    let schemas: Vec<&Schema> = catalog.iter().copied().filter(|s| tables.iter().any(|t| t.eq_ignore_ascii_case(&s.table)) && s.fields.iter().any(|f| f.ty == FieldType::Json)).collect();
+    if schemas.is_empty() {
+        return Ok(());
+    }
+    // A path the answer has as a column is named as the query wrote it
+    // (`attrs.color`), not by the call it becomes.
+    if let sql::SetExpr::Select(s) = q.body.as_mut() {
+        for item in s.projection.iter_mut() {
+            let SelectItem::UnnamedExpr(e) = item else { continue };
+            if schemas.iter().any(|s| matches!(super::sql::path_column(s, e), Ok(Some(_)))) {
+                let alias = sql::Ident::with_quote('"', e.to_string());
+                *item = SelectItem::ExprWithAlias { expr: e.clone(), alias };
+            }
+        }
+    }
+    let mut failed = None;
+    let mut rewrite = |e: &mut Expr| {
+        if matches!(e, Expr::Function(_)) || failed.is_some() {
+            return;
+        }
+        for s in &schemas {
+            match super::sql::path_column(s, e) {
+                Ok(Some((_, path, column))) => {
+                    let mut call = match parse(&format!("SELECT json_extract(x, {})", sql::Value::SingleQuotedString(path)))
+                        .ok()
+                        .and_then(|q| match *q.body {
+                            sql::SetExpr::Select(s) => s.projection.into_iter().next(),
+                            _ => None,
+                        }) {
+                        Some(SelectItem::UnnamedExpr(c)) => c,
+                        _ => unreachable!("a call"),
+                    };
+                    if let Expr::Function(f) = &mut call {
+                        if let Some(a) = func_args_mut(f).into_iter().next() {
+                            *a = column;
+                        }
+                    }
+                    *e = call;
+                    return;
+                }
+                Ok(None) => {}
+                Err(x) => {
+                    failed = Some(x);
+                    return;
+                }
+            }
+        }
+    };
+    query_mut(q, &mut rewrite);
+    joins_mut(q, &mut rewrite);
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Calls `f` on the `ON` conditions of `q`'s joins, and of its `WITH`
+/// queries', derived tables' and subqueries' ([`query_mut`] reaches the
+/// rest).
+fn joins_mut(q: &mut sql::Query, f: &mut dyn FnMut(&mut Expr)) {
+    if let Some(w) = &mut q.with {
+        for cte in &mut w.cte_tables {
+            joins_mut(&mut cte.query, f);
+        }
+    }
+    let sql::SetExpr::Select(s) = q.body.as_mut() else { return };
+    for t in &mut s.from {
+        if let TableFactor::Derived { subquery, .. } = &mut t.relation {
+            joins_mut(subquery, f);
+        }
+        for j in &mut t.joins {
+            if let TableFactor::Derived { subquery, .. } = &mut j.relation {
+                joins_mut(subquery, f);
+            }
+            match &mut j.join_operator {
+                sql::JoinOperator::Join(sql::JoinConstraint::On(on))
+                | sql::JoinOperator::Inner(sql::JoinConstraint::On(on))
+                | sql::JoinOperator::Left(sql::JoinConstraint::On(on))
+                | sql::JoinOperator::LeftOuter(sql::JoinConstraint::On(on)) => walk_mut(on, f),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Whether `e` (outside subqueries) computes a value of rows that a scan
@@ -274,7 +395,7 @@ pub(crate) fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
-fn func_args(f: &sql::Function) -> Vec<&Expr> {
+pub(crate) fn func_args(f: &sql::Function) -> Vec<&Expr> {
     let FunctionArguments::List(list) = &f.args else { return Vec::new() };
     list.args
         .iter()
@@ -330,6 +451,15 @@ pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params, profiles:
 
 /// [`plan_read`] of a parsed query.
 pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Params, profiles: Profiles) -> Result<ir::Plan> {
+    let mut rewritten;
+    let q = match catalog.iter().any(|s| s.fields.iter().any(|f| f.ty == FieldType::Json)) {
+        true => {
+            rewritten = q.clone();
+            json_paths(&mut rewritten, catalog)?;
+            &rewritten
+        }
+        false => q,
+    };
     if let Some((q, r)) = super::profile::expand(q, profiles)? {
         let table = super::tables::read_by(&q).first().cloned().unwrap_or_default();
         return Ok(super::profile::mark(plan_read_query(&q, catalog, params, &|_, _| None)?, &table, &r));
@@ -346,8 +476,10 @@ pub(crate) fn plan_read_query(q: &sql::Query, catalog: &[&Schema], params: &Para
 
 /// [`plan_in`] of a parsed query.
 pub(crate) fn plan_query(q: &sql::Query, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
+    let mut q = q.clone();
+    json_paths(&mut q, catalog)?;
     let p = Planner { catalog, params, ctes: RefCell::new(Vec::new()), outer: RefCell::new(None) };
-    Ok(ir::Plan::new(p.query(q)?.node))
+    Ok(ir::Plan::new(p.query(&q)?.node))
 }
 
 /// Runs a compound SELECT: its [`plan`], each leaf run by `runner`.
@@ -749,7 +881,7 @@ impl<'a> Planner<'a> {
             _ if per_capped(&q) => return self.join(&q, &s),
             // Columns computed from the rows' values, and an order by
             // text, by the row evaluator.
-            _ if computes_columns(&q, &s) || orders_by_text(&q, &s, schema) => return self.join(&q, &s),
+            _ if computes_columns(&q, &s) || orders_by_text(&q, &s, schema) || reads_paths(&q, &s) => return self.join(&q, &s),
             Some(sql::Distinct::Distinct) => distinct_to_group(&mut s)?,
             None => {}
         }
@@ -1735,6 +1867,24 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         }))
     };
     let not_if = |negated: bool, x: ir::Expr| if negated { ir::Expr::Not(Box::new(x)) } else { x };
+    // A JSON path compared with a value reads the values of the value's
+    // type only, as the field's terms do (`attrs.price > 5` sees numbers).
+    let kind_of = |x: &Expr| -> Option<crate::json::Kind> {
+        match go(x) {
+            Ok(ir::Expr::Lit(v)) => crate::json::Kind::of(&v),
+            _ => None,
+        }
+    };
+    let typed = |x: &Expr, kind: Option<crate::json::Kind>| -> Result<Box<ir::Expr>> {
+        match (x, kind) {
+            (Expr::Function(f), Some(k)) if fname(f) == "json_extract" && func_args(f).len() == 2 => {
+                let mut args: Vec<ir::Expr> = func_args(f).into_iter().map(go).collect::<Result<_>>()?;
+                args.push(ir::Expr::Lit(Value::Str(k.name().to_string())));
+                Ok(Box::new(ir::Expr::Call { func: Func::JsonExtract, args }))
+            }
+            (x, _) => listy(x),
+        }
+    };
     let sub = |q: &sql::Query, kind: Sub| match subs {
         Some(subs) => subs(q, kind),
         None => Err(err(format!("a subquery is not supported here: {e}"))),
@@ -1749,6 +1899,12 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         },
         Expr::IsNull(x) => ir::Expr::IsNull(bx(x)?),
         Expr::IsNotNull(x) => ir::Expr::Not(Box::new(ir::Expr::IsNull(bx(x)?))),
+        // `attrs.in_stock IS TRUE`: its booleans, as over the table.
+        Expr::IsTrue(x) | Expr::IsFalse(x) if matches!(x.as_ref(), Expr::Function(f) if fname(f) == "json_extract") => ir::Expr::Cmp {
+            op: CmpOp::Eq,
+            left: typed(x, Some(crate::json::Kind::Bool))?,
+            right: Box::new(ir::Expr::Lit(Value::Bool(matches!(e, Expr::IsTrue(_))))),
+        },
         Expr::BinaryOp { left, op, right } => {
             use BinaryOperator as B;
             let cmp = match op {
@@ -1761,7 +1917,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 _ => None,
             };
             if let Some(op) = cmp {
-                let (l, r) = (listy(left)?, listy(right)?);
+                let (l, r) = (typed(left, kind_of(right))?, typed(right, kind_of(left))?);
                 // A comparison of a multi-valued column holds when some value
                 // matches, and `!=` when none does, as over one table: `tags
                 // != 'red'` holds without tags, and not for ['red', 'blue'].
@@ -1788,8 +1944,26 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 (o, _) => return Err(err(format!("unsupported operator {o}"))),
             }
         }
-        Expr::Between { expr, negated, low, high } => not_if(*negated, ir::Expr::Between { expr: listy(expr)?, lo: Some(bx(low)?), hi: Some(bx(high)?) }),
-        Expr::InList { expr, list, negated } => not_if(*negated, ir::Expr::In { expr: listy(expr)?, list: list.iter().map(go).collect::<Result<_>>()? }),
+        Expr::Between { expr, negated, low, high } => not_if(*negated, ir::Expr::Between { expr: typed(expr, kind_of(low).or(kind_of(high)))?, lo: Some(bx(low)?), hi: Some(bx(high)?) }),
+        Expr::InList { expr, list, negated } => {
+            // Values of one type at a time: `attrs.k IN ('a', 1)` reads the
+            // path's strings for 'a' and its numbers for 1.
+            let kinds: Vec<Option<crate::json::Kind>> = list.iter().map(kind_of).collect();
+            let mut distinct: Vec<Option<crate::json::Kind>> = kinds.clone();
+            distinct.sort();
+            distinct.dedup();
+            let path = matches!(expr.as_ref(), Expr::Function(f) if fname(f) == "json_extract");
+            let x = match distinct.as_slice() {
+                [k] => ir::Expr::In { expr: typed(expr, *k)?, list: list.iter().map(go).collect::<Result<_>>()? },
+                ks if path && ks.iter().all(Option::is_some) => ir::Expr::Or(
+                    ks.iter()
+                        .map(|k| Ok(ir::Expr::In { expr: typed(expr, *k)?, list: list.iter().zip(&kinds).filter(|(_, x)| *x == k).map(|(v, _)| go(v)).collect::<Result<_>>()? }))
+                        .collect::<Result<_>>()?,
+                ),
+                _ => ir::Expr::In { expr: listy(expr)?, list: list.iter().map(go).collect::<Result<_>>()? },
+            };
+            not_if(*negated, x)
+        }
         Expr::InSubquery { expr, subquery, negated } => not_if(*negated, ir::Expr::In { expr: listy(expr)?, list: vec![sub(subquery, Sub::In)?] }),
         Expr::Exists { subquery, negated } => not_if(*negated, sub(subquery, Sub::Exists)?),
         Expr::Subquery(q) => sub(q, Sub::Scalar)?,
@@ -1797,7 +1971,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
             if *any || escape_char.is_some() {
                 return Err(err(format!("unsupported expression: {e}")));
             }
-            not_if(*negated, ir::Expr::Like { expr: listy(expr)?, pattern: bx(pattern)?, case_insensitive: matches!(e, Expr::ILike { .. }) })
+            not_if(*negated, ir::Expr::Like { expr: typed(expr, Some(crate::json::Kind::Str))?, pattern: bx(pattern)?, case_insensitive: matches!(e, Expr::ILike { .. }) })
         }
         Expr::Case { operand, conditions, else_result, .. } => ir::Expr::Case {
             operand: operand.as_deref().map(bx).transpose()?,
@@ -1807,7 +1981,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         Expr::Function(_) if outer_field(e).is_some() => ir::Expr::Outer(outer_field(e).expect("a field")),
         Expr::Function(f) if fname(f) == "prefix" => {
             let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
-            ir::Expr::Prefix { expr: listy(x)?, prefix: bx(p)?, edits: 0 }
+            ir::Expr::Prefix { expr: typed(x, Some(crate::json::Kind::Str))?, prefix: bx(p)?, edits: 0 }
         }
         Expr::Function(f) if fname(f) == "at_least" => {
             let usage = "AT_LEAST(n, condition, ...): n a count (2) or a percentage ('75%') of the conditions";
@@ -1844,6 +2018,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                 "dot" => Func::Dot,
                 "sid_at" => Func::SidAt,
                 "count_true" => Func::CountTrue,
+                "json_extract" => Func::JsonExtract,
                 n if Func::numeric(n).is_some() => Func::numeric(n).expect("a numeric function"),
                 n if NATIVE.contains(&n) => {
                     return Err(err(format!("{}(...) works on one table's scan, in its WHERE or ORDER BY (in a join, on that table's column: a.body), not on values of rows", n.to_uppercase())))

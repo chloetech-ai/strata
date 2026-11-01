@@ -72,7 +72,7 @@ async fn the_command_center_is_served_with_every_module_it_imports() {
     // Each served file is used, and each view is among them.
     let served: BTreeSet<String> = ui::FILES.iter().map(|(p, ..)| p.to_string()).filter(|p| p.ends_with(".js")).collect();
     assert_eq!(seen, served, "the modules main.js reaches, and those the server serves");
-    for v in ["overview", "topology", "fleet", "querypath", "control", "rollout", "aws", "cluster", "performance", "alerts", "queries", "logs", "sql", "builder", "schema", "import", "relevance", "recsys", "sid", "autocomplete", "media", "graph", "access", "system"] {
+    for v in ["overview", "topology", "fleet", "querypath", "control", "rollout", "autoscale", "cloud", "cluster", "performance", "alerts", "queries", "logs", "sql", "builder", "schema", "import", "relevance", "recsys", "sid", "autocomplete", "media", "graph", "access", "system"] {
         assert!(seen.contains(&format!("views/{v}.js")), "{v}");
     }
 

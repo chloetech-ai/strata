@@ -91,6 +91,9 @@ pub fn field_value(field: &Field, key: bool, j: &Json) -> Result<Value> {
         (FieldType::Keyword, Json::Number(n)) if key => Value::Str(n.to_string()),
         (FieldType::Text { .. } | FieldType::Keyword | FieldType::Edges, Json::String(s)) => Value::Str(s.clone()),
         (FieldType::Edges, Json::Array(_)) => Value::Str(j.to_string()),
+        // An object, or JSON text of one.
+        (FieldType::Json, Json::String(s)) => crate::json::canonical(Value::Str(s.clone()), &field.name)?,
+        (FieldType::Json, j) => crate::json::canonical_json(j, &field.name)?,
         (FieldType::Sparse, Json::Object(_) | Json::String(_)) => {
             let v = match j {
                 Json::String(s) => Value::Str(s.clone()),
@@ -180,7 +183,7 @@ pub fn cell(schema: &Schema, f: usize, s: &str) -> Result<Value> {
         FieldType::Int => Value::Int(t.parse().map_err(|_| bad())?),
         FieldType::Float => Value::Float(t.parse().map_err(|_| bad())?),
         FieldType::Vector { .. } => value(schema, f, &json(t)?)?,
-        FieldType::Sparse => value(schema, f, &json(t)?)?,
+        FieldType::Sparse | FieldType::Json => value(schema, f, &json(t)?)?,
         FieldType::Edges if t.starts_with('[') => value(schema, f, &json(t)?)?,
         FieldType::Edges => Value::Str(Json::Array(t.split('|').map(|x| Json::String(x.trim().to_string())).collect()).to_string()),
         FieldType::Text { .. } | FieldType::Keyword => Value::Str(s.to_string()),

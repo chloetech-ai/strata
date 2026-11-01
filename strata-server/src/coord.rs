@@ -76,6 +76,7 @@ use serde_json::{json, Value as Json};
 use strata::db::Source;
 use strata::query::agg::Part;
 use strata::query::exec::ResultSet;
+use strata::query::paths::{Call, Paths};
 use strata::query::ir::Plan;
 use strata::query::stats::TermStats;
 use strata::query::steps::{self, Step};
@@ -1187,6 +1188,38 @@ impl Coordinator {
             }
         }
         Ok(sums.into_iter().map(|m| m.into_values().collect()).collect())
+    }
+
+    /// The paths listing `call` asks for ([`strata::query::paths`]) over
+    /// every shard, summed ([`Paths::merge`]). It travels as the SQL that
+    /// asks for it, which each shard answers from its own rows: no plan
+    /// and no call of its own, so any shard that lists paths answers it.
+    pub async fn json_paths(&self, call: &Call, params: &Params, after: &After, deadline: Instant) -> Result<Paths, ApiError> {
+        self.routed(|| self.json_paths_once(call, params, after, deadline)).await
+    }
+
+    async fn json_paths_once(&self, call: &Call, params: &Params, after: &After, deadline: Instant) -> Result<Paths, ApiError> {
+        let t = &self.topo();
+        let start = self.turn.fetch_add(1, Ordering::Relaxed);
+        let after = &self.after(t, after)?;
+        let (sql, params) = (&call.sql(), &params_to_pb(params));
+        let calls = (0..t.replicas.len()).map(|i| async move {
+            self.call(t, i, start, None, deadline, |r, mut c| async move {
+                let p = self.speak(t, i, r, &mut c, PROTOCOL).await?;
+                let min_seq_no = after.get(i).copied().unwrap_or(0);
+                self.reads_after(t, i, r, min_seq_no)?;
+                let epoch = if p >= 4 { t.epoch() } else { 0 };
+                c.query(pb::QueryRequest { sql: sql.clone(), params: params.clone(), protocol: p, epoch, min_seq_no, timeout_ms: ms_left(deadline), ..Default::default() }).await
+            })
+            .await
+        });
+        let mut parts = Vec::new();
+        for (i, a) in join_all(calls).await.into_iter().enumerate() {
+            let (_, a) = a?;
+            let rs = result_from_pb(a)?;
+            parts.push(Paths::from_result(&rs).map_err(|e| ApiError::internal(format!("shard {}'s paths listing: {e}", t.shards[i])))?);
+        }
+        Ok(Paths::merge(parts))
     }
 
     /// Runs `select`, a query of table `schema`, on every shard and merges

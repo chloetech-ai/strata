@@ -10,14 +10,8 @@ use serde_json::{json, Value as Json};
 
 use super::catalog::Machine;
 use super::Catalog;
-use crate::operator::Spec;
-
-/// The image the cluster runs when the plan names none.
-pub const IMAGE: &str = "ghcr.io/chloetech-ai/strata-server:latest";
-
-/// The operator's manifests (its namespace, account, role and
-/// Deployment), whose image the plan's replaces.
-const OPERATOR_YAML: &str = include_str!("../../deploy/k8s/operator/operator.yaml");
+use crate::cloud::{check_name, cluster_objects, cluster_yaml, fit, operator_yaml, Node};
+pub use crate::cloud::IMAGE;
 
 /// Hours in a month, as AWS prices them.
 pub const HOURS_A_MONTH: f64 = 730.0;
@@ -63,28 +57,6 @@ impl Plan {
     pub fn stack(&self) -> String {
         format!("strata-{}", self.name)
     }
-
-    fn check_name(&self) -> Result<(), String> {
-        let n = &self.name;
-        let ok = !n.is_empty() && n.len() <= 40 && n.starts_with(|c: char| c.is_ascii_lowercase()) && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') && !n.ends_with('-');
-        if ok {
-            Ok(())
-        } else {
-            Err(format!("{n:?} is not a cluster name: 1 to 40 lower-case letters, digits and hyphens, starting with a letter"))
-        }
-    }
-}
-
-/// Where the copies go: copy `c` of shard `s` on node `(s + c) % nodes`,
-/// so a shard's copies are on different nodes while there are enough.
-pub fn layout(shards: u32, replicas: u32, nodes: u32) -> Vec<Vec<(u32, u32)>> {
-    let mut on = vec![Vec::new(); nodes.max(1) as usize];
-    for s in 0..shards {
-        for c in 0..replicas {
-            on[((s + c) % nodes.max(1)) as usize].push((s, c));
-        }
-    }
-    on
 }
 
 /// The memory a node's pods may have, GiB: what EKS keeps for the kubelet
@@ -96,7 +68,7 @@ pub fn allocatable_gib(m: &Machine) -> f64 {
 
 /// The plan: `Err` when it cannot be made.
 pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String> {
-    p.check_name()?;
+    check_name(&p.name)?;
     if p.region != cat.region {
         return Err(format!("the machines are those of {}, not {}", cat.region, p.region));
     }
@@ -107,44 +79,11 @@ pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String
     if !(1..=16_384).contains(&p.volume_gb) {
         return Err("volume_gb is 1 to 16,384 (a gp3 volume's size)".into());
     }
-    let mut cluster = match &p.cluster {
-        Json::Object(_) => p.cluster.clone(),
-        Json::Null => json!({}),
-        _ => return Err("cluster is a StrataCluster's spec (an object)".into()),
-    };
-    let field = |c: &Json, k: &str, d: u64| c[k].as_u64().unwrap_or(d) as u32;
-    let (shards, replicas, coordinators) = (field(&cluster, "shards", 2), field(&cluster, "replicas", 3), field(&cluster, "coordinators", 1));
-    let on = layout(shards, replicas, p.nodes);
-    let per_node = on.iter().map(Vec::len).max().unwrap_or(0) as u32;
     let alloc = allocatable_gib(m);
-    // The coordinators and the operator get a fixed share; the copies
-    // split the rest of the busiest node.
-    let (coordinator_gib, operator_gib) = (0.5_f64.min(alloc / 8.0), 0.25_f64);
-    let spare = alloc - (f64::from(coordinators) * coordinator_gib + operator_gib) / f64::from(p.nodes);
-    let copy_gib = if per_node > 0 { spare / f64::from(per_node) } else { spare };
-    let copy_cpu = (f64::from(m.vcpu) - 0.25) / f64::from(per_node.max(1));
-    // Requests a little under each copy's share, so they fit.
-    let mib = |g: f64| format!("{}Mi", (g * 1024.0 * 0.9).floor().max(64.0) as u64);
-    let milli = |c: f64| format!("{}m", (c * 1000.0 * 0.9).floor().max(50.0) as u64);
-    let o = cluster.as_object_mut().expect("an object");
-    o.entry("shards").or_insert(json!(shards));
-    o.entry("replicas").or_insert(json!(replicas));
-    o.entry("coordinators").or_insert(json!(coordinators));
-    o.entry("image").or_insert(json!(IMAGE));
-    if !o.contains_key("schema") {
-        o.entry("demo").or_insert(json!(10_000));
-    }
-    let storage = o.entry("storage").or_insert(json!({}));
-    if let Some(s) = storage.as_object_mut() {
-        s.entry("size").or_insert(json!(format!("{}Gi", p.volume_gb)));
-        s.entry("storageClassName").or_insert(json!("gp3"));
-    }
-    o.entry("resources").or_insert(json!({"requests": {"cpu": milli(copy_cpu), "memory": mib(copy_gib)}}));
-    o.entry("coordinatorResources").or_insert(json!({"requests": {"cpu": "250m", "memory": mib(coordinator_gib)}}));
-    let spec: Spec = serde_json::from_value(cluster.clone()).map_err(|e| format!("cluster: {e}"))?;
-    spec.check().map_err(|e| format!("cluster: {e}"))?;
+    let f = fit(&p.cluster, p.nodes, &Node { vcpu: m.vcpu, alloc_gib: alloc }, p.volume_gb, "gp3")?;
+    let (per_node, coordinators, replicas) = (f.per_node, f.coordinators, f.replicas);
 
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = f.warnings(p.nodes);
     // The quota, in the vCPUs of standard instances.
     let need = p.nodes * m.vcpu;
     let (quota, kind) = if p.spot { (cat.spot_quota_vcpus, "spot") } else { (cat.quota_vcpus, "on-demand") };
@@ -163,14 +102,6 @@ pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String
     if pods > m.max_pods {
         warnings.push(format!("a node would run {pods} pods, and EKS lets a {} run {}: some copies would not start. Fewer copies a node, or a larger machine", m.name, m.max_pods));
     }
-    if replicas > p.nodes {
-        warnings.push(format!("a shard has {replicas} copies and there are {} nodes: some copies of a shard share a node, and losing it loses them", p.nodes));
-    } else if replicas == 1 {
-        warnings.push("one copy a shard: losing a node loses its shards until the node comes back".into());
-    }
-    if copy_gib < 1.0 {
-        warnings.push(format!("each copy gets {copy_gib:.1} GiB of memory: search keeps its segments and vectors in the page cache, so a larger machine or more nodes"));
-    }
     if m.burstable {
         warnings.push(format!("{} is burstable: under steady queries its CPU credits run out and it slows to its baseline", m.name));
     }
@@ -184,8 +115,8 @@ pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String
         warnings.push(format!("{} has no on-demand price in the price list here", m.name));
     }
 
-    let cost = cost(p, m, cat, shards * replicas);
-    let image = cluster["image"].as_str().unwrap_or(IMAGE).to_string();
+    let cost = cost(p, m, cat, f.shards * replicas);
+    let image = f.cluster["image"].as_str().unwrap_or(IMAGE).to_string();
     let stack = p.stack();
     let r = &p.region;
     let commands = [
@@ -205,57 +136,30 @@ pub fn plan(p: &Plan, cat: &Catalog, principal_arn: &str) -> Result<Json, String
         format!("aws cloudformation delete-stack --region {r} --stack-name {stack}"),
         format!("aws cloudformation wait stack-delete-complete --region {r} --stack-name {stack}"),
     ];
+    let objects = cluster_objects(&p.name, &f.cluster, Some(gp3_class()));
     Ok(json!({
+        "provider": "aws",
         "stack": p.stack(),
         "cluster_name": p.stack(),
         "region": p.region,
         "machine": m,
-        "layout": {
-            "nodes": on.iter().enumerate().map(|(i, c)| json!({"node": i, "copies": c.iter().map(|(s, c)| json!({"shard": s, "copy": c})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
-            "copies_per_node": per_node,
-            "pods_per_node": pods,
-            "max_pods": m.max_pods,
-            "allocatable_gib": alloc,
-            "copy_memory_gib": copy_gib,
-            "copy_cpu": copy_cpu,
-        },
+        "layout": f.layout_json(pods, m.max_pods),
         "quota": {"vcpus": quota, "needs": need, "kind": kind},
         "cost": cost,
         "warnings": warnings,
-        "manifests": {"operator": operator_yaml(&image)?, "cluster": cluster_yaml(&p.name, &cluster)},
+        "manifests": {"operator": operator_yaml(&image)?, "cluster": cluster_yaml("A Strata cluster on EKS, from strata-server's cloud view", &objects)},
+        "objects": objects,
         "commands": commands,
         "teardown": teardown,
-        "cluster": cluster,
+        "cluster": f.cluster,
         "template": template(p, m, principal_arn),
     }))
 }
 
-/// The operator's manifests, running `image`.
-pub fn operator_yaml(image: &str) -> Result<String, String> {
-    const DEV: &str = "image: strata-server:dev";
-    if !OPERATOR_YAML.contains(DEV) {
-        return Err("the operator's manifests name no image to replace".into());
-    }
-    Ok(OPERATOR_YAML.replace(DEV, &format!("image: {image}")))
-}
-
-/// The cluster's manifests: its namespace, a gp3 storage class that grows
-/// volumes in place, and the StrataCluster. YAML documents written as JSON
-/// (which YAML reads), so a schema goes in whole.
-pub fn cluster_yaml(name: &str, spec: &Json) -> String {
-    let docs = [
-        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "strata"}}),
-        json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "gp3"}, "provisioner": "ebs.csi.aws.com",
-            "parameters": {"type": "gp3", "encrypted": "true"}, "volumeBindingMode": "WaitForFirstConsumer", "allowVolumeExpansion": true, "reclaimPolicy": "Delete"}),
-        json!({"apiVersion": "strata.chloetech.ai/v1alpha1", "kind": "StrataCluster", "metadata": {"name": name, "namespace": "strata"}, "spec": spec}),
-    ];
-    let mut out = String::from("# A Strata cluster on EKS, from strata-server's AWS view: kubectl apply -f this file\n");
-    for d in docs {
-        out.push_str("---\n");
-        out.push_str(&serde_json::to_string_pretty(&d).expect("JSON"));
-        out.push('\n');
-    }
-    out
+/// A gp3 storage class that grows volumes in place: EKS has none.
+fn gp3_class() -> Json {
+    json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": "gp3"}, "provisioner": "ebs.csi.aws.com",
+        "parameters": {"type": "gp3", "encrypted": "true"}, "volumeBindingMode": "WaitForFirstConsumer", "allowVolumeExpansion": true, "reclaimPolicy": "Delete"})
 }
 
 /// What the plan costs, an hour and a month, line by line: the nodes, the
@@ -351,7 +255,7 @@ pub fn template(p: &Plan, m: &Machine, principal_arn: &str) -> Json {
     }}));
     json!({
         "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": format!("Strata cluster {name}: EKS with {} {} nodes ({}), made by strata-server's AWS view", p.nodes, m.name, if p.spot { "spot" } else { "on demand" }),
+        "Description": format!("Strata cluster {name}: EKS with {} {} nodes ({}), made by strata-server's cloud view", p.nodes, m.name, if p.spot { "spot" } else { "on demand" }),
         "Resources": r,
         "Outputs": {
             "ClusterName": {"Value": {"Ref": "Cluster"}},
@@ -381,17 +285,6 @@ mod tests {
             ipv4_hour: Some(0.005),
             missing: vec![],
         }
-    }
-
-    #[test]
-    fn copies_of_a_shard_go_on_different_nodes() {
-        assert_eq!(layout(2, 3, 3), vec![vec![(0, 0), (1, 2)], vec![(0, 1), (1, 0)], vec![(0, 2), (1, 1)]]);
-        let on = layout(4, 2, 4);
-        assert!(on.iter().all(|n| n.len() == 2));
-        for n in &on {
-            assert_ne!(n[0].0, n[1].0, "two copies of a shard on one node: {on:?}");
-        }
-        assert_eq!(layout(1, 3, 1), vec![vec![(0, 0), (0, 1), (0, 2)]]);
     }
 
     #[test]

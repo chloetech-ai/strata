@@ -36,6 +36,12 @@ pub enum Pred {
     /// Rows with a value of the field (`IS NOT NULL`; a multi-valued field
     /// needs at least one).
     Present { field: usize },
+    /// A test of the values at `path` (as [`crate::json::parse_path`]
+    /// spells it) of a JSON field (`attrs.color = 'red'`): read from the
+    /// field's terms ([`crate::json`]). A row without a value of a test's
+    /// type there is UNKNOWN to it (to any test but [`PathTest::Has`]), so
+    /// a negation asks for such a value.
+    Path { field: usize, path: String, test: PathTest },
     And(Vec<Pred>),
     Or(Vec<Pred>),
     /// The rows at least `need` of `items` hold for (`AT_LEAST(n, c1,
@@ -54,6 +60,49 @@ pub enum Pred {
     /// ([`crate::query::compound`]); its plan runs the subquery first and
     /// hands the executor the condition on its values, never this.
     Sub(Box<crate::query::ir::Expr>),
+}
+
+/// What a [`Pred::Path`] tests of the values at a JSON field's path. A
+/// test of values holds when one of the path's values passes it (an array
+/// holds several), and a value matches values of its own type only: a
+/// number those numbers, integer or double, a string those strings, a
+/// boolean those booleans.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathTest {
+    /// The path holds a value (`IS NOT NULL`): of any type, an empty object
+    /// too, or of the one named (the rows a test of that type is TRUE or
+    /// FALSE for).
+    Has(Option<crate::json::Kind>),
+    /// A value equals one of these (`=`, `IN`).
+    In(Vec<Value>),
+    /// A value lies within the bounds (`<`, `>=`, `BETWEEN`), each with
+    /// whether it is included, both of one type; a missing bound is open.
+    Range { lo: Option<(Value, bool)>, hi: Option<(Value, bool)> },
+    /// A string value starts with this (`LIKE 'p%'`).
+    Prefix(String),
+}
+
+impl PathTest {
+    /// The types of value the test compares with, in order: one, or
+    /// several for an IN list of mixed values; none for [`PathTest::Has`]
+    /// of any type.
+    pub fn kinds(&self) -> Vec<crate::json::Kind> {
+        use crate::json::Kind;
+        let mut ks: Vec<Kind> = match self {
+            PathTest::Has(k) => k.iter().copied().collect(),
+            PathTest::In(vs) => vs.iter().filter_map(Kind::of).collect(),
+            PathTest::Range { lo, hi } => lo.iter().chain(hi.iter()).filter_map(|(v, _)| Kind::of(v)).collect(),
+            PathTest::Prefix(_) => vec![Kind::Str],
+        };
+        ks.sort();
+        ks.dedup();
+        ks
+    }
+}
+
+/// The number of types among an IN list's values.
+fn test_kinds(vs: &[Value]) -> usize {
+    PathTest::In(vs.to_vec()).kinds().len()
 }
 
 /// How a full-text search widens its words (`MATCH(.., synonyms => 1,
@@ -226,6 +275,31 @@ impl Pred {
             p if !negated => p,
             Pred::True => Pred::False,
             Pred::False => Pred::True,
+            // `x IN (.., NULL)` is never FALSE, so its negation never TRUE.
+            Pred::Path { test: PathTest::In(vs), .. } if vs.contains(&Value::Null) => Pred::False,
+            // UNKNOWN without a value of the test's type, and so is the
+            // negation; an IN list of several types is one test per type.
+            Pred::Path { field, path, test } if !matches!(test, PathTest::Has(_)) => {
+                let negate = |test: PathTest| {
+                    let has = Pred::Path { field, path: path.clone(), test: PathTest::Has(test.kinds().first().copied()) };
+                    Pred::And(vec![has, Pred::Not(Box::new(Pred::Path { field, path: path.clone(), test }))])
+                };
+                match test {
+                    PathTest::In(vs) if test_kinds(&vs) > 1 => {
+                        let mut by_kind: Vec<(crate::json::Kind, Vec<Value>)> = Vec::new();
+                        for v in vs {
+                            let k = crate::json::Kind::of(&v).expect("a value of a type");
+                            match by_kind.iter_mut().find(|(x, _)| *x == k) {
+                                Some((_, list)) => list.push(v),
+                                None => by_kind.push((k, vec![v])),
+                            }
+                        }
+                        by_kind.sort_by_key(|(k, _)| *k);
+                        Pred::And(by_kind.into_iter().map(|(_, vs)| negate(PathTest::In(vs))).collect())
+                    }
+                    test => negate(test),
+                }
+            }
             p @ (Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. } | Pred::Prefix { field, .. }) if !multi(field) => {
                 Pred::And(vec![Pred::Present { field }, Pred::Not(Box::new(p))])
             }
@@ -243,6 +317,10 @@ impl Pred {
                 if values.is_empty() { Pred::False } else { Pred::In { field, values } }
             }
             Pred::Prefix { field, prefix, edits: 0 } if prefix.is_empty() => Pred::Present { field },
+            Pred::Path { field, path, test: PathTest::In(vs) } if vs.contains(&Value::Null) => {
+                let vs: Vec<Value> = vs.into_iter().filter(|v| *v != Value::Null).collect();
+                if vs.is_empty() { Pred::False } else { Pred::Path { field, path, test: PathTest::In(vs) } }
+            }
             // `NOT (x IN (.., NULL))` as written, outside three_valued.
             Pred::Not(p) if matches!(&*p, Pred::In { values, .. } if values.contains(&Value::Null)) => Pred::False,
             Pred::And(ps) => {

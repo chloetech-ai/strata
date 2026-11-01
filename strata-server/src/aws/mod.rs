@@ -1,4 +1,4 @@
-//! AWS for the command center's AWS view: the account's credentials, kept
+//! AWS for the command center's cloud view: the account's credentials, kept
 //! on the server and never answered back, the machines of a region with
 //! their prices and the account's quota, and the plan of an EKS cluster
 //! for Strata ([`stack`]).
@@ -101,6 +101,15 @@ pub struct Catalog {
     pub ipv4_hour: Option<f64>,
     /// What could not be fetched (a price, a quota), said once each.
     pub missing: Vec<String>,
+}
+
+/// A CloudFormation stack's state, from `DescribeStacks`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StackState {
+    pub id: String,
+    /// `CREATE_IN_PROGRESS`, `CREATE_COMPLETE`, `ROLLBACK_COMPLETE`, ...
+    pub status: String,
+    pub reason: Option<String>,
 }
 
 /// How long a region's catalogue is kept before it is fetched again.
@@ -231,7 +240,7 @@ impl Aws {
     }
 
     fn need(&self) -> Result<Creds, String> {
-        self.creds().map(|(c, _)| c).ok_or_else(|| "no AWS credentials: save an access key in the AWS view (PUT /v1/admin/aws/credentials)".into())
+        self.creds().map(|(c, _)| c).ok_or_else(|| "no AWS credentials: save an access key in the Cloud view (PUT /v1/admin/aws/credentials)".into())
     }
 
     /// The host of a service's endpoint in a region.
@@ -466,6 +475,97 @@ impl Aws {
         Ok(json!({"capabilities": r["Capabilities"], "reason": r["CapabilitiesReason"], "parameters": r["Parameters"]}))
     }
 
+    /// Makes the stack `name` from `template` (CloudFormation `CreateStack`
+    /// with `CAPABILITY_IAM`, rolled back if any resource fails). `request`
+    /// makes the same call again a no-op. This bills the account.
+    pub async fn create_stack(&self, region: &str, name: &str, template: &Json, request: &str, tags: &[(&str, &str)]) -> Result<String, String> {
+        let c = self.need()?;
+        let mut p: Vec<(String, String)> = vec![
+            ("StackName".into(), name.into()),
+            ("TemplateBody".into(), template.to_string()),
+            ("Capabilities.member.1".into(), "CAPABILITY_IAM".into()),
+            ("ClientRequestToken".into(), request.into()),
+            ("OnFailure".into(), "ROLLBACK".into()),
+        ];
+        for (i, (k, v)) in tags.iter().enumerate() {
+            p.push((format!("Tags.member.{}.Key", i + 1), k.to_string()));
+            p.push((format!("Tags.member.{}.Value", i + 1), v.to_string()));
+        }
+        let p: Vec<(&str, String)> = p.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let t = self.query(&c, "cloudformation", region, "2010-05-15", "CreateStack", &p, true).await?;
+        let j: Json = serde_json::from_str(&t).map_err(|e| format!("cloudformation CreateStack: {e}"))?;
+        j["CreateStackResponse"]["CreateStackResult"]["StackId"].as_str().map(str::to_string).ok_or_else(|| format!("cloudformation CreateStack: no stack id in {t}"))
+    }
+
+    /// The stack `id` (or name) now; `None` when CloudFormation has none.
+    pub async fn stack(&self, region: &str, id: &str) -> Result<Option<StackState>, String> {
+        let c = self.need()?;
+        let t = match self.query(&c, "cloudformation", region, "2010-05-15", "DescribeStacks", &[("StackName", id.into())], true).await {
+            Ok(t) => t,
+            Err(e) if e.contains("does not exist") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let j: Json = serde_json::from_str(&t).map_err(|e| format!("cloudformation DescribeStacks: {e}"))?;
+        let s = &j["DescribeStacksResponse"]["DescribeStacksResult"]["Stacks"][0];
+        Ok(s["StackStatus"].as_str().map(|status| StackState {
+            id: s["StackId"].as_str().unwrap_or(id).to_string(),
+            status: status.to_string(),
+            reason: s["StackStatusReason"].as_str().filter(|r| !r.is_empty()).map(str::to_string),
+        }))
+    }
+
+    /// Why the stack failed: the first of its resources that did, and why.
+    pub async fn stack_failure(&self, region: &str, id: &str) -> Result<Option<String>, String> {
+        let c = self.need()?;
+        let t = self.query(&c, "cloudformation", region, "2010-05-15", "DescribeStackEvents", &[("StackName", id.into())], true).await?;
+        let j: Json = serde_json::from_str(&t).map_err(|e| format!("cloudformation DescribeStackEvents: {e}"))?;
+        let events = j["DescribeStackEventsResponse"]["DescribeStackEventsResult"]["StackEvents"].as_array().cloned().unwrap_or_default();
+        // Newest first: the earliest failure is the cause, the others follow it.
+        Ok(events.iter().rev().find(|e| {
+            e["ResourceStatus"].as_str().is_some_and(|s| s.ends_with("_FAILED")) && e["ResourceStatusReason"].as_str().is_some_and(|r| !r.contains("cancelled"))
+        }).map(|e| format!("{}: {}", e["LogicalResourceId"].as_str().unwrap_or("?"), e["ResourceStatusReason"].as_str().unwrap_or("?"))))
+    }
+
+    /// How many of the stack's resources are made, of how many it has.
+    pub async fn stack_progress(&self, region: &str, id: &str) -> Result<(usize, usize), String> {
+        let c = self.need()?;
+        let t = self.query(&c, "cloudformation", region, "2010-05-15", "DescribeStackResources", &[("StackName", id.into())], true).await?;
+        let j: Json = serde_json::from_str(&t).map_err(|e| format!("cloudformation DescribeStackResources: {e}"))?;
+        let r = j["DescribeStackResourcesResponse"]["DescribeStackResourcesResult"]["StackResources"].as_array().cloned().unwrap_or_default();
+        Ok((r.iter().filter(|r| r["ResourceStatus"] == "CREATE_COMPLETE").count(), r.len()))
+    }
+
+    /// Deletes the stack `id` (`DeleteStack`): its nodes, cluster and
+    /// network. Deleting one already gone does nothing.
+    pub async fn delete_stack(&self, region: &str, id: &str) -> Result<(), String> {
+        let c = self.need()?;
+        self.query(&c, "cloudformation", region, "2010-05-15", "DeleteStack", &[("StackName", id.into())], true).await.map(|_| ())
+    }
+
+    /// The EKS cluster `name`'s API: its endpoint and its CA (PEM).
+    pub async fn eks_cluster(&self, region: &str, name: &str) -> Result<(String, Vec<u8>), String> {
+        use base64::Engine;
+        let c = self.need()?;
+        let t = self.call(&c, "eks", region, &format!("/clusters/{}", sig::encode(name, true)), None, &[], "DescribeCluster").await?;
+        let j: Json = serde_json::from_str(&t).map_err(|e| format!("eks DescribeCluster: {e}"))?;
+        let endpoint = j["cluster"]["endpoint"].as_str().filter(|e| !e.is_empty()).ok_or_else(|| format!("eks DescribeCluster: {name} has no endpoint yet"))?;
+        let ca = j["cluster"]["certificateAuthority"]["data"].as_str().unwrap_or_default();
+        let ca = base64::engine::general_purpose::STANDARD.decode(ca.trim()).map_err(|e| format!("eks DescribeCluster: the CA of {name}: {e}"))?;
+        Ok((endpoint.to_string(), ca))
+    }
+
+    /// A token for the EKS cluster `name`'s API, as `aws eks get-token`
+    /// makes one: STS's `GetCallerIdentity` presigned for the cluster,
+    /// which EKS takes for 15 minutes as who signed it.
+    pub fn eks_token(&self, region: &str, name: &str) -> Result<String, String> {
+        use base64::Engine;
+        let c = self.need()?;
+        let host = format!("sts.{region}.amazonaws.com");
+        let params = [("Action", "GetCallerIdentity".to_string()), ("Version", "2011-06-15".to_string())];
+        let q = sig::presign(&host, "/", &params, &[("x-k8s-aws-id", name)], &c.access_key_id, &c.secret_access_key, c.session_token.as_deref(), region, "sts", &sig::amz_date(now_ms()), 60);
+        Ok(format!("k8s-aws-v1.{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("https://{host}/?{q}"))))
+    }
+
     /// The calls made so far, `service Action` each (tests).
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -517,7 +617,7 @@ fn error_text(body: &str) -> String {
 
 /// Writes `bytes` to `path` readable by its owner only, through a
 /// temporary file renamed over it.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
     {

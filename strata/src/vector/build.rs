@@ -17,12 +17,14 @@
 //!
 //! A field that is not `indexed` gets the forward vectors only (flat).
 
+use std::sync::Arc;
+
 use crate::postings::bytes::ByteWriter;
 
 use crate::error::{Error, Result};
 use crate::schema::{Field, FieldType, VectorCodes, VectorIndexKind};
 use crate::segment::build::BuildOptions;
-use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter};
+use crate::segment::{DocId, FieldIndexBuilder, SegmentFile, SegmentWriter, Spill, SpillStream};
 use crate::value::Value;
 use crate::vector::hnsw::{self, HnswConfig, HnswView};
 use crate::vector::ivf::{self, IvfConfig};
@@ -64,6 +66,42 @@ fn parse<T: std::str::FromStr>(opts: &BuildOptions, key: &str) -> Result<Option<
     opts.get(key).map(|v| v.parse::<T>().map_err(|_| Error::Schema(format!("bad value {v:?} for build option {key}")))).transpose()
 }
 
+/// A vector field's float32 rows as little-endian bytes: in memory, where
+/// the buffer becomes the section without a copy, or written out as they
+/// are added ([`FieldIndexBuilder::spill_to`]), with a buffer for one row's
+/// bytes.
+enum RowBuf {
+    Mem(Vec<u8>),
+    Spill(SpillStream, Vec<u8>),
+}
+
+impl RowBuf {
+    fn len(&self) -> usize {
+        match self {
+            RowBuf::Mem(v) => v.len(),
+            RowBuf::Spill(s, _) => s.len(),
+        }
+    }
+
+    fn push(&mut self, v: &[f32]) {
+        match self {
+            RowBuf::Mem(b) => b.extend(v.iter().flat_map(|x| x.to_le_bytes())),
+            RowBuf::Spill(s, b) => {
+                b.clear();
+                b.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+                s.extend_from_slice(b);
+            }
+        }
+    }
+
+    fn zeros(&mut self, n: usize) {
+        match self {
+            RowBuf::Mem(b) => b.resize(b.len() + n, 0),
+            RowBuf::Spill(s, _) => s.zeros(n),
+        }
+    }
+}
+
 pub(crate) struct VectorBuilder {
     field: String,
     dim: usize,
@@ -80,9 +118,8 @@ pub(crate) struct VectorBuilder {
     /// one's first document has here ([`hnsw::StartGraph`]); the first that
     /// fits keeps its links, the others are joined to it.
     start: Vec<(SegmentFile, u32)>,
-    /// Float32 rows as little-endian bytes, so the buffer becomes the
-    /// section without a copy.
-    rows: Vec<u8>,
+    /// Float32 rows as little-endian bytes.
+    rows: RowBuf,
     present: Vec<u64>,
     n: usize,
     missing: usize,
@@ -141,7 +178,7 @@ impl VectorBuilder {
             threads: parse(opts, "vector.threads")?.unwrap_or(1),
             seed: parse(opts, "vector.seed")?.unwrap_or(0x5EE_D0F5_747A),
             start: Vec::new(),
-            rows: Vec::new(),
+            rows: RowBuf::Mem(Vec::new()),
             present: Vec::new(),
             n: 0,
             missing: 0,
@@ -184,8 +221,8 @@ impl FieldIndexBuilder for VectorBuilder {
                         if self.n.is_multiple_of(64) {
                             self.present.push(0);
                         }
-                        self.rows.extend(v.iter().flat_map(|x| x.to_le_bytes()));
-                        self.rows.resize(self.rows.len() + (self.stride - self.dim) * 4, 0);
+                        self.rows.push(v);
+                        self.rows.zeros((self.stride - self.dim) * 4);
                         self.present[self.n / 64] |= 1 << (self.n % 64);
                         self.n += 1;
                     }
@@ -204,22 +241,29 @@ impl FieldIndexBuilder for VectorBuilder {
         }
         match value {
             Value::Vector(v) if v.len() == self.dim => {
-                self.rows.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+                self.rows.push(v);
                 self.present[self.n / 64] |= 1 << (self.n % 64);
             }
             Value::Null => {
-                self.rows.resize(self.rows.len() + self.dim * 4, 0);
+                self.rows.zeros(self.dim * 4);
                 self.missing += 1;
             }
             _ => return Err(Error::Schema(format!("vector field {}: bad value for document {doc}", self.field))),
         }
-        self.rows.resize(self.rows.len() + (self.stride - self.dim) * 4, 0);
+        self.rows.zeros((self.stride - self.dim) * 4);
         self.n += 1;
         Ok(())
     }
 
+    fn spill_to(&mut self, spill: &Arc<Spill>) -> Result<()> {
+        if self.rows.len() == 0 {
+            self.rows = RowBuf::Spill(spill.stream()?, Vec::new());
+        }
+        Ok(())
+    }
+
     fn finish(self: Box<Self>, out: &mut SegmentWriter) -> Result<()> {
-        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, rows, present, n, missing, multi } = *self;
+        let VectorBuilder { field, dim, stride, kind, codes: code_kind, hnsw_max_docs, threads, seed, start, mut rows, present, n, missing, multi } = *self;
         let code_stride = code_kind.stride(dim);
         let is_present = |d: u32| present[d as usize / 64] >> (d % 64) & 1 == 1;
         let ids: Vec<u32> = (0..n as u32).filter(|&d| is_present(d)).collect();
@@ -231,9 +275,19 @@ impl FieldIndexBuilder for VectorBuilder {
         };
         // A merge's graph is a graph of rows, not of a multi-vector field's vectors.
         let start = if multi.is_some() { Vec::new() } else { start };
+        // Spilled rows are read back through a mapping of their file.
+        let map = match &mut rows {
+            RowBuf::Mem(_) => None,
+            RowBuf::Spill(s, _) => s.map()?,
+        };
+        let bytes: &[u8] = match (&rows, &map) {
+            (RowBuf::Mem(v), _) => v,
+            (_, Some(m)) => m,
+            (_, None) => &[],
+        };
         // SAFETY: f32 has no invalid bit patterns; `align_to` only yields the
         // aligned middle part, and we require it to be everything.
-        let (head, data, tail) = unsafe { rows.align_to::<f32>() };
+        let (head, data, tail) = unsafe { bytes.align_to::<f32>() };
         assert!(head.is_empty() && tail.is_empty(), "allocator returned a misaligned vector buffer");
         let view = Rows { data, dim, stride, n };
 
@@ -346,7 +400,14 @@ impl FieldIndexBuilder for VectorBuilder {
             }
         }
         if info.f32 {
-            out.put(section(&field, "f32"), rows);
+            match rows {
+                RowBuf::Mem(v) => out.put(section(&field, "f32"), v),
+                RowBuf::Spill(s, _) => {
+                    drop(map);
+                    let (at, crc) = s.finish()?;
+                    out.put_spilled(section(&field, "f32"), at, crc);
+                }
+            }
         }
         Ok(())
     }

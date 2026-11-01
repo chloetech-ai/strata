@@ -40,7 +40,7 @@ use crate::error::{corrupt, Error, Result};
 use crate::schema::{Alter, FieldType, Schema};
 use crate::sid::{Codebook, Ties};
 use crate::segment::build::{build_segment, build_threads, BuildOptions, GraphStart, SegmentBuild};
-use crate::segment::{DocId, SegmentFile, SegmentWriter};
+use crate::segment::{DocId, SegmentFile, SegmentWriter, Spill};
 use crate::storage::freelist::FreeList;
 use crate::storage::io;
 use crate::storage::dir::{self, Current};
@@ -145,6 +145,14 @@ pub struct DbOptions {
     /// stays in its format: what is written to it meanwhile is written as
     /// the versions of Strata before field ids wrote it.
     pub open_old: bool,
+    /// A merge whose inputs hold more than this many bytes of live
+    /// documents' images writes the merged segment's sections out as it
+    /// finishes them, and its vectors' float32 rows and doc store blocks as
+    /// it adds them, to unnamed files beside the database
+    /// ([`crate::segment::spill`]), and copies them into the image at the
+    /// end: the same image, built without holding it in memory, for a
+    /// second write of its bytes. 0: every merge does.
+    pub merge_spill_bytes: u64,
 }
 
 /// How a database is laid out on disk.
@@ -189,6 +197,7 @@ impl Default for DbOptions {
             check_sections: true,
             ship_log_bytes: 0,
             open_old: false,
+            merge_spill_bytes: 64 << 20,
         }
     }
 }
@@ -408,6 +417,33 @@ pub(crate) struct Reserved {
     pub file: Option<String>,
 }
 
+/// The directory merges of the database at `path` spill to, and the start
+/// of their files' names: the database's directory in the directory
+/// layout, else its file's, with names after the file.
+fn spill_place<'a>(path: &'a Path, dir: Option<&'a Path>) -> (&'a Path, String) {
+    match dir {
+        Some(d) => (d, String::new()),
+        None => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            (parent, format!("{}.", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())))
+        }
+    }
+}
+
+/// Gives the memory a merge freed back to the system. glibc keeps what a
+/// thread frees in that thread's arena for its next allocations, so after a
+/// merge of 1M rows about half of the merge's peak stayed resident
+/// (`examples/merge_memory.rs`, the `probe` shape), counted against the
+/// process's memory limit while queries and other merges allocate
+/// elsewhere.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only returns free memory to the system.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Images are written in pieces of this size, each paced.
 const IMAGE_CHUNK: usize = 1 << 20;
 
@@ -457,7 +493,7 @@ impl std::io::Write for ImageOut<'_> {
 struct Merger {
     policy: MergePolicy,
     budget: Option<u64>,
-    pacer: Option<Pacer>,
+    pacer: Option<Arc<Pacer>>,
     wake: Mutex<MergerWake>,
     cv: Condvar,
     /// The table a merger thread looks at first, in turn.
@@ -1056,6 +1092,8 @@ impl Database {
         let mut record = MergeRecord::load(&merge_record_path);
         record.retain_live(|id| st.handle(id).is_some());
         record.store(&merge_record_path)?;
+        let (spill_dir, spill_prefix) = spill_place(path, dir.as_deref());
+        crate::segment::spill::remove_leftovers(spill_dir, &spill_prefix);
         let db = Database {
             path: path.to_path_buf(),
             wal_path,
@@ -2493,8 +2531,8 @@ impl Database {
     pub fn spawn_merger(self: &Arc<Self>, opts: MergerOptions) {
         let m = Arc::new(Merger {
             policy: opts.policy,
-            budget: opts.memory_budget.or_else(|| memory_limit().map(|l| l / 4)),
-            pacer: opts.write_bytes_per_sec.map(Pacer::new),
+            budget: opts.memory_budget.or_else(|| memory_limit().map(|l| l / 2)),
+            pacer: opts.write_bytes_per_sec.map(|r| Arc::new(Pacer::new(r))),
             wake: Mutex::new(MergerWake::default()),
             cv: Condvar::new(),
             next_table: AtomicUsize::new(0),
@@ -2559,7 +2597,7 @@ impl Database {
             .iter()
             .map(|v| {
                 let expired = retention.map_or(0, |(f, cutoff)| self.expired_in(v, &snap.schema().fields[f].key(), cutoff));
-                SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0) }
+                SegmentInfo { id: v.id, n_docs: v.file.n_docs() as u32, n_live: v.n_live.saturating_sub(expired), bytes: bytes.get(&v.id).copied().unwrap_or(0), spilled: v.file.section_bytes(crate::segment::spill::streams) }
             })
             .collect();
         let cap = |g: &[u64]| match (m.record.cap(g), budget) {
@@ -2567,9 +2605,10 @@ impl Database {
             (a, b) => a.or(b),
         };
         let threads = build_threads(&self.opts.build).unwrap_or(1);
-        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap, threads);
+        let spill = self.opts.merge_spill_bytes;
+        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id), cap, threads, spill);
         let mut group = group?;
-        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads);
+        let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads, spill);
         // It fits the budget alone: it waits for running merges to finish.
         if budget.is_some_and(|b| m.memory() + memory > b) {
             return None;
@@ -2612,13 +2651,13 @@ impl Database {
     }
 
     /// Runs a merge a merger thread claimed.
-    fn merge_claimed(&self, claim: &MergeClaim, pacer: Option<&Pacer>, stats: &mut MergeStats) -> Result<()> {
+    fn merge_claimed(&self, claim: &MergeClaim, pacer: Option<&Arc<Pacer>>, stats: &mut MergeStats) -> Result<()> {
         let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
         self.check_poisoned()?;
         self.merge_group(claim, source.as_ref(), pacer, &mut || true, stats)
     }
 
-    fn merge_group(&self, claim: &MergeClaim, source: &dyn DocumentSource, pacer: Option<&Pacer>, between: &mut dyn FnMut() -> bool, stats: &mut MergeStats) -> Result<()> {
+    fn merge_group(&self, claim: &MergeClaim, source: &dyn DocumentSource, pacer: Option<&Arc<Pacer>>, between: &mut dyn FnMut() -> bool, stats: &mut MergeStats) -> Result<()> {
         let (snap, ids) = (&claim.snap, &claim.ids[..]);
         let schema = snap.schema();
         let mut views = Vec::with_capacity(ids.len());
@@ -2771,6 +2810,10 @@ impl Database {
                 sections.put(name, bytes);
             }
         };
+        // A merge of more than `merge_spill_bytes` of live images writes
+        // its output as it goes.
+        let live_bytes: u64 = inputs.iter().zip(&views).map(|((_, live), v)| (v.file.image().len() as u128 * live.len() as u128 / v.file.n_docs().max(1) as u128) as u64).sum();
+        let spills = live_bytes > self.opts.merge_spill_bytes;
         let written = match batches.len() {
             // Every document was deleted; a segment without documents keeps
             // the codes they were given.
@@ -2780,11 +2823,18 @@ impl Database {
                     sections.put(rowseq::SECTION, rowseq::encode(&[]));
                 }
                 gone(&mut sections);
-                Some(self.write_reserved(sections, pacer)?)
+                Some(self.write_reserved(sections, pacer.map(|p| &**p))?)
             }
             0 => None,
             n => {
                 let mut build = SegmentBuild::with_starts(schema, &self.opts.build, n_new, &starts)?;
+                let spill = match spills {
+                    true => Some(Spill::new(self.spill_dir(), &self.spill_prefix(), pacer.cloned())?),
+                    false => None,
+                };
+                if let Some(s) = &spill {
+                    build.spill_to(s.clone())?;
+                }
                 let mut sections = std::thread::scope(|s| {
                     let mut next = decode(batches[0]);
                     for i in 1..n {
@@ -2800,7 +2850,9 @@ impl Database {
                     sections.put(rowseq::SECTION, rowseq::encode(seqs));
                 }
                 gone(&mut sections);
-                Some(self.write_reserved(sections, pacer)?)
+                let written = self.write_reserved(sections, pacer.map(|p| &**p))?;
+                stats.bytes_spilled += spill.map_or(0, |s| s.written());
+                Some(written)
             }
         };
         let n_new = n_new as u32;
@@ -2815,6 +2867,10 @@ impl Database {
             if let Some((res, _)) = &written {
                 self.unreserve(&wal, res);
             }
+        }
+        drop(wal);
+        if spills {
+            release_freed_memory();
         }
         r.map(|_| ())
     }
@@ -2924,6 +2980,16 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Where merges spill ([`crate::segment::spill`]): the database's
+    /// directory, or the directory of its file, with files named after it.
+    fn spill_dir(&self) -> &Path {
+        spill_place(&self.path, self.dir.as_deref()).0
+    }
+
+    fn spill_prefix(&self) -> String {
+        spill_place(&self.path, self.dir.as_deref()).1
     }
 
     /// A segment id and room for an image of `len` bytes ([`Reserved`]).

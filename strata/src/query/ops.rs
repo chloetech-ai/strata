@@ -53,7 +53,7 @@ pub fn run(plan: &Plan, schema: &Schema, runner: &mut Runner, opts: &ExecOptions
 
 /// [`run`] of a plan whose leaves read any tables of `catalog`.
 pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &ExecOptions) -> Result<ResultSet> {
-    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, per: None, plan: Vec::new(), encoded: Vec::new(), clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0 };
+    let mut ops = Ops { catalog, runner, opts, charge: Charge::new(opts.memory.clone()), steps: 0, ctes: Vec::new(), driver: None, per: None, plan: Vec::new(), encoded: Vec::new(), clock: Clock::new(opts.profile), prof: Vec::new(), dropped: 0, filter_docs: 0, scored: 0 };
     let rows = ops.node(&plan.root, "query")?;
     let keys = rows.keys.filter(|k| k.iter().all(|k| !matches!(k, Value::Null)));
     Ok(ResultSet {
@@ -62,7 +62,7 @@ pub fn run_in(plan: &Plan, catalog: &[&Schema], runner: &mut Runner, opts: &Exec
         keys: keys.unwrap_or_default(),
         scores: rows.scores.unwrap_or_default(),
         parts: None,
-        stats: ExecStats { plan: ops.plan, steps: ops.prof, steps_dropped: ops.dropped, ..ExecStats::default() },
+        stats: ExecStats { plan: ops.plan, filter_docs: ops.filter_docs, scored: ops.scored, steps: ops.prof, steps_dropped: ops.dropped, ..ExecStats::default() },
     })
 }
 
@@ -116,6 +116,9 @@ struct Ops<'a, 'r> {
     clock: Clock,
     prof: Vec<Step>,
     dropped: u64,
+    /// The leaves' rows passing their filters, and scored, summed.
+    filter_docs: u64,
+    scored: u64,
 }
 
 /// What an operator's step is called, and what it works on.
@@ -343,6 +346,8 @@ impl<'a> Ops<'a, '_> {
         }
         self.plan.push(line);
         self.plan.extend(rs.stats.plan.iter().map(|l| format!("  {l}")));
+        self.filter_docs += rs.stats.filter_docs;
+        self.scored += rs.stats.scored;
         self.dropped += steps::nest(&mut self.prof, &rs.stats.steps, 0) as u64 + rs.stats.steps_dropped;
         for r in &rs.rows {
             self.charge.row(r)?;
@@ -1245,7 +1250,7 @@ impl<'a> Ops<'a, '_> {
 /// value compared with it; a BOOL or TIMESTAMP field's as it is, which the
 /// plan's raising stores, and a fraction compared with an INT field too,
 /// which the raising rounds (`n > 2.5` is `n >= 3`).
-fn coerce(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Value> {
+pub(crate) fn coerce(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Value> {
     match f.and_then(|f| schema?.fields.get(f)) {
         Some(field) if field.ty == FieldType::Int && matches!(v, Value::Float(_)) => Ok(v),
         Some(field) if field.logical.is_none() => super::sql::coerced(field, v),
@@ -1255,7 +1260,7 @@ fn coerce(schema: Option<&Schema>, f: Option<usize>, v: Value) -> Result<Value> 
 
 /// Values field `f` is to equal ([`coerce`]d): an INT field holds no
 /// fraction, so a whole FLOAT is its INT and another FLOAT equals no row.
-fn equal_to(schema: Option<&Schema>, f: Option<usize>, vals: Vec<Value>) -> Result<Vec<Value>> {
+pub(crate) fn equal_to(schema: Option<&Schema>, f: Option<usize>, vals: Vec<Value>) -> Result<Vec<Value>> {
     vals.into_iter().filter_map(|v| equal_value(schema, f, v).transpose()).collect()
 }
 
@@ -1286,7 +1291,7 @@ fn trained_for(e: &Expr, schema: Option<&Schema>, f: u32) -> Result<()> {
 /// it ([`super::ir::Search::per`]). None when a filter, a join or an
 /// expression stands between them, since the scan's rows are then not the
 /// rows the cap counts.
-fn per_cap(n: &Node, scan: &Node) -> Option<super::ir::PerCap> {
+pub(crate) fn per_cap(n: &Node, scan: &Node) -> Option<super::ir::PerCap> {
     match n {
         Node::DistinctOn { input, keys, per } if std::ptr::eq(input.as_ref(), scan) => {
             let [Expr::Output(i)] = &keys[..] else { return None };
@@ -1305,7 +1310,7 @@ fn per_cap(n: &Node, scan: &Node) -> Option<super::ir::PerCap> {
 /// The first table's scan of the joins under a LIMIT, or the scan whose
 /// rows' first of each group a `DISTINCT ON` keeps, through the nodes that
 /// keep its rows' order (Project, Filter, DistinctOn): a leaf.
-fn driver_of(n: &Node) -> Option<&Node> {
+pub(crate) fn driver_of(n: &Node) -> Option<&Node> {
     match n {
         Node::DistinctOn { input, .. } => {
             let scan = match input.as_ref() {
@@ -1342,7 +1347,7 @@ fn value(e: &Expr, row: &[Value]) -> Result<Value> {
     eval::eval(e, &reader(row))
 }
 
-fn output(e: &Expr) -> Result<usize> {
+pub(crate) fn output(e: &Expr) -> Result<usize> {
     match e {
         Expr::Output(i) => Ok(*i as usize),
         e => Err(err(format!("a join key's right side is a column of the right rows, not {e:?}"))),
@@ -1351,7 +1356,7 @@ fn output(e: &Expr) -> Result<usize> {
 
 /// A value as a join or group key: numbers equal by value whatever their
 /// type.
-fn part(v: &Value) -> Part {
+pub(crate) fn part(v: &Value) -> Part {
     match v {
         Value::Float(x) if x.fract() == 0.0 && x.abs() < 9e15 => Part::Int(*x as i64),
         v => Part::of(v),
@@ -1403,7 +1408,7 @@ fn compare(a: &Value, b: &Value, k: &SortKey) -> Ordering {
 /// of its values is in the list, or none is, as on rows in memory), so the
 /// NULL matches none of them. Indexes answer a comparison with a value
 /// only.
-fn unknown(n: &mut Node, catalog: &[&Schema]) {
+pub(crate) fn unknown(n: &mut Node, catalog: &[&Schema]) {
     fn fold(e: &mut Expr, positive: bool, schema: Option<&Schema>) {
         let null = |x: &Expr| matches!(x, Expr::Lit(Value::Null));
         let multi = |x: &Expr| matches!(x, Expr::Field(f) if schema.and_then(|s| s.fields.get(*f as usize)).is_some_and(|f| f.multi));

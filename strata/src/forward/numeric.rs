@@ -630,6 +630,103 @@ impl NumericColumn {
     }
 }
 
+/// The keys of many values (an `IN` list) as sorted, disjoint ranges, so
+/// that a key is checked against all of them by one binary search.
+#[derive(Clone, Debug, Default)]
+pub struct KeySet {
+    ranges: Vec<KeyRange>,
+}
+
+impl KeySet {
+    pub fn new(ranges: impl IntoIterator<Item = KeyRange>) -> KeySet {
+        let mut all: Vec<KeyRange> = ranges.into_iter().filter(|r| r.lo <= r.hi).collect();
+        all.sort_by_key(|r| r.lo);
+        let mut ranges: Vec<KeyRange> = Vec::with_capacity(all.len());
+        for r in all {
+            match ranges.last_mut() {
+                Some(last) if r.lo <= last.hi.saturating_add(1) => last.hi = last.hi.max(r.hi),
+                _ => ranges.push(r),
+            }
+        }
+        KeySet { ranges }
+    }
+
+    #[inline]
+    pub fn contains(&self, k: i64) -> bool {
+        let i = self.ranges.partition_point(|r| r.lo <= k);
+        i > 0 && k <= self.ranges[i - 1].hi
+    }
+
+    /// The smallest range holding every key (`None` for no keys).
+    pub fn span(&self) -> Option<KeyRange> {
+        Some(KeyRange { lo: self.ranges.first()?.lo, hi: self.ranges.last()?.hi })
+    }
+
+    pub fn ranges(&self) -> &[KeyRange] {
+        &self.ranges
+    }
+}
+
+impl NumericColumn {
+    /// Documents with a key in `set`, in one pass over the column (blocks
+    /// whose zone misses the set's span are skipped): an `IN` of many
+    /// values, where a scan or a postings lookup a value reads the column
+    /// once a value.
+    pub fn scan_key_set(&self, set: &KeySet) -> DocSet {
+        let n = self.len();
+        let mut words = vec![0u64; n.div_ceil(64)];
+        if let Some(span) = set.span() {
+            let mut keys = [0i64; super::BLOCK];
+            for b in 0..self.blocks.n_blocks() {
+                let (lo, hi) = self.blocks.zone(b);
+                if lo > hi || hi < span.lo || lo > span.hi {
+                    continue;
+                }
+                let mask = self.block_keys_of(b, &mut keys);
+                for (j, &k) in keys.iter().enumerate() {
+                    if mask[j / 64] >> (j % 64) & 1 == 1 && set.contains(k) {
+                        let d = b * super::BLOCK + j;
+                        words[d / 64] |= 1 << (d % 64);
+                    }
+                }
+            }
+        }
+        DocSet::from_bits(words, n as u32)
+    }
+
+    /// A per-document check of the keys in `set` (as [`Self::filter_keys`]
+    /// for one range).
+    pub fn filter_key_set(&self, set: KeySet) -> KeySetFilter {
+        let estimate = set.ranges.iter().map(|r| self.estimate_keys(Some(*r))).sum::<f64>().min(self.n_present() as f64).round() as usize;
+        KeySetFilter { blocks: self.blocks.clone(), span: set.span(), set, estimate }
+    }
+}
+
+/// [`NumericColumn::filter_key_set`]: probes a document's key against a
+/// set of ranges.
+#[derive(Clone, Debug)]
+pub struct KeySetFilter {
+    blocks: Blocks,
+    set: KeySet,
+    span: Option<KeyRange>,
+    estimate: usize,
+}
+
+impl DocFilter for KeySetFilter {
+    #[inline]
+    fn contains(&self, doc: DocId) -> bool {
+        self.blocks.get(doc).is_some_and(|k| self.set.contains(k))
+    }
+
+    fn cardinality(&self) -> usize {
+        self.estimate
+    }
+
+    fn may_have(&self, docs: std::ops::Range<DocId>) -> bool {
+        self.span.is_some_and(|r| self.blocks.may_have(docs, r))
+    }
+}
+
 /// Whether `r` overlaps a zone `[min, max]` without containing it.
 fn cut(min: i64, max: i64, r: KeyRange) -> bool {
     min <= max && max >= r.lo && min <= r.hi && !(r.lo <= min && max <= r.hi)

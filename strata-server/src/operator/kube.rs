@@ -639,6 +639,17 @@ impl Link {
     }
 }
 
+impl Link {
+    /// Dismisses the autoscaler's suggestion ([`DISMISS`]): it is not
+    /// made, and the rules wait their cooldown before they suggest again.
+    pub async fn dismiss(&self) -> Result<Json, String> {
+        let now = self.get().await?;
+        let at = now["status"]["autoscale"]["suggestion"]["atMs"].as_u64().ok_or("the autoscaler suggests nothing now: nothing to dismiss")?;
+        self.kube.merge(&self.path(), &json!({"metadata": {"annotations": {DISMISS: at.to_string()}}})).await?;
+        self.get().await
+    }
+}
+
 /// The annotation that resumes a change a gate held (the hold's `atMs`).
 pub const RESUME: &str = "strata.chloetech.ai/resume";
 /// The annotation that marks a version as a rollback, which no gate
@@ -647,6 +658,10 @@ pub const ROLLBACK: &str = "strata.chloetech.ai/rollback";
 /// Who made the latest change through a coordinator, and its version
 /// (`name version`).
 pub const CHANGED_BY: &str = "strata.chloetech.ai/changed-by";
+/// The annotation that dismisses the autoscaler's suggestion (its `atMs`).
+pub const DISMISS: &str = "strata.chloetech.ai/autoscale-dismiss";
+/// Who the autoscaler is in [`CHANGED_BY`].
+pub const AUTOSCALER: &str = "autoscaler";
 
 /// Runs the operator: installs the CRD (with `install_crd`), then looks
 /// at every `StrataCluster` every `every`, takes each one step toward its
@@ -705,11 +720,27 @@ pub async fn once(kube: &Kube, c: &Json) -> Outcome {
         }
         Err(_) => c["status"]["history"].clone(),
     };
+    let autoscale = match &spec {
+        Ok(spec) => autoscaled(kube, c, spec, &out, &history, now).await,
+        Err(_) => c["status"]["autoscale"].clone(),
+    };
     let status = json!({
         "phase": out.phase, "message": out.message, "shards": out.shards, "observedGeneration": meta["generation"],
         "rollout": out.rollout, "history": history, "log": super::logged(&c["status"]["log"], out.phase, &out.message, now),
+        "autoscale": autoscale,
     });
-    if !same(&c["status"], &status) {
+    // The autoscaler's readings alone rewrite the status once a minute.
+    let fresh = c["status"]["autoscale"]["atMs"].as_u64().is_some_and(|t| now.saturating_sub(t) < 60_000);
+    let quiet = |s: &Json| {
+        let mut s = s.clone();
+        if let Some(a) = s["autoscale"].as_object_mut().filter(|_| fresh) {
+            for k in ["busy", "full", "atMs"] {
+                a.remove(k);
+            }
+        }
+        s
+    };
+    if !same(&quiet(&c["status"]), &quiet(&status)) {
         if out.phase != super::Phase::Ready || c["status"]["phase"] != "Ready" {
             tracing::info!(cluster = %format!("{ns}/{name}"), phase = ?out.phase, message = %out.message, "reconciled");
         }
@@ -719,6 +750,44 @@ pub async fn once(kube: &Kube, c: &Json) -> Outcome {
         }
     }
     out
+}
+
+/// The autoscaler's step for a cluster ([`super::autoscale::step`]): its
+/// rules on the numbers `out` read, from its state (`status.autoscale`),
+/// which it answers. With `mode: on` it changes the spec here, noted as a
+/// person's change through a coordinator is ([`CHANGED_BY`], by
+/// [`AUTOSCALER`]); with `suggest` the change waits in the state until a
+/// person applies it or dismisses it ([`DISMISS`]).
+pub async fn autoscaled(kube: &Kube, c: &Json, spec: &Spec, out: &Outcome, history: &Json, now: u64) -> Json {
+    use super::autoscale::{step, Mode, Reading, Sizes, State};
+    let a = &spec.autoscale;
+    if a.mode == Mode::Off && a.grow.is_none() && a.shrink.is_none() && a.volumes.is_none() {
+        return Json::Null;
+    }
+    let before: State = serde_json::from_value(c["status"]["autoscale"].clone()).unwrap_or_default();
+    let latest = history.as_array().and_then(|h| h.last()).and_then(|v| v["atMs"].as_u64());
+    let numbers = out.numbers.clone().unwrap_or_default();
+    let r = Reading { at_ms: now, busy: numbers.busy, full: numbers.disk_used_ratio };
+    let sizes = Sizes { replicas: spec.replicas, shards: spec.shards, volume: spec.storage.size.clone() };
+    let (mut s, change) = step(a, before, latest, c["metadata"]["annotations"][DISMISS].as_str(), &r, &sizes, out.phase == super::Phase::Ready);
+    if let Some(ch) = change {
+        let made = async {
+            let (_, new) = super::patched(&c["spec"], &ch.patch)?;
+            new.check()?;
+            let (ns, name) = (c["metadata"]["namespace"].as_str().unwrap_or("default"), c["metadata"]["name"].as_str().unwrap_or_default());
+            let patch = json!({"spec": ch.patch, "metadata": {"annotations": {CHANGED_BY: format!("{AUTOSCALER} {}", new.version())}}});
+            kube.merge(&format!("/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}"), &patch).await.map(drop)
+        };
+        match made.await {
+            Ok(()) => {
+                tracing::info!(cluster = %c["metadata"]["name"].as_str().unwrap_or_default(), change = %ch.text, "autoscaled");
+                s.last_change_ms = Some(now);
+                s.note(now, format!("made: {}", ch.text));
+            }
+            Err(e) => s.note(now, format!("could not make the change ({e}): {}", ch.text)),
+        }
+    }
+    serde_json::to_value(&s).unwrap_or(Json::Null)
 }
 
 /// Whether the status the API server holds is `b`: numbers by value (it

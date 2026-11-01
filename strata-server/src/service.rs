@@ -16,6 +16,7 @@ use strata::query::memory::MemoryBudget;
 use strata::query::stats::TermStats;
 use strata::query::ir::Plan;
 use strata::query::model::Models;
+use strata::query::paths::{Call, Paths};
 use strata::query::sql::{ident, quoted};
 use strata::query::{bind_command, compound, ops, profile, steps, Command, Params, Select};
 use strata::rank_log::{self, Log};
@@ -209,8 +210,14 @@ pub struct Service {
     pub keys: Arc<Keys>,
     pub audit: Audit,
     pub alerts: Alerts,
-    /// The AWS view's credentials and machine catalogues ([`crate::aws`]).
+    /// The cloud view's AWS credentials and machine catalogues ([`crate::aws`]).
     pub aws: Arc<crate::aws::Aws>,
+    /// The cloud view's DigitalOcean token and size catalogues
+    /// ([`crate::digitalocean`]).
+    pub digitalocean: Arc<crate::digitalocean::DigitalOcean>,
+    /// The clusters the cloud view made, and the loop that sees each one
+    /// through ([`crate::cloud::clusters`]).
+    pub clouds: Arc<crate::cloud::clusters::Clusters>,
     /// The server's log store ([`crate::logstore`]): its log lines and the
     /// queries it answered, in a Strata database of their own (`None`:
     /// `--log-store off`, or a coordinator without one).
@@ -362,6 +369,8 @@ impl Service {
             audit: Audit::new(None).expect("an audit log in memory"),
             alerts: Alerts::new(None, None).expect("the default alert rules"),
             aws: Arc::new(crate::aws::Aws::memory()),
+            digitalocean: Arc::new(crate::digitalocean::DigitalOcean::memory()),
+            clouds: Arc::new(crate::cloud::clusters::Clusters::memory()),
             log_store: None,
             models: RwLock::new(Arc::new(Vec::new())),
             models_dir: None,
@@ -1532,6 +1541,9 @@ impl Service {
     /// out), so that the text and the rows are embedded alike, or
     /// `{"embed": {"image": "<base64>"}, "field": "emb"}` (or `"audio"`),
     /// the vector of an image or sound file by a model of that and text.
+    /// The text of a multi-vector field (`VECTOR(d)[]`) embedded by a
+    /// model of its tokens, such as ColBERT, is the list of its tokens'
+    /// vectors, as `maxsim` takes them.
     pub async fn params(self: &Arc<Self>, j: Option<&Json>) -> Result<Params, ApiError> {
         let mut p = Params::new();
         let Some(j) = j.filter(|j| !j.is_null()) else { return Ok(p) };
@@ -1544,7 +1556,9 @@ impl Service {
                     self.vector_of(&table, &o["vector_of"], &field).await?
                 }
                 Json::Object(o) if o.get("embed").is_some_and(|e| e.is_string() || e.get("image").is_some() || e.get("audio").is_some()) && o.keys().all(|k| ["embed", "field", "table"].contains(&k.as_str())) => {
-                    let (_, field, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
+                    let (table, field, e) = self.model(o.get("table").and_then(|t| t.as_str()), o.get("field").and_then(|f| f.as_str()))?;
+                    // A multi-vector field's model embeds the query's tokens.
+                    let tokens = self.catalog().iter().find(|s| s.table.eq_ignore_ascii_case(&table)).and_then(|s| s.field(&field)).is_some_and(|f| f.multi);
                     let file = match &o["embed"] {
                         Json::String(_) => None,
                         Json::Object(i) if i.len() == 1 => {
@@ -1557,6 +1571,9 @@ impl Service {
                     if let Some((m, _)) = file.as_ref().filter(|(m, _)| !e.modalities().contains(m)) {
                         return Err(ApiError::bad(format!("the model of {field} ({}) does not embed {}", e.name(), strata::embed::modality_name(*m))));
                     }
+                    if tokens && file.is_some() {
+                        return Err(ApiError::bad(format!("{field} is a multi-vector field: its model embeds a text's tokens, not a file")));
+                    }
                     let text = o["embed"].as_str().unwrap_or_default().to_string();
                     let t0 = Instant::now();
                     let core = match tokio::time::timeout(self.timeout, self.embedding.clone().acquire_owned()).await {
@@ -1566,14 +1583,15 @@ impl Service {
                     let v = tokio::task::spawn_blocking(move || {
                         let _core = core;
                         match file {
-                            Some((_, data)) => strata::embed::embed_file(e.as_ref(), &data),
-                            None => e.embed_query(&text),
+                            Some((_, data)) => strata::embed::embed_file(e.as_ref(), &data).map(|v| Value::Vector(v.into())),
+                            None if tokens => e.embed_query_tokens(&text).map(|vs| Value::List(vs.into_iter().map(|v| Value::Vector(v.into())).collect())),
+                            None => e.embed_query(&text).map(|v| Value::Vector(v.into())),
                         }
                     })
                     .await
                     .map_err(ApiError::internal)??;
                     self.metrics.embedded("query", 1, t0.elapsed().as_secs_f64());
-                    Value::Vector(v.into())
+                    v
                 }
                 v => js::param(v)?,
             };
@@ -1675,6 +1693,14 @@ impl Service {
 
     async fn query_once(self: &Arc<Self>, mut req: QueryReq) -> Result<Answer, ApiError> {
         let t0 = Instant::now();
+        // A JSON field's paths listing: from this database's terms, or a
+        // coordinator's shards' listings summed.
+        if req.plan.is_none() {
+            if let Some(call) = Call::of_sql(&req.sql)? {
+                let res = self.json_paths(&call, &req.params, &req.after, req.timeout_ms).await.map(|p| (p.to_result(), Vec::new()));
+                return self.done(&req.sql, "paths", t0, None, req.shard, (false, req.quiet), res);
+            }
+        }
         let timeout = self.timeout_of(req.timeout_ms);
         // Bound against every table: a query of one table is the
         // executor's, any other a compound plan.
@@ -2194,6 +2220,28 @@ impl Service {
                 Ok(r?)
             }
             Backend::Cluster(c) => c.sid_next(sql, &schema, plan, params, field, prefixes, after, deadline).await,
+        }
+    }
+
+    /// The paths listing `call` asks for ([`strata::query::paths`]): of
+    /// this database's rows, or of every shard's, summed.
+    pub async fn json_paths(self: &Arc<Self>, call: &Call, params: &Params, after: &After, timeout_ms: u64) -> Result<Paths, ApiError> {
+        let t0 = Instant::now();
+        let timeout = self.timeout_of(timeout_ms);
+        let deadline = t0 + timeout;
+        call.field_of(&*self.table(&call.table).await?)?;
+        match &self.backend {
+            Backend::Local(db) => {
+                let snap = self.read_snapshot(db, 0, after, deadline).await?;
+                let Some(permit) = self.admit(timeout).await else { return Err(self.rejected("paths", t0)) };
+                let db = db.clone();
+                let opts = ExecOptions { deadline: Some(deadline), memory: self.query_memory.clone(), ..db.exec.clone() };
+                let (call, params) = (call.clone(), params.clone());
+                let r = tokio::task::spawn_blocking(move || db.json_paths_at(&snap, &call, &params, &opts)).await.map_err(ApiError::internal)?;
+                drop(permit);
+                Ok(r?)
+            }
+            Backend::Cluster(c) => c.json_paths(call, params, after, deadline).await,
         }
     }
 
@@ -2866,12 +2914,37 @@ impl Service {
     }
 
     /// This server's health and latest point, as a coordinator's
-    /// `/v1/cluster` shows each shard's copy.
+    /// `/v1/cluster` shows each shard's copy, and its last minute's load
+    /// (`minute`), which autoscaling reads.
     pub async fn detail(self: &Arc<Self>) -> Json {
         let health = self.health().await;
         let load = self.series.last().map(|p| (*p).clone());
         let log_store = self.log_store.as_ref().map(|s| s.status());
-        json!({"health": health, "load": load, "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores}, "running": self.live.len(), "log_store": log_store})
+        let minute = self.minute_load(telemetry::now_ms()).map(|l| {
+            json!({"qps": l.qps, "cpu": l.cpu, "cores": l.cores, "busy": l.busy(), "p99_ms": l.p99_ms, "disk_used_ratio": l.disk_used_ratio})
+        });
+        json!({
+            "health": health, "load": load, "minute": minute,
+            "system": {"version": env!("CARGO_PKG_VERSION"), "uptime_s": self.started.elapsed().map_or(0.0, |d| d.as_secs_f64()), "cores": self.cores},
+            "running": self.live.len(), "log_store": log_store,
+        })
+    }
+
+    /// This server's load over the minute before `now_ms` (from its
+    /// points), as the log store's `load` keeps it.
+    pub fn minute_load(&self, now_ms: u64) -> Option<crate::logstore::Load> {
+        let points = self.series.since(now_ms.saturating_sub(60_000));
+        let (qps, cpu, p99_ms, disk_used_ratio) = telemetry::load_of(&points)?;
+        let role = match &self.backend {
+            Backend::Cluster(_) => "coordinator",
+            Backend::Local(_) => match self.role() {
+                pb::Role::Primary => "primary",
+                pb::Role::Replica => "replica",
+                _ => "standalone",
+            },
+        };
+        let shard = self.slots().map(|(_, s)| s);
+        Some(crate::logstore::Load { ts_ms: now_ms, role: role.into(), shard, qps, cpu, cores: self.cores, p99_ms, disk_used_ratio })
     }
 
     /// The metrics (`GET /metrics`). A coordinator does not ask its shards

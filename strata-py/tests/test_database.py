@@ -85,6 +85,31 @@ def test_queries_and_results(db):
         db.query("SELECT nope FROM books")
 
 
+def test_a_field_of_token_vectors(tmp_path):
+    """A multi-vector field embedded from text holds a vector a token (the
+    hash model's, a vector a word); `embed_tokens` and `{"embed": ...}`
+    give a query's, and `maxsim` ranks the rows BM25 finds by them."""
+    schema = {
+        "table": "d",
+        "key": "id",
+        "fields": [
+            {"name": "id", "type": "keyword"},
+            {"name": "body", "type": "text"},
+            {"name": "tok", "type": "vector", "dim": 32, "multi": True, "index": "flat", "embed": {"from": ["body"], "model": "hash:32"}},
+        ],
+    }
+    db = strata.Database.create(str(tmp_path / "d.strata"), schema)
+    db.insert([{"id": "a", "body": "green apples"}, {"id": "b", "body": "red apples"}, {"id": "c", "body": "pears"}])
+    assert len(db.query("SELECT tok FROM d WHERE id = 'a'").scalar()) == 2
+    q = db.embed_tokens("green apples", "tok")
+    assert len(q) == 2 and len(q[0]) == 32
+    sql = "WITH top AS (SELECT * FROM d ORDER BY bm25(body, :w) DESC LIMIT 10) SELECT id FROM top ORDER BY maxsim(tok, :q) DESC LIMIT 2"
+    assert db.query(sql, w="apples", q=q).keys == ["a", "b"]
+    assert db.query(sql, w="apples", q={"embed": "green apples", "field": "tok"}).keys == ["a", "b"]
+    with pytest.raises(ValueError, match="embed_tokens"):
+        db.embed("green apples", "tok")
+
+
 def test_a_query_by_sound_needs_a_model_of_sound(db):
     """`embed(audio=...)` and `{"embed": {"audio": ...}}` go to a model of
     sound; the books' model reads text only, and a file given as audio has
@@ -240,6 +265,24 @@ def test_bool_and_timestamp(tmp_path):
             db.insert({"id": "x", "done": 2})
         with pytest.raises(strata.StrataError, match="at"):
             db.insert({"id": "x", "at": "next week"})
+
+
+def test_json_fields(tmp_path):
+    schema = {"table": "items", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "attrs", "type": "json"}]}
+    with strata.Database.create(tmp_path / "items.strata", schema) as db:
+        assert [f["type"] for f in db.schema["fields"]] == ["keyword", "json"]
+        db.insert([
+            {"id": "a", "attrs": {"color": "red", "dims": {"w": 4}, "certs": ["CE", "UL"]}},
+            {"id": "b", "attrs": '{"color": "blue", "voltage": 5}'},
+            {"id": "c", "attrs": None},
+        ])
+        # Paths filter; a dict is stored as compact JSON text.
+        assert db.query("SELECT id FROM items WHERE attrs.color = :c", c="red").keys == ["a"]
+        assert db.query("SELECT id FROM items WHERE attrs.certs = 'UL' OR attrs.voltage >= 5 ORDER BY id").keys == ["a", "b"]
+        assert db.query("SELECT id FROM items WHERE attrs.color IS NULL").keys == ["c"]
+        assert db.query("SELECT attrs.dims.w AS w, attrs FROM items WHERE id = 'a'")[0] == {"w": 4, "attrs": '{"certs":["CE","UL"],"color":"red","dims":{"w":4}}'}
+        with pytest.raises(strata.StrataError, match="object"):
+            db.insert({"id": "x", "attrs": [1, 2]})
 
 
 def test_not_null_and_default(tmp_path):

@@ -1,0 +1,126 @@
+{
+  "collections": {
+    "arguana": {
+      "colbert": {
+        "model": "answerai-colbert-small-v1",
+        "pool_factor": null
+      },
+      "db_bytes": 228966416,
+      "docs": 8674,
+      "load_s": 911.405934918,
+      "queries": 1406,
+      "variants": {
+        "colbert_rerank100": {
+          "failed": 0,
+          "ms_mean": 104.61698557183504,
+          "ms_p50": 104.34155000000001,
+          "ms_p99": 132.726882,
+          "ndcg10": 0.3355496492419551,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.6927453769559033
+        },
+        "colbert_rerank20": {
+          "failed": 0,
+          "ms_mean": 96.87941711948788,
+          "ms_p50": 96.460026,
+          "ms_p99": 119.853642,
+          "ndcg10": 0.3565001079824573,
+          "p_vs_plain": 0.3243675632436756,
+          "recall10": 0.7375533428165008
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 1.9071315967283102,
+          "ms_p50": 1.730314,
+          "ms_p99": 5.261404,
+          "ndcg10": 0.36229248694374827,
+          "recall10": 0.7574679943100996
+        }
+      }
+    },
+    "nfcorpus": {
+      "colbert": {
+        "model": "answerai-colbert-small-v1",
+        "pool_factor": null
+      },
+      "db_bytes": 131215376,
+      "docs": 3633,
+      "load_s": 578.666869282,
+      "queries": 323,
+      "variants": {
+        "colbert_rerank100": {
+          "failed": 0,
+          "ms_mean": 96.04269450773991,
+          "ms_p50": 95.64590000000001,
+          "ms_p99": 128.570061,
+          "ndcg10": 0.35938502993847454,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.16763541511053887
+        },
+        "colbert_rerank20": {
+          "failed": 0,
+          "ms_mean": 86.95862235913312,
+          "ms_p50": 86.375672,
+          "ms_p99": 112.462958,
+          "ndcg10": 0.35378486413988974,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.16255426519067318
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.06986458204334368,
+          "ms_p50": 0.059441,
+          "ms_p99": 0.16477199999999997,
+          "ndcg10": 0.32943148217697804,
+          "recall10": 0.15643383983134085
+        }
+      }
+    },
+    "scifact": {
+      "colbert": {
+        "model": "answerai-colbert-small-v1",
+        "pool_factor": null
+      },
+      "db_bytes": 187146256,
+      "docs": 5183,
+      "load_s": 787.852022934,
+      "queries": 300,
+      "variants": {
+        "colbert_rerank100": {
+          "failed": 0,
+          "ms_mean": 84.52348345666661,
+          "ms_p50": 83.355444,
+          "ms_p99": 107.38385000000001,
+          "ndcg10": 0.7421250226839045,
+          "p_vs_plain": 0.00009999000099990002,
+          "recall10": 0.8445555555555556
+        },
+        "colbert_rerank20": {
+          "failed": 0,
+          "ms_mean": 81.0209844966667,
+          "ms_p50": 78.938011,
+          "ms_p99": 101.619443,
+          "ndcg10": 0.7376392837236557,
+          "p_vs_plain": 0.00019998000199980003,
+          "recall10": 0.8387777777777777
+        },
+        "plain": {
+          "failed": 0,
+          "ms_mean": 0.22587279333333327,
+          "ms_p50": 0.20616800000000002,
+          "ms_p99": 0.444857,
+          "ndcg10": 0.6909863461109057,
+          "recall10": 0.8268333333333334
+        }
+      }
+    }
+  },
+  "machine": {
+    "arch": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpus": 4,
+    "os": "linux"
+  },
+  "split": "test",
+  "tag": "colbert"
+}

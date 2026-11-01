@@ -1,0 +1,385 @@
+{
+ "sizes": [
+  {
+   "slug": "512mb",
+   "memory": 512,
+   "vcpus": 1,
+   "disk": 20,
+   "transfer": 1.0,
+   "price_monthly": 6,
+   "price_hourly": 0.00893,
+   "regions": [
+    "ams3",
+    "blr1",
+    "fra1",
+    "lon1",
+    "nyc1",
+    "nyc2",
+    "nyc3",
+    "sfo2",
+    "sfo3",
+    "sgp1",
+    "syd1",
+    "tor1"
+   ],
+   "available": true,
+   "description": "Legacy Basic",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 20,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "s-4vcpu-8gb",
+   "memory": 8192,
+   "vcpus": 4,
+   "disk": 160,
+   "transfer": 5.0,
+   "price_monthly": 48,
+   "price_hourly": 0.07143,
+   "regions": [
+    "ams3",
+    "blr1",
+    "fra1",
+    "lon1",
+    "nyc1",
+    "nyc2",
+    "nyc3",
+    "sfo2",
+    "sfo3",
+    "sgp1",
+    "syd1",
+    "tor1"
+   ],
+   "available": true,
+   "description": "Basic",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 160,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "m-2vcpu-16gb",
+   "memory": 16384,
+   "vcpus": 2,
+   "disk": 50,
+   "transfer": 4.0,
+   "price_monthly": 84,
+   "price_hourly": 0.125,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "Memory-Optimized",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 50,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "m-2vcpu-16gb-intel",
+   "memory": 16384,
+   "vcpus": 2,
+   "disk": 50,
+   "transfer": 4.0,
+   "price_monthly": 99,
+   "price_hourly": 0.14732,
+   "regions": [
+    "nyc2"
+   ],
+   "available": true,
+   "description": "Premium Memory-Optimized",
+   "networking_throughput": 10000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 50,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "m-4vcpu-32gb",
+   "memory": 32768,
+   "vcpus": 4,
+   "disk": 100,
+   "transfer": 6.0,
+   "price_monthly": 168,
+   "price_hourly": 0.25,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "Memory-Optimized",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 100,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "g-8vcpu-32gb",
+   "memory": 32768,
+   "vcpus": 8,
+   "disk": 100,
+   "transfer": 6.0,
+   "price_monthly": 252,
+   "price_hourly": 0.375,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "General Purpose",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 100,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "m-8vcpu-64gb",
+   "memory": 65536,
+   "vcpus": 8,
+   "disk": 200,
+   "transfer": 7.0,
+   "price_monthly": 336,
+   "price_hourly": 0.5,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "Memory-Optimized",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 200,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "c-16",
+   "memory": 32768,
+   "vcpus": 16,
+   "disk": 200,
+   "transfer": 7.0,
+   "price_monthly": 336,
+   "price_hourly": 0.5,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "CPU-Optimized",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 200,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "so-8vcpu-64gb",
+   "memory": 65536,
+   "vcpus": 8,
+   "disk": 1200,
+   "transfer": 7.0,
+   "price_monthly": 524,
+   "price_hourly": 0.77976,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "Storage-Optimized",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 1200,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "g5-16vcpu-64gb-80gb",
+   "memory": 65536,
+   "vcpus": 16,
+   "disk": 80,
+   "transfer": 7.0,
+   "price_monthly": 533.89,
+   "price_hourly": 0.71759,
+   "regions": [
+    "mem1",
+    "mkc1",
+    "ric1"
+   ],
+   "available": true,
+   "description": "v5 General Purpose",
+   "networking_throughput": 24000,
+   "disk_info": [
+    {
+     "type": "boot",
+     "size": {
+      "amount": 80,
+      "unit": "gib"
+     }
+    }
+   ],
+   "components": {
+    "public_ipv4": {
+     "values": [
+      0,
+      1
+     ],
+     "default": 0,
+     "description": "Public IPv4",
+     "price_per_unit_hour": "0.00",
+     "price_per_unit_month": "0.00",
+     "included_in_size_price": false
+    }
+   }
+  },
+  {
+   "slug": "m-16vcpu-128gb",
+   "memory": 131072,
+   "vcpus": 16,
+   "disk": 400,
+   "transfer": 8.0,
+   "price_monthly": 672,
+   "price_hourly": 1,
+   "regions": [
+    "ams3",
+    "blr1",
+    "lon1",
+    "nyc1",
+    "nyc3",
+    "sfo2"
+   ],
+   "available": true,
+   "description": "Memory-Optimized",
+   "networking_throughput": 2000,
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 400,
+      "unit": "gib"
+     }
+    }
+   ]
+  },
+  {
+   "slug": "gpu-h100x1-80gb",
+   "memory": 245760,
+   "vcpus": 20,
+   "disk": 720,
+   "transfer": 15.0,
+   "price_monthly": 3281.04,
+   "price_hourly": 4.41,
+   "regions": [
+    "ams3",
+    "nyc2",
+    "tor1"
+   ],
+   "available": true,
+   "description": "H100 GPU - 1X",
+   "networking_throughput": 10000,
+   "gpu_info": {
+    "count": 1,
+    "vram": {
+     "amount": 80,
+     "unit": "gib"
+    },
+    "model": "nvidia_h100"
+   },
+   "disk_info": [
+    {
+     "type": "local",
+     "size": {
+      "amount": 720,
+      "unit": "gib"
+     }
+    },
+    {
+     "type": "scratch",
+     "size": {
+      "amount": 5120,
+      "unit": "gib"
+     }
+    }
+   ]
+  }
+ ],
+ "links": {},
+ "meta": {
+  "total": 12
+ }
+}

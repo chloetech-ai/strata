@@ -29,7 +29,8 @@ const PAPERS: &str = "CREATE TABLE papers (
     published TIMESTAMP,
     emb VECTOR(4) OPTIONS(index = 'flat'),
     terms SPARSE,
-    cites EDGES
+    cites EDGES,
+    attrs JSON
 )";
 
 fn papers(dir: &std::path::Path) -> Schema {
@@ -57,6 +58,8 @@ const SELECTS: &[&str] = &[
     "SELECT id FROM papers WHERE done AND published >= '2026-10-01' AND published < '2026-11-01T00:00:00Z'",
     "SELECT id FROM papers WHERE category IN (:ids) AND TRUE",
     "SELECT id FROM papers WHERE FALSE",
+    // Paths of a JSON field, as json_extract calls.
+    "SELECT id FROM papers WHERE attrs.dims.w > 4 AND NOT (attrs.color IN ('red', 2)) OR attrs['a.b'] LIKE 'x%' OR attrs.ok IS NULL",
     "SELECT id, rating FROM papers ORDER BY rating DESC NULLS FIRST, id LIMIT 3",
     "SELECT id FROM papers ORDER BY similarity(emb, :v) DESC LIMIT 5",
     "SELECT id, seq_no() FROM papers WHERE year > 2000 LIMIT 5",
@@ -91,6 +94,7 @@ const SELECTS: &[&str] = &[
 /// Compound queries: operators over single-table queries.
 const COMPOUND: &[&str] = &[
     "SELECT DISTINCT category FROM papers",
+    "SELECT attrs.color, COUNT(*) FROM papers WHERE attrs.n BETWEEN 1 AND 3 GROUP BY attrs.color",
     // Rerank phases: a second phase, then a global one.
     "WITH a AS (SELECT * FROM papers WHERE year > 2000 ORDER BY bm25(body, 'graph') DESC LIMIT 100), b AS (SELECT * FROM a ORDER BY similarity(emb, :v) DESC LIMIT 30) SELECT id, score() FROM b ORDER BY minmax(bm25(body, 'net')) + rating DESC LIMIT 5 OFFSET 1",
     "WITH a AS (SELECT * FROM papers ORDER BY bm25(body, 'graph') DESC LIMIT 100) SELECT id, score(), features() FROM a ORDER BY similarity(emb, :v) * (1 + rating) DESC LIMIT 5",

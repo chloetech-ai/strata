@@ -17,10 +17,14 @@
 //!   on. The workload goes on; operations that fail must have changed
 //!   nothing, except the one that left the database refusing writes
 //!   ("poisoned"), which may or may not have reached the disk.
+//!
+//! The same workloads run with every merge spilling its output to disk as
+//! it goes ([`DbOptions::merge_spill_bytes`] 0), whose writes fail too.
 #![cfg(feature = "fault-injection")]
 
 mod storage_util;
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,8 +70,21 @@ struct Run {
     last_flush: Option<(bool, bool)>,
 }
 
+thread_local! {
+    /// The workloads' `merge_spill_bytes`, by default the default's.
+    static SPILL: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
 fn options(src: &Arc<MapSource>, sync: bool) -> DbOptions {
-    DbOptions { sync, memtable_max_docs: 60, segment_max_docs: 150, ..opts(src) }
+    let o = DbOptions { sync, memtable_max_docs: 60, segment_max_docs: 150, ..opts(src) };
+    DbOptions { merge_spill_bytes: SPILL.get().unwrap_or(o.merge_spill_bytes), ..o }
+}
+
+/// Runs `f` with every merge spilling.
+fn spilling(f: impl FnOnce()) {
+    SPILL.set(Some(0));
+    f();
+    SPILL.set(None);
 }
 
 /// Runs `ops` seeded operations on a new database at `path` (in the
@@ -301,6 +318,27 @@ fn failing_calls(name: &str, errno: i32, sticky: bool, seed: u64, ops: usize) {
 }
 
 #[test]
+fn power_loss_while_merges_spill_keeps_every_acknowledged_commit() {
+    spilling(|| seeds(7, 1).for_each(|s| power_loss(true, s, ops())));
+}
+
+#[test]
+fn a_failed_call_while_merges_spill_changes_nothing_but_its_operation() {
+    // The spills' writes are among the calls that fail.
+    let plain = calls_of("db.strata", true, 8, ops());
+    spilling(|| {
+        let spilled = calls_of("db.strata", true, 8, ops());
+        assert!(spilled > plain, "{spilled} calls spilling, {plain} not");
+        seeds(8, 1).for_each(|s| failing_calls("db.strata", libc::EIO, false, s, ops()))
+    });
+}
+
+#[test]
+fn a_full_disk_while_merges_spill_keeps_what_was_committed() {
+    spilling(|| seeds(9, 1).for_each(|s| failing_calls("db.dir", libc::ENOSPC, true, s, ops())));
+}
+
+#[test]
 fn a_failed_call_changes_nothing_but_its_operation() {
     seeds(3, 2).for_each(|s| failing_calls("db.strata", libc::EIO, false, s, ops()));
 }
@@ -320,4 +358,41 @@ fn in_the_directory_layout_a_failed_call_changes_nothing_but_its_operation() {
 #[test]
 fn in_the_directory_layout_a_full_disk_keeps_what_was_committed() {
     seeds(6, 1).for_each(|s| failing_calls("db.dir", libc::ENOSPC, true, s, ops()));
+}
+
+// Linux's ext4 gives a file's inode to the next file created as soon as
+// the last name of the first is gone. The recorder keys files by inode, so
+// it took such a file for the one before it, and a failing sync rewrote it
+// from that file's content: a sealed log removed after a flush came back as
+// the new log, "damaged at byte 16, and 2 committed transactions follow"
+// (a_full_disk_while_merges_spill_keeps_what_was_committed on CI).
+#[test]
+fn a_file_on_the_inode_of_a_removed_or_replaced_one_is_new_to_the_recorder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let create = |name: &str| std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path(name)).unwrap();
+    let durable = |name: &str| {
+        let f = create(name);
+        io::write_at(&f, &[7; 4096], 0).unwrap();
+        io::sync(&f).unwrap();
+    };
+    // A new file written but not synced, then a sync that fails: the file
+    // holds at most what was written to it.
+    let fresh = |name: &str| {
+        let f = create(name);
+        io::write_at(&f, b"new", 0).unwrap();
+        io::fail_at(Fault { at: io::calls() + 1, errno: libc::EIO, sticky: false, crash: false });
+        assert!(io::sync(&f).is_err());
+        let got = std::fs::read(path(name)).unwrap();
+        assert!(got.len() <= 3 && !got.contains(&7), "{name}: {} bytes, {} of them the removed file's", got.len(), got.iter().filter(|&&b| b == 7).count());
+    };
+    io::arm(1);
+    durable("removed");
+    io::remove_file(&path("removed")).unwrap();
+    fresh("after a removal");
+    durable("replaced");
+    durable("replacement");
+    io::rename(&path("replacement"), &path("replaced")).unwrap();
+    fresh("after a replacement");
+    io::crash();
 }

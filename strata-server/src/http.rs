@@ -7,6 +7,7 @@
 //! | `GET /v1/health`, `/v1/stats`, `/v1/config` | | JSON (`/v1/health`: 503 when "down" or "failing") |
 //! | `GET /v1/schema?table=name` | | a table's schema (the first table's without `table`) |
 //! | `GET /v1/tables` | | `{tables: [...]}`: every table's schema and rank profiles, the first first |
+//! | `GET /v1/tables/:table/paths?field=attrs&path=dims&where=cond` | | `{table, field, rows, paths: [{path, keys, rows, types: {string, number, bool}, distinct, min?, max?, values?: [{value, rows}]}], truncated}`: the paths a JSON field's objects hold ([`strata::query::paths`]), under `path` if given, among the rows `where` matches; from a coordinator, every shard's summed |
 //! | `GET /metrics` | | Prometheus text |
 //! | `POST /v1/query` | `{sql, params?, timeout_ms?, shard?, stats?, snapshot?, min_seq_no?, min_seq_nos?, log?, trace?, profile?}` | rows, and in `stats.steps` the query's timed steps (with `profile`, their CPU time too, and with `trace` or `profile` the request's spans in `trace`); with `log` (`true` or `{table?, request?, context?, variant?, candidates?, ts?, interleave?: {sql, variants?}}`) also `request`, `logged` and, interleaved, `teams` ([`strata::rank_log`]) |
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
@@ -19,7 +20,7 @@
 //! | `GET /v1/export?tables=a,b&fts=false&indexes=false&schemas=false` | | the database as a SQLite file |
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
-//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
+//! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model; `vectors`, a vector a token, for a multi-vector field's (ColBERT) |
 //! | `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name, and whether each would open here |
 //! | `GET /v1/media/<sha256>` | | the bytes of the file a row's MEDIA value names, by its hash, read as writes read files (`--media-store`, `--media-fetch`); 404 when no row names it, 400 from a coordinator |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
@@ -129,6 +130,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/stats", get(stats))
         .route("/v1/schema", get(schema))
         .route("/v1/tables", get(tables))
+        .route("/v1/tables/:table/paths", get(json_paths))
         .route("/v1/config", get(config))
         .route("/metrics", get(metrics))
         .route("/v1/query", post(query))
@@ -192,12 +194,23 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/admin/kube", post(kube_change))
         .route("/v1/admin/kube/plan", post(kube_plan))
         .route("/v1/admin/kube/resume", post(kube_resume))
+        .route("/v1/admin/kube/autoscale/dismiss", post(autoscale_dismiss))
+        .route("/v1/admin/autoscale/replay", post(autoscale_replay))
         .route("/v1/admin/aws", get(aws_status))
         .route("/v1/admin/aws/credentials", put(aws_save).merge(axum::routing::delete(aws_forget)))
         .route("/v1/admin/aws/regions", get(aws_regions))
         .route("/v1/admin/aws/machines", get(aws_machines))
         .route("/v1/admin/aws/plan", post(aws_plan))
         .route("/v1/admin/aws/validate", post(aws_validate))
+        .route("/v1/admin/digitalocean", get(do_status))
+        .route("/v1/admin/digitalocean/token", put(do_save).merge(axum::routing::delete(do_forget)))
+        .route("/v1/admin/digitalocean/regions", get(do_regions))
+        .route("/v1/admin/digitalocean/machines", get(do_machines))
+        .route("/v1/admin/digitalocean/plan", post(do_plan))
+        .route("/v1/admin/digitalocean/validate", post(do_validate))
+        .route("/v1/admin/cloud/clusters", get(cloud_list).post(cloud_create))
+        .route("/v1/admin/cloud/clusters/:id", get(cloud_one).merge(axum::routing::delete(cloud_forget)))
+        .route("/v1/admin/cloud/clusters/:id/delete", post(cloud_delete))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -398,6 +411,26 @@ async fn schema(State(app): State<App>, Query(q): Query<std::collections::HashMa
 async fn tables(State(app): State<App>) -> AxJson<Json> {
     let tables: Vec<Json> = app.svc.catalog().iter().map(|s| table_json(&app.svc, s)).collect();
     AxJson(json!({"tables": tables}))
+}
+
+/// `GET /v1/tables/:table/paths?field=&path=&where=`: a JSON field's
+/// paths listing ([`strata::query::paths`]).
+async fn json_paths(State(app): State<App>, axum::extract::Path(table): axum::extract::Path<String>, Query(q): Params) -> Res {
+    let t0 = Instant::now();
+    let field = q.get("field").filter(|f| !f.is_empty()).ok_or_else(|| ApiError::bad("name the JSON field: ?field=attrs"))?;
+    let prefix = q.get("path").or_else(|| q.get("prefix")).filter(|p| !p.is_empty() && *p != "$");
+    let call = strata::query::paths::Call {
+        table,
+        field: field.clone(),
+        prefix: prefix.map(|p| strata::json::parse_path(p)).transpose()?,
+        filter: q.get("where").filter(|w| !w.trim().is_empty()).cloned(),
+    };
+    let paths = app.svc.json_paths(&call, &strata::query::Params::new(), &crate::service::After::Any, param_u64(&q, "timeout_ms", 0)?).await?;
+    let mut j = paths.to_json();
+    j["table"] = json!(call.table);
+    j["field"] = json!(call.field);
+    j["took_ms"] = json!(t0.elapsed().as_secs_f64() * 1e3);
+    Ok(AxJson(j))
 }
 
 fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json {
@@ -935,8 +968,15 @@ async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     let (table, field, _) = app.svc.model(name("table")?, name("field")?)?;
     let p = app.svc.params(Some(&json!({ "v": { "embed": what, "field": field, "table": table } }))).await?;
-    let Some(strata::value::Value::Vector(v)) = p.0.get("v") else { return Err(ApiError::internal("the text has no vector")) };
-    Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] })))
+    match p.0.get("v") {
+        Some(strata::value::Value::Vector(v)) => Ok(AxJson(json!({ "table": table, "field": field, "vector": &v[..] }))),
+        // A multi-vector field's model: a vector a token of the text.
+        Some(strata::value::Value::List(vs)) => {
+            let vectors: Vec<&[f32]> = vs.iter().filter_map(|v| if let strata::value::Value::Vector(v) = v { Some(&v[..]) } else { None }).collect();
+            Ok(AxJson(json!({ "table": table, "field": field, "vectors": vectors })))
+        }
+        _ => Err(ApiError::internal("the text has no vector")),
+    }
 }
 
 /// The file a MEDIA value names, by its SHA-256, for showing it: only a
@@ -1570,13 +1610,104 @@ async fn kube_resume(State(app): State<App>) -> Result<Response, ApiError> {
     Ok(audited(j, format!("resumed the change of the StrataCluster {}/{}, held as {held}", l.namespace, l.name)))
 }
 
+/// `POST /v1/admin/kube/autoscale/dismiss`: the autoscaler's suggestion
+/// is not made; its rules wait their cooldown before they suggest again.
+async fn autoscale_dismiss(State(app): State<App>) -> Result<Response, ApiError> {
+    let l = kube_link(&app)?;
+    let now = l.get().await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
+    let text = now["status"]["autoscale"]["suggestion"]["text"].as_str().unwrap_or_default().to_string();
+    let j = l.dismiss().await.map_err(ApiError::bad)?;
+    Ok(audited(j, format!("dismissed the autoscaler's suggestion for the StrataCluster {}/{}: {text}", l.namespace, l.name)))
+}
+
+/// The steps of load the servers kept since `since_ms` (each log store's
+/// `load`, a row a server a minute), ten minutes each: the busiest
+/// shard's copies, how busy and how many, and the fullest volume. And
+/// the servers that answered.
+async fn load_steps(app: &App, since_ms: u64) -> Result<(Vec<crate::operator::autoscale::Step>, Json), ApiError> {
+    let sql = "SELECT step, shard, SUM(busy), COUNT(*), MIN(minute), MAX(minute), MAX(disk_used_ratio) FROM load \
+               WHERE ts > :since AND role IN ('primary', 'replica', 'standalone') GROUP BY step, shard LIMIT 10000";
+    let params = strata::query::Params::new().set("since", strata::value::Value::Timestamp(since_ms as i64 * 1000));
+    let timeout = app.svc.timeout_of(0);
+    let store = app.svc.log_store.as_ref();
+    let j = match &app.svc.backend {
+        crate::service::Backend::Cluster(c) => crate::logstore::cluster_query(store, c, sql, &params, timeout).await?,
+        _ => {
+            let store = store.ok_or_else(crate::logstore::none_here)?;
+            let (rs, ms) = store.query(sql, &params, false, timeout).await?;
+            let mut j = js::result(&rs, ms);
+            j["nodes"] = json!([{"node": store.options().node, "rows": rs.rows.len(), "ms": ms}]);
+            j
+        }
+    };
+    // By step: (busy, copies) of each shard, and the fullest volume.
+    let mut by: std::collections::BTreeMap<u64, (f64, f64, Option<f64>)> = Default::default();
+    for r in j["rows"].as_array().into_iter().flatten() {
+        let (Some(step), Some(sum), Some(n)) = (r[0].as_u64(), r[2].as_f64(), r[3].as_f64()) else { continue };
+        let minutes = (r[5].as_f64().unwrap_or(0.0) - r[4].as_f64().unwrap_or(0.0) + 1.0).max(1.0);
+        let (busy, copies) = (sum / n.max(1.0), n / minutes);
+        let e = by.entry(step).or_insert((f64::MIN, 0.0, None));
+        if busy > e.0 {
+            (e.0, e.1) = (busy, copies);
+        }
+        if let Some(d) = r[6].as_f64() {
+            e.2 = Some(e.2.map_or(d, |x: f64| x.max(d)));
+        }
+    }
+    let steps = by.into_iter().map(|(step, (busy, copies, full))| crate::operator::autoscale::Step { at_ms: step * 600_000, busy, copies, full }).collect();
+    Ok((steps, j["nodes"].clone()))
+}
+
+/// `POST /v1/admin/autoscale/replay {"autoscale": rules, "days"?}`: the
+/// rules ([`crate::operator::autoscale`]) on the load the servers kept of
+/// the last `days` (7 at most, the log stores' retention): how busy the
+/// copies would have been, how many there would have been, and each
+/// change, beside the cluster at its size. Nothing is changed. The sizes
+/// it starts from are the `StrataCluster`'s, or the cluster's as it is,
+/// or `sizes` (`{replicas, shards, volume}`).
+async fn autoscale_replay(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+    use crate::operator::autoscale::{replay, Autoscale, Sizes};
+    let rules: Autoscale = serde_json::from_value(b.get("autoscale").cloned().unwrap_or(json!({}))).map_err(|e| ApiError::bad(format!("autoscale: {e}")))?;
+    rules.check().map_err(ApiError::bad)?;
+    let days = b.get("days").and_then(Json::as_f64).unwrap_or(7.0);
+    if !(days > 0.0 && days <= 7.0) {
+        return Err(ApiError::bad(format!("days is more than 0 and at most 7 (the log stores keep a week), not {days}")));
+    }
+    let spec = match &app.svc.kube {
+        Some(l) => l.get().await.ok().and_then(|c| serde_json::from_value::<crate::operator::Spec>(c["spec"].clone()).ok()),
+        None => None,
+    };
+    let cluster = app.svc.cluster().await;
+    let shards = cluster["shards"].as_array();
+    let given = &b["sizes"];
+    let n = |k: &str| given[k].as_u64().map(|v| v as usize).filter(|v| *v > 0);
+    let start = Sizes {
+        replicas: n("replicas").or(spec.as_ref().map(|s| s.replicas)).or_else(|| shards?.iter().filter_map(|s| s["replicas"].as_array().map(Vec::len)).max()).unwrap_or(1),
+        shards: n("shards").or(spec.as_ref().map(|s| s.shards)).or_else(|| shards.map(Vec::len)).unwrap_or(1).max(1),
+        volume: given["volume"].as_str().map(String::from).or(spec.as_ref().map(|s| s.storage.size.clone())).unwrap_or_else(|| "10Gi".into()),
+    };
+    let now = crate::telemetry::now_ms();
+    // A step a shard a row: at most 10,000 rows.
+    let days = days.min(10_000.0 / (144.0 * start.shards as f64));
+    let since = now.saturating_sub((days * 86_400_000.0) as u64);
+    let (steps, nodes) = load_steps(&app, since).await?;
+    let mut j = replay(&rules, &steps, &start);
+    j["rules"] = json!(rules.said());
+    j["sizes"] = json!({"replicas": start.replicas, "shards": start.shards, "volume": start.volume});
+    j["sinceMs"] = json!(since);
+    j["days"] = json!(days);
+    j["nodes"] = nodes;
+    j["managed"] = json!(spec.is_some());
+    Ok(AxJson(j))
+}
+
 /// An AWS failure: 400 without credentials or for a region that is no
 /// region's name, else 502 (AWS's answer).
 fn aws_error(e: String) -> ApiError {
     ApiError { status: if e.starts_with("no AWS credentials") || e.contains("is not a region") { 400 } else { 502 }, message: e }
 }
 
-/// The AWS view's state: the credentials as far as they may be shown (the
+/// The cloud view's AWS state: the credentials as far as they may be shown (the
 /// key id masked; never the secret nor the session token).
 async fn aws_status(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.aws.status())
@@ -1614,7 +1745,7 @@ async fn aws_regions(State(app): State<App>) -> Result<AxJson<Json>, ApiError> {
 async fn aws_machines(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<AxJson<Json>, ApiError> {
     let region = match q.get("region").filter(|r| !r.is_empty()) {
         Some(r) => r.clone(),
-        None => app.svc.aws.creds().map(|(c, _)| c.region).ok_or_else(|| aws_error("no AWS credentials: save an access key in the AWS view (PUT /v1/admin/aws/credentials)".into()))?,
+        None => app.svc.aws.creds().map(|(c, _)| c.region).ok_or_else(|| aws_error("no AWS credentials: save an access key in the Cloud view (PUT /v1/admin/aws/credentials)".into()))?,
     };
     let fresh = q.get("fresh").is_some_and(|v| v != "0" && v != "false");
     let cat = app.svc.aws.catalog(&region, fresh).await.map_err(aws_error)?;
@@ -1645,6 +1776,204 @@ async fn aws_validate(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result
     let (p, mut j) = aws_planned(&app, b).await?;
     j["validated"] = match app.svc.aws.validate(&p.region, &j["template"]).await {
         Ok(v) => json!({"ok": true, "answer": v}),
+        Err(e) => json!({"ok": false, "error": e}),
+    };
+    Ok(AxJson(j))
+}
+
+/// The clusters the cloud view made ([`crate::cloud::clusters`]), the
+/// newest first, each with where it is, what it has cost so far and how
+/// to reach it.
+async fn cloud_list(State(app): State<App>) -> AxJson<Json> {
+    let list: Vec<Json> = app.svc.clouds.list().iter().map(crate::cloud::clusters::Made::view).collect();
+    AxJson(json!({"clusters": list, "file": app.svc.clouds.file().map(|f| f.display().to_string())}))
+}
+
+async fn cloud_one(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<AxJson<Json>, ApiError> {
+    let m = app.svc.clouds.get(&id).ok_or_else(|| ApiError { status: 404, message: format!("no cluster {id}") })?;
+    Ok(AxJson(m.view()))
+}
+
+/// `{"provider", "plan", "confirm"}`: makes the plan's cluster, which bills
+/// the account until it is deleted. `confirm` is the cluster's name, typed
+/// again. Refused when the account's limit would not start the nodes, or
+/// when the cloud already has a cluster of that name. 202: the cluster is
+/// on its way; `GET` it to follow.
+async fn cloud_create(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    use crate::cloud::clusters::{Made, Phase};
+    let provider = b["provider"].as_str().unwrap_or_default().to_string();
+    let plan = b["plan"].clone();
+    let refuse = |m: String| ApiError { status: 409, message: m };
+    let (j, nodes) = match provider.as_str() {
+        "aws" => {
+            let (p, j) = aws_planned(&app, plan).await?;
+            let (needs, may) = (j["quota"]["needs"].as_f64().unwrap_or(0.0), j["quota"]["vcpus"].as_f64());
+            if may.is_some_and(|q| needs > q) {
+                return Err(refuse(format!("the nodes need {needs} vCPUs of {} instances and the account may run {} in {}: ask AWS for more first (Service Quotas)", j["quota"]["kind"].as_str().unwrap_or("standard"), may.unwrap_or(0.0), p.region)));
+            }
+            if let Some(s) = app.svc.aws.stack(&p.region, j["stack"].as_str().unwrap_or_default()).await.map_err(aws_error)? {
+                if s.status != "DELETE_COMPLETE" {
+                    return Err(refuse(format!("{} already has a stack named {} ({}): pick another name", p.region, j["stack"].as_str().unwrap_or_default(), s.status)));
+                }
+            }
+            (j, p.nodes)
+        }
+        "digitalocean" => {
+            let p: crate::digitalocean::plan::Plan = serde_json::from_value(plan).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+            let cat = app.svc.digitalocean.catalog(&p.region, true).await.map_err(do_error)?;
+            let j = crate::digitalocean::plan::plan(&p, &cat).map_err(ApiError::bad)?;
+            let q = &j["quota"];
+            if let (Some(limit), Some(running)) = (q["droplets"].as_u64(), q["running"].as_u64()) {
+                if running + u64::from(p.nodes) > limit {
+                    return Err(refuse(format!("the nodes need {} droplets and the account runs {running} of its {limit}: ask DigitalOcean for more first", p.nodes)));
+                }
+            }
+            if app.svc.digitalocean.cluster_named(j["cluster_name"].as_str().unwrap_or_default()).await.map_err(do_error)?.is_some() {
+                return Err(refuse(format!("the account already has a cluster named {}: pick another name", j["cluster_name"].as_str().unwrap_or_default())));
+            }
+            (j, p.nodes)
+        }
+        _ => return Err(ApiError::bad("provider is aws or digitalocean")),
+    };
+    let cluster = j["cluster_name"].as_str().unwrap_or_default().to_string();
+    if b["confirm"].as_str() != Some(cluster.as_str()) {
+        return Err(ApiError::bad(format!("confirm is the cluster's name, {cluster}, typed again: making it bills the account until it is deleted")));
+    }
+    let who = who(w);
+    let now = crate::operator::now_ms();
+    let m = Made {
+        id: format!("{provider}-{cluster}-{now}"),
+        provider: provider.clone(),
+        name: j["cluster"]["name"].as_str().map(str::to_string).unwrap_or_else(|| cluster.trim_start_matches("strata-").to_string()),
+        cluster: cluster.clone(),
+        region: j["region"].as_str().unwrap_or_default().to_string(),
+        machine: j["machine"]["type"].as_str().or(j["machine"]["name"].as_str()).unwrap_or_default().to_string(),
+        nodes,
+        cost_hour: j["cost"]["hour"].as_f64().unwrap_or(0.0),
+        by: who.name.clone(),
+        created_ms: now,
+        phase: Phase::Creating,
+        cloud_id: None,
+        request: if provider == "aws" { j["template"].clone() } else { j["request"].clone() },
+        image: j["cluster"]["image"].as_str().unwrap_or(crate::cloud::IMAGE).to_string(),
+        objects: j["objects"].as_array().cloned().unwrap_or_default(),
+        steps: Vec::new(),
+        error: None,
+        strata: Json::Null,
+        progress: None,
+        ready_ms: None,
+        ended_ms: None,
+        generation: 0,
+        tries: 0,
+        checked_ms: 0,
+        deleting_since_ms: None,
+        volumes_gone: false,
+        delete_asked: false,
+    };
+    let m = app.svc.clouds.add(m).map_err(refuse)?;
+    app.svc.clouds.start(app.svc.aws.clone(), app.svc.digitalocean.clone());
+    let what = if provider == "aws" { "AWS" } else { "DigitalOcean" };
+    let detail = format!("asked {what} for the cluster {cluster} in {}: {} × {}, ${:.3} an hour", m.region, m.nodes, m.machine, m.cost_hour);
+    let mut r = audited(m.view(), detail);
+    *r.status_mut() = axum::http::StatusCode::ACCEPTED;
+    Ok(r)
+}
+
+/// `{"confirm"}`: deletes a cluster made here: the StrataCluster and its
+/// volumes, then the cloud's cluster. `confirm` is its name.
+async fn cloud_delete(State(app): State<App>, w: Option<axum::Extension<Principal>>, axum::extract::Path(id): axum::extract::Path<String>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let m = app.svc.clouds.get(&id).ok_or_else(|| ApiError { status: 404, message: format!("no cluster {id}") })?;
+    if b["confirm"].as_str() != Some(m.cluster.as_str()) {
+        return Err(ApiError::bad(format!("confirm is the cluster's name, {}, typed again: deleting it deletes its data", m.cluster)));
+    }
+    let who = who(w);
+    let m = app.svc.clouds.delete(&id, &who.name).map_err(|e| ApiError { status: 409, message: e })?;
+    app.svc.clouds.start(app.svc.aws.clone(), app.svc.digitalocean.clone());
+    let detail = format!("deleting the cluster {} on {} in {}", m.cluster, if m.provider == "aws" { "AWS" } else { "DigitalOcean" }, m.region);
+    let mut r = audited(m.view(), detail);
+    *r.status_mut() = axum::http::StatusCode::ACCEPTED;
+    Ok(r)
+}
+
+/// Forgets a cluster that is deleted, or that failed before the cloud
+/// made anything; 409 while it may still bill.
+async fn cloud_forget(State(app): State<App>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
+    let m = app.svc.clouds.forget(&id).map_err(|e| ApiError { status: if e.starts_with("no cluster") { 404 } else { 409 }, message: e })?;
+    Ok(audited(json!({"forgot": m.view()}), format!("forgot the cluster {} ({:?})", m.cluster, m.phase)))
+}
+
+/// A DigitalOcean failure: 400 without a token or for a region that is no
+/// region's name, else 502 (DigitalOcean's answer).
+fn do_error(e: String) -> ApiError {
+    ApiError { status: if e.starts_with("no DigitalOcean token") || e.contains("is not a region") || e.starts_with("DOKS does not run") { 400 } else { 502 }, message: e }
+}
+
+/// The cloud view's DigitalOcean state: the token as far as it may be
+/// shown (masked).
+async fn do_status(State(app): State<App>) -> AxJson<Json> {
+    AxJson(app.svc.digitalocean.status())
+}
+
+/// `{"token"}`: checked with DigitalOcean (`GET /v2/account`), then kept on
+/// this server. Answers whose it is.
+async fn do_save(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let token = b["token"].as_str().ok_or_else(|| ApiError::bad("the body is {\"token\": \"dop_v1_...\"}"))?.to_string();
+    let masked = crate::aws::mask(token.trim());
+    let who = who(w);
+    let a = app.svc.digitalocean.set(token, &who.name).await.map_err(|e| ApiError { status: if e.starts_with("write ") { 500 } else { 400 }, message: e })?;
+    let mut j = app.svc.digitalocean.status();
+    j["account"] = json!(a);
+    Ok(audited(j, format!("saved the DigitalOcean token {masked} (team {}, account {})", a.team, a.uuid)))
+}
+
+async fn do_forget(State(app): State<App>) -> Result<Response, ApiError> {
+    let was = app.svc.digitalocean.forget().map_err(ApiError::internal)?;
+    let detail = match &was {
+        Some(k) => format!("forgot the DigitalOcean token {k}"),
+        None => "forgot the DigitalOcean token (none was saved)".into(),
+    };
+    Ok(audited(json!({"forgot": was, "status": app.svc.digitalocean.status()}), detail))
+}
+
+async fn do_regions(State(app): State<App>) -> Result<AxJson<Json>, ApiError> {
+    Ok(AxJson(json!({"regions": app.svc.digitalocean.regions().await.map_err(do_error)?})))
+}
+
+/// `?region=` (default nyc3), `&fresh=1` to fetch again: the sizes a DOKS
+/// node may be there with their prices, DOKS's versions and the account's
+/// droplets.
+async fn do_machines(State(app): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<AxJson<Json>, ApiError> {
+    let region = q.get("region").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| "nyc3".into());
+    let fresh = q.get("fresh").is_some_and(|v| v != "0" && v != "false");
+    let cat = app.svc.digitalocean.catalog(&region, fresh).await.map_err(do_error)?;
+    let mut j = json!(&*cat);
+    let recommended: Vec<&str> = crate::digitalocean::recommended(&cat.machines).iter().map(|m| m.name.as_str()).collect();
+    j["recommended"] = json!(recommended);
+    Ok(AxJson(j))
+}
+
+/// A plan of a cluster on DOKS ([`crate::digitalocean::plan`]). Creates
+/// nothing.
+async fn do_plan(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<AxJson<Json>, ApiError> {
+    let p: crate::digitalocean::plan::Plan = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+    let cat = app.svc.digitalocean.catalog(&p.region, false).await.map_err(do_error)?;
+    Ok(AxJson(crate::digitalocean::plan::plan(&p, &cat).map_err(ApiError::bad)?))
+}
+
+/// The plan, and DigitalOcean's answers now: the account, the region,
+/// the size, the version and the droplet limit, fetched again. Creates
+/// nothing.
+async fn do_validate(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<AxJson<Json>, ApiError> {
+    let p: crate::digitalocean::plan::Plan = serde_json::from_value(b).map_err(|e| ApiError::bad(format!("a plan: {e}")))?;
+    let d = &app.svc.digitalocean;
+    let cat = d.catalog(&p.region, true).await.map_err(do_error)?;
+    let mut j = crate::digitalocean::plan::plan(&p, &cat).map_err(ApiError::bad)?;
+    let token = d.token().map(|(t, _)| t).ok_or_else(|| do_error("no DigitalOcean token".into()))?;
+    j["validated"] = match d.account(&token).await {
+        Ok(a) => {
+            let checks = crate::digitalocean::plan::checks(&p, &cat, &a.status);
+            json!({"ok": checks.iter().all(|c| c["ok"] == true), "checks": checks})
+        }
         Err(e) => json!({"ok": false, "error": e}),
     };
     Ok(AxJson(j))
