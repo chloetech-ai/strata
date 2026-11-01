@@ -2406,15 +2406,13 @@ impl Coordinator {
     }
 
     /// Creates every table the cluster serves on a new server, `c`, which
-    /// serves the first table already, and with `profiles` its rank
-    /// profiles. A server that is to follow a primary is given no
-    /// profile: a profile is a numbered write, which would make its
-    /// history differ from its primary's, which ships its profiles.
-    async fn copy_catalog(&self, url: &str, c: &mut Client, profiles: bool) -> Result<(), ApiError> {
+    /// serves the first table already, and its rank profiles. Only a
+    /// server that no primary ships to is given them: each is a numbered
+    /// write, which would make a replica's history differ from its
+    /// primary's, which ships its tables and profiles.
+    async fn copy_catalog(&self, url: &str, c: &mut Client) -> Result<(), ApiError> {
         let mut statements: Vec<String> = self.catalog().iter().skip(1).map(|t| strata::query::ddl::create_sql(t).replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)).collect();
-        if profiles {
-            statements.extend(self.rank_profiles().iter().map(|(t, p)| profile_sql(t, p)));
-        }
+        statements.extend(self.rank_profiles().iter().map(|(t, p)| profile_sql(t, p)));
         for sql in statements {
             let r = pb::WriteRequest { sql: sql.clone(), ..Default::default() };
             c.write(r).await.map_err(|s| ApiError { status: ApiError::from(s.clone()).status, message: format!("{url}: {sql}: {}", s.message()) })?;
@@ -2425,8 +2423,8 @@ impl Coordinator {
     /// Adds a shard served by `servers` (gRPC URLs; the first is its
     /// primary and ships to the others), holding no slot until slots move
     /// to it. Each must be new: protocol 9, no rows, no cluster map, the
-    /// cluster's first table. It is given the cluster's other tables and
-    /// rank profiles first.
+    /// cluster's first table. Its primary is given the cluster's other
+    /// tables and rank profiles first, which it ships to the others.
     pub async fn add_shard(&self, servers: Vec<String>, acks: Acks) -> Result<Json, ApiError> {
         if servers.is_empty() {
             return Err(ApiError::bad("a shard needs at least one server"));
@@ -2435,11 +2433,7 @@ impl Coordinator {
         for url in &servers {
             clients.push(self.admit(url, false).await?.0);
         }
-        // Tables before replication: a primary ships rows and rank
-        // profiles, not tables.
-        for (k, (url, c)) in servers.iter().zip(clients.iter_mut()).enumerate() {
-            self.copy_catalog(url, c, k == 0).await?;
-        }
+        self.copy_catalog(&servers[0], &mut clients[0]).await?;
         if servers.len() > 1 {
             for (url, c) in servers.iter().zip(clients.iter_mut()).skip(1) {
                 configure(c, url, pb::Role::Replica, Vec::new(), None).await?;
@@ -2479,7 +2473,7 @@ impl Coordinator {
             (None, _) => return Err(ApiError::bad(format!("shard {i}'s servers do not replicate (each takes every write): a replica needs a primary to follow; serve the shard from one server first"))),
         };
         let primary = rs[k].clone();
-        self.copy_catalog(url, &mut c, false).await?;
+        // Its tables come with the copy of the primary it is sent.
         configure(&mut c, url, pb::Role::Replica, Vec::new(), None).await?;
         let mut pc = primary.client.clone();
         let mut replicas: Vec<String> = rs.iter().filter(|r| r.url != primary.url).map(|r| r.url.clone()).collect();

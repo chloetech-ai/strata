@@ -282,7 +282,7 @@ async fn replicas_join_and_leave_a_shard() {
 
     // A second replica, added to a shard that replicates already.
     let r1db = create(d, "r1.strata", |_| false);
-    let (_, u_r1) = serve(r1db.clone(), d, "r1.strata").await;
+    let (r1, u_r1) = serve(r1db.clone(), d, "r1.strata").await;
     let j = a.add_replica(0, &u_r1, false).await.unwrap();
     assert_eq!(j["replicas"], serde_json::json!([u_r0.clone(), u_r1.clone()]));
     until("the second replica catches up", || async { r1db.snapshot().n_live_docs() == mine.len() as u64 - 1 }).await;
@@ -315,6 +315,33 @@ async fn replicas_join_and_leave_a_shard() {
     assert_eq!((r2.role(), shards[1].role()), (pb::Role::Primary, pb::Role::Replica));
     sql(&svc_a, &format!("DELETE FROM products WHERE id = '{}'", all.iter().find(|id| !mine.contains(id)).unwrap())).await.unwrap();
     assert_eq!(ids(&svc_a).await.len(), N - 2);
+
+    // A table made through the coordinator reaches each shard's replica,
+    // in order with the rows written to it (shard 1's primary is the one
+    // just handed over); a replica that joins later gets it with its copy
+    // of the primary. (No notes while a replica catching up refuses
+    // reads.)
+    let notes = |svc: Arc<Service>| async move {
+        let Ok(a) = svc.query(QueryReq { sql: "SELECT id FROM notes LIMIT 1000".into(), ..Default::default() }).await else { return Vec::new() };
+        let mut v: Vec<String> = a.rs.rows.iter().map(|r| r[0].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    sql(&svc_a, "CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT)").await.unwrap();
+    let values: Vec<String> = (0..20).map(|i| format!("('n{i:02}', 'note {i}')")).collect();
+    sql(&svc_a, &format!("INSERT INTO notes (id, body) VALUES {}", values.join(", "))).await.unwrap();
+    assert_eq!(notes(svc_a.clone()).await.len(), 20);
+    for (primary, replica, rdb) in [(&shards[0], &r1, &r1db), (&r2, &shards[1], &r2db)] {
+        assert_eq!(rdb.catalog(), primary.catalog(), "the replica made the table");
+        until("the replica holds its shard's notes", || async { notes(replica.clone()).await == notes(primary.clone()).await }).await;
+    }
+    let r3db = create(d, "r3.strata", |_| false);
+    let (r3, u_r3) = serve(r3db.clone(), d, "r3.strata").await;
+    a.add_replica(1, &u_r3, false).await.unwrap();
+    until("the third replica holds the notes", || async { notes(r3.clone()).await == notes(r2.clone()).await }).await;
+    assert_eq!(r3db.catalog(), r2.catalog(), "its copy brought the table");
+    sql(&svc_a, "DROP TABLE notes").await.unwrap();
+    until("the replicas drop it too", || async { [&r1db, &r3db].iter().all(|db| db.storage().table("notes").is_none()) }).await;
 }
 
 /// `Configure` refuses the changes of part that would lose writes.

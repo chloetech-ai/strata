@@ -10,6 +10,10 @@
 //! ([`strata::storage::Database::apply_shipped`], which checks that each
 //! batch follows its last transaction) and takes no writes from clients,
 //! so that every copy holds the same rows under the same sequence numbers.
+//! A table the primary creates or drops (`CREATE TABLE`, `DROP TABLE`, an
+//! import that makes one) and a rank profile are numbered transactions
+//! too, shipped in order with the rows: a replica makes the same change,
+//! with the primary's table ids.
 //!
 //! A write is answered once the copies `--write-acks` asks for hold it
 //! ([`Acks`]), waiting up to the write's deadline: the primary alone, a
@@ -32,8 +36,8 @@
 //! A replica the primary's log no longer reaches is sent a copy of the
 //! primary (`Restore`): a checkpoint, written beside the primary's
 //! database and streamed in chunks, which the replica writes beside its
-//! own, opens, and puts in place of its rows, numbers and terms in one
-//! commit ([`strata::storage::Database::install_copy`]). It then follows
+//! own, opens, and puts in place of its tables, rows, numbers and terms in
+//! one commit ([`strata::storage::Database::install_copy`]). It then follows
 //! from the copy's last transaction, which the primary's log holds until
 //! the replica has caught up ([`strata::storage::Database::hold_log`]). A
 //! replica whose history differs from the primary's is not copied, and
@@ -1795,7 +1799,7 @@ impl Follow {
         let applied = tokio::task::spawn_blocking(move || {
             let txns: Vec<&[u8]> = txns.iter().map(|t| &t[..]).collect();
             // A flush or a merge may hold the writer for a moment.
-            crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().apply_shipped(prev, &txns).map_err(ApiError::from))
+            crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.apply_shipped(prev, &txns).map_err(ApiError::from))
         })
         .await
         .map_err(ApiError::internal)
@@ -1929,7 +1933,7 @@ impl Follow {
                 return Err(ApiError::bad(format!("the copy is damaged: {what}")));
             }
             // A flush or a merge may hold the writer for a moment.
-            crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.storage().install_copy(&copy).map_err(ApiError::from))
+            crate::service::wait_for_writer(Instant::now() + WRITER_WAIT, || db.install_copy(&copy).map_err(ApiError::from))
         })
         .await
         .map_err(ApiError::internal)??;
