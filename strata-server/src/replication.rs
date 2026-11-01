@@ -632,6 +632,8 @@ pub struct Primary {
     verify_asked: AtomicU64,
     /// Held while it answers a vote ([`Primary::vote`]).
     voting: Mutex<()>,
+    /// It takes no writes before then ([`Primary::hold_writes`]).
+    writes_from: Mutex<Option<Instant>>,
 }
 
 impl Primary {
@@ -699,6 +701,7 @@ impl Primary {
             fenced: AtomicU64::new(0),
             verify_asked: AtomicU64::new(0),
             voting: Mutex::new(()),
+            writes_from: Mutex::new(None),
         });
         for k in 0..p.followers.len() {
             tokio::spawn(ship(Arc::downgrade(&p), k));
@@ -740,8 +743,14 @@ impl Primary {
             .map_err(ApiError::bad)?;
         let kept = Kept { id: self.id.clone(), voted: self.voted(), ..Kept::default() };
         let p = Primary::run_with(self.db.clone(), self.file.as_deref(), kept, opts, followers).map_err(ApiError::internal)?;
+        *p.writes_from.lock().unwrap_or_else(|e| e.into_inner()) = *self.writes_from.lock().unwrap_or_else(|e| e.into_inner());
         tracing::info!(replicas = %p.opts.replicas.join(", "), write_acks = p.opts.acks.name(), "primary: ships to these replicas from now on");
         Ok(p)
+    }
+
+    /// Takes no writes for `d` from now ([`Follow::promote`]).
+    fn hold_writes(&self, d: Duration) {
+        *self.writes_from.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + d);
     }
 
     fn term(&self) -> u64 {
@@ -894,8 +903,10 @@ impl Primary {
     }
 
     /// Whether a write may be applied: not on a primary another replaced
-    /// (409), and with `majority`, while a majority of copies is in sync
-    /// (503), so that a write the copies cannot acknowledge is not applied.
+    /// (409), not while it waits out the lease of the primary it replaced
+    /// by hand (503, [`Follow::promote`]), and with `majority`, while a
+    /// majority of copies is in sync (503), so that a write the copies
+    /// cannot acknowledge is not applied.
     pub fn admit(&self) -> Result<(), ApiError> {
         let fenced = self.fenced.load(Ordering::Relaxed);
         if fenced > 0 {
@@ -903,6 +914,13 @@ impl Primary {
                 "a copy holds term {fenced}, newer than this primary's ({}): another primary replaced this one, which takes no more writes",
                 self.term()
             )));
+        }
+        let from = *self.writes_from.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(wait) = from.and_then(|f| f.checked_duration_since(Instant::now())).filter(|w| !w.is_zero()) {
+            return Err(ApiError {
+                status: 503,
+                message: format!("this primary was promoted by hand, and the primary it replaced may serve reads for {} ms more: it takes writes after that", wait.as_millis()),
+            });
         }
         if self.opts.acks != Acks::Primary {
             let up = 1 + self.followers.iter().filter(|f| f.member() && f.in_sync()).count();
@@ -1433,6 +1451,9 @@ pub struct Follow {
     digests: AtomicU64,
     /// When it started following here, for [`Follow::silent_for`].
     opened: Instant,
+    /// The newest term a copy said it knows, answering its votes: its next
+    /// [`Follow::campaign`] asks above it.
+    heard: AtomicU64,
 }
 
 /// What a copy that won an election holds ([`Follow::campaign`]).
@@ -1444,6 +1465,26 @@ pub struct Elected {
     pub others: Vec<String>,
     /// What each copy answered.
     pub votes: Json,
+}
+
+/// How long a replica promoted by hand (`elected`, none with `force`)
+/// waits before it takes writes, when primaries hold a `lease` on reads:
+/// the primary it replaced serves reads until it learns of the new term or
+/// its lease runs out, and it would serve them without what the new
+/// primary acknowledges. None when every copy that said it serves as the
+/// shard's primary (`primaries`) voted for it: it stepped down then.
+///
+/// Only a handover needs it: on its own, a copy votes once its primary
+/// has been silent for longer than that primary's lease (the failover
+/// delay, of which the lease is three quarters). A copy voting in a
+/// handover may have answered its primary a moment before, so the winner
+/// waits as long: the lease, and a third more for the servers' clocks.
+fn handover_hold(primaries: &[String], elected: Option<&Elected>, lease: Duration) -> Duration {
+    let granted = |url: &String| elected.and_then(|e| e.votes.as_array()).is_some_and(|v| v.iter().any(|j| j["url"] == json!(url) && j["granted"] == json!(true)));
+    match lease.is_zero() || (!primaries.is_empty() && primaries.iter().all(granted)) {
+        true => Duration::ZERO,
+        false => lease + lease / 3,
+    }
 }
 
 /// How recently a replica's primary called for the replica to refuse
@@ -1483,6 +1524,7 @@ impl Follow {
             pinned: Mutex::new(None),
             digests: AtomicU64::new(0),
             opened: Instant::now(),
+            heard: AtomicU64::new(0),
         })
     }
 
@@ -1522,12 +1564,18 @@ impl Follow {
     /// `handover` is a promotion asked by hand. The term it asked for stays
     /// voted in when it loses: copies that granted it refuse the primary
     /// of an older term from then.
+    ///
+    /// It asks for the term after the newest it knows or a copy told it.
+    /// A term in which a minority voted for a candidate that lost is never
+    /// begun, and the copies that did not vote in it never learn it from a
+    /// primary: asked for it again, the copies that voted would refuse it
+    /// every time, and the copies holding the most could never be elected.
     pub async fn campaign(&self, copies: &[String], opts: &PrimaryOptions, handover: bool) -> Result<Elected, ApiError> {
         let (id, newest) = {
             let kept = self.kept.lock().await;
             (kept.id.clone(), kept.newest(self.db.storage().numbering().map_or(0, |n| n.term)))
         };
-        let term = newest + 1;
+        let term = newest.max(self.heard.load(Ordering::Relaxed)) + 1;
         let ask = |pre: bool| {
             let last = self.db.storage().numbering().unwrap_or_default().last();
             let req = pb::VoteRequest { term, candidate: id.clone(), last_seq: last.seq, last_term: last.term, pre, handover };
@@ -1568,6 +1616,7 @@ impl Follow {
                 }
             }
             let need = (others.len() + 1) / 2 + 1;
+            self.heard.fetch_max(newer, Ordering::Relaxed);
             (others, granted, need, newer, Json::Array(said))
         };
         let lost = |round: &str, granted: usize, need: usize, said: &Json| {
@@ -1685,9 +1734,14 @@ impl Follow {
         };
         let mut copies = Vec::new();
         let mut ahead = Vec::new();
+        // The copies that serve as the shard's primary, as they say.
+        let mut primaries = Vec::new();
         for (url, a) in checked.iter().zip(futures::future::join_all(asks).await) {
             copies.push(match a {
                 Ok(h) => {
+                    if h.role() == pb::Role::Primary && h.replaced_by_term == 0 {
+                        primaries.push(url.clone());
+                    }
                     // By its last transaction: a copy that began or follows a
                     // newer term but holds nothing of it holds nothing more.
                     // (A server that does not say its last term, or holds no
@@ -1721,7 +1775,14 @@ impl Follow {
             (false, None, Some(v)) => opts.replicas = self.others(v, &opts).await,
             _ => {}
         }
+        let lease = opts.lease;
         let (p, mut answer) = self.take_over(elected.as_ref().map(|e| e.term), opts).await?;
+        let hold = handover_hold(&primaries, elected.as_ref(), lease);
+        if !hold.is_zero() {
+            p.hold_writes(hold);
+            tracing::info!(ms = hold.as_millis() as u64, "promoted by hand: takes writes once the lease of the primary it replaced has run out");
+            answer["writes_in_ms"] = json!(hold.as_millis() as u64);
+        }
         answer["replicas"] = json!(copies);
         if let Some(e) = elected {
             answer["votes"] = e.votes;
@@ -1986,5 +2047,22 @@ impl Follow {
             Family::one("strata_replica_reads_refused_total", "counter", "Reads refused while this replica caught up, or because it had not applied a write they must see in time.", self.reads_refused.load(Ordering::Relaxed) as f64),
             Family::one("strata_replica_digests_total", "counter", "Digests of its rows this replica computed for its primary to compare (Verify).", self.digests.load(Ordering::Relaxed) as f64),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replica_promoted_by_hand_waits_out_the_lease_of_the_primary_it_replaced() {
+        let lease = Duration::from_millis(750);
+        let elected = |granted: bool| Elected { term: 3, others: vec!["p".into(), "q".into()], votes: json!([{"url": "p", "granted": granted}, {"url": "q", "granted": true}]) };
+        let primaries = ["p".to_string()];
+        assert_eq!(handover_hold(&primaries, Some(&elected(true)), lease), Duration::ZERO, "the primary voted and stepped down");
+        assert_eq!(handover_hold(&primaries, Some(&elected(false)), lease), Duration::from_millis(1000));
+        assert_eq!(handover_hold(&[], Some(&elected(true)), lease), Duration::from_millis(1000), "no copy said it was the primary");
+        assert_eq!(handover_hold(&primaries, None, lease), Duration::from_millis(1000), "forced: no votes");
+        assert_eq!(handover_hold(&primaries, Some(&elected(false)), Duration::ZERO), Duration::ZERO, "no lease, no failover");
     }
 }

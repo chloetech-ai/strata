@@ -7,7 +7,7 @@
 //!
 //! The rules are [`crate::replication`]'s, whose documentation says what
 //! they promise and why; each function here is one of its decisions, with
-//! the same answers and messages, but for the fixes [`super`] lists. What a caller must keep durably before it
+//! the same answers and messages. What a caller must keep durably before it
 //! answers comes back as a [`Kept`] to save; the time is passed in.
 
 use std::time::{Duration, Instant};

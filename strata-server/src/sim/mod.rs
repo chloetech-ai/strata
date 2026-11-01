@@ -90,7 +90,8 @@ pub struct Config {
     /// parts per million.
     pub promote_ppm: u64,
     /// Bugs put back, each as the server had it before the simulator
-    /// found it: a run with one must find it ([`Bug`]).
+    /// found it and the server was fixed: a run with one must find it
+    /// ([`Bug`]).
     pub bugs: Vec<Bug>,
 }
 
