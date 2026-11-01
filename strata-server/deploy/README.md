@@ -49,7 +49,7 @@ kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
 | `writeAcks` | `all` | every primary's `--write-acks` |
 | `tokenSecret` | | a Secret whose key `token` every server and coordinator requires; without it they run with `--no-token`, open to whatever reaches them |
 | `clusterTokenSecret` | | a Secret whose key `token` is the cluster's own token (`--cluster-token`), which the servers and coordinators send each other and clients never hold; with it, the `tokenSecret` token goes to the coordinators alone, as the admin token (the operator's too), and may not make the calls between servers. Needs `tokenSecret` |
-| `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args` | `strata-server:dev` | the servers' image, containers and further arguments |
+| `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args`, `coordinatorArgs` | `strata-server:dev` | the servers' image, containers and further arguments (`args` for every server, `coordinatorArgs` for every coordinator: `--hedge-ms 50`, `--partial`) |
 
 What a change does:
 
@@ -65,16 +65,36 @@ What a change does:
   that answers), then the set shrinks and the pod's volume is deleted.
 - A pod that comes back without its volume (its node was replaced) leaves
   its shard and joins again, and is sent a copy.
+- **New settings for the servers** (`image`, `imagePullPolicy`, `args`,
+  `resources`, `failoverAfterMs`, `writeAcks`, the token Secrets): each
+  StatefulSet's pod template takes them at once, but its pods restart only
+  when the operator says (`updateStrategy: OnDelete`; each pod carries the
+  hash of its settings in the annotation `strata.chloetech.ai/config`).
+  The operator restarts one copy at a time, replicas first: a primary is
+  first handed to a copy in step, one already restarted when there is one,
+  and the next restart waits until every copy is back and caught up with
+  its primary. Every row stays served and every shard keeps taking writes.
+- **New settings for the coordinators** (`coordinatorArgs`,
+  `coordinatorResources`, the image): their Deployment rolls them, one
+  coordinator at a time.
+- **A larger `storage.size`**: each copy's volume claim grows in place,
+  which its storage class must allow (`allowVolumeExpansion: true`); the
+  status says so when it does not. A volume never shrinks (a smaller size
+  is refused), and a new `storageClassName` applies to the volumes made
+  after it.
 - The coordinators' `--shards` list follows the cluster's servers, so that
   a coordinator that starts again finds the cluster; their number follows
   `coordinators`.
 
 The coordinators run as the service account `<cluster>-coordinator`, which
 a Role lets read and patch their own `StrataCluster` and nothing else: the
-command center's **Cluster** view (`kubectl -n strata port-forward svc/demo
-7700`, then `http://127.0.0.1:7700/#/cluster`) shows the operator's phase
-and message and changes the shards, copies per shard and coordinators,
-which the operator then makes as above.
+command center's **Control center** (`kubectl -n strata port-forward
+svc/demo 7700`, then `http://127.0.0.1:7700/#/control`) edits the whole
+spec as a draft, with the operator's plan for it, and applies it, and the
+**Cluster** view shows the operator's phase and message; the operator then
+makes the change as above. Both go through `POST /v1/admin/kube/plan` and
+`POST /v1/admin/kube`, which take `{"spec": {...}}`, a merge patch of the
+spec, checked first.
 
 The operator does not choose primaries: the copies of a shard elect one
 among themselves ([failover](../../docs/strata/server.md#failover)), so a
@@ -99,8 +119,9 @@ strata-server/deploy/kind-test.sh scale 2 2   # back to two, a copy fewer each
 
 Its tests: `tests/operator.rs` runs the same steps with server processes
 standing in for pods (a cluster made, grown, healed and shrunk, every row
-kept), and `tests/operator_kube.rs` makes a cluster's objects on a real API
-server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
+kept, and every copy restarted with new settings one at a time), and
+`tests/operator_kube.rs` makes a cluster's objects, rolls new settings into
+a set and grows its volumes on a real API server (`STRATA_ENVTEST_DIR`: a directory with `etcd` and `kube-apiserver`,
 as `setup-envtest` downloads them).
 
 ## The fixed layout

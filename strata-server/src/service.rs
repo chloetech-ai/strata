@@ -2228,11 +2228,6 @@ impl Service {
                 if matches!(self.backend, Backend::Cluster(_)) && alters.iter().any(|a| matches!(a, Alter::DropField(_))) {
                     return Err(ApiError::bad("ALTER TABLE ... DROP COLUMN does not run through a coordinator yet (its plans name columns by place); ADD COLUMN and RENAME COLUMN do"));
                 }
-                // A primary ships CREATE TABLE and DROP TABLE, but no
-                // replica applies a shipped ALTER TABLE yet.
-                if let (Backend::Local(_), Replication::Primary(_)) = (&self.backend, self.replication()) {
-                    return Err(conflict("ALTER TABLE does not reach replicas yet: change a table's columns before its copies replicate".into()));
-                }
                 true
             }
             Command::Write { .. } => false,

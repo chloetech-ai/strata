@@ -489,7 +489,7 @@ fn a_replica_takes_a_copy_of_its_primary() {
         };
         let lone = Db::create(&dir.path().join("lone.strata"), other(), options(Layout::SingleFile)).unwrap();
         lone.storage().start_seq_no().unwrap();
-        refused(&lone, "the copy's first table (u) is not this database's (t), or their schemas differ");
+        refused(&lone, "the copy's first table (u) is not this database's (t): neither one ALTER TABLE could make of it nor one of the same columns");
         let lone = Db::create(&dir.path().join("lone2.strata"), schema(), options(Layout::SingleFile)).unwrap();
         lone.storage().start_seq_no().unwrap();
         refused(&lone, "the copy is of term 1, older than this database's (2)");
@@ -668,4 +668,181 @@ fn a_replica_keeps_the_vectors_its_primary_pooled() {
 
 fn documents_of(db: &Db) -> Vec<Document> {
     db.documents(&db.snapshot()).map(|d| d.unwrap()).collect()
+}
+
+fn run(db: &Db, sql: &str) {
+    db.sql(sql, &Params::new()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+fn select(db: &Db, sql: &str) -> Vec<Vec<Value>> {
+    db.query(sql, &Params::new()).unwrap_or_else(|e| panic!("{sql}: {e}")).rows
+}
+
+/// An `ALTER TABLE` on a primary that numbers its writes is a numbered
+/// transaction that it ships as it ships a write: a replica gives the
+/// table the same columns under the same field ids, so that the writes
+/// after it, shipped in one batch with it or one at a time, fill the same
+/// columns, and the rows from before read the same defaults; opened
+/// again, it holds them. A database whose table has the same columns by
+/// other changes (other field ids) refuses the change. A replica made
+/// before the changes takes a copy of the primary, as does one made since
+/// with the table's columns as they are now; one whose first table is
+/// neither does not.
+#[test]
+fn a_replica_alters_the_tables_its_primary_alters() {
+    for (pl, rl) in [(Layout::SingleFile, Layout::Directory), (Layout::Directory, Layout::SingleFile)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pp, rp) = (path_for(dir.path(), "primary", pl), path_for(dir.path(), "replica", rl));
+        let primary = Db::create(&pp, schema(), options(pl)).unwrap();
+        let mut replica = Db::create(&rp, schema(), options(rl)).unwrap();
+        for db in [&primary, &replica] {
+            db.create_table(other()).unwrap();
+            db.storage().start_seq_no().unwrap();
+        }
+        let mut rng = StdRng::seed_from_u64(12);
+        for _ in 0..40 {
+            write(&primary, &mut rng, 50);
+        }
+        primary.storage().flush().unwrap();
+        for _ in 0..10 {
+            write(&primary, &mut rng, 50);
+        }
+        assert!(ship(&primary, &replica, usize::MAX) > 0);
+
+        // Two columns in one change, which takes the next number, then rows
+        // and values set in place in them, all in one batch.
+        let at = last(&primary).seq;
+        run(&primary, "ALTER TABLE t ADD COLUMN tag KEYWORD DEFAULT 'old', ADD COLUMN w FLOAT");
+        assert_eq!(last(&primary).seq, at + 1, "{pl:?}: the change takes the next number");
+        run(&primary, "INSERT INTO t (id, n, body, tag, w) VALUES ('z1', 1, 'written after', 'new', 0.5), ('z2', 2, 'also after', NULL, 1.5)");
+        run(&primary, "UPDATE t SET tag = 'set' WHERE n < 300");
+        run(&primary, "ALTER TABLE u ADD COLUMN label KEYWORD");
+        run(&primary, "INSERT INTO u (id, x, label) VALUES (5000, 1.5, 'l')");
+        assert_eq!(ship(&primary, &replica, usize::MAX), 5);
+        same(&primary, &replica, "added");
+        assert_eq!(replica.catalog(), primary.catalog());
+        let olds = "SELECT count(*) FROM t WHERE tag = 'old'";
+        assert!(select(&primary, olds)[0][0].as_i64().unwrap() > 0, "rows from before read the default");
+        assert_eq!(select(&replica, olds), select(&primary, olds));
+        assert_eq!(select(&replica, "SELECT label FROM u WHERE id = 5000"), [[Value::Str("l".into())]]);
+
+        // Renamed and dropped, one transaction at a time.
+        run(&primary, "ALTER TABLE t RENAME COLUMN body TO text");
+        run(&primary, "UPDATE t SET text = 'changed after the rename' WHERE id = 'z1'");
+        run(&primary, "ALTER TABLE t DROP COLUMN w");
+        run(&primary, "INSERT INTO t (id, n, text, tag) VALUES ('z3', 3, 'after the drop', 'new')");
+        assert_eq!(ship(&primary, &replica, 1), 4);
+        same(&primary, &replica, "renamed and dropped");
+        assert_eq!(replica.catalog(), primary.catalog());
+        let z = "SELECT id, text, tag FROM t WHERE id IN ('z1', 'z3') ORDER BY id";
+        assert_eq!(select(&replica, z), select(&primary, z));
+        replica.storage().check().unwrap();
+
+        // Opened again, the replica holds the columns, and follows on.
+        drop(replica);
+        replica = Db::open(&rp, options(rl)).unwrap();
+        assert_eq!(replica.catalog(), primary.catalog());
+        run(&primary, "INSERT INTO t (id, n, text, tag) VALUES ('z4', 4, 'after reopening', 'new')");
+        assert_eq!(ship(&primary, &replica, usize::MAX), 1);
+        same(&primary, &replica, "opened again");
+
+        // The same columns, made by other changes, are not the primary's
+        // table: their field ids differ.
+        let other_dir = tempfile::tempdir().unwrap();
+        let p2 = Db::create(&other_dir.path().join("p2.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        let mut wider = schema().fields;
+        wider.push(Field::new("junk", FieldType::Int));
+        let x = Db::create(&other_dir.path().join("x.strata"), Schema::new("t", wider, Some("id")).unwrap(), options(Layout::SingleFile)).unwrap();
+        run(&x, "ALTER TABLE t DROP COLUMN junk");
+        assert!(x.schema().same_columns(&p2.schema()));
+        for db in [&p2, &x] {
+            db.storage().start_seq_no().unwrap();
+        }
+        run(&p2, "ALTER TABLE t ADD COLUMN tag KEYWORD");
+        let got = txns(p2.storage().log_from(1, usize::MAX));
+        let e = x.storage().apply_shipped(prev(&p2, 0), &[&*got[0].bytes]).unwrap_err().to_string();
+        assert!(e.contains("shipped transaction 1 alters the table with id 0, which this database lacks, cannot alter, or holds with other columns or field ids"), "{e}");
+        assert_eq!(last(&x).seq, 0, "and applies nothing");
+        assert!(x.schema().field("tag").is_none());
+
+        // Copies: to a replica made before the changes, and to one made
+        // since with the table's columns (under new field ids); both then
+        // hold the primary's ids, and follow on.
+        let to = path_for(dir.path(), "copy", Layout::SingleFile);
+        primary.storage().checkpoint(&to, &CheckpointOptions::default()).unwrap();
+        let copy = Db::open(&to, options(Layout::SingleFile)).unwrap();
+        let now = primary.storage().table("t").unwrap();
+        let cols = now.fields.iter().cloned().map(|mut f| {
+            f.id = strata::schema::NO_ID;
+            f.added = None;
+            f
+        });
+        let fresh = Schema::new("t", cols.collect(), Some("id")).unwrap();
+        assert!(fresh.same_columns(&now) && fresh != *now);
+        let mut copies = Vec::new();
+        for (name, first) in [("r2", schema()), ("r3", fresh)] {
+            let r = Db::create(&path_for(dir.path(), name, rl), first, options(rl)).unwrap();
+            r.storage().start_seq_no().unwrap();
+            assert_eq!(r.install_copy(copy.storage()).unwrap(), last(&primary), "{name}");
+            assert_eq!(r.catalog(), primary.catalog(), "{name}");
+            same(&primary, &r, name);
+            copies.push(r);
+        }
+        run(&primary, "INSERT INTO t (id, n, text, tag) VALUES ('z5', 5, 'after the copies', 'new')");
+        for r in &copies {
+            assert_eq!(ship(&primary, r, usize::MAX), 1);
+            same(&primary, r, "shipped after a copy");
+            r.storage().check().unwrap();
+        }
+        let odd = Schema::new("t", vec![Field::new("id", FieldType::Keyword), Field::new("n", FieldType::Float)], Some("id")).unwrap();
+        let r = Db::create(&path_for(dir.path(), "odd", rl), odd, options(rl)).unwrap();
+        r.storage().start_seq_no().unwrap();
+        let e = r.install_copy(copy.storage()).unwrap_err().to_string();
+        assert!(e.contains("the copy's first table (t) is not this database's (t): neither one ALTER TABLE could make of it nor one of the same columns"), "{e}");
+    }
+}
+
+/// Ships what `replica` lacks of `primary`'s log in one batch, through
+/// `Db::apply_shipped` (which keeps the replica's models); returns how
+/// many transactions it shipped.
+fn ship_to_db(primary: &Db, replica: &Db) -> usize {
+    let at = last(replica);
+    let got = txns(primary.storage().log_from(at.seq + 1, usize::MAX));
+    let bytes: Vec<&[u8]> = got.iter().map(|t| &*t.bytes).collect();
+    replica.apply_shipped(prev(primary, at.seq), &bytes).unwrap();
+    got.len()
+}
+
+/// A replica's models follow the columns of a table its primary altered,
+/// as the primary's do: a renamed embedded column keeps its model (the
+/// same one, not opened again), an added one gets its own, and a dropped
+/// one loses it.
+#[test]
+fn a_replica_s_models_follow_its_primary_s_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir(&models).unwrap();
+    let primary = Db::create(&dir.path().join("p.strata"), schema(), options(Layout::SingleFile)).unwrap();
+    let replica = Db::create(&dir.path().join("r.strata"), schema(), options(Layout::SingleFile)).unwrap();
+    for db in [&primary, &replica] {
+        run(db, "ALTER TABLE t ADD COLUMN emb VECTOR OPTIONS(embed = 'body', model = 'hash:8', index = 'flat')");
+        assert!(db.open_embedders(&models).is_empty());
+        db.storage().start_seq_no().unwrap();
+    }
+    assert_eq!(replica.catalog(), primary.catalog());
+    let model = replica.embedder_in("t", "emb").unwrap();
+    run(&primary, "INSERT INTO t (id, n, body) VALUES ('a', 1, 'red apple')");
+    run(&primary, "ALTER TABLE t RENAME COLUMN emb TO vec, RENAME COLUMN body TO text");
+    run(&primary, "ALTER TABLE t ADD COLUMN emb2 VECTOR OPTIONS(embed = 'text', model = 'hash:4', index = 'flat')");
+    assert_eq!(ship_to_db(&primary, &replica), 3);
+    assert_eq!(replica.catalog(), primary.catalog());
+    assert!(Arc::ptr_eq(&replica.embedder_in("t", "vec").unwrap(), &model), "the renamed column keeps its model");
+    assert!(replica.embedder_in("t", "emb").is_none());
+    assert_eq!(replica.embedder_in("t", "emb2").map(|m| m.dim()), Some(4));
+    let q = "SELECT vec FROM t WHERE id = 'a'";
+    assert_eq!(select(&replica, q), select(&primary, q));
+    run(&primary, "ALTER TABLE t DROP COLUMN emb2");
+    assert_eq!(ship_to_db(&primary, &replica), 1);
+    assert!(replica.embedder_in("t", "emb2").is_none());
+    assert!(Arc::ptr_eq(&replica.embedder_in("t", "vec").unwrap(), &model));
 }

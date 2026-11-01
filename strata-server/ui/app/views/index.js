@@ -2,12 +2,15 @@
 
 import overview from "./overview.js";
 import topology from "./topology.js";
+import fleet from "./fleet.js";
+import querypath from "./querypath.js";
 import performance from "./performance.js";
 import alerts from "./alerts.js";
 import queries from "./queries.js";
 import profile from "./profile.js";
 import logs from "./logs.js";
 import cluster from "./cluster.js";
+import control from "./control.js";
 import access from "./access.js";
 import system from "./system.js";
 import sql from "./sql.js";
@@ -23,4 +26,4 @@ import graph from "./graph.js";
 import classic from "./classic.js";
 
 export const GROUPS = ["Monitor", "Workload", "Data", "Tune", "Explore", "Admin", "More"];
-export const VIEWS = [overview, topology, performance, alerts, queries, profile, logs, sql, builder, schema, importer, relevance, recsys, sid, autocomplete, media, graph, cluster, access, system, classic];
+export const VIEWS = [overview, topology, fleet, querypath, performance, alerts, queries, profile, logs, sql, builder, schema, importer, relevance, recsys, sid, autocomplete, media, graph, control, cluster, access, system, classic];

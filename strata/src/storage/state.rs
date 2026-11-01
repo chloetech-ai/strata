@@ -490,7 +490,7 @@ impl State {
             },
             // Never logged: a change of tables is a version of its own
             // (`Database::change_tables`).
-            Op::Table { .. } => debug_assert!(false, "a change of tables applied as a write"),
+            Op::Table { .. } | Op::Alter { .. } => debug_assert!(false, "a change of tables applied as a write"),
             Op::Profile { name, def } => {
                 let profiles = Arc::make_mut(&mut self.tables[t].profiles);
                 profiles.retain(|p| !p.name.eq_ignore_ascii_case(&name));

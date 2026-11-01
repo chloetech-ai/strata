@@ -41,7 +41,8 @@ function render(page) {
   const kubeBox = h("div"), sumBox = h("div"), shardsBox = h("div"), movesBox = h("div"), addBox = h("div"), setupBox = h("div");
   let kube = null, moves = null, movesErr = null;
   page.append(
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Cluster"), h("p", {}, "The shards, their copies and the slots each holds: add, remove, hand over and move them while the cluster serves."))),
+    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Cluster"), h("p", {}, "The shards, their copies and the slots each holds: add, remove, hand over and move them while the cluster serves.")),
+      isCoordinator() ? h("a", { class: "btn sm", href: "#/control" }, icon("sliders"), "Plan a change in the Control center") : null),
     kubeBox, sumBox, shardsBox, movesBox, addBox, setupBox);
 
   const managed = () => !!kube?.managed;
@@ -103,7 +104,7 @@ function render(page) {
       h("div", { class: "row", style: { gap: "14px", alignItems: "flex-end", flexWrap: "wrap" } },
         h("label", { class: "f" }, "Shards", shards), h("label", { class: "f" }, "Copies per shard", replicas), h("label", { class: "f" }, "Coordinators", coords), apply),
       h("dl", { class: "kv" }, [["image", sp.image || "strata-server:dev"], ["volume", sp.storage?.size || "10Gi"], ["failover after", sp.failoverAfterMs === 0 ? "by hand" : fmt.ms(sp.failoverAfterMs ?? 3000)], ["write acks", sp.writeAcks || "all"], ["token", sp.tokenSecret ? "Secret " + sp.tokenSecret : "none (open to the cluster's network)"], ["cluster token", sp.clusterTokenSecret ? "Secret " + sp.clusterTokenSecret : "the token"]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])));
-    clear(kubeBox, card({ title: "Kubernetes", sub: `StrataCluster ${kube.namespace}/${kube.name}: the operator makes what you change here, one step at a time`, attrs: { style: { marginBottom: "14px" } }, body: kubeForm }));
+    clear(kubeBox, card({ title: "Kubernetes", sub: `StrataCluster ${kube.namespace}/${kube.name}: the operator makes what you change here, one step at a time`, tools: h("a", { class: "btn sm", href: "#/control", title: "Every setting of the StrataCluster, with the operator's plan" }, icon("sliders"), "Control center"), attrs: { style: { marginBottom: "14px" } }, body: kubeForm }));
   }
 
   // ------------------------------------------------------------ the shards

@@ -1155,10 +1155,12 @@ impl Database {
 
     /// Makes the change of tables `ops` (each an [`Op::Table`]: a schema
     /// for the table to create with that id, `None` to drop the table with
-    /// that id) in one version, under the writer lock. A drop removes the
-    /// references the tables left standing hold to the dropped ones, and
-    /// the memtables are flushed first, so that no logged write outlives
-    /// its table.
+    /// that id; or an [`Op::Alter`]: the schema `ALTER TABLE` made of that
+    /// of the table with that id, which must be its schema) in one version, under the writer lock. A drop
+    /// removes the references the tables left standing hold to the dropped
+    /// ones, and the memtables are flushed first, so that no logged write
+    /// outlives its table, nor one that names an altered table's columns
+    /// by their old places.
     ///
     /// In a database that numbers its writes, the change is a numbered
     /// transaction too, of the next number (`seq`, which a replica passes
@@ -1178,7 +1180,12 @@ impl Database {
             return Err(corrupt(format!("a change of tables numbered {seq:?} here, whose next number is {next:?}")));
         }
         let dropped: Vec<u32> = ops.iter().filter(|(_, op)| matches!(op, Op::Table { def: None })).map(|(id, _)| *id).collect();
-        if next.is_some() || !dropped.is_empty() {
+        // The altered tables, as they were.
+        let altered: Vec<(u32, Arc<Schema>)> = {
+            let st = lock(&self.state);
+            ops.iter().filter(|(_, op)| matches!(op, Op::Alter { .. })).filter_map(|(id, _)| st.tables.iter().find(|t| t.id == *id).map(|t| (*id, t.schema.clone()))).collect()
+        };
+        if next.is_some() || !dropped.is_empty() || !altered.is_empty() {
             self.flush_locked(wal)?;
             if !wal.is_empty() {
                 // Only transactions the segments already hold can be left.
@@ -1196,7 +1203,15 @@ impl Database {
                     vw.manifest.tables.push(TableMeta { id: *id, schema: (**schema).clone(), segments: Vec::new(), profiles: Vec::new() });
                 }
                 Op::Table { def: None } => vw.drop_table(*id),
-                _ => return Err(Error::Schema("a change of tables holds only table defs".into())),
+                Op::Alter { was, def } => {
+                    // Its columns keep their ids.
+                    def.check_ids()?;
+                    match vw.manifest.tables.iter_mut().find(|t| t.id == *id) {
+                        Some(t) if t.schema == **was => t.schema = (**def).clone(),
+                        _ => return Err(Error::Schema(format!("no table with id {id} and the schema altered"))),
+                    }
+                }
+                _ => return Err(Error::Schema("a change of tables holds only table defs and alters".into())),
             }
         }
         for t in vw.manifest.tables.iter_mut() {
@@ -1209,11 +1224,12 @@ impl Database {
         if let (Some(s), Some(n)) = (next, vw.manifest.seq_no.as_mut()) {
             n.seq = n.seq.max(s.seq);
         }
+        let altered: Vec<(u32, Arc<Schema>, Schema)> = altered.into_iter().filter_map(|(id, was)| vw.manifest.table(id).map(|t| (id, was, t.schema.clone()))).collect();
         let txn = vw.txn;
         let before = lock(&self.state).manifest.format();
         let c = vw.commit(wal)?;
         self.publish(c, |st| {
-            if !dropped.is_empty() {
+            if !dropped.is_empty() || !altered.is_empty() {
                 st.live_cache.clear();
                 st.updates_cache.clear();
             }
@@ -1230,6 +1246,20 @@ impl Database {
             // slots hold the older format.
             let c = VersionWriter::begin(self).commit(wal)?;
             self.publish(c, |_| {})?;
+        }
+        if !altered.is_empty() {
+            // Codebooks are kept by the position of their field.
+            let mut coded = self.codebooks.write().unwrap_or_else(|e| e.into_inner());
+            coded.retain_mut(|c| {
+                let Some((_, was, now)) = altered.iter().find(|(id, _, _)| *id == c.table) else { return true };
+                match was.fields.get(c.field).and_then(|f| now.position_of(f.id)) {
+                    Some(p) => {
+                        c.field = p;
+                        true
+                    }
+                    None => false,
+                }
+            });
         }
         self.committed(next);
         Ok(())
@@ -1450,7 +1480,10 @@ impl Database {
     /// [`Database::drop_tables`]) is made here too, with the primary's
     /// table ids, so that the writes after it find their tables; one that
     /// creates a table this database has (by id or name) or drops one it
-    /// lacks is refused with the rest of the batch.
+    /// lacks is refused with the rest of the batch. So is an
+    /// [`Database::alter_table`] it made of a table this database lacks, or
+    /// holds with another schema than the primary's before the change
+    /// (other columns, or the same under other field ids).
     pub fn apply_shipped(&self, prev: SeqNo, txns: &[&[u8]]) -> Result<Applied> {
         let now = || self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()));
         // None: a primary asks the last transaction, which needs no writer
@@ -1471,7 +1504,7 @@ impl Database {
         // Writes fit the tables as the changes of tables before them in the
         // batch leave them; those changes are checked below.
         let fits = |schemas: &[(u32, Arc<Schema>)], table: u32, op: &Op| match op {
-            Op::Table { .. } => true,
+            op if op.changes_tables() => true,
             _ => schemas.iter().find(|(id, _)| *id == table).is_some_and(|(_, s)| op_fits(s, op)),
         };
         let mut shipped = Vec::with_capacity(txns.len());
@@ -1491,7 +1524,7 @@ impl Database {
                 )));
             }
             at = s;
-            if t.ops.iter().any(|(_, op)| matches!(op, Op::Table { .. })) {
+            if t.ops.iter().any(|(_, op)| op.changes_tables()) {
                 let differs = |what: String| Error::Schema(format!("shipped transaction {} {what}: this database is not a copy of its primary's", s.seq));
                 for (id, op) in &t.ops {
                     let system = *id == 0 || *id == SOURCES_ID;
@@ -1508,6 +1541,13 @@ impl Database {
                             }
                             schemas.retain(|(i, _)| i != id);
                         }
+                        // The table as this database holds it, field ids
+                        // included: columns kept under another id here
+                        // would read the primary's ids as columns missing.
+                        Op::Alter { was, def } => match schemas.iter_mut().find(|(i, _)| i == id) {
+                            Some((_, s)) if *id != SOURCES_ID && **s == **was && def.check_ids().is_ok() && def.follows(was) => *s = def.clone(),
+                            _ => return Err(differs(format!("alters the table with id {id}, which this database lacks, cannot alter, or holds with other columns or field ids"))),
+                        },
                         _ => return Err(corrupt(format!("shipped transaction {} changes tables along with rows", s.seq))),
                     }
                 }
@@ -1526,7 +1566,7 @@ impl Database {
                     break;
                 }
             }
-            if ops.iter().any(|(_, op)| matches!(op, Op::Table { .. })) {
+            if ops.iter().any(|(_, op)| op.changes_tables()) {
                 if let Err(e) = self.change_tables(&mut wal, ops, Some(s)) {
                     failed = Some(e);
                     break;
@@ -1601,7 +1641,10 @@ impl Database {
     /// installs nothing. The copy's tables replace this database's, with
     /// the copy's ids, so that the transactions shipped after it find
     /// theirs: tables only this database has are dropped. Both must number
-    /// their writes and have the same first table (name and schema), and
+    /// their writes, the copy's first table must be this database's, one
+    /// `ALTER TABLE` could have made of it ([`Schema::follows`]), or one of
+    /// the same columns ([`Schema::same_columns`]: a replica made to join a
+    /// shard after the table was altered), and
     /// the copy's term must not be older than this database's: a copy of a
     /// replaced primary is refused. Durable on return. Returns the copy's
     /// last transaction.
@@ -1636,9 +1679,9 @@ impl Database {
         self.check_poisoned()?;
         let ours = self.numbering().ok_or_else(|| Error::Schema("the database does not number its writes (Database::start_seq_no)".into()))?;
         let first = self.schema();
-        if tables.first().is_none_or(|(id, s, _, _)| *id != 0 || *s != *first) {
+        if tables.first().is_none_or(|(id, s, _, _)| *id != 0 || !(s.follows(&first) || s.same_columns(&first))) {
             return Err(Error::Schema(format!(
-                "the copy's first table ({}) is not this database's ({}), or their schemas differ",
+                "the copy's first table ({}) is not this database's ({}): neither one ALTER TABLE could make of it nor one of the same columns",
                 tables.first().map_or("none", |t| t.1.table.as_str()),
                 first.table
             )));
@@ -1786,8 +1829,9 @@ impl Database {
     /// columns, and a NOT NULL column added to a table with rows needs a
     /// default.
     ///
-    /// The change is not shipped to replicas yet: a primary's replicas take
-    /// it with a copy.
+    /// In a database that numbers its writes the change takes the next
+    /// number, and its replicas make the same change, with the same field
+    /// ids ([`Database::apply_shipped`]).
     pub fn alter_table(&self, table: &str, alters: &[Alter]) -> Result<()> {
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
@@ -1820,33 +1864,7 @@ impl Database {
         for p in profiles.iter() {
             crate::query::profile::check_columns(p, &schema).map_err(|e| Error::Schema(format!("rank profile {} of {} would no longer bind ({e}): drop or replace it first", p.name, before.table)))?;
         }
-        self.flush_locked(&mut wal)?;
-        if !wal.is_empty() {
-            // Only transactions the segments already hold can be left.
-            wal.reset(self.opts.sync).map_err(|e| self.poison(e))?;
-        }
-        let mut vw = VersionWriter::begin(self);
-        vw.table_mut(id).schema = schema.clone();
-        let c = vw.commit(&mut wal)?;
-        self.publish(c, |st| {
-            st.live_cache.clear();
-            st.updates_cache.clear();
-        })?;
-        // Codebooks are kept by the position of their field.
-        let mut coded = self.codebooks.write().unwrap_or_else(|e| e.into_inner());
-        coded.retain_mut(|c| {
-            if c.table != id {
-                return true;
-            }
-            match before.fields.get(c.field).and_then(|f| schema.position_of(f.id)) {
-                Some(p) => {
-                    c.field = p;
-                    true
-                }
-                None => false,
-            }
-        });
-        Ok(())
+        self.change_tables(&mut wal, vec![(id, Op::Alter { was: before, def: Arc::new(schema) })], None)
     }
 
     pub fn path(&self) -> &Path {
@@ -4098,7 +4116,7 @@ impl<'a> WriteTxn<'a> {
                     }
                 }
                 op @ Op::Profile { .. } => self.ops.push((t.id, op)),
-                Op::Table { .. } => return Err(differs("changes tables along with rows".into())),
+                Op::Table { .. } | Op::Alter { .. } => return Err(differs("changes tables along with rows".into())),
             }
         }
         Ok(())
@@ -4715,7 +4733,7 @@ fn op_fits(schema: &Schema, op: &Op) -> bool {
         Op::Delete(k) => is_key(k),
         Op::Profile { name, def } => check_name("rank profile", name).is_ok() && def.as_ref().is_none_or(|p| p.name == *name),
         // A change of tables, which writes no table's rows.
-        Op::Table { .. } => false,
+        Op::Table { .. } | Op::Alter { .. } => false,
         Op::Set { key, field, value } => {
             let i = *field as usize;
             is_key(key)

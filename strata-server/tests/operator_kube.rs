@@ -111,11 +111,14 @@ async fn get(k: &Kube, path: &str) -> Json {
     k.get(path).await.unwrap().unwrap_or(Json::Null)
 }
 
-/// A pod of set `set` the kubelet would have started, ready.
+/// A pod of set `set` the kubelet would have started from its template,
+/// ready.
 async fn ready_pod(k: &Kube, set: u32, ordinal: usize) {
     let name = format!("orders-s{set}-{ordinal}");
     let labels = json!({"app.kubernetes.io/instance": "orders", "app.kubernetes.io/component": "shard", "strata.chloetech.ai/set": set.to_string()});
-    let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "db", "labels": labels}, "spec": {"containers": [{"name": "strata", "image": "strata-server:dev"}]}});
+    let template = get(k, &format!("/apis/apps/v1/namespaces/db/statefulsets/orders-s{set}")).await["spec"]["template"].clone();
+    let annotations = template["metadata"]["annotations"].clone();
+    let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": name, "namespace": "db", "labels": labels, "annotations": annotations}, "spec": {"containers": [{"name": "strata", "image": "strata-server:dev"}]}});
     k.apply(&format!("/api/v1/namespaces/db/pods/{name}"), &pod).await.unwrap();
     let status = json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
     k.merge(&format!("/api/v1/namespaces/db/pods/{name}/status"), &status).await.unwrap();
@@ -195,6 +198,57 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     sets.sort_by_key(|s| s.id);
     assert_eq!(sets.iter().map(|s| (s.id, s.replicas, s.ready.clone())).collect::<Vec<_>>(), vec![(0, 3, vec![0]), (1, 3, vec![0, 1])]);
     assert_eq!(c.coordinator().await.unwrap().unwrap().0.len(), 2);
+    assert_eq!(c.coordinator_config().await.unwrap(), Some(c.spec.coordinator_config()));
+
+    // New settings: a set's template takes them at once, and each copy when
+    // the operator restarts it.
+    assert_eq!(c.stale(&c.spec).await.unwrap(), vec![]);
+    let mut newer = c.spec.clone();
+    newer.args = vec!["--slow-ms".into(), "50".into()];
+    assert!(c.configure(0, &newer).await.unwrap());
+    assert!(!c.configure(0, &newer).await.unwrap(), "configured once");
+    let s0 = get(&k, "/apis/apps/v1/namespaces/db/statefulsets/orders-s0").await;
+    assert_eq!(s0["spec"]["updateStrategy"]["type"], "OnDelete");
+    assert_eq!(s0["spec"]["template"]["metadata"]["annotations"]["strata.chloetech.ai/config"], json!(newer.server_config()));
+    let env0 = s0["spec"]["template"]["spec"]["containers"][0]["env"].as_array().unwrap().iter().find(|e| e["name"] == "STRATA_ARGS").cloned().unwrap();
+    assert_eq!(env0["value"], "'--slow-ms' '50'");
+    assert_eq!(s0["spec"]["volumeClaimTemplates"][0]["spec"]["resources"]["requests"]["storage"], "1Gi", "the claims are as they were");
+    assert_eq!(c.stale(&newer).await.unwrap(), vec![(0, 0), (1, 0), (1, 1)]);
+    c.restart(0, 0).await.unwrap();
+    let p = k.get("/api/v1/namespaces/db/pods/orders-s0-0").await.unwrap();
+    assert!(p.is_none() || !p.unwrap()["metadata"]["deletionTimestamp"].is_null(), "the pod is deleted, for its set to start it again");
+    assert_eq!(c.stale(&newer).await.unwrap(), vec![(1, 0), (1, 1)]);
+    // Volumes grow in place, once, when their storage class lets them.
+    let class = |name: &str, grows: bool| json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass", "metadata": {"name": name}, "provisioner": "example.com/disks", "allowVolumeExpansion": grows});
+    k.apply("/apis/storage.k8s.io/v1/storageclasses/fixed", &class("fixed", false)).await.unwrap();
+    k.apply("/apis/storage.k8s.io/v1/storageclasses/grows", &class("grows", true)).await.unwrap();
+    let claim = |name: &str, class: &str| json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"name": name, "namespace": "db", "labels": {"app.kubernetes.io/instance": "orders", "app.kubernetes.io/component": "shard", "strata.chloetech.ai/set": "0"}},
+        "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": class, "resources": {"requests": {"storage": "1Gi"}}, "volumeName": format!("pv-{name}")}});
+    let bind = |name: &'static str, class: &'static str| {
+        let k = k.clone();
+        async move {
+            k.apply(&format!("/api/v1/namespaces/db/persistentvolumeclaims/{name}"), &claim(name, class)).await.unwrap();
+            k.merge(&format!("/api/v1/namespaces/db/persistentvolumeclaims/{name}/status"), &json!({"status": {"phase": "Bound", "capacity": {"storage": "1Gi"}}})).await.unwrap();
+        }
+    };
+    bind("data-orders-s0-0", "fixed").await;
+    let e = c.grow_volumes("2Gi").await.unwrap_err();
+    assert!(e.contains("must support resize"), "{e}");
+    k.delete("/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s0-0").await.unwrap();
+    // (A claim keeps its protection finalizer here: take it off.)
+    let _ = k.merge("/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s0-0", &json!({"metadata": {"finalizers": null}})).await;
+    let t0 = Instant::now();
+    while k.get("/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s0-0").await.unwrap().is_some() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the claim was not deleted");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bind("data-orders-s0-0", "grows").await;
+    bind("data-orders-s0-1", "grows").await;
+    assert_eq!(c.grow_volumes("2Gi").await.unwrap(), 2);
+    assert_eq!(get(&k, "/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s0-1").await["spec"]["resources"]["requests"]["storage"], "2Gi");
+    assert_eq!(c.grow_volumes("2Gi").await.unwrap(), 0);
+    assert_eq!(c.grow_volumes("1Gi").await.unwrap(), 0, "a volume never shrinks");
     c.scale_set(1, 2).await.unwrap();
     assert_eq!(get(&k, "/apis/apps/v1/namespaces/db/statefulsets/orders-s1").await["spec"]["replicas"], 2);
     let pvc = json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
@@ -212,7 +266,7 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     let link = kube::Link::with("db/orders", &kube::Options { api: Some(env.url.clone()), token: Some(TOKEN.into()), ca: Some(env.ca.clone()), ..Default::default() }).unwrap();
     let j = link.get().await.unwrap();
     assert_eq!((&j["spec"]["shards"], &j["status"]["phase"], &j["settled"]), (&json!(2), &json!("Creating"), &json!(true)), "{j}");
-    let j = link.scale(&kube::Link::sizes(Some(3), Some(2), None).unwrap()).await.unwrap();
+    let j = link.change(&kube::Link::sizes(Some(3), Some(2), None).unwrap()).await.unwrap();
     assert_eq!((&j["spec"]["shards"], &j["spec"]["replicas"], &j["spec"]["demo"], &j["settled"]), (&json!(3), &json!(2), &json!(300), &json!(false)), "{j}");
     kube::once(&k, &now().await).await;
     assert_eq!(link.get().await.unwrap()["settled"], true);

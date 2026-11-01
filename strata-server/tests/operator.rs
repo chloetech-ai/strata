@@ -4,7 +4,8 @@
 //! each with a directory for its volume, and the coordinator a process
 //! started again when its `--shards` list changes. A cluster is made,
 //! grows and shrinks in shards and in copies, hands a primary over before
-//! its copy goes, and takes back a copy that lost its volume, answering
+//! its copy goes, starts every copy again with new settings one at a
+//! time, and takes back a copy that lost its volume, answering
 //! every row throughout: open, and with a cluster token of its own, the
 //! admin token held by the coordinator alone.
 
@@ -40,6 +41,8 @@ fn port() -> u16 {
 struct Pod {
     child: Child,
     http: u16,
+    /// The settings it was started with ([`Spec::server_config`]).
+    config: String,
 }
 
 impl Drop for Pod {
@@ -53,6 +56,9 @@ impl Drop for Pod {
 struct State {
     /// Each set's demo shard, and its pods by ordinal.
     sets: BTreeMap<u32, (Option<(usize, usize)>, BTreeMap<usize, Pod>)>,
+    /// The settings each set starts its copies with, as its StatefulSet's
+    /// pod template holds them.
+    configs: BTreeMap<u32, Spec>,
     ports: HashMap<(u32, usize), (u16, u16)>,
     coordinator: Option<(Vec<Vec<String>>, Pod)>,
 }
@@ -61,20 +67,22 @@ struct Procs {
     dir: PathBuf,
     schema: PathBuf,
     coordinator_port: u16,
-    failover_after_ms: u64,
     /// The admin token and the cluster token, as `tokenSecret` and
     /// `clusterTokenSecret` give them: the servers take the cluster token,
     /// the coordinator both.
     tokens: Option<(String, String)>,
+    /// The spec the operator works to, as the `StrataCluster` the
+    /// platform's objects are made from.
+    spec: Mutex<Spec>,
     state: Mutex<State>,
 }
 
 impl Procs {
-    fn new(dir: &Path, failover_after_ms: u64, tokens: Option<(&str, &str)>) -> Procs {
+    fn new(dir: &Path, tokens: Option<(&str, &str)>) -> Procs {
         let schema = dir.join("schema.json");
         std::fs::write(&schema, serde_json::to_string(&strata_server::demo::schema(ROWS)).unwrap()).unwrap();
         let tokens = tokens.map(|(a, c)| (a.to_string(), c.to_string()));
-        Procs { dir: dir.to_path_buf(), schema, coordinator_port: port(), failover_after_ms, tokens, state: Mutex::new(State::default()) }
+        Procs { dir: dir.to_path_buf(), schema, coordinator_port: port(), tokens, spec: Mutex::default(), state: Mutex::new(State::default()) }
     }
 
     fn ports(&self, id: u32, k: usize) -> (u16, u16) {
@@ -89,15 +97,19 @@ impl Procs {
         std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(format!("{name}.log"))).unwrap()
     }
 
-    /// Starts copy `k` of set `id` as the StatefulSet's script does.
+    /// Starts copy `k` of set `id` as the StatefulSet's script does, with
+    /// its set's settings.
     fn start(&self, id: u32, k: usize, demo: Option<(usize, usize)>) -> Pod {
+        let set = self.state.lock().unwrap().configs.get(&id).cloned();
+        let set = set.unwrap_or_else(|| self.spec.lock().unwrap().clone());
         let (http, grpc) = self.ports(id, k);
         let vol = self.volume(id, k);
         std::fs::create_dir_all(&vol).unwrap();
         let db = vol.join("db.strata");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_strata-server"));
         cmd.arg("--db").arg(&db).args(["--seq-no", "--listen", &format!("127.0.0.1:{http}"), "--grpc", &format!("127.0.0.1:{grpc}")]);
-        cmd.args(["--failover-after-ms", &self.failover_after_ms.to_string(), "--log", "info"]);
+        cmd.args(["--failover-after-ms", &set.failover_after_ms.to_string(), "--log", "info"]);
+        cmd.args(&set.args);
         if let Some((_, cluster)) = &self.tokens {
             cmd.args(["--cluster-token", cluster]);
         }
@@ -108,7 +120,7 @@ impl Procs {
             };
         }
         let child = cmd.stdout(Stdio::null()).stderr(self.log(&format!("s{id}-{k}"))).spawn().unwrap();
-        Pod { child, http }
+        Pod { child, http, config: set.server_config() }
     }
 
     /// Copy `k` of set `id` comes back without its volume.
@@ -161,6 +173,8 @@ impl Platform for Procs {
     }
 
     async fn create_set(&self, id: u32, replicas: usize, demo: Option<(usize, usize)>) -> Result<(), String> {
+        let spec = self.spec.lock().unwrap().clone();
+        self.state.lock().unwrap().configs.insert(id, spec);
         let pods = (0..replicas).map(|k| (k, self.start(id, k, demo))).collect();
         self.state.lock().unwrap().sets.insert(id, (demo, pods));
         Ok(())
@@ -185,7 +199,11 @@ impl Platform for Procs {
     }
 
     async fn delete_set(&self, id: u32) -> Result<(), String> {
-        let pods = self.state.lock().unwrap().sets.remove(&id);
+        let pods = {
+            let mut st = self.state.lock().unwrap();
+            st.configs.remove(&id);
+            st.sets.remove(&id)
+        };
         if let Some((_, pods)) = pods {
             for k in pods.keys() {
                 let _ = std::fs::remove_dir_all(self.volume(id, *k));
@@ -212,8 +230,45 @@ impl Platform for Procs {
             .stderr(self.log("coordinator"))
             .spawn()
             .unwrap();
-        self.state.lock().unwrap().coordinator = Some((shards.to_vec(), Pod { child, http }));
+        let config = self.spec.lock().unwrap().coordinator_config();
+        self.state.lock().unwrap().coordinator = Some((shards.to_vec(), Pod { child, http, config }));
         Ok(())
+    }
+
+    async fn coordinator_config(&self) -> Result<Option<String>, String> {
+        Ok(self.state.lock().unwrap().coordinator.as_ref().map(|(_, p)| p.config.clone()))
+    }
+
+    async fn configure(&self, id: u32, spec: &Spec) -> Result<bool, String> {
+        let mut st = self.state.lock().unwrap();
+        let changed = st.configs.get(&id).is_none_or(|c| c.server_config() != spec.server_config());
+        if changed {
+            st.configs.insert(id, spec.clone());
+        }
+        Ok(changed)
+    }
+
+    async fn stale(&self, spec: &Spec) -> Result<Vec<(u32, usize)>, String> {
+        let want = spec.server_config();
+        let st = self.state.lock().unwrap();
+        Ok(st.sets.iter().flat_map(|(&id, (_, pods))| pods.iter().filter(|(_, p)| p.config != want).map(move |(&k, _)| (id, k))).collect())
+    }
+
+    async fn restart(&self, id: u32, ordinal: usize) -> Result<(), String> {
+        let demo = {
+            let mut st = self.state.lock().unwrap();
+            let (demo, pods) = st.sets.get_mut(&id).ok_or("no such set")?;
+            drop(pods.remove(&ordinal));
+            *demo
+        };
+        let pod = self.start(id, ordinal, demo);
+        self.state.lock().unwrap().sets.get_mut(&id).unwrap().1.insert(ordinal, pod);
+        Ok(())
+    }
+
+    async fn grow_volumes(&self, _size: &str) -> Result<usize, String> {
+        // A directory has no size.
+        Ok(0)
     }
 
     fn url(&self, id: u32, k: usize) -> String {
@@ -238,6 +293,7 @@ impl Run {
     async fn settle(&self, what: &str) -> Vec<String> {
         let t0 = Instant::now();
         let mut said: Vec<String> = Vec::new();
+        *self.procs.spec.lock().unwrap() = self.spec.clone();
         loop {
             let out = reconcile(&self.spec, &self.procs, &self.admin).await;
             if said.last() != Some(&out.message) {
@@ -283,7 +339,7 @@ impl Run {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_is_made_grown_shrunk_and_healed() {
     let dir = tempfile::tempdir().unwrap();
-    let procs = Procs::new(dir.path(), 1000, None);
+    let procs = Procs::new(dir.path(), None);
     let admin = Admin::new(&format!("http://127.0.0.1:{}", procs.coordinator_port), None);
     let spec = Spec { shards: 2, replicas: 2, demo: Some(ROWS), failover_after_ms: 1000, ..Spec::default() };
     every_step(&mut Run { procs, admin, spec }).await;
@@ -295,7 +351,7 @@ async fn a_cluster_is_made_grown_shrunk_and_healed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cluster_with_its_own_token_is_made_grown_shrunk_and_healed() {
     let dir = tempfile::tempdir().unwrap();
-    let procs = Procs::new(dir.path(), 1000, Some(("admin-token", "cluster-token")));
+    let procs = Procs::new(dir.path(), Some(("admin-token", "cluster-token")));
     let admin = Admin::new(&format!("http://127.0.0.1:{}", procs.coordinator_port), Some("admin-token".into()));
     let spec = Spec {
         shards: 2,
@@ -363,6 +419,26 @@ async fn every_step(run: &mut Run) {
     }
     let c = run.cluster().await;
     assert!(c["shards"].as_array().unwrap().iter().any(|s| s["replicas"].as_array().unwrap().iter().any(|r| r["url"] == json!(lost))), "{c}");
+    assert_eq!((run.count().await, run.sold().await), (ROWS as i64, sum));
+
+    // New settings: every copy starts again with them, one at a time, each
+    // primary handing its shard over to a copy in step before it goes.
+    run.spec.args = vec!["--slow-ms".into(), "777".into()];
+    let said = run.settle("new settings").await;
+    assert!(said.iter().any(|m| m.contains("restarting") && m.contains("with the new settings")), "{said:?}");
+    assert!(said.iter().any(|m| m.contains("before") && m.contains("restarts with the new settings")), "{said:?}");
+    let servers: Vec<u16> = run.procs.state.lock().unwrap().sets.values().flat_map(|(_, pods)| pods.values().map(|p| p.http)).collect();
+    assert_eq!(servers.len(), 9);
+    for http in servers {
+        let mut r = reqwest::Client::new().get(format!("http://127.0.0.1:{http}/v1/profile/settings"));
+        if let Some((_, cluster)) = &run.procs.tokens {
+            r = r.bearer_auth(cluster);
+        }
+        let j: Json = r.send().await.unwrap().json().await.unwrap();
+        assert_eq!(j["started_slow_ms"], json!(777.0), "{http}: {j}");
+    }
+    assert!(run.procs.stale(&run.spec).await.unwrap().is_empty());
+    assert_eq!(run.shape().await.0, vec![3, 3, 3]);
     assert_eq!((run.count().await, run.sold().await), (ROWS as i64, sum));
 
     // Two copies each again. The highest copy of the first set is made its
