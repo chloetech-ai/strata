@@ -84,7 +84,7 @@ fn children(steps: &[Json], at: usize) -> Vec<usize> {
 async fn a_query_s_profile_is_on_its_request_s_clock() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "one.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = service(Backend::Local(db), schema);
     let base = http(svc.clone()).await;
 
@@ -171,7 +171,7 @@ async fn a_coordinator_s_profile_holds_each_shard_s_steps() {
     let mut shards = Vec::new();
     for s in 0..2 {
         let db = open(dir.path(), &format!("s{s}.strata"), shard(s));
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         // The shards measure their steps' CPU time when the coordinator's
         // query asks (QueryRequest.profile), not for every query.
         shards.push(grpc(service(Backend::Local(db), schema)).await);

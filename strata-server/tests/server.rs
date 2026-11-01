@@ -42,13 +42,13 @@ fn vector_42(db: &Db) -> Value {
 }
 
 fn service(db: Db, base_url: &str) -> Arc<Service> {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Arc::new(Service::new(Backend::Local(Arc::new(db)), schema, agent_config(base_url), 16, Duration::from_secs(10)))
 }
 
 /// A server of `db`, set up by `f` (its replication).
 fn service_with(db: Arc<Db>, f: impl FnOnce(&mut Service)) -> Arc<Service> {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(db), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
     f(&mut svc);
     Arc::new(svc)
@@ -247,7 +247,7 @@ async fn writes_over_http() {
 async fn concurrent_writes_wait_for_the_writer() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(create(dir.path(), "c.strata", |i| i < 500));
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = Arc::new(Service::new(Backend::Local(db.clone()), schema, agent_config("http://unused"), 16, Duration::from_secs(30)));
     let base = http(svc, None).await;
     let c = reqwest::Client::new();
@@ -295,7 +295,7 @@ async fn concurrent_writes_wait_for_the_writer() {
 async fn grouped_writes_fail_alone() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(create(dir.path(), "g.strata", |i| i < 200));
-    let svc = Arc::new(Service::new(Backend::Local(db.clone()), db.schema().clone(), agent_config("http://unused"), 16, Duration::from_secs(30)));
+    let svc = Arc::new(Service::new(Backend::Local(db.clone()), (*db.schema()).clone(), agent_config("http://unused"), 16, Duration::from_secs(30)));
     let base = http(svc, None).await;
     let c = reqwest::Client::new();
     let sold = |r: &Json| r["rows"][0][0].as_i64().unwrap();
@@ -394,6 +394,23 @@ async fn a_token_guards_the_api() {
     // The UI page and health stay open, so the page can ask for the token.
     assert_eq!(c.get(format!("{base}/")).send().await.unwrap().status(), 200);
     assert_eq!(c.get(format!("{base}/v1/health")).send().await.unwrap().status(), 200);
+}
+
+/// A server the Kubernetes operator does not run says so, and refuses to
+/// scale a StrataCluster; the command center's Cluster view is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_not_run_by_the_operator_has_no_kubernetes_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = http(service(create(dir.path(), "k.strata", |i| i < 10), "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let j: Json = c.get(format!("{base}/v1/kube")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(j, json!({"managed": false}));
+    let (status, j) = post(&c, &format!("{base}/v1/admin/kube"), json!({"shards": 3})).await;
+    assert_eq!(status, 400, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("not run by the Kubernetes operator"), "{j}");
+    let view = c.get(format!("{base}/ui/views/cluster.js")).send().await.unwrap();
+    assert_eq!(view.status(), 200);
+    assert!(view.text().await.unwrap().contains("/v1/admin/kube"));
 }
 
 /// OPS-1: the gRPC port took writes from anyone, a token on HTTP or not.
@@ -795,7 +812,7 @@ async fn replicas_cover_for_a_shard_down_or_hung() {
         good.push(replicas);
     }
     let dead = "http://127.0.0.1:1".to_string();
-    let hung = stuck(whole.schema()).await;
+    let hung = stuck(&whole.schema()).await;
 
     // Shard 0's first replica refuses connections; shard 1's never answers.
     let opts = CoordOptions { hedge: Duration::from_millis(50), ..Default::default() };
@@ -1537,7 +1554,7 @@ async fn a_page_is_fetched_from_the_snapshot_it_was_ranked_on() {
 async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "db.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let svc = service(db, "http://unused");
     let url = grpc(svc.clone()).await;
     let mut c = pb::strata_client::StrataClient::connect(url).await.unwrap();
@@ -1579,7 +1596,7 @@ async fn a_shard_takes_typed_plans_and_refuses_newer_ones() {
 
 /// A shard serving `db`, keeping the slot map it is given beside `path`.
 fn holding_slots(db: Db, path: &std::path::Path) -> Arc<Service> {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
     svc.keep_slots_in(slots::file_of(path)).unwrap();
     Arc::new(svc)
@@ -1742,6 +1759,97 @@ async fn agent_runs_queries_and_answers() {
     assert!(r["error"].as_str().unwrap().contains("API key"));
 }
 
+/// Relevance judgments, against a stand-in for the Messages API that
+/// grades a passage 3 if it mentions a tent, answers one passage without
+/// a grade even when asked again, another without one until asked again,
+/// and grades the rest 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_judge_grades_each_row_alone() {
+    use axum::{extract::State, routing::post as route_post, Json as AxJson, Router};
+    #[derive(Clone)]
+    struct Mock {
+        seen: Arc<std::sync::Mutex<Vec<Json>>>,
+        /// The titles of the passage answered without a grade, and of the
+        /// one graded only when asked again.
+        odd: Arc<std::sync::Mutex<(String, String)>>,
+    }
+    async fn messages(State(m): State<Mock>, AxJson(body): AxJson<Json>) -> AxJson<Json> {
+        m.seen.lock().unwrap().push(body.clone());
+        let p = body["messages"][0]["content"].as_str().unwrap().to_string();
+        let passage = p.split("Passage: ").nth(1).unwrap().split("\n\nSplit this problem").next().unwrap().to_lowercase();
+        let (odd, late) = m.odd.lock().unwrap().clone();
+        let again = body["messages"].as_array().unwrap().len() > 1;
+        let text = if passage.contains("tent") {
+            "##final score: 3"
+        } else if passage.contains(&odd.to_lowercase()) {
+            "It depends."
+        } else if passage.contains(&late.to_lowercase()) {
+            if again { "##final score: 2" } else { "The passage is about something else." }
+        } else {
+            "##final score: 0"
+        };
+        AxJson(json!({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn", "usage": {"input_tokens": 300, "output_tokens": 6}}))
+    }
+    let mock = Mock { seen: Arc::new(std::sync::Mutex::new(Vec::new())), odd: Arc::new(std::sync::Mutex::new(Default::default())) };
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = l.local_addr().unwrap();
+    let app = Router::new().route("/v1/messages", route_post(messages)).with_state(mock.clone());
+    tokio::spawn(async move { axum::serve(l, app).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(dir.path(), "j.strata", |i| i < 300);
+    let rows = db.query("SELECT id, title, description FROM products LIMIT 300", &Params::new()).unwrap();
+    let text = |i: usize| rows.rows[i].iter().skip(1).map(|v| v.as_str().unwrap_or("").to_lowercase()).collect::<String>();
+    let tent = (0..rows.rows.len()).find(|&i| text(i).contains("tent")).unwrap();
+    let others: Vec<usize> = (0..rows.rows.len()).filter(|&i| !text(i).contains("tent")).collect();
+    let title = |i: usize| rows.rows[i][1].as_str().unwrap().to_string();
+    // Three rows of titles none of which holds another.
+    let distinct = |a: usize, b: usize| !title(a).to_lowercase().contains(&title(b).to_lowercase()) && !title(b).to_lowercase().contains(&title(a).to_lowercase());
+    let other = others[0];
+    let odd = *others.iter().find(|&&i| distinct(i, other)).unwrap();
+    let late = *others.iter().find(|&&i| distinct(i, other) && distinct(i, odd)).unwrap();
+    *mock.odd.lock().unwrap() = (title(odd), title(late));
+    let key = |i: usize| rows.rows[i][0].as_str().unwrap().to_string();
+    let base = http(service(db, &format!("http://{addr}")), None).await;
+    let c = reqwest::Client::new();
+    let keys = json!([key(tent), key(other), "p9999999", key(odd), key(late)]);
+    let (status, r) = post(&c, &format!("{base}/v1/judge"), json!({"query": "a tent for two", "keys": keys})).await;
+    assert_eq!(status, 200, "{r}");
+    let g = r["grades"].as_array().unwrap();
+    // In the order asked, each with its key.
+    assert_eq!(g.iter().map(|x| x["key"].clone()).collect::<Vec<_>>(), keys.as_array().unwrap().clone());
+    assert_eq!((g[0]["grade"].clone(), g[1]["grade"].clone()), (json!(3), json!(0)));
+    assert!(g[2]["grade"].is_null() && g[2]["error"] == "no such row", "{r}");
+    assert!(g[3]["grade"].is_null() && g[3]["error"].as_str().unwrap().contains("no grade"), "{r}");
+    assert_eq!(g[4]["grade"], json!(2), "{r}");
+    assert_eq!(r["fields"], json!(["title", "description"]));
+    assert_eq!(r["prompt"], "umbrela");
+    // Each request counted, those asking again too.
+    assert_eq!(r["usage"]["input_tokens"], 1800);
+    {
+        // One request per row that exists, each with UMBRELA's prompt and
+        // the row's stored text fields, named, and one more for each
+        // answer without a grade, after it.
+        let seen = mock.seen.lock().unwrap();
+        assert_eq!(seen.len(), 6);
+        let again: Vec<&Json> = seen.iter().filter(|b| b["messages"].as_array().unwrap().len() == 3).collect();
+        assert_eq!(again.len(), 2);
+        assert!(again.iter().all(|b| b["messages"][1]["role"] == "assistant" && b["messages"][2]["content"].as_str().unwrap().contains("##final score")));
+        assert_eq!(seen[0]["model"], "claude-haiku-5-5");
+        let p = seen.iter().map(|b| b["messages"][0]["content"].as_str().unwrap().to_string()).find(|p| p.to_lowercase().contains("tent")).unwrap();
+        assert!(p.starts_with("Given a query and a passage, you must provide a score on an integer scale of 0 to 3"), "{p}");
+        assert!(p.contains("Query: a tent for two\nPassage: title: "), "{p}");
+        assert!(p.contains("\ndescription: "), "{p}");
+    }
+    // The fields named are what it reads; a field not stored is refused.
+    let (status, r) = post(&c, &format!("{base}/v1/judge"), json!({"query": "tent", "keys": [key(tent)], "fields": ["title"]})).await;
+    assert_eq!((status, r["fields"].clone()), (200, json!(["title"])), "{r}");
+    let (status, r) = post(&c, &format!("{base}/v1/judge"), json!({"query": "tent", "keys": [key(tent)], "fields": ["body"]})).await;
+    assert!(status == 400 && r["error"].as_str().unwrap().contains("not stored"), "{r}");
+    let (status, _) = post(&c, &format!("{base}/v1/judge"), json!({"query": "tent", "keys": []})).await;
+    assert_eq!(status, 400);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sparse_and_binary_vector_fields_over_http() {
     use strata::{Field, FieldType, Schema, VectorCodes, VectorIndexKind};
@@ -1846,13 +1954,13 @@ async fn vector_of_any_field_name() {
 async fn embedded_fields_over_http() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::create(&dir.path().join("e.strata"), demo::schema(500), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://unused"), 16, Duration::from_secs(10));
     svc.open_models(dir.path());
     let base = http(Arc::new(svc), None).await;
     let c = reqwest::Client::new();
     let r: Json = c.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(r["embeddings"], json!([{"field": "emb", "from": ["title", "description"], "model": "hash:64", "loaded": true, "error": null, "usage": null}]));
+    assert_eq!(r["embeddings"], json!([{"field": "emb", "from": ["title", "description"], "model": "hash:64", "loaded": true, "error": null, "usage": null, "backfill": null}]));
 
     let docs: Vec<Json> = (0..500).map(|i| js::document_json(&demo::schema(500), &demo::product(i, 7))).collect();
     let mut ops: Vec<Json> = docs.iter().map(|d| json!({"op": "insert", "doc": d})).collect();
@@ -2106,7 +2214,7 @@ async fn an_overloaded_replica_is_not_relieved_by_its_sibling() {
     let db = create(dir.path(), "db.strata", |_| true);
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let over = format!("http://{}", l.local_addr().unwrap());
-    let fake = pb::strata_server::StrataServer::new(Overloaded(serde_json::to_string(db.schema()).unwrap()));
+    let fake = pb::strata_server::StrataServer::new(Overloaded(serde_json::to_string(&*db.schema()).unwrap()));
     tokio::spawn(tonic::transport::Server::builder().add_service(fake).serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)));
     let good = grpc(service(db, "http://unused")).await;
     let coord = cluster(Coordinator::connect(vec![format!("{over}|{good}")]).await.unwrap());
@@ -2241,7 +2349,7 @@ async fn health_reports_a_database_that_cannot_write() {
 async fn admin_routes_checkpoint_check_and_vacuum() {
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "db.strata", |_| true);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent_config("http://127.0.0.1:9"), 16, Duration::from_secs(10));
     let backups = dir.path().join("backups");
     svc.set_backup_dir(&backups).unwrap();
@@ -2492,7 +2600,7 @@ async fn explain_gives_the_plan_ir() {
     use strata::query::{bind_command, Command};
     let dir = tempfile::tempdir().unwrap();
     let db = create(dir.path(), "e.strata", |i| i < 300);
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let base = http(service(db, "http://unused"), None).await;
     let c = reqwest::Client::new();
     let sql = "SELECT id, price, score() FROM products WHERE category = 'kitchen' ORDER BY bm25(body, 'quiet kettle') DESC LIMIT 5";

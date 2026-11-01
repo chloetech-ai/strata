@@ -261,7 +261,7 @@ async fn main() {
     let mut dbs = Vec::new();
     for with_edges in [false, true] {
         let db = database(&work.join(format!("{with_edges}.strata")), with_edges, a.items);
-        let schema = db.schema().clone();
+        let schema = (*db.schema()).clone();
         let url = http(Arc::new(Service::new(Backend::Local(db.clone()), schema, agent(), 64, Duration::from_secs(60)))).await;
         let users: Vec<Json> = (0..a.users).map(|u| json!({"op": "insert", "table": "users", "doc": {"id": format!("u{u}")}})).collect();
         for c in users.chunks(1000) {

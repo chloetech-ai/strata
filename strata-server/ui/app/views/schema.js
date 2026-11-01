@@ -271,7 +271,7 @@ function diagram(host, bar, { openDesigner }) {
           h("span", { class: "mono" }, `${l.from.table}${l.from.field ? "." + l.from.field : ""}`), h("span", { class: "muted" }, (KIND[l.kind] || KIND.ref).label), h("span", { class: "mono" }, `${l.to.table}${l.to.field ? "." + l.to.field : ""}`))))) : null,
         (t.embeddings || []).length || (t.profiles || []).length || (t.derived || []).length ? h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Models and rank profiles")),
           h("div", { class: "bd stack", style: { gap: "6px" } },
-            (t.embeddings || []).map((e) => h("div", { class: "row nw small" }, e.error ? h("span", { class: "pill bad" }, "error") : e.loaded ? h("span", { class: "pill ok" }, "loaded") : h("span", { class: "pill" }, "not loaded"), h("b", {}, e.field), h("span", { class: "dim" }, `embeds ${[].concat(e.from).join(", ")} with ${e.model}`), e.error ? h("span", { class: "error small" }, e.error) : null)),
+            (t.embeddings || []).map((e) => h("div", { class: "row nw small" }, e.error ? h("span", { class: "pill bad" }, "error") : e.loaded ? h("span", { class: "pill ok" }, "loaded") : h("span", { class: "pill" }, "not loaded"), h("b", {}, e.field), h("span", { class: "dim" }, `embeds ${[].concat(e.from).join(", ")} with ${e.model}`), e.error ? h("span", { class: "error small" }, e.error) : null, backfillNote(e.backfill))),
             (t.derived || []).map((e) => h("div", { class: "row nw small" }, h("span", { class: "pill" }, "derived"), h("b", {}, e.field), h("span", { class: "dim" }, JSON.stringify(e)))),
             (t.profiles || []).map((p) => h("div", { class: "row nw small" }, h("span", { class: "pill info" }, "profile"), h("b", {}, p.name || p.profile || ""), h("span", { class: "mono dim ellipsis" }, p.sql || p.expression || JSON.stringify(p)))))) : null,
         h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "CREATE TABLE"), h("div", { class: "tools" }, h("button", { class: "btn sm ghost", onclick: () => copy(t.sql, "CREATE TABLE copied") }, icon("copy"), "Copy"))),
@@ -305,6 +305,15 @@ async function tableSizes(ts) {
     try { const j = await api("/v1/query", { body: { sql: `SELECT COUNT(*) FROM ${quoteName(t.table)}` } }); (out[t.table] ||= { bytes: 0, segments: 0 }).rows = j.rows[0][0]; } catch { /* left without a count */ }
   }));
   return out;
+}
+
+// Rows stored without a vector while the model was not open, filled in
+// since it opened (/v1/schema's backfill).
+function backfillNote(b) {
+  if (!b) return null;
+  if (b.state === "running") return h("span", { class: "pill" }, `filling in vectors: ${b.embedded} of ${b.missing} rows`);
+  if (b.state === "failed") return h("span", { class: "error small" }, `filling in vectors stopped after ${b.embedded} rows (tried again in five minutes): ${b.error}`);
+  return h("span", { class: "dim" }, `${b.embedded} rows stored without a vector were given one`);
 }
 
 // ------------------------------------------------------------ the designer

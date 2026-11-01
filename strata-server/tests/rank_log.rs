@@ -41,7 +41,7 @@ fn agent() -> AgentConfig {
 
 fn local(dir: &std::path::Path, name: &str) -> (Arc<Service>, Arc<Db>) {
     let db = Arc::new(Db::create(&dir.join(name), items(), DbOptions { segment_max_docs: 100, publish_snapshots: true, ..DbOptions::default() }).unwrap());
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     (Arc::new(Service::new(Backend::Local(db.clone()), schema, agent(), 16, Duration::from_secs(20))), db)
 }
 
@@ -115,8 +115,10 @@ async fn three_shards_log_what_one_database_logs() {
         let mut answers = Vec::new();
         for svc in [&whole, &coord] {
             let plain = svc.query(QueryReq { sql: sql.into(), params: params(k), ..Default::default() }).await.unwrap();
-            let (a, request, w) = svc.query_logged(&Principal::open(), QueryReq { sql: sql.into(), params: params(k), ..Default::default() }, log.clone()).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+            let (a, served, w) = svc.query_logged(&Principal::open(), QueryReq { sql: sql.into(), params: params(k), ..Default::default() }, log.clone()).await.unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+            let request = served.request;
             assert_eq!(request, format!("r{k}"));
+            assert!(served.teams.is_empty());
             assert_eq!((&a.rs.columns, &a.rs.rows, &a.rs.keys), (&plain.rs.columns, &plain.rs.rows, &plain.rs.keys), "{sql}");
             let rows = logged_rows(svc, &request).await;
             assert_eq!(w.rows as usize, rows.len());
@@ -193,4 +195,107 @@ async fn a_logged_query_over_http_and_its_export() {
     assert_eq!(records.iter().filter(|r| r["shown"] == json!(false)).count(), 5 * 2);
     let (status, text) = post("/v1/rank_log/export", json!({"table": "items"})).await;
     assert!(status == 400 && text.contains("not a log table"), "{text}");
+}
+
+/// Two rankings interleaved by team draft over HTTP: the rows shown are
+/// drawn from both, each logged with its own ranking's score and values
+/// and its team's name; the same request draws the same list; and the
+/// credit endpoint gives each team the requests whose clicks went to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_rankings_interleaved_and_credited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, db) = local(dir.path(), "il.strata");
+    load(&svc).await;
+    let h = http(svc.clone()).await;
+    let c = reqwest::Client::new();
+    let post = |path: &str, body: Json| {
+        let (c, url) = (c.clone(), format!("{h}{path}"));
+        async move {
+            let r = c.post(url).json(&body).send().await.unwrap();
+            let status = r.status().as_u16();
+            (status, r.json::<Json>().await.unwrap())
+        }
+    };
+    let a_sql = "SELECT id, price FROM items ORDER BY bm25(title, :t) + 0.1 * coalesce(price, 0) DESC LIMIT 8";
+    let b_sql = "SELECT id, price FROM items ORDER BY bm25(title, :t) - 0.1 * coalesce(price, 0) DESC LIMIT 8";
+    let keys = |a: &Json| a["keys"].as_array().unwrap().iter().map(|k| k.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let mut firsts = std::collections::BTreeSet::new();
+    let mut want = [0u64; 2];
+    let mut acted = 0;
+    for k in 0..30 {
+        let t = format!("{} {}", WORDS[k % 12], WORDS[(k * 5 + 3) % 12]);
+        let (_, a) = post("/v1/query", json!({"sql": a_sql, "params": {"t": t}})).await;
+        let (_, b) = post("/v1/query", json!({"sql": b_sql, "params": {"t": t}})).await;
+        let log = json!({"request": format!("r{k}"), "context": format!("u{}", k % 20), "interleave": {"sql": b_sql, "variants": ["bm25", "cheap"]}});
+        let (status, il) = post("/v1/query", json!({"sql": a_sql, "params": {"t": t}, "log": log})).await;
+        assert_eq!(status, 200, "{il}");
+        assert_eq!(il["columns"], a["columns"]);
+        let (ka, kb, shown) = (keys(&a), keys(&b), keys(&il));
+        let teams: Vec<String> = il["teams"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+        assert_eq!((shown.len(), teams.len()), (8, 8), "{il}");
+        assert_eq!(shown.iter().collect::<std::collections::HashSet<_>>().len(), 8, "a row twice: {shown:?}");
+        // Each row is its team's best row not shown before it.
+        for (i, (key, team)) in shown.iter().zip(&teams).enumerate() {
+            let list = if team == "bm25" { &ka } else { &kb };
+            assert_eq!(list.iter().find(|x| !shown[..i].contains(x)), Some(key), "row {i} of {shown:?}, {teams:?}");
+        }
+        let n_a = teams.iter().filter(|t| *t == "bm25").count();
+        assert!(n_a.abs_diff(8 - n_a) <= 1, "{teams:?}");
+        firsts.insert(teams[0].clone());
+        // The rows logged: each with its team, and its ranking's values.
+        let rows = logged_rows(&svc, &format!("r{k}")).await;
+        assert_eq!(rows.len(), 8);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(r[1].as_str().unwrap(), shown[i]);
+            let mine = if teams[i] == "bm25" { "bm25(title, :t) + 0.1 * coalesce(price, 0)" } else { "bm25(title, :t) - 0.1 * coalesce(price, 0)" };
+            assert!(r[4].get(mine).is_some(), "row {i} of team {} logged {}", teams[i], r[4]);
+        }
+        // The user clicks the row the second ranking puts first, when shown.
+        if let Some(i) = shown.iter().position(|x| *x == kb[0]) {
+            let (status, w) = post("/v1/sql", json!({"sql": "UPDATE rank_log SET label = 1 WHERE request = :r AND row_key = :k", "params": {"r": format!("r{k}"), "k": kb[0]}})).await;
+            assert_eq!(status, 200, "{w}");
+            acted += 1;
+            want[(teams[i] == "cheap") as usize] += 1;
+        }
+    }
+    // The coin lets either ranking take first.
+    assert_eq!(firsts.len(), 2, "{firsts:?}");
+    // The same request draws the same list.
+    let log = json!({"request": "r3", "interleave": {"sql": b_sql}});
+    let t = format!("{} {}", WORDS[3], WORDS[18 % 12]);
+    let (_, x) = post("/v1/query", json!({"sql": a_sql, "params": {"t": t}, "log": log})).await;
+    let (_, y) = post("/v1/query", json!({"sql": a_sql, "params": {"t": t}, "log": log})).await;
+    assert_eq!((&x["keys"], &x["teams"]), (&y["keys"], &y["teams"]));
+    assert!(x["teams"].as_array().unwrap().iter().all(|t| t == "a" || t == "b"), "{x}");
+    // That request is relogged under the default names: put it back.
+    let log = json!({"request": "r3", "context": "u3", "interleave": {"sql": b_sql, "variants": ["bm25", "cheap"]}});
+    let (status, _) = post("/v1/query", json!({"sql": a_sql, "params": {"t": t}, "log": log})).await;
+    assert_eq!(status, 200);
+    let (_, b3) = post("/v1/query", json!({"sql": b_sql, "params": {"t": t}})).await;
+    let k3 = keys(&b3)[0].clone();
+    let (status, _) = post("/v1/sql", json!({"sql": "UPDATE rank_log SET label = 1 WHERE request = 'r3' AND row_key = :k", "params": {"k": k3}})).await;
+    assert_eq!(status, 200);
+
+    // The credit: requests whose click went to each team.
+    let (status, cr) = post("/v1/rank_log/interleaving", json!({})).await;
+    assert_eq!(status, 200, "{cr}");
+    let pairs = cr["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{cr}");
+    let p = &pairs[0];
+    assert_eq!(p["variants"], json!(["bm25", "cheap"]));
+    assert_eq!(p["requests"], json!(30));
+    assert_eq!((p["acted"].as_u64().unwrap(), p["wins"].clone(), p["ties"].clone()), (acted, json!(want), json!(0)), "{cr}");
+    assert!((p["p"].as_f64().unwrap() - strata::rank_log::sign_test(want[0], want[1])).abs() < 1e-12);
+    let mine = db.interleaving_credit(&Export::default()).unwrap();
+    assert_eq!(mine[0].to_json(), *p);
+
+    // Refused: a page past the first, rankings of other columns, a variant.
+    for (sql, log) in [
+        ("SELECT id, price FROM items ORDER BY bm25(title, :t) DESC LIMIT 8 OFFSET 8", json!({"interleave": {"sql": b_sql}})),
+        (a_sql, json!({"interleave": {"sql": "SELECT id FROM items ORDER BY bm25(title, :t) DESC LIMIT 8"}})),
+        (a_sql, json!({"variant": "x", "interleave": {"sql": b_sql}})),
+    ] {
+        let (status, e) = post("/v1/query", json!({"sql": sql, "params": {"t": "red mug"}, "log": log})).await;
+        assert_eq!(status, 400, "{sql}: {e}");
+    }
 }

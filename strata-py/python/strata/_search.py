@@ -3,7 +3,7 @@ parameters, `table`, `search` and the rank log."""
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from ._strata import StrataError
 from .build import Expr, Query, bm25, hops, rrf, score, similarity
@@ -55,6 +55,8 @@ class Search:
         candidates: int | None = None,
         ts: Any = None,
         table: str = "rank_log",
+        interleave: str | None = None,
+        variants: Sequence[str] | None = None,
     ) -> Result:
         """Runs a SELECT ranked by an ORDER BY and logs what it served to a
         log table, which the first query logged to it makes: one row per
@@ -66,8 +68,12 @@ class Search:
         datetime or microseconds) when it was served, now by default.
         `result.request` is the request's id (`request`, or a new one),
         which labels its rows later: `UPDATE rank_log SET label = 1 WHERE
-        request = ... AND row_key = ...`."""
-        opts = {"table": table, "request": request, "context": context, "variant": variant, "candidates": candidates, "ts": _time(ts)}
+        request = ... AND row_key = ...`. `interleave`, a second SELECT of
+        the same table and columns, shows both rankings in one list by
+        team draft, each row logged with the name of the one that placed it
+        (`variants`, ("a", "b") unless named); `result.teams` names them."""
+        il = None if interleave is None else {"sql": interleave, **({"variants": list(variants)} if variants else {})}
+        opts = {"table": table, "request": request, "context": context, "variant": variant, "candidates": candidates, "ts": _time(ts), "interleave": il}
         return self._query_logged(sql, params, {k: v for k, v in opts.items() if v is not None})
 
     def export_rank_log(

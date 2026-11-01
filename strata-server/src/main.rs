@@ -54,6 +54,14 @@ struct Args {
     /// Where embedded fields' models are (see `fetch-model`).
     #[arg(long, env = "STRATA_MODELS")]
     models: Option<PathBuf>,
+    /// Leave rows stored while their embedded field had no model open
+    /// without vectors. By default they get them once the model opens.
+    #[arg(long)]
+    no_backfill: bool,
+    /// Do not download the models Strata knows (see `fetch-model`) that an
+    /// embedded field names and --models lacks.
+    #[arg(long)]
+    no_fetch_models: bool,
     /// Create a new database as a directory of segment files.
     #[arg(long)]
     directory: bool,
@@ -136,6 +144,11 @@ struct Args {
     /// flagged "partial" (a request's "partial" overrides it).
     #[arg(long)]
     partial: bool,
+    /// With --shards: the StrataCluster (namespace/name) that runs this
+    /// coordinator on Kubernetes, read and scaled through the API server as
+    /// the pod's service account (the operator sets it).
+    #[arg(long, env = "STRATA_KUBE_CLUSTER")]
+    kube_cluster: Option<String>,
     /// HTTP address (API, metrics, UI).
     #[arg(long, default_value = "127.0.0.1:7700")]
     listen: String,
@@ -580,6 +593,7 @@ async fn main() {
         verify_every_s: a.verify_every_s,
         failover_after_ms: a.failover_after_ms,
         shards: a.shards,
+        kube_cluster: a.kube_cluster.filter(|c| !c.is_empty()),
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
             shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),
@@ -605,6 +619,8 @@ async fn main() {
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()),
         api_base: a.api_base,
         models: a.models.unwrap_or_else(strata::embed::models_dir),
+        backfill: !a.no_backfill,
+        fetch_models: !a.no_fetch_models,
         synonyms: a.synonyms,
         backup_dir: a.backup_dir,
         media_fetch: a.media_fetch,

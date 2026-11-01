@@ -16,7 +16,7 @@ use rand::{Rng, SeedableRng};
 use storage_util::*;
 use strata::db::Db;
 use strata::query::Params;
-use strata::storage::{Applied, CheckpointOptions, DbOptions, Layout, LogRead, MergePolicy, SeqNo, Shipped};
+use strata::storage::{Applied, CheckpointOptions, DbOptions, DropOptions, Layout, LogRead, MergePolicy, SeqNo, Shipped};
 use strata::{Document, Field, FieldType, Schema, Value};
 
 fn options(layout: Layout) -> DbOptions {
@@ -487,10 +487,11 @@ fn a_replica_takes_a_copy_of_its_primary() {
             assert!(e.contains(why), "{e}");
             same(&primary, &replica, why);
         };
-        let lone = Db::create(&dir.path().join("lone.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        let lone = Db::create(&dir.path().join("lone.strata"), other(), options(Layout::SingleFile)).unwrap();
         lone.storage().start_seq_no().unwrap();
-        refused(&lone, "the copy's tables (t) are not this database's (t, u)");
-        lone.create_table(other()).unwrap();
+        refused(&lone, "the copy's first table (u) is not this database's (t), or their schemas differ");
+        let lone = Db::create(&dir.path().join("lone2.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        lone.storage().start_seq_no().unwrap();
         refused(&lone, "the copy is of term 1, older than this database's (2)");
         let plain = Db::create(&dir.path().join("plain.strata"), schema(), options(Layout::SingleFile)).unwrap();
         plain.create_table(other()).unwrap();
@@ -506,5 +507,130 @@ fn a_replica_takes_a_copy_of_its_primary() {
         }
         assert_eq!(replica.storage().install_copy(copy.storage()).unwrap(), last(&copy));
         same(&copy, &replica, &format!("seed {seed}: a copy with rows in its memtables"));
+    }
+}
+
+/// A third table, which references the second.
+fn third() -> Schema {
+    let mut uid = Field::new("uid", FieldType::Int);
+    uid.references = Some("u".into());
+    Schema::new("v", vec![Field::new("id", FieldType::Keyword), uid], Some("id")).unwrap()
+}
+
+fn upsert_v(db: &Db, i: u64) {
+    let mut tx = db.storage().begin().unwrap();
+    tx.table("v").unwrap().upsert(vec![Value::Str(key(i)), Value::Int(i as i64)]).unwrap();
+    tx.commit().unwrap();
+}
+
+fn rows_of(db: &Db, table: &str) -> Vec<Vec<Value>> {
+    let mut rows = db.query(&format!("SELECT * FROM {table} LIMIT 100000"), &Params::new()).unwrap().rows;
+    rows.sort_by_key(|r| format!("{:?}", r[0]));
+    rows
+}
+
+/// On a primary that numbers its writes, creating or dropping tables is a
+/// numbered transaction that it ships as it ships a write: a replica makes
+/// the same change, with the same table ids, so that the writes after it
+/// find their tables, shipped in one batch with it or one at a time. A drop
+/// with CASCADE removes the references on both. A replica that has a table
+/// the primary creates refuses the batch. Opened again, the primary's log
+/// starts after its last change of tables, and a replica that its log no
+/// longer reaches takes a copy, which brings the primary's tables and ids
+/// in place of its own.
+#[test]
+fn a_replica_makes_the_tables_its_primary_makes() {
+    for (pl, rl) in [(Layout::SingleFile, Layout::Directory), (Layout::Directory, Layout::SingleFile)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pp, rp) = (path_for(dir.path(), "primary", pl), path_for(dir.path(), "replica", rl));
+        let mut primary = Db::create(&pp, schema(), options(pl)).unwrap();
+        let replica = Db::create(&rp, schema(), options(rl)).unwrap();
+        for db in [&primary, &replica] {
+            db.storage().start_seq_no().unwrap();
+        }
+        let mut rng = StdRng::seed_from_u64(11);
+        for i in 0..20 {
+            upsert_one(&primary, i);
+        }
+        primary.create_table(other()).unwrap();
+        assert_eq!(last(&primary).seq, 21, "{pl:?}: the table takes the next number");
+        for _ in 0..30 {
+            write(&primary, &mut rng, 50);
+        }
+        // The rows before, the table and the rows after, in one batch.
+        let n = last(&primary).seq as usize;
+        assert_eq!(ship(&primary, &replica, usize::MAX), n);
+        same(&primary, &replica, "created");
+        assert_eq!(replica.catalog(), primary.catalog());
+
+        // One at a time: a table that references u, rows in it, u dropped
+        // with CASCADE (v's reference goes), and u made again, with a new id.
+        primary.create_table(third()).unwrap();
+        for i in 0..5 {
+            upsert_v(&primary, i);
+        }
+        primary.storage().drop_tables(&["u"], DropOptions { cascade: true, if_exists: false }).unwrap();
+        assert_eq!(primary.storage().table("v").unwrap().fields[1].references, None);
+        primary.create_table(other()).unwrap();
+        let made = last(&primary).seq;
+        for _ in 0..20 {
+            write(&primary, &mut rng, 50);
+        }
+        assert!(ship(&primary, &replica, 1) >= 8);
+        same(&primary, &replica, "dropped and made again");
+        assert_eq!(replica.catalog(), primary.catalog());
+        assert_eq!(rows_of(&replica, "v"), rows_of(&primary, "v"));
+        replica.storage().check().unwrap();
+
+        // A database that made a table of that name itself is no copy.
+        let other_dir = tempfile::tempdir().unwrap();
+        let p2 = Db::create(&other_dir.path().join("p2.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        let x = Db::create(&other_dir.path().join("x.strata"), schema(), options(Layout::SingleFile)).unwrap();
+        for db in [&p2, &x] {
+            db.storage().start_seq_no().unwrap();
+        }
+        upsert_one(&p2, 1);
+        p2.create_table(other()).unwrap();
+        x.create_table(other()).unwrap();
+        let got = txns(p2.storage().log_from(2, usize::MAX));
+        let e = x.storage().apply_shipped(prev(&p2, 1), &[&*got[0].bytes]).unwrap_err().to_string();
+        assert!(e.contains("shipped transaction 2 creates table u with id 1, which this database has or cannot have"), "{e}");
+        assert_eq!(last(&x).seq, 1, "and applies nothing");
+
+        // Opened again, the primary numbers on; its log starts after the
+        // last change of tables.
+        let at = last(&primary);
+        drop(primary);
+        primary = Db::open(&pp, options(pl)).unwrap();
+        assert_eq!(last(&primary), at);
+        assert_eq!(primary.storage().log_from(made, usize::MAX), LogRead::Gone { oldest: made + 1 });
+        upsert_one(&primary, 3);
+        assert_eq!(ship(&primary, &replica, usize::MAX), 1);
+        same(&primary, &replica, "opened again");
+
+        // A replica with a table of its own, at id 1, takes a copy: it then
+        // has the primary's tables, with the primary's ids, and applies the
+        // writes shipped after the copy.
+        let r2 = Db::create(&path_for(dir.path(), "r2", rl), schema(), options(rl)).unwrap();
+        r2.storage().start_seq_no().unwrap();
+        r2.create_table(Schema::new("w", vec![Field::new("id", FieldType::Int)], Some("id")).unwrap()).unwrap();
+        let to = path_for(dir.path(), "copy", Layout::SingleFile);
+        primary.storage().checkpoint(&to, &CheckpointOptions::default()).unwrap();
+        let copy = Db::open(&to, options(Layout::SingleFile)).unwrap();
+        assert_eq!(r2.install_copy(copy.storage()).unwrap(), last(&primary));
+        assert_eq!(r2.catalog(), primary.catalog());
+        same(&primary, &r2, "copied");
+        for _ in 0..20 {
+            write(&primary, &mut rng, 50);
+        }
+        upsert_v(&primary, 9);
+        assert!(ship(&primary, &r2, usize::MAX) > 0);
+        same(&primary, &r2, "shipped after the copy");
+        assert_eq!(rows_of(&r2, "v"), rows_of(&primary, "v"));
+        r2.storage().check().unwrap();
+        drop(r2);
+        let r2 = Db::open(&path_for(dir.path(), "r2", rl), options(rl)).unwrap();
+        same(&primary, &r2, "the copy opened again");
+        assert_eq!(r2.catalog(), primary.catalog());
     }
 }

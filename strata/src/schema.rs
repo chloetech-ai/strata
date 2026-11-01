@@ -228,7 +228,31 @@ pub struct Field {
     /// `derive`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive: Option<Derive>,
+    /// Set on a field that `ALTER TABLE ... ADD COLUMN` gave its table
+    /// ([`Alter::AddField`]): segments written before hold no sections
+    /// of it, and their rows read [`Added::fill`]. Makes the database
+    /// format 3 (feature [`ADDED_FIELDS`]), so that versions of Strata
+    /// that would find those sections missing refuse it by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<Added>,
 }
+
+/// What [`Field::added`] records of a field added to a table.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Added {
+    /// The value the rows written before the field was added hold, as JSON
+    /// in the form [`Field::default`] takes: the default the field was
+    /// added with, fixed then (NULL without one, and for a TIMESTAMP whose
+    /// default is the time of writing, since those rows were not written
+    /// then). A segment that lacks the field reads it in every row
+    /// ([`crate::segment::build::missing_fields`]); a merge writes it.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub fill: serde_json::Value,
+}
+
+/// The feature of a database with a field added to a table that existed
+/// ([`Field::added`]).
+pub const ADDED_FIELDS: &str = "added_fields";
 
 /// A TEXT field made by `model` from the file MEDIA field `from` holds
 /// ([`crate::derive`]): a caption of an image. Writes that leave the text
@@ -322,6 +346,7 @@ impl Field {
             media: None,
             semantic_id: None,
             derive: None,
+            added: None,
         }
     }
     /// What the field's sections are named by in a segment
@@ -426,6 +451,14 @@ impl Field {
             None => Ok(Value::Null),
             Some(serde_json::Value::String(s)) if self.logical == Some(Logical::Timestamp) && s.eq_ignore_ascii_case("now") => Ok(Value::Int(now)),
             Some(j) => crate::ingest::field_value(self, false, j).map_err(|e| Error::Schema(format!("the default of {}: {e}", self.name))),
+        }
+    }
+    /// The value, in stored form, that a row written before the field was
+    /// added holds ([`Added::fill`]): NULL for a field the table always had.
+    pub fn fill_value(&self) -> Result<crate::value::Value> {
+        match self.added.as_ref().map(|a| &a.fill) {
+            None | Some(serde_json::Value::Null) => Ok(crate::value::Value::Null),
+            Some(j) => crate::ingest::field_value(self, false, j).map_err(|e| Error::Schema(format!("the value {} has in rows written before it was added: {e}", self.name))),
         }
     }
     /// A stored value as queries return it ([`Logical::output`]).
@@ -593,10 +626,192 @@ impl Retain {
     }
 }
 
+/// A change of a table's columns (SQL `ALTER TABLE`, [`Schema::altered`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Alter {
+    /// Adds a column after the others, with the next field id. The rows
+    /// the table holds read its default (NULL without one, and for a
+    /// TIMESTAMP that defaults to the time of writing): [`Added::fill`].
+    /// It is not the key, nor generated, a semantic ID or EDGES.
+    AddField(Field),
+    /// Drops the column of this name (any case): its id leaves the table
+    /// for good, and segments keep its data until a merge rewrites them.
+    /// Not the key, nor a column that another one or the table's options
+    /// name (`shard_by`, `cluster_by`, `retain_by`, `edges`).
+    DropField(String),
+    /// Renames a column, which keeps its id and everything written of it;
+    /// the table's options and fields that name it name it anew.
+    RenameField { from: String, to: String },
+}
+
+impl Alter {
+    /// The column it names.
+    pub fn column(&self) -> &str {
+        match self {
+            Alter::AddField(f) => &f.name,
+            Alter::DropField(name) | Alter::RenameField { from: name, .. } => name,
+        }
+    }
+}
+
 impl Schema {
+    /// This table with `alter` made, checked as [`Schema::new`] checks a
+    /// table. Fields keep their ids; an added one gets the next
+    /// ([`Schema::next_field_id`]), and the ids of dropped ones are never
+    /// given again. A table read from a database written before field ids
+    /// cannot change: its positions are its ids ([`crate::upgrade`]).
+    pub fn altered(&self, alter: &Alter) -> Result<Schema> {
+        let bad = |m: String| Err(Error::Schema(format!("table {}: {m}", self.table)));
+        if self.is_legacy() {
+            return bad("it comes from a database written before field ids, whose columns cannot change: upgrade it first (strata::upgrade)".into());
+        }
+        let find = |name: &str| self.field_index(name).ok_or_else(|| Error::Schema(format!("table {} has no column {name}", self.table)));
+        let mut fields = self.fields.clone();
+        let mut options = (self.shard_by.clone(), self.cluster_by.clone(), self.retain.clone(), self.edges.clone());
+        match alter {
+            Alter::AddField(f) => {
+                let mut f = f.clone();
+                if f.id != NO_ID {
+                    return bad(format!("column {} is new, and has no id yet", f.name));
+                }
+                if !f.generated_from.is_empty() || f.semantic_id.is_some() || f.ty == FieldType::Edges {
+                    return bad(format!(
+                        "column {}: a generated column, a semantic ID or an EDGES column is given when the table is created, since its rows would have to be computed again",
+                        f.name
+                    ));
+                }
+                let fill = match (&f.default, f.logical) {
+                    (Some(serde_json::Value::String(s)), Some(Logical::Timestamp)) if s.eq_ignore_ascii_case("now") => serde_json::Value::Null,
+                    (Some(d), _) => d.clone(),
+                    (None, _) => serde_json::Value::Null,
+                };
+                f.added = Some(Added { fill });
+                fields.push(f);
+            }
+            Alter::DropField(name) => {
+                let i = find(name)?;
+                let name = &self.fields[i].name;
+                if self.primary_key == Some(i) {
+                    return bad(format!("{name} is its primary key, which cannot be dropped"));
+                }
+                if let Some(why) = self.naming(name) {
+                    return bad(format!("{why} names {name}: change that first"));
+                }
+                if fields.len() == 1 {
+                    return bad(format!("{name} is its only column"));
+                }
+                fields.remove(i);
+            }
+            Alter::RenameField { from, to } => {
+                let i = find(from)?;
+                let from = self.fields[i].name.clone();
+                if to.trim().is_empty() {
+                    return bad(format!("column {from} needs a new name"));
+                }
+                if self.fields.iter().enumerate().any(|(j, f)| j != i && f.name.eq_ignore_ascii_case(to)) {
+                    return bad(format!("it has a column named {to} already"));
+                }
+                let same = |n: &str| n.eq_ignore_ascii_case(&from);
+                let rename = |n: &mut String| {
+                    if same(n) {
+                        *n = to.clone();
+                    }
+                };
+                for f in fields.iter_mut() {
+                    f.generated_from.iter_mut().for_each(rename);
+                    if let Some(e) = &mut f.embed {
+                        e.from.iter_mut().for_each(rename);
+                    }
+                    if let Some(d) = &mut f.derive {
+                        rename(&mut d.from);
+                    }
+                    if let Some(sid) = &mut f.semantic_id {
+                        rename(&mut sid.from);
+                    }
+                }
+                fields[i].name = to.clone();
+                let (shard_by, cluster_by, retain, edges) = &mut options;
+                shard_by.iter_mut().chain(cluster_by.iter_mut()).for_each(rename);
+                if let Some(r) = retain {
+                    rename(&mut r.by);
+                }
+                if let Some(e) = edges {
+                    rename(&mut e.src);
+                    rename(&mut e.dst);
+                    e.weight.iter_mut().for_each(rename);
+                }
+            }
+        }
+        let key = self.primary_key.map(|k| self.fields[k].id).and_then(|id| fields.iter().find(|f| f.id == id)).map(|f| f.name.clone());
+        let mut s = Schema::with_next_id(&self.table, fields, key.as_deref(), self.next_field_id)?;
+        let (shard_by, cluster_by, retain, edges) = options;
+        if let Some(f) = shard_by {
+            s = s.with_shard_by(&f)?;
+        }
+        if let Some(f) = cluster_by {
+            s = s.with_cluster_by(&f)?;
+        }
+        if let Some(r) = retain {
+            s = s.with_retain(&r.by, r.seconds)?;
+        }
+        if let Some(e) = edges {
+            s = s.with_edges(&e.src, &e.dst, e.weight.as_deref())?;
+        }
+        Ok(s)
+    }
+
+    /// Whether `other` has the columns and options of this schema, in the
+    /// same order, leaving out what is a database's own: the ids its
+    /// fields are named by on disk and how a column added later fills the
+    /// rows written before it. Two databases a table was made in by
+    /// different statements (`CREATE TABLE` with every column, or with
+    /// fewer and `ALTER TABLE ... ADD COLUMN`) hold the same columns.
+    pub fn same_columns(&self, other: &Schema) -> bool {
+        let plain = |s: &Schema| {
+            let mut s = s.clone();
+            s.next_field_id = 0;
+            for f in &mut s.fields {
+                f.id = NO_ID;
+                f.added = None;
+            }
+            s
+        };
+        self.fields.len() == other.fields.len() && plain(self) == plain(other)
+    }
+
+    /// What of this table names column `name` (any case) besides the
+    /// column itself: another field (as a source of its text, vectors,
+    /// caption or semantic IDs) or one of the table's options.
+    pub fn naming(&self, name: &str) -> Option<String> {
+        let same = |n: &str| n.eq_ignore_ascii_case(name);
+        for f in &self.fields {
+            if f.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            let names = f.generated_from.iter().chain(f.embed.iter().flat_map(|e| e.from.iter())).chain(f.derive.iter().map(|d| &d.from)).chain(f.semantic_id.iter().map(|s| &s.from));
+            if names.into_iter().any(|n| same(n)) {
+                return Some(format!("column {}", f.name));
+            }
+        }
+        let options = [("shard_by", self.shard_by.as_deref()), ("cluster_by", self.cluster_by.as_deref()), ("retain_by", self.retain.as_ref().map(|r| r.by.as_str()))];
+        if let Some((o, _)) = options.iter().find(|(_, n)| n.is_some_and(same)) {
+            return Some(format!("its option {o}"));
+        }
+        if self.edges.as_ref().is_some_and(|e| same(&e.src) || same(&e.dst) || e.weight.as_deref().is_some_and(same)) {
+            return Some("its option edges".into());
+        }
+        None
+    }
+
     pub fn new(table: &str, fields: Vec<Field>, primary_key: Option<&str>) -> Result<Self> {
-        let s = Schema { table: table.to_string(), fields, next_field_id: 0, primary_key: None, shard_by: None, cluster_by: None, retain: None, edges: None };
-        let mut s = s;
+        Schema::with_next_id(table, fields, primary_key, 0)
+    }
+
+    /// [`Schema::new`] of a table whose fields have had ids below
+    /// `next_field_id`: a field without one gets the next, never an id a
+    /// field it had before held.
+    fn with_next_id(table: &str, fields: Vec<Field>, primary_key: Option<&str>, next_field_id: u32) -> Result<Self> {
+        let mut s = Schema { table: table.to_string(), fields, next_field_id, primary_key: None, shard_by: None, cluster_by: None, retain: None, edges: None };
         s.give_ids()?;
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
@@ -709,6 +924,16 @@ impl Schema {
         }
         s.check_semantic_ids()?;
         s.check_references()?;
+        for (i, f) in s.fields.iter().enumerate() {
+            if f.added.is_none() {
+                continue;
+            }
+            if s.primary_key == Some(i) || !f.generated_from.is_empty() || f.semantic_id.is_some() || f.ty == FieldType::Edges {
+                return Err(Error::Schema(format!("field {}: a field added to a table is not its key, generated, a semantic ID or EDGES", f.name)));
+            }
+            // A value of the field's type (ingest checks it as a row's).
+            f.fill_value()?;
+        }
         if s.fields.iter().any(|f| f.name.trim().is_empty()) {
             return Err(Error::Schema(format!("a column of {} has an empty name", s.table)));
         }
@@ -971,6 +1196,7 @@ impl Schema {
                 f.semantic_id.as_ref().map(|_| "semantic_id"),
                 f.media.map(|_| "media"),
                 f.derive.as_ref().map(|_| "derive"),
+                f.added.as_ref().map(|_| ADDED_FIELDS),
             ];
             named.into_iter().flatten().map(String::from).chain(f.analyzer.and_then(Analyzer::feature))
         });
@@ -1412,6 +1638,15 @@ impl Schema {
         }
         out.insert("fields".into(), J::Array(fields));
         J::Object(out)
+    }
+}
+
+impl Field {
+    /// A field from its short JSON form, as a schema's `fields` list it
+    /// ([`Schema::from_json`]): `{"name": "price", "type": "float",
+    /// "default": 0}`. It has no id until a table gives it one.
+    pub fn from_short_json(j: &serde_json::Value) -> Result<Field> {
+        short_field(j)
     }
 }
 

@@ -28,6 +28,7 @@ pub mod heap;
 pub mod http;
 pub mod idem;
 pub mod json;
+pub mod judge;
 pub mod keys;
 pub mod keysync;
 pub mod logstore;

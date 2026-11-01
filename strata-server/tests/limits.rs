@@ -31,7 +31,7 @@ fn open(dir: &std::path::Path, name: &str, keep: impl Fn(usize) -> bool) -> Arc<
 /// A server of `db` that returns at most 100 rows and makes at most 5
 /// groups, as `strata-server --max-result-window 100 --max-groups 5`.
 fn capped(db: Arc<Db>) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut s = Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(10));
     s.max_rows = Some(100);
     s.max_groups = Some(5);

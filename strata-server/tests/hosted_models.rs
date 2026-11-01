@@ -3,7 +3,9 @@
 //! written as plain text get their vectors from it, `{"embed": text}`
 //! parameters too, `/v1/models` says which models would open here,
 //! `/metrics` and `/v1/schema` count the requests, and a model that keeps
-//! failing fails the write with 503 and writes nothing.
+//! failing fails the write with 503 and writes nothing. Rows stored before
+//! a field had its model get their vectors once it opens, and a model that
+//! fails leaves them for another try.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -143,4 +145,85 @@ async fn rows_and_queries_embedded_by_a_hosted_model() {
     assert_eq!(r["rows"][0][0], 40, "{r}");
     let (status, r) = post(&c, &format!("{base}/v1/sql"), json!({"sql": "INSERT INTO docs (id, title) VALUES ('x2', 'kettle')"})).await;
     assert_eq!(status, 503, "{r}");
+}
+
+/// `/v1/schema`'s embeddings, once `ready` holds of them (10 s at most).
+async fn embeddings_when(c: &reqwest::Client, base: &str, ready: impl Fn(&Json) -> bool) -> Json {
+    for _ in 0..200 {
+        let r: Json = c.get(format!("{base}/v1/schema")).send().await.unwrap().json().await.unwrap();
+        if ready(&r["embeddings"][0]) {
+            return r["embeddings"][0].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("not ready in 10 s");
+}
+
+/// A server over `db` with the models of `models`, filling in vectors.
+async fn serve(db: Db, schema: Schema, models: &std::path::Path) -> String {
+    let agent = AgentConfig { api_key: None, model: strata_server::agent::DEFAULT_MODEL.into(), base_url: "http://unused".into() };
+    let mut svc = Service::new(Backend::Local(Arc::new(db)), schema, agent, 16, Duration::from_secs(10));
+    svc.open_models(models);
+    let svc = Arc::new(svc);
+    tokio::spawn(svc.clone().keep_models());
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(server::serve_http(svc, l, Access::default()));
+    base
+}
+
+/// Rows of `SCHEMA` without vectors: the database had no model open.
+fn stored_without_vectors(path: &std::path::Path, n: usize) -> (Db, Schema) {
+    let schema = Schema::from_json(SCHEMA).unwrap();
+    let db = Db::create(path, schema.clone(), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap();
+    let colours = ["red", "blue", "green", "black"];
+    db.load((0..n).map(|i| vec![strata::value::Value::Str(format!("d{i:02}")), strata::value::Value::Str(if i == 0 { String::new() } else { format!("{} mug {i}", colours[i % 4]) }), strata::value::Value::Null])).unwrap();
+    assert_eq!(db.missing_vectors("docs", "emb").unwrap().len(), n);
+    (db, schema)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_stored_before_the_model_opened_get_their_vectors() {
+    let (down, seen) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let url = mock(down, seen.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let (db, schema) = stored_without_vectors(&dir.path().join("h.strata"), 600);
+    // The model's endpoint is configured since: the server opens it.
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(models.join("gpu")).unwrap();
+    std::fs::write(models.join("gpu").join("endpoint.json"), json!({"api": "openai", "url": url, "dim": 16}).to_string()).unwrap();
+    let base = serve(db, schema, &models).await;
+    let c = reqwest::Client::new();
+
+    let e = embeddings_when(&c, &base, |e| e["backfill"]["state"] == "done").await;
+    // The row without text gets none; 599 in writes of 256 rows.
+    assert_eq!(e["backfill"], json!({"state": "done", "missing": 600, "embedded": 599, "error": null}), "{e}");
+    assert_eq!(seen.load(Ordering::SeqCst), 3);
+    // Each the vector of its text.
+    let score = json!({"sql": "SELECT similarity(emb, :q) FROM docs WHERE id = 'd306'", "params": {"q": {"embed": "green mug 306"}}});
+    let (status, r) = post(&c, &format!("{base}/v1/query"), score).await;
+    assert_eq!(status, 200, "{r}");
+    assert!((r["rows"][0][0].as_f64().unwrap() - 1.0).abs() < 1e-5, "{r}");
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT title FROM docs WHERE id = 'd07'"})).await;
+    assert_eq!(r["rows"][0][0], "black mug 7", "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_that_fails_leaves_the_rows_for_another_try() {
+    let (down, seen) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicUsize::new(0)));
+    let url = mock(down, seen.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let (db, schema) = stored_without_vectors(&dir.path().join("h.strata"), 10);
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(models.join("gpu")).unwrap();
+    std::fs::write(models.join("gpu").join("endpoint.json"), json!({"api": "openai", "url": url, "dim": 16, "retries": 0}).to_string()).unwrap();
+    let base = serve(db, schema, &models).await;
+    let c = reqwest::Client::new();
+
+    let e = embeddings_when(&c, &base, |e| e["backfill"]["state"] == "failed").await;
+    assert_eq!((&e["backfill"]["missing"], &e["backfill"]["embedded"]), (&json!(10), &json!(0)), "{e}");
+    assert!(e["backfill"]["error"].as_str().unwrap().contains("overloaded"), "{e}");
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    let (_, r) = post(&c, &format!("{base}/v1/query"), json!({"sql": "SELECT COUNT(*) FROM docs"})).await;
+    assert_eq!(r["rows"][0][0], 10, "{r}");
 }

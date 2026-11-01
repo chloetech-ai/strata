@@ -33,7 +33,7 @@ fn models() -> std::path::PathBuf {
 
 fn local(dir: &Path, name: &str, with_models: bool) -> Arc<Service> {
     let db = Arc::new(Db::create(&dir.join(name), items(), DbOptions { segment_max_docs: 20, publish_snapshots: true, ..DbOptions::default() }).unwrap());
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     let mut svc = Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(20));
     if with_models {
         svc.open_models(&models());

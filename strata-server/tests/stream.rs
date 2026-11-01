@@ -51,7 +51,7 @@ fn create(path: &std::path::Path, opts: DbOptions) -> Arc<Db> {
 }
 
 fn service(db: Arc<Db>) -> Service {
-    let schema = db.schema().clone();
+    let schema = (*db.schema()).clone();
     Service::new(Backend::Local(db), schema, agent(), 16, Duration::from_secs(20))
 }
 

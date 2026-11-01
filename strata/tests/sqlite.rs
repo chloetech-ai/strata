@@ -424,7 +424,7 @@ fn export_some_tables_bare() {
     drop(c);
     // Without the kept schemas, the import makes them from SQLite's.
     let (back, _) = sqlite::import_new(&out, &dir.path().join("back.strata"), DbOptions::default(), &ImportOptions::default()).unwrap();
-    let s = back.schema();
+    let s = &back.schema();
     assert_eq!(field(s, "published").type_name(), "TIMESTAMP");
     assert_eq!(field(s, "in_print").type_name(), "BOOL");
     assert!(matches!(field(s, "emb").ty, FieldType::Vector { dim: 3, .. }));

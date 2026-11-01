@@ -18,9 +18,20 @@
 //! its row's events after it, within a window. A row given a label of its
 //! own (`UPDATE rank_log SET label = 3 WHERE ...`: a judge's grade, an
 //! agent citing it) keeps it.
+//!
+//! A logged query may interleave a second ranking with its own
+//! ([`Log::interleave`]): both run, and the rows shown are drawn from the
+//! two by team draft ([`team_draft`]), each logged with the name of the
+//! ranking that placed it. [`Credit`] then says which ranking the users
+//! preferred, from the export: the one whose rows they acted on more,
+//! request by request. Interleaving tells two rankings apart with ten to a
+//! hundred times fewer requests than an A/B test of the same two (Chapelle
+//! et al., "Large-scale validation and analysis of interleaved search
+//! evaluation", TOIS 2012), since each request sets the two side by side
+//! for the same user and query.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{json, Map, Value as Json};
 use sqlparser::ast as sql;
@@ -127,24 +138,38 @@ pub struct Log {
     /// When the request was served, in microseconds since the epoch; now
     /// when `None`. Replaying past traffic gives the times it had.
     pub ts: Option<i64>,
+    /// A second ranking to interleave with the query's.
+    pub interleave: Option<Interleave>,
 }
 
 impl Default for Log {
     fn default() -> Self {
-        Log { table: TABLE.into(), request: None, context: None, variant: None, candidates: None, ts: None }
+        Log { table: TABLE.into(), request: None, context: None, variant: None, candidates: None, ts: None, interleave: None }
     }
+}
+
+/// A second ranking interleaved with a logged query's ([`interleave`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Interleave {
+    /// The other ranking: a SELECT of the same table answering the same
+    /// columns, ranked by an ORDER BY, with the same parameters.
+    pub sql: String,
+    /// The two rankings' names, the logged query's first: each row shown
+    /// is logged with the name of the one that placed it (`variant`).
+    pub variants: [String; 2],
 }
 
 impl Log {
     /// A log from JSON (strata-server's `"log"`): `true`, or an object of
-    /// `table`, `request`, `context`, `variant`, `candidates` and `ts` (ISO
-    /// 8601 text, or microseconds).
+    /// `table`, `request`, `context`, `variant`, `candidates`, `ts` (ISO
+    /// 8601 text, or microseconds) and `interleave` (an object of `sql` and
+    /// `variants`, two names, `["a", "b"]` when left out).
     pub fn from_json(j: &Json) -> Result<Log> {
         let mut log = Log::default();
         let m = match j {
             Json::Bool(true) => return Ok(log),
             Json::Object(m) => m,
-            _ => return Err(bad("log is true or an object of table, request, context, variant, candidates and ts")),
+            _ => return Err(bad("log is true or an object of table, request, context, variant, candidates, ts and interleave")),
         };
         let text = |k: &str| -> Result<Option<String>> {
             match m.get(k) {
@@ -155,8 +180,8 @@ impl Log {
             }
         };
         for k in m.keys() {
-            if !["table", "request", "context", "variant", "candidates", "ts"].contains(&k.as_str()) {
-                return Err(bad(format!("log has no option {k:?}: table, request, context, variant, candidates, ts")));
+            if !["table", "request", "context", "variant", "candidates", "ts", "interleave"].contains(&k.as_str()) {
+                return Err(bad(format!("log has no option {k:?}: table, request, context, variant, candidates, ts, interleave")));
             }
         }
         if let Some(t) = text("table")? {
@@ -170,6 +195,38 @@ impl Log {
             Some(v) => Some(v.as_u64().filter(|&n| n > 0).ok_or_else(|| bad(format!("log candidates is a positive number, not {v}")))? as usize),
         };
         log.ts = m.get("ts").map(time_of).transpose()?.flatten();
+        log.interleave = match m.get("interleave") {
+            None | Some(Json::Null) => None,
+            Some(Json::Object(i)) => {
+                for k in i.keys() {
+                    if k != "sql" && k != "variants" {
+                        return Err(bad(format!("log interleave has no option {k:?}: sql, variants")));
+                    }
+                }
+                let sql = i.get("sql").and_then(|v| v.as_str()).ok_or_else(|| bad("log interleave needs sql, the ranking to interleave with the query's"))?;
+                let variants = match i.get("variants") {
+                    None | Some(Json::Null) => ["a".to_string(), "b".to_string()],
+                    Some(Json::Array(v)) => match v.as_slice() {
+                        [Json::String(a), Json::String(b)] => [a.clone(), b.clone()],
+                        _ => return Err(bad("log interleave variants are two names, the query's ranking's first")),
+                    },
+                    Some(v) => return Err(bad(format!("log interleave variants are two names, not {v}"))),
+                };
+                Some(Interleave { sql: sql.to_string(), variants })
+            }
+            Some(v) => return Err(bad(format!("log interleave is an object of sql and variants, not {v}"))),
+        };
+        if let Some(i) = &log.interleave {
+            if i.variants[0].is_empty() || i.variants[1].is_empty() || i.variants[0] == i.variants[1] {
+                return Err(bad("an interleaved query's two rankings have two different names"));
+            }
+            if log.variant.is_some() {
+                return Err(bad("an interleaved query's rows are named by interleave's variants: leave out variant"));
+            }
+            if log.candidates.is_some() {
+                return Err(bad("an interleaved query logs the rows it shows: leave out candidates"));
+            }
+        }
         Ok(log)
     }
 }
@@ -197,10 +254,15 @@ pub struct Prepared {
 
 /// `sql_text` as a logged query runs it: one SELECT ranked by an ORDER BY
 /// (rerank phases included), with its ranking's values added to its
-/// columns ([`crate::query::sql::with_features`]).
+/// columns ([`crate::query::sql::with_features`]). Each ranking of an
+/// interleaved query is prepared alike, and needs a LIMIT and no OFFSET:
+/// a draft is of a first page.
 pub fn prepare(sql_text: &str, params: &Params, log: &Log) -> Result<Prepared> {
     let mut q = crate::query::sql::ranked_query(sql_text).ok_or_else(|| bad("a logged query is one SELECT ranked by an ORDER BY"))?;
     let (offset, limit) = crate::query::compound::limits(&q.limit_clause, params)?;
+    if log.interleave.is_some() && (limit.is_none() || offset > 0) {
+        return Err(bad("each ranking of an interleaved query has a LIMIT, the rows it shows, and no OFFSET"));
+    }
     if let Some(c) = log.candidates {
         let l = limit.ok_or_else(|| bad("candidates are rows past a LIMIT: the query needs one"))?;
         if c > l {
@@ -252,6 +314,9 @@ pub struct Served {
     pub request: String,
     /// The rows to log.
     pub entries: Vec<Entry>,
+    /// An interleaved query's: per row answered, the ranking whose team
+    /// placed it, `None` for a row placed after one ranking ran out.
+    pub teams: Vec<Option<String>>,
 }
 
 /// The answer to a logged query ([`crate::db::Db::query_logged`]).
@@ -263,6 +328,8 @@ pub struct Logged {
     /// The log write's sequence number, in a database that numbers its
     /// writes.
     pub seq_no: Option<u64>,
+    /// An interleaved query's teams ([`Served::teams`]); empty otherwise.
+    pub teams: Vec<Option<String>>,
 }
 
 /// Splits the answer of a [`prepare`]d query into the answer the query
@@ -314,7 +381,212 @@ pub fn serve(mut rs: ResultSet, p: &Prepared, log: &Log) -> Result<Served> {
     rs.columns.truncate(k);
     rs.keys.truncate(n);
     rs.scores.truncate(n);
-    Ok(Served { rs, request, entries })
+    Ok(Served { rs, request, entries, teams: Vec::new() })
+}
+
+/// A row of an interleaved list ([`team_draft`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pick {
+    /// The ranking it came from: 0 or 1.
+    pub from: usize,
+    /// Its place in that ranking.
+    pub index: usize,
+    /// Whether it counts for its ranking's team: a row placed after the
+    /// other ranking ran out counts for neither.
+    pub team: bool,
+}
+
+/// Team-draft interleaving (Radlinski, Kurup and Joachims, "How does
+/// clickthrough data reflect retrieval quality?", CIKM 2008) of two
+/// rankings' keys, `k` rows at most: in each round the team with fewer
+/// picks, or the coin's choice when they have as many, adds its best row
+/// not yet in the list. When one ranking runs out the other's rows fill
+/// the list for neither team, so that a short ranking is neither favoured
+/// nor blamed. A row both rankings hold counts for the team that took it,
+/// and a click on it for that team alone; the coin keeps either ranking
+/// from always taking first, so neither is credited for the position bias.
+pub fn team_draft(a: &[String], b: &[String], k: usize, coin: &mut dyn FnMut() -> bool) -> Vec<Pick> {
+    let lists = [a, b];
+    let mut next = [0usize; 2];
+    let mut picks = [0usize; 2];
+    let mut taken: HashSet<&str> = HashSet::new();
+    let mut out = Vec::with_capacity(k);
+    while out.len() < k {
+        for (l, i) in lists.iter().zip(next.iter_mut()) {
+            while *i < l.len() && taken.contains(l[*i].as_str()) {
+                *i += 1;
+            }
+        }
+        let has = [next[0] < a.len(), next[1] < b.len()];
+        let (from, team) = match has {
+            [false, false] => break,
+            [true, false] => (0, false),
+            [false, true] => (1, false),
+            [true, true] => (if picks[0] < picks[1] || (picks[0] == picks[1] && coin()) { 0 } else { 1 }, true),
+        };
+        let index = next[from];
+        taken.insert(lists[from][index].as_str());
+        if team {
+            picks[from] += 1;
+        }
+        out.push(Pick { from, index, team });
+    }
+    out
+}
+
+/// A coin from a request's id (FNV-1a, then splitmix64): the same draft
+/// for the same request, a fair one across requests.
+fn coin_of(request: &str) -> impl FnMut() -> bool {
+    let mut x = request.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    move || {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) & 1 == 1
+    }
+}
+
+/// What an interleaved query serves: the rows of the two rankings `a` and
+/// `b` ([`serve`]d, the logged query's first, `p` its preparation) drawn
+/// by [`team_draft`] up to the first's LIMIT, with the coin seeded by the
+/// request's id. Each row logged is the one its ranking served, its
+/// score and features that ranking's, at its place in the list, with its
+/// team's name as its variant (none for a row of neither team).
+pub fn interleave(a: Served, b: Served, p: &Prepared, il: &Interleave) -> Result<Served> {
+    if a.rs.columns != b.rs.columns {
+        return Err(bad(format!("the rankings an interleaved query draws from answer the same columns, not {:?} and {:?}", a.rs.columns, b.rs.columns)));
+    }
+    let keys = |s: &Served| s.entries.iter().map(|e| e.row_key.clone()).collect::<Vec<_>>();
+    let k = p.limit.unwrap_or(usize::MAX);
+    let picks = team_draft(&keys(&a), &keys(&b), k, &mut coin_of(&a.request));
+    let request = a.request.clone();
+    let sides = [a, b];
+    let mut rs = ResultSet { columns: sides[0].rs.columns.clone(), rows: Vec::new(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: sides[0].rs.stats.clone() };
+    let (mut entries, mut teams) = (Vec::with_capacity(picks.len()), Vec::with_capacity(picks.len()));
+    for (position, pk) in picks.iter().enumerate() {
+        let s = &sides[pk.from];
+        rs.rows.push(s.rs.rows[pk.index].clone());
+        if let Some(key) = s.rs.keys.get(pk.index) {
+            rs.keys.push(key.clone());
+        }
+        if let Some(score) = s.rs.scores.get(pk.index) {
+            rs.scores.push(*score);
+        }
+        let team = pk.team.then(|| il.variants[pk.from].clone());
+        let mut e = s.entries[pk.index].clone();
+        e.id = format!("{request}#{position}");
+        e.request = request.clone();
+        e.position = position;
+        e.shown = true;
+        e.variant = team.clone();
+        entries.push(e);
+        teams.push(team);
+    }
+    Ok(Served { rs, request, entries, teams })
+}
+
+/// Which of two interleaved rankings the users preferred ([`credits`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Credit {
+    /// The two rankings, by name in order.
+    pub variants: [String; 2],
+    /// Interleaved requests of the two.
+    pub requests: u64,
+    /// Requests with a row of either team acted on (a label above 0).
+    pub acted: u64,
+    /// Requests whose users acted on more rows of the first ranking, and
+    /// of the second.
+    pub wins: [u64; 2],
+    /// Requests acted on as much for one team as for the other.
+    pub ties: u64,
+    /// Δ of Chapelle et al. (2012): `(wins[0] + ties / 2) / acted - 0.5`,
+    /// above 0 when the first is preferred, from -0.5 to 0.5.
+    pub delta: f64,
+    /// The two-sided sign test's p of the wins (ties left out): the chance
+    /// of a split at least this uneven between rankings the users like
+    /// alike.
+    pub p: f64,
+}
+
+impl Credit {
+    pub fn to_json(&self) -> Json {
+        json!({"variants": self.variants, "requests": self.requests, "acted": self.acted, "wins": self.wins, "ties": self.ties, "delta": self.delta, "p": self.p})
+    }
+}
+
+/// The two-sided exact sign test of `a` wins against `b`.
+pub fn sign_test(a: u64, b: u64) -> f64 {
+    let n = a + b;
+    if n == 0 {
+        return 1.0;
+    }
+    // P(X <= min) for X ~ Binomial(n, 1/2), in logs.
+    let (lo, nf) = (a.min(b), n as f64);
+    let (mut ln_c, mut tail) = (0.0f64, 0.0f64);
+    let half = nf * std::f64::consts::LN_2;
+    for i in 0..=lo {
+        if i > 0 {
+            ln_c += (nf - (i - 1) as f64).ln() - (i as f64).ln();
+        }
+        tail += (ln_c - half).exp();
+    }
+    (2.0 * tail).min(1.0)
+}
+
+/// The credit of interleaved requests ([`Credit`]), summed over export
+/// records ([`export`]) as they come: a request is interleaved when its
+/// shown rows carry two variants, and each team's credit is its rows
+/// acted on (a label above 0). Requests of one variant (an A/B arm) are
+/// left out.
+#[derive(Default)]
+pub struct Credits {
+    requests: HashMap<String, BTreeMap<String, u64>>,
+}
+
+impl Credits {
+    pub fn add(&mut self, record: &Json) {
+        if record["shown"] != Json::Bool(true) {
+            return;
+        }
+        let (Some(request), Some(variant)) = (record["request"].as_str(), record["variant"].as_str()) else { return };
+        let acted = record["label"].as_f64().is_some_and(|l| l > 0.0) as u64;
+        *self.requests.entry(request.to_string()).or_default().entry(variant.to_string()).or_default() += acted;
+    }
+
+    /// Each pair of rankings interleaved, by their names.
+    pub fn finish(self) -> Vec<Credit> {
+        let mut pairs: BTreeMap<[String; 2], Credit> = BTreeMap::new();
+        for teams in self.requests.into_values() {
+            if teams.len() != 2 {
+                continue;
+            }
+            let mut it = teams.into_iter();
+            let ((va, ca), (vb, cb)) = (it.next().unwrap(), it.next().unwrap());
+            let names = [va, vb];
+            let c = pairs.entry(names.clone()).or_insert_with(|| Credit { variants: names, requests: 0, acted: 0, wins: [0, 0], ties: 0, delta: 0.0, p: 1.0 });
+            c.requests += 1;
+            if ca + cb == 0 {
+                continue;
+            }
+            c.acted += 1;
+            match ca.cmp(&cb) {
+                Ordering::Greater => c.wins[0] += 1,
+                Ordering::Less => c.wins[1] += 1,
+                Ordering::Equal => c.ties += 1,
+            }
+        }
+        pairs
+            .into_values()
+            .map(|mut c| {
+                if c.acted > 0 {
+                    c.delta = (c.wins[0] as f64 + c.ties as f64 / 2.0) / c.acted as f64 - 0.5;
+                }
+                c.p = sign_test(c.wins[0], c.wins[1]);
+                c
+            })
+            .collect()
+    }
 }
 
 /// A value as JSON, as answers give it: a TIMESTAMP as ISO 8601 text, a
@@ -680,5 +952,108 @@ mod tests {
         assert_eq!(p.limit, Some(10));
         assert!(prepare("SELECT id FROM t WHERE x = 1", &Params::new(), &log).is_err());
         assert!(prepare("SELECT id FROM t ORDER BY x", &Params::new(), &log).is_err());
+    }
+
+    fn keys(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn team_draft_alternates_takes_each_row_once_and_fills_for_neither() {
+        let a = keys(&["d1", "d2", "d3", "d4"]);
+        let b = keys(&["d2", "d5", "d1", "d6"]);
+        // The first ranking wins every coin.
+        let picks = team_draft(&a, &b, 4, &mut || true);
+        let shown: Vec<&str> = picks.iter().map(|p| [&a, &b][p.from][p.index].as_str()).collect();
+        assert_eq!(shown, ["d1", "d2", "d3", "d5"]);
+        assert_eq!(picks.iter().map(|p| p.from).collect::<Vec<_>>(), [0, 1, 0, 1]);
+        assert!(picks.iter().all(|p| p.team));
+        // The second wins every coin: it takes first in each round.
+        let picks = team_draft(&a, &b, 6, &mut || false);
+        let shown: Vec<&str> = picks.iter().map(|p| [&a, &b][p.from][p.index].as_str()).collect();
+        assert_eq!(shown, ["d2", "d1", "d5", "d3", "d6", "d4"]);
+        // A ranking that runs out: the other's rows fill, for neither.
+        let picks = team_draft(&keys(&["d1", "d5"]), &b, 5, &mut || true);
+        assert_eq!(picks.iter().map(|p| (p.from, p.index, p.team)).collect::<Vec<_>>(), [(0, 0, true), (1, 0, true), (0, 1, true), (1, 3, false)]);
+        assert!(team_draft(&[], &[], 3, &mut || true).is_empty());
+        // Each team's picks never differ by more than one, whatever the coin.
+        let mut flip = coin_of("r1");
+        for k in 1..=8 {
+            let picks = team_draft(&a, &b, k, &mut flip);
+            let n0 = picks.iter().filter(|p| p.team && p.from == 0).count() as i64;
+            let n1 = picks.iter().filter(|p| p.team && p.from == 1).count() as i64;
+            assert!((n0 - n1).abs() <= 1, "{picks:?}");
+            let mut seen = HashSet::new();
+            assert!(picks.iter().all(|p| seen.insert([&a, &b][p.from][p.index].clone())), "a row twice: {picks:?}");
+        }
+    }
+
+    #[test]
+    fn the_coin_is_the_requests_and_fair() {
+        let draw = |r: &str| (0..64).map({ let mut c = coin_of(r); move |_| c() }).collect::<Vec<_>>();
+        assert_eq!(draw("req-1"), draw("req-1"));
+        assert_ne!(draw("req-1"), draw("req-2"));
+        let heads = (0..4000).filter(|i| coin_of(&format!("{i:032x}"))()).count();
+        assert!((1800..2200).contains(&heads), "{heads} heads of 4000");
+    }
+
+    #[test]
+    fn the_sign_test_matches_the_binomial() {
+        assert_eq!(sign_test(0, 0), 1.0);
+        assert_eq!(sign_test(5, 5), 1.0);
+        // 2 * P(X <= 1) for Binomial(10, 1/2) = 2 * 11 / 1024.
+        assert!((sign_test(9, 1) - 22.0 / 1024.0).abs() < 1e-12);
+        assert!((sign_test(1, 9) - sign_test(9, 1)).abs() < 1e-15);
+        // Large counts stay finite: 5,300 against 4,700 is p ~ 1.9e-9.
+        let p = sign_test(5300, 4700);
+        assert!(p > 1e-10 && p < 1e-8, "{p}");
+    }
+
+    #[test]
+    fn credit_goes_to_the_team_acted_on() {
+        let rec = |r: &str, v: Option<&str>, label: f64| json!({"request": r, "shown": true, "variant": v, "label": label});
+        let mut c = Credits::default();
+        // r1: b's row clicked; r2: a's two rows to b's one; r3: one each, a tie;
+        // r4: nothing clicked; r5: an A/B request, left out; r6: a row
+        // of neither team clicked, which counts for neither.
+        for r in [
+            rec("r1", Some("a"), 0.0), rec("r1", Some("b"), 1.0),
+            rec("r2", Some("a"), 1.0), rec("r2", Some("b"), 3.0), rec("r2", Some("a"), 2.0),
+            rec("r3", Some("a"), 1.0), rec("r3", Some("b"), 1.0),
+            rec("r4", Some("b"), 0.0), rec("r4", Some("a"), 0.0),
+            rec("r5", Some("a"), 1.0), rec("r5", Some("a"), 1.0),
+            rec("r6", Some("a"), 0.0), rec("r6", Some("b"), 0.0), rec("r6", None, 1.0),
+        ] {
+            c.add(&r);
+        }
+        c.add(&json!({"request": "r7", "shown": false, "variant": "a", "label": 1.0}));
+        let out = c.finish();
+        assert_eq!(out.len(), 1);
+        let x = &out[0];
+        assert_eq!((x.variants.clone(), x.requests, x.acted, x.wins, x.ties), (["a".to_string(), "b".to_string()], 5, 3, [1, 1], 1));
+        assert!((x.delta - 0.0).abs() < 1e-12 && x.p == 1.0, "{x:?}");
+    }
+
+    #[test]
+    fn interleaving_is_parsed_and_checked() {
+        let l = Log::from_json(&json!({"context": "u1", "interleave": {"sql": "SELECT id FROM t ORDER BY x DESC LIMIT 10"}})).unwrap();
+        assert_eq!(l.interleave.as_ref().unwrap().variants, ["a".to_string(), "b".to_string()]);
+        let l = Log::from_json(&json!({"interleave": {"sql": "S", "variants": ["bm25", "hybrid"]}})).unwrap();
+        assert_eq!(l.interleave.unwrap().variants[1], "hybrid");
+        for bad in [
+            json!({"interleave": {"variants": ["a", "b"]}}),
+            json!({"interleave": {"sql": "S", "variants": ["a", "a"]}}),
+            json!({"interleave": {"sql": "S", "variants": ["a"]}}),
+            json!({"interleave": {"sql": "S"}, "variant": "a"}),
+            json!({"interleave": {"sql": "S"}, "candidates": 20}),
+            json!({"interleave": {"sql": "S", "seed": 1}}),
+            json!({"interleave": "S"}),
+        ] {
+            assert!(Log::from_json(&bad).is_err(), "{bad}");
+        }
+        let log = Log { interleave: Some(Interleave { sql: String::new(), variants: ["a".into(), "b".into()] }), ..Log::default() };
+        assert!(prepare("SELECT id FROM t ORDER BY bm25(body, :q) DESC LIMIT 10", &Params::new(), &log).is_ok());
+        assert!(prepare("SELECT id FROM t ORDER BY bm25(body, :q) DESC", &Params::new(), &log).is_err());
+        assert!(prepare("SELECT id FROM t ORDER BY bm25(body, :q) DESC LIMIT 10 OFFSET 10", &Params::new(), &log).is_err());
     }
 }
