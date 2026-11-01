@@ -21,6 +21,8 @@
 pub mod agent;
 pub mod alerts;
 pub mod aws;
+pub mod cloud;
+pub mod digitalocean;
 pub mod auth;
 pub mod coord;
 pub mod demo;

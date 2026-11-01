@@ -761,9 +761,13 @@ kubectl -n strata patch strata demo --type merge -p '{"spec": {"shards": 3}}'
 
 The coordinators run as a service account of their own, which may read and change only their `StrataCluster`: the command center's **Control center** edits its whole spec and **Cluster** shows its phase, through `GET /v1/kube` (the spec, the status, and `settled` once the operator has seen the latest spec; `{"managed": false}` elsewhere), `POST /v1/admin/kube/plan {"spec": {...}}` (what a merge patch of the spec would change, the operator's steps for it, what to mind, and why it is refused if it is: a volume that would shrink, a size Kubernetes does not read, a spec the operator would not take; nothing is changed) and `POST /v1/admin/kube {"spec": {...}}` (the same patch, checked as the plan is, then applied; or the sizes alone, `{"shards"?, "replicas"?, "coordinators"?}`; admin scope, audited, and noted on the resource with who made it). Both also take `{"rollback": version}`, the spec of an earlier version in the status's history (its `rollout` kept), which no gate holds; `POST /v1/admin/kube/resume` lifts the hold a gate put on a change. The spec's `rollout` pauses a change (`paused`), holds it while a live number is over a limit (`gates`: `p99Ms`, `errorRatio`, `replicaBehind`, `diskUsedRatio`, each over for `holdAfterSeconds`), and lets each restarted copy serve `soakSeconds` before the next restarts. The spec's fields, what each change does, and a run on kind are in the [deploy README](https://github.com/rkonow/strata/tree/main/strata-server/deploy#the-operator).
 
-### On AWS
+### In the cloud
 
-The command center's **AWS** view plans a cluster on EKS from what AWS says now, and writes the files that make it; it creates nothing itself. Its routes need the admin scope:
+The command center's **Cloud** view plans a cluster on Amazon EKS or on DigitalOcean Kubernetes (DOKS), picked at its top, from what the cloud says now, and writes the files that make it; it creates nothing itself. Both clouds lay the copies out the same way: copy *c* of shard *s* goes on node (*s* + *c*) mod *nodes*, so a shard's copies are on different nodes while there are at least as many nodes as copies, and each copy's requests are 90% of its share of its node's memory and CPU. Their routes need the admin scope.
+
+#### On AWS
+
+The view reads the region's machines, their prices and the account's quota from AWS:
 
 | route | what |
 |---|---|
@@ -784,6 +788,24 @@ The credentials are kept in `<db>.aws.json` beside `--db` (`--aws-file` names an
 ```
 
 The plan's commands then make the cluster with your own `aws` and `kubectl`: `aws cloudformation create-stack` (and its wait), `aws eks update-kubeconfig`, and `kubectl apply` of the two manifests. To delete it, delete the StrataCluster and its volume claims first (the copies' EBS volumes are the driver's, not the stack's, and stay and cost otherwise), then the stack. A new AWS account often has a vCPU quota of 0, or 5, for on-demand and spot instances: the view shows the quota against what the plan needs and links to the request for more.
+
+#### On DigitalOcean
+
+The view reads the sizes DOKS takes in a region, their prices, DOKS's versions and the account's droplet limit from DigitalOcean's API:
+
+| route | what |
+|---|---|
+| `GET /v1/admin/digitalocean` | the token as far as it is shown: where it comes from, masked (`dop_…7f3c`), and its team; never the token |
+| `PUT /v1/admin/digitalocean/token` | `{"token"}`: checked with DigitalOcean (`GET /v2/account`), then kept; a token DigitalOcean refuses is a 400 and is not kept; audited by masked token and team |
+| `DELETE /v1/admin/digitalocean/token` | forgets it and deletes its file; nothing in the DigitalOcean account changes; audited |
+| `GET /v1/admin/digitalocean/regions` | the regions DOKS runs in |
+| `GET /v1/admin/digitalocean/machines?region=` | the sizes a DOKS node may be in the region (default `nyc3`), with vCPUs, memory, disk, transfer and the price an hour and a month, whether its CPUs are shared, dedicated, premium Intel or premium AMD, DOKS's versions, the account's droplet limit and the droplets it runs, and what a highly available control plane and a GiB-month of volume cost; kept six hours (`&fresh=1` fetches again) |
+| `POST /v1/admin/digitalocean/plan` | `{"name", "region", "machine", "nodes", "ha", "version"?, "volume_gb", "cluster": {StrataCluster spec}}`: which node each copy goes on, each copy's share of a node, the cost an hour and a month line by line (the nodes, the control plane, the volumes), the droplets it needs, warnings, the body of DOKS's create request, the operator's and the cluster's manifests (the cluster's volumes on `do-block-storage`), and the commands that make it and delete it |
+| `POST /v1/admin/digitalocean/validate` | the plan, and DigitalOcean's answers now, fetched again: whether the account is active, DOKS runs in the region and takes the size there, offers the version, and the nodes fit the droplet limit beside the droplets running. Creates nothing |
+
+The token is kept in `<db>.digitalocean.json` beside `--db` (`--digitalocean-file` names another file), written readable by its owner only; a coordinator without `--digitalocean-file` keeps it in memory. Without a saved one the view uses `DIGITALOCEAN_TOKEN` or `DIGITALOCEAN_ACCESS_TOKEN`. The server only reads (`GET /v2/account`, `/v2/sizes`, `/v2/kubernetes/options` and `/v2/droplets`), so a read-only token is enough for the view; the plan's commands need one that may create clusters.
+
+Prices are DigitalOcean's: a node costs its size's hourly price up to its monthly price (672 hours; a v5 size has no monthly cap, and the view says so), the standard control plane is free and a highly available one $40 a month, and volumes $0.10 a GiB-month. The plan sets `ha` and `auto_upgrade` itself, since DOKS makes control planes highly available by default from Kubernetes 1.36. Its commands make the cluster with your own `doctl` and `kubectl`: `doctl kubernetes cluster create` (which waits, and points `kubectl` at the cluster), then `kubectl apply` of the two manifests. To delete it, delete the StrataCluster and its volume claims, then the cluster (`doctl kubernetes cluster delete --dangerous` also deletes the volumes and load balancers it made).
 
 ## Deadlines, admission and metrics
 
@@ -947,9 +969,11 @@ A local database merges its segments on merger threads as writes add them ([how 
 
 ![Rollout: a new image held by its p99 gate after five of twelve restarts, with its steps, timeline, gates and versions (a sample status: no pods run here)](../assets/img/strata-command-center-rollout.png)
 
-- **AWS** plans a cluster on [EKS](#on-aws). Save an access key (checked with AWS, then shown only masked), and the view reads the region's machines with their prices and the account's vCPU quota. The machines are a chart of memory against price an hour (on demand or spot, coloured by what each is for, Graviton filled and x86-64 hollow, the suggested ones ringed) and a table to sort and filter; pick one, then the nodes, shards, copies of each, coordinators and each copy's volume, and see where every copy goes, each copy's share of a node's memory and CPU, the cost an hour, a day and a month line by line, and whether the quota allows it. **Check with AWS** has CloudFormation check the template; the template, the operator's and the cluster's manifests download, with the commands that make the cluster and delete it.
+- **Cloud** plans a cluster on [Amazon EKS](#on-aws) or [DigitalOcean Kubernetes](#on-digitalocean), picked at its top (and in the address, `#/cloud?provider=digitalocean`). Save an AWS access key or a DigitalOcean token (checked with the cloud, then shown only masked), and the view reads the region's machines with their prices and the account's limit: AWS's vCPU quotas, or DigitalOcean's droplet limit. The machines are a chart of memory against price an hour (coloured by what each is for; on AWS, on demand or spot, Graviton filled and x86-64 hollow; on DigitalOcean, shared CPUs hollow; the suggested ones ringed) and a table to sort and filter; pick one, then the nodes, shards, copies of each, coordinators and each copy's volume (on DigitalOcean also the control plane and the Kubernetes version), and see where every copy goes, each copy's share of a node's memory and CPU, the cost an hour, a day and a month line by line, and whether the account's limit allows it. **Check with AWS** has CloudFormation check the template, and **Check with DigitalOcean** asks DigitalOcean again for the account, the region, the size, the version and the droplet limit; the files that make the cluster (the template, or DOKS's request) and the operator's and the cluster's manifests download, with the commands that make the cluster and delete it.
 
-![AWS: the machines of us-east-1 by memory and price, a plan of four r8g.xlarge nodes, where its copies go and what it costs, on an account whose vCPU quota is 0 (account number and key replaced)](../assets/img/strata-command-center-aws.png)
+![Cloud, on DigitalOcean: the sizes of nyc3 by memory and price, a plan of four m-4vcpu-32gb nodes, where its copies go, what it costs, and DigitalOcean's answer that it would take the cluster (token replaced)](../assets/img/strata-command-center-cloud.png)
+
+![Cloud, on AWS: the machines of us-east-1 by memory and price, a plan of four r8g.xlarge nodes, where its copies go and what it costs, on an account whose vCPU quota is 0 (account number and key replaced)](../assets/img/strata-command-center-aws.png)
 
 - **Cluster** changes the cluster while it serves (admin calls, so an admin key). Each shard shows the slots it holds and its copies: the primary, each replica in sync, behind or being copied, and the term and last transaction of each; add a copy, remove one, make a replica the primary (a handover by vote), drain a shard and remove it once it holds no slot, add a shard (its servers' URLs) and even the slots out, and follow each move of slots as it copies, catches up and switches over. A coordinator the [Kubernetes operator](#on-kubernetes) runs shows its `StrataCluster` instead: the operator's phase and what it is doing, and the shards, copies per shard and coordinators to change, which the operator then makes; the changes by hand are left to it. A server that is not in a cluster, and a coordinator the operator does not run, write the files to run one on Kubernetes (with this server's first table) and, for a server, the commands to start one on machines of your own.
 - **Access** says who you are, checks the server's posture (a token, keys, loopback, TLS), makes keys with a scope and an expiry (showing the secret once), revokes them, and reads the audit log.
