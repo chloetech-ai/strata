@@ -108,6 +108,7 @@ fn kind(ty: &FieldType) -> &'static str {
         FieldType::Vector { .. } => "vector",
         FieldType::Sparse => "sparse",
         FieldType::Edges => "edges",
+        FieldType::Json => "json",
     }
 }
 
@@ -182,6 +183,7 @@ impl<'a> SegmentBuild<'a> {
                     Some(Slot::Text(Vec::new()))
                 }
                 FieldType::Sparse if f.indexed => Some(Slot::Index(crate::text::sparse::field_builder(f, opts)?)),
+                FieldType::Json if f.indexed => Some(Slot::Index(crate::json::field_builder(f, opts)?)),
                 FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => Some(Slot::Index(crate::forward::field_builder(f, opts)?)),
                 // Vector fields always store their vectors; `indexed` adds the ANN index.
                 FieldType::Vector { .. } => {
@@ -414,6 +416,7 @@ pub fn build_missing(schema: &Schema, fields: &[usize], n_docs: usize, opts: &Bu
         let builder = match &f.ty {
             FieldType::Text { .. } if f.indexed => crate::text::field_builder(f, opts)?,
             FieldType::Sparse if f.indexed => crate::text::sparse::field_builder(f, opts)?,
+            FieldType::Json if f.indexed => crate::json::field_builder(f, opts)?,
             FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => crate::forward::field_builder(f, opts)?,
             // One-vector rows are arrays of every row: a header stands in.
             FieldType::Vector { .. } if !f.multi => {

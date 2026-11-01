@@ -1,8 +1,8 @@
 //! Plans of bound statements: [`Plan::bind`], [`Plan::of_select`] and
 //! [`Plan::of_write`].
 
-use super::{Agg, Column, Expr, Graph, GraphKind, Guard, GuardSite, Node, OnConflict, Phase, Plan, Search, Set, SortKey};
-use crate::query::logical::{self, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
+use super::{Agg, CmpOp, Column, Expr, Func, Graph, GraphKind, Guard, GuardSite, Node, OnConflict, Phase, Plan, Search, Set, SortKey};
+use crate::query::logical::{self, GraphQuery, Having, OrderBy, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors};
 use crate::query::sql::{Assign, Conflict, Write};
 use crate::schema::Schema;
 use crate::value::Value;
@@ -205,8 +205,10 @@ impl Lower<'_> {
             Pred::In { field: f, values } => Expr::In { expr: field(*f), list: values.iter().map(|v| self.lit(*f, v)).collect() },
             Pred::Prefix { field: f, prefix, edits } => Expr::Prefix { expr: field(*f), prefix: Box::new(Expr::Lit(Value::Str(prefix.clone()))), edits: *edits },
             Pred::Present { field: f } => Expr::Not(Box::new(Expr::IsNull(field(*f)))),
+            Pred::Path { field: f, path, test } => path_expr(*f, path, test),
             Pred::Not(q) => match &**q {
                 Pred::Present { field: f } => Expr::IsNull(field(*f)),
+                Pred::Path { field: f, path, test: PathTest::Has(k) } => Expr::IsNull(Box::new(json_extract(*f, path, *k))),
                 q => Expr::Not(Box::new(self.pred(q))),
             },
             Pred::And(ps) => Expr::And(ps.iter().map(|p| self.pred(p)).collect()),
@@ -308,5 +310,53 @@ impl Lower<'_> {
             Assign::Expr(e) => e.clone(),
         };
         Set { field: f as u32, value }
+    }
+}
+
+/// `json_extract(field, path [, type])` ([`Func::JsonExtract`]).
+pub(crate) fn json_extract(f: usize, path: &str, kind: Option<crate::json::Kind>) -> Expr {
+    let mut args = vec![Expr::Field(f as u32), Expr::Lit(Value::Str(path.to_string()))];
+    args.extend(kind.map(|k| Expr::Lit(Value::Str(k.name().to_string()))));
+    Expr::Call { func: Func::JsonExtract, args }
+}
+
+/// A test of a JSON field's path as the expression it is over rows: of
+/// the values of the type it compares with ([`crate::json::Kind`]), so
+/// that rows in memory read it as the field's terms do.
+fn path_expr(f: usize, path: &str, test: &PathTest) -> Expr {
+    use crate::json::Kind;
+    let x = |k: Option<Kind>| Box::new(json_extract(f, path, k));
+    let lit = |v: &Value| Box::new(Expr::Lit(v.clone()));
+    match test {
+        PathTest::Has(k) => Expr::Not(Box::new(Expr::IsNull(x(*k)))),
+        PathTest::Prefix(p) => Expr::Prefix { expr: x(Some(Kind::Str)), prefix: lit(&Value::Str(p.clone())), edits: 0 },
+        PathTest::In(values) => {
+            let mut kinds: Vec<Kind> = values.iter().filter_map(Kind::of).collect();
+            kinds.sort();
+            kinds.dedup();
+            let ins: Vec<Expr> = kinds.iter().map(|&k| Expr::In { expr: x(Some(k)), list: values.iter().filter(|v| Kind::of(v) == Some(k)).map(|v| Expr::Lit(v.clone())).collect() }).collect();
+            match ins.len() {
+                0 => Expr::Lit(Value::Bool(false)),
+                1 => ins.into_iter().next().expect("one"),
+                _ => Expr::Or(ins),
+            }
+        }
+        PathTest::Range { lo, hi } => {
+            let k = lo.iter().chain(hi.iter()).find_map(|(v, _)| Kind::of(v));
+            let inclusive = lo.as_ref().is_none_or(|(_, i)| *i) && hi.as_ref().is_none_or(|(_, i)| *i);
+            match inclusive {
+                true => Expr::Between { expr: x(k), lo: lo.as_ref().map(|(l, _)| lit(l)), hi: hi.as_ref().map(|(h, _)| lit(h)) },
+                false => {
+                    let mut parts = Vec::new();
+                    if let Some((l, inc)) = lo {
+                        parts.push(Expr::Cmp { op: if *inc { CmpOp::Ge } else { CmpOp::Gt }, left: x(k), right: lit(l) });
+                    }
+                    if let Some((h, inc)) = hi {
+                        parts.push(Expr::Cmp { op: if *inc { CmpOp::Le } else { CmpOp::Lt }, left: x(k), right: lit(h) });
+                    }
+                    if parts.len() == 1 { parts.pop().expect("one") } else { Expr::And(parts) }
+                }
+            }
+        }
     }
 }

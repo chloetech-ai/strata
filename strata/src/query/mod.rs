@@ -38,5 +38,5 @@ pub mod stats;
 pub mod steps;
 pub mod tables;
 
-pub use logical::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy, GraphKind, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak};
+pub use logical::{AggFn, Decay, DecayShape, Direction, Expand, Fuzzy, GraphKind, GraphQuery, Having, OrderBy, PathTest, Pred, Projection, Score, Seeds, Select, Tiebreak};
 pub use sql::{bind, bind_command, bind_write, Assign, Command, Conflict, Params, Write};

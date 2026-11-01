@@ -157,6 +157,7 @@ fn notes(s: &Schema) -> Vec<String> {
             }
             FieldType::Edges => out.push(format!("{}: edges as JSON arrays of keys, without the graph index", f.name)),
             FieldType::Sparse => out.push(format!("{}: term weights as JSON objects, without their index", f.name)),
+            FieldType::Json => out.push(format!("{}: objects as JSON text, without the index of their paths", f.name)),
             _ if f.media.is_some() => out.push(format!("{}: each file's description as a JSON object (uri, sha256, mime and what else Strata read), indexed by sha256; the files stay where the URIs say", f.name)),
             _ if f.multi => out.push(format!("{}: values as JSON arrays", f.name)),
             _ => {}
@@ -182,7 +183,7 @@ fn declared(f: &Field) -> String {
         (_, FieldType::Int) => "INTEGER".into(),
         (_, FieldType::Float) => "REAL".into(),
         (_, FieldType::Vector { dim, .. }) => format!("F32_BLOB({dim})"),
-        (_, FieldType::Edges | FieldType::Sparse) => "JSON".into(),
+        (_, FieldType::Edges | FieldType::Sparse | FieldType::Json) => "JSON".into(),
     }
 }
 

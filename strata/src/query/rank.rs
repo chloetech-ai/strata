@@ -856,7 +856,7 @@ fn leaf_name(s: &Score, schema: &Schema) -> String {
         Score::Cond(p) => {
             fn fields(p: &Pred, out: &mut Vec<usize>) {
                 match p {
-                    Pred::Match { field, .. } | Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. } | Pred::Prefix { field, .. } | Pred::Present { field } => out.push(*field),
+                    Pred::Match { field, .. } | Pred::Range { field, .. } | Pred::IntRange { field, .. } | Pred::In { field, .. } | Pred::Prefix { field, .. } | Pred::Present { field } | Pred::Path { field, .. } => out.push(*field),
                     Pred::And(ps) | Pred::Or(ps) | Pred::AtLeast { items: ps, .. } => ps.iter().for_each(|p| fields(p, out)),
                     Pred::Not(p) => fields(p, out),
                     Pred::True | Pred::False | Pred::Graph { .. } | Pred::Sub(_) => {}
@@ -1001,7 +1001,7 @@ mod tests {
                         fin((v[0]? * m).round() / m)
                     }
                     Func::CountTrue => Some(some.iter().filter(|&&x| x != 0.0).count() as f64),
-                    Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt => None,
+                    Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt | Func::JsonExtract => None,
                 }
             }
             Score::Norm { kind: NormKind::Tmm, input, lo } => {

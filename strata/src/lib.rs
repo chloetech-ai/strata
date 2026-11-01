@@ -45,6 +45,7 @@ pub mod graph;
 pub mod hosted;
 pub mod ingest;
 pub mod iostat;
+pub mod json;
 pub mod media;
 pub mod metrics;
 pub mod postings;
