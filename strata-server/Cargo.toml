@@ -35,6 +35,8 @@ backtrace = "0.3"
 # SQLite files sent to `/v1/import` and written for `/v1/export`.
 tempfile = "3"
 # API keys are kept as the SHA-256 of their secrets (`keys`).
+# A new cluster's CA, and EKS's tokens (the cloud view).
+base64 = "0.23"
 sha2 = "0.10"
 # AWS answers in XML (EC2: instance types, regions, spot prices; `aws`).
 roxmltree = "0.20"
@@ -61,7 +63,8 @@ tonic-build = "0.12"
 protox = "0.7"
 
 [dev-dependencies]
-base64 = "0.23"
+# The operator's manifests read in a test, to keep src/cloud/install.rs the same.
+serde_yaml = "0.9"
 # PNGs written by the tests of `vision`.
 image = { version = "0.25", default-features = false, features = ["png"] }
 

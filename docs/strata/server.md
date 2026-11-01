@@ -788,7 +788,7 @@ The coordinators run as a service account of their own, which may read and chang
 
 ### In the cloud
 
-The command center's **Cloud** view plans a cluster on Amazon EKS or on DigitalOcean Kubernetes (DOKS), picked at its top, from what the cloud says now, and writes the files that make it; it creates nothing itself. Both clouds lay the copies out the same way: copy *c* of shard *s* goes on node (*s* + *c*) mod *nodes*, so a shard's copies are on different nodes while there are at least as many nodes as copies, and each copy's requests are 90% of its share of its node's memory and CPU. Their routes need the admin scope.
+The command center's **Cloud** view plans a cluster on Amazon EKS or on DigitalOcean Kubernetes (DOKS), picked at its top, from what the cloud says now, and writes the files that make it. It also [makes the cluster itself](#making-it-from-the-view), installs Strata on it and deletes it, once the cluster's name is typed again. Both clouds lay the copies out the same way: copy *c* of shard *s* goes on node (*s* + *c*) mod *nodes*, so a shard's copies are on different nodes while there are at least as many nodes as copies, and each copy's requests are 90% of its share of its node's memory and CPU. Their routes need the admin scope.
 
 #### On AWS
 
@@ -831,6 +831,38 @@ The view reads the sizes DOKS takes in a region, their prices, DOKS's versions a
 The token is kept in `<db>.digitalocean.json` beside `--db` (`--digitalocean-file` names another file), written readable by its owner only; a coordinator without `--digitalocean-file` keeps it in memory. Without a saved one the view uses `DIGITALOCEAN_TOKEN` or `DIGITALOCEAN_ACCESS_TOKEN`. The server only reads (`GET /v2/account`, `/v2/sizes`, `/v2/kubernetes/options` and `/v2/droplets`), so a read-only token is enough for the view; the plan's commands need one that may create clusters.
 
 Prices are DigitalOcean's: a node costs its size's hourly price up to its monthly price (672 hours; a v5 size has no monthly cap, and the view says so), the standard control plane is free and a highly available one $40 a month, and volumes $0.10 a GiB-month. The plan sets `ha` and `auto_upgrade` itself, since DOKS makes control planes highly available by default from Kubernetes 1.36. Its commands make the cluster with your own `doctl` and `kubectl`: `doctl kubernetes cluster create` (which waits, and points `kubectl` at the cluster), then `kubectl apply` of the two manifests. To delete it, delete the StrataCluster and its volume claims, then the cluster (`doctl kubernetes cluster delete --dangerous` also deletes the volumes and load balancers it made).
+
+#### Making it from the view
+
+**Create it** makes the planned cluster with the saved key or token. The server asks the cloud for it, installs Strata through the new cluster's own API, follows its copies until they answer, and deletes it when asked. The routes need the admin scope, and every change is audited with who asked (a new cluster also with its nodes and cost an hour):
+
+| route | what |
+|---|---|
+| `GET /v1/admin/cloud/clusters` | the clusters made from this server, newest first. Each has its phase (`creating`, `installing`, `starting`, `ready`, `deleting`, `deleted`, `failed`), the cloud's progress, the last 60 steps it went through, the StrataCluster's status and a line summing it up, the cost so far at the planned price, why it failed, and, once Strata runs, the commands that open its command center (`kubectl -n strata port-forward svc/<name> 7700:7700`) |
+| `POST /v1/admin/cloud/clusters` | `{"provider": "aws" \| "digitalocean", "plan": {the plan's body}, "confirm": "<the cluster's name>"}`: planned again from a fresh catalogue, then made; 202. A 409 when the account's quota or droplet limit is too small, or when the cloud, or this server, already has a cluster of that name. A 400 unless `confirm` is the cluster's name |
+| `GET /v1/admin/cloud/clusters/{id}` | one of them |
+| `POST /v1/admin/cloud/clusters/{id}/delete` | `{"confirm": "<the cluster's name>"}`: deletes it; 202 |
+| `DELETE /v1/admin/cloud/clusters/{id}` | takes it off the list, once it is deleted or failed before the cloud made anything; a 409 while it may still be billed |
+
+![The Cloud view's Clusters made here card: a cluster on AWS on its way, its stack 7 of 19 resources made, and one on DigitalOcean ready, with every step it went through (against stand-ins for the clouds)](../assets/img/strata-command-center-cloud-clusters.png)
+
+What the server does, in order:
+
+1. **The cloud makes the cluster.**
+   - On AWS, CloudFormation's `CreateStack` takes the plan's template (`CAPABILITY_IAM`, rolled back on failure, tagged as made by strata-server). The server follows the stack and how many of its resources are made, and on failure gives the first failed resource's reason. This takes 15 to 20 minutes.
+   - On DigitalOcean, `POST /v2/kubernetes/clusters` takes the plan's request, and the server follows the cluster's state and its nodes. This takes 5 to 10 minutes.
+2. **Strata is installed.** The server reads the cluster's endpoint and certificate: from EKS's `DescribeCluster`, with a token signed as `aws eks get-token` signs one, or from DOKS's short-lived credentials. It then applies, with server-side apply (applying again changes nothing), the StrataCluster resource definition, the operator, the namespace, AWS's gp3 storage class and the StrataCluster. The cluster's API can take a few minutes to answer after the cloud says the cluster is up, so the server tries again for about ten minutes.
+3. **The copies start.** The server reads the StrataCluster's status until every copy of every shard answers. The cluster is then `ready`, and is read again every minute.
+4. **Deleting** deletes the StrataCluster and every volume claim in the namespace `strata`. It waits up to ten minutes for the volumes' disks to go, then deletes the stack (`DeleteStack`) or the DOKS cluster with what it made (`destroy_with_associated_resources/dangerous`), and follows it until it is gone.
+
+The clusters are kept in `<db>.cloud.json` beside `--db` (`--cloud-file` names another file), which holds no key or token; a coordinator without `--cloud-file` keeps them in memory. A server that restarts carries on with those on their way. A create interrupted before the cloud answered finds the cluster by its name rather than making a second one. The cost so far is the plan's price times the hours since the cluster was asked for; the cloud's bill is the one to trust.
+
+The view's read-only keys are not enough to make a cluster:
+
+- **On AWS**, the keys need `cloudformation:CreateStack`, `DescribeStacks`, `DescribeStackEvents`, `DescribeStackResources` and `DeleteStack`, `eks:DescribeCluster`, and the rights to make and delete what the template holds: a VPC with its subnets, route table and internet gateway, three IAM roles (with `iam:PassRole` on them), the EKS cluster, its access entry, node group and two add-ons (the pod identity agent and the EBS CSI driver). The keys' user or role becomes the cluster's administrator.
+- **On DigitalOcean**, the token must be able to create, read and delete Kubernetes clusters and the volumes they make.
+
+The nodes pull the plan's image (`ghcr.io/chloetech-ai/strata-server:latest` unless changed), so it must be one they can reach.
 
 ## Deadlines, admission and metrics
 
@@ -994,7 +1026,7 @@ A local database merges its segments on merger threads as writes add them ([how 
 
 ![Rollout: a new image held by its p99 gate after five of twelve restarts, with its steps, timeline, gates and versions (a sample status: no pods run here)](../assets/img/strata-command-center-rollout.png)
 
-- **Cloud** plans a cluster on [Amazon EKS](#on-aws) or [DigitalOcean Kubernetes](#on-digitalocean), picked at its top (and in the address, `#/cloud?provider=digitalocean`). Save an AWS access key or a DigitalOcean token (checked with the cloud, then shown only masked), and the view reads the region's machines with their prices and the account's limit: AWS's vCPU quotas, or DigitalOcean's droplet limit. The machines are a chart of memory against price an hour (coloured by what each is for; on AWS, on demand or spot, Graviton filled and x86-64 hollow; on DigitalOcean, shared CPUs hollow; the suggested ones ringed) and a table to sort and filter; pick one, then the nodes, shards, copies of each, coordinators and each copy's volume (on DigitalOcean also the control plane and the Kubernetes version), and see where every copy goes, each copy's share of a node's memory and CPU, the cost an hour, a day and a month line by line, and whether the account's limit allows it. **Check with AWS** has CloudFormation check the template, and **Check with DigitalOcean** asks DigitalOcean again for the account, the region, the size, the version and the droplet limit; the files that make the cluster (the template, or DOKS's request) and the operator's and the cluster's manifests download, with the commands that make the cluster and delete it.
+- **Cloud** plans a cluster on [Amazon EKS](#on-aws) or [DigitalOcean Kubernetes](#on-digitalocean), picked at its top (and in the address, `#/cloud?provider=digitalocean`). Save an AWS access key or a DigitalOcean token (checked with the cloud, then shown only masked), and the view reads the region's machines with their prices and the account's limit: AWS's vCPU quotas, or DigitalOcean's droplet limit. The machines are a chart of memory against price an hour (coloured by what each is for; on AWS, on demand or spot, Graviton filled and x86-64 hollow; on DigitalOcean, shared CPUs hollow; the suggested ones ringed) and a table to sort and filter; pick one, then the nodes, shards, copies of each, coordinators and each copy's volume (on DigitalOcean also the control plane and the Kubernetes version), and see where every copy goes, each copy's share of a node's memory and CPU, the cost an hour, a day and a month line by line, and whether the account's limit allows it. **Check with AWS** has CloudFormation check the template, and **Check with DigitalOcean** asks DigitalOcean again for the account, the region, the size, the version and the droplet limit. **Create it** makes the cluster after its name is typed again (and not while the account's limit is too small). **Clusters made here** follows each one: where it is (the stack or cluster, Strata, the copies, ready), the cost so far, its last step and what happened before it, the StrataCluster's status, why it failed, the commands that open its command center, and **Delete**, also after typing its name. The files that make the cluster yourself (the template, or DOKS's request) and the operator's and the cluster's manifests also download, with the commands that make the cluster and delete it.
 
 ![Cloud, on DigitalOcean: the sizes of nyc3 by memory and price, a plan of four m-4vcpu-32gb nodes, where its copies go, what it costs, and DigitalOcean's answer that it would take the cluster (token replaced)](../assets/img/strata-command-center-cloud.png)
 

@@ -139,6 +139,9 @@ pub struct Options {
     /// `<db>.digitalocean.json` beside a database; in memory on a
     /// coordinator without it).
     pub digitalocean_file: Option<PathBuf>,
+    /// The clusters the cloud view made (default: `<db>.cloud.json` beside
+    /// a database; in memory on a coordinator without it).
+    pub cloud_file: Option<PathBuf>,
     /// The alert rules' file (default rules, in memory, without it).
     pub alerts: Option<PathBuf>,
     /// Post alerts that fire or resolve to this URL.
@@ -333,6 +336,14 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let digitalocean = o.digitalocean_file.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::digitalocean::DigitalOcean::file_of));
     if let Some(file) = digitalocean {
         svc.digitalocean = Arc::new(crate::digitalocean::DigitalOcean::open(file)?);
+    }
+    let cloud = o.cloud_file.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::cloud::clusters::Clusters::file_of));
+    if let Some(file) = cloud {
+        svc.clouds = Arc::new(crate::cloud::clusters::Clusters::open(file)?);
+        // Clusters on their way when the server stopped go on.
+        if svc.clouds.list().iter().any(|m| !matches!(m.phase, crate::cloud::clusters::Phase::Deleted | crate::cloud::clusters::Phase::Failed)) {
+            svc.clouds.start(svc.aws.clone(), svc.digitalocean.clone());
+        }
     }
     let keys = o.keys.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(Keys::file_of));
     if let Some(file) = keys {

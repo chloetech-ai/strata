@@ -301,6 +301,11 @@ struct Args {
     /// one, the view uses DIGITALOCEAN_TOKEN or DIGITALOCEAN_ACCESS_TOKEN.
     #[arg(long)]
     digitalocean_file: Option<PathBuf>,
+    /// The clusters the cloud view made, and where each one is (default:
+    /// DB.cloud.json beside --db; a coordinator keeps them in memory
+    /// without it). No secrets: the clouds' keys stay in their own files.
+    #[arg(long)]
+    cloud_file: Option<PathBuf>,
     /// The alert rules' file, JSON (created when the rules are first
     /// edited; default rules in memory without it).
     #[arg(long)]
@@ -646,6 +651,7 @@ async fn main() {
         audit_log: a.audit_log,
         aws_file: a.aws_file,
         digitalocean_file: a.digitalocean_file,
+        cloud_file: a.cloud_file,
         alerts: a.alerts,
         alert_webhook: a.alert_webhook.filter(|u| !u.is_empty()),
         log_store: a.log_store.as_deref().map(|p| (p != "off").then(|| PathBuf::from(p))),

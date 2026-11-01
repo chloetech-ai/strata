@@ -7,12 +7,15 @@ use serde_json::{json, Value as Json};
 
 use crate::operator::Spec;
 
+pub mod clusters;
+pub mod install;
+
 /// The image the cluster runs when the plan names none.
 pub const IMAGE: &str = "ghcr.io/chloetech-ai/strata-server:latest";
 
 /// The operator's manifests (its namespace, account, role and
 /// Deployment), whose image the plan's replaces.
-const OPERATOR_YAML: &str = include_str!("../deploy/k8s/operator/operator.yaml");
+const OPERATOR_YAML: &str = include_str!("../../deploy/k8s/operator/operator.yaml");
 
 /// A cluster's name: the cloud's cluster is `strata-<name>`.
 pub fn check_name(n: &str) -> Result<(), String> {
@@ -144,17 +147,25 @@ pub fn operator_yaml(image: &str) -> Result<String, String> {
     Ok(OPERATOR_YAML.replace(DEV, &format!("image: {image}")))
 }
 
-/// The cluster's manifests: its namespace, the storage class when the
-/// cloud has none to use (`storage_class`), and the StrataCluster. YAML
-/// documents written as JSON (which YAML reads), so a schema goes in whole.
-pub fn cluster_yaml(what: &str, name: &str, spec: &Json, storage_class: Option<Json>) -> String {
-    let mut docs = vec![json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "strata"}})];
+/// The namespace a cluster made from the cloud view runs in.
+pub const NAMESPACE: &str = "strata";
+
+/// The cluster's objects: its namespace, the storage class when the cloud
+/// has none to use (`storage_class`), and the StrataCluster.
+pub fn cluster_objects(name: &str, spec: &Json, storage_class: Option<Json>) -> Vec<Json> {
+    let mut docs = vec![json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}})];
     docs.extend(storage_class);
-    docs.push(json!({"apiVersion": "strata.chloetech.ai/v1alpha1", "kind": "StrataCluster", "metadata": {"name": name, "namespace": "strata"}, "spec": spec}));
+    docs.push(json!({"apiVersion": "strata.chloetech.ai/v1alpha1", "kind": "StrataCluster", "metadata": {"name": name, "namespace": NAMESPACE}, "spec": spec}));
+    docs
+}
+
+/// The cluster's manifests ([`cluster_objects`]): YAML documents written
+/// as JSON (which YAML reads), so a schema goes in whole.
+pub fn cluster_yaml(what: &str, objects: &[Json]) -> String {
     let mut out = format!("# {what}: kubectl apply -f this file\n");
-    for d in docs {
+    for d in objects {
         out.push_str("---\n");
-        out.push_str(&serde_json::to_string_pretty(&d).expect("JSON"));
+        out.push_str(&serde_json::to_string_pretty(d).expect("JSON"));
         out.push('\n');
     }
     out
@@ -195,7 +206,7 @@ mod tests {
         let w = f.warnings(2).join("; ");
         assert!(w.contains("one copy a shard") && w.contains("GiB of memory"), "{w}");
         assert!(fit(&json!([]), 2, &Node { vcpu: 2, alloc_gib: 4.0 }, 10, "gp3").is_err());
-        let y = cluster_yaml("a test", "search", &json!({"shards": 1}), None);
+        let y = cluster_yaml("a test", &cluster_objects("search", &json!({"shards": 1}), None));
         assert!(y.starts_with("# a test: kubectl apply -f this file\n---\n") && y.matches("---\n").count() == 2, "{y}");
     }
 }

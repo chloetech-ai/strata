@@ -5,9 +5,12 @@
 // plan lays the shards' copies on the nodes, prices them line by line,
 // says what would stop them, and hands over what makes the cluster (a
 // CloudFormation template, or DOKS's request) and the Kubernetes
-// manifests, checked by the cloud itself. Nothing here creates anything.
+// manifests, checked by the cloud itself. **Create it** makes the cluster
+// from here, after its name is typed again: this server asks the cloud,
+// installs Strata's operator through the new cluster's API, follows its
+// copies until they answer, and deletes it (its volumes first) when asked.
 
-import { h, s, icon, clear, fmt, card, api, toast, confirm, seg, toggle, pill, empty, table, tipOn, hideTip, debounce, copy, failure, clamp } from "../core.js";
+import { h, s, icon, clear, fmt, card, api, toast, confirm, seg, toggle, pill, empty, table, tipOn, hideTip, debounce, copy, failure, clamp, modal } from "../core.js";
 
 export default {
   id: "cloud", title: "Cloud", icon: "cloud", group: "Admin",
@@ -70,6 +73,35 @@ function download(name, text, type = "application/json") {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
+/** Commands, each with a copy button. */
+const cmds = (list) => h("div", { class: "cloud-cmds" }, list.map((c) => h("div", { class: "row nw" }, h("code", { class: "mono small" }, c), h("button", { class: "btn xs ghost", title: "Copy", onclick: () => copy(c) }, icon("copy")))));
+
+/** Asks before something that cannot be taken back, with `name` typed again. */
+function typed({ title, body, name, ok }) {
+  return new Promise((resolve) => {
+    let answered = false;
+    const inp = h("input", { class: "input mono", placeholder: name, autocomplete: "off", spellcheck: "false", "aria-label": "the cluster's name" });
+    const yes = h("button", { class: "btn danger solid", disabled: true }, ok);
+    const no = h("button", { class: "btn" }, "Cancel");
+    inp.oninput = () => { yes.disabled = inp.value.trim() !== name; };
+    inp.onkeydown = (e) => { if (e.key === "Enter" && !yes.disabled) yes.click(); };
+    const m = modal({
+      title,
+      body: h("div", { class: "stack" }, body, h("label", { class: "stack", style: { gap: "4px" } }, h("span", { class: "small dim" }, "Type ", h("b", { class: "mono" }, name), " to go on"), inp)),
+      foot: [no, yes], onClose: () => { if (!answered) resolve(false); },
+    });
+    yes.onclick = () => { answered = true; m.close(); resolve(true); };
+    no.onclick = () => { answered = true; m.close(); resolve(false); };
+  });
+}
+
+/** Where a made cluster is, as a pill. */
+const PHASES = {
+  creating: ["pending", "creating"], installing: ["pending", "installing Strata"], starting: ["pending", "starting its copies"],
+  ready: ["ok", "ready"], deleting: ["warn", "deleting"], deleted: ["disabled", "deleted"], failed: ["bad", "failed"],
+};
+const ON_ITS_WAY = new Set(["creating", "installing", "starting", "deleting"]);
+
 function stepper(value, min, max, onChange, label, unit = "") {
   const v = h("b", { class: "num" }, String(value) + unit);
   const set = (x) => { x = clamp(x, min, max); if (x !== value) { value = x; v.textContent = String(x) + unit; onChange(x); } };
@@ -86,8 +118,10 @@ const remembered = () => { try { return localStorage.getItem("strata.cloud") || 
 function render(page, r) {
   let prov = PROVIDERS[r?.params?.get("provider")] ? r.params.get("provider") : remembered();
   let P = PROVIDERS[prov];
-  const head = h("div"), creds = h("div"), where = h("div"), machines = h("div"), planEl = h("div");
-  page.append(head, h("div", { class: "cloud-top" }, creds, where), machines, planEl);
+  const head = h("div"), made = h("div"), creds = h("div"), where = h("div"), machines = h("div"), planEl = h("div");
+  page.append(head, made, h("div", { class: "cloud-top" }, creds, where), machines, planEl);
+  let clusters = [], pollT = null, alive = true, creating = false;
+  const createEl = h("div");
 
   let status, regions, region, cat, catErr, loadingCat, editing, filt, form, plan, planErr, checked, checking;
   let seq = 0;
@@ -461,6 +495,7 @@ function render(page, r) {
     if (planErr) { clear(planEl, card({ title: "Plan", body: h("div", { class: "stack" }, controls, h("div", { class: "error" }, planErr.message)) })); return; }
     if (!plan) { clear(planEl, card({ title: "Plan", body: h("div", { class: "stack" }, controls, h("div", { class: "small dim" }, "Planning…")) })); return; }
     const stack = plan.stack;
+    drawCreate();
     const files = [
       prov === "aws"
         ? [stack + ".json", "the CloudFormation template", () => download(stack + ".json", JSON.stringify(plan.template, null, 2))]
@@ -468,7 +503,6 @@ function render(page, r) {
       [stack + "-operator.yaml", "the operator", () => download(stack + "-operator.yaml", plan.manifests.operator, "text/yaml")],
       [stack + "-cluster.yaml", prov === "aws" ? "the namespace, a gp3 storage class and the StrataCluster" : "the namespace and the StrataCluster", () => download(stack + "-cluster.yaml", plan.manifests.cluster, "text/yaml")],
     ];
-    const cmds = (list) => h("div", { class: "cloud-cmds" }, list.map((c) => h("div", { class: "row nw" }, h("code", { class: "mono small" }, c), h("button", { class: "btn xs ghost", title: "Copy", onclick: () => copy(c) }, icon("copy")))));
     const q = plan.quota;
     const quotaLine = prov === "aws"
       ? h("div", { class: "row small" }, q.vcpus != null && q.needs > q.vcpus ? pill("bad", "over quota") : pill("ok", "within quota"), `${q.needs} vCPUs of ${q.kind} instances; the account may run ${q.vcpus == null ? "an unknown number" : fmt.n(q.vcpus)} in ${plan.region}.`)
@@ -490,6 +524,8 @@ function render(page, r) {
         plan.warnings.length ? h("div", { class: "stack cloud-warn" }, plan.warnings.map((w) => h("div", { class: "row nw small" }, icon("warn"), h("span", {}, w)))) : null,
         checkedLine(),
         h("h4", {}, "Make it"),
+        createEl,
+        h("div", { class: "small dim" }, "Or make it yourself, with these files:"),
         h("div", { class: "row" }, files.map(([f, what, go]) => h("button", { class: "btn sm", title: "Download " + what, onclick: go }, icon("download"), f))),
         h("div", { class: "small dim" }, prov === "aws" ? "With the AWS CLI and kubectl, from the folder the files are in." : "With doctl (signed in with a token that may create clusters) and kubectl, from the folder the files are in; doctl points kubectl at the new cluster.", " The nodes pull the image above, so it must be one they can reach."),
         cmds(plan.commands),
@@ -499,6 +535,121 @@ function render(page, r) {
     }));
   }
 
+  // ---------------------------------------------------------- making it
+  /** Why the account would not start the nodes, if it would not. */
+  function blocked() {
+    const q = plan.quota;
+    const same = clusters.find((c) => c.provider === prov && c.cluster === plan.cluster_name && c.phase !== "deleted" && !(c.phase === "failed" && !c.cloud_id));
+    if (same) return `${plan.cluster_name} was made from here already (${PHASES[same.phase][1]}): delete it first, or change its name.`;
+    if (prov === "aws") return q.vcpus != null && q.needs > q.vcpus ? `The account may run ${fmt.n(q.vcpus)} vCPUs of ${q.kind} instances in ${plan.region} and the nodes need ${q.needs}: ask AWS for more first.` : null;
+    return q.droplets != null && q.running != null && q.running + q.needs > q.droplets ? `The account runs ${q.running} of its ${q.droplets} droplets and the nodes need ${q.needs}: ask DigitalOcean for more first.` : null;
+  }
+
+  /** The Create button, redrawn alone (the plan's inputs keep their focus). */
+  function drawCreate() {
+    if (!plan) return;
+    const why = blocked();
+    clear(createEl, h("div", { class: "row" },
+      h("button", { class: "btn danger solid", disabled: creating || !!why, onclick: create, title: why || `Make ${plan.stack} on ${P.name} now` }, icon("cloud"), creating ? "Asking…" : `Create it on ${P.name}…`),
+      h("span", { class: "small dim" }, why || `About ${usd(plan.cost.hour, 2)} an hour from then until it is deleted, billed to the account whose key is saved here. This page follows it and deletes it.`)));
+  }
+
+  async function create() {
+    const name = plan.cluster_name, p = plan;
+    const ok = await typed({
+      title: `Create ${name} on ${P.name}?`, name, ok: "Create it",
+      body: h("div", { class: "stack" },
+        h("p", { class: "dim", style: { margin: 0 } }, `${p.layout.nodes.length} × ${p.machine.type} in ${p.region}, on ${P.k8s}: about ${usd(p.cost.hour, 2)} an hour, ${usd(p.cost.month, 0)} a month, from now until it is deleted.`),
+        h("p", { class: "dim", style: { margin: 0 } }, prov === "aws"
+          ? "CloudFormation makes the network, the EKS cluster and its nodes (15 to 20 minutes); then this server installs Strata's operator and the cluster, and follows its copies until they answer."
+          : "DigitalOcean makes the cluster and its nodes (5 to 10 minutes); then this server installs Strata's operator and the cluster, and follows its copies until they answer."),
+        p.warnings.length ? h("div", { class: "stack cloud-warn" }, p.warnings.map((w) => h("div", { class: "row nw small" }, icon("warn"), h("span", {}, w)))) : null),
+    });
+    if (!ok) return;
+    creating = true; drawCreate();
+    try {
+      const m = await api("/v1/admin/cloud/clusters", { body: { provider: prov, plan: body(), confirm: name } });
+      clusters = [m, ...clusters.filter((c) => c.id !== m.id)];
+      toast(`${name} is on its way`, "ok");
+      drawMade(); poll(2000);
+      made.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) { toast(e.message, "bad", 8000); }
+    creating = false; drawCreate();
+  }
+
+  async function remove(c) {
+    const ok = await typed({
+      title: `Delete ${c.cluster}?`, name: c.cluster, ok: "Delete it",
+      body: h("p", { class: "dim", style: { margin: 0 } }, `This deletes the StrataCluster and its volumes (its data), then ${c.provider === "aws" ? "the stack: the nodes, the EKS cluster and the network" : "the DOKS cluster, its nodes and what it made"}. It cannot be undone.`),
+    });
+    if (!ok) return;
+    try { const m = await api(`/v1/admin/cloud/clusters/${encodeURIComponent(c.id)}/delete`, { body: { confirm: c.cluster } }); clusters = clusters.map((x) => (x.id === m.id ? m : x)); drawMade(); poll(2000); }
+    catch (e) { toast(e.message, "bad", 8000); }
+  }
+
+  async function forget(c) {
+    try { await api(`/v1/admin/cloud/clusters/${encodeURIComponent(c.id)}`, { method: "DELETE" }); clusters = clusters.filter((x) => x.id !== c.id); drawMade(); }
+    catch (e) { toast(e.message, "bad"); }
+  }
+
+  async function loadMade() {
+    try { clusters = (await api("/v1/admin/cloud/clusters")).clusters || []; } catch { return; }
+    if (!alive) return;
+    drawMade(); poll(); drawCreate();
+  }
+
+  /** Follows the clusters: every few seconds while one is on its way, every half minute while one is up. */
+  function poll(ms) {
+    clearTimeout(pollT);
+    if (!alive || !clusters.length) return;
+    const busy = clusters.some((c) => ON_ITS_WAY.has(c.phase));
+    if (!busy && !clusters.some((c) => c.phase === "ready")) return;
+    pollT = setTimeout(loadMade, ms ?? (busy ? 3000 : 30000));
+  }
+
+  function drawMade() {
+    if (!clusters.length) { clear(made); return; }
+    const up = clusters.filter((c) => c.phase !== "deleted" && c.phase !== "failed").length;
+    const billing = clusters.filter((c) => c.phase !== "deleted").reduce((a, c) => a + c.cost_hour, 0);
+    clear(made, card({
+      title: "Clusters made here", cls: "cloud-made",
+      sub: up ? `${up} up or on the way, about ${usd(billing, 2)} an hour` : "none running",
+      tools: [h("button", { class: "btn sm ghost", title: "Ask again now", onclick: loadMade }, icon("refresh"))],
+      body: h("div", { class: "stack" }, clusters.map(madeRow)),
+    }));
+  }
+
+  function madeRow(c) {
+    const order = ["creating", "installing", "starting", "ready"];
+    const at = order.indexOf(c.phase);
+    const stages = [[c.provider === "aws" ? "Stack" : "Cluster", "the cloud makes the cluster and its nodes"], ["Strata", "the operator and the cluster are applied"], ["Copies", "the operator starts every copy"], ["Ready", "every copy answers"]];
+    const track = at < 0 ? null : h("div", { class: "cloud-track" }, stages.map(([label, what], i) =>
+      h("span", { class: "cloud-stage" + (i < at || c.phase === "ready" ? " done" : i === at ? " now" : ""), title: what }, label)));
+    const last = c.steps[c.steps.length - 1];
+    const progress = c.progress && c.phase === "creating" ? ` (${c.progress.done} of ${c.progress.of} ${c.provider === "aws" ? "resources" : "nodes"})` : "";
+    const action = c.phase === "deleted" || (c.phase === "failed" && !c.cloud_id)
+      ? h("button", { class: "btn sm", title: "Take it off this list", onclick: () => forget(c) }, icon("x"), "Forget")
+      : c.phase === "deleting" ? null
+      : h("button", { class: "btn sm danger", onclick: () => remove(c) }, icon("trash"), "Delete");
+    return h("div", { class: "cloud-made-row" },
+      h("div", { class: "row between" },
+        h("div", { class: "row nw" }, h("b", { class: "mono" }, c.cluster), pill(...PHASES[c.phase]),
+          h("span", { class: "small dim" }, `${c.provider === "aws" ? "AWS" : "DigitalOcean"} · ${c.region} · ${c.nodes} × ${c.machine}`)),
+        h("div", { class: "row nw" },
+          h("span", { class: "small dim num", title: "at the planned price, from when it was asked for" }, `${usd(c.cost_so_far, 2)} so far${c.phase === "deleted" ? "" : ` · ${usd(c.cost_hour, 2)}/h`}`),
+          action)),
+      track,
+      last ? h("div", { class: "small" }, h("span", { class: "dim" }, fmt.ago(last.at_ms) + " · "), last.text + progress) : null,
+      c.summary && !["deleted", "ready"].includes(c.phase) && !(last && last.text.includes(c.summary)) ? h("div", { class: "small" }, h("span", { class: "dim" }, "The StrataCluster: "), c.summary) : null,
+      c.phase === "failed" && c.error ? h("div", { class: "error small" }, c.error, c.cloud_id ? " Delete it: what the cloud made may still bill." : "") : null,
+      c.connect.length ? h("details", {}, h("summary", { class: "small" }, "Open its command center"),
+        h("div", { class: "small dim", style: { margin: "6px 0" } }, "Point kubectl at it, forward the coordinator's port, then open http://127.0.0.1:7700."),
+        cmds(c.connect)) : null,
+      h("details", {}, h("summary", { class: "small" }, `What happened (${c.steps.length})`),
+        h("div", { class: "stack small cloud-steps" }, c.steps.map((st) => h("div", { class: "row nw" }, h("span", { class: "dim num" }, fmt.time(st.at_ms)), h("span", {}, st.text))))));
+  }
+
   load();
-  return () => { hideTip(); switchProvider = null; };
+  loadMade();
+  return () => { alive = false; clearTimeout(pollT); hideTip(); switchProvider = null; };
 }
