@@ -31,7 +31,7 @@ rust-stemmers = "1.2"
 base64 = "0.23"
 # SQLite (bundled, with FTS5): importing and exporting SQLite databases
 # (feature `sqlite`, `strata::sqlite`) and the SQLite baseline (`baselines`).
-rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled", "functions"], optional = true }
 tantivy = { version = "0.26", optional = true }
 # Embedding models for VECTOR fields declared with `embed` (`embed`):
 # Model2Vec by default, BERT encoders through candle with `bert`.
