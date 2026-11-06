@@ -21,9 +21,9 @@
 //! * Readers never take the writer lock; the state lock is held only to
 //!   copy pointers, never across I/O or index builds.
 //! * With [`DbOptions::publish_snapshots`] the writer also builds each new
-//!   version's snapshot before its commit returns, and readers only clone
-//!   the published one: they never build a memtable segment or wait for
-//!   one to be built.
+//!   version's snapshot before its commit returns, while readers take
+//!   snapshots, and readers only clone the published one: they never build
+//!   a memtable segment or wait for one to be built.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -104,9 +104,12 @@ pub struct DbOptions {
     pub random_hints: bool,
     /// Build each version's snapshot when it is made, in the writer (a
     /// commit, flush, bulk load, merge or vacuum returns once readers can
-    /// see it), and give readers that one. A reader then never builds a
-    /// memtable segment or waits for another reader's build; each write
-    /// pays for the build instead of the first query after it.
+    /// see it), and give readers that one. While queries keep coming, a
+    /// reader then never builds a memtable segment or waits for another
+    /// reader's build; each write pays for the build instead of the first
+    /// query after it. A write that follows no read since the last
+    /// published version publishes none (nobody is waiting for it), and
+    /// the first reader after it builds the version, as without this.
     pub publish_snapshots: bool,
     /// How a database created with these options is laid out on disk (an
     /// existing one opens in the layout it has).
@@ -283,6 +286,9 @@ pub struct Database {
     build_lock: Mutex<()>,
     /// The snapshot readers get, with `DbOptions::publish_snapshots`.
     published: RwLock<Option<Snapshot>>,
+    /// Whether a snapshot was taken since the writer last published one:
+    /// it publishes the next version only then ([`Database::republish`]).
+    read: AtomicBool,
     /// The merges running, with what a crash interrupted ([`Merging`]).
     merging: Mutex<Merging>,
     /// Expired rows per segment ([`Database::expired_in`]): the segment's
@@ -1121,6 +1127,7 @@ impl Database {
             state: Mutex::new(st),
             build_lock: Mutex::new(()),
             published: RwLock::new(None),
+            read: AtomicBool::new(true),
             merging: Mutex::new(Merging { record, ..Merging::default() }),
             expired: Mutex::new(HashMap::new()),
             merge_record_path,
@@ -1981,6 +1988,9 @@ impl Database {
     /// after a write rebuilds the last memtable chunk's segment, unless
     /// `DbOptions::publish_snapshots` has the writer build it.
     pub fn snapshot(&self) -> Snapshot {
+        if !self.read.load(Ordering::Relaxed) {
+            self.read.store(true, Ordering::Relaxed);
+        }
         if let Some(s) = &*self.published.read().unwrap_or_else(|e| e.into_inner()) {
             return s.clone();
         }
@@ -1988,12 +1998,16 @@ impl Database {
     }
 
     /// With `publish_snapshots`, builds the current version's snapshot and
-    /// hands it to readers from now on. Callers hold the writer lock (or
-    /// are opening the database), so versions are published in order.
+    /// hands it to readers from now on, if a snapshot was taken since the
+    /// last one was published; if none was, readers build the version
+    /// themselves ([`Self::snapshot_inner`]) until one is published again,
+    /// so writes nobody reads (a bulk import) do not index memtable chunks
+    /// the flush indexes again. Callers hold the writer lock (or are
+    /// opening the database), so versions are published in order.
     fn republish(&self) {
         if self.opts.publish_snapshots {
-            let s = self.snapshot_inner(true);
-            *self.published.write().unwrap_or_else(|e| e.into_inner()) = Some(s);
+            let s = self.read.swap(false, Ordering::Relaxed).then(|| self.snapshot_inner(true));
+            *self.published.write().unwrap_or_else(|e| e.into_inner()) = s;
         }
     }
 

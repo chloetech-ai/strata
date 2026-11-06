@@ -5,7 +5,9 @@
 //! queued as one transaction and numbers new records in commit order.
 //! Strata publishes each version before the writer answers
 //! (`DbOptions::publish_snapshots`), so a caller reads its own writes, and a
-//! reader never waits for a write or for the index build that follows it. A
+//! reader never waits for a write, nor for the index build that follows it
+//! unless nothing read since the write before (then the reader builds the
+//! chunks those writes filled). A
 //! full memtable becomes a segment, and segments merge, on Strata's
 //! background threads; a write waits for a flush only once the memtable
 //! holds twice `flush_docs` before the flush under way ends.

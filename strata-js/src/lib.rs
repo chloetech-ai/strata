@@ -266,9 +266,12 @@ fn threads_or_cores(threads: Option<u64>) -> Result<usize> {
 
 /// How this module opens a database, as strata-server and strata-py do:
 /// segment builds (flushes, merges) build vector indexes on `threads`
-/// cores, and the newest in-memory chunk keeps its vectors flat.
+/// cores, the newest in-memory chunk keeps its vectors flat, and each write
+/// publishes its snapshot, so a query never waits to index a memtable
+/// chunk another write filled.
 fn db_options(directory: bool, threads: usize) -> DbOptions {
     DbOptions {
+        publish_snapshots: true,
         layout: if directory { Layout::Directory } else { Layout::SingleFile },
         build: BuildOptions::default().set("vector.threads", threads),
         mem_build: Some(BuildOptions::default().set("vector.index", "flat")),

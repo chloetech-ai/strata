@@ -208,11 +208,13 @@ fn build_options() -> BuildOptions {
     BuildOptions::default().set("vector.threads", std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// How the server opens a database. Each write publishes its snapshot,
-/// rebuilding the newest in-memory chunk (up to 1,024 rows): those chunks
-/// keep their vectors flat, since a graph over so few rows costs more to
-/// build at every write than an exact scan of them costs a query. Segments
-/// build their vector indexes on every core.
+/// How the server opens a database. Each write publishes its snapshot
+/// while queries come in, building the in-memory chunks it filled (1,024
+/// rows each; a write nobody reads leaves them to the flush, or to the
+/// first query after it): those chunks keep their vectors flat, since a
+/// graph over so few rows costs more to build at every write than an
+/// exact scan of them costs a query. Segments build their vector indexes
+/// on every core.
 pub fn db_options(directory: bool) -> DbOptions {
     DbOptions {
         publish_snapshots: true,

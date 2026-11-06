@@ -281,8 +281,18 @@ fn threads_or_cores(threads: Option<usize>) -> PyResult<usize> {
 /// in-memory chunk keeps its vectors flat, since a graph over so few rows
 /// costs more to build at every write than an exact scan of them costs a
 /// query.
+///
+/// Each write publishes its snapshot while queries come in
+/// (`DbOptions::publish_snapshots`): the insert that fills a memtable chunk
+/// indexes it before it returns. Without that the first query after it
+/// did, while every other query waited for it, and a stream of inserts
+/// beside queries left the queries waiting on chunk after chunk (on 4
+/// cores, inserts of 2,500 rows 20 times a second beside 4 threads
+/// querying: 77 queries a second with a p99 of 1.2 s, against 5,200 with
+/// a p99 of 6 ms).
 fn db_options(directory: bool, threads: usize) -> DbOptions {
     DbOptions {
+        publish_snapshots: true,
         layout: if directory { Layout::Directory } else { Layout::SingleFile },
         build: BuildOptions::default().set("vector.threads", threads),
         mem_build: Some(BuildOptions::default().set("vector.index", "flat")),
