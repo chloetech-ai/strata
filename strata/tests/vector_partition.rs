@@ -259,3 +259,37 @@ fn the_cost_model_weighs_partitions() {
     let r = db.query_with("SELECT id FROM t WHERE rating >= 4 ORDER BY similarity(emb, :q, strategy => 'partition') DESC LIMIT 10", &p, &off).unwrap();
     assert!(r.stats.plan.iter().any(|l| l.contains("vector partitions range 4")), "{:?}", r.stats.plan);
 }
+
+#[test]
+fn merges_start_partition_graphs_only_from_the_same_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("p.strata"), seed(), opts()).unwrap();
+    create(&db, "rating");
+    let mut data = rows(3000, 5);
+    for part in data.chunks(1000) {
+        insert(&db, part);
+        db.storage().flush().unwrap();
+    }
+    // Rows of the second segment move to another partition after it was
+    // built: a merge must not start their partitions' graphs from it.
+    let moved: Vec<usize> = (1000..2000).step_by(3).filter(|&i| data[i].rating.is_some()).collect();
+    for chunk in moved.chunks(200) {
+        let ids: Vec<String> = chunk.iter().map(|i| format!("'r{i}'")).collect();
+        run(&db, &format!("UPDATE t SET rating = 4.5 WHERE id IN ({})", ids.join(", ")));
+    }
+    for &i in &moved {
+        data[i].rating = Some(4.5);
+    }
+    db.storage().merge(&MergePolicy { merge_factor: 3, floor_docs: 100_000, ..MergePolicy::default() }).unwrap();
+    assert_eq!(strata::storage::manifest::read(&dir.path().join("p.strata")).unwrap().segments().count(), 1);
+    let queries = rows(10, 6);
+    for filter in ["rating >= 4", "rating < 2", "rating >= 2 AND rating < 3"] {
+        assert!(recall(&db, &queries, filter) >= 0.9, "{filter}");
+    }
+    for q in &queries {
+        let (got, _) = top(&db, &q.v, "rating >= 4", ", strategy => 'partition'");
+        assert!(got.iter().all(|g| rating_of(&data, g).is_some_and(|r| r >= 4.0)), "{got:?}");
+        let (got, _) = top(&db, &q.v, "rating < 4", ", strategy => 'partition'");
+        assert!(got.iter().all(|g| rating_of(&data, g).is_some_and(|r| r < 4.0)), "{got:?}");
+    }
+}

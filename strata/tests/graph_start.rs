@@ -188,3 +188,89 @@ fn merged_segments_start_from_their_largest_whole_input() {
         assert_eq!(r.search(r.vector(d), 1, &params, None).hits[0].doc, d);
     }
 }
+
+/// Field `emb` partitioned by `rating`'s ranges (`< 1`, `[1, 2)` ... `>= 4`).
+fn part_schema() -> Schema {
+    let mut emb = Field::new("emb", FieldType::Vector { dim: DIM, index: VectorIndexKind::Hnsw { m: 16, ef_construction: 100 } });
+    emb.partition = Some(strata::schema::VectorPartition { by: "rating".into(), bounds: vec![1.0, 2.0, 3.0, 4.0] });
+    Schema::new("t", vec![Field::new("id", FieldType::Int), Field::new("rating", FieldType::Int), emb], Some("id")).unwrap()
+}
+
+/// Documents `ids` with a rating from 0 to 4 (`shift` moves every third
+/// one up by that much) and their vectors; every 13th has none.
+fn rated(vectors: &[Vec<f32>], ids: std::ops::Range<usize>, shift: usize) -> Vec<Vec<Value>> {
+    ids.map(|i| {
+        let rating = (i * 7 + if i % 3 == 0 { shift } else { 0 }) % 5;
+        vec![Value::Int(i as i64), Value::Int(rating as i64), if i % 13 == 5 { Value::Null } else { Value::Vector(Arc::from(vectors[i].as_slice())) }]
+    })
+    .collect()
+}
+
+/// Every partition graph section of `emb`, by name.
+fn part_graphs(seg: &SegmentFile) -> Vec<(String, Vec<u8>)> {
+    let key = part_schema().key_of("emb").unwrap();
+    let parts = VectorReader::open(seg, &key).unwrap().partitions().unwrap().parts.len();
+    assert_eq!(parts, 5);
+    (0..parts)
+        .flat_map(|i| ["docs", "hnsw", "hnsw_upper"].map(|x| format!("vec.{key}.part{i}.{x}")))
+        .map(|name| {
+            let bytes = seg.require(&name).unwrap().to_vec();
+            (name, bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn partition_graphs_started_from_one_over_the_same_rows_are_those_graphs() {
+    let vectors = clustered(3000, 12);
+    let all = rated(&vectors, 0..3000, 0);
+    let first = segment(build_segment(&part_schema(), &all, &opts(1)).unwrap());
+    let other = segment(build_segment(&part_schema(), &all, &opts(2)).unwrap());
+    assert_ne!(part_graphs(&other), part_graphs(&first));
+    let start = [GraphStart { field: 2, segment: first.clone(), base: 0 }];
+    let started = segment(build_segment_from(&part_schema(), &all, &opts(2), &start).unwrap());
+    assert_eq!(part_graphs(&started), part_graphs(&first));
+}
+
+#[test]
+fn partition_graphs_of_other_rows_are_ignored() {
+    let vectors = clustered(3000, 13);
+    let all = rated(&vectors, 0..3000, 0);
+    // The same vectors, a third of the rows in another partition: the
+    // field's graph still starts from it, no partition's does.
+    let moved = segment(build_segment(&part_schema(), &rated(&vectors, 0..3000, 1), &opts(1)).unwrap());
+    let start = [GraphStart { field: 2, segment: moved, base: 0 }];
+    let started = segment(build_segment_from(&part_schema(), &all, &opts(1), &start).unwrap());
+    let plain = segment(build_segment(&part_schema(), &all, &opts(1)).unwrap());
+    assert_eq!(part_graphs(&started), part_graphs(&plain));
+}
+
+#[test]
+fn partition_graphs_started_from_part_of_the_rows_find_neighbours_as_well() {
+    let vectors = clustered(8000, 14);
+    let queries = clustered(200, 15);
+    let all = rated(&vectors, 0..8000, 0);
+    let schema = part_schema();
+    let key = schema.key_of("emb").unwrap();
+    // Two inputs merged with others: documents 0 to 3,000 and 3,000 to 6,000.
+    let inputs: Vec<GraphStart> = [0..3000, 3000..6000]
+        .into_iter()
+        .map(|r| GraphStart { field: 2, segment: segment(build_segment(&schema, &rated(&vectors, r.clone(), 0), &opts(1)).unwrap()), base: r.start as u32 })
+        .collect();
+    let started = segment(build_segment_from(&schema, &all, &opts(1), &inputs).unwrap());
+    let whole = segment(build_segment(&schema, &all, &opts(1)).unwrap());
+    assert_ne!(part_graphs(&started), part_graphs(&whole));
+    // Recall@10 over every partition's graph at once, against an exact scan.
+    let recall = |seg: &SegmentFile| {
+        let r = VectorReader::open(seg, &key).unwrap();
+        let params = SearchParams { strategy: Strategy::Hnsw, ef: 100, ..SearchParams::default() };
+        let mut found = 0;
+        for q in &queries {
+            let exact: Vec<u32> = r.exact(q, 10, None).iter().map(|h| h.doc).collect();
+            found += r.search_parts(q, 10, &params, &[0, 1, 2, 3, 4], None).hits.iter().filter(|h| exact.contains(&h.doc)).count();
+        }
+        found as f64 / (10 * queries.len()) as f64
+    };
+    let (with, without) = (recall(&started), recall(&whole));
+    assert!(with >= 0.9 && with >= without - 0.02, "recall@10 started {with:.3}, built whole {without:.3}");
+}

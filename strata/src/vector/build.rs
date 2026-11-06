@@ -277,6 +277,61 @@ fn start_graph(seg: &SegmentFile, field: &str, dim: usize) -> Option<(HnswView, 
     Some((g, info.n))
 }
 
+/// `seg`'s graphs of `field`'s partitions, each with its rows (docIDs of
+/// `seg`), if the segment has an HNSW graph of `dim` dimensions. A merge
+/// starts a partition's graph from these when an input's rows of that
+/// partition are exactly one of its graphs' rows ([`part_starts`]).
+fn start_parts(seg: &SegmentFile, field: &str, dim: usize) -> Vec<(Vec<u32>, HnswView)> {
+    let Some(info) = seg.section(&section(field, "meta")).ok().flatten().and_then(|b| serde_json::from_slice::<VectorInfo>(&b).ok()) else {
+        return Vec::new();
+    };
+    let (Some(p), Some(m)) = (&info.partitions, info.m) else {
+        return Vec::new();
+    };
+    if info.index != "hnsw" || info.dim != dim || info.n != seg.n_docs() {
+        return Vec::new();
+    }
+    p.parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pi)| {
+            let part = |x: &str| section(field, &format!("part{i}.{x}"));
+            let docs: Vec<u32> = seg.section(&part("docs")).ok()??.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect();
+            if docs.len() != pi.n || !docs.windows(2).all(|w| w[0] < w[1]) || docs.last().is_some_and(|&d| d as usize >= info.n) {
+                return None;
+            }
+            let g = HnswView::open(m, pi.entry, seg.section(&part("hnsw")).ok()??, seg.section(&part("hnsw_upper")).ok()??, pi.n).ok()?;
+            Some((docs, g))
+        })
+        .collect()
+}
+
+/// The graphs a partition of rows `docs` (docIDs of this build, in order)
+/// starts from: of each start segment (its first docID here, its document
+/// count and its partitions' graphs from [`start_parts`]), the graph whose
+/// rows are exactly this partition's rows in that segment's range, numbered
+/// as the partition numbers them. A segment whose rows of the partition
+/// are not exactly one of its graphs' (a key written in place since, or
+/// other bounds) is left out; the same rows under another key are not,
+/// since the graph is over the same vectors. Largest first, as the field's
+/// graph starts from the largest input's.
+fn part_starts<'a>(docs: &[u32], from: &'a [(u32, usize, Vec<(Vec<u32>, HnswView)>)]) -> Vec<hnsw::StartGraph<'a>> {
+    let mut out = Vec::new();
+    for (base, n_docs, parts) in from {
+        let lo = docs.partition_point(|&d| d < *base);
+        let hi = docs.partition_point(|&d| (d as u64) < *base as u64 + *n_docs as u64);
+        let mine = &docs[lo..hi];
+        if mine.is_empty() {
+            continue;
+        }
+        if let Some((_, g)) = parts.iter().find(|(pd, _)| pd.len() == mine.len() && pd.iter().zip(mine).all(|(&a, &b)| a + base == b)) {
+            out.push(hnsw::StartGraph { view: g, base: lo as u32, n: mine.len() });
+        }
+    }
+    out.sort_by_key(|s| (std::cmp::Reverse(s.n), s.base));
+    out
+}
+
 impl FieldIndexBuilder for VectorBuilder {
     fn add(&mut self, doc: DocId, value: &Value) -> Result<()> {
         if let Some((offsets, _)) = &self.multi {
@@ -430,6 +485,9 @@ impl FieldIndexBuilder for VectorBuilder {
                         return Err(Error::Schema(format!("vector field {field}: partition keys of {} documents, not {n}", keys.keys.len())));
                     }
                     let (groups, complete) = keys.groups(&is_present);
+                    // A merge starts each partition's graph from its inputs'
+                    // graphs of the same rows, as it starts the field's.
+                    let from: Vec<(u32, usize, Vec<(Vec<u32>, HnswView)>)> = start.iter().map(|(seg, base)| (*base, seg.n_docs(), start_parts(seg, &field, dim))).filter(|(_, _, p)| !p.is_empty()).collect();
                     let mut parts = Vec::with_capacity(groups.len());
                     for (i, (k, docs)) in groups.iter().enumerate() {
                         let rows = Rows { data, dim, stride, n: docs.len(), map: Some(docs) };
@@ -437,7 +495,8 @@ impl FieldIndexBuilder for VectorBuilder {
                             Quantiser::Sq8(sq8) if !f32 => Some(hnsw::BuildCodes { sq8, codes: &codes, stride: code_stride, map: Some(docs) }),
                             _ => None,
                         };
-                        let g = hnsw::build(&rows, &|_| true, &HnswConfig { m, ef_construction, threads, seed: seed ^ (*k as u64 + 1) }, &[], on.as_ref());
+                        let starts = part_starts(docs, &from);
+                        let g = hnsw::build(&rows, &|_| true, &HnswConfig { m, ef_construction, threads, seed: seed ^ (*k as u64 + 1) }, &starts, on.as_ref());
                         parts.push(PartInfo {
                             bucket: (!keys.bounds.is_empty()).then_some(*k as usize),
                             value: keys.bounds.is_empty().then(|| keys.values[*k as usize].clone()),

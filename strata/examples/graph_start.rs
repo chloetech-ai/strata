@@ -3,9 +3,14 @@
 //! joined (Lucene 10.2): build time and recall@10 against an exact scan.
 //!
 //! ```text
-//! graph_start DIM SEGMENTS DOCS_PER_SEGMENT [KEY=VALUE ...]
-//! graph_start beir:NAME SEGMENTS DOCS_PER_SEGMENT [KEY=VALUE ...]
+//! graph_start DIM SEGMENTS DOCS_PER_SEGMENT [--partition] [KEY=VALUE ...]
+//! graph_start beir:NAME SEGMENTS DOCS_PER_SEGMENT [--partition] [KEY=VALUE ...]
 //! ```
+//!
+//! `--partition` gives each row a random rating from 0 to 5 and partitions
+//! the field by it at 1, 2, 3 and 4, as the engine comparison builds
+//! Strata's vectors: a merge then also builds a graph per partition, and
+//! recall is that of the five partition graphs searched together.
 //!
 //! With a number, the vectors are unit vectors around 100 random centres;
 //! with `beir:NAME`, the first documents of a collection prepared under
@@ -49,14 +54,15 @@ fn rows(path: &std::path::Path, dim: usize, n: usize) -> Vec<Vec<f32>> {
     bytes.chunks_exact(dim * 4).map(|r| r.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()).collect()
 }
 
-fn recall(seg: &SegmentFile, queries: &[Vec<f32>], ef: usize) -> f64 {
-    // Field emb, the table's second (id 1), names its sections f1.
-    let r = VectorReader::open(seg, "f1").unwrap();
+fn recall(seg: &SegmentFile, field: &str, queries: &[Vec<f32>], ef: usize) -> f64 {
+    let r = VectorReader::open(seg, field).unwrap();
+    let parts: Vec<usize> = (0..r.partitions().map_or(0, |p| p.parts.len())).collect();
     let params = SearchParams { strategy: Strategy::Hnsw, ef, ..SearchParams::default() };
     let mut found = 0;
     for q in queries {
         let exact: Vec<u32> = r.exact(q, 10, None).iter().map(|h| h.doc).collect();
-        found += r.search(q, 10, &params, None).hits.iter().filter(|h| exact.contains(&h.doc)).count();
+        let got = if parts.is_empty() { r.search(q, 10, &params, None) } else { r.search_parts(q, 10, &params, &parts, None) };
+        found += got.hits.iter().filter(|h| exact.contains(&h.doc)).count();
     }
     found as f64 / (10 * queries.len()) as f64
 }
@@ -64,8 +70,9 @@ fn recall(seg: &SegmentFile, queries: &[Vec<f32>], ef: usize) -> f64 {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (segs, per): (usize, usize) = (a[2].parse().unwrap(), a[3].parse().unwrap());
+    let partition = a[4..].iter().any(|x| x == "--partition");
     let mut opts = BuildOptions::default();
-    for kv in &a[4..] {
+    for kv in a[4..].iter().filter(|x| *x != "--partition") {
         let (k, v) = kv.split_once('=').expect("KEY=VALUE");
         opts = opts.set(k, v);
     }
@@ -88,18 +95,28 @@ fn main() {
             (dim, vectors, clustered(200, &mut rng, &centres))
         }
     };
-    let schema = Schema::new("t", vec![Field::new("id", FieldType::Int), Field::new("emb", FieldType::Vector { dim, index: DEFAULT_HNSW })], Some("id")).unwrap();
-    let docs: Vec<Vec<Value>> = vectors.iter().enumerate().map(|(i, v)| vec![Value::Int(i as i64), Value::Vector(Arc::from(v.as_slice()))]).collect();
+    let mut emb = Field::new("emb", FieldType::Vector { dim, index: DEFAULT_HNSW });
+    let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+    let (schema, docs): (Schema, Vec<Vec<Value>>) = if partition {
+        emb.partition = Some(strata::schema::VectorPartition { by: "rating".into(), bounds: vec![1.0, 2.0, 3.0, 4.0] });
+        let fields = vec![Field::new("id", FieldType::Int), Field::new("rating", FieldType::Float), emb];
+        let docs = vectors.iter().enumerate().map(|(i, v)| vec![Value::Int(i as i64), Value::Float(rng.gen_range(0.0..5.0)), Value::Vector(Arc::from(v.as_slice()))]).collect();
+        (Schema::new("t", fields, Some("id")).unwrap(), docs)
+    } else {
+        let docs = vectors.iter().enumerate().map(|(i, v)| vec![Value::Int(i as i64), Value::Vector(Arc::from(v.as_slice()))]).collect();
+        (Schema::new("t", vec![Field::new("id", FieldType::Int), emb], Some("id")).unwrap(), docs)
+    };
+    let (emb_id, key) = (schema.field_index("emb").unwrap(), schema.key_of("emb").unwrap());
     let t = Instant::now();
     let inputs: Vec<SegmentFile> = (0..segs).map(|s| SegmentFile::from_vec(build_segment(&schema, &docs[s * per..(s + 1) * per], &opts).unwrap()).unwrap()).collect();
     let inputs_s = t.elapsed().as_secs_f64() / segs as f64;
-    let starts: Vec<GraphStart> = inputs.iter().enumerate().map(|(s, seg)| GraphStart { field: 1, segment: seg.clone(), base: (s * per) as u32 }).collect();
+    let starts: Vec<GraphStart> = inputs.iter().enumerate().map(|(s, seg)| GraphStart { field: emb_id, segment: seg.clone(), base: (s * per) as u32 }).collect();
     let timed = |starts: &[GraphStart]| {
         let t = Instant::now();
         let seg = SegmentFile::from_vec(build_segment_from(&schema, &docs, &opts, starts).unwrap()).unwrap();
-        (t.elapsed().as_secs_f64(), recall(&seg, &queries, 64), recall(&seg, &queries, 100))
+        (t.elapsed().as_secs_f64(), recall(&seg, &key, &queries, 64), recall(&seg, &key, &queries, 100))
     };
-    println!("{dim}-dim, {segs} x {per} ({} queries), an input {inputs_s:.2} s", queries.len());
+    println!("{dim}-dim, {segs} x {per} ({} queries){}, an input {inputs_s:.2} s", queries.len(), if partition { ", partitioned by rating" } else { "" });
     for (name, s) in [("whole", &starts[..0]), ("largest", &starts[..1]), ("joined", &starts[..])] {
         let (secs, r64, r100) = timed(s);
         println!("  {name:8} {secs:7.2} s, recall@10 ef 64 {r64:.3}, ef 100 {r100:.3}");
