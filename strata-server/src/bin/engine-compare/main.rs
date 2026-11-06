@@ -129,6 +129,12 @@ enum Cmd {
         /// uses the linear retriever with min-max normalisation.
         #[arg(long)]
         paid: bool,
+        /// HNSW candidates per vector search (ef, num_candidates, topK) for
+        /// every engine; the default is the benchmark's 64. Give the run a
+        /// `--label` per value for a sweep. Weaviate's ef is set when its
+        /// collection is made, at `load`, so this does not reach it.
+        #[arg(long, default_value_t = CANDIDATES)]
+        candidates: usize,
         #[arg(long)]
         out: PathBuf,
     },
@@ -1015,7 +1021,25 @@ const KINDS: &[(&str, &str)] = &[
 /// OpenSearch get the same (num_candidates or ef_search 64, re-scoring 4 x
 /// 10 with the full vectors); Solr's and Vespa's vectors are full precision,
 /// searched with topK 64 (Vespa: target hits 10 plus 54 explored).
+///
+/// `run --candidates N` sets another number, for a sweep of recall against
+/// speed: the engines above get N, and Strata's vector searches `ef => N`.
 const CANDIDATES: usize = 64;
+static CANDIDATES_RUN: AtomicUsize = AtomicUsize::new(CANDIDATES);
+
+/// The HNSW candidates of this run ([`CANDIDATES`] unless `--candidates`).
+fn candidates() -> usize {
+    CANDIDATES_RUN.load(Ordering::Relaxed)
+}
+
+/// A Strata statement with the run's candidates: its vector searches get
+/// `ef => N` when the run has other than [`CANDIDATES`].
+fn with_ef(sql: &str) -> std::borrow::Cow<'_, str> {
+    match candidates() {
+        CANDIDATES => sql.into(),
+        n => sql.replace("similarity(emb, :v)", &format!("similarity(emb, :v, ef => {n})")).replace("similarity(emb, :i)", &format!("similarity(emb, :i, ef => {n})")).into(),
+    }
+}
 const OVERSAMPLE: usize = 4;
 /// Each input's depth for the hybrid kinds (Strata's default).
 const DEPTH: usize = 100;
@@ -1305,7 +1329,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                 .replace(":fc", &cats.iter().map(|c| sql_str(c)).collect::<Vec<_>>().join(", "))
                 .replace(":fr", &f.rating_min.to_string())
                 .replace(":fs", &f.similar_rating.to_string());
-            Some(("/v1/query", json!({"sql": sql, "params": params})))
+            Some(("/v1/query", json!({"sql": with_ef(&sql), "params": params})))
         }
         Engine::Es | Engine::Os => {
             let os = engine == Engine::Os;
@@ -1346,7 +1370,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                     {"range": {"year": {"gte": f.year_min}}}, {"terms": {"category": cats}}]}}})),
                 "vector" | "vector + filter" => {
                     let filter = (kind == "vector + filter").then(|| json!({"range": {"rating": {"gte": json_num(f.rating_min)}}}));
-                    top(knn_body(knn_query(v, 10, CANDIDATES, true, filter)))
+                    top(knn_body(knn_query(v, 10, candidates(), true, filter)))
                 }
                 "hybrid (RRF)" | "hybrid (weighted)" if os => {
                     let pipeline = if kind == "hybrid (RRF)" { "rrf" } else { "minmax" };
@@ -1384,7 +1408,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                 }
                 "similar items" => {
                     let filter = json!({"bool": {"filter": [{"range": {"rating": {"gte": json_num(f.similar_rating)}}}], "must_not": [{"ids": {"values": seen}}]}});
-                    top(knn_body(knn_query(p.item, 10, CANDIDATES, true, Some(filter))))
+                    top(knn_body(knn_query(p.item, 10, candidates(), true, Some(filter))))
                 }
                 "sql aggregate" => {
                     // Elasticsearch SQL quotes identifiers (year is also a function); OpenSearch SQL reads a quoted one as a string.
@@ -1415,7 +1439,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                     b
                 }
                 "vector" | "vector + filter" => {
-                    let mut b = json!({"query": knn(CANDIDATES), "limit": 10, "fields": "id,score"});
+                    let mut b = json!({"query": knn(candidates()), "limit": 10, "fields": "id,score"});
                     if kind == "vector + filter" {
                         b["filter"] = json!([format!("rating:[{} TO *]", f.rating_min)]);
                     }
@@ -1462,7 +1486,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                 }
                 "similar items" => {
                     let ids: Vec<String> = seen.iter().map(|k| format!("\"{}\"", k.replace('"', "\\\""))).collect();
-                    json!({"query": format!("{{!knn f=emb topK={CANDIDATES}}}{}", vector_text(p.item)), "limit": 10, "fields": "id,score",
+                    json!({"query": format!("{{!knn f=emb topK={}}}{}", candidates(), vector_text(p.item)), "limit": 10, "fields": "id,score",
                         "filter": [format!("rating:[{} TO *]", f.similar_rating), format!("-id:({})", ids.join(" OR "))]})
                 }
                 "sql aggregate" => {
@@ -1495,7 +1519,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                 }
                 "vector" | "vector + filter" => {
                     let filter = if kind == "vector + filter" { format!(" and rating >= {}", f.rating_min) } else { String::new() };
-                    json!({"yql": format!("select * from doc where {}{filter}", nn("v", 10, CANDIDATES - 10)), "ranking": "vector", "input.query(v)": v.to_vec()})
+                    json!({"yql": format!("select * from doc where {}{filter}", nn("v", 10, candidates().saturating_sub(10))), "ranking": "vector", "input.query(v)": v.to_vec()})
                 }
                 "hybrid (RRF)" | "hybrid (weighted)" => json!({
                     "yql": format!("select * from doc where userQuery() or ({{targetHits:{DEPTH}}}nearestNeighbor(emb, v))"),
@@ -1513,7 +1537,7 @@ fn request(engine: Engine, kind: &str, sql: &str, p: &Probe) -> Option<(&'static
                 }
                 "similar items" => {
                     let ids: Vec<String> = seen.iter().map(|k| yql_str(k)).collect();
-                    json!({"yql": format!("select * from doc where {} and rating >= {} and !(id in ({}))", nn("i", 10, CANDIDATES - 10), f.similar_rating, ids.join(", ")),
+                    json!({"yql": format!("select * from doc where {} and rating >= {} and !(id in ({}))", nn("i", 10, candidates().saturating_sub(10)), f.similar_rating, ids.join(", ")),
                         "ranking": "similar", "input.query(i)": p.item.to_vec()})
                 }
                 "sql aggregate" => json!({
@@ -1903,7 +1927,7 @@ async fn run(
     eprintln!("{label:<8} result cache: {cache}");
     let report = json!({
         "engine": engine.name(), "label": label, "collection": collection, "urls": urls, "queries": queries.len(),
-        "params": {"seconds": seconds, "concurrency": concurrency, "candidates": CANDIDATES, "oversample": OVERSAMPLE, "hybrid_depth": DEPTH, "paid": paid},
+        "params": {"seconds": seconds, "concurrency": concurrency, "candidates": candidates(), "oversample": OVERSAMPLE, "hybrid_depth": DEPTH, "paid": paid},
         "http": http, "unavailable": unavailable, "differs": differ, "query_ids": query_ids, "probes": probes, "answers": answers, "warm_up_p50_ms": warmups,
         "result_cache": cache,
     });
@@ -2843,10 +2867,13 @@ async fn main() {
             Ok(e) => load(&cli.collection, e, url, *shards, *batch, *clients, *limit, out).await,
             Err(o) => more::load(&cli.collection, o, url, *batch, *clients, *limit, out).await,
         },
-        Cmd::Run { engine, url, queries, concurrency, seconds, label, kinds, paid, out } => match engine.engine() {
-            Ok(e) => run(&cli.collection, e, url, *queries, concurrency, *seconds, label.clone(), kinds, *paid, out).await,
-            Err(o) => more::run(&cli.collection, o, url, *queries, concurrency, *seconds, label.clone(), kinds, out).await,
-        },
+        Cmd::Run { engine, url, queries, concurrency, seconds, label, kinds, paid, candidates, out } => {
+            CANDIDATES_RUN.store(*candidates, Ordering::Relaxed);
+            match engine.engine() {
+                Ok(e) => run(&cli.collection, e, url, *queries, concurrency, *seconds, label.clone(), kinds, *paid, out).await,
+                Err(o) => more::run(&cli.collection, o, url, *queries, concurrency, *seconds, label.clone(), kinds, out).await,
+            }
+        }
         Cmd::Writes { engine, url, concurrency, seconds, batch, samples, label, out } => match engine.engine() {
             Ok(e) => writes(&cli.collection, e, url, concurrency, *seconds, *batch, *samples, label.clone(), out).await,
             Err(o) => Err(format!("writes are not measured for {} yet", o.name())),

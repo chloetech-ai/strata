@@ -840,7 +840,7 @@ async fn setup(o: Other, c: &mut Conns, u: &str, dim: usize) -> Result<(), Strin
                 Some(json!({
                     "class": "Doc", "vectorizer": "none", "vectorIndexType": "hnsw",
                     // 8-bit rotational quantization re-scoring the best 40 with the full vectors, as Strata's.
-                    "vectorIndexConfig": {"distance": "dot", "efConstruction": 200, "maxConnections": 16, "ef": CANDIDATES,
+                    "vectorIndexConfig": {"distance": "dot", "efConstruction": 200, "maxConnections": 16, "ef": candidates(),
                         "rq": {"enabled": true, "bits": 8, "rescoreLimit": OVERSAMPLE * 10}},
                     "invertedIndexConfig": {"bm25": {"k1": K1, "b": B}, "stopwords": {"preset": "en"}},
                     "properties": [
@@ -1540,7 +1540,7 @@ pub(crate) fn request(o: Other, kind: &str, p: &Probe, u: &str) -> Option<Req> {
         Other::Typesense => {
             let text = |q: &str| json!({"collection": "docs", "q": q, "query_by": "body", "per_page": 10, "include_fields": "id", "prefix": false, "num_typos": 0, "stopwords": "query"});
             let vq = |vec: &[f32], k: usize, extra: &str| format!("emb:({}, k:{k}{extra})", vector_text(vec));
-            let vector = |vec: &[f32]| json!({"collection": "docs", "q": "*", "per_page": 10, "include_fields": "id", "vector_query": vq(vec, 10, &format!(", ef:{CANDIDATES}"))});
+            let vector = |vec: &[f32]| json!({"collection": "docs", "q": "*", "per_page": 10, "include_fields": "id", "vector_query": vq(vec, 10, &format!(", ef:{}", candidates()))});
             let s = match kind {
                 "bm25" => text(t),
                 "bm25 + filter" => with(text(t), json!({"filter_by": format!("year:>={} && category:[{}]", f.year_min, cats.join(","))})),
@@ -1570,7 +1570,7 @@ pub(crate) fn request(o: Other, kind: &str, p: &Probe, u: &str) -> Option<Req> {
         }
         Other::Qdrant => {
             let q = format!("{u}/collections/docs/points/query");
-            let vparams = json!({"hnsw_ef": CANDIDATES, "quantization": {"rescore": true, "oversampling": OVERSAMPLE}});
+            let vparams = json!({"hnsw_ef": candidates(), "quantization": {"rescore": true, "oversampling": OVERSAMPLE}});
             let sparse = || query_sparse(t);
             let text = |filter: Option<Json>| -> Option<Json> {
                 let mut b = json!({"query": sparse()?, "using": "bm25", "limit": 10, "with_payload": ["key"]});
@@ -1686,7 +1686,7 @@ pub(crate) fn request(o: Other, kind: &str, p: &Probe, u: &str) -> Option<Req> {
             let search = |data: Json, field: &str, filter: Option<String>, limit: usize| {
                 let mut b = json!({"collectionName": "docs", "data": [data], "annsField": field, "limit": limit, "outputFields": ["key"]});
                 if field == "emb" {
-                    b["searchParams"] = json!({"params": {"ef": CANDIDATES, "refine_k": OVERSAMPLE}});
+                    b["searchParams"] = json!({"params": {"ef": candidates(), "refine_k": OVERSAMPLE}});
                 }
                 if let Some(f) = filter {
                     b["filter"] = json!(f);
@@ -1737,7 +1737,7 @@ pub(crate) fn request(o: Other, kind: &str, p: &Probe, u: &str) -> Option<Req> {
             let options = "ranker=expr('10000*bm25a(1.2,0.75)'), idf='plain,tfidf_unnormalized'";
             let ranker = format!("OPTION {options}");
             let text = |m: &str, filter: &str| format!("SELECT key, weight() s FROM docs WHERE MATCH({}){filter} ORDER BY s DESC LIMIT 10 {ranker}", sql_str(m));
-            let knn = |vec: &[f32], k: usize| format!("knn(emb, {k}, {}, {{ef={}, rescore=1, oversampling={}.0}})", manticore_vec(vec), CANDIDATES.max(k), OVERSAMPLE);
+            let knn = |vec: &[f32], k: usize| format!("knn(emb, {k}, {}, {{ef={}, rescore=1, oversampling={}.0}})", manticore_vec(vec), candidates().max(k), OVERSAMPLE);
             let sql = match kind {
                 "bm25" => text(&quorum, ""),
                 "bm25 + filter" => text(&quorum, &format!(" AND year >= {} AND category IN ({sql_cats})", f.year_min)),
@@ -1889,7 +1889,7 @@ pub(crate) fn request(o: Other, kind: &str, p: &Probe, u: &str) -> Option<Req> {
             };
             let knn = |filter: &str| {
                 let mut x = a(&["FT.SEARCH", "idx"]);
-                x.push(format!("({filter})=>[KNN 10 @emb $v EF_RUNTIME {CANDIDATES} AS d]"));
+                x.push(format!("({filter})=>[KNN 10 @emb $v EF_RUNTIME {} AS d]", candidates()));
                 x.extend(a(&["SORTBY", "d", "RETURN", "1", "d", "LIMIT", "0", "10"]));
                 x
             };
@@ -2307,7 +2307,7 @@ pub async fn run(collection: &str, o: Other, urls: &[String], n_queries: usize, 
     eprintln!("{label:<9} result cache: {cache}");
     let report = json!({
         "engine": o.name(), "label": label, "collection": collection, "urls": urls, "queries": queries.len(),
-        "params": {"seconds": seconds, "concurrency": concurrency, "candidates": CANDIDATES, "oversample": OVERSAMPLE, "hybrid_depth": DEPTH},
+        "params": {"seconds": seconds, "concurrency": concurrency, "candidates": candidates(), "oversample": OVERSAMPLE, "hybrid_depth": DEPTH},
         "http": http, "unavailable": unavailable, "differs": differ, "query_ids": query_ids, "probes": probes, "answers": answers, "warm_up_p50_ms": warmups,
         "result_cache": cache,
     });

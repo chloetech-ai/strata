@@ -62,6 +62,12 @@
 # skipped (its down still runs) and the next engine goes on; its failures
 # are in the job's reason and failures/<engine>/, and the job ends done.
 #   same-nodes-1m  strata-first+es+os+solr+vespa+strata-last  sharded  7
+# EFS in the fifth column (values separated by /) sweeps the HNSW
+# candidates (ef, num_candidates, topK; the runs' default is 64): after its
+# PASSES passes of `run`, each engine runs PASSES more per value, labelled
+# ENGINE-efN, with only the kinds that search vectors (EF_KINDS); ef.py
+# reports recall and latency per value:
+#   ef-sweep  strata+qdrant  sharded  5  EFS=128/256
 set -euo pipefail
 
 API=https://api.digitalocean.com/v2
@@ -79,6 +85,7 @@ RETRIES=${RETRIES:-1}
 BUDGET=${BUDGET:-50}
 LOAD_HOURS=${LOAD_HOURS:-3}
 PASSES=${PASSES:-3}
+EFS=${EFS:-}
 COPY_JOBS=${COPY_JOBS:-0}
 STATE=${STATE:-$HOME/.strata-fanout}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -314,11 +321,19 @@ print("slow" if len(xs) >= 3 and line["sha256_4g_s"] > 1.05 * statistics.median(
 PY
 }
 
-# The PASSES passes of `run` for ENGINE (labelled LABEL, default ENGINE).
+# The PASSES passes of `run` for ENGINE (labelled LABEL, default ENGINE),
+# then, on the first set of runs (LABEL is ENGINE), PASSES more for each
+# HNSW candidates value in EFS (the header).
+EF_KINDS=${EF_KINDS:-vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items}
 runs() { # ENGINE [LABEL]
-    local i l=${2:-$1}
+    local i l=${2:-$1} ef
     [ "$l" = "$1" ] && echo "run $1" || echo "run $1 --label $l"
     for ((i = 2; i <= PASSES; i++)); do echo "run $1 --label $l-pass$i"; done
+    [ "$l" = "$1" ] || return 0
+    for ef in ${EFS//\// }; do
+        echo "run $1 --candidates $ef --label $l-ef$ef --kinds $EF_KINDS"
+        for ((i = 2; i <= PASSES; i++)); do echo "run $1 --candidates $ef --label $l-ef$ef-pass$i --kinds $EF_KINDS"; done
+    done
 }
 # The engine a step is for: compare.sh's argument after the command.
 step_engine() { # STEP (without IMAGE=)
