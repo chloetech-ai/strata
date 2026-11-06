@@ -102,14 +102,29 @@ pub struct MergerOptions {
     /// their spill files ([`crate::storage::DbOptions::merge_spill_bytes`]);
     /// `None`: as fast as the disk takes them.
     pub write_bytes_per_sec: Option<u64>,
+    /// The nice value (0 to 19) the merger's threads run at, and with them
+    /// the threads a merge's build starts, on Linux; 0 leaves them at the
+    /// priority of the threads serving reads and writes. Merges are
+    /// background work: at the same priority, a merge building a vector
+    /// graph on every core makes a commit or a query that wakes up wait
+    /// for a core (single-row updates on 4 cores had a p99 of 0.7 ms with no
+    /// merge running and 5.4 ms beside one, `examples/writes_beside_merges.rs`). At 10
+    /// a busy core gives a merge thread about a tenth of the time it gives
+    /// a reader or writer, and a merge on idle cores runs as fast as
+    /// before.
+    pub nice: i32,
 }
+
+/// The nice value of the merger's threads unless [`MergerOptions::nice`]
+/// says otherwise.
+pub const MERGE_NICE: i32 = 10;
 
 impl Default for MergerOptions {
     /// Half the cores, between 1 and 4 merges at once (as Lucene's
     /// `ConcurrentMergeScheduler` on an SSD).
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        MergerOptions { policy: MergePolicy::default(), threads: (cores / 2).clamp(1, 4), memory_budget: None, write_bytes_per_sec: None }
+        MergerOptions { policy: MergePolicy::default(), threads: (cores / 2).clamp(1, 4), memory_budget: None, write_bytes_per_sec: None, nice: MERGE_NICE }
     }
 }
 

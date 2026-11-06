@@ -41,7 +41,7 @@ use std::sync::{Mutex, MutexGuard};
 pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, DropOptions, FileStats, Layout, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
 pub use live::LiveDocs;
 pub use manifest::{sources_schema, Numbering, RankProfile, SeqNo, SOURCES, SOURCES_ID};
-pub use merge::{memory_limit, merge_memory, MergePolicy, MergeStats, MergeStatus, MergerOptions, SegmentInfo};
+pub use merge::{memory_limit, merge_memory, MergePolicy, MergeStats, MergeStatus, MergerOptions, SegmentInfo, MERGE_NICE};
 pub use ship::{Applied, LogRead, Shipped};
 pub use pk::{build_pk_index, build_pk_index_of, key_hash, KeyList, KeyRef, PkIndex};
 pub use snapshot::{tail_builds, Found, Mask, SegmentView, Snapshot};

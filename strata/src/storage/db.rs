@@ -2587,8 +2587,16 @@ impl Database {
         }
         let mut threads = lock(&self.merger_threads);
         for i in 0..opts.threads.max(1) {
-            let (db, m) = (Arc::downgrade(self), m.clone());
-            threads.push(std::thread::Builder::new().name(format!("strata-merger-{i}")).spawn(move || merger(db, m)).expect("spawn a merger thread"));
+            let (db, m, nice) = (Arc::downgrade(self), m.clone(), opts.nice);
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("strata-merger-{i}"))
+                    .spawn(move || {
+                        lower_priority(nice);
+                        merger(db, m)
+                    })
+                    .expect("spawn a merger thread"),
+            );
         }
     }
 
@@ -5240,4 +5248,26 @@ fn lock_exclusive(file: &File) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Lowers the calling thread's CPU priority to nice value `nice` (at most
+/// 19) unless it is lower already ([`MergerOptions::nice`]). On Linux a
+/// thread's nice value is its own, and the threads it starts inherit it;
+/// elsewhere this does nothing, since `setpriority` there sets the whole
+/// process's.
+pub(crate) fn lower_priority(nice: i32) {
+    #[cfg(target_os = "linux")]
+    if nice > 0 {
+        // SAFETY: gettid and get/setpriority on the calling thread take no
+        // pointers.
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            let now = libc::getpriority(libc::PRIO_PROCESS, tid);
+            if now < nice.min(19) {
+                libc::setpriority(libc::PRIO_PROCESS, tid, nice.min(19));
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = nice;
 }

@@ -285,6 +285,11 @@ struct Args {
     /// How fast merges may write, in MiB/s (default: no limit).
     #[arg(long)]
     merge_write_mb_per_sec: Option<u64>,
+    /// The nice value merges run at, 0 to 19, on Linux (default 10): a
+    /// merge gets the cores reads and writes leave idle, and a tenth of a
+    /// busy one. 0 runs them at the priority of reads and writes.
+    #[arg(long)]
+    merge_nice: Option<i32>,
     /// Log queries and writes that take this many milliseconds or more,
     /// with their SQL (0: none).
     #[arg(long, default_value_t = 1000)]
@@ -795,6 +800,7 @@ async fn main() {
                 threads: a.merge_threads.unwrap_or(d.threads),
                 memory_budget: a.merge_memory_mb.map(|m| m << 20),
                 write_bytes_per_sec: a.merge_write_mb_per_sec.map(|m| m << 20),
+                nice: a.merge_nice.unwrap_or(d.nice),
                 ..d
             }
         },

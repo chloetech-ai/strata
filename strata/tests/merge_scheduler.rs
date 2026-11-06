@@ -378,7 +378,7 @@ fn the_merger_cuts_merges_to_its_memory_budget() {
     let three = estimate(&db, &ids[..3]);
     let db = Arc::new(db);
     let policy = MergePolicy { merge_factor: 8, ..ALL_TIER_0 };
-    db.spawn_merger(MergerOptions { policy, threads: 1, memory_budget: Some(three + three / 10), write_bytes_per_sec: None });
+    db.spawn_merger(MergerOptions { policy, threads: 1, memory_budget: Some(three + three / 10), write_bytes_per_sec: None, ..MergerOptions::default() });
     // Three of the eight merge: then the tier holds six, short of eight.
     wait_for("a merge", || segment_ids(&db).len() == 6 && db.storage().merge_status().running == 0);
     let status = db.storage().merge_status();
@@ -399,7 +399,7 @@ fn the_merger_keeps_up_with_the_flusher() {
         let db = Arc::new(Db::create(&path, schema(), o).unwrap());
         db.spawn_flusher();
         let policy = MergePolicy { merge_factor: 4, floor_docs: 100, ..MergePolicy::default() };
-        db.spawn_merger(MergerOptions { policy, threads: 2, memory_budget: None, write_bytes_per_sec: Some(64 << 20) });
+        db.spawn_merger(MergerOptions { policy, threads: 2, memory_budget: None, write_bytes_per_sec: Some(64 << 20), ..MergerOptions::default() });
         let mut rng = StdRng::seed_from_u64(7);
         let mut model = Rows::new();
         for _ in 0..300 {
