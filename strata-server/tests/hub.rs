@@ -98,7 +98,8 @@ async fn the_hub_forwards_with_each_connections_key() {
     // The connection's page is the command center.
     let page = client().get(format!("{hub_url}/c/remote")).send().await.unwrap();
     assert_eq!(page.status(), 200);
-    assert!(page.text().await.unwrap().contains("/ui/main.js"));
+    let main_js = strata_server::ui::tag().map_or("/ui/main.js".to_string(), |t| format!("/ui/{t}/main.js"));
+    assert!(page.text().await.unwrap().contains(&main_js));
 
     // A page on another site cannot drive the hub's connections.
     let r = client().post(format!("{hub_url}/c/remote/v1/write")).header("origin", "https://evil.example").json(&json!({"ops": []})).send().await.unwrap();

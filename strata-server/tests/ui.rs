@@ -51,8 +51,27 @@ async fn the_command_center_is_served_with_every_module_it_imports() {
     let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
     tokio::spawn(server::serve_http(svc, l, Default::default()));
 
-    let page = strata_server::http_client().build().unwrap().get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
-    assert!(page.contains("/ui/main.js") && page.contains("/ui/app.css"), "{page}");
+    let r = strata_server::http_client().build().unwrap().get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-cache");
+    let page = r.text().await.unwrap();
+    // The page names its files under this build's tag, which the browser
+    // keeps for good (a reload asks for the page alone).
+    let at = match ui::tag() {
+        Some(t) => format!("/ui/{t}/"),
+        None => "/ui/".to_string(),
+    };
+    assert!(page.contains(&format!("{at}main.js")) && page.contains(&format!("{at}app.css")), "{page}");
+    let keep = |r: &reqwest::Response| r.headers()["cache-control"].to_str().unwrap().to_string();
+    if ui::tag().is_some() {
+        let r = strata_server::http_client().build().unwrap().get(format!("{base}{at}views/sql.js")).send().await.unwrap();
+        assert_eq!((r.status().as_u16(), keep(&r).as_str()), (200, "public, max-age=31536000, immutable"));
+        // Untagged, or another build's tag (a page from before an upgrade):
+        // this build's file, asked for again each time.
+        for other in ["/ui/views/sql.js", "/ui/v-0123456789abcdef/views/sql.js"] {
+            let r = strata_server::http_client().build().unwrap().get(format!("{base}{other}")).send().await.unwrap();
+            assert_eq!((r.status().as_u16(), keep(&r).as_str()), (200, "no-cache"), "{other}");
+        }
+    }
 
     // Every module reachable from main.js, and the stylesheet.
     let mut todo = vec!["main.js".to_string()];
@@ -61,13 +80,13 @@ async fn the_command_center_is_served_with_every_module_it_imports() {
         if !seen.insert(p.clone()) {
             continue;
         }
-        let r = strata_server::http_client().build().unwrap().get(format!("{base}/ui/{p}")).send().await.unwrap();
-        assert_eq!(r.status(), 200, "/ui/{p}");
-        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/javascript"), "/ui/{p}");
+        let r = strata_server::http_client().build().unwrap().get(format!("{base}{at}{p}")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{at}{p}");
+        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/javascript"), "{at}{p}");
         let js = r.text().await.unwrap();
         todo.extend(imports(&p, &js));
     }
-    let css = strata_server::http_client().build().unwrap().get(format!("{base}/ui/app.css")).send().await.unwrap();
+    let css = strata_server::http_client().build().unwrap().get(format!("{base}{at}app.css")).send().await.unwrap();
     assert!(css.headers()["content-type"].to_str().unwrap().starts_with("text/css"));
     // Each served file is used, and each view is among them.
     let served: BTreeSet<String> = ui::FILES.iter().map(|(p, ..)| p.to_string()).filter(|p| p.ends_with(".js")).collect();

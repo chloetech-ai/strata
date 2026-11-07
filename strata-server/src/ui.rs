@@ -3,9 +3,17 @@
 //! binary (no CDN: it works offline and behind a firewall). The console it
 //! grew from is at `/classic`.
 //!
+//! The page names its files under `/ui/v-<hash of them all>/`, which the
+//! browser keeps for good: a reload asks for the page alone, and a new
+//! build's page names new paths. Under `/ui/` itself, or another build's
+//! tag, they are asked for again each time.
+//!
 //! With `STRATA_UI_DIR` set to a checkout's `strata-server/ui`, the server
 //! reads the files from there on every request instead, so that an edit
-//! shows on a reload without a rebuild.
+//! shows on a reload without a rebuild; the page then names them under
+//! `/ui/` alone.
+
+use std::sync::OnceLock;
 
 use axum::extract::Path;
 use axum::http::{header, StatusCode};
@@ -75,21 +83,55 @@ fn from_disk(rel: &str) -> Option<String> {
     std::fs::read_to_string(std::path::Path::new(&dir).join(rel)).ok()
 }
 
+/// How long a browser keeps the files under this build's tag: for good.
+const KEEP: &str = "public, max-age=31536000, immutable";
+
+/// This build's tag for its files under `/ui/`: `v-` and the hash of them
+/// all; none when they come from `STRATA_UI_DIR`, where they change.
+pub fn tag() -> Option<&'static str> {
+    static TAG: OnceLock<String> = OnceLock::new();
+    if std::env::var_os("STRATA_UI_DIR").is_some() {
+        return None;
+    }
+    Some(TAG.get_or_init(|| {
+        let mut all = Vec::new();
+        for (p, _, body) in FILES {
+            all.extend_from_slice(p.as_bytes());
+            all.push(0);
+            all.extend_from_slice(body.as_bytes());
+            all.push(0);
+        }
+        format!("v-{:016x}", twox_hash::XxHash3_64::oneshot(&all))
+    }))
+}
+
 /// The page; the browser asks again each time (`no-cache`), so a new
-/// binary's files are seen at once.
+/// binary's files, under their new tag, are seen at once.
 pub async fn index() -> Response {
-    ([(header::CACHE_CONTROL, "no-cache")], Html(from_disk("index.html").unwrap_or_else(|| INDEX.into()))).into_response()
+    let page = from_disk("index.html").unwrap_or_else(|| INDEX.into());
+    let page = match tag() {
+        Some(t) => page.replace("\"/ui/", &format!("\"/ui/{t}/")),
+        None => page,
+    };
+    ([(header::CACHE_CONTROL, "no-cache")], Html(page)).into_response()
 }
 
 pub async fn classic() -> Response {
     ([(header::CACHE_CONTROL, "no-cache")], Html(from_disk("classic.html").unwrap_or_else(|| CLASSIC.into()))).into_response()
 }
 
+/// A file under `/ui/`, or under a build's tag there: kept for good under
+/// this build's, asked for again each time otherwise (a page of another
+/// build, during an upgrade, gets this build's file).
 pub async fn file(Path(path): Path<String>) -> Response {
+    let (path, cache) = match path.split_once('/') {
+        Some((t, rest)) if t.starts_with("v-") => (rest, if tag() == Some(t) { KEEP } else { "no-cache" }),
+        _ => (path.as_str(), "no-cache"),
+    };
     match FILES.iter().find(|(p, ..)| *p == path) {
         Some((p, ty, body)) => {
             let body = from_disk(&format!("app/{p}")).unwrap_or_else(|| (*body).into());
-            ([(header::CONTENT_TYPE, *ty), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+            ([(header::CONTENT_TYPE, *ty), (header::CACHE_CONTROL, cache)], body).into_response()
         }
         None => (StatusCode::NOT_FOUND, "no such file in the command center").into_response(),
     }

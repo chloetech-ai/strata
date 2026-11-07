@@ -1421,7 +1421,7 @@ The navigation has four groups for running a fleet, **Operate**, **Diagnose**, *
 
 One time range applies to every view and is kept in the link: 15 minutes to 7 days, or a fixed window (past the last hour the series come from the log store's minutes). Views without a time axis (the SQL workbench, Schema, Labs) hide it. **Share** copies a link that opens the same view and window, paused; it never holds a key. When the API does not answer, the top bar says so and since when, and every panel says how old its data is. `Ctrl K` (`⌘K`) finds a shard, a copy (`s9-2`), a node, a table, a statement, an alert, a key or a view, and what to do about it; `g` then a letter goes to a view, and `?` lists the shortcuts. On a phone the navigation is behind the menu button and panels open full screen. The page follows the system's light or dark theme unless you choose one.
 
-The page and its modules (`strata-server/ui/`) are compiled into the binary. To work on them without rebuilding, start the server with `STRATA_UI_DIR=strata-server/ui`: it then reads them from there on each request.
+The page and its modules (`strata-server/ui/`) are compiled into the binary. The page names them under `/ui/v-<hash of them all>/`, which the browser keeps for good, so a reload asks the server for the page alone; a new build's page names new paths. To work on them without rebuilding, start the server with `STRATA_UI_DIR=strata-server/ui`: it then reads them from there on each request, and the page names them under `/ui/` alone.
 
 ### The index inspector
 
