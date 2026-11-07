@@ -12,7 +12,7 @@ use strata::segment::build::BuildOptions;
 use strata::storage::{DbOptions, Layout, MergePolicy, MergerOptions};
 use tokio::net::TcpListener;
 
-use crate::auth::{self, Access};
+use crate::auth::{self, Access, Secret};
 use crate::coord::{CoordOptions, Coordinator};
 use crate::cores::shard::{self, Restart};
 use crate::replication::{self, Acks, Follow, Primary, PrimaryOptions};
@@ -527,6 +527,11 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
 /// service's queries; a coordinator keeps one only where told. Without one
 /// the lines kept for it are let go ([`obs::Sink::stop`]).
 fn open_log_store(svc: &mut Service, o: &Options) -> Result<(), String> {
+    // A coordinator in a shard server's process: the shard keeps the
+    // process's lines.
+    if o.coord.local.is_some() {
+        return Ok(());
+    }
     let path = match &o.log_store {
         Some(p) => p.clone(),
         None => o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::logstore::file_of),
@@ -1143,45 +1148,64 @@ pub async fn serve_grpc(svc: Arc<Service>, listener: TcpListener, access: Access
         }
         s
     });
-    let (token, cluster) = (access.token.clone(), access.cluster.clone());
-    let counted = svc.clone();
-    // Who the call is from, for each method to check its scope.
-    let check = move |mut req: tonic::Request<()>| match counted.keys.resolve(token.as_ref(), cluster.as_ref(), req.metadata().get("authorization").and_then(|v| v.to_str().ok())) {
-        Some(who) => {
-            req.extensions_mut().insert(who);
-            Ok(req)
-        }
-        None => {
-            counted.metrics.grpc("any", "Unauthenticated", 0.0);
-            // The method is not known yet: the path is the service's.
-            counted.audit.add(crate::keys::Entry {
-                ts_ms: crate::telemetry::now_ms(),
-                who: "unknown".into(),
-                key: None,
-                scope: None,
-                method: "gRPC".into(),
-                route: "any".into(),
-                status: 401,
-                ms: 0.0,
-                request_id: None,
-                detail: None,
-                kind: crate::keys::REFUSAL.into(),
-                ..Default::default()
-            });
-            Err(tonic::Status::unauthenticated("missing or wrong token"))
-        }
-    };
-    // A Write message carries rows, as an HTTP write's body does.
-    let max_body = svc.max_body;
-    let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(max_body).max_encoding_message_size(256 << 20);
+    let service = grpc_service(svc, &access);
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = &access.tls {
         builder = builder.tls_config(tonic::transport::ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(&tls.cert, &tls.key)))?;
     }
-    builder
-        .add_service(tonic::service::interceptor::InterceptedService::new(service, check))
-        .serve_with_incoming_shutdown(incoming, shutdown())
-        .await
+    builder.add_service(service).serve_with_incoming_shutdown(incoming, shutdown()).await
+}
+
+/// A shard server's gRPC service, its calls checked for their token or key
+/// ([`Check`]): what [`serve_grpc`] serves, and what a coordinator in the
+/// same process calls in-process ([`crate::coord::LocalShard`]).
+pub type GrpcService = tonic::service::interceptor::InterceptedService<pb::strata_server::StrataServer<grpc::Grpc>, Check>;
+
+pub fn grpc_service(svc: Arc<Service>, access: &Access) -> GrpcService {
+    // A Write message carries rows, as an HTTP write's body does.
+    let max_body = svc.max_body;
+    let check = Check { svc: svc.clone(), token: access.token.clone(), cluster: access.cluster.clone() };
+    let service = pb::strata_server::StrataServer::new(grpc::Grpc(svc)).max_decoding_message_size(max_body).max_encoding_message_size(256 << 20);
+    tonic::service::interceptor::InterceptedService::new(service, check)
+}
+
+/// Who a gRPC call is from, for each method to check its scope: the
+/// caller its token or key names, or a refusal.
+#[derive(Clone)]
+pub struct Check {
+    svc: Arc<Service>,
+    token: Option<Secret>,
+    cluster: Option<Secret>,
+}
+
+impl tonic::service::Interceptor for Check {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        match self.svc.keys.resolve(self.token.as_ref(), self.cluster.as_ref(), req.metadata().get("authorization").and_then(|v| v.to_str().ok())) {
+            Some(who) => {
+                req.extensions_mut().insert(who);
+                Ok(req)
+            }
+            None => {
+                self.svc.metrics.grpc("any", "Unauthenticated", 0.0);
+                // The method is not known yet: the path is the service's.
+                self.svc.audit.add(crate::keys::Entry {
+                    ts_ms: crate::telemetry::now_ms(),
+                    who: "unknown".into(),
+                    key: None,
+                    scope: None,
+                    method: "gRPC".into(),
+                    route: "any".into(),
+                    status: 401,
+                    ms: 0.0,
+                    request_id: None,
+                    detail: None,
+                    kind: crate::keys::REFUSAL.into(),
+                    ..Default::default()
+                });
+                Err(tonic::Status::unauthenticated("missing or wrong token"))
+            }
+        }
+    }
 }
 
 /// Whether the server was told to stop and serves out its drain time

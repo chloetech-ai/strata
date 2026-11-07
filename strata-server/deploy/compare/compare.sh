@@ -57,8 +57,12 @@ CLIENT_NODE=${CLIENT_NODE:-strata-worker3}
 # the client sends its requests to both coordinators. Loading gets the
 # whole budget too: Elasticsearch and Solr on their two data nodes, Strata
 # one shard's build job at a time.
-# STRATA_COORD=pod runs Strata as the runs before 6 November 2026 did
-# instead: two shards of SHARD_CPU and SHARD_MEM (1 CPU and 2.5 GiB) and a
+# By default each pod runs one server, the shard with its coordinator in
+# its process, which calls that shard in-process (--coordinator-listen).
+# STRATA_COORD=shards runs them as two processes in the pod, as from 6
+# November 2026 until then (and as images without --coordinator-listen
+# must run). STRATA_COORD=pod runs Strata as the runs before 6 November
+# 2026 did: two shards of SHARD_CPU and SHARD_MEM (1 CPU and 2.5 GiB) and a
 # coordinator of COORD_CPU and COORD_MEM (1 CPU and 1 GiB) in a pod of its
 # own on the clients' node (strata.yaml, strata-coordinator.yaml).
 # BUILD_PARALLEL=1 builds both shards at once, each with its node's share
@@ -67,8 +71,8 @@ DATA_CPU=${DATA_CPU:-1500m} DATA_MEM=${DATA_MEM:-3Gi}
 BUILD_CPU=${BUILD_CPU:-3} BUILD_MEM=${BUILD_MEM:-6Gi} BUILD_THREADS=${BUILD_THREADS:-3} BUILD_PARALLEL=${BUILD_PARALLEL:-0}
 SHARD_CPU=${SHARD_CPU:-1} SHARD_MEM=${SHARD_MEM:-2560Mi}
 COORD_CPU=${COORD_CPU:-1} COORD_MEM=${COORD_MEM:-1Gi}
-STRATA_COORD=${STRATA_COORD:-shards}
-case $STRATA_COORD in pod | shards) ;; *) echo "STRATA_COORD is shards (a coordinator in each shard's pod, the default) or pod (one in its own pod)" >&2 && exit 2 ;; esac
+STRATA_COORD=${STRATA_COORD:-process}
+case $STRATA_COORD in process | pod | shards) ;; *) echo "STRATA_COORD is process (a coordinator in each shard's process, the default), shards (in each shard's pod, a process of its own) or pod (one in its own pod)" >&2 && exit 2 ;; esac
 # Vespa: vespa-0 (config server, cluster controller and the container that
 # answers queries and takes documents) on the clients' node, as Strata's
 # coordinator, and a content node on each data node; 1 CPU each, 6 GiB in all.
@@ -91,7 +95,7 @@ COLLECTION=${COLLECTION:-quora}
 # render FILE I NODE CPU MEM [ZK|ROLE]: a manifest for node I.
 render() {
     sed -e "s/__I__/$2/g" -e "s/__NODE__/$3/g" -e "s/__CPU__/$4/g" -e "s/__MEM__/$5/g" -e "s|__ZK__|${6:-}|g" -e "s|__ROLE__|${6:-}|g" -e "s|__COLL__|$COLLECTION|g" \
-        -e "s|__NS__|$NS|g" -e "s|__IMAGE__|$IMAGE|g" -e "s|__HEAP__|${HEAP:-}|g" -e "s|__THREADS__|$ONE_THREADS|g" -e "s|__TS_THREADS__|$TS_THREADS|g" \
+        -e "s|__NS__|$NS|g" -e "s|__IMAGE__|$IMAGE|g" -e "s|__IN_PROCESS__|$([ "$STRATA_COORD" = process ] && echo 1)|g" -e "s|__HEAP__|${HEAP:-}|g" -e "s|__THREADS__|$ONE_THREADS|g" -e "s|__TS_THREADS__|$TS_THREADS|g" \
         -e "s|__MEILI_MEM__|$MEILI_MEM|g" -e "s|__REDIS_MAXMEM__|$REDIS_MAXMEM|g" -e "s|__GOMEMLIMIT__|$GOMEMLIMIT_ONE|g" -e "s|__PG_SHARED__|$PG_SHARED|g" \
         -e "s|__PG_CACHE__|$PG_CACHE|g" -e "s|__PG_MAINT__|$PG_MAINT|g" -e "s|__PG_PAR__|$PG_PAR|g" -e "s|__PG_WORKERS__|$PG_WORKERS|g" "$HERE/$1"
 }
@@ -194,7 +198,7 @@ EOF
 urls() {
     case $1 in
     strata)
-        if [ "$STRATA_COORD" = shards ]; then
+        if [ "$STRATA_COORD" != pod ]; then
             echo http://strata-0.strata:7710,http://strata-1.strata:7710
         else
             echo http://strata-coordinator:7700
@@ -303,7 +307,7 @@ up)
     case $1 in
     strata)
         token_secret
-        if [ "$STRATA_COORD" = shards ]; then
+        if [ "$STRATA_COORD" != pod ]; then
             render strata-coordinating.yaml 0 "${NODES[0]}" "$DATA_CPU" "$DATA_MEM" | $K apply -f -
             render strata-coordinating.yaml 1 "${NODES[1]}" "$DATA_CPU" "$DATA_MEM" | awk 'f {print} /^---$/ {f = 1}' | $K apply -f -
             $K wait --for=condition=Ready pod/strata-0 pod/strata-1 --timeout=300s

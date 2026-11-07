@@ -156,6 +156,17 @@ struct Args {
     /// the pod's service account (the operator sets it).
     #[arg(long, env = "STRATA_KUBE_CLUSTER")]
     kube_cluster: Option<String>,
+    /// With --db, --grpc and --shards: this shard server also coordinates
+    /// --shards, serving the coordinator's HTTP API at this address, in
+    /// the same process. The coordinator calls this server's own shard
+    /// (--local-shard) in-process, without a connection or HTTP/2, and the
+    /// others over the network.
+    #[arg(long)]
+    coordinator_listen: Option<String>,
+    /// With --coordinator-listen: the URL of --shards that is this server's
+    /// own gRPC address (http://strata-0.strata:7701).
+    #[arg(long)]
+    local_shard: Option<String>,
     /// HTTP address (API, metrics, UI).
     #[arg(long, default_value = "127.0.0.1:7700")]
     listen: String,
@@ -858,6 +869,38 @@ async fn main() {
             }
         },
     };
+    // --coordinator-listen: a shard server with a coordinator beside it, in
+    // this process. The coordinator keeps none of the files a server may
+    // be given (the shard does), nor a part in replication.
+    let beside = a.coordinator_listen.clone().map(|addr| {
+        let local = match (&o.db, a.grpc.as_str(), o.shards.is_empty(), &a.local_shard) {
+            (Some(_), g, false, Some(url)) if g != "off" && o.shards.iter().any(|s| s.split('|').any(|u| u == url)) => url.clone(),
+            _ => fail("--coordinator-listen serves a coordinator beside this shard server: it needs --db, --grpc, --shards and --local-shard, the URL of --shards that is this server"),
+        };
+        let co = Options {
+            db: None,
+            replicas: Vec::new(),
+            replica: false,
+            promote: false,
+            seq_no: false,
+            keys: None,
+            audit_log: None,
+            aws_file: None,
+            digitalocean_file: None,
+            cloud_file: None,
+            hub_file: None,
+            alerts: None,
+            contain: None,
+            backup_dir: None,
+            log_store: None,
+            ..o.clone()
+        };
+        (addr, local, co)
+    });
+    let o = match beside {
+        Some(_) => Options { shards: Vec::new(), ..o },
+        None => o,
+    };
     let coordinator = !o.shards.is_empty();
     server::set_drain(std::time::Duration::from_millis(a.drain_ms));
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
@@ -902,6 +945,24 @@ async fn main() {
         tasks.push(tokio::spawn(async move {
             if let Err(e) = server::serve_grpc(svc, l, access).await {
                 tracing::error!(error = %e, "gRPC stopped");
+            }
+        }));
+    }
+    if let Some((addr, url, mut co)) = beside {
+        co.coord.local = Some(strata_server::coord::LocalShard { url, service: server::grpc_service(svc.clone(), &access) });
+        let (l, cip) = bind(&addr).await;
+        let access = Access { hosts: auth::allowed_hosts(cip, &a.allow_host), ..access.clone() };
+        let (peer, no_read_stats) = (a.peer_url.clone(), a.no_read_stats);
+        // Its shards, this one among them, may answer only later: the
+        // shard serves meanwhile.
+        tasks.push(tokio::spawn(async move {
+            let c = server::service(&co).await.unwrap_or_else(|e| fail(&format!("the coordinator: {e}")));
+            c.reads.set_on(!no_read_stats);
+            let at = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
+            strata_server::peers::start(&c, strata_server::peers::own_url(peer.as_deref(), at, access.tls.is_some()));
+            tracing::info!("coordinator HTTP on {addr}, its own shard in-process");
+            if let Err(e) = server::serve_http(c, l, access).await {
+                fail(&format!("coordinator HTTP server: {e}"));
             }
         }));
     }

@@ -63,6 +63,12 @@
 //! version, and speaks the oldest any replica speaks. From protocol 2 a
 //! read reaches the shards as a typed plan ([`crate::plan_pb`]); a server
 //! from before `Hello` takes SQL, or a JSON plan, as it did.
+//!
+//! A coordinator may run in the process of one of its shards
+//! (`--coordinator-listen`, [`CoordOptions::local`]): it calls that shard's
+//! gRPC service in-process ([`Transport::Local`]), the same messages
+//! through the same checks, without the connection, HTTP/2 and the second
+//! process. The other shards it reaches over the network as ever.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -133,6 +139,9 @@ pub struct CoordOptions {
     /// Terms whose BM25 statistics are kept per shard copy
     /// ([`StatsCache`]); 0 keeps none.
     pub stats_cache_terms: usize,
+    /// The shard served by this process, if any: the coordinator calls the
+    /// server of that URL in-process.
+    pub local: Option<LocalShard>,
 }
 
 impl Default for CoordOptions {
@@ -147,6 +156,81 @@ impl Default for CoordOptions {
             fetch: true,
             slots: None,
             stats_cache_terms: STATS_CACHE_TERMS,
+            local: None,
+        }
+    }
+}
+
+impl CoordOptions {
+    /// A client of the server at gRPC URL `url`: the process's own shard
+    /// in-process, any other over the network ([`client`]).
+    fn client(&self, url: &str) -> Result<Client, ApiError> {
+        match &self.local {
+            Some(l) if l.url == url => Ok(StrataClient::with_interceptor(Transport::Local(l.service.clone()), credentials(self.token.as_ref())?).max_decoding_message_size(256 << 20)),
+            _ => client(url, self.token.as_ref(), self.ca.as_deref()),
+        }
+    }
+}
+
+/// The gRPC service of the shard this process serves
+/// ([`crate::server::grpc_service`]), as other servers reach it over the
+/// network, and the URL they reach it at (the one `--shards` names).
+#[derive(Clone)]
+pub struct LocalShard {
+    pub url: String,
+    pub service: crate::server::GrpcService,
+}
+
+impl std::fmt::Debug for LocalShard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalShard").field("url", &self.url).finish_non_exhaustive()
+    }
+}
+
+/// How a client reaches its server: over the network, or, for the shard
+/// this process serves, by calling its service in-process.
+#[derive(Clone)]
+pub enum Transport {
+    Net(Channel),
+    Local(crate::server::GrpcService),
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>> for Transport {
+    type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
+    type Error = BoxError;
+    type Future = std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), BoxError>> {
+        match self {
+            Transport::Net(c) => tower::Service::poll_ready(c, cx).map_err(Into::into),
+            Transport::Local(_) => std::task::Poll::Ready(Ok(())),
+        }
+    }
+
+    fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::BoxBody>) -> Self::Future {
+        match self {
+            Transport::Net(c) => {
+                let f = tower::Service::call(c, req);
+                Box::pin(async move { f.await.map_err(Into::into) })
+            }
+            Transport::Local(s) => {
+                let mut s = s.clone();
+                // A task of its own, as a call from another server would
+                // be: the shard's part sees none of the coordinator's
+                // request's task-locals, and runs on while the
+                // coordinator stops waiting for it (a hedge won, a
+                // deadline passed), as a remote shard's would.
+                let call = tokio::spawn(async move { tower::Service::call(&mut s, req).await });
+                Box::pin(async move {
+                    match call.await {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(e)) => match e {},
+                        Err(e) => Err(e.into()),
+                    }
+                })
+            }
         }
     }
 }
@@ -177,16 +261,20 @@ impl tonic::service::Interceptor for Credentials {
     }
 }
 
-pub(crate) type Client = StrataClient<InterceptedService<Channel, Credentials>>;
+pub(crate) type Client = StrataClient<InterceptedService<Transport, Credentials>>;
+
+fn credentials(token: Option<&Secret>) -> Result<Credentials, ApiError> {
+    match token {
+        Some(t) => Ok(Credentials(Some(format!("Bearer {}", t.0).parse().map_err(|_| ApiError::bad("the shards' token must be printable ASCII"))?))),
+        None => Ok(Credentials(None)),
+    }
+}
 
 /// A client of the server at gRPC URL `url`, sending `token` with every
 /// call; an `https://` server's certificate is checked against the public
 /// roots and `ca`. It connects on its first call.
 pub(crate) fn client(url: &str, token: Option<&Secret>, ca: Option<&[u8]>) -> Result<Client, ApiError> {
-    let credentials = match token {
-        Some(t) => Some(format!("Bearer {}", t.0).parse().map_err(|_| ApiError::bad("the shards' token must be printable ASCII"))?),
-        None => None,
-    };
+    let credentials = credentials(token)?;
     let mut ep = Channel::from_shared(url.to_string()).map_err(|e| ApiError::bad(format!("bad shard URL {url}: {e}")))?;
     if url.starts_with("https://") {
         let mut tls = tonic::transport::ClientTlsConfig::new().with_webpki_roots();
@@ -196,7 +284,7 @@ pub(crate) fn client(url: &str, token: Option<&Secret>, ca: Option<&[u8]>) -> Re
         ep = ep.tls_config(tls).map_err(|e| ApiError::bad(format!("TLS to {url}: {e}")))?;
     }
     let ch = ep.connect_timeout(Duration::from_secs(5)).tcp_nodelay(true).connect_lazy();
-    Ok(StrataClient::with_interceptor(ch, Credentials(credentials)).max_decoding_message_size(256 << 20))
+    Ok(StrataClient::with_interceptor(Transport::Net(ch), credentials).max_decoding_message_size(256 << 20))
 }
 
 /// Each source every shard has, at the least offset over the shards
@@ -593,7 +681,7 @@ impl Topology {
                 let kept = before.and_then(|b| b.replicas.iter().flatten().find(|r| r.url == *url));
                 rs.push(match kept {
                     Some(r) => r.clone(),
-                    None => Arc::new(Replica::new(url, client(url, opts.token.as_ref(), opts.ca.as_deref())?)),
+                    None => Arc::new(Replica::new(url, opts.client(url)?)),
                 });
             }
             if rs.is_empty() {
@@ -3312,7 +3400,7 @@ impl Coordinator {
         if let Some(i) = t.replicas.iter().position(|rs| rs.iter().any(|r| r.url == url)) {
             return Err(ApiError::bad(format!("{url} serves shard {i} already")));
         }
-        let mut c = client(url, self.opts.token.as_ref(), self.opts.ca.as_deref())?;
+        let mut c = self.opts.client(url)?;
         let named = |s: tonic::Status| ApiError { status: ApiError::from(s.clone()).status, message: format!("{url}: {}", s.message()) };
         let ask = async {
             let said = hello(&mut c).await.map_err(named)?;

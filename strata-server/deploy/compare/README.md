@@ -16,7 +16,7 @@ Elasticsearch and Solr, 28 October 2026) are in
 | `compare.sh` | builds and loads the image, starts and stops each engine, loads it, runs the client |
 | `es.yaml`, `os.yaml`, `solr.yaml` | two data nodes of Elasticsearch 9.5.5, OpenSearch 3.9.0 or Solr 10.1.0 (SolrCloud, ZooKeeper embedded in `solr-0`) |
 | `vespa.yaml`, `vespa/` | Vespa 8.778.45: `vespa-0` (config server, cluster controller and the container that answers queries) and two content nodes; `vespa/package.sh` writes the application package (`services-cluster.xml`, `schemas/doc.sd`, the stopword lists); `vespa/services.xml` is the same application on one node, for trying it in Docker |
-| `strata-coordinating.yaml` | two Strata shards, each with a coordinator in its pod |
+| `strata-coordinating.yaml` | two Strata shards, each with a coordinator in its process that calls the shard in-process (`--coordinator-listen`), or as a process of its own in the pod (`STRATA_COORD=shards`, as from 6 November 2026 until then) |
 | `strata.yaml`, `strata-coordinator.yaml` | two Strata shards and a coordinator in a pod of its own (`STRATA_COORD=pod`, as before 6 November 2026) |
 | `redpanda.yaml` | one Redpanda broker for the stream test |
 | `more/*.yaml` | the nine one-node engines (`postgres.yaml` is ParadeDB's and Postgres's, as `paradedb-0` or `postgres-0`) |

@@ -5,7 +5,9 @@
 # (DATA_CPU, DATA_MEM), so Strata then has nothing on the clients' node;
 # the client sends its requests round-robin to both coordinators (port
 # 7710). compare.sh writes strata-0 and strata-1 from this file (unless
-# STRATA_COORD=pod).
+# STRATA_COORD=pod). The coordinator runs in the shard's process and calls
+# it in-process (--coordinator-listen), or with STRATA_COORD=shards as a
+# process of its own that calls it over gRPC.
 apiVersion: v1
 kind: Service
 metadata:
@@ -34,18 +36,25 @@ spec:
     - name: strata
       image: __IMAGE__
       imagePullPolicy: IfNotPresent
-      # Two servers in one container, so that they share one CPU and memory
-      # limit. The coordinator waits for both shards (it asks again every 2
-      # s), so the two pods may start in either order; exec leaves the shard
-      # as the container's own process, which the pod's deletion stops. The
-      # deadlines are strata.yaml's and strata-coordinator.yaml's.
+      # One server, or two in one container (STRATA_COORD=shards), so that
+      # they share one CPU and memory limit. The coordinator waits for both
+      # shards (it asks again every 2 s), so the two pods may start in
+      # either order; exec leaves the shard as the container's own process,
+      # which the pod's deletion stops. The deadlines are strata.yaml's and
+      # strata-coordinator.yaml's.
       command: [sh, -c]
       args:
         - |
-          strata-server --listen=0.0.0.0:7710 --grpc=off --shards=http://strata-0.strata:7701,http://strata-1.strata:7701 --timeout-ms=30000 &
+          shards=http://strata-0.strata:7701,http://strata-1.strata:7701
+          if [ "$IN_PROCESS" = 1 ]; then
+            exec strata-server --db /local/__COLL__.shard__I__of2.strata --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701 --timeout-ms 30000 \
+              --shards $shards --coordinator-listen 0.0.0.0:7710 --local-shard http://strata-__I__.strata:7701
+          fi
+          strata-server --listen=0.0.0.0:7710 --grpc=off --shards=$shards --timeout-ms=30000 &
           exec strata-server --db /local/__COLL__.shard__I__of2.strata --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701 --timeout-ms 30000
       env:
         - {name: STRATA_TOKEN, valueFrom: {secretKeyRef: {name: strata-token, key: token}}}
+        - {name: IN_PROCESS, value: "__IN_PROCESS__"}
       ports:
         - {name: http, containerPort: 7700}
         - {name: grpc, containerPort: 7701}
