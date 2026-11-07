@@ -1,0 +1,2916 @@
+{
+ "machine": {
+  "os": "Linux-6.12.113+deb13-amd64-x86_64-with-glibc2.36",
+  "python": "3.12.16",
+  "cpus": 8,
+  "host": "bench",
+  "cpu": "Intel(R) Xeon(R) Platinum 8358 CPU @ 2.60GHz",
+  "memory_bytes": 33661616128,
+  "node_size": "g-8vcpu-32gb-intel",
+  "node_region": "nyc3"
+ },
+ "written": "2026-11-06T10:25:33Z",
+ "system": "strata",
+ "version": "",
+ "dataset": {
+  "products": 137260,
+  "reviews": 4624176
+ },
+ "limit_reviews": null,
+ "load": {
+  "products": {
+   "rows": 137260,
+   "seconds": 6.644984370000202,
+   "rows_per_s": 20656.181016720107
+  },
+  "reviews": {
+   "rows": 4624176,
+   "seconds": 135.18224056800045,
+   "rows_per_s": 34206.978524474966
+  },
+  "finish_seconds": 99.03760750200036,
+  "bytes": 3352752144,
+  "rss_bytes": 1197551616
+ },
+ "open": {
+  "ms": 29.210538000370434,
+  "found": 1
+ },
+ "get": {
+  "product": {
+   "n": 77175,
+   "p50_ms": 0.06205499994393904,
+   "p90_ms": 0.06468900028266944,
+   "p99_ms": 0.10065690019473542,
+   "mean_ms": 0.06339619850941235,
+   "qps": 15434.896314539264,
+   "threads": 1,
+   "errors": 0
+  },
+  "user_reviews": {
+   "n": 58060,
+   "p50_ms": 0.07920899952296168,
+   "p90_ms": 0.08699330001036287,
+   "p99_ms": 0.12749141023959965,
+   "mean_ms": 0.08448596615327092,
+   "qps": 11611.871275440853,
+   "threads": 1,
+   "errors": 0
+  },
+  "product_4threads": {
+   "n": 234887,
+   "p50_ms": 0.0729670000509941,
+   "p90_ms": 0.11959499988734024,
+   "p99_ms": 0.15599912007019168,
+   "mean_ms": 0.08340653631678407,
+   "qps": 46974.29370270074,
+   "threads": 4,
+   "errors": 0
+  },
+  "products_100": {
+   "n": 2742,
+   "p50_ms": 1.8110744995283312,
+   "p90_ms": 1.8632014004651865,
+   "p99_ms": 2.0680508297846254,
+   "mean_ms": 1.8208521225412808,
+   "qps": 548.2191125819649,
+   "threads": 1,
+   "errors": 0
+  },
+  "product_by_key": {
+   "n": 241717,
+   "p50_ms": 0.019242999769630842,
+   "p90_ms": 0.021943000319879502,
+   "p99_ms": 0.030612839655077547,
+   "mean_ms": 0.01984167680771289,
+   "qps": 48343.243474252806,
+   "threads": 1,
+   "errors": 0
+  },
+  "product_by_key_4threads": {
+   "n": 326381,
+   "p50_ms": 0.0611850000495906,
+   "p90_ms": 0.07978099984029541,
+   "p99_ms": 0.13792720037599793,
+   "mean_ms": 0.059986991865211184,
+   "qps": 65272.0820496206,
+   "threads": 4,
+   "errors": 0
+  },
+  "products_100_by_key": {
+   "n": 3067,
+   "p50_ms": 1.6188010004043463,
+   "p90_ms": 1.6832035998959327,
+   "p99_ms": 1.8900399799713354,
+   "mean_ms": 1.6279835445063473,
+   "qps": 613.3321831245675,
+   "threads": 1,
+   "errors": 0
+  },
+  "by_key_matches_sql": true
+ },
+ "answers": {
+  "get": [
+   [
+    "B07ZPX8S3M",
+    "Bosmarlin Mouse Keyboard Converter for Playstation 3/4/4 Pro/Slim, Xbox One/S/X, Switch",
+    "Bosmarlin",
+    null,
+    3.3,
+    16
+   ]
+  ],
+  "get_100": [
+   [
+    "B00002SVCW",
+    "Namco Museum Volume 5",
+    "Namco",
+    289.99,
+    4.4,
+    153
+   ],
+   [
+    "B00004SVSD",
+    "Mickey's Safari In Letterland - Nintendo NES",
+    "Hi Tech Expressions",
+    41.97,
+    4.2,
+    44
+   ],
+   [
+    "B00004SVT9",
+    "Powerblade - Nintendo NES",
+    "Taito Video Games",
+    null,
+    4.4,
+    53
+   ],
+   [
+    "B00004SVXL",
+    "Code Name Viper - Nintendo NES",
+    "Capcom",
+    24.74,
+    4.2,
+    62
+   ],
+   [
+    "B00004WHXM",
+    "Jack Nicklaus 6 Golden Bear Challenge (Jewel Case) - PC",
+    "ACTIVISION",
+    null,
+    3.9,
+    95
+   ],
+   [
+    "B000059MSH",
+    "ISS Pro Evolution Soccer 2",
+    "Konami",
+    null,
+    4.6,
+    6
+   ],
+   [
+    "B000069SQG",
+    "Ore no Ryouri [Japan Import]",
+    "Sony",
+    27.0,
+    4.3,
+    130
+   ],
+   [
+    "B00007FS64",
+    "Thrustmaster Freestyler Bike (PC)",
+    "THRUSTMASTER",
+    null,
+    5.0,
+    126
+   ],
+   [
+    "B00009KGKJ",
+    "Alien Crossfire",
+    "Aspyr",
+    null,
+    5.0,
+    0
+   ],
+   [
+    "B00014BWW0",
+    "Super Collapse II",
+    "Majesco",
+    null,
+    4.7,
+    110
+   ],
+   [
+    "B0006A9HCQ",
+    "Mission Force: Cyberstorm (PC)",
+    "Sierra International",
+    null,
+    4.1,
+    119
+   ],
+   [
+    "B0007U71LE",
+    "Red Baron II",
+    "Sierra Online, Inc.",
+    null,
+    4.5,
+    106
+   ],
+   [
+    "B000ARNX5M",
+    "PSP Stealth Case",
+    "Mad Catz",
+    null,
+    4.0,
+    111
+   ],
+   [
+    "B000CQIDTC",
+    "Half-Life 2: Episode One",
+    "Electronic Arts",
+    11.99,
+    3.4,
+    0
+   ],
+   [
+    "B000I5HNZM",
+    "Final Fantasy VII (EA Classics)",
+    "EA Classics",
+    null,
+    3.1,
+    136
+   ],
+   [
+    "B000JIR62S",
+    "Star Wars Lethal Alliance - Sony PSP",
+    "Ubisoft",
+    49.99,
+    4.1,
+    71
+   ],
+   [
+    "B000NKPE3A",
+    "Wii Home Power Adapter",
+    "Intec",
+    null,
+    3.4,
+    130
+   ],
+   [
+    "B000WP13EA",
+    "Roller Coaster Tycoon 2: Wacky Worlds Expansion Pack / Time Twister Expansion Pack",
+    "Cafetec",
+    null,
+    5.0,
+    127
+   ],
+   [
+    "B001BXV73O",
+    "Lara Croft - Tomb Raider - The Angel of Darkness (2003)(Windows 98 SE/Me/2000/XP)",
+    "Square Enix",
+    null,
+    5.0,
+    179
+   ],
+   [
+    "B001EZ8IBS",
+    "Official Wii Speak Microphone",
+    "Nintendo",
+    null,
+    3.9,
+    49
+   ],
+   [
+    "B00289EIEU",
+    "Mightyskins Skin Decal Skin Compatible with Guitar Hero 3 III Nintendo Wii Les Paul - American Pride",
+    "MIGHTY SKINS",
+    null,
+    4.4,
+    88
+   ],
+   [
+    "B002JTX68I",
+    "Dead to Rights: Retribution - Playstation 3",
+    "BANDAI NAMCO Entertainment",
+    49.99,
+    4.2,
+    0
+   ],
+   [
+    "B003C1ODMU",
+    "PS3 Hyperkin Wireless Keypad",
+    "Hyperkin",
+    null,
+    3.1,
+    61
+   ],
+   [
+    "B003KZLTXE",
+    "NHL 11 - Playstation 3",
+    "Electronic Arts",
+    16.22,
+    4.1,
+    89
+   ],
+   [
+    "B003WIYQAW",
+    "Ys Seven - Sony PSP",
+    "Xseed",
+    199.9,
+    4.5,
+    126
+   ],
+   [
+    "B0050U1KSG",
+    "Nintendo Gamer Keychain",
+    "Bioworld",
+    null,
+    4.5,
+    102
+   ],
+   [
+    "B0054OGIRQ",
+    "Halo 4 (Xbox 360)",
+    "Microsoft",
+    26.49,
+    4.4,
+    134
+   ],
+   [
+    "B005YR1VP2",
+    "Xbox 360 Slim 250GB Console",
+    "Xbox",
+    138.99,
+    4.2,
+    0
+   ],
+   [
+    "B00697KL5M",
+    "Skylanders Spyros Adventure LOOSE Mini Figure LEGENDARY Spyro GOLD WIngs Includes Card Online Code",
+    "ACTIVISION",
+    39.88,
+    4.3,
+    147
+   ],
+   [
+    "B006ZO885Y",
+    "MightySkins Skin Compatible with X-Box 360 Xbox 360 S Console - Cheetah | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    "MIGHTY SKINS",
+    14.86,
+    5.0,
+    0
+   ],
+   [
+    "B0088V9EKA",
+    "Red Burst Design Protective Decal Skin Sticker (High Gloss Coating) for Sony Playstation PS Vita Handheld",
+    null,
+    null,
+    2.0,
+    80
+   ],
+   [
+    "B008B3UKF8",
+    "ATC New Replacement Wired Controller for Super Nintendo SNES NES White",
+    "Atc",
+    null,
+    2.9,
+    117
+   ],
+   [
+    "B008PW9ZYC",
+    "Lost Lagoon 2 - Cursed and Forgotten [Download]",
+    "Intenium",
+    6.99,
+    3.0,
+    90
+   ],
+   [
+    "B0094PO47W",
+    "Cooking Mama 2 Pack Wii",
+    "Majesco",
+    null,
+    4.7,
+    175
+   ],
+   [
+    "B00BREH2P4",
+    "The Sims 3 Plus University Life",
+    "Electronic Arts",
+    27.0,
+    4.5,
+    92
+   ],
+   [
+    "B00E8K9WI4",
+    "Planet Side 2 NC Infantry Options Pack [Download]",
+    "Sony",
+    null,
+    3.5,
+    119
+   ],
+   [
+    "B00FJ3QR6O",
+    "Glossy Purple Custom Controller Shell for PS3",
+    "GamerModz",
+    null,
+    2.8,
+    129
+   ],
+   [
+    "B00J1F4UU6",
+    "Skin Stickers for Playstation 3 Controller - Vinyl Leather Texture Sticker for DualShock 3 Wireless Game Controllers - Protectors Controller Decal - Wood Grain [ Controller Not Included ]",
+    "GameXcel",
+    null,
+    3.7,
+    186
+   ],
+   [
+    "B00N2KIG4W",
+    "LBRNO Remote Game Controller Nunchuck Bundle Set for Wii Remote Motion Plus Nintendo with Silicon Case",
+    "LBRNO",
+    null,
+    4.4,
+    152
+   ],
+   [
+    "B00P5JJOJY",
+    "The Big Lebowski [Blu-ray]",
+    "KUOBI",
+    24.5,
+    5.0,
+    187
+   ],
+   [
+    "B00PAYGSFW",
+    "Designer Skin for PS4 Playstation 4 Console + Dualshock Controller Decals Call of Duty Ghost",
+    null,
+    null,
+    4.0,
+    115
+   ],
+   [
+    "B00QGTRUNY",
+    "Insten 2 x White Wrist Strap Compatible With Nintendo Wii Remote Control / Controller",
+    "INSTEN",
+    null,
+    3.7,
+    0
+   ],
+   [
+    "B016W3FPO4",
+    "GranVela G2000 Over-Ear Stereo Gaming Headset with Microphone Volume Control LED Lights Noise Isolating Headphone for Laptop PC Computer (White)",
+    "GranVela",
+    null,
+    3.8,
+    21
+   ],
+   [
+    "B0171RL3P0",
+    "HORI Amiibo Card Folio Officially Licensed by Nintendo",
+    "HORI",
+    null,
+    4.5,
+    79
+   ],
+   [
+    "B0176NK6D4",
+    "SADES SA903 Gaming Headset 7.1 Surround Sound USB PC Computer Stereo Game Headphones with Microphone LED Light(Blackwhite)",
+    "SADES",
+    null,
+    3.7,
+    122
+   ],
+   [
+    "B018104XTO",
+    "Madden NFL 16 (PS3) Playstation 3",
+    "EA",
+    null,
+    5.0,
+    123
+   ],
+   [
+    "B01AYMN2WG",
+    "LEGO Marvel's Avengers: Deluxe Edition - Xbox One Digital Code",
+    "WARNER BROS",
+    null,
+    4.6,
+    108
+   ],
+   [
+    "B01CJNHEEK",
+    "CM Storm QuickFire Rapid-i Fully Backlit Mechanical Gaming Keyboard with ActivLite Technology and Per-Key Lighting (Brown Switch Model)",
+    "Cooler Master",
+    null,
+    4.3,
+    46
+   ],
+   [
+    "B01FT178VS",
+    "Mafia III - Xbox One Digital Code",
+    "2K",
+    null,
+    3.9,
+    94
+   ],
+   [
+    "B01G51NKJU",
+    "eForHome Gaming Headset with Mic Noise Cancelling Headphones for PS4 PlayStation 4 / PC / Laptop / Tablet / Mac iPhones, 3.5MM Headphone Splitter with USB LED Light (Black-red)",
+    "eForHome",
+    null,
+    3.9,
+    188
+   ],
+   [
+    "B01LR2A2XY",
+    "Games&Tech Fuchsia Clear Pink Battery Cover Door Lid for Nintendo GBA Game Boy Advance",
+    "Honbeanify TYVB",
+    null,
+    4.8,
+    0
+   ],
+   [
+    "B01N97U7FG",
+    "eJiasu Screw Feet Cover Kit Rubber Boot Pad Replacement for Playstation 3 Sony PS3 Slim 2000 3000 Console(Pack of 9) (2sets)",
+    "eJiasu",
+    9.99,
+    4.6,
+    21
+   ],
+   [
+    "B071DFL2LL",
+    "Blade & Soul Student Bundle [Online Game Code]",
+    "NCSOFT",
+    null,
+    3.7,
+    142
+   ],
+   [
+    "B072BX8NHF",
+    "2 in 1 PS4 Pro Cooler with USB External 5-Fan Super Turbo + PS4 Pro USB HUB with(1\u00d73.0)-(4\u00d72.0)-5-USB Ports Cable Adapter",
+    "DOBE",
+    null,
+    3.9,
+    99
+   ],
+   [
+    "B074BQ87P7",
+    "Doc Martin: Series 8 [Blu-ray]",
+    "Martin Clunes  (Actor),     Nigel Cole  (Director)    Rated:    NR    Format: Blu-ray",
+    23.07,
+    4.6,
+    168
+   ],
+   [
+    "B075375BPJ",
+    "Generic 28 in 1 Durable Hard Plastic Game Card Case Holder Cartridge Box for Nintendo 3DS Video Games Keep Your Collection Looking Nice Protect Games from Dust and Scratches (Black) [Video Game]",
+    "Cheenjo",
+    20.99,
+    3.8,
+    57
+   ],
+   [
+    "B075B475G5",
+    "YoRHa Studded Silicone Cover Skin Case for Sony PS4/slim/Pro Dualshock 4 Controller x 2(Black+red) with Pro Thumb Grips x 8",
+    "YoRHa",
+    null,
+    4.0,
+    168
+   ],
+   [
+    "B07895XFR9",
+    "Code: Realize \"Future Blessings\" Limited Edition - PlayStation Vita",
+    "Aksys",
+    null,
+    4.7,
+    150
+   ],
+   [
+    "B078L141BH",
+    "Controller Gear Nintendo Switch Skin & Screen Protector Set, Officially Licensed By Nintendo - The Legend of Zelda Botw \"Woodgrain Triforce\" Joy-Con Only - Nintendo Switch",
+    "Controller Gear",
+    null,
+    4.6,
+    104
+   ],
+   [
+    "B07DVWWF44",
+    "Guess Perfume for Women by Marciano - Eau de Parfum, 100 ml",
+    "Electronic Arts",
+    null,
+    4.1,
+    115
+   ],
+   [
+    "B07DZCHHZL",
+    "Gaming Mouse - Wired Mouse with 7 Programmable Buttons, 4800 DPI, Ergonomic Design and Breathing LED Light, Gaming Mice Used for PC Games and Office",
+    "BOOTOO TECH",
+    null,
+    3.9,
+    189
+   ],
+   [
+    "B07K85PH26",
+    "Earth Defense Force 4.1: The Shadow of New Despair - PlayStation 4",
+    "Xseed Games",
+    23.99,
+    4.5,
+    33
+   ],
+   [
+    "B07MD78NG7",
+    "Armored Warrior Iris Pc Game",
+    "Manga Gamer",
+    null,
+    5.0,
+    115
+   ],
+   [
+    "B07P14ZW6L",
+    "Namco Museum (Renewed)",
+    "Amazon Renewed",
+    11.53,
+    4.3,
+    64
+   ],
+   [
+    "B07S7Y8XJ4",
+    "Ssgamer N64 Controller, Upgraded Joystick Classic Wired Controller Compatible with N64 Console (Clear Purple and Clear Green)",
+    "Ssgamer",
+    null,
+    3.2,
+    124
+   ],
+   [
+    "B07S9NZM74",
+    "Team Sonic Racing (PS4)",
+    "SEGA",
+    24.84,
+    4.6,
+    31
+   ],
+   [
+    "B07SYPTK73",
+    "100 Pack Sanitary VR Mask Pads Covers Disposable Face Cover Hygiene VR Pads for HTC Vive, PS VR, Gear VR Oculus Rift, etc.",
+    "LINHUIPAD",
+    20.99,
+    4.0,
+    91
+   ],
+   [
+    "B07V5XSWKF",
+    "Anleo Hard Travel Case for Oculus Rift S PC-Powered VR Gaming Headset",
+    "Anleo",
+    null,
+    4.6,
+    163
+   ],
+   [
+    "B07VFRR3NW",
+    "Wired Vertical Mouse,USB Wired Left Hand Vertical Mouse Ergonomic Gaming Mouse Wrist Healthy Mouse for Laptop PC Computer Mouse",
+    "Pomya",
+    null,
+    3.1,
+    163
+   ],
+   [
+    "B07XVQYTZS",
+    "Deca Sports 2 - Nintendo Wii (Renewed)",
+    "Amazon Renewed",
+    25.98,
+    3.9,
+    128
+   ],
+   [
+    "B07Z5W9ZCP",
+    "NBA Street - PlayStation 2 (Renewed)",
+    "Amazon Renewed",
+    28.05,
+    4.1,
+    200
+   ],
+   [
+    "B07ZPX8S3M",
+    "Bosmarlin Mouse Keyboard Converter for Playstation 3/4/4 Pro/Slim, Xbox One/S/X, Switch",
+    "Bosmarlin",
+    null,
+    3.3,
+    16
+   ],
+   [
+    "B081C5NVNR",
+    "YICHUMY Replacement RB LB Bumper RT LT Trigger Buttons Mod Kit for Xbox One S Slim Controller (Black)",
+    "YICHUMY",
+    null,
+    4.0,
+    63
+   ],
+   [
+    "B081W29V4V",
+    "XHN Wired Gaming Headset PC 3.5mm Headsets, Over Ear 3.5mm PC Headphone with Lightweight Design Noise Cancelling Volume Control for Laptop, Mac",
+    "XHN",
+    null,
+    3.0,
+    0
+   ],
+   [
+    "B083BGMDVH",
+    "Controller Grip Skin & Protective Covers for Oculus Go Controller, Premium Gel Shell Silicone Grip Covers 2 Patterns to Choose",
+    "Nisson",
+    null,
+    4.0,
+    24
+   ],
+   [
+    "B086DGKSZJ",
+    "Daymare 1998 PC",
+    "Gs2 Games",
+    29.82,
+    4.4,
+    0
+   ],
+   [
+    "B08BYHVNCM",
+    "Over Ear Headphones with Aluminum\u00a0Headphone Stand Hanger, SourceTon 3.5mm Gaming Headset Noise Isolating with Mic and Volume Control for TV, PC and Cell Phone",
+    "SourceTon",
+    12.99,
+    3.3,
+    75
+   ],
+   [
+    "B08CW6SJL2",
+    "MageGee Mechanical Gaming Keyboard with Blue Switch, Compact 87 Keys Wired Computer Keyboard for Windows Laptop PC Gamer, LED Ice Blue Backlit, White",
+    "MageGee",
+    22.99,
+    4.5,
+    190
+   ],
+   [
+    "B08F43Q6GQ",
+    "PowerA Enhanced Wired Controller for Xbox Series X|S - Blue Hint, gamepad, wired video game controller, gaming controller, Xbox Series X|S",
+    "PowerA",
+    33.0,
+    4.1,
+    149
+   ],
+   [
+    "B08GSP1HBM",
+    "Goosebumps: Dead of Night, Cosmic Forces - Nintendo Switch",
+    "COKeM International",
+    null,
+    4.5,
+    51
+   ],
+   [
+    "B08LPMP12D",
+    "Wasserstein Touch Controller Knuckle Strap Compatible with Oculus Quest 2 - Immerse Yourself Better in Your VR Experience",
+    "Wasserstein",
+    null,
+    3.8,
+    92
+   ],
+   [
+    "B08PRWDX5B",
+    "Kaygo Goods Red PS5 DualSense Controller Cover - Anti-Slip Skin with Precision Cut-Outs for Pads, Buttons, triggers, joysticks, and Charger",
+    "Kaygo Goods",
+    7.99,
+    4.0,
+    10
+   ],
+   [
+    "B08VWR9HS4",
+    "HMANE 109 Keys POM Jelly Keycaps Set, Rainbow Blank Doubleshot Translucent OEM Profile Mechanical Gaming Keyboard Keycaps for 60\u00ef\u00bc\u2026/87 TKL/104/108 Cherry MX Switches",
+    "HMANE",
+    null,
+    3.9,
+    187
+   ],
+   [
+    "B08WKBCWRM",
+    "Chess Ultra (Nintendo Switch)",
+    "Maximum Games",
+    40.48,
+    3.5,
+    19
+   ],
+   [
+    "B08XX73P3N",
+    "Bangcheer - Wall Mount Bracket and Controller Holder, Sturdy & Easy-to-Install Bracket Base for Xbox Series X Gaming Setup, Aluminum, Black",
+    "BANGCHEER",
+    null,
+    4.8,
+    166
+   ],
+   [
+    "B08Z39X9CT",
+    "D.Gruoiza Joypad Switch Controllers Have Wake Up Feature, Enhanced Joy-Pad Remotes Apply to Switch with Grip (Yellow and Green)",
+    "D.Gruoiza",
+    null,
+    4.1,
+    127
+   ],
+   [
+    "B095W1BN9Y",
+    "YUANHOT Vertical Stand and 2-in-1 Cooling Fan Accessories Kit Compatible with PS5, Stand with Controller Charging Station Within 2-3H, Cooling System, Headset Holder, Extra USB Ports, 14 Game Slots",
+    "YUANHOT",
+    null,
+    4.5,
+    0
+   ],
+   [
+    "B097B2LM9R",
+    "Charger for Gameboy Advance SP, HAUZIK Power Adapter with Cable Compatible with Nintendo Gameboy Advance SP (AGS-001, AGS-101), GBA SP, First Generation Nintendo DS (NTR-001)",
+    "HAUZIK",
+    10.99,
+    4.5,
+    26
+   ],
+   [
+    "B09LTYW489",
+    "Brawlout - Nintendo Switch",
+    "Merge Games",
+    29.99,
+    4.4,
+    180
+   ],
+   [
+    "B09PFZ4KF7",
+    "USB Breakaway Cord for Microsoft Xbox 360 & Slim Wired Controller, Dongle Adapter Extension Cable, Pack of 2",
+    "CSYLX",
+    5.99,
+    3.8,
+    197
+   ],
+   [
+    "B09SFZG8WV",
+    "Redragon M686 Wireless Gaming Mouse, 16000 DPI Wired/Wireless Gamer Mouse with Professional Sensor, 45-Hour Durable Power Capacity, Customizable Macro and RGB Backlight for PC/Mac/Laptop",
+    "Redragon",
+    42.99,
+    4.6,
+    63
+   ],
+   [
+    "B09VKSWXKT",
+    "SQXBK AV Audio Video Composite Cable Adapter for Nintendo N64 SNES Gamecube GC",
+    "SQXBK",
+    6.58,
+    2.8,
+    0
+   ],
+   [
+    "B09YSWLFYW",
+    "1 Leg Strap and 2 Ring-Con Grips Ring-Con for Nintendo Switch Fit Adventure Game",
+    "YIDUOMAOYI",
+    null,
+    5.0,
+    152
+   ],
+   [
+    "B0B2937FB8",
+    "Wireless Gaming Headset, Noise Cancelling Mic, 3D Surround Sound, Dual Chamber Driver, Soft Memory Earmuffs, Long Battery Life, Over Ear Gaming Headphones for PC, Mac, Nintendo Switch, PS4/5, Red.\u2026",
+    null,
+    null,
+    3.9,
+    120
+   ],
+   [
+    "B0B45D2D3Z",
+    "14 Pack - RHOTALL Dust Proof Plugs Kit for Nintendo Switch OLED Accessories, 11 Soft Silicone Dust Plug Cover for Switch OLED Console and Dock, 3 Thumb Grip Caps for Switch OLED Joy Con",
+    "RHOTALL",
+    null,
+    4.7,
+    135
+   ],
+   [
+    "B0BGP7J9LF",
+    "Force Feedback Steering Wheel,PXN V10 Racing Wheel 270\u00b0/900\u00b0 Rotation with Pedal and Gear Lever for PC,PlayStation 4,Xbox One,Xbox Series X/S (V10)",
+    "PXN",
+    279.99,
+    4.3,
+    94
+   ],
+   [
+    "B0BKSM37HV",
+    "BestParts New Mouse Wheel Mouse Roller Scroll Replacement for Logitech G403 G703 Gaming Mouse",
+    "BestParts",
+    12.99,
+    4.9,
+    81
+   ],
+   [
+    "B0BQCJHJ6H",
+    "Blood Bowl 3: Brutal Edition (PS5)",
+    "Maximum Games",
+    28.94,
+    3.1,
+    0
+   ],
+   [
+    "B0BYYQCWYK",
+    "Metal Thumbsticks for Xbox Elite Series 2 Core Controller Accessories, Replacement Magnetic Buttons kit Includes 4 Swap Magnetic Joysticks, 4 Paddles, 1 Standard D-Pads (Purple)",
+    "KUAILEYA",
+    24.99,
+    4.5,
+    127
+   ],
+   [
+    "B0C2YLY7JB",
+    "NINIFEI Switch Controller for Handheld Mode,Compatible with Nintendo Switch/Switch OLED,With 6-Axis Gyro and Dual Motor Vibration",
+    "NINIFEI",
+    null,
+    3.4,
+    26
+   ]
+  ],
+  "user_reviews": [
+   [
+    "r221706",
+    "B073SC6V1D",
+    2,
+    1648663437070
+   ],
+   [
+    "r221707",
+    "B07WJ6WP3G",
+    5,
+    1516246131047
+   ],
+   [
+    "r221708",
+    "B01MYXNB7G",
+    5,
+    1514507989159
+   ]
+  ],
+  "page_0": [
+   [
+    "B001TP0DLQ",
+    "Conntek 07250 Inline IEC 320 C13 Power Splitter, 9 Feet",
+    11.49,
+    5.0
+   ],
+   [
+    "B008KMIWXM",
+    "Elite Core EC-PROCAT5E-EE-10 Pro CAT5E Cable Ethercon-Ethercon 10-Feet",
+    34.99,
+    5.0
+   ],
+   [
+    "B0093WFPB0",
+    "Lynn Electronics C13515P10A-1F NEMA 5-15P to IEC 60320-C13 10A/125V 18AWG/3C SJT 1-Feet Power Cord, Black, 4-Pack",
+    13.62,
+    5.0
+   ],
+   [
+    "B0093WFQC8",
+    "Lynn Electronics C13515P10A-2F NEMA 5-15P to IEC 60320-C13 10A/125V 18AWG/3C SJT 2-Feet Power Cord, Black, 4-Pack",
+    12.64,
+    5.0
+   ],
+   [
+    "B0098NPPLE",
+    "Elite Core EC-PROCAT5E-RE-20 Pro CAT5E Cable RJ45-Ethercon 20-Feet",
+    38.99,
+    5.0
+   ],
+   [
+    "B00A8OGS04",
+    "GUEST 22209 / Guest Replacement Joystick Control f/M-100 Spotlights",
+    81.28,
+    5.0
+   ],
+   [
+    "B00CBYN8H0",
+    "Lynn Electronics C13515P15ABL-3F Power Cord IEC60320 C13 to NEMA 5 SJT Jacket, 15-Amp/125-volt, Blue",
+    11.36,
+    5.0
+   ],
+   [
+    "B00CBYP1UM",
+    "Lynn Electronics C13C1415ARD-3F 15-Amp/250-volt 3-Feet Power Cord IEC 60320 C13 to IEC 60320 C14, Red",
+    14.05,
+    5.0
+   ],
+   [
+    "B00CBYR6AU",
+    "Lynn Electronics C13R515P15A-8F 15-Amp/125-volt 8-Feet Power Cord IEC 60320 C13 Right Angle to NEMA 5, Black",
+    21.43,
+    5.0
+   ],
+   [
+    "B00FMS7YKE",
+    "INSTALLBAY PZGBOLT - Tools Ground Kit - Zinc Anodized Thread Cutting Bolts 5/16 Inch Package of 50",
+    37.95,
+    5.0
+   ],
+   [
+    "B00GJ0W1B6",
+    "MightySkins Skin Compatible with Nintendo 2DS - Pink Camo | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    10.87,
+    5.0
+   ],
+   [
+    "B00GJW1R1O",
+    "MightySkins Skin Compatible with Sony PS4 Controller - Desert Camo | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    8.99,
+    5.0
+   ],
+   [
+    "B00GJW51SY",
+    "MightySkins Skin Compatible with Sony PS4 Controller - Antique Purple | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    8.99,
+    5.0
+   ],
+   [
+    "B00GJW7506",
+    "MightySkins SOPS4CO-Wicked Skull Skin Decal Wrap for Sony Playstation Dualshock 4 Controller - Wicked Skull",
+    8.99,
+    5.0
+   ],
+   [
+    "B00GJW75ZG",
+    "MightySkins SOPS4CO-Wicked Skin Decal Wrap for Sony Playstation Dualshock 4 Controller - Wicked",
+    8.99,
+    5.0
+   ],
+   [
+    "B00GP4HHVA",
+    "MightySkins Skin Compatible with Sony PS4 Console - Urban Night | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    14.99,
+    5.0
+   ],
+   [
+    "B00GP4HWFQ",
+    "MightySkins Skin Compatible with Sony PS4 Console - Fire Fighter | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    14.99,
+    5.0
+   ],
+   [
+    "B00GP4OUUG",
+    "MightySkins Skin Compatible with Sony PS4 Console - Dragon Fantasy | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    14.99,
+    5.0
+   ],
+   [
+    "B00GP4OYAC",
+    "MightySkins Skin Compatible with Sony Playstation 4 PS4 Console wrap Sticker Skins Dream",
+    14.52,
+    5.0
+   ],
+   [
+    "B00GP4QR3E",
+    "MightySkins Skin Compatible with Sony PS4 Console - Cow Print | Protective, Durable, and Unique Vinyl Decal wrap Cover | Easy to Apply, Remove, and Change Styles | Made in The USA",
+    14.99,
+    5.0
+   ]
+  ],
+  "agg_brand": [
+   [
+    "Nintendo",
+    4.309555,
+    4228
+   ],
+   [
+    "Amazon Renewed",
+    4.135664,
+    2961
+   ],
+   [
+    "Electronic Arts",
+    3.952608,
+    2627
+   ],
+   [
+    "Sony",
+    4.074844,
+    1924
+   ],
+   [
+    "Ubisoft",
+    3.960307,
+    1887
+   ],
+   [
+    "SEGA",
+    4.149321,
+    1841
+   ],
+   [
+    "ACTIVISION",
+    4.001764,
+    1757
+   ],
+   [
+    "Microsoft",
+    3.991184,
+    1622
+   ],
+   [
+    "BANDAI NAMCO Entertainment",
+    4.14745,
+    1157
+   ],
+   [
+    "Square Enix",
+    4.108517,
+    1045
+   ],
+   [
+    "Atari",
+    3.835721,
+    1033
+   ],
+   [
+    "PlayStation",
+    4.221571,
+    1006
+   ],
+   [
+    "MIGHTY SKINS",
+    3.905572,
+    1005
+   ],
+   [
+    "Capcom",
+    4.171296,
+    972
+   ],
+   [
+    "Konami",
+    4.090378,
+    925
+   ],
+   [
+    "Skinit",
+    4.161736,
+    818
+   ],
+   [
+    "THQ",
+    4.013004,
+    769
+   ],
+   [
+    "Generic",
+    3.91042,
+    691
+   ],
+   [
+    "2K",
+    3.959455,
+    624
+   ],
+   [
+    "Mad Catz",
+    3.798803,
+    585
+   ]
+  ],
+  "agg_month": [
+   [
+    199811,
+    1,
+    5.0
+   ],
+   [
+    199812,
+    5,
+    4.4
+   ],
+   [
+    199901,
+    1,
+    5.0
+   ],
+   [
+    199903,
+    2,
+    5.0
+   ],
+   [
+    199904,
+    1,
+    4.0
+   ],
+   [
+    199905,
+    1,
+    4.0
+   ],
+   [
+    199906,
+    1,
+    5.0
+   ],
+   [
+    199908,
+    3,
+    3.333333
+   ],
+   [
+    199909,
+    4,
+    4.75
+   ],
+   [
+    199910,
+    3,
+    4.0
+   ],
+   [
+    199911,
+    163,
+    4.184049
+   ],
+   [
+    199912,
+    279,
+    4.057348
+   ],
+   [
+    200001,
+    246,
+    3.918699
+   ],
+   [
+    200002,
+    175,
+    4.011429
+   ],
+   [
+    200003,
+    178,
+    4.129213
+   ],
+   [
+    200004,
+    264,
+    4.268939
+   ],
+   [
+    200005,
+    308,
+    4.100649
+   ],
+   [
+    200006,
+    353,
+    4.181303
+   ],
+   [
+    200007,
+    425,
+    4.051765
+   ],
+   [
+    200008,
+    499,
+    4.216433
+   ],
+   [
+    200009,
+    400,
+    4.1425
+   ],
+   [
+    200010,
+    505,
+    4.233663
+   ],
+   [
+    200011,
+    707,
+    3.934936
+   ],
+   [
+    200012,
+    765,
+    4.057516
+   ],
+   [
+    200101,
+    765,
+    3.947712
+   ],
+   [
+    200102,
+    623,
+    4.044944
+   ],
+   [
+    200103,
+    553,
+    3.940325
+   ],
+   [
+    200104,
+    592,
+    4.013514
+   ],
+   [
+    200105,
+    699,
+    3.998569
+   ],
+   [
+    200106,
+    843,
+    3.957295
+   ],
+   [
+    200107,
+    1013,
+    4.035538
+   ],
+   [
+    200108,
+    878,
+    4.136674
+   ],
+   [
+    200109,
+    696,
+    3.965517
+   ],
+   [
+    200110,
+    940,
+    4.081915
+   ],
+   [
+    200111,
+    1564,
+    4.053708
+   ],
+   [
+    200112,
+    1666,
+    4.019208
+   ],
+   [
+    200201,
+    1528,
+    4.070026
+   ],
+   [
+    200202,
+    1058,
+    3.952741
+   ],
+   [
+    200203,
+    1172,
+    4.008532
+   ],
+   [
+    200204,
+    1129,
+    4.093888
+   ],
+   [
+    200205,
+    911,
+    4.096597
+   ],
+   [
+    200206,
+    1207,
+    4.104391
+   ],
+   [
+    200207,
+    1179,
+    4.12553
+   ],
+   [
+    200208,
+    997,
+    4.006018
+   ],
+   [
+    200209,
+    1026,
+    4.062378
+   ],
+   [
+    200210,
+    1278,
+    3.978873
+   ],
+   [
+    200211,
+    1395,
+    3.94552
+   ],
+   [
+    200212,
+    1469,
+    3.970728
+   ],
+   [
+    200301,
+    1404,
+    3.976496
+   ],
+   [
+    200302,
+    984,
+    3.978659
+   ],
+   [
+    200303,
+    1222,
+    3.96072
+   ],
+   [
+    200304,
+    1157,
+    3.936906
+   ],
+   [
+    200305,
+    972,
+    3.978395
+   ],
+   [
+    200306,
+    1076,
+    4.008364
+   ],
+   [
+    200307,
+    1213,
+    4.068425
+   ],
+   [
+    200308,
+    969,
+    3.98968
+   ],
+   [
+    200309,
+    944,
+    4.007415
+   ],
+   [
+    200310,
+    1070,
+    3.915888
+   ],
+   [
+    200311,
+    1354,
+    3.953471
+   ],
+   [
+    200312,
+    1765,
+    3.930312
+   ],
+   [
+    200401,
+    1558,
+    3.872272
+   ],
+   [
+    200402,
+    971,
+    3.963955
+   ],
+   [
+    200403,
+    1078,
+    4.022263
+   ],
+   [
+    200404,
+    1085,
+    3.879263
+   ],
+   [
+    200405,
+    898,
+    3.86637
+   ],
+   [
+    200406,
+    1113,
+    3.948787
+   ],
+   [
+    200407,
+    1269,
+    3.988968
+   ],
+   [
+    200408,
+    1159,
+    3.8956
+   ],
+   [
+    200409,
+    1204,
+    3.844684
+   ],
+   [
+    200410,
+    1254,
+    3.865231
+   ],
+   [
+    200411,
+    1988,
+    3.942153
+   ],
+   [
+    200412,
+    1692,
+    3.839835
+   ],
+   [
+    200501,
+    1509,
+    3.874751
+   ],
+   [
+    200502,
+    994,
+    3.812877
+   ],
+   [
+    200503,
+    1384,
+    3.872832
+   ],
+   [
+    200504,
+    1285,
+    3.888716
+   ],
+   [
+    200505,
+    1174,
+    3.737649
+   ],
+   [
+    200506,
+    1191,
+    3.884131
+   ],
+   [
+    200507,
+    1331,
+    4.006011
+   ],
+   [
+    200508,
+    1318,
+    3.929439
+   ],
+   [
+    200509,
+    1422,
+    3.998594
+   ],
+   [
+    200510,
+    1470,
+    3.845578
+   ],
+   [
+    200511,
+    1724,
+    3.603828
+   ],
+   [
+    200512,
+    1876,
+    3.702559
+   ],
+   [
+    200601,
+    1584,
+    3.79798
+   ],
+   [
+    200602,
+    1226,
+    3.882545
+   ],
+   [
+    200603,
+    1666,
+    3.876951
+   ],
+   [
+    200604,
+    1270,
+    3.751969
+   ],
+   [
+    200605,
+    1013,
+    3.772952
+   ],
+   [
+    200606,
+    1139,
+    3.808604
+   ],
+   [
+    200607,
+    1392,
+    3.798132
+   ],
+   [
+    200608,
+    1249,
+    3.874299
+   ],
+   [
+    200609,
+    886,
+    3.72912
+   ],
+   [
+    200610,
+    1031,
+    3.623666
+   ],
+   [
+    200611,
+    2120,
+    3.800943
+   ],
+   [
+    200612,
+    1891,
+    3.643575
+   ],
+   [
+    200701,
+    4460,
+    4.073991
+   ],
+   [
+    200702,
+    1882,
+    3.930925
+   ],
+   [
+    200703,
+    2438,
+    3.968417
+   ],
+   [
+    200704,
+    1599,
+    3.938712
+   ],
+   [
+    200705,
+    2435,
+    4.080903
+   ],
+   [
+    200706,
+    1734,
+    3.892157
+   ],
+   [
+    200707,
+    2079,
+    3.901876
+   ],
+   [
+    200708,
+    1948,
+    3.983573
+   ],
+   [
+    200709,
+    1964,
+    3.952138
+   ],
+   [
+    200710,
+    2130,
+    3.928169
+   ],
+   [
+    200711,
+    2575,
+    3.934757
+   ],
+   [
+    200712,
+    3524,
+    4.003405
+   ],
+   [
+    200801,
+    4073,
+    4.04272
+   ],
+   [
+    200802,
+    2750,
+    4.023273
+   ],
+   [
+    200803,
+    2630,
+    3.971863
+   ],
+   [
+    200804,
+    2645,
+    4.040076
+   ],
+   [
+    200805,
+    2742,
+    4.008388
+   ],
+   [
+    200806,
+    2996,
+    4.003004
+   ],
+   [
+    200807,
+    2914,
+    3.912835
+   ],
+   [
+    200808,
+    2526,
+    3.896675
+   ],
+   [
+    200809,
+    4731,
+    2.963855
+   ],
+   [
+    200810,
+    3191,
+    3.778126
+   ],
+   [
+    200811,
+    3543,
+    3.871013
+   ],
+   [
+    200812,
+    4781,
+    3.861535
+   ],
+   [
+    200901,
+    7064,
+    4.044026
+   ],
+   [
+    200902,
+    4215,
+    3.992408
+   ],
+   [
+    200903,
+    4050,
+    3.903457
+   ],
+   [
+    200904,
+    3795,
+    3.913834
+   ],
+   [
+    200905,
+    3652,
+    3.977547
+   ],
+   [
+    200906,
+    3818,
+    3.910948
+   ],
+   [
+    200907,
+    3069,
+    3.876833
+   ],
+   [
+    200908,
+    3082,
+    3.894549
+   ],
+   [
+    200909,
+    3785,
+    3.98177
+   ],
+   [
+    200910,
+    3966,
+    3.995966
+   ],
+   [
+    200911,
+    4483,
+    3.922373
+   ],
+   [
+    200912,
+    5919,
+    3.954553
+   ],
+   [
+    201001,
+    6731,
+    3.969544
+   ],
+   [
+    201002,
+    6009,
+    4.027958
+   ],
+   [
+    201003,
+    5230,
+    3.857361
+   ],
+   [
+    201004,
+    3908,
+    3.941658
+   ],
+   [
+    201005,
+    3866,
+    3.934558
+   ],
+   [
+    201006,
+    3595,
+    3.940751
+   ],
+   [
+    201007,
+    4582,
+    3.818638
+   ],
+   [
+    201008,
+    4089,
+    3.810223
+   ],
+   [
+    201009,
+    4548,
+    3.883685
+   ],
+   [
+    201010,
+    5262,
+    3.833143
+   ],
+   [
+    201011,
+    7144,
+    3.714306
+   ],
+   [
+    201012,
+    9527,
+    3.850215
+   ],
+   [
+    201101,
+    10881,
+    3.957908
+   ],
+   [
+    201102,
+    6876,
+    3.953316
+   ],
+   [
+    201103,
+    7822,
+    3.895807
+   ],
+   [
+    201104,
+    6662,
+    3.931702
+   ],
+   [
+    201105,
+    6137,
+    3.900603
+   ],
+   [
+    201106,
+    6120,
+    3.862582
+   ],
+   [
+    201107,
+    5726,
+    3.860286
+   ],
+   [
+    201108,
+    5968,
+    3.982909
+   ],
+   [
+    201109,
+    6229,
+    3.957618
+   ],
+   [
+    201110,
+    7282,
+    3.916094
+   ],
+   [
+    201111,
+    9067,
+    3.855741
+   ],
+   [
+    201112,
+    11539,
+    3.953982
+   ],
+   [
+    201201,
+    11661,
+    3.981391
+   ],
+   [
+    201202,
+    7931,
+    3.961669
+   ],
+   [
+    201203,
+    7880,
+    3.844543
+   ],
+   [
+    201204,
+    6175,
+    3.928421
+   ],
+   [
+    201205,
+    5611,
+    3.905008
+   ],
+   [
+    201206,
+    5757,
+    3.918013
+   ],
+   [
+    201207,
+    6304,
+    3.915292
+   ],
+   [
+    201208,
+    6127,
+    3.873021
+   ],
+   [
+    201209,
+    6369,
+    3.86764
+   ],
+   [
+    201210,
+    7661,
+    3.952617
+   ],
+   [
+    201211,
+    12221,
+    4.063088
+   ],
+   [
+    201212,
+    28400,
+    4.239507
+   ],
+   [
+    201301,
+    31569,
+    4.267066
+   ],
+   [
+    201302,
+    21331,
+    4.22479
+   ],
+   [
+    201303,
+    27069,
+    3.709298
+   ],
+   [
+    201304,
+    19441,
+    4.159611
+   ],
+   [
+    201305,
+    16956,
+    4.165664
+   ],
+   [
+    201306,
+    15737,
+    4.13249
+   ],
+   [
+    201307,
+    16720,
+    4.147488
+   ],
+   [
+    201308,
+    17146,
+    4.131284
+   ],
+   [
+    201309,
+    14934,
+    4.121066
+   ],
+   [
+    201310,
+    16315,
+    4.150965
+   ],
+   [
+    201311,
+    22243,
+    3.965337
+   ],
+   [
+    201312,
+    30063,
+    4.063899
+   ],
+   [
+    201401,
+    34681,
+    4.175456
+   ],
+   [
+    201402,
+    22396,
+    4.121093
+   ],
+   [
+    201403,
+    23712,
+    4.118548
+   ],
+   [
+    201404,
+    18134,
+    4.092147
+   ],
+   [
+    201405,
+    16809,
+    4.10542
+   ],
+   [
+    201406,
+    15899,
+    4.085037
+   ],
+   [
+    201407,
+    28980,
+    4.249827
+   ],
+   [
+    201408,
+    29909,
+    4.264001
+   ],
+   [
+    201409,
+    28450,
+    4.200984
+   ],
+   [
+    201410,
+    28763,
+    4.223725
+   ],
+   [
+    201411,
+    29748,
+    4.136513
+   ],
+   [
+    201412,
+    46091,
+    4.241696
+   ],
+   [
+    201501,
+    51780,
+    4.316512
+   ],
+   [
+    201502,
+    43425,
+    4.259482
+   ],
+   [
+    201503,
+    40662,
+    4.257464
+   ],
+   [
+    201504,
+    32345,
+    4.234874
+   ],
+   [
+    201505,
+    28542,
+    4.214035
+   ],
+   [
+    201506,
+    27966,
+    4.18923
+   ],
+   [
+    201507,
+    31218,
+    4.186751
+   ],
+   [
+    201508,
+    30703,
+    4.195062
+   ],
+   [
+    201509,
+    27306,
+    4.174101
+   ],
+   [
+    201510,
+    29064,
+    4.136733
+   ],
+   [
+    201511,
+    32004,
+    4.059274
+   ],
+   [
+    201512,
+    35398,
+    4.038505
+   ],
+   [
+    201601,
+    43485,
+    4.199609
+   ],
+   [
+    201602,
+    35994,
+    4.162305
+   ],
+   [
+    201603,
+    37877,
+    4.194023
+   ],
+   [
+    201604,
+    27361,
+    4.14422
+   ],
+   [
+    201605,
+    30050,
+    4.186988
+   ],
+   [
+    201606,
+    28732,
+    4.165147
+   ],
+   [
+    201607,
+    28496,
+    4.161426
+   ],
+   [
+    201608,
+    29802,
+    4.106033
+   ],
+   [
+    201609,
+    27576,
+    4.083986
+   ],
+   [
+    201610,
+    26699,
+    4.09476
+   ],
+   [
+    201611,
+    28086,
+    4.045574
+   ],
+   [
+    201612,
+    45948,
+    4.14882
+   ],
+   [
+    201701,
+    47401,
+    4.217991
+   ],
+   [
+    201702,
+    30347,
+    4.136356
+   ],
+   [
+    201703,
+    38883,
+    4.139907
+   ],
+   [
+    201704,
+    30082,
+    4.114221
+   ],
+   [
+    201705,
+    27237,
+    4.119874
+   ],
+   [
+    201706,
+    24262,
+    4.078106
+   ],
+   [
+    201707,
+    25429,
+    4.05828
+   ],
+   [
+    201708,
+    28092,
+    4.112381
+   ],
+   [
+    201709,
+    25433,
+    4.036842
+   ],
+   [
+    201710,
+    24760,
+    3.994023
+   ],
+   [
+    201711,
+    28643,
+    3.993052
+   ],
+   [
+    201712,
+    33462,
+    3.977676
+   ],
+   [
+    201801,
+    44204,
+    4.14743
+   ],
+   [
+    201802,
+    33284,
+    4.038217
+   ],
+   [
+    201803,
+    37247,
+    4.05783
+   ],
+   [
+    201804,
+    31465,
+    4.042619
+   ],
+   [
+    201805,
+    26352,
+    3.993549
+   ],
+   [
+    201806,
+    26462,
+    4.006575
+   ],
+   [
+    201807,
+    28991,
+    4.036874
+   ],
+   [
+    201808,
+    28515,
+    4.045239
+   ],
+   [
+    201809,
+    24051,
+    4.058418
+   ],
+   [
+    201810,
+    26756,
+    4.082449
+   ],
+   [
+    201811,
+    28887,
+    3.993319
+   ],
+   [
+    201812,
+    43268,
+    4.060784
+   ],
+   [
+    201901,
+    52676,
+    4.233636
+   ],
+   [
+    201902,
+    36341,
+    4.1402
+   ],
+   [
+    201903,
+    36591,
+    4.149572
+   ],
+   [
+    201904,
+    29014,
+    4.129248
+   ],
+   [
+    201905,
+    29344,
+    4.159113
+   ],
+   [
+    201906,
+    33485,
+    4.181006
+   ],
+   [
+    201907,
+    41342,
+    4.205626
+   ],
+   [
+    201908,
+    34794,
+    4.166925
+   ],
+   [
+    201909,
+    29082,
+    4.118286
+   ],
+   [
+    201910,
+    29184,
+    4.104955
+   ],
+   [
+    201911,
+    33594,
+    4.093856
+   ],
+   [
+    201912,
+    61946,
+    4.177219
+   ],
+   [
+    202001,
+    69388,
+    4.2598
+   ],
+   [
+    202002,
+    50911,
+    4.200978
+   ],
+   [
+    202003,
+    38799,
+    4.038841
+   ],
+   [
+    202004,
+    36485,
+    3.816856
+   ],
+   [
+    202005,
+    43961,
+    3.904597
+   ],
+   [
+    202006,
+    39259,
+    3.898189
+   ],
+   [
+    202007,
+    41261,
+    3.954582
+   ],
+   [
+    202008,
+    38568,
+    3.938239
+   ],
+   [
+    202009,
+    36683,
+    3.961617
+   ],
+   [
+    202010,
+    38392,
+    3.950328
+   ],
+   [
+    202011,
+    35756,
+    3.910197
+   ],
+   [
+    202012,
+    51832,
+    3.940461
+   ],
+   [
+    202101,
+    58362,
+    4.059576
+   ],
+   [
+    202102,
+    46634,
+    3.929536
+   ],
+   [
+    202103,
+    57475,
+    3.983871
+   ],
+   [
+    202104,
+    50037,
+    3.97276
+   ],
+   [
+    202105,
+    40803,
+    3.975369
+   ],
+   [
+    202106,
+    37769,
+    3.935344
+   ],
+   [
+    202107,
+    37910,
+    3.921129
+   ],
+   [
+    202108,
+    32958,
+    3.855634
+   ],
+   [
+    202109,
+    27254,
+    3.814559
+   ],
+   [
+    202110,
+    26526,
+    3.784363
+   ],
+   [
+    202111,
+    26489,
+    3.798067
+   ],
+   [
+    202112,
+    37384,
+    3.835946
+   ],
+   [
+    202201,
+    44649,
+    3.932048
+   ],
+   [
+    202202,
+    31544,
+    3.824499
+   ],
+   [
+    202203,
+    34924,
+    3.844863
+   ],
+   [
+    202204,
+    30705,
+    3.875134
+   ],
+   [
+    202205,
+    27719,
+    3.83293
+   ],
+   [
+    202206,
+    26120,
+    3.802335
+   ],
+   [
+    202207,
+    31372,
+    3.834279
+   ],
+   [
+    202208,
+    34054,
+    3.858754
+   ],
+   [
+    202209,
+    30874,
+    3.867753
+   ],
+   [
+    202210,
+    31737,
+    3.935785
+   ],
+   [
+    202211,
+    33905,
+    3.930394
+   ],
+   [
+    202212,
+    41543,
+    3.921647
+   ],
+   [
+    202301,
+    46477,
+    4.006778
+   ],
+   [
+    202302,
+    33121,
+    3.878838
+   ],
+   [
+    202303,
+    38240,
+    3.942286
+   ],
+   [
+    202304,
+    24347,
+    3.903807
+   ],
+   [
+    202305,
+    14508,
+    3.871381
+   ],
+   [
+    202306,
+    9685,
+    3.854414
+   ],
+   [
+    202307,
+    8322,
+    3.965753
+   ],
+   [
+    202308,
+    5456,
+    4.013013
+   ],
+   [
+    202309,
+    358,
+    4.097765
+   ]
+  ],
+  "join_top": [
+   [
+    "B01N3ASPNV",
+    "amFilm Tempered Glass Screen Protector for Nintendo Switch 2017 (2-Pack)",
+    18105
+   ],
+   [
+    "B0BN942894",
+    "BENGOO Stereo Pro Gaming Headset for PS4, PC, Xbox One Controller, Noise Cancelling Over Ear Headphones with Mic, LED Light, Bass Surround, Soft Memory Earmuffs for Laptop Mac Wii Accessory Kits",
+    17310
+   ],
+   [
+    "B077GG9D5D",
+    "DualShock 4 Wireless Controller for PlayStation 4 - Jet Black",
+    15594
+   ],
+   [
+    "B000N5Z2L4",
+    "Xbox Live Gold: 1 Month Membership [Digital Code]",
+    13329
+   ],
+   [
+    "B0086VPUHI",
+    "Grand Theft Auto V: Premium Edition - Xbox One [Digital Code]",
+    12100
+   ],
+   [
+    "B004RMK5QG",
+    "PlayStation Plus: 12 Month Membership [Digital Code]",
+    10256
+   ],
+   [
+    "B07YBXFDYN",
+    "Skyrim VR - PlayStation 4",
+    9430
+   ],
+   [
+    "B00BGA9WK2",
+    "PlayStation 4 500GB Console [Old Model][Discontinued]",
+    8089
+   ],
+   [
+    "B07V8YSBFG",
+    "Roblox Digital Gift Code for 1,200 Robux [Redeem Worldwide - Includes Exclusive Virtual Item] [Online Game Code]",
+    7844
+   ],
+   [
+    "B07CRX5X9T",
+    "UtechSmart Venus Pro RGB Wireless MMO Gaming Mouse, 16,000 DPI Optical Sensor, 2.4 GHz Transmission Technology, Ergonomic Design, 16M Chroma RGB Lighting, 16 programmable Buttons, Up to 70 Hours",
+    7570
+   ]
+  ],
+  "join_user": [
+   [
+    "B073SC6V1D",
+    "havit Gaming Keyboard and Mouse Combo, Backlit Computer keyboards and RGB Gaming Mouse, Gaming Accessories 104 Keys PC Gaming Keyboard with DPI 4800 Mouse for Gamer, Black",
+    2,
+    1648663437070
+   ],
+   [
+    "B07WJ6WP3G",
+    "Redragon S101 Wired RGB Backlit Gaming Keyboard and Mouse, Gaming Mouse Pad, Gaming Headset Combo All in 1 PC Gamer Bundle for Windows PC \u2013 (Black)",
+    5,
+    1516246131047
+   ],
+   [
+    "B01MYXNB7G",
+    "8-Bit HD Entertainment System - Compatible with NES Games - HDMI output",
+    5,
+    1514507989159
+   ]
+  ]
+ },
+ "page": {
+  "category": "Accessories",
+  "price": [
+   7.99,
+   89.99
+  ],
+  "0": {
+   "n": 4052,
+   "p50_ms": 1.2054710000484192,
+   "p90_ms": 1.2851348995354783,
+   "p99_ms": 1.717309160103464,
+   "mean_ms": 1.2312280952600054,
+   "qps": 810.3827130781453,
+   "threads": 1,
+   "errors": 0
+  },
+  "100": {
+   "n": 5406,
+   "p50_ms": 0.9075430002667417,
+   "p90_ms": 0.9529965000183438,
+   "p99_ms": 1.2259599996013997,
+   "mean_ms": 0.9221769774390834,
+   "qps": 1081.1887632051323,
+   "threads": 1,
+   "errors": 0
+  },
+  "1000": {
+   "n": 4115,
+   "p50_ms": 1.196234000417462,
+   "p90_ms": 1.247381199755182,
+   "p99_ms": 1.7918503196233362,
+   "mean_ms": 1.2123981035407028,
+   "qps": 822.8437819560514,
+   "threads": 1,
+   "errors": 0
+  },
+  "10000": {
+   "n": 1447,
+   "p50_ms": 3.4234920003655134,
+   "p90_ms": 3.5270830005174503,
+   "p99_ms": 5.203037679966656,
+   "mean_ms": 3.4534887546518616,
+   "qps": 289.29456433956403,
+   "threads": 1,
+   "errors": 0
+  }
+ },
+ "aggregate": {
+  "brand": {
+   "n": 104,
+   "p50_ms": 48.06904750012109,
+   "p90_ms": 49.5500858000014,
+   "p99_ms": 54.17305903029046,
+   "mean_ms": 48.50299322117735,
+   "qps": 20.614710234782965,
+   "threads": 1,
+   "errors": 0
+  },
+  "month": {
+   "n": 6,
+   "p50_ms": 859.1840540002522,
+   "p90_ms": 861.258646999886,
+   "p99_ms": 861.8987836999622,
+   "mean_ms": 859.3277621665342,
+   "qps": 1.1636891667447204,
+   "threads": 1,
+   "errors": 0
+  }
+ },
+ "join": {
+  "top": {
+   "n": 12,
+   "p50_ms": 441.8628555004034,
+   "p90_ms": 452.27738890034743,
+   "p99_ms": 454.7301926201271,
+   "mean_ms": 440.9230859166655,
+   "qps": 2.2679294897979707,
+   "threads": 1,
+   "errors": 0
+  },
+  "user": {
+   "n": 7997,
+   "p50_ms": 0.5925169998590718,
+   "p90_ms": 0.7011014000454451,
+   "p99_ms": 1.0848896399329533,
+   "mean_ms": 0.6214414774223342,
+   "qps": 1599.313501448971,
+   "threads": 1,
+   "errors": 0
+  }
+ },
+ "insert": {
+  "one_per_txn": {
+   "n": 31086,
+   "p50_ms": 0.14909350056768744,
+   "p90_ms": 0.17528899979879498,
+   "p99_ms": 0.2918865001447558,
+   "mean_ms": 0.1596576127818706,
+   "qps": 6217.032949568821,
+   "threads": 1,
+   "errors": 0,
+   "rows_per_s": 6263.4031824478825
+  },
+  "1000_per_txn": {
+   "rows": 20000,
+   "rows_per_s": 108627.96160423117
+  },
+  "visible": true
+ },
+ "update": {
+  "price_stock": {
+   "n": 11237,
+   "p50_ms": 0.4161399992881343,
+   "p90_ms": 0.5234114001723356,
+   "p99_ms": 0.6830703605010058,
+   "mean_ms": 0.44084813535533496,
+   "qps": 2247.24693551671,
+   "threads": 1,
+   "errors": 0,
+   "rows_per_s": 2268.354836510705
+  },
+  "counter": {
+   "n": 11765,
+   "p50_ms": 0.43294400074955774,
+   "p90_ms": 0.46260579947556835,
+   "p99_ms": 0.590791239883402,
+   "mean_ms": 0.4213423338769969,
+   "qps": 2352.8965930182703,
+   "threads": 1,
+   "errors": 0,
+   "rows_per_s": 2373.367021534398,
+   "counted_right": true
+  }
+ },
+ "delete": {
+  "by_id": {
+   "n": 21092,
+   "p50_ms": 0.1350295001429913,
+   "p90_ms": 0.15401049977299408,
+   "p99_ms": 0.24616857976070614,
+   "mean_ms": 0.14115816157604458,
+   "qps": 7030.488371138405,
+   "threads": 1,
+   "errors": 0,
+   "rows_per_s": 7084.252081742231
+  },
+  "by_range": {
+   "n": 10,
+   "p50_ms": 17.789016500046273,
+   "p90_ms": 34.601421199749886,
+   "p99_ms": 51.66255002029175,
+   "mean_ms": 22.16624900001989,
+   "rows": 7930,
+   "ranges": 10
+  }
+ },
+ "mixed": {
+  "reads": {
+   "n": 28865,
+   "p50_ms": 0.32265400022879476,
+   "p90_ms": 5.7143760001054025,
+   "p99_ms": 8.133261479779321,
+   "mean_ms": 1.3844456312508504,
+   "qps": 2885.39131493301
+  },
+  "writes": {
+   "n": 16334,
+   "p50_ms": 0.5901839995203773,
+   "p90_ms": 0.818157200319547,
+   "p99_ms": 1.1114251202889136,
+   "mean_ms": 0.6107420610998202,
+   "qps": 1632.7726221415483
+  },
+  "errors": 0,
+  "first_error": null
+ },
+ "footprint": {
+  "bytes_after_load": 3352752144,
+  "bytes_after_writes": 3354284859,
+  "bytes_after_10pct_updated": 3353092764,
+  "update_10pct_seconds": 0.29387857199981227,
+  "rss_bytes": 2664681472
+ },
+ "params": {
+  "seconds": 5.0,
+  "batch": 10000
+ }
+}

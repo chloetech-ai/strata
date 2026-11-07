@@ -1,0 +1,1 @@
+{"docs": 1000000, "queries": 1000, "dim": 768, "source": "msmarco-v2.1 segmented + snowflake-arctic-embed-m-v1.5", "shards": [{"shard": 0, "rows": 1000000}], "attrs": "v1", "categories": "independent", "heldout": 0}

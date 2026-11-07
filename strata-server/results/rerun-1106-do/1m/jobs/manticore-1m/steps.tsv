@@ -1,0 +1,6 @@
+1	ok	1793956307	1793956319	up manticore
+2	ok	1793956319	1793958122	load manticore
+3	ok	1793958122	1793958507	run manticore
+4	ok	1793958507	1793958888	run manticore --label manticore-pass2
+5	ok	1793958888	1793959270	run manticore --label manticore-pass3
+6	ok	1793959270	1793959272	down manticore

@@ -73,6 +73,7 @@ A statement is parsed and bound into a predicate tree and a scorer; the planner 
 
 | question | answer |
 |---|---|
+| How does it compare with search engines? | First of 14 engines on places summed over 45 tests (MS MARCO 1M on DigitalOcean, main of 6 November): Strata **137**, Solr 288, Elasticsearch 292, Qdrant 300. Behind on typo search and key lookups. [The benchmarks](site/benchmarks.html) |
 | Is Strata fast? | Warm BM25 **1.7–3.2×** faster than Tantivy, and 24 of 28 text and filter comparisons won; vector top-10 in **0.05–0.10 ms** at recall@10 0.99 on Quora. |
 | Does the planner earn its keep? | On filtered vector search it is **1.8–6.1×** faster than the best fixed strategy, at recall@10 0.991–0.998. |
 | Do graph edges help search? | Following the citations of the two nearest papers doubles nDCG@20 on arXiv (0.123 → 0.253). |
@@ -140,6 +141,6 @@ Each project also has a long-form report with interactive charts, formulas and e
 
 ## Where the numbers come from
 
-Every figure on these pages comes from the experiments committed in this repository (`*/results/`). The timings were measured on a MacBook Air with an Apple M2 (8 cores, 24 GB), replacing earlier runs on a 4-core cloud VM; the runs that call a model are the original ones. [Reproducing the results](reproduce.md) compares the two machines and has the commands.
+Every figure on these pages comes from the experiments committed in this repository (`*/results/`). The timings were measured on a MacBook Air with an Apple M2 (8 cores, 24 GB), replacing earlier runs on a 4-core cloud VM; the runs that call a model are the original ones. The comparisons with other engines ran on DigitalOcean, and [each report](site/benchmarks.html) names its machines. [Reproducing the results](reproduce.md) compares the two machines and has the commands.
 
 The repository was called `rkonow/engram`, and this site `rkonow.github.io/engram`, until October 2026.

@@ -1,0 +1,4 @@
+Cloud container (claude.ai/code), 4 cores: Intel(R) Xeon(R) Processor @ 2.10GHz, 15 GB RAM
+Linux 6.18.44-fc-v242
+strata-server built with cargo build --release: "then" at 9b3ed9b (#273's head; the server code is the same as 234054e, which the first run measured), "now" at b022e39 (main on 6 November)
+Server and the 4 client processes share the 4 cores; durable commits (fdatasync on each commit).

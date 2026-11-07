@@ -1,0 +1,219 @@
+service/manticore created
+pod/manticore-0 created
+pod/manticore-0 condition met
+job.batch/load-manticore created
+manticore: index created in 0.0 s
+manticore: 25000 documents sent, 9 s
+manticore: 50000 documents sent, 19 s
+manticore: 75000 documents sent, 29 s
+manticore: 100000 documents sent, 40 s
+manticore: 125000 documents sent, 53 s
+manticore: 150000 documents sent, 66 s
+manticore: 175000 documents sent, 81 s
+manticore: 200000 documents sent, 94 s
+manticore: 225000 documents sent, 108 s
+manticore: 250000 documents sent, 122 s
+manticore: 275000 documents sent, 139 s
+manticore: 300000 documents sent, 154 s
+manticore: 325000 documents sent, 170 s
+manticore: 350000 documents sent, 183 s
+manticore: 375000 documents sent, 200 s
+manticore: 400000 documents sent, 214 s
+manticore: 425000 documents sent, 230 s
+manticore: 450000 documents sent, 243 s
+manticore: 475000 documents sent, 257 s
+manticore: 500000 documents sent, 272 s
+manticore: 525000 documents sent, 288 s
+manticore: 550000 documents sent, 304 s
+manticore: 575000 documents sent, 320 s
+manticore: 600000 documents sent, 334 s
+manticore: 625000 documents sent, 350 s
+manticore: 650000 documents sent, 363 s
+manticore: 675000 documents sent, 377 s
+manticore: 700000 documents sent, 393 s
+manticore: 725000 documents sent, 408 s
+manticore: 750000 documents sent, 424 s
+manticore: 775000 documents sent, 438 s
+manticore: 800000 documents sent, 452 s
+manticore: 825000 documents sent, 468 s
+manticore: 850000 documents sent, 481 s
+manticore: 875000 documents sent, 494 s
+manticore: 900000 documents sent, 509 s
+manticore: 925000 documents sent, 524 s
+manticore: 950000 documents sent, 539 s
+manticore: 975000 documents sent, 553 s
+manticore: 1000000 documents sent, 568 s
+manticore: 1000000 documents (10.8 GB) sent in 567.8 s
+manticore: flush_s in 3.7 s
+manticore: merge_s in 1217.1 s
+manticore: indexed 1220.8 s after the last write; 1788.6 s in all
+wrote /data/compare/load-manticore.json
+job.batch/run-manticore created
+manticore bm25                     warm-up: p50 11.997, 12.604 ms
+manticore bm25                     c=1        144 q/s  p50   5.318 ms  p90  15.728 ms  p99  29.844 ms  errors 0
+manticore bm25                     c=4        184 q/s  p50  11.632 ms  p90  53.754 ms  p99 137.147 ms  errors 0
+manticore bm25                     c=16       177 q/s  p50  39.496 ms  p90 323.625 ms  p99 746.895 ms  errors 0
+manticore bm25 + filter            warm-up: p50 11.112, 12.105 ms
+manticore bm25 + filter            c=1        163 q/s  p50   6.372 ms  p90  10.368 ms  p99  16.132 ms  errors 0
+manticore bm25 + filter            c=4        245 q/s  p50  11.721 ms  p90  35.088 ms  p99  75.618 ms  errors 0
+manticore bm25 + filter            c=16       239 q/s  p50  40.829 ms  p90  79.117 ms  p99 1069.300 ms  errors 0
+manticore vector                   warm-up: p50 1.475, 1.477 ms
+manticore vector                   c=1        617 q/s  p50   1.547 ms  p90   2.173 ms  p99   2.644 ms  errors 0
+manticore vector                   c=4       2629 q/s  p50   1.473 ms  p90   1.887 ms  p99   2.662 ms  errors 0
+manticore vector                   c=16      5207 q/s  p50   2.658 ms  p90   3.249 ms  p99  16.003 ms  errors 0
+manticore vector + filter          warm-up: p50 11.576, 11.572 ms
+manticore vector + filter          c=1         98 q/s  p50  10.183 ms  p90  11.465 ms  p99  12.672 ms  errors 0
+manticore vector + filter          c=4        338 q/s  p50  11.486 ms  p90  14.758 ms  p99  16.972 ms  errors 0
+manticore vector + filter          c=16       489 q/s  p50  30.327 ms  p90  42.211 ms  p99  47.361 ms  errors 0
+manticore hybrid (RRF)             warm-up: p50 18.384, 18.372 ms
+manticore hybrid (RRF)             c=1         45 q/s  p50  14.419 ms  p90  55.256 ms  p99 114.130 ms  errors 0
+manticore hybrid (RRF)             c=4        141 q/s  p50  17.366 ms  p90  68.082 ms  p99 151.701 ms  errors 0
+manticore hybrid (RRF)             c=16       172 q/s  p50  77.409 ms  p90 158.355 ms  p99 338.478 ms  errors 0
+manticore hybrid (weighted)        unavailable: its hybrid search fuses by RRF only (fusion_method='rrf')
+manticore boosted (bm25 × decay)   warm-up: p50 11.712, 13.072, 13.378 ms
+manticore boosted (bm25 × decay)   c=1        132 q/s  p50   5.809 ms  p90  17.203 ms  p99  32.262 ms  errors 0
+manticore boosted (bm25 × decay)   c=4        166 q/s  p50  14.117 ms  p90  57.019 ms  p99 142.671 ms  errors 0
+manticore boosted (bm25 × decay)   c=16       162 q/s  p50  43.870 ms  p90 353.935 ms  p99 722.457 ms  errors 0
+manticore facet                    warm-up: p50 2.127, 2.075 ms
+manticore facet                    c=1        407 q/s  p50   1.860 ms  p90   4.727 ms  p99   8.261 ms  errors 0
+manticore facet                    c=4       1009 q/s  p50   2.132 ms  p90   8.756 ms  p99  28.268 ms  errors 0
+manticore facet                    c=16      1211 q/s  p50   7.734 ms  p90  24.315 ms  p99  53.052 ms  errors 0
+manticore key lookup               warm-up: p50 0.569, 0.569 ms
+manticore key lookup               c=1       1651 q/s  p50   0.534 ms  p90   0.956 ms  p99   1.207 ms  errors 0
+manticore key lookup               c=4       6792 q/s  p50   0.570 ms  p90   0.674 ms  p99   0.890 ms  errors 0
+manticore key lookup               c=16     20764 q/s  p50   0.704 ms  p90   0.924 ms  p99   2.165 ms  errors 0
+manticore phrase                   warm-up: p50 2.616, 2.678 ms
+manticore phrase                   c=1        459 q/s  p50   1.799 ms  p90   3.879 ms  p99   8.268 ms  errors 0
+manticore phrase                   c=4        893 q/s  p50   2.638 ms  p90   9.907 ms  p99  23.407 ms  errors 0
+manticore phrase                   c=16       855 q/s  p50  14.776 ms  p90  34.329 ms  p99  72.062 ms  errors 0
+manticore typo                     warm-up: p50 59.829, 61.470 ms
+manticore typo                     c=1         19 q/s  p50  45.710 ms  p90  88.011 ms  p99 125.232 ms  errors 0
+manticore typo                     c=4         59 q/s  p50  62.492 ms  p90 112.684 ms  p99 167.524 ms  errors 0
+manticore typo                     c=16        78 q/s  p50 183.876 ms  p90 312.883 ms  p99 552.937 ms  errors 0
+manticore prefix                   warm-up: p50 29.377, 25.235, 24.077 ms
+manticore prefix                   c=1         53 q/s  p50  12.472 ms  p90  39.319 ms  p99 151.614 ms  errors 0
+manticore prefix                   c=4         61 q/s  p50  31.576 ms  p90 120.550 ms  p99 409.702 ms  errors 0
+manticore prefix                   c=16        65 q/s  p50  80.168 ms  p90 550.133 ms  p99 2695.362 ms  errors 0
+manticore similar items            warm-up: p50 3.633, 3.549 ms
+manticore similar items            c=1        281 q/s  p50   3.574 ms  p90   5.044 ms  p99   5.885 ms  errors 0
+manticore similar items            c=4       1042 q/s  p50   3.820 ms  p90   5.621 ms  p99   7.130 ms  errors 0
+manticore similar items            c=16      1746 q/s  p50   8.135 ms  p90  11.781 ms  p99  24.497 ms  errors 0
+manticore sql aggregate            warm-up: p50 82.034, 88.785 ms
+manticore sql aggregate            c=1         30 q/s  p50  32.623 ms  p90  48.458 ms  p99  57.655 ms  errors 0
+manticore sql aggregate            c=4         34 q/s  p50  85.107 ms  p90 259.637 ms  p99 346.281 ms  errors 0
+manticore sql aggregate            c=16        39 q/s  p50 395.905 ms  p90 616.505 ms  p99 772.768 ms  errors 0
+manticore result cache: {"after":{"http://manticore-0.manticore:9308":[{"Counter":"qcache_max_bytes","Value":"0"},{"Counter":"qcache_thresh_msec","Value":"3000"},{"Counter":"qcache_ttl_sec","Value":"60"},{"Counter":"qcache_cached_queries","Value":"0"},{"Counter":"qcache_used_bytes","Value":"0"},{"Counter":"qcache_hits","Value":"0"}]},"before":{"http://manticore-0.manticore:9308":[{"Counter":"qcache_max_bytes","Value":"0"},{"Counter":"qcache_thresh_msec","Value":"3000"},{"Counter":"qcache_ttl_sec","Value":"60"},{"Counter":"qcache_cached_queries","Value":"0"},{"Counter":"qcache_used_bytes","Value":"0"},{"Counter":"qcache_hits","Value":"0"}]}}
+wrote /data/compare/run-manticore.json
+job.batch/run-manticore-pass2 created
+manticore-pass2 bm25                     warm-up: p50 12.976, 13.066 ms
+manticore-pass2 bm25                     c=1        145 q/s  p50   5.207 ms  p90  15.940 ms  p99  30.145 ms  errors 0
+manticore-pass2 bm25                     c=4        181 q/s  p50  12.457 ms  p90  53.238 ms  p99 130.293 ms  errors 0
+manticore-pass2 bm25                     c=16       177 q/s  p50  39.139 ms  p90 337.082 ms  p99 718.857 ms  errors 0
+manticore-pass2 bm25 + filter            warm-up: p50 12.215, 12.289 ms
+manticore-pass2 bm25 + filter            c=1        160 q/s  p50   6.346 ms  p90  10.527 ms  p99  16.669 ms  errors 0
+manticore-pass2 bm25 + filter            c=4        242 q/s  p50  11.793 ms  p90  36.793 ms  p99  72.643 ms  errors 0
+manticore-pass2 bm25 + filter            c=16       231 q/s  p50  41.948 ms  p90  79.505 ms  p99 1091.225 ms  errors 0
+manticore-pass2 vector                   warm-up: p50 1.554, 1.557 ms
+manticore-pass2 vector                   c=1        728 q/s  p50   1.366 ms  p90   1.651 ms  p99   1.979 ms  errors 0
+manticore-pass2 vector                   c=4       2591 q/s  p50   1.501 ms  p90   1.916 ms  p99   2.641 ms  errors 0
+manticore-pass2 vector                   c=16      5012 q/s  p50   2.763 ms  p90   3.411 ms  p99  15.176 ms  errors 0
+manticore-pass2 vector + filter          warm-up: p50 11.496, 11.614 ms
+manticore-pass2 vector + filter          c=1         96 q/s  p50  10.409 ms  p90  11.702 ms  p99  12.906 ms  errors 0
+manticore-pass2 vector + filter          c=4        331 q/s  p50  11.735 ms  p90  14.955 ms  p99  17.139 ms  errors 0
+manticore-pass2 vector + filter          c=16       486 q/s  p50  30.802 ms  p90  41.955 ms  p99  48.312 ms  errors 0
+manticore-pass2 hybrid (RRF)             warm-up: p50 18.625, 20.382 ms
+manticore-pass2 hybrid (RRF)             c=1         45 q/s  p50  14.953 ms  p90  55.677 ms  p99 111.263 ms  errors 0
+manticore-pass2 hybrid (RRF)             c=4        137 q/s  p50  17.884 ms  p90  71.460 ms  p99 150.311 ms  errors 0
+manticore-pass2 hybrid (RRF)             c=16       172 q/s  p50  77.232 ms  p90 163.772 ms  p99 345.946 ms  errors 0
+manticore-pass2 hybrid (weighted)        unavailable: its hybrid search fuses by RRF only (fusion_method='rrf')
+manticore-pass2 boosted (bm25 × decay)   warm-up: p50 13.482, 13.097 ms
+manticore-pass2 boosted (bm25 × decay)   c=1        132 q/s  p50   5.693 ms  p90  17.055 ms  p99  33.413 ms  errors 0
+manticore-pass2 boosted (bm25 × decay)   c=4        166 q/s  p50  13.268 ms  p90  56.685 ms  p99 163.823 ms  errors 0
+manticore-pass2 boosted (bm25 × decay)   c=16       162 q/s  p50  43.352 ms  p90 360.023 ms  p99 759.805 ms  errors 0
+manticore-pass2 facet                    warm-up: p50 2.115, 2.103 ms
+manticore-pass2 facet                    c=1        413 q/s  p50   1.854 ms  p90   4.650 ms  p99   7.849 ms  errors 0
+manticore-pass2 facet                    c=4        999 q/s  p50   2.121 ms  p90   8.841 ms  p99  27.636 ms  errors 0
+manticore-pass2 facet                    c=16      1185 q/s  p50   7.689 ms  p90  25.482 ms  p99  54.461 ms  errors 0
+manticore-pass2 key lookup               warm-up: p50 0.569, 0.572 ms
+manticore-pass2 key lookup               c=1       1715 q/s  p50   0.535 ms  p90   0.674 ms  p99   1.152 ms  errors 0
+manticore-pass2 key lookup               c=4       6874 q/s  p50   0.563 ms  p90   0.662 ms  p99   0.893 ms  errors 0
+manticore-pass2 key lookup               c=16     20602 q/s  p50   0.711 ms  p90   0.933 ms  p99   1.961 ms  errors 0
+manticore-pass2 phrase                   warm-up: p50 2.774, 2.685 ms
+manticore-pass2 phrase                   c=1        456 q/s  p50   1.770 ms  p90   3.954 ms  p99   8.640 ms  errors 0
+manticore-pass2 phrase                   c=4        881 q/s  p50   2.770 ms  p90   9.928 ms  p99  24.280 ms  errors 0
+manticore-pass2 phrase                   c=16       852 q/s  p50  13.624 ms  p90  35.672 ms  p99  71.435 ms  errors 0
+manticore-pass2 typo                     warm-up: p50 60.597, 60.901 ms
+manticore-pass2 typo                     c=1         20 q/s  p50  45.544 ms  p90  87.104 ms  p99 124.209 ms  errors 0
+manticore-pass2 typo                     c=4         59 q/s  p50  62.174 ms  p90 111.286 ms  p99 161.501 ms  errors 0
+manticore-pass2 typo                     c=16        79 q/s  p50 182.797 ms  p90 289.018 ms  p99 553.028 ms  errors 0
+manticore-pass2 prefix                   warm-up: p50 29.151, 27.509 ms
+manticore-pass2 prefix                   c=1         53 q/s  p50  11.896 ms  p90  38.190 ms  p99 144.266 ms  errors 0
+manticore-pass2 prefix                   c=4         64 q/s  p50  29.792 ms  p90 114.038 ms  p99 496.796 ms  errors 0
+manticore-pass2 prefix                   c=16        64 q/s  p50  80.319 ms  p90 538.043 ms  p99 2682.442 ms  errors 0
+manticore-pass2 similar items            warm-up: p50 3.595, 3.517 ms
+manticore-pass2 similar items            c=1        275 q/s  p50   3.658 ms  p90   5.076 ms  p99   6.074 ms  errors 0
+manticore-pass2 similar items            c=4       1116 q/s  p50   3.560 ms  p90   5.219 ms  p99   6.851 ms  errors 0
+manticore-pass2 similar items            c=16      1890 q/s  p50   7.475 ms  p90  10.637 ms  p99  23.765 ms  errors 0
+manticore-pass2 sql aggregate            warm-up: p50 75.360, 84.313, 86.191 ms
+manticore-pass2 sql aggregate            c=1         31 q/s  p50  32.037 ms  p90  48.786 ms  p99  53.023 ms  errors 0
+manticore-pass2 sql aggregate            c=4         36 q/s  p50  81.111 ms  p90 253.312 ms  p99 328.527 ms  errors 0
+manticore-pass2 sql aggregate            c=16        41 q/s  p50 370.297 ms  p90 578.939 ms  p99 712.748 ms  errors 0
+manticore-pass2 result cache: {"after":{"http://manticore-0.manticore:9308":[{"Counter":"qcache_max_bytes","Value":"0"},{"Counter":"qcache_thresh_msec","Value":"3000"},{"Counter":"qcache_ttl_sec","Value":"60"},{"Counter":"qcache_cached_queries","Value":"0"},{"Counter":"qcache_used_bytes","Value":"0"},{"Counter":"qcache_hits","Value":"0"}]},"before":{"http://manticore-0.manticore:9308":[{"Counter":"qcache_max_bytes","Value":"0"},{"Counter":"qcache_thresh_msec","Value":"3000"},{"Counter":"qcache_ttl_sec","Value":"60"},{"Counter":"qcache_cached_queries","Value":"0"},{"Counter":"qcache_used_bytes","Value":"0"},{"Counter":"qcache_hits","Value":"0"}]}}
+wrote /data/compare/run-manticore-pass2.json
+job.batch/run-manticore-pass3 created
+manticore-pass3 bm25                     warm-up: p50 11.937, 12.118 ms
+manticore-pass3 bm25                     c=1        144 q/s  p50   5.131 ms  p90  15.750 ms  p99  31.631 ms  errors 0
+manticore-pass3 bm25                     c=4        180 q/s  p50  12.375 ms  p90  50.606 ms  p99 136.907 ms  errors 0
+manticore-pass3 bm25                     c=16       176 q/s  p50  41.270 ms  p90 331.605 ms  p99 756.916 ms  errors 0
+manticore-pass3 bm25 + filter            warm-up: p50 11.343, 11.818 ms
+manticore-pass3 bm25 + filter            c=1        158 q/s  p50   6.542 ms  p90  10.521 ms  p99  16.835 ms  errors 0
+manticore-pass3 bm25 + filter            c=4        241 q/s  p50  12.023 ms  p90  34.523 ms  p99  74.016 ms  errors 0
+manticore-pass3 bm25 + filter            c=16       236 q/s  p50  41.328 ms  p90  79.258 ms  p99 1114.713 ms  errors 0
+manticore-pass3 vector                   warm-up: p50 1.496, 1.489 ms
+manticore-pass3 vector                   c=1        637 q/s  p50   1.481 ms  p90   2.134 ms  p99   2.621 ms  errors 0
+manticore-pass3 vector                   c=4       2571 q/s  p50   1.508 ms  p90   1.942 ms  p99   2.720 ms  errors 0
+manticore-pass3 vector                   c=16      5051 q/s  p50   2.739 ms  p90   3.354 ms  p99  15.921 ms  errors 0
+manticore-pass3 vector + filter          warm-up: p50 11.999, 11.688 ms
+manticore-pass3 vector + filter          c=1         97 q/s  p50  10.344 ms  p90  11.580 ms  p99  12.783 ms  errors 0
+manticore-pass3 vector + filter          c=4        335 q/s  p50  11.666 ms  p90  14.765 ms  p99  17.207 ms  errors 0
+manticore-pass3 vector + filter          c=16       485 q/s  p50  30.258 ms  p90  43.559 ms  p99  47.928 ms  errors 0
+manticore-pass3 hybrid (RRF)             warm-up: p50 18.370, 18.099 ms
+manticore-pass3 hybrid (RRF)             c=1         45 q/s  p50  15.008 ms  p90  56.285 ms  p99 113.752 ms  errors 0
+manticore-pass3 hybrid (RRF)             c=4        139 q/s  p50  17.924 ms  p90  67.177 ms  p99 179.905 ms  errors 0
+manticore-pass3 hybrid (RRF)             c=16       171 q/s  p50  77.812 ms  p90 160.601 ms  p99 353.336 ms  errors 0
+manticore-pass3 hybrid (weighted)        unavailable: its hybrid search fuses by RRF only (fusion_method='rrf')
+manticore-pass3 boosted (bm25 × decay)   warm-up: p50 13.457, 12.320 ms
+manticore-pass3 boosted (bm25 × decay)   c=1        134 q/s  p50   5.660 ms  p90  16.950 ms  p99  31.787 ms  errors 0
+manticore-pass3 boosted (bm25 × decay)   c=4        166 q/s  p50  14.237 ms  p90  55.890 ms  p99 143.360 ms  errors 0
+manticore-pass3 boosted (bm25 × decay)   c=16       162 q/s  p50  44.830 ms  p90 354.694 ms  p99 726.187 ms  errors 0
+manticore-pass3 facet                    warm-up: p50 2.115, 2.130 ms
+manticore-pass3 facet                    c=1        401 q/s  p50   1.907 ms  p90   4.769 ms  p99   8.247 ms  errors 0
+manticore-pass3 facet                    c=4       1000 q/s  p50   2.109 ms  p90   8.960 ms  p99  27.798 ms  errors 0
+manticore-pass3 facet                    c=16      1186 q/s  p50   7.894 ms  p90  24.799 ms  p99  52.671 ms  errors 0
+manticore-pass3 key lookup               warm-up: p50 0.566, 0.566 ms
+manticore-pass3 key lookup               c=1       1697 q/s  p50   0.532 ms  p90   0.809 ms  p99   1.154 ms  errors 0
+manticore-pass3 key lookup               c=4       6763 q/s  p50   0.571 ms  p90   0.675 ms  p99   0.905 ms  errors 0
+manticore-pass3 key lookup               c=16     20514 q/s  p50   0.709 ms  p90   0.930 ms  p99   2.468 ms  errors 0
+manticore-pass3 phrase                   warm-up: p50 2.787, 2.777 ms
+manticore-pass3 phrase                   c=1        452 q/s  p50   1.783 ms  p90   3.992 ms  p99   7.943 ms  errors 0
+manticore-pass3 phrase                   c=4        879 q/s  p50   2.699 ms  p90  10.256 ms  p99  23.770 ms  errors 0
+manticore-pass3 phrase                   c=16       850 q/s  p50  14.714 ms  p90  36.578 ms  p99  74.074 ms  errors 0
+manticore-pass3 typo                     warm-up: p50 61.459, 59.367 ms
+manticore-pass3 typo                     c=1         20 q/s  p50  46.879 ms  p90  86.456 ms  p99 121.981 ms  errors 0
+manticore-pass3 typo                     c=4         59 q/s  p50  63.431 ms  p90 112.567 ms  p99 167.265 ms  errors 0
+manticore-pass3 typo                     c=16        79 q/s  p50 174.093 ms  p90 306.763 ms  p99 692.067 ms  errors 0
+manticore-pass3 prefix                   warm-up: p50 30.324, 27.025, 27.646 ms
+manticore-pass3 prefix                   c=1         53 q/s  p50  11.985 ms  p90  38.588 ms  p99 149.505 ms  errors 0
+manticore-pass3 prefix                   c=4         60 q/s  p50  27.897 ms  p90 119.188 ms  p99 911.126 ms  errors 0
+manticore-pass3 prefix                   c=16        65 q/s  p50  78.871 ms  p90 524.976 ms  p99 2491.449 ms  errors 0
+manticore-pass3 similar items            warm-up: p50 3.755, 3.665 ms
+manticore-pass3 similar items            c=1        286 q/s  p50   3.499 ms  p90   4.951 ms  p99   5.758 ms  errors 0
+manticore-pass3 similar items            c=4       1093 q/s  p50   3.672 ms  p90   5.334 ms  p99   6.624 ms  errors 0
+manticore-pass3 similar items            c=16      1884 q/s  p50   7.725 ms  p90  13.844 ms  p99  19.046 ms  errors 0
+manticore-pass3 sql aggregate            warm-up: p50 83.300, 88.355 ms
+manticore-pass3 sql aggregate            c=1         31 q/s  p50  32.801 ms  p90  47.667 ms  p99  54.190 ms  errors 0
+manticore-pass3 sql aggregate            c=4         35 q/s  p50  78.795 ms  p90 275.637 ms  p99 323.185 ms  errors 0
+manticore-pass3 sql aggregate            c=16        41 q/s  p50 391.439 ms  p90 602.726 ms  p99 753.379 ms  errors 0
+manticore-pass3 result cache: {"after":{"http://manticore-0.manticore:9308":[{"Counter":"qcache_max_bytes","Value":"0"},{"Counter":"qcache_thresh_msec","Value":"3000"},{"Counter":"qcache_ttl_sec","Value":"60"},{"Counter":"qcache_cached_queries","Value":"0"},{"Counter":"qcache_used_bytes","Value":"0"},{"Counter":"qcache_hits","Value":"0"}]},"before":{"http://manticore-0.manticore:9308":[{"Counter":"qcache_max_bytes","Value":"0"},{"Counter":"qcache_thresh_msec","Value":"3000"},{"Counter":"qcache_ttl_sec","Value":"60"},{"Counter":"qcache_cached_queries","Value":"0"},{"Counter":"qcache_used_bytes","Value":"0"},{"Counter":"qcache_hits","Value":"0"}]}}
+wrote /data/compare/run-manticore-pass3.json
+pod "manticore-0" deleted from manticore-1m namespace

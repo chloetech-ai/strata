@@ -38,7 +38,7 @@
   <section class="gutter" id="app-search"><div class="wrap block">
     <div class="uc2">
       <div><span class="ico text"><svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="5"/><circle cx="15.5" cy="11.5" r="2"/><path d="m17 13 1.6 1.6"/></svg></span><h2>Search inside an app</h2><p>A store, a notes app or a help center: typos, facets and hybrid search on the rows the app already keeps, with no second service.</p>
-        <dl class="kv"><dt>Replaces</dt><dd>SQLite with FTS5, or a database plus Elasticsearch</dd><dt>Measured</dt><dd>Hybrid search 1.9–23× faster than SQLite, DuckDB or LanceDB (<a href="bench-embedded.html">no server</a>)</dd></dl></div>
+        <dl class="kv"><dt>Replaces</dt><dd>SQLite with FTS5, or a database plus Elasticsearch</dd><dt>Measured</dt><dd>Hybrid search 4.8–33× faster than SQLite, DuckDB or LanceDB (<a href="bench-embedded.html">no server</a>)</dd></dl></div>
       <pre data-lang="sql">SELECT id, title, price, score() FROM products
 WHERE MATCH(title, :q, synonyms => 1) AND in_stock
 ORDER BY rrf(bm25(title, :q), similarity(emb, :v)) DESC LIMIT 10;
@@ -65,7 +65,7 @@ ORDER BY rrf(
   <section class="gutter" id="sessions"><div class="wrap block">
     <div class="uc2">
       <div><span class="ico cols"><svg viewBox="0 0 24 24"><rect x="4" y="9" width="16" height="11" rx="2"/><path d="M8 9V7a4 4 0 0 1 8 0v2"/></svg></span><h2>Sessions, carts and caches</h2><p>Rows read by key on every request, in the same database, each with its own time to live.</p>
-        <dl class="kv"><dt>Replaces</dt><dd>A key-value store or cache beside the database</dd><dt>Measured</dt><dd>21 µs a read inside an app; 0.86 ms through a coordinator at 10M (<a href="bench-10m.html#behind">behind Postgres</a>)</dd></dl></div>
+        <dl class="kv"><dt>Replaces</dt><dd>A key-value store or cache beside the database</dd><dt>Measured</dt><dd>21 µs a read inside an app; 1.02 ms through a coordinator at 10M (<a href="bench-10m.html#behind">behind Postgres</a>)</dd></dl></div>
       <pre data-lang="sh">curl -s -X PUT localhost:7700/v1/kv/sessions/s1 \
   -d '{"usr": "u7", "until": "2026-11-02T12:00:00Z"}'
 curl -s localhost:7700/v1/kv/sessions/s1

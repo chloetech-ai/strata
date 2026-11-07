@@ -1,0 +1,96 @@
+crawl 1/540 2026-09-01 00:00 snaps=10000 new=10000 insert=99ms upd=2ms size=3.9MB
+crawl 41/540 2026-09-07 16:00 snaps=10000 new=40 insert=97ms upd=193ms size=71.0MB
+crawl 81/540 2026-09-14 08:00 snaps=10000 new=51 insert=96ms upd=206ms size=122.1MB
+crawl 121/540 2026-09-21 00:00 snaps=10000 new=45 insert=114ms upd=241ms size=172.3MB
+crawl 161/540 2026-09-27 16:00 snaps=10000 new=49 insert=102ms upd=249ms size=238.0MB
+crawl 201/540 2026-10-04 08:00 snaps=10000 new=52 insert=99ms upd=228ms size=288.0MB
+crawl 241/540 2026-10-11 00:00 snaps=10000 new=71 insert=116ms upd=246ms size=339.5MB
+crawl 281/540 2026-10-17 16:00 snaps=10000 new=72 insert=199ms upd=257ms size=406.4MB
+crawl 321/540 2026-10-24 08:00 snaps=10000 new=70 insert=103ms upd=222ms size=456.7MB
+crawl 361/540 2026-10-31 00:00 snaps=10000 new=62 insert=117ms upd=198ms size=507.1MB
+crawl 401/540 2026-11-06 16:00 snaps=10000 new=65 insert=230ms upd=210ms size=573.2MB
+crawl 441/540 2026-11-13 08:00 snaps=10000 new=63 insert=98ms upd=199ms size=624.4MB
+crawl 481/540 2026-11-20 00:00 snaps=10000 new=54 insert=118ms upd=221ms size=675.4MB
+crawl 521/540 2026-11-26 16:00 snaps=10000 new=64 insert=107ms upd=195ms size=742.8MB
+crawl 540/540 2026-11-29 20:00 snaps=10000 new=74 insert=119ms upd=222ms size=770.4MB
+final optimize 8.0s -> 790.5MB (146.4 B/snapshot)
+periodic optimize: 89 runs, median 6.38s, max 12.75s
+
+5400000 snapshots, 44349 listings, ingest 829.6s, close/merge 0.0s, size open 770.4MB, closed 770.6MB (142.7 B/snapshot)
+
+== item_history: 0.1 ms, 26 rows
+    ['ts', 'price', 'shipping', 'total', 'bids']
+    ['2026-09-01T00:00:00Z', 671.73, 0.0, 671.73, None]
+    ['2026-09-01T04:00:00Z', 671.73, 0.0, 671.73, None]
+    ['2026-09-01T08:00:00Z', 671.73, 0.0, 671.73, None]
+    ['2026-09-01T12:00:00Z', 595.14, 0.0, 595.14, None]
+    ['2026-09-01T16:00:00Z', 595.14, 0.0, 595.14, None]
+    ['2026-09-01T20:00:00Z', 595.14, 0.0, 595.14, None]
+    ['2026-09-02T00:00:00Z', 595.14, 0.0, 595.14, None]
+    ['2026-09-02T04:00:00Z', 595.14, 0.0, 595.14, None]
+
+== product_daily: 9.7 ms, 90 rows
+    ['day', 'avg_total', 'min_total', 'n']
+    [20697, 351.6239317773778, 249.15, 557]
+    [20698, 345.128020654044, 249.15, 581]
+    [20699, 341.20951096121354, 253.85, 593]
+    [20700, 337.6533443708604, 254.19, 604]
+    [20701, 332.634868852459, 254.19, 610]
+    [20702, 336.0182475884243, 254.19, 622]
+    [20703, 338.09809523809486, 254.19, 630]
+    [20704, 339.05077160493846, 254.19, 648]
+
+== trends_used: 368.9 ms, 40 rows
+    ['product', 'day', 'today', 'ma7', 'ma30', 'pct', 'signal']
+    ['Apple iPhone 15 Pro Max 256GB', 20786, 646.66, 646.55, 670.0, -3.5, 'CHEAPER']
+    ['Apple iPhone 13 128GB Unlocked', 20786, 301.9, 301.62, 310.61, -2.9, 'FLAT']
+    ['Apple MacBook Air M2 13in 8GB 256GB', 20786, 570.8, 560.38, 575.03, -2.5, 'FLAT']
+    ['Dyson V15 Detect Cordless Vacuum', 20786, 353.57, 355.37, 363.54, -2.2, 'FLAT']
+    ['Lenovo ThinkPad X1 Carbon Gen 9', 20786, 437.32, 433.68, 443.29, -2.2, 'FLAT']
+    ['Magic The Gathering Black Lotus Unlimited Proxy', 20786, 39.28, 39.55, 40.37, -2.0, 'FLAT']
+    ['Apple iPhone 14 Pro 256GB Unlocked', 20786, 507.29, 509.0, 518.23, -1.8, 'FLAT']
+    ['Samsung Galaxy S23 Ultra 256GB', 20786, 422.42, 422.75, 429.83, -1.6, 'FLAT']
+
+== deals: 173.1 ms, 15 rows
+    ['l.id', 'l.title', 'l.condition', 'l.last_total', 'market', 'pct_below']
+    ['v1|100090093148|0', 'Magic The Gathering Black Lotus Unlimited Proxy For parts or not working Great', 'For parts or not working', 12.34, 18.33, 32.7]
+    ['v1|100091880281|0', 'Magic The Gathering Black Lotus Unlimited Proxy For parts or not working', 'For parts or not working', 12.43, 18.33, 32.2]
+    ['v1|100088804440|0', 'Magic The Gathering Black Lotus Unlimited Proxy For parts or not working', 'For parts or not working', 12.52, 18.33, 31.7]
+    ['v1|100107416751|0', 'Magic The Gathering Black Lotus Unlimited Proxy For parts or not working Bundle', 'For parts or not working', 12.66, 18.33, 30.9]
+    ['v1|100067994660|0', 'Magic The Gathering Black Lotus Unlimited Proxy For parts or not working Origina', 'For parts or not working', 12.82, 18.33, 30.1]
+    ['v1|100097224021|0', 'Magic The Gathering Black Lotus Unlimited Proxy For parts or not working', 'For parts or not working', 13.09, 18.33, 28.6]
+    ['v1|100110100399|0', 'Magic The Gathering Black Lotus Unlimited Proxy Used', 'Used', 28.41, 39.56, 28.2]
+    ['v1|100083911543|0', 'Magic The Gathering Black Lotus Unlimited Proxy Certified - Refurbished', 'Certified - Refurbished', 32.7, 43.59, 25.0]
+
+== price_drops: 73.5 ms, 20 rows
+    ['item', 'product', 'ts', 'prev', 'total', 'pct_drop']
+    ['v1|100101516178|0', 'LEGO Titanic 10294', '2026-11-29T20:00:00Z', 700.35, 616.43, 12.0]
+    ['v1|100087165577|0', 'Fujifilm X100V Silver', '2026-11-29T20:00:00Z', 1725.78, 1522.62, 11.8]
+    ['v1|100110115029|0', 'LEGO Titanic 10294', '2026-11-29T20:00:00Z', 661.41, 583.55, 11.8]
+    ['v1|100092826866|0', 'Google Pixel 8 Pro 128GB', '2026-11-29T20:00:00Z', 439.25, 387.68, 11.7]
+    ['v1|100097378752|0', 'Omega Speedmaster Moonwatch 310.30.42', '2026-11-29T20:00:00Z', 6103.74, 5391.23, 11.7]
+    ['v1|100078926272|0', 'Dell XPS 13 9310 i7 16GB', '2026-11-29T20:00:00Z', 389.12, 344.04, 11.6]
+    ['v1|100097257600|0', 'Canon EOS R6 Body', '2026-11-29T20:00:00Z', 429.16, 379.35, 11.6]
+    ['v1|100099607984|0', 'GoPro HERO11 Black', '2026-11-29T20:00:00Z', 259.5, 229.51, 11.6]
+
+== auction_closes: 17.9 ms, 13 rows
+    ['week', 'closed', 'avg_close', 'max_bids']
+    [2957, 56, 228.09, 27]
+    [2958, 27, 353.55, 45]
+    [2959, 17, 361.32, 36]
+    [2960, 21, 381.88, 43]
+    [2961, 13, 367.28, 46]
+    [2962, 11, 355.99, 34]
+    [2963, 18, 354.44, 45]
+    [2964, 18, 389.71, 41]
+
+== search_stats: 3.6 ms, 10 rows
+    ['l.product', 'l.condition', 'listings', 'avg_total', 'cheapest']
+    ['Apple iPhone 15 Pro Max 256GB', 'New', 95, 886.45, 684.67]
+    ['Apple iPhone 15 Pro Max 256GB', 'Used', 94, 648.89, 534.12]
+    ['Apple iPhone 14 Pro 256GB Unlocked', 'Used', 93, 504.01, 237.36]
+    ['Apple iPhone 14 Pro 256GB Unlocked', 'New', 79, 680.96, 97.67]
+    ['Apple iPhone 14 Pro 256GB Unlocked', 'Open box', 29, 620.64, 545.88]
+    ['Apple iPhone 15 Pro Max 256GB', 'Open box', 24, 794.91, 683.21]
+    ['Apple iPhone 14 Pro 256GB Unlocked', 'Certified - Refurbished', 21, 553.15, 334.14]
+    ['Apple iPhone 15 Pro Max 256GB', 'Certified - Refurbished', 18, 738.3, 624.19]

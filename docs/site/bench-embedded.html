@@ -28,16 +28,17 @@
 <main>
 <div class="gutter head-band"><div class="wrap page-head">
     <nav class="subnav" aria-label="Benchmark pages"><a href="benchmarks.html">Overview</a><a href="bench-10m.html">10M, cloud</a><a href="bench-1m.html">1M, cloud</a><a href="bench-laptop.html">1M, laptop cluster</a><a href="bench-embedded.html" aria-current="page">No server</a><a href="bench-graph.html">Graph</a><a href="bench-method.html">How we test</a></nav>
-    <span class="eyebrow">No server · one file in an app · 2 and 3 November 2026</span>
+    <span class="eyebrow">No server · one file in an app · 2, 3 and 6 November 2026</span>
     <h1>One file in your app, against what apps embed today</h1>
-    <p class="lede">Apps keep rows in SQLite, analytics in DuckDB, vectors in LanceDB or FAISS and search in Tantivy. Strata does all of it in one file. Here it runs as a Python library against each, one at a time on an idle 8-vCPU node.</p>
-    <p class="verdict"><b>First on search, hybrid search, recommendations and reads beside a writer.</b> Behind SQLite on single-row work and DuckDB on aggregates.</p>
+    <p class="lede">Apps keep rows in SQLite, analytics in DuckDB, vectors in LanceDB or FAISS and search in Tantivy. Strata does all of it in one file. Here it runs as a Python library against each, one at a time on an idle 8-vCPU node. Strata on main ran again on 6 November, beside its 2 November build on the same node; the others ran on 2 November.</p>
+    <p class="verdict"><b>First on search, hybrid search, recommendations and reads beside a writer.</b> Behind SQLite on single-row work and price updates, and DuckDB on aggregates and the heavy join.</p>
     <dl class="atglance">
-      <div><dt>Machine</dt><dd>DigitalOcean 8 vCPU, Xeon Platinum 8358 at 2.60 GHz, 31 GiB</dd></div>
+      <div><dt>Machine</dt><dd>DigitalOcean 8 vCPU, Xeon Platinum 8358 at 2.60 GHz, 31 GiB; a new node of the same type on 6 November</dd></div>
       <div><dt>Systems</dt><dd>SQLite with FTS5 and sqlite-vec, DuckDB with fts and vss, LanceDB, FAISS, Tantivy</dd></div>
       <div><dt>The app</dt><dd>A shop of 137,260 products and 4.6M reviews</dd></div>
       <div><dt>Search</dt><dd>Five BEIR collections, 3,633 to 522,931 documents</dd></div>
       <div><dt>Method</dt><dd>Medians at one client, throughput at four; every commit synced, as SQLite at FULL</dd></div>
+      <div><dt>Node check</dt><dd>On 6 November's node the 2 November build searched about 5% faster, and committed single rows 1.6 times as fast</dd></div>
     </dl>
     <nav class="toc" aria-label="Sections"><a href="#search">Search</a><a href="#app">The app</a><a href="#writes">Writes</a><a href="#recs">Recommendations</a><a href="#tantivy">Tantivy</a><a href="#behind">Behind</a><a href="#files">Raw data</a></nav>
   </div></div>
@@ -46,7 +47,7 @@
     <div class="block-head">
       <span class="eyebrow">Search</span>
       <h2>Hybrid search fastest on every collection</h2>
-      <p>Hybrid search is 3.8 to 23× faster than the next system (1.9 to 16.5× held to one thread), with nDCG@10 within 0.02 of the best. Vectors are 9 to 14× faster at recall@10 0.986 to 0.999. On BM25 alone, Tantivy is faster on the two smallest collections. Under each bar: nDCG@10, or recall@10 for vectors.</p>
+      <p>Hybrid search is 4.8 to 33× faster than the next system (1.9 to 17× held to one thread, an older build), with nDCG@10 within 0.02 of the best. Vectors are 18 to 24× faster at recall@10 0.977 to 0.997. BM25 is now fastest on all five collections, though on the two smallest its 1.1× lead over Tantivy is inside the node's margin. On the same node, main's medians are 1.04 to 2.8× faster than its 2 November build's on these kinds; its 99th percentile got slower on the three larger collections, for BM25 (1.2 to 1.6×) and filtered hybrid (up to 1.8× on quora). Under each bar: nDCG@10, or recall@10 for vectors.</p>
     </div>
     <div class="grid">
       <div data-chart="emb-a2-hybrid"></div>
@@ -55,14 +56,14 @@
       <div data-chart="emb-a2-bm25"></div>
       <div data-chart="emb-a2-filtered-hybrid"></div>
     </div>
-    <p class="small muted">Tantivy kept stopwords the others dropped, which is most of its nDCG lead on quora; with the same stopwords they tie (<a href="#tantivy">below</a>). The one-thread bars are an older build.</p>
+    <p class="small muted">Tantivy kept stopwords the others dropped, which is most of its nDCG lead on quora; with the same stopwords they tie (<a href="#tantivy">below</a>). The others, and the one-thread column, ran on 2 November's node, where the 2 November build searched about 5% slower than in its column here.</p>
   </div></section>
 
   <section class="gutter" id="app"><div class="wrap block">
     <div class="block-head">
       <span class="eyebrow">The app</span>
       <h2>Pages and joins faster than SQLite; single rows slower</h2>
-      <p>Strata is 5 to 8× faster than SQLite at filtered, sorted pages, about 5× at the heavy join and at reads beside a writer, and 2 to 4× at aggregates. SQLite reads one row in 8 µs, against Strata's 21 µs by key. DuckDB is fastest at aggregates and the heavy join.</p>
+      <p>Strata is 7 to 10× faster than SQLite at filtered, sorted pages, about 5× at the heavy join and at reads beside a writer, and 3.4× and 180× at the two aggregates. SQLite reads one row in 8 µs, against Strata's 21 µs by key. DuckDB is fastest at aggregates and the heavy join. Compare writes through the 2 November build's column: this node commits single rows faster.</p>
     </div>
     <div class="grid">
       <div data-chart="emb-a1-reads"></div>
@@ -74,20 +75,20 @@
     <div class="block-head">
       <span class="eyebrow">Writes and streams</span>
       <h2>Indexed writes, and reads beside a stream</h2>
-      <p>With a text and a vector index, Strata commits single rows 2.3 to 2.5× faster than SQLite and 7 to 12× faster than DuckDB and LanceDB. SQLite and LanceDB take batches faster. While 10,000 rows a second stream in, Strata answers 6,424 reads a second, 6 to 12× DuckDB's and SQLite's.</p>
+      <p>With a text and a vector index, Strata commits single rows 3.0 to 3.2× faster than SQLite and 9 to 15× faster than DuckDB and LanceDB; LanceDB takes 10,000-row batches fastest. Title and vector updates are now 26 and 36× the 2 November build's; price updates are 2.4× slower than that build's on the same node, and 13× slower than SQLite's. While 10,000 rows a second stream in, Strata answers 8,781 reads a second, 9 to 16× DuckDB's and SQLite's.</p>
     </div>
     <div class="grid">
       <div data-chart="emb-writes"></div>
       <div data-chart="emb-stream"></div>
     </div>
-    <p class="small muted">Updates to indexed text or vectors were Strata's worst case here; a later build (#223) made 1,797 title and 1,297 vector updates a second on a newer CPU (<a href="#tantivy">the Tantivy run</a>).</p>
+    <p class="small muted">Both slowdowns of main showed in both writes runs: price updates with the indexes on (571 and 641 a second, against 1,389 and 1,379), and reads while 50,000 rows a second stream in (89 and 160 a second, against 3,190 and 3,227, while main writes 1.7 times as many rows). Without indexes, price updates got faster (3,276 a second against 2,268).</p>
   </div></section>
 
   <section class="gutter" id="recs"><div class="wrap block">
     <div class="block-head">
       <span class="eyebrow">Recommendations</span>
       <h2>Similar items in under a millisecond, under filters</h2>
-      <p>FAISS beside SQLite is faster at the median and slower at the 99th percentile; LanceDB takes 15× longer. Strata's home feed fuses vectors with a PageRank walk in one statement; LanceDB's, with the walk in app code, is 4.4× faster.</p>
+      <p>Strata answers similar items in 0.51 ms, against FAISS beside SQLite's 0.57, and at the 99th percentile in 0.91 against 8.5; LanceDB takes 25× longer. Strata's home feed fuses vectors with a PageRank walk in one statement: 4.87 ms, 20× its 2 November build, and 5.8× faster than LanceDB's with the walk in app code.</p>
     </div>
     <div data-chart="emb-a3"></div>
   </div></section>
@@ -96,7 +97,7 @@
     <div class="block-head">
       <span class="eyebrow">Against Tantivy</span>
       <h2>Tantivy as the app's store, and BM25 side by side</h2>
-      <p>On a newer node (Xeon Gold 6548N) with a later build: Strata commits single rows and updates 30× faster and reads rows faster; Tantivy aggregates, joins and bulk-loads faster. With the same stopwords their BM25 ties on nDCG@10.</p>
+      <p>On a newer node (Xeon Gold 6548N) with Strata of 3 November, not run again: Strata commits single rows and updates 30× faster and reads rows faster; Tantivy aggregates, joins and bulk-loads faster. With the same stopwords their BM25 ties on nDCG@10.</p>
     </div>
     <div class="grid">
       <div data-chart="emb-tantivy"></div>
@@ -107,13 +108,14 @@
   <section class="gutter" id="behind"><div class="wrap block">
     <div class="block-head">
       <span class="eyebrow">Where Strata is behind</span>
-      <h2>Single rows, aggregates and one feed</h2>
+      <h2>Single rows, aggregates, price updates and a fast stream</h2>
     </div>
     <ul class="gaps">
-      <li><b>Single rows.</b> SQLite reads one by id in 8 µs against Strata's 64 through SQL (21 by key), and joins a user's reviews in 22 µs against 657.</li>
-      <li><b>Aggregates.</b> DuckDB counts reviews per month in 10.1 ms against Strata's 881 (SQLite 3,569).</li>
-      <li><b>Writes without indexes.</b> 4,022 rows a second against SQLite's 5,128 at FULL.</li>
-      <li><b>The feed.</b> 125 ms against LanceDB's 28.3; the PageRank walk is 108 ms of it.</li>
+      <li><b>Single rows.</b> SQLite reads one by id in 8 µs against Strata's 30 through SQL (21 by key), and joins a user's reviews in 22 µs against 465.</li>
+      <li><b>Aggregates.</b> DuckDB counts reviews per brand in 5.2 ms and per month in 10.1, against Strata's 29.3 and 19.2 (SQLite 99.5 and 3,569). DuckDB's heavy join takes 215 ms, Strata's 524.</li>
+      <li><b>Price updates.</b> 3,276 a second without indexes against SQLite's 6,640 at FULL, and 571 with them against 7,670; the latter was 1,389 on the 2 November build.</li>
+      <li><b>Reads beside a fast stream.</b> 89 to 160 a second while 50,000 rows a second arrive, down from 3,190.</li>
+      <li><b>Tail latency on larger collections.</b> BM25's 99th percentile is 1.2 to 1.6× its 2 November build's on fiqa, trec-covid and quora, and filtered hybrid's 1.8× on quora (one run).</li>
     </ul>
   </div></section>
 
@@ -124,7 +126,8 @@
     </div>
     <ul class="files">
       <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata/results/laptop-2026-11/part-a-do/README.md">README.md</a>: machines, builds, caveats and every table</li>
-      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata/results/laptop-2026-11/part-a-do/part-a">part-a/</a>: one JSON report per system and part</li>
+      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata/results/laptop-2026-11/part-a-do/part-a">part-a/</a>: one JSON report per system and part (2 November)</li>
+      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata/results/laptop-2026-11/part-a-do/part-a-1106">part-a-1106/</a> and <a href="https://github.com/chloetech-ai/strata/tree/main/strata/results/laptop-2026-11/part-a-do/part-a-1106-check">part-a-1106-check/</a>: Strata on main and its 2 November build on 6 November's node (README, "6 November")</li>
       <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata/results/laptop-2026-11/part-a-do/part-a-tantivy">part-a-tantivy/</a> and <a href="https://github.com/chloetech-ai/strata/tree/main/strata/results/laptop-2026-11/part-a-do/part-a-tantivy-2">part-a-tantivy-2/</a>: the Tantivy runs, each on its own node</li>
       <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-py/bench/laptop">strata-py/bench/laptop/</a>: the scripts, and <code>do_part_a.sh</code>, which runs it all on one node</li>
     </ul>

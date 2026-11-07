@@ -264,9 +264,9 @@
       <h2>Where Strata is behind</h2>
     </div>
     <ul class="gaps">
-      <li><b>SQL aggregates through a coordinator.</b> <span>178 ms at 1M and 4.3 s at 10M, where Elasticsearch and OpenSearch take a few ms (<a href="bench-10m.html#behind">10M</a>).</span></li>
-      <li><b>Typo search in the cloud runs.</b> <span>Both used a build from before the faster typo walk, which since cut a coordinator's median from 112 to 15.8 ms on a Xeon VM; not re-run yet.</span></li>
-      <li><b>BM25 under load.</b> <span>Two rounds per query in the cloud runs. Caching the statistics (#245) took BM25 at 16 clients from 1,375 to 1,787 queries a second on the same DigitalOcean nodes (<a href="bench-1m.html#since">before and after</a>).</span></li>
+      <li><b>Key lookups through a coordinator.</b> <span>1.02 ms at 10M, where Postgres, Weaviate, ParadeDB and Qdrant read a row in 0.37 to 0.47 ms (<a href="bench-10m.html#behind">10M</a>). Most of it is the hop through a coordinator, not the read. At 16 clients Strata serves 9,159 a second, OpenSearch 12,620.</span></li>
+      <li><b>Typo search.</b> <span>The typo walk (#242, then #266's in-memory term table) took the cloud medians from 120 to 13.2 ms at 1M and from 824 to 43.9 ms at 10M. Typesense and Meilisearch take about 6 ms at 1M, and Elasticsearch 34.6 at 10M (<a href="bench-10m.html#behind">10M</a>).</span></li>
+      <li><b>BM25 under load.</b> <span>At 10M and 16 clients Strata serves 604 queries a second, Elasticsearch 683 and OpenSearch 720 (on other nodes of the same type). Moving the coordinators into the shard pods (#287) added 3%: what waits is the shards' own scoring.</span></li>
       <li><b>Builds.</b> <span>The HNSW graph is 146 s of Quora's 153.1 s load on an M2.</span></li>
       <li><b>Cold filters and small facets.</b> <span>Tantivy is 1.4 to 3.4× faster on cold range filters, and 1.1 to 2.1× on facets in three of four BEIR collections (M2).</span></li>
     </ul>

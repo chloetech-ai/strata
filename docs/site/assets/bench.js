@@ -104,7 +104,7 @@
       h += '<div class="rb-row' + (self ? " self" : "") + '" role="row"><span class="rb-pl" role="cell">' + (i + 1) + '</span><span class="rb-name" role="cell">' + esc(engineName(rep, r.e)) + '</span><span class="rb-bar" role="cell"><i style="width:' + w.toFixed(1) + '%"></i><b>' + r.points + '</b></span><span class="rb-own" role="cell">' + r.half + ' <span class="muted">of ' + rep.tests + '</span></span><span class="rb-own" role="cell">' + fmt(r.own, 2) + (r.cant ? ' <span class="muted">on ' + r.ran + " tests; no result on " + r.cant + (r.cant === 1 ? " kind" : " kinds") + "</span>" : ' <span class="muted">on all ' + rep.tests + "</span>") + "</span></div>";
     });
     h += "</div>";
-    h += '<p class="small muted">' + rep.tests + " tests: 14 kinds at three measures, plus recall on the vector kinds" + (rep.passes > 1 ? ", medians of " + rep.passes + " passes" : ", one pass") + ". Places add up, so fewer points is better (" + best + " is the best here); a kind an engine cannot run counts as last (" + n + "). <a href=\"bench-method.html#ranking\">How the ranking works</a>. " + srcLink(rep) + "</p>";
+    h += '<p class="small muted">' + rep.tests + " tests: 14 kinds at three measures, plus recall on the vector kinds" + (rep.passes_note ? ", " + rep.passes_note : rep.passes > 1 ? ", medians of " + rep.passes + " passes" : ", one pass") + ". Places add up, so fewer points is better (" + best + " is the best here); a kind an engine cannot run counts as last (" + n + "). <a href=\"bench-method.html#ranking\">How the ranking works</a>. " + srcLink(rep) + "</p>";
     el.innerHTML = h;
   }
 
@@ -387,7 +387,7 @@
     var pos = 0;
     rep.rank.forEach(function (r, i) { if (r.e === "strata") pos = i + 1; });
     var top = rep.rank.slice(0, 3).map(function (r) { return esc(engineName(rep, r.e)) + " " + r.points; }).join(", ");
-    var passes = rep.passes > 1 ? "medians of " + rep.passes + " passes" : "one pass";
+    var passes = rep.passes_note || (rep.passes > 1 ? "medians of " + rep.passes + " passes" : "one pass");
     var head = ord(pos) + " of " + rep.ranked.length;
     if (mode === "chip") el.innerHTML = "<b>" + head + "</b> " + esc(CHIPS[id] || LABELS[id] || id);
     else if (mode === "tile") el.innerHTML = '<span class="eyebrow">' + esc(LABELS[id] || id) + '</span><span class="v">' + head + "</span><p>Summed places on " + rep.tests + " tests, " + passes + ": " + top + ".</p>";

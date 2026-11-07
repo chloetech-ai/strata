@@ -1,0 +1,18 @@
+09:29:24 rerun-10m: waiting for its nodes
+09:30:43 rerun-10m: nodes rerun-10m-d-a1-3evwfl rerun-10m-d-a1-3evwft and rerun-10m-c-a1-3evwf2
+09:44:00 rerun-10m: step 1: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod build
+10:52:08 rerun-10m: step 2: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod up strata
+10:52:25 rerun-10m: step 3: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod run strata --label strata-b
+10:59:48 rerun-10m: step 4: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod run strata --label strata-b-pass2
+11:06:43 rerun-10m: step 5: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod run strata --label strata-b-pass3
+11:13:33 rerun-10m: step 6: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod down strata
+11:13:36 rerun-10m: step 7: compare.sh build
+13:12:47 rerun-10m: step 8: compare.sh up strata
+13:12:56 rerun-10m: step 9: compare.sh run strata
+13:20:04 rerun-10m: step 10: compare.sh run strata --label strata-pass2
+13:26:43 rerun-10m: step 11: compare.sh run strata --label strata-pass3
+13:33:31 rerun-10m: step 12: compare.sh writes strata
+13:34:44 rerun-10m: step 13: compare.sh stream strata
+13:37:28 rerun-10m: step 14: compare.sh down strata
+13:37:35 rerun-10m: reports fetched (13 files)
+13:37:37 rerun-10m: done after 14893 s

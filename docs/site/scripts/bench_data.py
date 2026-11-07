@@ -122,12 +122,29 @@ def medians(src, e, passes):
             for k, hs in rows.items()}
 
 
-def cluster(src, rid, engines=None, extra_runs=None, ranked=None, lanes=None):
+def cluster(src, rid, engines=None, extra_runs=None, ranked=None, lanes=None, take=None):
+    """One comparison. `take` maps an engine to a later run (a Source) that
+    measured it again, after a change to that engine or to its settings: its
+    numbers, recall, load, writes and streams come from there, and the other
+    engines' from `src`. Elasticsearch's trial-licence run comes with it."""
     s = src.json("summary.json")
+    take = dict(take or {})
+    if "es" in take:
+        take.setdefault("es-trial", take["es"])
+    for e, t in take.items():
+        ts = t.json("summary.json")
+        if e not in s["engines"]:
+            s["engines"].append(e)
+        for key in ("quality", "unavailable", "load", "writes", "stream"):
+            s.setdefault(key, {})
+            if (ts.get(key) or {}).get(e) is not None:
+                s[key][e] = ts[key][e]
+            else:
+                s[key].pop(e, None)
     all_engines = [e for e in s["engines"] if e != "es-trial"]
     engines = [e for e in (engines or all_engines) if e in all_engines]
     passes = ["", "-pass2", "-pass3"]
-    H = {e: medians(src, e, passes) for e in all_engines + ["es-trial"]}
+    H = {e: medians(take.get(e, src), e, passes) for e in all_engines + ["es-trial"]}
     for e, name in (extra_runs or {}).items():  # a kind re-run on its own (Solr's SQL on the Mac)
         for k, v in medians(src, name, [""]).items():
             H[e][k] = v
@@ -277,7 +294,8 @@ def cluster(src, rid, engines=None, extra_runs=None, ranked=None, lanes=None):
     return {
         "id": rid, "type": "cluster", "passes": npass, "source": src.url(), "branch": src.ref,
         "engines": [{"id": e, "name": ENGINES[e][0], "ver": ENGINES[e][1], "sharded": e in SHARDED}
-                    | ({"lane": lanes[e]} if lanes and e in lanes else {}) for e in engines],
+                    | ({"lane": lanes[e]} if lanes and e in lanes else {})
+                    | ({"from": take[e].url()} if e in take else {}) for e in engines],
         "kinds": [{"id": k, "name": n, "fam": f} for k, n, f in KINDS],
         "m": {k: v for k, v in m.items() if any(v[e] for e in v)}, "na": na, "notes": notes,
         "rank": rank, "tests": len(tests), "ranked": rank_engines, "places": places, "variants": variants,
@@ -290,7 +308,15 @@ def cluster(src, rid, engines=None, extra_runs=None, ranked=None, lanes=None):
 def part_a(src):
     def j(name):
         return src.json(name)
-    a1 = {s: j(f"part-a/a1_{s}.json") for s in ["strata", "sqlite-full", "sqlite-normal", "duckdb"]}
+    # Strata from the rerun of 6 November (main, and 2 November's build as the
+    # node check, both on one node); the other systems from 2 November.
+    new, was = ("part-a-1106", "part-a-1106-check") if j("part-a-1106/a1_strata.json") else ("part-a", None)
+
+    def sj(part, name):  # a Strata report: "strata" from the rerun, "strata-was" its check
+        return j(f"{new}/{part}_strata{name}.json"), (j(f"{was}/{part}_strata{name}.json") if was else None)
+
+    a1 = {s: j(f"part-a/a1_{s}.json") for s in ["sqlite-full", "sqlite-normal", "duckdb"]}
+    a1["strata"], a1["strata-was"] = sj("a1", "")
     a1t = {s: j(f"part-a-tantivy/a1_{s}.json") for s in ["strata", "tantivy"]}
     machine = a1["strata"]["machine"]
     machine_t = a1t["strata"]["machine"]
@@ -303,9 +329,12 @@ def part_a(src):
     def us(x):  # ms -> µs
         return r3(x * 1000) if x is not None else None
 
-    cols_a1 = [{"name": "Strata", "self": True}, {"name": "SQLite", "ver": "3.53, FULL"},
-               {"name": "SQLite", "ver": "3.53, NORMAL"}, {"name": "DuckDB", "ver": "2.0"}]
-    sys_a1 = ["strata", "sqlite-full", "sqlite-normal", "duckdb"]
+    scols = [{"name": "Strata", "ver": "main, 6 Nov", "self": True}] + (
+        [{"name": "Strata", "ver": "2 Nov build, rerun 6 Nov", "self": True}] if was else [])
+    ss = ["strata"] + (["strata-was"] if was else [])
+    cols_a1 = scols + [{"name": "SQLite", "ver": "3.53, FULL"},
+                       {"name": "SQLite", "ver": "3.53, NORMAL"}, {"name": "DuckDB", "ver": "2.0"}]
+    sys_a1 = ss + ["sqlite-full", "sqlite-normal", "duckdb"]
 
     def row(label, f, unit=None, better=None, systems=sys_a1, data=a1):
         cells = []
@@ -348,15 +377,19 @@ def part_a(src):
         ]})
     # A2: one chart per kind, rows = collections, columns = systems
     colls = ["scifact", "nfcorpus", "fiqa", "trec-covid", "quora"]
-    a2sys = ["strata", "strata-1t", "sqlite", "tantivy", "duckdb", "lancedb"]
-    a2 = {(s, c): j(f"part-a/a2_{s}_{c}.json") for s in a2sys if s != "strata-1t" for c in colls}
+    a2sys = ss + ["strata-1t", "sqlite", "tantivy", "duckdb", "lancedb"]
+    a2 = {(s, c): j(f"part-a/a2_{s}_{c}.json") for s in a2sys if not s.startswith("strata") for c in colls}
     a2.update({("strata-1t", c): j(f"part-a-1thread/a2_strata_{c}.json") for c in colls})
-    a2cols = [{"name": "Strata", "self": True}, {"name": "Strata", "ver": "1 thread, older build", "self": True},
-              {"name": "SQLite", "ver": "FTS5, sqlite-vec (exact)"}, {"name": "Tantivy", "ver": "0.27"},
-              {"name": "DuckDB", "ver": "fts, vss"}, {"name": "LanceDB", "ver": "defaults"}]
+    for c in colls:
+        a2[("strata", c)], a2[("strata-was", c)] = sj("a2", f"_{c}")
+    a2cols = scols + [{"name": "Strata", "ver": "1 thread, older build", "self": True},
+                      {"name": "SQLite", "ver": "FTS5, sqlite-vec (exact)"}, {"name": "Tantivy", "ver": "0.27"},
+                      {"name": "DuckDB", "ver": "fts, vss"}, {"name": "LanceDB", "ver": "defaults"}]
     a2note = ("Strata searches a query's segments on up to 8 threads by default; its one-thread column is the older build "
-              "128459b, not run on quora. SQLite's vectors are sqlite-vec's exact scan (it has no ANN index); LanceDB is at its "
-              "default search settings.")
+              "128459b, not run on quora. SQLite's vectors are sqlite-vec's exact scan (it has no ANN index); LanceDB is "
+              "at its default search settings." + (
+                  " Strata on main and its 2 November build ran on 6 November on one node, the rest on 2 November on another of the same "
+                  "type, on which the 2 November build was about 5% slower at search." if was else ""))
     ndocs = {c: a2[("strata", c)]["n_docs"] for c in colls}
 
     def a2row(c, kind, field="p50_ms"):
@@ -389,8 +422,9 @@ def part_a(src):
                    "unit": "q/s", "better": "higher", "scale": "log", "run": "embedded", "columns": a2cols, "note": a2note,
                    "rows": [a2row(c, "hybrid", "qps4") for c in colls]})
     # writes and streams with indexes
-    wsys = ["strata", "sqlite-full", "sqlite-normal", "duckdb", "lancedb"]
-    W = {s: j(f"part-a/writes_{s}.json") for s in wsys}
+    wsys = sys_a1 + ["lancedb"]
+    W = {s: j(f"part-a/writes_{s}.json") for s in wsys if not s.startswith("strata")}
+    W["strata"], W["strata-was"] = sj("writes", "")
     wcols = cols_a1 + [{"name": "LanceDB"}]
     charts.append({
         "id": "emb-writes", "title": "Writes with a text and a vector index", "sub": "137,260 products; rows a second, higher is better",
@@ -416,9 +450,10 @@ def part_a(src):
             row("lag p99 at 10,000 rows/s", lambda d: g(phase(d, 10000), "lag", "p99_ms"), "ms", "lower", systems=wsys, data=W),
         ]})
     # A3
-    a3sys = ["strata", "lancedb", "sqlite-vec", "faiss-sqlite"]
-    A3 = {s: j(f"part-a/a3_{s}.json") for s in a3sys}
-    a3cols = [{"name": "Strata", "self": True}, {"name": "LanceDB"}, {"name": "sqlite-vec"}, {"name": "FAISS", "ver": "+ SQLite"}]
+    a3sys = ss + ["lancedb", "sqlite-vec", "faiss-sqlite"]
+    A3 = {s: j(f"part-a/a3_{s}.json") for s in a3sys if not s.startswith("strata")}
+    A3["strata"], A3["strata-was"] = sj("a3", "")
+    a3cols = scols + [{"name": "LanceDB"}, {"name": "sqlite-vec"}, {"name": "FAISS", "ver": "+ SQLite"}]
     charts.append({
         "id": "emb-a3", "title": "Recommendations", "sub": "Similar products under filters, and a feed fusing vectors with a walk over products reviewed together",
         "unit": "ms", "better": "lower", "scale": "row", "run": "embedded", "columns": a3cols,
@@ -593,21 +628,44 @@ def main():
     gr = Source("strata-server/results/graph-compare-mac", "origin/claude/graph-compare-mac")
     bl = Source("strata-server/results/bm25-stats-cache-container")
     bd = Source("strata-server/results/bm25-do-1m")
+    bi1 = Source("strata-server/results/bigger-items-do/1m")
+    bi10 = Source("strata-server/results/bigger-items-do/10m")
+    r1 = Source("strata-server/results/rerun-1106-do/1m")
+    r10 = Source("strata-server/results/rerun-1106-do/10m")
 
     if c10.ok:
         ranked = ["strata", "os", "es", "solr", "vespa", "qdrant", "weaviate", "paradedb", "postgres"]
         # Milvus (out of memory at 52 GiB) and Redis (all in memory) ran on a 128 GB
         # node with the same CPUs: shown, never ranked (the run's README)
-        reports["cloud-10m"] = cluster(c10, "cloud-10m", ranked=ranked,
-                                       lanes={"milvus": "128 GB node, not ranked", "redis": "128 GB node, not ranked"})
+        # Strata from the 6 November rerun, Elasticsearch and OpenSearch from 5
+        # November's (result caches off, #262); the others did not change
+        take10 = {"strata": r10, "es": bi10, "os": bi10} if r10.ok else {}
+        reports["cloud-10m"] = cluster(c10, "cloud-10m", ranked=ranked, take=take10,
+                                       lanes={"milvus": "128 GB node, not ranked", "redis": "128 GB node, not ranked"} | (
+                                           {"strata": "6 Nov", "es": "9.5.5, 5 Nov", "os": "3.9.0, 5 Nov"} if take10 else {}))
+        if take10:
+            reports["cloud-10m"]["passes_note"] = "medians of 3 passes for Strata, Elasticsearch and OpenSearch, one pass for the rest"
     else:
         missing.append("cloud-10m")
-    reports["cloud-10m-h2h"] = cluster(c10h, "cloud-10m-h2h")
+    if r10.ok:
+        # 5 November's head to head with Strata from 6 November's rerun
+        reports["cloud-10m-h2h"] = cluster(bi10, "cloud-10m-h2h", take={"strata": r10}, lanes={"strata": "6 Nov", "es": "5 Nov", "os": "5 Nov"})
+        c10h = bi10
+    else:
+        reports["cloud-10m-h2h"] = cluster(c10h, "cloud-10m-h2h")
     # Milvus from its run alone on a fresh node: last in its lane it was still
     # compacting during its first two passes (the run's README)
-    reports["cloud-1m"] = cluster(c1, "cloud-1m", lanes={"milvus": "2.6.26, run alone on a fresh node"})
+    # Engines whose code or settings changed since that run, from the runs that
+    # measured them again: Strata on 6 November (main b022e39), Manticore then
+    # too (its query cache off, #262), Elasticsearch and OpenSearch on 5
+    # November (result caches off, #262). The others' code and settings did
+    # not change. Every run's README names its nodes.
+    take1 = {"strata": r1, "manticore": r1, "es": bi1, "os": bi1} if r1.ok else {}
+    reports["cloud-1m"] = cluster(c1, "cloud-1m", take=take1, lanes={
+        "milvus": "2.6.26, run alone on a fresh node"} | ({
+        "strata": "6 Nov", "manticore": "29.9.0, 6 Nov", "es": "9.5.5, 5 Nov", "os": "3.9.0, 5 Nov"} if take1 else {}))
     reports["cloud-1m-first"] = cluster(c1f, "cloud-1m-first")
-    reports["strata-1m-since"] = {"id": "strata-1m-since", "type": "ab", "source": c1.url(), "rows": since(c1f, c1, [
+    reports["strata-1m-since"] = {"id": "strata-1m-since", "type": "ab", "source": (r1 if r1.ok else c1).url(), "rows": since(c1f, r1 if r1.ok else c1, [
         ("bm25", 1), ("bm25", 16), ("bm25 + filter", 16), ("phrase", 16), ("prefix", 16),
         ("typo", 1), ("typo", 16), ("boosted (bm25 × decay)", 16), ("hybrid (RRF)", 16), ("sql aggregate", 1)])}
     reports["laptop"] = cluster(mac, "laptop", extra_runs={"solr": "solr+sql"})
@@ -615,7 +673,7 @@ def main():
         if rid in reports:
             reports[rid]["source"] = src.url()
     charts, machine, machine_t = part_a(pa)
-    runs["embedded"] = {"label": "No server, 2 November 2026", "machine": machine, "source": pa.path + "/part-a/", "url": pa.url()}
+    runs["embedded"] = {"label": "No server, 2 and 6 November 2026", "machine": machine, "source": pa.path + "/part-a/ and part-a-1106*/", "url": pa.url()}
     runs["embedded-tantivy"] = {"label": "No server, 3 November 2026", "machine": machine_t, "source": pa.path + "/part-a-tantivy*/", "url": pa.url()}
     suites.append({"id": "embedded", "charts": charts})
     if gr.ok:

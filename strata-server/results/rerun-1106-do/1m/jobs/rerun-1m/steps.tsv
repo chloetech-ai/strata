@@ -1,0 +1,14 @@
+1	ok	1793956311	1793956572	IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod build
+2	ok	1793956572	1793956586	IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod up strata
+3	ok	1793956587	1793956962	IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod run strata --label strata-b
+4	ok	1793956962	1793957331	IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod run strata --label strata-b-pass2
+5	ok	1793957331	1793957700	IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod run strata --label strata-b-pass3
+6	ok	1793957700	1793957701	IMAGE=ghcr.io/chloetech-ai/strata-server:18fb4bc4ba69b1d0abf4adaca2be0fa9e1ad8bb4 STRATA_COORD=pod down strata
+7	ok	1793957701	1793958234	build
+8	ok	1793958234	1793958243	up strata
+9	ok	1793958243	1793958614	run strata
+10	ok	1793958614	1793958983	run strata --label strata-pass2
+11	ok	1793958983	1793959352	run strata --label strata-pass3
+12	ok	1793959352	1793959424	writes strata
+13	ok	1793959424	1793959591	stream strata
+14	ok	1793959591	1793959593	down strata

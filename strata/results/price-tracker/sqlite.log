@@ -1,0 +1,7 @@
+sqlite: 5400000 snapshots, ingest 452.2s, crawl write median 748ms, size 1890.9MB (350.2 B/snapshot)
+  item_history: 0.0 ms, 26 rows
+  product_daily: 89.1 ms, 90 rows
+  trends_used: 2333.1 ms, 40 rows
+  deals: 9286.8 ms, 15 rows
+  price_drops: 254.4 ms, 20 rows
+  search_stats: 3.4 ms, 10 rows

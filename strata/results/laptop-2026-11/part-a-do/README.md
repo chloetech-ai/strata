@@ -373,3 +373,178 @@ the lists fetched for nothing are many, and each of their edges costs a key
 lookup. `dir => 'out'` halves it (64 ms). A degree read without resolving keys
 (the edge table's rows and weights are already there), or a resolved-ends cache
 kept across queries, would remove most of this work.
+
+## 6 November: Strata on main, and the 2 November build on the same node
+
+Strata alone, run again after the merges of 5 and 6 November, on a fresh
+`g-8vcpu-32gb-intel` node in nyc3 (Intel Xeon Platinum 8358 @ 2.60GHz, as on
+2 November) by `do_part_a.sh` (`up`, `push`, `setup`, `prep`) and the
+scripts of 2 November (2061b64's `strata-py/bench/laptop`, identical to the
+ones those rows ran), so its rows sit beside the other systems' 2 November
+rows. The other systems did not change and were not run again.
+
+| directory | what |
+|---|---|
+| `part-a-1106/` | main at b022e39 (strata-py built on the node), all four parts |
+| `part-a-1106-check/` | 2061b64, the build of the `part-a/` rows, run again on this node after it: the node check |
+| `part-a-1106-w2/`, `part-a-1106-check-w2/` | a second writes run of each (check first, then main), to confirm the two slowdowns below |
+
+Each part ran as below, main's strata-py in one virtualenv and 2061b64's in
+another (`B` is 2061b64's `strata-py/bench/laptop`, `OUT` the directory):
+
+```bash
+python3 $B/a1_app.py --shop /work/data/shop --work /work/w/a1 --out $OUT --systems strata
+python3 $B/a2_search.py --data /work/data/beir --collections scifact,nfcorpus,fiqa,trec-covid,quora \
+  --workloads strata/results/workloads --work /work/w/a2 --out $OUT --systems strata
+python3 $B/a_writes.py --shop /work/data/shop --work /work/w/aw --out $OUT --systems strata
+python3 $B/a3_recsys.py --shop /work/data/shop --work /work/w/a3 --out $OUT --systems strata
+```
+
+Order: main's A1, writes, A3; the check's A1, writes, A3; main's A2, the
+check's A2; the check's second writes run, main's.
+
+The prep made the same data (137,260 products, 4,624,176 reviews; `shop_prep.py` and `prepare_beir.py` are unchanged since 2061b64), and every A1 answer is the same in all three runs. A2's workloads are `strata/results/workloads` on main (the same files as 2061b64's, plus nfcorpus's, which 2 November made on the node).
+
+**The node.** The 2 November build ran 5 to 10% faster on this node than on
+2 November's at reads and search (A2 p50 0.92 to 0.99 of its 2 November
+time, A1 0.75 to 0.98), and much faster at single-row commits: 6,263
+inserts a second against 4,022, and in the writes part 22,254 rows a second
+at 100 a commit against 3,419. So compare main with the other systems on
+reads and search, with that margin, and on writes only through the check
+column.
+
+**What changed, same node.** Median of the five collections, main over the 2
+November build:
+
+- A2 search: p50 0.27 (phrase) to 0.73 (BM25) of the old time, typos 10 to
+  25 times faster; queries a second at 4 threads 1.2 to 2.9 times, typos 10
+  to 24 times. nDCG@10 is the same to 0.003, except typos, which are better
+  (fiqa 0.241 against 0.196); vector recall@10 is 0.002 to 0.015 lower on
+  four of the five (fiqa 0.978 against 0.993).
+- Files are less than half the size after a build (quora 2,820 MB against
+  6,223; A1 1,844 against 3,353), since the bindings merge as they write and
+  close() gives back the space (#270). A2 builds take up to 21% less time
+  (quora 160 s against 201), A3's 51 s against 142.
+- A1: reviews per month 859 to 19.2 ms (#252, #264), per brand 48.1 to 29.3;
+  a row by id through SQL 62 to 30 µs; loading reviews 34,207 to 65,682 rows
+  a second. The heavy join is 19% slower (442 to 524 ms).
+- Writes with indexes: title and vector updates 26 and 36 times faster (65
+  to 1,688 and 33 to 1,188 a second), batches about twice as fast, a 50,000
+  rows a second stream reached at 45,713 rows a second (26,986).
+- A3: the feed 20 times faster (97.5 to 4.87 ms), similar items 1.6 times.
+
+**Two slowdowns, both seen in both writes runs:**
+
+- Updating a product's price and stock with the text and vector indexes on:
+  571 and 641 a second against 1,389 and 1,379 (p90 4.0 ms against 0.79).
+  Without indexes (A1) the same update is faster than before (3,276 against
+  2,268).
+- Reads while 50,000 rows a second stream in: 89 and 160 a second (p99 682
+  and 528 ms) against 3,190 and 3,227, while main writes 45,713 and 43,783
+  rows a second against 26,986 and 26,499. At 1,000 and 10,000 rows a second
+  main reads faster than before (34,036 and 8,781 a second against 19,018
+  and 7,278).
+
+One more, in A2's single run: the medians got faster on every kind and
+collection, but on the three larger collections some 99th percentiles got
+slower. Main over the 2 November build, p99 at one thread: BM25 1.48 (fiqa),
+1.22 (trec-covid) and 1.63 (quora); filtered hybrid 1.26, 1.08 and 1.78;
+filtered vector 1.15, 1.08 and 1.99; on quora also phrase 1.33 and prefix
+1.36. On scifact and nfcorpus every p99 is faster.
+
+Cost: the node from 08:51 to 12:12 UTC, $1.51 at list price ($1.80 in
+whole hours). The cluster `strata-bench-a` was deleted at 12:12.
+
+Tables from `part_a_report.py part-a-1106 --compare "2 Nov build=part-a-1106-check"`
+(first writes run):
+
+### A1: the app (Shop, 137,260 products and 4,624,176 reviews)
+
+Reads (p50 / p99, one thread):
+
+| system | get by id (SQL) | get by key (no SQL) | get, 4 threads | 100 by id (SQL) | 100 by key | a user's reviews | page 1 | page 10,000 |
+|---|---|---|---|---|---|---|---|---|
+| strata | 30 µs / 49 µs | 21 µs / 32 µs | 58,230/s | 1.54 ms / 1.72 ms | 1.72 ms / 1.99 ms | 32 µs / 62 µs | 953 µs / 1.44 ms | 3.05 ms / 4.04 ms |
+| strata (2 Nov build) | 62 µs / 101 µs | 19 µs / 31 µs | 46,974/s | 1.81 ms / 2.07 ms | 1.62 ms / 1.89 ms | 79 µs / 127 µs | 1.21 ms / 1.72 ms | 3.42 ms / 5.20 ms |
+
+Loads, aggregates and joins:
+
+| system | load reviews | file | reviews by brand | reviews by month | join: top products | join: a user's |
+|---|---|---|---|---|---|---|
+| strata | 65,682/s | 1,844 MB | 29.3 ms / 34.5 ms | 19.2 ms / 35.3 ms | 524 ms / 556 ms | 465 µs / 947 µs |
+| strata (2 Nov build) | 34,207/s | 3,353 MB | 48.1 ms / 54.2 ms | 859 ms / 862 ms | 442 ms / 455 ms | 593 µs / 1.08 ms |
+
+Writes (one row per transaction unless noted) and a mixed run of 2 readers and 1 writer:
+
+| system | insert | insert, 1,000 per txn | update price | counter + 1 | delete by id | mixed reads | mixed writes | errors |
+|---|---|---|---|---|---|---|---|---|
+| strata | 6,080/s | 115,885/s | 3,276/s | 3,713/s | 7,077/s | 2,991/s, p99 9.49 ms | 2,490/s, p99 751 µs | 0 |
+| strata (2 Nov build) | 6,263/s | 108,628/s | 2,268/s | 2,373/s | 7,084/s | 2,885/s, p99 8.13 ms | 1,633/s, p99 1.11 ms | 0 |
+
+### A2: search (BEIR, bge-small 384-d vectors)
+
+Each cell is p50 / p99 on one thread, then nDCG@10 (vector: and recall@10 against exact search). Hybrid is RRF of BM25 and vectors at depth 100.
+
+#### scifact (5,183 documents)
+
+| system | build | size | BM25 | vector | hybrid | filtered hybrid | hybrid, 4 threads |
+|---|---|---|---|---|---|---|---|
+| strata | 0.9 s | 35 MB | 92 µs / 255 µs · 0.690 | 185 µs / 263 µs · 0.718 · r 0.997 | 442 µs / 627 µs · 0.729 | 271 µs / 664 µs | 6,793/s |
+| strata (2 Nov build) | 0.9 s | 35 MB | 167 µs / 313 µs · 0.690 | 327 µs / 514 µs · 0.715 · r 0.999 | 622 µs / 883 µs · 0.729 | 477 µs / 908 µs | 4,208/s |
+
+#### nfcorpus (3,633 documents)
+
+| system | build | size | BM25 | vector | hybrid | filtered hybrid | hybrid, 4 threads |
+|---|---|---|---|---|---|---|---|
+| strata | 0.6 s | 25 MB | 34 µs / 85 µs · 0.329 | 177 µs / 249 µs · 0.385 · r 0.977 | 293 µs / 437 µs · 0.377 | 218 µs / 501 µs | 8,609/s |
+| strata (2 Nov build) | 0.6 s | 25 MB | 94 µs / 158 µs · 0.329 | 284 µs / 436 µs · 0.385 · r 0.989 | 491 µs / 753 µs · 0.379 | 365 µs / 702 µs | 5,865/s |
+
+#### fiqa (57,638 documents)
+
+| system | build | size | BM25 | vector | hybrid | filtered hybrid | hybrid, 4 threads |
+|---|---|---|---|---|---|---|---|
+| strata | 14.5 s | 350 MB | 298 µs / 1.03 ms · 0.253 | 235 µs / 292 µs · 0.416 · r 0.978 | 903 µs / 1.76 ms · 0.361 | 548 µs / 3.54 ms | 3,994/s |
+| strata (2 Nov build) | 14.8 s | 646 MB | 317 µs / 696 µs · 0.253 | 498 µs / 848 µs · 0.419 · r 0.993 | 1.16 ms / 1.84 ms · 0.361 | 918 µs / 2.81 ms | 1,702/s |
+
+#### trec-covid (171,332 documents)
+
+| system | build | size | BM25 | vector | hybrid | filtered hybrid | hybrid, 4 threads |
+|---|---|---|---|---|---|---|---|
+| strata | 46.7 s | 1,081 MB | 670 µs / 2.87 ms · 0.664 | 229 µs / 310 µs · 0.816 · r 0.984 | 1.66 ms / 4.95 ms · 0.836 | 1.01 ms / 10.4 ms | 2,216/s |
+| strata (2 Nov build) | 54.3 s | 2,306 MB | 695 µs / 2.36 ms · 0.664 | 550 µs / 974 µs · 0.817 · r 0.990 | 1.97 ms / 4.35 ms · 0.834 | 1.45 ms / 9.60 ms | 1,146/s |
+
+#### quora (522,931 documents)
+
+| system | build | size | BM25 | vector | hybrid | filtered hybrid | hybrid, 4 threads |
+|---|---|---|---|---|---|---|---|
+| strata | 159.5 s | 2,820 MB | 195 µs / 1.13 ms · 0.755 | 327 µs / 410 µs · 0.891 · r 0.993 | 805 µs / 2.09 ms · 0.850 | 1.24 ms / 23.5 ms | 4,096/s |
+| strata (2 Nov build) | 201.3 s | 6,223 MB | 266 µs / 696 µs · 0.755 | 610 µs / 1.33 ms · 0.892 · r 0.990 | 1.28 ms / 2.19 ms · 0.850 | 1.81 ms / 13.2 ms | 1,400/s |
+
+
+### Writes, updates and streams (137,260 products with a text index and a vector index)
+
+Rows per second, one writer:
+
+| system | load | insert 1/txn | 100/txn | 1,000/txn | 10,000/txn | update price | update title | update vector | upsert row | delete |
+|---|---|---|---|---|---|---|---|---|---|---|
+| strata | 17.1 s | 2,539/s | 47,073/s | 11,975/s | 13,739/s | 571/s | 1,688/s | 1,188/s | 2,762/s | 7,499/s |
+| strata (2 Nov build) | 15.8 s | 1,852/s | 22,254/s | 6,208/s | 6,712/s | 1,389/s | 65/s | 33/s | 2,593/s | 6,558/s |
+
+A stream of new rows at a target rate, with a reader running:
+
+| system | target | reached | commit p50 | lag p99 | reads |
+|---|---|---|---|---|---|
+| strata | 1,000/s | 1,000/s | 1.43 ms | 5.34 ms | 34,036/s, p99 342 µs |
+| strata | 10,000/s | 9,999/s | 8.16 ms | 182 ms | 8,781/s, p99 5.39 ms |
+| strata | 50,000/s | 45,713/s | 34.1 ms | 1,337 ms | 89/s, p99 682 ms |
+| strata | flat out | 45,795/s | 77.9 ms | 285 ms | 56/s, p99 732 ms |
+| strata (2 Nov build) | 1,000/s | 1,000/s | 1.39 ms | 2.97 ms | 19,018/s, p99 497 µs |
+| strata (2 Nov build) | 10,000/s | 9,999/s | 7.51 ms | 202 ms | 7,278/s, p99 13.9 ms |
+| strata (2 Nov build) | 50,000/s | 26,986/s | 93.7 ms | 6,902 ms | 3,190/s, p99 10.7 ms |
+
+### A3: recommendations (similar products under filters; a feed fusing vectors with a walk of the co-purchase graph)
+
+| system | build | size | similar | similar recall@10 | similar, 4 threads | feed |
+|---|---|---|---|---|---|---|
+| strata | 50.7 s | 1,448 MB | 513 µs / 906 µs | 0.995 | 6,821/s | 4.87 ms / 6.27 ms |
+| strata (2 Nov build) | 141.5 s | 2,366 MB | 802 µs / 1.41 ms | 0.996 | 3,560/s | 97.5 ms / 146 ms |

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="claude:viewport-fit-sides" content="cover">
 <title>1M passages on DigitalOcean · Strata benchmarks</title>
-<meta name="description" content="Strata on latest main and thirteen other engines on 1M MS MARCO passages, each lane's engines taking turns on the same DigitalOcean machines: fourteen kinds of query at 1, 4 and 16 clients, medians of three passes, recall beside speed, writes, freshness and streams, and Strata before and after its BM25 and typo fixes.">
+<meta name="description" content="Strata on main of 6 November and thirteen other engines on 1M MS MARCO passages on DigitalOcean, each engine from its newest run: fourteen kinds of query at 1, 4 and 16 clients, medians of three passes, recall beside speed, writes, freshness and streams, and Strata since the first run.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -28,20 +28,20 @@
 <main>
 <div class="gutter head-band"><div class="wrap page-head">
     <nav class="subnav" aria-label="Benchmark pages"><a href="benchmarks.html">Overview</a><a href="bench-10m.html">10M, cloud</a><a href="bench-1m.html" aria-current="page">1M, cloud</a><a href="bench-laptop.html">1M, laptop cluster</a><a href="bench-embedded.html">No server</a><a href="bench-graph.html">Graph</a><a href="bench-method.html">How we test</a></nav>
-    <span class="eyebrow">Cluster · 1M passages · DigitalOcean · 4 November 2026</span>
+    <span class="eyebrow">Cluster · 1M passages · DigitalOcean · 4 to 6 November 2026</span>
     <h1>Fourteen engines, 1M passages, latest main</h1>
-    <p class="lede">Strata on latest main, with the BM25 and typo fixes, against thirteen engines. The engines of each lane took turns on the same DigitalOcean machines, with the same data, the same 14 kinds of query and three passes. Engines that shard shared two machines, the others one, with the same CPU limit.</p>
+    <p class="lede">Strata on main of 6 November against thirteen engines, with the same data, the same 14 kinds of query and three passes each. Each engine's numbers come from its newest run: an engine whose code or settings changed ran again, the others kept their 4 November numbers. Engines that shard had two 4-vCPU machines, the others one 8-vCPU machine, with the same CPU limit.</p>
     <p class="verdict" data-overall="cloud-1m"></p>
-    <p>Strata is first under all five ranking rules. It runs all 14 kinds, is in the top half on 40 of 45 tests and is never below 11th. It is fastest outright on 8 tests: facets, both hybrids, and the 99th percentile of filtered vectors and similar items. Qdrant is faster on BM25, Typesense and Meilisearch on typos, Redis on key lookups, and OpenSearch and Elasticsearch on SQL aggregates.</p>
+    <p>Strata is first under all five ranking rules. It runs all 14 kinds, is in the top half on 42 of 45 tests and is never below 10th. It is fastest outright on 9 tests: the three of SQL aggregates, both hybrids at one and four clients, prefix queries and the 99th percentile of facets. Qdrant is faster on BM25, Typesense and Meilisearch on typos, and Redis on key lookups and vectors.</p>
     <dl class="atglance">
       <div><dt>Data</dt><dd>1M MS MARCO v2.1 passages, with their Arctic Embed M v1.5 vectors (768 dimensions)</dd></div>
-      <div><dt>Machines</dt><dd>DigitalOcean sfo2: two 4-vCPU nodes taken in turn by the five engines that shard, one 8-vCPU node by the other nine</dd></div>
-        <div><dt>Strata</dt><dd>Image <code>055f6bf</code>: main with the typo fix (#242) and the BM25 statistics cache (#245)</dd></div>
-      <div><dt>Budget</dt><dd>6.8 CPUs per engine. Strata: 2 shards of 2.9 CPUs, a 1-CPU coordinator</dd></div>
+      <div><dt>Machines</dt><dd>DigitalOcean sfo2: two 4-vCPU nodes for each engine that shards, one 8-vCPU node for the others. Strata and Manticore ran on 6 November, Elasticsearch and OpenSearch on 5 November, the other ten on 4 November</dd></div>
+        <div><dt>Strata</dt><dd>Image <code>b022e39</code>: main of 6 November, with the eleven merges of 5 November, vector partitions (#278) and a coordinator in each shard's pod (#287)</dd></div>
+      <div><dt>Budget</dt><dd>6.8 CPUs per engine. Strata: 2 pods of 3.4 CPUs, each a shard and a coordinator, like Elasticsearch's data nodes</dd></div>
       <div><dt>Queries</dt><dd>300 dev queries per kind at 1, 4 and 16 clients; the median of three passes</dd></div>
       <div><dt>Quality</dt><dd>Recall@10 against an exact search of the same vectors</dd></div>
-      <div><dt>Noise</dt><dd>Strata ran first and again last on the same machines: 1.4% apart at the median</dd></div>
-        <div><dt>Cost</dt><dd>$20.76 at list price, with the 10M head-to-head</dd></div>
+      <div><dt>Noise</dt><dd>5 November's Strata ran again on 6 November's machines first: 9% faster to 14% slower kind by kind, slower on most</dd></div>
+        <div><dt>Cost</dt><dd>$20.76 on 4 November with the 10M head-to-head; the reruns are in their READMEs</dd></div>
     </dl>
     <nav class="toc" aria-label="Sections"><a href="#rank">Overall</a><a href="#places">Every kind</a><a href="#explore">One kind at a time</a><a href="#writes">Writes</a><a href="#load">Load</a><a href="#behind">Behind</a><a href="#since">Since the first run</a><a href="#files">Raw data</a></nav>
   </div></div>
@@ -80,8 +80,8 @@
   <section class="gutter" id="writes"><div class="wrap block">
     <div class="block-head">
       <span class="eyebrow">Writes and streams</span>
-      <h2>Searchable in 5 ms, and a stream written once</h2>
-      <p>Strata and Vespa make a write searchable when it returns (5.4 and 8.6 ms); Elasticsearch, OpenSearch and Solr refresh every second. Single inserts are about as fast as the Lucene engines'. Updates are more than twice as fast, because Strata sets one column in place. After a consumer crash, Strata resumes exactly, since offsets commit with the rows; the others write some events twice. None lost any.</p>
+      <h2>Searchable in 8 ms, and a stream written once</h2>
+      <p>Strata and Vespa make a write searchable when it returns (7.6 and 8.6 ms); Elasticsearch, OpenSearch and Solr refresh every second. Single inserts are about as fast as Elasticsearch's and OpenSearch's, and Solr's are faster up to four clients. At 16 clients Strata's updates are more than twice as fast as any other's, because it sets one column in place. From one client, Strata's writes are slower than on 4 November (287 inserts a second against 417, 285 updates against 547): other nodes, and a coordinator now across the network; the run did not separate the two. After a consumer crash, Strata resumes exactly, since offsets commit with the rows; the others write some events twice. None lost any.</p>
     </div>
     <div data-writes="cloud-1m"></div>
   </div></section>
@@ -100,20 +100,20 @@
       <span class="eyebrow">Where Strata is behind</span>
       <h2>Three kinds where it is clearly slower</h2>
     </div>
-    <div data-pick="cloud-1m" data-metric="p50" data-title="Median latency at 1 client, ms, lower is better" data-engines="strata,es,os,solr,qdrant,typesense,meili,redis,postgres" data-kinds="typo|sql aggregate|key lookup"></div>
-    <div data-pick="cloud-1m" data-metric="qps16" data-title="Queries a second at 16 clients, higher is better" data-engines="strata,es,os,solr,qdrant,typesense,meili,redis,postgres" data-kinds="typo|sql aggregate|key lookup"></div>
+    <div data-pick="cloud-1m" data-metric="p50" data-title="Median latency at 1 client, ms, lower is better" data-engines="strata,es,os,solr,qdrant,typesense,meili,redis,postgres" data-kinds="typo|key lookup|boosted (bm25 × decay)"></div>
+    <div data-pick="cloud-1m" data-metric="qps16" data-title="Queries a second at 16 clients, higher is better" data-engines="strata,es,os,solr,qdrant,typesense,meili,redis,postgres" data-kinds="typo|key lookup|boosted (bm25 × decay)"></div>
     <ul class="gaps">
-      <li><b>Typo search.</b> 19.6 ms with #242, down from 120 in the first run; Typesense and Meilisearch take 6.0, Elasticsearch 14.7.</li>
-      <li><b>SQL aggregates.</b> 184 ms through a coordinator, where OpenSearch and Elasticsearch take 4.7 and 6.4. Not fixed yet.</li>
-      <li><b>Key lookups.</b> 0.79 ms through Strata's key API and a coordinator, 9th of 14; Redis takes 0.09 and Postgres 0.21.</li>
+      <li><b>Typo search.</b> 13.1 ms, down from 120 in the first run (#242, #266); Typesense and Meilisearch take 6.0, Elasticsearch 14.7.</li>
+      <li><b>Key lookups.</b> 0.89 ms through Strata's key API and a coordinator, 9th of 14; Redis takes 0.09 and Postgres 0.21.</li>
+      <li><b>BM25 × recency.</b> 4.18 ms, 4th; Qdrant takes 1.95. Plain BM25 is 3rd at 2.03 ms, behind Qdrant's 1.63.</li>
     </ul>
   </div></section>
 
   <section class="gutter" id="since"><div class="wrap block">
     <div class="block-head">
       <span class="eyebrow">Since the first run</span>
-      <h2>BM25 74% faster at 16 clients, typos six times faster</h2>
-      <p>Strata's medians in the <a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-1m-do/README.md">first 1M run</a> (3 November) and in this one. The coordinator now caches each shard version's term statistics (#245), so a BM25 query takes one round to the shards instead of two, and a misspelt word is no longer expanded against the whole dictionary (#242). SQL aggregates did not get faster. The machines changed too, and were if anything slower: Elasticsearch's BM25 median went from <span data-num="cloud-1m-first:p50:es:bm25"></span> to <span data-num="cloud-1m:p50:es:bm25"></span> ms, OpenSearch's from <span data-num="cloud-1m-first:p50:os:bm25"></span> to <span data-num="cloud-1m:p50:os:bm25"></span>. Both builds on the same nodes, BM25 at 16 clients gained 30% (<a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/bm25-do-1m">results</a>).</p>
+      <h2>SQL aggregates 21 times faster, typos nine times, BM25 76% more at 16 clients</h2>
+      <p>Strata's medians in the <a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-1m-do/README.md">first 1M run</a> (3 November) and on main of 6 November. The coordinator caches each shard version's term statistics (#245), so a BM25 query takes one round to the shards instead of two; a misspelt word is no longer expanded against the whole dictionary (#242, #266); aggregates read their groups from the columns (#252, #264); and later BM25 segments start at the scores the earlier ones found (#258). The machines changed too: Elasticsearch's BM25 median went from <span data-num="cloud-1m-first:p50:es:bm25"></span> to <span data-num="cloud-1m:p50:es:bm25"></span> ms, OpenSearch's from <span data-num="cloud-1m-first:p50:os:bm25"></span> to <span data-num="cloud-1m:p50:os:bm25"></span>. One-client latency also pays the network hop to a coordinator in a shard's pod (#287), which the first run's coordinator, on the client's machine, did not.</p>
     </div>
     <div data-ab="strata-1m-since"></div>
   </div></section>
@@ -124,14 +124,16 @@
       <h2>Every number comes from these files</h2>
     </div>
     <ul class="files">
-      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/README.md">README.md</a>: setup, machines, the drift between Strata's two rounds and why Milvus ran alone</li>
-      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/1m/passes.md">passes.md</a>: each pass, with medians and ranges</li>
-      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/1m/rank-no-load.md">rank-no-load.md</a>: the ranking as <code>rank.py --no-load</code> computes it (<a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/1m/rank.md">rank.md</a> with load)</li>
-      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/compare-msmarco-same-nodes-do/1m">The directory</a>: raw results per engine and pass</li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/rerun-1106-do/README.md">The 6 November rerun</a>: Strata on main and Manticore, the node check, and which engines kept their numbers and why</li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/bigger-items-do/README.md">The 5 November run</a>: Elasticsearch and OpenSearch with their result caches off</li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/README.md">The 4 November run</a>: setup, machines, the drift between Strata's two rounds and why Milvus ran alone</li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/1m/passes.md">passes.md</a>: each pass of 4 November, with medians and ranges (each rerun has its own)</li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-same-nodes-do/1m/rank-no-load.md">rank-no-load.md</a>: 4 November's ranking as <code>rank.py --no-load</code> computes it; the one above applies the same rule to each engine's newest run (<a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/rerun-1106-do/1m-ranked.md">1m-ranked.md</a>)</li>
+      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/compare-msmarco-same-nodes-do/1m">The directory</a>: raw results per engine and pass (and <a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/rerun-1106-do/1m">the rerun's</a>)</li>
       <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/compare-msmarco-1m-do/README.md">The first 1M run</a>: every engine on machines of its own, Strata before #242 and #245</li>
       <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/deploy/compare/README.md">The method</a>: budgets, settings and every engine's request</li>
       <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/bm25-stats-cache-container/README.md">BM25 under load</a>: the before and after of #245 in a container</li>
-      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/bm25-do-1m/README.md">BM25 on DigitalOcean</a>: the same, on this run's nodes</li>
+      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/bm25-do-1m/README.md">BM25 on DigitalOcean</a>: the same, on 4 November's nodes</li>
     </ul>
   </div></section>
 </main>

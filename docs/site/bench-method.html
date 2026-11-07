@@ -75,7 +75,7 @@
       <div><b>Equal budgets, enforced</b><p>Kubernetes limits: 6.8 CPUs per engine in the cloud, 3 CPUs and 6 GiB on the laptop. Each engine is told its budget.</p></div>
       <div><b>The same text analysis</b><p>Folding, English stopwords, Snowball stemming, BM25 k1 1.2 and b 0.75 everywhere. The Lucene engines' top 10s share 93 to 96% of Strata's.</p></div>
       <div><b>The same vector settings</b><p>HNSW m 16, ef_construction 200, 64 candidates, 8-bit codes re-scored where supported.</p></div>
-      <div><b>No result caches</b><p>Query caches off in Solr, Elasticsearch and OpenSearch. Every answer is recorded and checked.</p></div>
+      <div><b>No result caches</b><p>Result caches off for every engine, its SQL endpoint included, since 5 November (<a href="#audit">our audit</a>); filter and page caches stay on, and each run records its cache hits. Every answer is recorded and checked.</p></div>
       <div><b>Pinned versions</b><p>Images pinned by tag, Strata by commit, data by SHA-256.</p></div>
       <div><b>Defaults plus documented tuning</b><p>What each engine's own docs recommend, committed beside the results.</p></div>
     </div>
@@ -89,7 +89,7 @@
     <ul class="gaps">
       <li><b>Latency</b>: median and 99th percentile at one client, measured at the client.</li>
       <li><b>Throughput</b>: queries a second at 4 and 16 clients, 6 s per cell over 300 queries, after warm-up.</li>
-      <li><b>Passes</b>: the median of three at 1M (the cold first pass alone would favour Strata). One pass at 10M after a longer warm-up; a second Strata landed within 4.5%.</li>
+      <li><b>Passes</b>: the median of three at 1M (the cold first pass alone would favour Strata). One pass in the 10M run after a longer warm-up, where a second Strata landed within 4.5%; three in its head-to-head on latest main.</li>
       <li><b>Quality</b>: recall@10 against exact vector search, and nDCG@10 where the collection has judgments.</li>
       <li><b>Writes</b>: inserts and updates at 16 clients, and time until a write is searchable.</li>
       <li><b>Streams</b>: a Redpanda topic at rising rates, then a consumer crash; duplicates and losses counted.</li>
@@ -133,11 +133,12 @@
         <tr><th scope="row">Strata's updates set one column; the Lucene engines re-index the document</th><td>Said beside the results</td></tr>
         <tr><th scope="row">PageRank compares a local push with power iteration over the whole graph</th><td>Recall beside every PageRank time</td></tr>
         <tr><th scope="row">Thread pools larger than the CPU limit throttled Vespa (408 s), Postgres (136 s) and Typesense (52 s), against Strata's 18 s</th><td>Open: it hurts their tails</td></tr>
-        <tr><th scope="row">Strata's coordinator shares the client's node, so its first hop does not cross the network</th><td>Open</td></tr>
+        <tr><th scope="row">Strata's coordinator shares the client's node, so its first hop does not cross the network</th><td>Since 6 November each shard pod also runs a coordinator, as Elasticsearch's nodes do, and the client calls them across the network (<a href="https://github.com/chloetech-ai/strata/pull/287">#287</a>); at 1M that costs Strata 4 to 29% at the median on one client</td></tr>
         <tr><th scope="row">DigitalOcean handed out four Xeon models; the same engine on other nodes moved 12% at the median, and Strata's same image up to 39% on BM25 at 16 clients</th><td>Since 4 November each lane's engines take turns on the same nodes, with Strata first and again last: 1.4% apart at the median at 1M, 3.4% at 10M</td></tr>
           <tr><th scope="row">Last in its lane, Milvus was still compacting during its first two passes, 2 to 3 times slower than alone</th><td>Its 1M numbers come from a run alone on a fresh node</td></tr>
         <tr><th scope="row">A slow kind is timed on fewer queries in its 6 seconds (Strata's typo kind on its first 48)</th><td>Open</td></tr>
         <tr><th scope="row">The graph run is on a fanless laptop, in a fixed order</th><td>Said on the graph page</td></tr>
+        <tr><th scope="row">Elasticsearch's and OpenSearch's SQL aggregate went through their SQL endpoints, where the shard request cache stayed on; its 300 queries repeat 30 years, so their times are likely cached answers</th><td>Since <a href="https://github.com/chloetech-ai/strata/pull/262">#262</a> the harness turns it off for the whole index and records every engine's cache hits. Run again with it off on 5 November: Elasticsearch 50.1 ms at 1M, against 6.44 cached</td></tr>
       </tbody>
     </table></div>
   </div></section>
