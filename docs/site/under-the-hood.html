@@ -264,9 +264,9 @@
       <h2>Where Strata is behind</h2>
     </div>
     <ul class="gaps">
-      <li><b>SQL aggregates through a coordinator.</b> <span>178 ms at 1M and 4.3 s at 10M, where Elasticsearch and OpenSearch take a few ms (<a href="bench-10m.html#behind">10M</a>).</span></li>
-      <li><b>Typo search in the cloud runs.</b> <span>Both used a build from before the faster typo walk, which since cut a coordinator's median from 112 to 15.8 ms on a Xeon VM; not re-run yet.</span></li>
-      <li><b>BM25 under load.</b> <span>Two rounds per query in the cloud runs. Caching the statistics (#245) took BM25 at 16 clients from 1,375 to 1,787 queries a second on the same DigitalOcean nodes (<a href="bench-1m.html#since">before and after</a>).</span></li>
+      <li><b>SQL aggregates through a coordinator.</b> <span>184 ms at 1M and 2.9 s at 10M on latest main, where Elasticsearch and OpenSearch take a few ms (<a href="bench-10m.html#latest">10M</a>), likely from a request cache the runs left on for SQL. Reading the groups from the columns (#252, in review) took the same query on 5M rows from 722 to 27 ms in a container.</span></li>
+      <li><b>Typo search.</b> <span>The faster typo walk (#242) took the cloud medians from 120 to 19.6 ms at 1M and from 824 to 81 ms at 10M. Typesense and Meilisearch still take 6 ms at 1M, and Elasticsearch 38 at 10M (<a href="bench-10m.html#latest">10M</a>).</span></li>
+      <li><b>BM25 under load.</b> <span>Caching the statistics (#245) made a query one round to the shards instead of two: at 16 clients Strata now serves 1,962 queries a second at 1M, second to Qdrant (<a href="bench-1m.html#since">before and after</a>). At 10M it serves 470 to OpenSearch's 896, waiting on its shards. Starting each segment at the scores the earlier ones found (#258, in review) gave 46% more queries a second on one thread in a container.</span></li>
       <li><b>Builds.</b> <span>The HNSW graph is 146 s of Quora's 153.1 s load on an M2.</span></li>
       <li><b>Cold filters and small facets.</b> <span>Tantivy is 1.4 to 3.4× faster on cold range filters, and 1.1 to 2.1× on facets in three of four BEIR collections (M2).</span></li>
     </ul>

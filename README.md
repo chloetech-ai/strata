@@ -57,6 +57,7 @@ flowchart LR
 
 | | Result | Where |
 |---|---|---|
+| Against 13 search engines and databases, 14 kinds of query (MS MARCO 1M on DigitalOcean, latest main) | **First** on places summed over 45 tests: 156 points, Elasticsearch 284, Solr 287, OpenSearch 292; head to head at 10M, 67 against OpenSearch's 83 and Elasticsearch's 120. Behind on typo search, SQL aggregates and key lookups | [Benchmarks](https://chloetech-ai.github.io/strata/site/benchmarks.html) |
 | Strata vs Tantivy, warm BM25 top-10 | **1.7–3.2× faster**; conjunctions 2.7–4.1× faster; 24 of 28 text and filter comparisons won | [Strata results](docs/strata/results.md#query-latency) |
 | Strata vector top-10 (HNSW, 1,024-d) | **0.05–0.10 ms**, recall@10 0.99 on Quora; SQLite's scan takes 7.7 ms to 0.7 s | [Strata results](docs/strata/results.md#vector-indexes) |
 | Filtered vector search planner | **1.8–6.1× faster** than the best fixed strategy, recall@10 0.991–0.998 | [Strata results](docs/strata/results.md#filtered-vector-search-and-the-planner) |
@@ -230,7 +231,7 @@ Each crate also carries its own design document ([Strata](strata/DESIGN.md), [En
 
 ## Status and limits
 
-This is a research prototype, measured carefully but on one machine (an Apple M2 MacBook Air; the model-based runs on an earlier 4-core cloud VM). A Strata database has one writer process (the multi-process writer lock is designed but not built), and `strata-server` serves a database's first table for now; its sharding, replication and agent are new and have been tested, not yet measured at scale. Engram's coding evidence comes from one long session, a handful of live runs and three small A/B projects; the public benchmarks it uses (LongMemEval, LoCoMo) are chat histories, not coding sessions. Each results page lists its own limitations.
+This is a research prototype, measured carefully, most of it on one machine (an Apple M2 MacBook Air; the model-based runs on an earlier 4-core cloud VM, and the comparisons with other engines on DigitalOcean). A Strata database has one writer process (the multi-process writer lock is designed but not built), and `strata-server` serves a database's first table for now; its sharding, replication and agent are new and have been tested, not yet measured at scale. Engram's coding evidence comes from one long session, a handful of live runs and three small A/B projects; the public benchmarks it uses (LongMemEval, LoCoMo) are chat histories, not coding sessions. Each results page lists its own limitations.
 
 The repository was called `rkonow/engram` until October 2026. GitHub redirects the old address, so existing clones keep working.
 

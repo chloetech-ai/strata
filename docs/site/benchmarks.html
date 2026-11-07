@@ -31,7 +31,7 @@
     <span class="eyebrow">Benchmarks</span>
     <h1>First overall when one system has to do it all</h1>
     <p class="lede">Applications need full text, filters, SQL, vectors and hybrids together. We test all of them at once, against thirteen search engines and databases. Strata is not the fastest at everything, and this page shows where.</p>
-    <p class="updated">Updated 4 November 2026 · measured, never edited</p>
+    <p class="updated">Updated 5 November 2026 · measured, never edited</p>
   </div></div>
 
   <section class="gutter" id="results"><div class="wrap block">
@@ -62,11 +62,11 @@
       <div class="loss"><div><h3>Typo-tolerant search</h3><div class="nums">10M · 81 ms on latest main; Elasticsearch 38</div></div>
         <p>A misspelt word was expanded against the whole dictionary. <span class="fix">#242 made it six to ten times faster (824 to 81 ms at 10M, 120 to 19.6 at 1M), but at 10M Elasticsearch and OpenSearch are still about twice as fast, and at 1M Typesense and Meilisearch take 6 ms.</span></p></div>
       <div class="loss"><div><h3>SQL aggregates</h3><div class="nums">10M · 2,894 ms on latest main; OpenSearch 4.08</div></div>
-        <p>A <code>GROUP BY</code> with <code>HAVING</code> over a filtered table. Strata's largest loss, and it grows with the data. Not fixed yet.</p></div>
+        <p>A <code>GROUP BY</code> with <code>HAVING</code> over a filtered table. Strata's largest loss, and it grows with the data. Elasticsearch's and OpenSearch's times are likely from their request cache, which the runs left on for SQL (<a href="bench-method.html#audit">our audit</a>); the next run turns it off. <span class="fix open">In review: #252 reads the groups from the columns, 722 to 27 ms for this query on 5M rows in a container (<a href="#since">below</a>).</span></p></div>
       <div class="loss"><div><h3>BM25 at 16 clients</h3><div class="nums">10M · 470 q/s on latest main; OpenSearch 896</div></div>
-        <p>A query through a coordinator took two rounds to the shards. <span class="fix">#245 made it one: at 1M Strata now serves 1,962 q/s, second to Qdrant's 2,471. At 10M the shards are what waits.</span></p></div>
+        <p>A query through a coordinator took two rounds to the shards. <span class="fix">#245 made it one: at 1M Strata now serves 1,962 q/s, second to Qdrant's 2,471. At 10M the shards are what waits.</span> <span class="fix open">In review: #258 starts each segment at the scores the earlier ones found, 46% more queries a second on one thread in a container.</span></p></div>
       <div class="loss"><div><h3>Key lookups</h3><div class="nums">10M · 0.86 ms, 5th of 9; Postgres 0.37</div></div>
-        <p>Postgres, Weaviate, ParadeDB and Qdrant read a row by id in about half Strata's time.</p></div>
+        <p>Postgres, Weaviate, ParadeDB and Qdrant read a row by id in about half Strata's time. Most of Strata's time is the hop through its coordinator, not the read. Not fixed yet.</p></div>
       <div class="loss"><div><h3>Vector recall at shared settings</h3><div class="nums">10M · recall@10 0.795; Qdrant 0.941</div></div>
         <p>Strata scores 8-bit codes and re-scores the best 40, so read its vector speeds with this recall.</p></div>
       <div class="loss"><div><h3>Single-row writes in an app</h3><div class="nums">One row a commit 4,022/s; SQLite 5,128</div></div>
@@ -74,6 +74,24 @@
     </div>
   </div></section>
 
+  <section class="gutter" id="since"><div class="wrap block">
+    <div class="block-head">
+      <h2>Fixes measured since the last run</h2>
+      <p>Five pull requests, in review, each timed against main on one machine. These are micro-benchmarks: no ranking on these pages includes them, and the cluster numbers change only with a rerun.</p>
+    </div>
+    <div class="table-wrap"><table class="data">
+      <thead><tr><th scope="col">fix</th><th scope="col">for</th><th scope="col">measured</th><th scope="col" class="num">main</th><th scope="col" class="num">with the fix</th></tr></thead>
+      <tbody>
+        <tr><th scope="row"><a href="https://github.com/chloetech-ai/strata/pull/252">#252</a> groups read from the columns</th><td>SQL aggregates</td><td>the benchmark's aggregate, median</td><td class="n">722 ms</td><td class="n">27.0 ms</td></tr>
+        <tr><th scope="row" rowspan="2"><a href="https://github.com/chloetech-ai/strata/pull/253">#253</a> filters kept per segment</th><td rowspan="2">BM25 + filter, prefix</td><td>BM25 + filter, median</td><td class="n">3.60 ms</td><td class="n">1.35 ms</td></tr>
+        <tr><td>prefix, median</td><td class="n">3.56 ms</td><td class="n">2.49 ms</td></tr>
+        <tr><th scope="row"><a href="https://github.com/chloetech-ai/strata/pull/258">#258</a> each segment starts at the scores found so far</th><td>BM25 under load</td><td>BM25, q/s at 4 clients, one thread a query</td><td class="n">1,904</td><td class="n">2,789</td></tr>
+        <tr><th scope="row"><a href="https://github.com/chloetech-ai/strata/pull/260">#260</a> shards skip rows only old coordinators read</th><td>BM25 × recency</td><td>q/s at 4 clients, one thread a query</td><td class="n">401</td><td class="n">593</td></tr>
+        <tr><th scope="row"><a href="https://github.com/chloetech-ai/strata/pull/259">#259</a> read counts without a scan</th><td>the coordinator's time</td><td>each of 3M reads counted over 1M keys</td><td class="n">1.9 µs</td><td class="n">0.2 µs</td></tr>
+      </tbody>
+    </table></div>
+    <p class="small muted">All in a 4-core cloud container (Xeon at 2.1 GHz). Except #259's, on the first 5M MS MARCO passages with the benchmark's columns, as one database in shard mode, with the benchmark's SQL. Each number is from its pull request's description.</p>
+  </div></section>
   <section class="gutter" id="reports"><div class="wrap block">
     <div class="block-head">
       <h2>Every report</h2>

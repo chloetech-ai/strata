@@ -104,7 +104,7 @@
     <div data-pick="cloud-1m" data-metric="qps16" data-title="Queries a second at 16 clients, higher is better" data-engines="strata,es,os,solr,qdrant,typesense,meili,redis,postgres" data-kinds="typo|sql aggregate|key lookup"></div>
     <ul class="gaps">
       <li><b>Typo search.</b> 19.6 ms with #242, down from 120 in the first run; Typesense and Meilisearch take 6.0, Elasticsearch 14.7.</li>
-      <li><b>SQL aggregates.</b> 184 ms through a coordinator, where OpenSearch and Elasticsearch take 4.7 and 6.4. Not fixed yet.</li>
+      <li><b>SQL aggregates.</b> 184 ms through a coordinator, where OpenSearch and Elasticsearch take 4.7 and 6.4, likely from their request cache, which the run left on for SQL (<a href="bench-method.html#audit">our audit</a>). In review: #252 reads the groups from the columns, 722 to 27 ms for this query on 5M rows in a container.</li>
       <li><b>Key lookups.</b> 0.79 ms through Strata's key API and a coordinator, 9th of 14; Redis takes 0.09 and Postgres 0.21.</li>
     </ul>
   </div></section>

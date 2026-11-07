@@ -680,6 +680,7 @@ a.report:hover { border-color: var(--ink-3); text-decoration: none; }
 .loss p { color: var(--ink-2); font-size: 0.93rem; }
 .loss p b { color: var(--ink); }
 .loss .fix { display: inline-block; margin-top: 4px; font-size: 0.84rem; color: var(--yes); }
+.loss .fix.open { color: var(--ink-2); }
 @media (max-width: 760px) { .loss { grid-template-columns: minmax(0, 1fr); } }
 
 .principles { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }

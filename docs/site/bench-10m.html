@@ -124,11 +124,11 @@
     <div data-pick="cloud-10m" data-metric="p50" data-title="Median latency at 1 client, ms, lower is better" data-engines="strata,os,es,solr,paradedb,postgres,qdrant,weaviate" data-kinds="sql aggregate|typo|key lookup|bm25 + filter"></div>
     <div data-pick="cloud-10m" data-metric="recall" data-title="Recall@10 at the shared settings, higher is better" data-engines="strata,os,es,solr,paradedb,postgres,qdrant,weaviate" data-kinds="vector|vector + filter|similar items"></div>
     <ul class="gaps">
-      <li><b>SQL aggregates.</b> 4.3 s, up from 178 ms at 1M; Elasticsearch and OpenSearch take under 8 ms. 2.9 s on latest main. Not fixed yet.</li>
+      <li><b>SQL aggregates.</b> 4.3 s, up from 178 ms at 1M; Elasticsearch and OpenSearch take under 8 ms, likely from their request cache, which the run left on for SQL (<a href="bench-method.html#audit">our audit</a>). 2.9 s on latest main. In review: #252 reads the groups from the columns, 722 to 27 ms for this query on 5M rows in a container; not yet run on a cluster.</li>
       <li><b>Typo search.</b> 824 ms on this build. 81 ms on latest main with #242, still about twice Elasticsearch's 38 and OpenSearch's 45.</li>
       <li><b>Key lookups.</b> 0.86 ms, about twice Postgres, Weaviate, ParadeDB and Qdrant.</li>
       <li><b>Vector recall.</b> 0.795 at the shared settings, against Qdrant's 0.941 and Postgres's 0.826.</li>
-      <li><b>BM25 at 16 clients.</b> 493 queries a second against OpenSearch's 777 and Elasticsearch's 608, without the statistics cache (#245). With it on latest main, 470 against OpenSearch's 896 on the same machines: at 10M the shards are what waits (p90 76 ms, median 19).</li>
+      <li><b>BM25 at 16 clients.</b> 493 queries a second against OpenSearch's 777 and Elasticsearch's 608, without the statistics cache (#245). With it on latest main, 470 against OpenSearch's 896 on the same machines: at 10M the shards are what waits (p90 76 ms, median 19). In review: #258 starts each segment at the scores the earlier ones found, 46% more queries a second on one thread in a container.</li>
     </ul>
   </div></section>
 
