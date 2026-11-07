@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: The tag names package.json's version
@@ -79,7 +79,7 @@ jobs:
             await db.close();
             console.log(`strata-db ${version}: installed and searched on ${process.platform}-${process.arch}`);
           '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: strata-js-${{ matrix.platform }}
           path: strata-js/dist/*.tgz
@@ -94,7 +94,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: strata-js-*
           path: dist

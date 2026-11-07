@@ -86,7 +86,7 @@ jobs:
           cp -r "$GITHUB_WORKSPACE/strata-py/tests" "$RUNNER_TEMP/strata-py/tests"
           cp -r "$GITHUB_WORKSPACE/strata/tests/models" "$RUNNER_TEMP/strata/tests/models"
           python -m pytest -q "$RUNNER_TEMP/strata-py/tests/test_database.py"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: strata-py-${{ matrix.platform }}
           path: strata-py/dist/*.whl
@@ -101,7 +101,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: strata-py-*
           path: dist
