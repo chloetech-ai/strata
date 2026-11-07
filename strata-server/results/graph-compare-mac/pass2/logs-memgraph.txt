@@ -1,0 +1,6 @@
+You are running Memgraph v3.14.0
+To get started with Memgraph, visit https://memgr.ph/start
+Max virtual memory areas vm.max_map_count 262144 is too low, increase to at least 524288
+/usr/local/lib/python3.12/dist-packages/torchmetrics/utilities/imports.py:23: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import DistributionNotFound, get_distribution
+DGL backend not selected or invalid.  Assuming PyTorch for now.

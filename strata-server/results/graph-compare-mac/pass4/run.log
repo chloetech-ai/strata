@@ -1,0 +1,86 @@
+2026-11-03T16:40:13Z load 2.86
+2026-11-03T16:40:14Z strata: started strata-server:graph
+strata: loading
+strata: load {'total_s': 1.048067916999571, 'nodes': 169343}
+hops_both_1: p50 0.458 ms, p95 0.539 ms, wrong 0/200
+hops_both_2: p50 0.516 ms, p95 1.838 ms, wrong 0/200
+hops_out_3: p50 0.496 ms, p95 0.872 ms, wrong 0/200
+path: p50 0.560 ms, p95 1.270 ms, wrong 0/200
+ppr_0.0001: p50 1.439 ms, p95 1.880 ms, wrong 0/200
+ppr_1e-05: p50 7.519 ms, p95 9.968 ms, wrong 0/200
+ppr_1e-06: p50 52.396 ms, p95 77.856 ms, wrong 0/200
+2026-11-03T16:40:30Z strata: done (rc 0)
+2026-11-03T16:40:30Z load 2.60
+2026-11-03T16:40:31Z strata-grpc: started strata-server:graph
+strata-grpc: loading
+strata-grpc: load {'total_s': 1.030564583998057, 'nodes': 169343}
+hops_both_1: p50 0.352 ms, p95 0.399 ms, wrong 0/200
+hops_both_2: p50 0.398 ms, p95 1.722 ms, wrong 0/200
+hops_out_3: p50 0.401 ms, p95 1.358 ms, wrong 0/200
+path: p50 0.542 ms, p95 1.357 ms, wrong 0/200
+ppr_0.0001: p50 1.394 ms, p95 1.875 ms, wrong 0/200
+ppr_1e-05: p50 7.816 ms, p95 10.760 ms, wrong 0/200
+ppr_1e-06: p50 49.219 ms, p95 71.099 ms, wrong 0/200
+2026-11-03T16:40:47Z strata-grpc: done (rc 0)
+2026-11-03T16:40:47Z load 2.66
+2026-11-03T16:40:48Z strata-edges: started strata-server:graph
+strata-edges: loading
+strata-edges: load {'nodes_s': 0.530898042001354, 'edges_s': 6.392497626999102, 'total_s': 6.923400128001958, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.449 ms, p95 0.538 ms, wrong 0/200
+hops_both_2: p50 0.562 ms, p95 5.201 ms, wrong 0/200
+hops_out_3: p50 0.500 ms, p95 1.094 ms, wrong 0/200
+path: p50 1.424 ms, p95 5.393 ms, wrong 0/200
+ppr_0.0001: p50 3.030 ms, p95 3.988 ms, wrong 0/200
+ppr_1e-05: p50 17.062 ms, p95 25.265 ms, wrong 0/200
+ppr_1e-06: p50 75.231 ms, p95 104.792 ms, wrong 0/200
+2026-11-03T16:41:18Z strata-edges: done (rc 0)
+2026-11-03T16:41:18Z load 2.76
+2026-11-03T16:41:18Z strata-edges-grpc: started strata-server:graph
+strata-edges-grpc: loading
+strata-edges-grpc: load {'nodes_s': 0.5108897499994782, 'edges_s': 6.156602461000148, 'total_s': 6.66749641899878, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.360 ms, p95 0.379 ms, wrong 0/200
+hops_both_2: p50 0.467 ms, p95 4.978 ms, wrong 0/200
+hops_out_3: p50 0.396 ms, p95 0.971 ms, wrong 0/200
+path: p50 1.440 ms, p95 5.722 ms, wrong 0/200
+ppr_0.0001: p50 2.993 ms, p95 3.976 ms, wrong 0/200
+ppr_1e-05: p50 17.053 ms, p95 23.722 ms, wrong 0/200
+ppr_1e-06: p50 75.611 ms, p95 105.564 ms, wrong 0/200
+2026-11-03T16:41:49Z strata-edges-grpc: done (rc 0)
+2026-11-03T16:41:49Z load 2.61
+2026-11-03T16:41:49Z neo4j: started neo4j:2026.10.1-community
+neo4j: loading
+neo4j: load {'nodes_s': 2.241006501000811, 'edges_s': 13.852036923999549, 'total_s': 16.093057550002413, 'nodes': 169343, 'edges': 1166243, 'gds_project_s': 1.005174582998734}
+hops_both_1: p50 1.020 ms, p95 1.227 ms, wrong 0/200
+hops_both_2: p50 0.904 ms, p95 5.477 ms, wrong 0/200
+hops_out_3: p50 0.749 ms, p95 1.300 ms, wrong 0/200
+path: p50 1.303 ms, p95 5.689 ms, wrong 0/200
+ppr_0.0001: p50 97.087 ms, p95 146.479 ms, wrong 0/200
+ppr_1e-05: p50 445.842 ms, p95 478.824 ms, wrong 0/200
+2026-11-03T16:44:18Z neo4j: done (rc 0)
+2026-11-03T16:44:18Z load 4.62
+2026-11-03T16:44:18Z memgraph: started memgraph/memgraph-mage:3.14.0
+memgraph: loading
+memgraph: load {'nodes_s': 0.3179224159976002, 'edges_s': 6.527900170000066, 'total_s': 6.845823835999909, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.186 ms, p95 0.203 ms, wrong 0/200
+hops_both_2: p50 0.230 ms, p95 4.176 ms, wrong 0/200
+hops_out_3: p50 0.198 ms, p95 0.443 ms, wrong 0/200
+path: p50 0.894 ms, p95 25.892 ms, wrong 0/200
+2026-11-03T16:44:38Z memgraph: done (rc 0)
+2026-11-03T16:44:38Z load 3.75
+2026-11-03T16:44:38Z arangodb: started arangodb/arangodb:3.12.4.3
+arangodb: loading
+arangodb: load {'nodes_s': 0.6551688340005057, 'edges_s': 12.837566213001992, 'total_s': 13.492739754998183, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.367 ms, p95 0.561 ms, wrong 0/200
+hops_both_2: p50 0.551 ms, p95 4.812 ms, wrong 0/200
+hops_out_3: p50 0.395 ms, p95 1.063 ms, wrong 0/200
+path: p50 2.228 ms, p95 9.661 ms, wrong 0/200
+2026-11-03T16:44:58Z arangodb: done (rc 0)
+2026-11-03T16:44:58Z load 3.04
+2026-11-03T16:44:58Z falkordb: started falkordb/falkordb:v4.22.3
+falkordb: loading
+falkordb: load {'nodes_s': 0.2904084170004353, 'edges_s': 26.68239426299988, 'total_s': 26.972811346000526, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.203 ms, p95 0.224 ms, wrong 0/200
+hops_both_2: p50 0.222 ms, p95 5.281 ms, wrong 0/200
+hops_out_3: p50 0.189 ms, p95 0.715 ms, wrong 0/200
+2026-11-03T16:45:30Z falkordb: done (rc 0)
+PASS DONE pass4 2026-11-03T16:45:30Z

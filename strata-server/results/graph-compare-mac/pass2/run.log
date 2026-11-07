@@ -1,0 +1,73 @@
+2026-11-03T07:59:16Z load 4.58
+2026-11-03T07:59:16Z strata: started strata-server:graph
+strata: loading
+strata: load {'total_s': 1.2792885000017122, 'nodes': 169343}
+hops_both_1: p50 0.505 ms, p95 0.741 ms, wrong 0/200
+hops_both_2: p50 0.638 ms, p95 2.112 ms, wrong 0/200
+hops_out_3: p50 0.511 ms, p95 0.832 ms, wrong 0/200
+path: p50 0.720 ms, p95 1.589 ms, wrong 0/200
+ppr_0.0001: p50 1.749 ms, p95 2.392 ms, wrong 0/200
+ppr_1e-05: p50 10.353 ms, p95 14.708 ms, wrong 0/200
+ppr_1e-06: p50 69.116 ms, p95 97.503 ms, wrong 0/200
+2026-11-03T07:59:38Z strata: done (rc 0)
+2026-11-03T07:59:38Z load 4.42
+2026-11-03T07:59:38Z strata-edges: started strata-server:graph
+strata-edges: loading
+strata-edges: load {'nodes_s': 0.5442682919965591, 'edges_s': 7.100381878997723, 'total_s': 7.644657170996652, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.480 ms, p95 0.613 ms, wrong 0/200
+hops_both_2: p50 0.751 ms, p95 6.672 ms, wrong 0/200
+hops_out_3: p50 0.544 ms, p95 1.291 ms, wrong 0/200
+path: p50 1.705 ms, p95 7.318 ms, wrong 0/200
+ppr_0.0001: p50 3.736 ms, p95 5.776 ms, wrong 0/200
+ppr_1e-05: p50 23.593 ms, p95 43.218 ms, wrong 0/200
+ppr_1e-06: p50 113.090 ms, p95 156.846 ms, wrong 0/200
+2026-11-03T08:00:18Z strata-edges: done (rc 0)
+2026-11-03T08:00:18Z load 5.89
+2026-11-03T08:00:19Z neo4j: started neo4j:2026.10.1-community
+neo4j: loading
+neo4j: load {'nodes_s': 2.618196418006846, 'edges_s': 17.187919133000833, 'total_s': 19.80612925900641, 'nodes': 169343, 'edges': 1166243, 'gds_project_s': 1.1780102509947028}
+hops_both_1: p50 1.158 ms, p95 2.120 ms, wrong 0/200
+hops_both_2: p50 1.194 ms, p95 7.624 ms, wrong 0/200
+hops_out_3: p50 0.883 ms, p95 1.450 ms, wrong 0/200
+path: p50 1.704 ms, p95 7.616 ms, wrong 0/200
+ppr_0.0001: p50 182.006 ms, p95 234.242 ms, wrong 0/200
+ppr_1e-05: p50 621.749 ms, p95 769.368 ms, wrong 0/200
+2026-11-03T08:04:04Z neo4j: done (rc 0)
+2026-11-03T08:04:04Z load 5.93
+2026-11-03T08:04:05Z memgraph: started memgraph/memgraph-mage:3.14.0
+memgraph: loading
+memgraph: load {'nodes_s': 0.3794991670001764, 'edges_s': 7.670193003003078, 'total_s': 8.049693711996952, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.198 ms, p95 0.285 ms, wrong 0/200
+hops_both_2: p50 0.328 ms, p95 6.571 ms, wrong 0/200
+hops_out_3: p50 0.226 ms, p95 0.525 ms, wrong 0/200
+path: p50 1.120 ms, p95 35.367 ms, wrong 0/200
+2026-11-03T08:04:24Z memgraph: done (rc 0)
+2026-11-03T08:04:24Z load 5.56
+2026-11-03T08:04:24Z arangodb: started arangodb/arangodb:3.12.4.3
+arangodb: loading
+arangodb: load {'nodes_s': 0.9030407499958528, 'edges_s': 24.33036746900325, 'total_s': 25.233483760996023, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.547 ms, p95 1.332 ms, wrong 0/200
+hops_both_2: p50 1.135 ms, p95 7.035 ms, wrong 0/200
+hops_out_3: p50 0.648 ms, p95 2.197 ms, wrong 0/200
+path: p50 5.033 ms, p95 20.408 ms, wrong 0/200
+2026-11-03T08:05:01Z arangodb: done (rc 0)
+2026-11-03T08:05:02Z load 4.79
+2026-11-03T08:05:03Z falkordb: started falkordb/falkordb:v4.22.3
+falkordb: loading
+falkordb: load {'nodes_s': 1.4550281259944313, 'edges_s': 52.55601810799999, 'total_s': 54.01107019199844, 'nodes': 169343, 'edges': 1166243}
+hops_both_1: p50 0.196 ms, p95 0.213 ms, wrong 0/200
+hops_both_2: p50 0.264 ms, p95 6.189 ms, wrong 0/200
+hops_out_3: p50 0.187 ms, p95 0.743 ms, wrong 0/200
+2026-11-03T08:06:08Z falkordb: done (rc 0)
+PASS DONE 2026-11-03T08:06:08Z
+2026-11-03T08:13:28Z load 5.36
+2026-11-03T08:13:29Z neo4j: started neo4j:2026.10.1-community
+neo4j: loading
+neo4j: load {'nodes_s': 2.839133543006028, 'edges_s': 16.614180423996004, 'total_s': 19.45332784200582, 'nodes': 169343, 'edges': 1166243, 'gds_project_s': 1.1276437510023243}
+hops_both_1: p50 1.178 ms, p95 1.885 ms, wrong 0/200
+hops_both_2: p50 1.392 ms, p95 8.021 ms, wrong 0/200
+hops_out_3: p50 0.980 ms, p95 1.846 ms, wrong 0/200
+path: p50 1.682 ms, p95 8.256 ms, wrong 0/200
+ppr_0.0001: p50 109.230 ms, p95 176.160 ms, wrong 0/200
+ppr_1e-05: p50 538.681 ms, p95 694.069 ms, wrong 0/200
+2026-11-03T08:16:31Z neo4j: done (rc 0)

@@ -1,0 +1,24 @@
+INFO: No AUTH_SECRET provided, generated a random one for this container session.
+WARNING: Every session is invalidated if the container is recreated without persisting the secret.
+INFO: No ENCRYPTION_KEY provided, generated a random one for this container session.
+WARNING: Encrypted credentials will be lost if the container is recreated without persisting the key.
+1:C 03 Nov 2026 16:50:09.449 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+1:C 03 Nov 2026 16:50:09.450 * Redis version=8.10.2, bits=64, commit=00000000, modified=1, pid=1, just started
+1:C 03 Nov 2026 16:50:09.450 * Configuration loaded
+1:M 03 Nov 2026 16:50:09.450 * monotonic clock: ARM CNTVCT @ 24 ticks/us
+1:M 03 Nov 2026 16:50:09.466 * Running mode=standalone, port=6379.
+1:M 03 Nov 2026 16:50:09.518 * <graph> GraphBLAS JIT restrict to pre-jit kernels
+1:M 03 Nov 2026 16:50:09.528 * <graph> Enabled role change notification
+1:M 03 Nov 2026 16:50:09.528 * <graph> Starting up FalkorDB version 4.22.3.
+1:M 03 Nov 2026 16:50:09.536 * <graph> Thread pool created, using 4 threads.
+1:M 03 Nov 2026 16:50:09.536 * <graph> Maximum number of OpenMP threads set to 4
+1:M 03 Nov 2026 16:50:09.536 * <graph> Query backlog size: 1000
+1:M 03 Nov 2026 16:50:09.536 * Module 'graph' loaded from /var/lib/falkordb/bin/falkordb.so
+1:M 03 Nov 2026 16:50:09.552 * Server initialized
+1:M 03 Nov 2026 16:50:09.552 * Ready to accept connections tcp
+1:M 03 Nov 2026 16:50:09.553 # WARNING: Redis does not require authentication and is not protected by network restrictions. Redis will accept connections from any IP address on any network interface.
+▲ Next.js 16.4.3
+- Local:         http://localhost:3000
+- Network:       http://0.0.0.0:3000
+✓ Ready in 0ms
+✓ Running next.config took 0.8ms

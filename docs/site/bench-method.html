@@ -138,6 +138,7 @@
           <tr><th scope="row">Last in its lane, Milvus was still compacting during its first two passes, 2 to 3 times slower than alone</th><td>Its 1M numbers come from a run alone on a fresh node</td></tr>
         <tr><th scope="row">A slow kind is timed on fewer queries in its 6 seconds (Strata's typo kind on its first 48)</th><td>Open</td></tr>
         <tr><th scope="row">The graph run is on a fanless laptop, in a fixed order</th><td>Said on the graph page</td></tr>
+        <tr><th scope="row">The first graph passes sent Strata's queries as HTTP JSON, while Neo4j, Memgraph and FalkorDB used their binary protocols</th><td>Re-run with Strata over gRPC beside HTTP JSON; both on the graph page, gRPC 0.1 ms faster on short hops</td></tr>
       </tbody>
     </table></div>
   </div></section>

@@ -69,6 +69,8 @@
         <p>Postgres, Weaviate, ParadeDB and Qdrant read a row by id in about half Strata's time.</p></div>
       <div class="loss"><div><h3>Vector recall at shared settings</h3><div class="nums">10M · recall@10 0.795; Qdrant 0.941</div></div>
         <p>Strata scores 8-bit codes and re-scores the best 40, so read its vector speeds with this recall.</p></div>
+      <div class="loss"><div><h3>Short graph hops</h3><div class="nums">Graph · 1 hop 0.35 ms over gRPC; Memgraph 0.18</div></div>
+        <p>Memgraph and FalkorDB, both in memory, answer one to three hops in about half Strata's time. Strata's own time on one hop is 0.10 ms against Memgraph's 0.02; gRPC instead of HTTP JSON took 0.1 ms off the rest. Not fixed yet.</p></div>
       <div class="loss"><div><h3>Single-row writes in an app</h3><div class="nums">One row a commit 4,022/s; SQLite 5,128</div></div>
         <p>SQLite wins one row a commit; batches turn it around, 95,670 rows a second to SQLite's 18,905.</p></div>
     </div>

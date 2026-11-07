@@ -1,0 +1,1 @@
+396448	/var/lib/memgraph

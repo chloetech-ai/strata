@@ -1,0 +1,6 @@
+2026-11-03T16:40:14.073094Z  INFO strata_server::server: merging in the background threads=1 memory_mib=3072
+2026-11-03T16:40:14.074513Z  INFO strata_server::server: queries share a memory budget memory_mib=2048
+2026-11-03T16:40:14.086425Z  INFO strata_server::server: keeps its logs in a log store path=/data/graph.strata.logs node=c1795bd5ca1e:7700 retain_s=604800 max_mib=1024
+2026-11-03T16:40:14.086701Z  INFO strata_server: serving table=papers rows=0 segments=0 version="0.1.0" simd=neon-dotprod
+2026-11-03T16:40:14.086709Z  INFO strata_server: HTTP and UI on http://0.0.0.0:7700/ (it asks for the token)
+2026-11-03T16:40:14.086712Z  INFO strata_server: no ANTHROPIC_API_KEY; the agent asks for a key in the UI

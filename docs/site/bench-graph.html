@@ -38,7 +38,7 @@
       <div><dt>Engines</dt><dd>Neo4j 2026.10 with GDS, Memgraph 3.14, FalkorDB 4.22, ArangoDB 3.12</dd></div>
       <div><dt>Queries</dt><dd>200 per kind from one client, after warm-up; the second of two passes</dd></div>
     </dl>
-    <div class="note"><b>One laptop</b><span>This compares the engines with each other, not with a server. Sub-millisecond medians moved by up to a third between passes.</span></div>
+    <div class="note"><b>One laptop</b><span>This compares the engines with each other, not with a server. Each engine ran alone, one after another; between the two passes every median moved by at most 7%.</span></div>
   </div></div>
 
   <section class="gutter" id="rank"><div class="wrap block">
@@ -54,7 +54,7 @@
     <div class="block-head">
       <span class="eyebrow">Latency</span>
       <h2>Short hops: the in-memory stores. Paths and PageRank: Strata</h2>
-      <p>Memgraph and FalkorDB answer one to three hops in about half Strata's time. Strata is fastest on shortest paths, and on two-hop expansion at the 95th percentile. Its PageRank takes 1.42 ms against Neo4j's 93.1, as an approximation (below).</p>
+      <p>Memgraph and FalkorDB answer one to three hops in about half Strata's time. Strata is fastest on shortest paths, and on two-hop expansion at the 95th percentile. Its PageRank takes 1.42 ms against Neo4j's 93.1, as an approximation (below). Strata is shown over gRPC and over HTTP JSON: gRPC takes about 0.1 ms off its short hops. On one hop the rest of its gap is its own time, 0.10 ms against Memgraph's 0.02, and the Python client's gRPC call, 0.25 ms against 0.17 for Bolt.</p>
     </div>
     <div class="grid">
       <div data-chart="graph-p50"></div>
@@ -74,8 +74,8 @@
   <section class="gutter" id="load"><div class="wrap block">
     <div class="block-head">
       <span class="eyebrow">Load and footprint</span>
-      <h2>Loaded in about a second, with the least memory and disk</h2>
-      <p>The field layout writes one row a paper. As one row a citation, like the others, Strata loads in 6.22 s against Memgraph's 6.96.</p>
+      <h2>Loaded in about a second, with the least memory</h2>
+      <p>The field layout writes one row a paper and keeps 68 MB on disk; FalkorDB, all in memory, saved nothing during the run. As one row a citation, like the others, Strata loads in 6.22 s against Memgraph's 6.96.</p>
     </div>
     <div data-chart="graph-load"></div>
   </div></section>
@@ -84,12 +84,12 @@
     <div class="block-head">
       <span class="eyebrow">Raw data</span>
       <h2>Every number comes from these files</h2>
-      <p>This run's results are on a branch whose pull request is not merged yet.</p>
     </div>
     <ul class="files">
-      <li><a href="https://github.com/chloetech-ai/strata/blob/claude/graph-compare-mac/strata-server/results/graph-compare-mac/README.md">README.md</a>: setup, schemas and every table</li>
-      <li><a href="https://github.com/chloetech-ai/strata/tree/claude/graph-compare-mac/strata-server/results/graph-compare-mac">The directory</a>: raw reports per engine and pass</li>
-      <li><a href="https://github.com/chloetech-ai/strata/tree/claude/graph-compare-mac/strata-server/deploy/graph-compare">deploy/graph-compare/</a>: <code>prep.py</code> (data and exact answers), <code>run.py</code> (queries) and <code>compare.sh</code></li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/graph-compare-mac/README.md">README.md</a>: setup, schemas and every table</li>
+      <li><a href="https://github.com/chloetech-ai/strata/blob/main/strata-server/results/graph-compare-mac/NOTES.md">NOTES.md</a>: what went wrong on the way, and the gRPC re-run</li>
+      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/results/graph-compare-mac">The directory</a>: raw reports per engine and pass</li>
+      <li><a href="https://github.com/chloetech-ai/strata/tree/main/strata-server/deploy/graph-compare">deploy/graph-compare/</a>: <code>prep.py</code> (data and exact answers), <code>run.py</code> (queries) and <code>compare.sh</code></li>
     </ul>
   </div></section>
 </main>

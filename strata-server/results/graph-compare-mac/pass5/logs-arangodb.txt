@@ -1,0 +1,12 @@
+Initializing database...Hang on...
+Database initialized...Starting System...
+2026-11-03T16:49:50.608737Z [1-1] INFO [e52b0] {general} ArangoDB 3.12.4-3 [linux] 64bit, using jemalloc, build refs/tags/v3.12.4.3 e17f4bad164, VPack 0.2.1, RocksDB 7.2.0, ICU 64.2, V8 12.1.165, OpenSSL 3.4.0 22 Oct 2024, build-id: d263fe3bb9e8989219ccca32654e7af759e87f06
+2026-11-03T16:49:50.608742Z [1-1] INFO [11111] {general} This executable uses the GNU C library (glibc), which is licensed under the GNU Lesser General Public License (LGPL), see https://www.gnu.org/copyleft/lesser.html and https://www.gnu.org/licenses/gpl.html
+2026-11-03T16:49:50.608762Z [1-1] INFO [a1c60] {syscall} file-descriptors (nofiles) hard limit is 1048576, soft limit is 1048576
+2026-11-03T16:49:50.608888Z [1-1] INFO [75ddc] {general} detected operating system: Linux version 5.15.49-linuxkit-pr (root@buildkitsandbox) (gcc (Alpine 10.2.1_pre1) 10.2.1 20201203, GNU ld (GNU Binutils) 2.35.2) #1 SMP PREEMPT Thu May 25 07:27:39 UTC 2023
+2026-11-03T16:49:50.608926Z [1-1] INFO [25362] {memory} Available physical memory: 6000000000 bytes (overriden by environment variable), available cores: 3 (overriden by environment variable)
+2026-11-03T16:49:50.621818Z [1-1] INFO [3bb7d] {cluster} Starting up with role SINGLE
+2026-11-03T16:49:50.629684Z [1-1] INFO [f6e0e] {aql} memory limit per AQL query automatically set to 3600000000 bytes. to modify this value, please adjust the startup option `--query.memory-limit`
+2026-11-03T16:49:50.837944Z [1-1] INFO [c1b63] {arangosearch} ArangoSearch maintenance: [1..1] commit thread(s), [1..1] consolidation thread(s). ArangoSearch execution parallel threads limit: 6
+2026-11-03T16:49:50.841973Z [1-1] INFO [6ea38] {general} using endpoint 'http+tcp://0.0.0.0:8529' for non-encrypted requests
+2026-11-03T16:49:50.849888Z [1-1] INFO [cf3f4] {general} ArangoDB (version 3.12.4-3 [linux]) is ready for business. Have fun!
