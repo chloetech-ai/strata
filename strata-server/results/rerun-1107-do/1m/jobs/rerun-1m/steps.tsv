@@ -1,0 +1,20 @@
+1	ok	1794015969	1794016439	IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards build
+2	ok	1794016439	1794016449	IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards up strata
+3	ok	1794016449	1794016828	IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards run strata --label strata-b
+4	ok	1794016828	1794017196	IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards run strata --label strata-b-pass2
+5	ok	1794017196	1794017567	IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards run strata --label strata-b-pass3
+6	ok	1794017567	1794017568	IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards down strata
+7	ok	1794017568	1794017904	build
+8	ok	1794017904	1794017909	up strata
+9	ok	1794017909	1794018280	run strata
+10	ok	1794018280	1794018650	run strata --label strata-pass2
+11	ok	1794018650	1794019019	run strata --label strata-pass3
+12	ok	1794019019	1794019164	run strata --candidates 128 --label strata-ef128 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+13	ok	1794019164	1794019307	run strata --candidates 128 --label strata-ef128-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+14	ok	1794019307	1794019449	run strata --candidates 128 --label strata-ef128-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+15	ok	1794019449	1794019591	run strata --candidates 256 --label strata-ef256 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+16	ok	1794019591	1794019734	run strata --candidates 256 --label strata-ef256-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+17	ok	1794019734	1794019876	run strata --candidates 256 --label strata-ef256-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+18	ok	1794019876	1794019948	writes strata
+19	ok	1794019948	1794020116	stream strata
+20	ok	1794020116	1794020117	down strata

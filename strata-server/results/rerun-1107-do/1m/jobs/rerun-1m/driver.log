@@ -1,0 +1,24 @@
+01:42:29 rerun-1m: waiting for its nodes
+01:43:48 rerun-1m: nodes rerun-1m-d-a1-3e000b rerun-1m-d-a1-3e000w and rerun-1m-c-a1-3e000g
+01:46:09 rerun-1m: step 1: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards build
+01:53:59 rerun-1m: step 2: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards up strata
+01:54:09 rerun-1m: step 3: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards run strata --label strata-b
+02:00:28 rerun-1m: step 4: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards run strata --label strata-b-pass2
+02:06:36 rerun-1m: step 5: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards run strata --label strata-b-pass3
+02:12:47 rerun-1m: step 6: compare.sh IMAGE=ghcr.io/chloetech-ai/strata-server:b022e39d6f73295afb2e4bbde8c9d99da262059b STRATA_COORD=shards down strata
+02:12:48 rerun-1m: step 7: compare.sh build
+02:18:24 rerun-1m: step 8: compare.sh up strata
+02:18:29 rerun-1m: step 9: compare.sh run strata
+02:24:40 rerun-1m: step 10: compare.sh run strata --label strata-pass2
+02:30:50 rerun-1m: step 11: compare.sh run strata --label strata-pass3
+02:36:59 rerun-1m: step 12: compare.sh run strata --candidates 128 --label strata-ef128 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+02:39:24 rerun-1m: step 13: compare.sh run strata --candidates 128 --label strata-ef128-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+02:41:47 rerun-1m: step 14: compare.sh run strata --candidates 128 --label strata-ef128-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+02:44:09 rerun-1m: step 15: compare.sh run strata --candidates 256 --label strata-ef256 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+02:46:31 rerun-1m: step 16: compare.sh run strata --candidates 256 --label strata-ef256-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+02:48:54 rerun-1m: step 17: compare.sh run strata --candidates 256 --label strata-ef256-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+02:51:16 rerun-1m: step 18: compare.sh writes strata
+02:52:28 rerun-1m: step 19: compare.sh stream strata
+02:55:16 rerun-1m: step 20: compare.sh down strata
+02:55:22 rerun-1m: reports fetched (19 files)
+02:55:24 rerun-1m: done after 4375 s

@@ -1,0 +1,16 @@
+01:42:31 qdrant-ef: waiting for its nodes
+01:43:50 qdrant-ef: nodes qdrant-ef-d-a1-3e0005 qdrant-ef-d-a1-3e0005 and qdrant-ef-c-a1-3e0009
+01:46:05 qdrant-ef: step 1: compare.sh up qdrant
+01:46:11 qdrant-ef: step 2: compare.sh load qdrant
+02:43:17 qdrant-ef: step 3: compare.sh run qdrant
+02:48:19 qdrant-ef: step 4: compare.sh run qdrant --label qdrant-pass2
+02:53:14 qdrant-ef: step 5: compare.sh run qdrant --label qdrant-pass3
+02:58:11 qdrant-ef: step 6: compare.sh run qdrant --candidates 128 --label qdrant-ef128 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+03:00:38 qdrant-ef: step 7: compare.sh run qdrant --candidates 128 --label qdrant-ef128-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+03:03:05 qdrant-ef: step 8: compare.sh run qdrant --candidates 128 --label qdrant-ef128-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+03:05:33 qdrant-ef: step 9: compare.sh run qdrant --candidates 256 --label qdrant-ef256 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+03:08:05 qdrant-ef: step 10: compare.sh run qdrant --candidates 256 --label qdrant-ef256-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+03:10:38 qdrant-ef: step 11: compare.sh run qdrant --candidates 256 --label qdrant-ef256-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+03:13:09 qdrant-ef: step 12: compare.sh down qdrant
+03:13:15 qdrant-ef: reports fetched (12 files)
+03:13:17 qdrant-ef: done after 5446 s

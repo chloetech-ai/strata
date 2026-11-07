@@ -1,0 +1,115 @@
+{
+  "batch": 500,
+  "clients": 8,
+  "collection": "msmarco-1000k",
+  "docs": 1000000,
+  "engine": "qdrant",
+  "engine_stats": {
+    "config": {
+      "hnsw_config": {
+        "ef_construct": 100,
+        "full_scan_threshold": 10000,
+        "m": 16,
+        "max_indexing_threads": 0,
+        "on_disk": false
+      },
+      "optimizer_config": {
+        "default_segment_number": 0,
+        "deleted_threshold": 0.2,
+        "flush_interval_sec": 5,
+        "indexing_threshold": 10000,
+        "max_optimization_threads": null,
+        "max_segment_size": null,
+        "memmap_threshold": null,
+        "prevent_unoptimized": null,
+        "vacuum_min_vector_number": 1000
+      },
+      "params": {
+        "on_disk_payload": true,
+        "replication_factor": 1,
+        "shard_number": 1,
+        "sparse_vectors": {
+          "bm25": {
+            "modifier": "idf"
+          }
+        },
+        "vectors": {
+          "emb": {
+            "distance": "Dot",
+            "hnsw_config": {
+              "ef_construct": 200,
+              "m": 16
+            },
+            "size": 768
+          }
+        },
+        "write_consistency_factor": 1
+      },
+      "quantization_config": {
+        "scalar": {
+          "always_ram": true,
+          "type": "int8"
+        }
+      },
+      "wal_config": {
+        "wal_capacity_mb": 32,
+        "wal_retain_closed": 1,
+        "wal_segments_ahead": 0
+      }
+    },
+    "created_at": "2026-11-07T01:46:39.031Z",
+    "indexed_vectors_count": 1999969,
+    "optimizer_status": "ok",
+    "payload_schema": {
+      "body": {
+        "data_type": "text",
+        "params": {
+          "lowercase": true,
+          "phrase_matching": true,
+          "stemmer": {
+            "language": "english",
+            "type": "snowball"
+          },
+          "stopwords": "english",
+          "tokenizer": "word",
+          "type": "text"
+        },
+        "points": 999969
+      },
+      "category": {
+        "data_type": "keyword",
+        "points": 1000000
+      },
+      "key": {
+        "data_type": "keyword",
+        "points": 1000000
+      },
+      "rating": {
+        "data_type": "float",
+        "points": 1000000
+      },
+      "year": {
+        "data_type": "integer",
+        "points": 1000000
+      }
+    },
+    "points_count": 1000000,
+    "segments_count": 4,
+    "status": "green",
+    "update_queue": {
+      "length": 0
+    }
+  },
+  "ingest_s": 333.307299712,
+  "merge_s": 3054.683626999,
+  "prepare_s": 22.783527218,
+  "refresh_s": 0.0,
+  "request_bytes": 13335504536,
+  "searchable_docs": 1000000,
+  "segments": 4,
+  "setup_s": 0.446901636,
+  "steps": {
+    "index_s": 3054.683585494
+  },
+  "total_s": 3387.990957244
+}

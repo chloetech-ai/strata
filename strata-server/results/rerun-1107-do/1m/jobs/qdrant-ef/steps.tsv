@@ -1,0 +1,12 @@
+1	ok	1794015965	1794015971	up qdrant
+2	ok	1794015971	1794019397	load qdrant
+3	ok	1794019397	1794019699	run qdrant
+4	ok	1794019699	1794019994	run qdrant --label qdrant-pass2
+5	ok	1794019994	1794020291	run qdrant --label qdrant-pass3
+6	ok	1794020291	1794020438	run qdrant --candidates 128 --label qdrant-ef128 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+7	ok	1794020438	1794020585	run qdrant --candidates 128 --label qdrant-ef128-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+8	ok	1794020585	1794020733	run qdrant --candidates 128 --label qdrant-ef128-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+9	ok	1794020733	1794020885	run qdrant --candidates 256 --label qdrant-ef256 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+10	ok	1794020885	1794021038	run qdrant --candidates 256 --label qdrant-ef256-pass2 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+11	ok	1794021038	1794021189	run qdrant --candidates 256 --label qdrant-ef256-pass3 --kinds vector,vector + filter,hybrid (RRF),hybrid (weighted),similar items
+12	ok	1794021189	1794021191	down qdrant

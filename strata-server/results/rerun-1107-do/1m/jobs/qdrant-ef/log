@@ -1,0 +1,340 @@
+service/qdrant created
+pod/qdrant-0 created
+pod/qdrant-0 condition met
+job.batch/load-qdrant created
+qdrant: average body length 127.9 terms (22.8 s)
+qdrant: index created in 0.4 s
+qdrant: 25000 documents sent, 7 s
+qdrant: 50000 documents sent, 13 s
+qdrant: 75000 documents sent, 21 s
+qdrant: 100000 documents sent, 28 s
+qdrant: 125000 documents sent, 38 s
+qdrant: 150000 documents sent, 44 s
+qdrant: 175000 documents sent, 51 s
+qdrant: 200000 documents sent, 57 s
+qdrant: 225000 documents sent, 65 s
+qdrant: 250000 documents sent, 74 s
+qdrant: 275000 documents sent, 83 s
+qdrant: 300000 documents sent, 93 s
+qdrant: 325000 documents sent, 103 s
+qdrant: 350000 documents sent, 113 s
+qdrant: 375000 documents sent, 122 s
+qdrant: 400000 documents sent, 130 s
+qdrant: 425000 documents sent, 139 s
+qdrant: 450000 documents sent, 149 s
+qdrant: 475000 documents sent, 156 s
+qdrant: 500000 documents sent, 163 s
+qdrant: 525000 documents sent, 169 s
+qdrant: 550000 documents sent, 179 s
+qdrant: 575000 documents sent, 189 s
+qdrant: 600000 documents sent, 199 s
+qdrant: 625000 documents sent, 210 s
+qdrant: 650000 documents sent, 220 s
+qdrant: 675000 documents sent, 229 s
+qdrant: 700000 documents sent, 238 s
+qdrant: 725000 documents sent, 249 s
+qdrant: 750000 documents sent, 259 s
+qdrant: 775000 documents sent, 270 s
+qdrant: 800000 documents sent, 279 s
+qdrant: 825000 documents sent, 289 s
+qdrant: 850000 documents sent, 295 s
+qdrant: 875000 documents sent, 302 s
+qdrant: 900000 documents sent, 308 s
+qdrant: 925000 documents sent, 314 s
+qdrant: 950000 documents sent, 321 s
+qdrant: 975000 documents sent, 327 s
+qdrant: 1000000 documents sent, 333 s
+qdrant: 1000000 documents (13.3 GB) sent in 333.3 s
+error: read tcp 127.0.0.1:60930->127.0.0.1:36567: read: connection reset by peer
+qdrant: index_s in 3054.7 s
+qdrant: indexed 3054.7 s after the last write; 3388.0 s in all
+wrote /data/compare/load-qdrant.json
+job.batch/run-qdrant created
+qdrant    bm25                     warm-up: p50 2.058, 2.057 ms
+qdrant    bm25                     c=1        705 q/s  p50   1.360 ms  p90   2.078 ms  p99   2.822 ms  errors 0
+qdrant    bm25                     c=4       1853 q/s  p50   2.075 ms  p90   3.073 ms  p99   4.211 ms  errors 0
+qdrant    bm25                     c=16      2431 q/s  p50   6.261 ms  p90   9.250 ms  p99  14.459 ms  errors 0
+qdrant    bm25 + filter            warm-up: p50 2.263, 2.281 ms
+qdrant    bm25 + filter            c=1        600 q/s  p50   1.586 ms  p90   2.296 ms  p99   3.683 ms  errors 0
+qdrant    bm25 + filter            c=4       1667 q/s  p50   2.294 ms  p90   3.302 ms  p99   4.990 ms  errors 0
+qdrant    bm25 + filter            c=16      2091 q/s  p50   7.162 ms  p90  10.975 ms  p99  17.430 ms  errors 0
+qdrant    vector                   warm-up: p50 3.096, 3.068 ms
+qdrant    vector                   c=1        522 q/s  p50   1.842 ms  p90   2.266 ms  p99   2.735 ms  errors 0
+qdrant    vector                   c=4       1238 q/s  p50   3.116 ms  p90   3.997 ms  p99   5.117 ms  errors 0
+qdrant    vector                   c=16      1417 q/s  p50  10.605 ms  p90  15.351 ms  p99  22.800 ms  errors 0
+qdrant    vector + filter          warm-up: p50 5.294, 5.365 ms
+qdrant    vector + filter          c=1        301 q/s  p50   3.233 ms  p90   4.032 ms  p99   4.711 ms  errors 0
+qdrant    vector + filter          c=4        727 q/s  p50   5.355 ms  p90   6.657 ms  p99   8.506 ms  errors 0
+qdrant    vector + filter          c=16       744 q/s  p50  20.379 ms  p90  28.416 ms  p99  34.491 ms  errors 0
+qdrant    hybrid (RRF)             warm-up: p50 12.006, 11.915 ms
+qdrant    hybrid (RRF)             c=1        115 q/s  p50   8.169 ms  p90  12.273 ms  p99  14.129 ms  errors 0
+qdrant    hybrid (RRF)             c=4        307 q/s  p50  11.902 ms  p90  18.574 ms  p99  22.421 ms  errors 0
+qdrant    hybrid (RRF)             c=16       323 q/s  p50  47.228 ms  p90  65.285 ms  p99  79.689 ms  errors 0
+qdrant    hybrid (weighted)        warm-up: p50 11.772, 11.722 ms
+qdrant    hybrid (weighted)        c=1        114 q/s  p50   8.308 ms  p90  12.219 ms  p99  14.325 ms  errors 0
+qdrant    hybrid (weighted)        c=4        302 q/s  p50  12.042 ms  p90  18.706 ms  p99  22.767 ms  errors 0
+qdrant    hybrid (weighted)        c=16       321 q/s  p50  47.855 ms  p90  66.670 ms  p99  79.741 ms  errors 0
+qdrant    boosted (bm25 × decay)   warm-up: p50 2.610, 2.589 ms
+qdrant    boosted (bm25 × decay)   c=1        558 q/s  p50   1.773 ms  p90   2.478 ms  p99   3.184 ms  errors 0
+qdrant    boosted (bm25 × decay)   c=4       1541 q/s  p50   2.536 ms  p90   3.633 ms  p99   4.895 ms  errors 0
+qdrant    boosted (bm25 × decay)   c=16      2027 q/s  p50   7.570 ms  p90  11.127 ms  p99  17.239 ms  errors 0
+qdrant    facet                    warm-up: p50 62.301, 61.322 ms
+qdrant    facet                    c=1         54 q/s  p50  13.698 ms  p90  40.114 ms  p99  51.412 ms  errors 0
+qdrant    facet                    c=4         64 q/s  p50  61.481 ms  p90 109.082 ms  p99 146.503 ms  errors 0
+qdrant    facet                    c=16        64 q/s  p50 247.919 ms  p90 331.010 ms  p99 401.441 ms  errors 0
+qdrant    key lookup               warm-up: p50 0.372, 0.374 ms
+qdrant    key lookup               c=1       3046 q/s  p50   0.324 ms  p90   0.365 ms  p99   0.431 ms  errors 0
+qdrant    key lookup               c=4      10300 q/s  p50   0.379 ms  p90   0.455 ms  p99   0.567 ms  errors 0
+qdrant    key lookup               c=16     26671 q/s  p50   0.566 ms  p90   0.796 ms  p99   1.170 ms  errors 0
+qdrant    phrase                   warm-up: p50 1.620, 1.641 ms
+qdrant    phrase                   c=1        409 q/s  p50   1.138 ms  p90   4.855 ms  p99  14.316 ms  errors 0
+qdrant    phrase                   c=4       1342 q/s  p50   1.630 ms  p90   5.270 ms  p99  16.237 ms  errors 0
+qdrant    phrase                   c=16      1719 q/s  p50   8.282 ms  p90  14.784 ms  p99  28.216 ms  errors 0
+qdrant    typo                     unavailable: no fuzzy matching: its text index matches whole words (or prefixes, with a prefix tokenizer)
+qdrant    prefix                   unavailable: prefixes need the prefix tokenizer, an index of its own that would replace the word index the facet and phrase kinds use on the field
+qdrant    similar items            warm-up: p50 13.301, 13.199 ms
+qdrant    similar items            c=1        120 q/s  p50   8.419 ms  p90  10.420 ms  p99  12.103 ms  errors 0
+qdrant    similar items            c=4        305 q/s  p50  13.033 ms  p90  16.406 ms  p99  19.796 ms  errors 0
+qdrant    similar items            c=16       306 q/s  p50  49.264 ms  p90  69.829 ms  p99  81.227 ms  errors 0
+qdrant    sql aggregate            unavailable: no grouped aggregates: its facet API counts values only
+qdrant    result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant.json
+job.batch/run-qdrant-pass2 created
+qdrant-pass2 bm25                     warm-up: p50 2.055, 2.052 ms
+qdrant-pass2 bm25                     c=1        697 q/s  p50   1.395 ms  p90   2.092 ms  p99   2.800 ms  errors 0
+qdrant-pass2 bm25                     c=4       1878 q/s  p50   2.055 ms  p90   3.059 ms  p99   4.063 ms  errors 0
+qdrant-pass2 bm25                     c=16      2409 q/s  p50   6.299 ms  p90   9.148 ms  p99  14.997 ms  errors 0
+qdrant-pass2 bm25 + filter            warm-up: p50 2.260, 2.230 ms
+qdrant-pass2 bm25 + filter            c=1        614 q/s  p50   1.552 ms  p90   2.269 ms  p99   3.765 ms  errors 0
+qdrant-pass2 bm25 + filter            c=4       1673 q/s  p50   2.278 ms  p90   3.319 ms  p99   4.889 ms  errors 0
+qdrant-pass2 bm25 + filter            c=16      2104 q/s  p50   7.146 ms  p90  10.774 ms  p99  16.982 ms  errors 0
+qdrant-pass2 vector                   warm-up: p50 3.152, 3.124 ms
+qdrant-pass2 vector                   c=1        505 q/s  p50   1.942 ms  p90   2.327 ms  p99   2.730 ms  errors 0
+qdrant-pass2 vector                   c=4       1237 q/s  p50   3.122 ms  p90   3.994 ms  p99   5.245 ms  errors 0
+qdrant-pass2 vector                   c=16      1416 q/s  p50  10.570 ms  p90  15.998 ms  p99  22.919 ms  errors 0
+qdrant-pass2 vector + filter          warm-up: p50 5.369, 5.363 ms
+qdrant-pass2 vector + filter          c=1        290 q/s  p50   3.313 ms  p90   4.252 ms  p99   4.941 ms  errors 0
+qdrant-pass2 vector + filter          c=4        719 q/s  p50   5.458 ms  p90   6.664 ms  p99   8.653 ms  errors 0
+qdrant-pass2 vector + filter          c=16       734 q/s  p50  20.470 ms  p90  28.902 ms  p99  35.350 ms  errors 0
+qdrant-pass2 hybrid (RRF)             warm-up: p50 11.948, 11.654 ms
+qdrant-pass2 hybrid (RRF)             c=1        115 q/s  p50   8.125 ms  p90  12.262 ms  p99  14.349 ms  errors 0
+qdrant-pass2 hybrid (RRF)             c=4        306 q/s  p50  11.882 ms  p90  18.503 ms  p99  22.307 ms  errors 0
+qdrant-pass2 hybrid (RRF)             c=16       321 q/s  p50  47.788 ms  p90  65.337 ms  p99  79.973 ms  errors 0
+qdrant-pass2 hybrid (weighted)        warm-up: p50 11.955, 12.017 ms
+qdrant-pass2 hybrid (weighted)        c=1        113 q/s  p50   8.341 ms  p90  12.406 ms  p99  14.519 ms  errors 0
+qdrant-pass2 hybrid (weighted)        c=4        302 q/s  p50  12.069 ms  p90  18.646 ms  p99  22.486 ms  errors 0
+qdrant-pass2 hybrid (weighted)        c=16       322 q/s  p50  47.673 ms  p90  65.281 ms  p99  78.617 ms  errors 0
+qdrant-pass2 boosted (bm25 × decay)   warm-up: p50 2.573, 2.561 ms
+qdrant-pass2 boosted (bm25 × decay)   c=1        564 q/s  p50   1.744 ms  p90   2.473 ms  p99   3.216 ms  errors 0
+qdrant-pass2 boosted (bm25 × decay)   c=4       1523 q/s  p50   2.563 ms  p90   3.645 ms  p99   4.874 ms  errors 0
+qdrant-pass2 boosted (bm25 × decay)   c=16      2032 q/s  p50   7.534 ms  p90  11.103 ms  p99  17.196 ms  errors 0
+qdrant-pass2 facet                    warm-up: p50 62.053, 64.784 ms
+qdrant-pass2 facet                    c=1         53 q/s  p50  14.068 ms  p90  40.328 ms  p99  52.528 ms  errors 0
+qdrant-pass2 facet                    c=4         63 q/s  p50  61.784 ms  p90 108.271 ms  p99 145.981 ms  errors 0
+qdrant-pass2 facet                    c=16        64 q/s  p50 242.745 ms  p90 337.183 ms  p99 408.929 ms  errors 0
+qdrant-pass2 key lookup               warm-up: p50 0.376, 0.376 ms
+qdrant-pass2 key lookup               c=1       3246 q/s  p50   0.304 ms  p90   0.347 ms  p99   0.417 ms  errors 0
+qdrant-pass2 key lookup               c=4      10383 q/s  p50   0.374 ms  p90   0.452 ms  p99   0.556 ms  errors 0
+qdrant-pass2 key lookup               c=16     26566 q/s  p50   0.567 ms  p90   0.812 ms  p99   1.177 ms  errors 0
+qdrant-pass2 phrase                   warm-up: p50 1.645, 1.650 ms
+qdrant-pass2 phrase                   c=1        429 q/s  p50   1.134 ms  p90   4.754 ms  p99  14.091 ms  errors 0
+qdrant-pass2 phrase                   c=4       1343 q/s  p50   1.637 ms  p90   5.366 ms  p99  16.007 ms  errors 0
+qdrant-pass2 phrase                   c=16      1722 q/s  p50   8.324 ms  p90  14.759 ms  p99  29.012 ms  errors 0
+qdrant-pass2 typo                     unavailable: no fuzzy matching: its text index matches whole words (or prefixes, with a prefix tokenizer)
+qdrant-pass2 prefix                   unavailable: prefixes need the prefix tokenizer, an index of its own that would replace the word index the facet and phrase kinds use on the field
+qdrant-pass2 similar items            warm-up: p50 13.281, 13.006 ms
+qdrant-pass2 similar items            c=1        121 q/s  p50   8.259 ms  p90  10.391 ms  p99  12.750 ms  errors 0
+qdrant-pass2 similar items            c=4        300 q/s  p50  13.262 ms  p90  16.689 ms  p99  20.339 ms  errors 0
+qdrant-pass2 similar items            c=16       303 q/s  p50  49.637 ms  p90  70.052 ms  p99  81.393 ms  errors 0
+qdrant-pass2 sql aggregate            unavailable: no grouped aggregates: its facet API counts values only
+qdrant-pass2 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-pass2.json
+job.batch/run-qdrant-pass3 created
+qdrant-pass3 bm25                     warm-up: p50 2.061, 2.113 ms
+qdrant-pass3 bm25                     c=1        689 q/s  p50   1.407 ms  p90   2.109 ms  p99   2.825 ms  errors 0
+qdrant-pass3 bm25                     c=4       1856 q/s  p50   2.088 ms  p90   3.088 ms  p99   4.155 ms  errors 0
+qdrant-pass3 bm25                     c=16      2407 q/s  p50   6.280 ms  p90   9.377 ms  p99  15.546 ms  errors 0
+qdrant-pass3 bm25 + filter            warm-up: p50 2.284, 2.257 ms
+qdrant-pass3 bm25 + filter            c=1        609 q/s  p50   1.577 ms  p90   2.310 ms  p99   3.262 ms  errors 0
+qdrant-pass3 bm25 + filter            c=4       1682 q/s  p50   2.275 ms  p90   3.299 ms  p99   4.865 ms  errors 0
+qdrant-pass3 bm25 + filter            c=16      2107 q/s  p50   7.132 ms  p90  10.863 ms  p99  17.369 ms  errors 0
+qdrant-pass3 vector                   warm-up: p50 3.175, 3.162 ms
+qdrant-pass3 vector                   c=1        527 q/s  p50   1.819 ms  p90   2.265 ms  p99   2.694 ms  errors 0
+qdrant-pass3 vector                   c=4       1221 q/s  p50   3.164 ms  p90   4.102 ms  p99   5.241 ms  errors 0
+qdrant-pass3 vector                   c=16      1415 q/s  p50  10.583 ms  p90  15.667 ms  p99  23.103 ms  errors 0
+qdrant-pass3 vector + filter          warm-up: p50 5.411, 5.439 ms
+qdrant-pass3 vector + filter          c=1        279 q/s  p50   3.462 ms  p90   4.438 ms  p99   5.087 ms  errors 0
+qdrant-pass3 vector + filter          c=4        716 q/s  p50   5.433 ms  p90   6.763 ms  p99   8.780 ms  errors 0
+qdrant-pass3 vector + filter          c=16       732 q/s  p50  20.520 ms  p90  28.823 ms  p99  34.992 ms  errors 0
+qdrant-pass3 hybrid (RRF)             warm-up: p50 11.936, 11.883 ms
+qdrant-pass3 hybrid (RRF)             c=1        113 q/s  p50   8.213 ms  p90  12.881 ms  p99  14.749 ms  errors 0
+qdrant-pass3 hybrid (RRF)             c=4        303 q/s  p50  12.059 ms  p90  18.774 ms  p99  22.380 ms  errors 0
+qdrant-pass3 hybrid (RRF)             c=16       321 q/s  p50  47.971 ms  p90  66.243 ms  p99  79.262 ms  errors 0
+qdrant-pass3 hybrid (weighted)        warm-up: p50 12.056, 12.087 ms
+qdrant-pass3 hybrid (weighted)        c=1        112 q/s  p50   8.445 ms  p90  12.779 ms  p99  14.507 ms  errors 0
+qdrant-pass3 hybrid (weighted)        c=4        301 q/s  p50  12.120 ms  p90  18.894 ms  p99  22.718 ms  errors 0
+qdrant-pass3 hybrid (weighted)        c=16       321 q/s  p50  47.752 ms  p90  66.576 ms  p99  79.066 ms  errors 0
+qdrant-pass3 boosted (bm25 × decay)   warm-up: p50 2.559, 2.560 ms
+qdrant-pass3 boosted (bm25 × decay)   c=1        554 q/s  p50   1.775 ms  p90   2.490 ms  p99   3.195 ms  errors 0
+qdrant-pass3 boosted (bm25 × decay)   c=4       1525 q/s  p50   2.557 ms  p90   3.676 ms  p99   4.893 ms  errors 0
+qdrant-pass3 boosted (bm25 × decay)   c=16      2013 q/s  p50   7.607 ms  p90  11.077 ms  p99  17.674 ms  errors 0
+qdrant-pass3 facet                    warm-up: p50 60.633, 57.676 ms
+qdrant-pass3 facet                    c=1         53 q/s  p50  14.240 ms  p90  40.825 ms  p99  53.366 ms  errors 0
+qdrant-pass3 facet                    c=4         62 q/s  p50  64.796 ms  p90 109.080 ms  p99 140.512 ms  errors 0
+qdrant-pass3 facet                    c=16        62 q/s  p50 250.784 ms  p90 338.608 ms  p99 411.146 ms  errors 0
+qdrant-pass3 key lookup               warm-up: p50 0.384, 0.374 ms
+qdrant-pass3 key lookup               c=1       3012 q/s  p50   0.327 ms  p90   0.373 ms  p99   0.452 ms  errors 0
+qdrant-pass3 key lookup               c=4      10324 q/s  p50   0.377 ms  p90   0.452 ms  p99   0.557 ms  errors 0
+qdrant-pass3 key lookup               c=16     27059 q/s  p50   0.564 ms  p90   0.778 ms  p99   1.092 ms  errors 0
+qdrant-pass3 phrase                   warm-up: p50 1.712, 1.662 ms
+qdrant-pass3 phrase                   c=1        430 q/s  p50   1.169 ms  p90   4.638 ms  p99  13.670 ms  errors 0
+qdrant-pass3 phrase                   c=4       1331 q/s  p50   1.672 ms  p90   5.341 ms  p99  16.108 ms  errors 0
+qdrant-pass3 phrase                   c=16      1708 q/s  p50   8.324 ms  p90  14.777 ms  p99  27.081 ms  errors 0
+qdrant-pass3 typo                     unavailable: no fuzzy matching: its text index matches whole words (or prefixes, with a prefix tokenizer)
+qdrant-pass3 prefix                   unavailable: prefixes need the prefix tokenizer, an index of its own that would replace the word index the facet and phrase kinds use on the field
+qdrant-pass3 similar items            warm-up: p50 13.242, 13.174 ms
+qdrant-pass3 similar items            c=1        118 q/s  p50   8.435 ms  p90  10.591 ms  p99  12.711 ms  errors 0
+qdrant-pass3 similar items            c=4        301 q/s  p50  13.167 ms  p90  16.752 ms  p99  20.873 ms  errors 0
+qdrant-pass3 similar items            c=16       305 q/s  p50  49.958 ms  p90  68.414 ms  p99  79.980 ms  errors 0
+qdrant-pass3 sql aggregate            unavailable: no grouped aggregates: its facet API counts values only
+qdrant-pass3 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-pass3.json
+job.batch/run-qdrant-ef128 created
+qdrant-ef128 vector                   warm-up: p50 4.803, 4.829 ms
+qdrant-ef128 vector                   c=1        340 q/s  p50   2.780 ms  p90   3.524 ms  p99   4.102 ms  errors 0
+qdrant-ef128 vector                   c=4        811 q/s  p50   4.763 ms  p90   6.037 ms  p99   7.875 ms  errors 0
+qdrant-ef128 vector                   c=16       845 q/s  p50  17.812 ms  p90  25.585 ms  p99  32.041 ms  errors 0
+qdrant-ef128 vector + filter          warm-up: p50 8.999, 9.002 ms
+qdrant-ef128 vector + filter          c=1        183 q/s  p50   5.173 ms  p90   6.889 ms  p99   7.939 ms  errors 0
+qdrant-ef128 vector + filter          c=4        437 q/s  p50   8.973 ms  p90  11.049 ms  p99  13.663 ms  errors 0
+qdrant-ef128 vector + filter          c=16       432 q/s  p50  35.601 ms  p90  47.490 ms  p99  55.101 ms  errors 0
+qdrant-ef128 hybrid (RRF)             warm-up: p50 15.404, 15.230 ms
+qdrant-ef128 hybrid (RRF)             c=1         99 q/s  p50   9.783 ms  p90  12.053 ms  p99  13.119 ms  errors 0
+qdrant-ef128 hybrid (RRF)             c=4        254 q/s  p50  15.410 ms  p90  18.986 ms  p99  23.069 ms  errors 0
+qdrant-ef128 hybrid (RRF)             c=16       253 q/s  p50  61.484 ms  p90  78.104 ms  p99  88.610 ms  errors 0
+qdrant-ef128 hybrid (weighted)        warm-up: p50 15.498, 15.311 ms
+qdrant-ef128 hybrid (weighted)        c=1         98 q/s  p50  10.258 ms  p90  12.204 ms  p99  13.354 ms  errors 0
+qdrant-ef128 hybrid (weighted)        c=4        253 q/s  p50  15.477 ms  p90  18.864 ms  p99  23.333 ms  errors 0
+qdrant-ef128 hybrid (weighted)        c=16       253 q/s  p50  61.799 ms  p90  76.684 ms  p99  87.692 ms  errors 0
+qdrant-ef128 similar items            warm-up: p50 22.890, 22.776 ms
+qdrant-ef128 similar items            c=1         70 q/s  p50  14.097 ms  p90  17.923 ms  p99  21.152 ms  errors 0
+qdrant-ef128 similar items            c=4        173 q/s  p50  22.940 ms  p90  29.314 ms  p99  34.274 ms  errors 0
+qdrant-ef128 similar items            c=16       172 q/s  p50  84.834 ms  p90 127.269 ms  p99 146.209 ms  errors 0
+qdrant-ef128 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-ef128.json
+job.batch/run-qdrant-ef128-pass2 created
+qdrant-ef128-pass2 vector                   warm-up: p50 4.794, 4.812 ms
+qdrant-ef128-pass2 vector                   c=1        336 q/s  p50   2.800 ms  p90   3.580 ms  p99   4.236 ms  errors 0
+qdrant-ef128-pass2 vector                   c=4        826 q/s  p50   4.708 ms  p90   5.742 ms  p99   7.343 ms  errors 0
+qdrant-ef128-pass2 vector                   c=16       835 q/s  p50  17.962 ms  p90  26.104 ms  p99  33.203 ms  errors 0
+qdrant-ef128-pass2 vector + filter          warm-up: p50 9.286, 9.340 ms
+qdrant-ef128-pass2 vector + filter          c=1        176 q/s  p50   5.362 ms  p90   7.134 ms  p99   7.926 ms  errors 0
+qdrant-ef128-pass2 vector + filter          c=4        427 q/s  p50   9.197 ms  p90  11.171 ms  p99  14.134 ms  errors 0
+qdrant-ef128-pass2 vector + filter          c=16       431 q/s  p50  35.375 ms  p90  48.228 ms  p99  57.968 ms  errors 0
+qdrant-ef128-pass2 hybrid (RRF)             warm-up: p50 15.395, 15.403 ms
+qdrant-ef128-pass2 hybrid (RRF)             c=1         98 q/s  p50  10.302 ms  p90  12.246 ms  p99  13.252 ms  errors 0
+qdrant-ef128-pass2 hybrid (RRF)             c=4        253 q/s  p50  15.352 ms  p90  18.875 ms  p99  23.063 ms  errors 0
+qdrant-ef128-pass2 hybrid (RRF)             c=16       251 q/s  p50  62.198 ms  p90  78.300 ms  p99  91.103 ms  errors 0
+qdrant-ef128-pass2 hybrid (weighted)        warm-up: p50 15.574, 15.588 ms
+qdrant-ef128-pass2 hybrid (weighted)        c=1         95 q/s  p50  10.692 ms  p90  12.493 ms  p99  13.523 ms  errors 0
+qdrant-ef128-pass2 hybrid (weighted)        c=4        252 q/s  p50  15.499 ms  p90  18.971 ms  p99  23.498 ms  errors 0
+qdrant-ef128-pass2 hybrid (weighted)        c=16       250 q/s  p50  62.216 ms  p90  78.726 ms  p99  88.208 ms  errors 0
+qdrant-ef128-pass2 similar items            warm-up: p50 23.222, 23.082 ms
+qdrant-ef128-pass2 similar items            c=1         69 q/s  p50  14.755 ms  p90  18.351 ms  p99  21.404 ms  errors 0
+qdrant-ef128-pass2 similar items            c=4        173 q/s  p50  22.961 ms  p90  28.719 ms  p99  33.817 ms  errors 0
+qdrant-ef128-pass2 similar items            c=16       173 q/s  p50  84.637 ms  p90 125.149 ms  p99 147.305 ms  errors 0
+qdrant-ef128-pass2 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-ef128-pass2.json
+job.batch/run-qdrant-ef128-pass3 created
+qdrant-ef128-pass3 vector                   warm-up: p50 4.862, 4.810 ms
+qdrant-ef128-pass3 vector                   c=1        334 q/s  p50   2.857 ms  p90   3.607 ms  p99   4.281 ms  errors 0
+qdrant-ef128-pass3 vector                   c=4        806 q/s  p50   4.810 ms  p90   6.030 ms  p99   7.682 ms  errors 0
+qdrant-ef128-pass3 vector                   c=16       849 q/s  p50  17.775 ms  p90  25.351 ms  p99  31.956 ms  errors 0
+qdrant-ef128-pass3 vector + filter          warm-up: p50 9.111, 9.083 ms
+qdrant-ef128-pass3 vector + filter          c=1        182 q/s  p50   5.234 ms  p90   6.928 ms  p99   7.982 ms  errors 0
+qdrant-ef128-pass3 vector + filter          c=4        436 q/s  p50   9.022 ms  p90  10.958 ms  p99  13.870 ms  errors 0
+qdrant-ef128-pass3 vector + filter          c=16       435 q/s  p50  35.878 ms  p90  46.426 ms  p99  54.862 ms  errors 0
+qdrant-ef128-pass3 hybrid (RRF)             warm-up: p50 15.344, 15.458 ms
+qdrant-ef128-pass3 hybrid (RRF)             c=1         98 q/s  p50  10.188 ms  p90  12.074 ms  p99  13.337 ms  errors 0
+qdrant-ef128-pass3 hybrid (RRF)             c=4        253 q/s  p50  15.370 ms  p90  19.014 ms  p99  23.216 ms  errors 0
+qdrant-ef128-pass3 hybrid (RRF)             c=16       252 q/s  p50  61.687 ms  p90  78.105 ms  p99  88.578 ms  errors 0
+qdrant-ef128-pass3 hybrid (weighted)        warm-up: p50 15.357, 15.252 ms
+qdrant-ef128-pass3 hybrid (weighted)        c=1         99 q/s  p50  10.025 ms  p90  12.222 ms  p99  13.113 ms  errors 0
+qdrant-ef128-pass3 hybrid (weighted)        c=4        253 q/s  p50  15.433 ms  p90  18.935 ms  p99  23.111 ms  errors 0
+qdrant-ef128-pass3 hybrid (weighted)        c=16       253 q/s  p50  61.392 ms  p90  79.004 ms  p99  88.682 ms  errors 0
+qdrant-ef128-pass3 similar items            warm-up: p50 22.401, 22.391 ms
+qdrant-ef128-pass3 similar items            c=1         72 q/s  p50  13.883 ms  p90  17.914 ms  p99  19.810 ms  errors 0
+qdrant-ef128-pass3 similar items            c=4        176 q/s  p50  22.683 ms  p90  28.526 ms  p99  34.730 ms  errors 0
+qdrant-ef128-pass3 similar items            c=16       178 q/s  p50  82.843 ms  p90 119.338 ms  p99 134.391 ms  errors 0
+qdrant-ef128-pass3 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-ef128-pass3.json
+job.batch/run-qdrant-ef256 created
+qdrant-ef256 vector                   warm-up: p50 8.305, 8.334 ms
+qdrant-ef256 vector                   c=1        206 q/s  p50   4.447 ms  p90   6.011 ms  p99   6.661 ms  errors 0
+qdrant-ef256 vector                   c=4        477 q/s  p50   8.296 ms  p90   9.744 ms  p99  12.719 ms  errors 0
+qdrant-ef256 vector                   c=16       475 q/s  p50  32.518 ms  p90  42.875 ms  p99  51.331 ms  errors 0
+qdrant-ef256 vector + filter          warm-up: p50 16.566, 16.245 ms
+qdrant-ef256 vector + filter          c=1        104 q/s  p50   9.045 ms  p90  12.282 ms  p99  13.513 ms  errors 0
+qdrant-ef256 vector + filter          c=4        240 q/s  p50  16.549 ms  p90  20.430 ms  p99  24.611 ms  errors 0
+qdrant-ef256 vector + filter          c=16       243 q/s  p50  61.538 ms  p90  87.110 ms  p99 100.652 ms  errors 0
+qdrant-ef256 hybrid (RRF)             warm-up: p50 15.199, 15.373 ms
+qdrant-ef256 hybrid (RRF)             c=1        102 q/s  p50   9.259 ms  p90  12.021 ms  p99  13.204 ms  errors 0
+qdrant-ef256 hybrid (RRF)             c=4        254 q/s  p50  15.350 ms  p90  19.037 ms  p99  23.135 ms  errors 0
+qdrant-ef256 hybrid (RRF)             c=16       253 q/s  p50  61.355 ms  p90  77.236 ms  p99  87.426 ms  errors 0
+qdrant-ef256 hybrid (weighted)        warm-up: p50 15.361, 15.389 ms
+qdrant-ef256 hybrid (weighted)        c=1         99 q/s  p50   9.834 ms  p90  12.069 ms  p99  12.914 ms  errors 0
+qdrant-ef256 hybrid (weighted)        c=4        251 q/s  p50  15.610 ms  p90  18.974 ms  p99  23.760 ms  errors 0
+qdrant-ef256 hybrid (weighted)        c=16       251 q/s  p50  61.631 ms  p90  79.024 ms  p99  89.331 ms  errors 0
+qdrant-ef256 similar items            warm-up: p50 40.409, 40.100 ms
+qdrant-ef256 similar items            c=1         43 q/s  p50  23.090 ms  p90  28.739 ms  p99  34.336 ms  errors 0
+qdrant-ef256 similar items            c=4         99 q/s  p50  40.417 ms  p90  51.014 ms  p99  59.562 ms  errors 0
+qdrant-ef256 similar items            c=16       100 q/s  p50 145.634 ms  p90 214.013 ms  p99 235.716 ms  errors 0
+qdrant-ef256 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-ef256.json
+job.batch/run-qdrant-ef256-pass2 created
+qdrant-ef256-pass2 vector                   warm-up: p50 8.324, 8.310 ms
+qdrant-ef256-pass2 vector                   c=1        204 q/s  p50   4.489 ms  p90   6.015 ms  p99   7.324 ms  errors 0
+qdrant-ef256-pass2 vector                   c=4        477 q/s  p50   8.286 ms  p90   9.804 ms  p99  12.121 ms  errors 0
+qdrant-ef256-pass2 vector                   c=16       477 q/s  p50  32.446 ms  p90  42.321 ms  p99  49.888 ms  errors 0
+qdrant-ef256-pass2 vector + filter          warm-up: p50 16.360, 16.341 ms
+qdrant-ef256-pass2 vector + filter          c=1        104 q/s  p50   9.047 ms  p90  12.238 ms  p99  13.762 ms  errors 0
+qdrant-ef256-pass2 vector + filter          c=4        245 q/s  p50  16.126 ms  p90  19.805 ms  p99  23.932 ms  errors 0
+qdrant-ef256-pass2 vector + filter          c=16       243 q/s  p50  61.183 ms  p90  87.351 ms  p99  98.702 ms  errors 0
+qdrant-ef256-pass2 hybrid (RRF)             warm-up: p50 15.434, 15.260 ms
+qdrant-ef256-pass2 hybrid (RRF)             c=1        100 q/s  p50   9.624 ms  p90  12.160 ms  p99  13.318 ms  errors 0
+qdrant-ef256-pass2 hybrid (RRF)             c=4        255 q/s  p50  15.351 ms  p90  18.939 ms  p99  23.239 ms  errors 0
+qdrant-ef256-pass2 hybrid (RRF)             c=16       252 q/s  p50  62.222 ms  p90  79.257 ms  p99  89.348 ms  errors 0
+qdrant-ef256-pass2 hybrid (weighted)        warm-up: p50 15.403, 15.391 ms
+qdrant-ef256-pass2 hybrid (weighted)        c=1         98 q/s  p50  10.043 ms  p90  12.214 ms  p99  13.271 ms  errors 0
+qdrant-ef256-pass2 hybrid (weighted)        c=4        253 q/s  p50  15.438 ms  p90  19.029 ms  p99  23.363 ms  errors 0
+qdrant-ef256-pass2 hybrid (weighted)        c=16       252 q/s  p50  61.604 ms  p90  78.228 ms  p99  88.663 ms  errors 0
+qdrant-ef256-pass2 similar items            warm-up: p50 40.208, 39.634 ms
+qdrant-ef256-pass2 similar items            c=1         43 q/s  p50  23.237 ms  p90  30.121 ms  p99  34.550 ms  errors 0
+qdrant-ef256-pass2 similar items            c=4         99 q/s  p50  39.874 ms  p90  52.209 ms  p99  61.053 ms  errors 0
+qdrant-ef256-pass2 similar items            c=16        99 q/s  p50 145.469 ms  p90 209.963 ms  p99 254.933 ms  errors 0
+qdrant-ef256-pass2 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-ef256-pass2.json
+job.batch/run-qdrant-ef256-pass3 created
+qdrant-ef256-pass3 vector                   warm-up: p50 8.307, 8.381 ms
+qdrant-ef256-pass3 vector                   c=1        203 q/s  p50   4.506 ms  p90   6.111 ms  p99   6.962 ms  errors 0
+qdrant-ef256-pass3 vector                   c=4        475 q/s  p50   8.289 ms  p90   9.739 ms  p99  12.118 ms  errors 0
+qdrant-ef256-pass3 vector                   c=16       473 q/s  p50  32.883 ms  p90  43.359 ms  p99  51.622 ms  errors 0
+qdrant-ef256-pass3 vector + filter          warm-up: p50 16.319, 16.362 ms
+qdrant-ef256-pass3 vector + filter          c=1        105 q/s  p50   9.010 ms  p90  12.050 ms  p99  13.577 ms  errors 0
+qdrant-ef256-pass3 vector + filter          c=4        241 q/s  p50  16.483 ms  p90  20.223 ms  p99  24.727 ms  errors 0
+qdrant-ef256-pass3 vector + filter          c=16       245 q/s  p50  61.408 ms  p90  84.342 ms  p99 102.383 ms  errors 0
+qdrant-ef256-pass3 hybrid (RRF)             warm-up: p50 15.402, 15.337 ms
+qdrant-ef256-pass3 hybrid (RRF)             c=1         99 q/s  p50  10.052 ms  p90  12.076 ms  p99  13.505 ms  errors 0
+qdrant-ef256-pass3 hybrid (RRF)             c=4        255 q/s  p50  15.322 ms  p90  18.870 ms  p99  23.169 ms  errors 0
+qdrant-ef256-pass3 hybrid (RRF)             c=16       254 q/s  p50  61.134 ms  p90  78.519 ms  p99  87.277 ms  errors 0
+qdrant-ef256-pass3 hybrid (weighted)        warm-up: p50 15.488, 15.723 ms
+qdrant-ef256-pass3 hybrid (weighted)        c=1         99 q/s  p50   9.656 ms  p90  12.354 ms  p99  13.476 ms  errors 0
+qdrant-ef256-pass3 hybrid (weighted)        c=4        252 q/s  p50  15.402 ms  p90  18.857 ms  p99  23.985 ms  errors 0
+qdrant-ef256-pass3 hybrid (weighted)        c=16       250 q/s  p50  62.535 ms  p90  78.773 ms  p99  89.004 ms  errors 0
+qdrant-ef256-pass3 similar items            warm-up: p50 40.642, 40.396 ms
+qdrant-ef256-pass3 similar items            c=1         44 q/s  p50  22.709 ms  p90  29.279 ms  p99  33.832 ms  errors 0
+qdrant-ef256-pass3 similar items            c=4        100 q/s  p50  39.972 ms  p90  50.556 ms  p99  60.013 ms  errors 0
+qdrant-ef256-pass3 similar items            c=16       101 q/s  p50 144.552 ms  p90 209.459 ms  p99 229.209 ms  errors 0
+qdrant-ef256-pass3 result cache: {"after":null,"before":null}
+wrote /data/compare/run-qdrant-ef256-pass3.json
+pod "qdrant-0" deleted
