@@ -503,6 +503,13 @@ fn deliver(sup: &Supervisor, id: &str, event: &str, source: &str) -> Option<Json
             }
         }
     }
+    // How to work without stopping the user: with the edit-and-test
+    // profile, file edits through the edit tools never ask, and a file
+    // written by a shell command (a heredoc, `sed -i`, a script) always does.
+    if !told.contains("brief:edit") && event == "SessionStart" && !sup.is_read_only(id) && crate::guarded::has_edit_profile(sup, id, std::path::Path::new(&a.cwd)) {
+        parts.push("Edit and create files with the Edit and Write tools, not with shell commands (heredocs, sed -i, python scripts that write files): the user allowed edits in this worktree without asking, but every shell command that writes a file stops and asks them. Reading commands, the tests and local git run without asking; run them as plain commands.".to_string());
+        items.push("brief:edit".to_string());
+    }
     let rules: Vec<_> = questions::rules(sup, Some(&a.repo), true).into_iter().filter(|r| !told.contains(&r.id)).collect();
     if !rules.is_empty() {
         let mut s = String::from(if items.is_empty() && told.iter().any(|t| t.starts_with('r')) { "A new rule the user set for this repository (follow it):" } else { "Rules the user set for this repository (follow them):" });
@@ -561,7 +568,7 @@ pub fn steer(sup: &Arc<Supervisor>, lv: &Levels, id: &str, text: &str) -> Result
     let (delivered, message) = match &w {
         crate::screen::Waits::Menu(m) => {
             let what = if m.question.is_empty() { "a choice".to_string() } else { format!("“{}”", one_line(&m.question, 120)) };
-            ("queued", format!("Nothing was typed: {} shows a prompt ({what}), where a key would choose an option. Answer it first (Decide, or its terminal); your words reach {} at its next tool call, or as its next prompt when its turn ends.", a.name, a.name))
+            ("queued", format!("Queued: {} gets this at its next tool call, or as its next prompt when its turn ends. It shows a prompt ({what}) now, so nothing was typed there; answer that first.", a.name))
         }
         _ if a.state == "idle" || matches!(w, crate::screen::Waits::Input { .. }) => {
             let _typing = questions::Typing::start(lv, id);
@@ -570,7 +577,7 @@ pub fn steer(sup: &Arc<Supervisor>, lv: &Levels, id: &str, text: &str) -> Result
             let after = if matches!(w, crate::screen::Waits::Input { interrupted: true }) { " It had been interrupted and was waiting for what to do instead." } else { "" };
             ("typed", format!("Typed into {}'s prompt as its next instruction.{after}", a.name))
         }
-        _ => ("queued", format!("{} is working: it gets this at its next tool call, or as its next prompt when this turn ends.", a.name)),
+        _ => ("queued", format!("Queued: {} is working, and gets this at its next tool call, or as its next prompt when this turn ends.", a.name)),
     };
     Ok(json!({ "ok": true, "steer": { "id": sid, "text": text }, "delivered": delivered, "message": message }))
 }

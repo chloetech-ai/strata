@@ -1036,7 +1036,7 @@ pub fn grants(sup: &Supervisor, repo: Option<&str>) -> Result<Json, ApiError> {
         "grants": out,
         "revoked": revoked,
         "defaults": {
-            "text": "In a worktree Workbench made, agents edit and read files there, run the tests and use git locally without asking (unless started with “Ask before edits”). Guarded commands still stop.",
+            "text": "In a worktree Workbench made, an agent started with “Edit files on its branch and run the tests” edits files there with the Edit and Write tools, and runs reading commands (ls, cat, grep, git log), the tests and local git, alone or chained, without asking. A heredoc or a script that rewrites files, anything on the network, a delete and a guarded command still ask.",
             "rules": ev.agents.values().find(|a| workbench_worktree(sup, &a.cwd)).map(|a| crate::flow::worktree_allow(Path::new(&a.cwd)).len()),
         },
     }))

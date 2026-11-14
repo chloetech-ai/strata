@@ -12,7 +12,7 @@
 // threshold).
 
 import {
-  h, useStyle, icon, label, btn, page, pane, bank, since, fmtTokens, fmtClock, turnStrip, meter, repoOf,
+  h, useStyle, icon, label, btn, page, pane, bank, since, ago, fmtTokens, fmtClock, turnStrip, meter, repoOf,
 } from "../levels/common.js";
 import { hunkView } from "./review.js";
 
@@ -540,7 +540,7 @@ export function mount(root, ctx) {
     };
     const forget = () => box.replaceChildren(h("p", {}, "Forget this note? No agent is reminded of it again, and it is taken out of the records of what agents were shown."),
       h("div", { class: "db-row" }, btn("Forget it", { sm: true, danger: true, onclick: () => act("DELETE", undefined, "Forgotten.") }), btn("Keep it", { sm: true, ghost: true, onclick: () => box.replaceChildren() })));
-    const meta = [kindWord(x.kind), `said by ${x.by_label || "someone"}`, x.branch, x.ts ? `${since(x.ts)} ago` : null].filter(Boolean).join(" · ");
+    const meta = [kindWord(x.kind), `said by ${x.by_label || "someone"}`, x.branch, x.ts ? ago(x.ts) : null].filter(Boolean).join(" · ");
     return h("article", { class: `db-recrow${x.superseded ? " old" : ""}` },
       h("div", { class: "db-rt" }, h("p", {}, x.text),
         h("div", { class: "s" }, meta,

@@ -473,7 +473,8 @@ async fn hook(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiRes
         let out = crate::levels::after_hook(&sup, &lv, &id, &v);
         // Guarded actions (src/guarded.rs): a guarded Bash command is denied.
         // Hotspots (src/hotspots.rs): a first edit of one gets its history.
-        Ok(crate::guarded::check(&sup, &id, &v).or(out).or_else(|| crate::hotspots::check(&sup, &id, &v)))
+        // The edit-and-test profile allows what it covers, compound commands included.
+        Ok(crate::guarded::check(&sup, &id, &v).or(out).or_else(|| crate::hotspots::check(&sup, &id, &v)).or_else(|| crate::guarded::profile_allow(&sup, &id, &v)))
     })
     .await?;
     Ok(Json(json!({ "ok": true, "output": output })).into_response())
@@ -607,7 +608,7 @@ struct AskB {
 async fn ask(State(app): State<App>, body: Bytes) -> ApiResult {
     let b: AskB = parse_body(&body)?;
     let sup = app.sup.clone();
-    Ok(Json(blocking(move || trail::ask(&sup, b.repo.as_deref(), b.question.as_deref().unwrap_or(""))).await?).into_response())
+    Ok(Json(blocking(move || crate::ask::answer(&sup, b.repo.as_deref(), b.question.as_deref().unwrap_or(""))).await?).into_response())
 }
 
 /// Serves until SIGINT or SIGTERM, then stops the agents and exits.

@@ -152,13 +152,14 @@ export function repoPicker(ctx, opts = {}) {
       h("span", { class: "rp-km" }, [r.branch, r.agents_running ? `${r.agents_running} running` : r.agents ? `${r.agents} agent${r.agents === 1 ? "" : "s"} before` : "no agent yet", r.last_ms ? fmtAgo(r.last_ms) : null].filter(Boolean).join(" · ")))))));
   }
 
-  loadKnown();
+  // A page that lists the projects itself leaves this list out (one list, not two).
+  if (opts.known !== false) loadKnown();
   const form = h("form", { class: "lv-card rp" + (opts.compact ? " compact" : ""), onsubmit: submit },
     h("h2", { class: "rp-h" }, opts.title || "Open a repository"),
     h("p", { class: "rp-why" }, opts.why || "Search, Map, Trace and Library read a repository's code and history. No agent is needed: point Workbench at a git checkout."),
     h("div", { class: "rp-row" }, h("div", { class: "rp-box" }, input, list), go),
     h("div", { class: "rp-hint" }, h("kbd", null, "Tab"), " completes a folder · ", h("kbd", null, "↑"), h("kbd", null, "↓"), " pick · git checkouts come first"),
-    err, known);
+    err, opts.known === false ? null : known);
   queueMicrotask(() => { if (opts.focus !== false && form.isConnected) input.focus({ preventScroll: true }); });
   return form;
 }

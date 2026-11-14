@@ -237,6 +237,33 @@ fn edit_event<'a>(evs: &'a [Event], cwd: &Path, rel: &str, line: &str, near_ms: 
     Some(pre.unwrap_or(best))
 }
 
+/// The Bash call among `evs` that most likely wrote `line` of `rel`: its
+/// command names the file and either holds the line's text or writes
+/// (a redirect, a heredoc, `sed -i`, `tee`, `open(…, "w")`, `write`).
+/// Its `PreToolUse` when there is one, the newest first.
+fn bash_event<'a>(evs: &'a [Event], rel: &str, line: &str) -> Option<&'a Event> {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    if base.len() < 3 {
+        return None;
+    }
+    let line = line.trim();
+    let cmd_of = |e: &Event| data_of(e).and_then(|d| d["tool_input"]["command"].as_str().map(str::to_string));
+    let writes = |c: &str| c.contains('>') || c.contains("<<") || c.contains("sed -i") || c.contains("tee ") || c.contains("write") || c.contains("\"w\"") || c.contains("'w'") || c.contains("mv ") || c.contains("cp ");
+    let cands: Vec<(&Event, String)> = evs
+        .iter()
+        .filter(|e| matches!(e.kind.as_str(), "PreToolUse" | "PostToolUse") && e.tool.as_deref() == Some("Bash"))
+        .filter_map(|e| cmd_of(e).map(|c| (e, c)))
+        .filter(|(_, c)| c.contains(base))
+        .collect();
+    let holds = |c: &str| line.chars().count() >= 4 && c.lines().any(|l| l.trim() == line || l.contains(line));
+    let best = cands.iter().rev().find(|(_, c)| holds(c)).or_else(|| cands.iter().rev().find(|(_, c)| writes(c)))?;
+    if best.0.kind == "PreToolUse" {
+        return Some(best.0);
+    }
+    let pre = evs.iter().rev().filter(|e| e.seq < best.0.seq).find(|e| e.kind == "PreToolUse" && e.tool.as_deref() == Some("Bash") && cmd_of(e).as_deref() == Some(best.1.as_str()));
+    Some(pre.unwrap_or(best.0))
+}
+
 /// The prompt event before event number `seq` (or before `ms`), and who
 /// gave it: `you`, or the name of the agent that typed it or spawned this
 /// one with it as its task.
@@ -464,7 +491,21 @@ pub fn why(sup: &Supervisor, q: WhyQ) -> Result<Json, ApiError> {
 
     // Only what the agent did before the line's commit.
     let evs: Vec<Event> = who.as_ref().map(|a| sup.all_events(&a.id).unwrap_or_default()).unwrap_or_default().into_iter().filter(|e| until_ms.is_none_or(|u| e.ts <= u)).collect();
-    let tool_ev = who.as_ref().and_then(|a| edit_event(&evs, Path::new(&a.cwd), &rel, &text, edit_ms));
+    let mut tool_ev = who.as_ref().and_then(|a| edit_event(&evs, Path::new(&a.cwd), &rel, &text, edit_ms));
+    // An edit made by a shell command (a heredoc, `sed -i`, `python3 -c`):
+    // the Bash call that names the file, the one holding the line first.
+    let mut by_shell = false;
+    if tool_ev.is_none() && edit.is_none() {
+        if let Some(ev) = who.as_ref().and_then(|_| bash_event(&evs, &rel, &text)) {
+            tool_ev = Some(ev);
+            by_shell = true;
+            let name = who.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+            // ChloeCtx records the edit tools' calls, not what a command wrote:
+            // say that instead of "no record".
+            missing.retain(|m| !m.starts_with("ChloeCtx has no record of an edit"));
+            missing.push(format!("{name} wrote {rel} with a shell command, not the edit tool, so ChloeCtx has no edit record of it; the command is below."));
+        }
+    }
     if who.is_some() && tool_ev.is_none() {
         missing.push(match until_ms {
             Some(_) => format!("Workbench recorded no tool call of {} that edited {rel} before the line's commit (it may have written it with a shell command).", who.as_ref().unwrap().name),
@@ -505,6 +546,11 @@ pub fn why(sup: &Supervisor, q: WhyQ) -> Result<Json, ApiError> {
     // When.
     let when = match (edit, tool_ev) {
         (Some(e), _) => Some(json!({ "edit_ts": ctx_time(&e["ts"]), "turn": e["turn"], "session": e["session"], "how": blame.as_ref().map(|b| b["how"].clone()) })),
+        (None, Some(ev)) if by_shell => Some(json!({
+            "edit_ts": iso(ev.ts), "turn": null, "session": who.as_ref().and_then(|a| a.session_id.clone()),
+            "how": "a shell command of the agent that names the file", "tool": "Bash",
+            "command": data_of(ev).and_then(|d| d["tool_input"]["command"].as_str().map(|c| c.chars().take(4000).collect::<String>())),
+        })),
         (None, Some(ev)) => Some(json!({ "edit_ts": iso(ev.ts), "turn": null, "session": who.as_ref().and_then(|a| a.session_id.clone()), "how": "Workbench's newest edit of the file by the agent" })),
         _ => None,
     };
@@ -753,13 +799,23 @@ pub fn decisions(sup: &Supervisor, repo: Option<&str>, limit: usize) -> Result<J
     let col = |row: &Vec<Json>, name: &str| cols.iter().position(|c| c == name).and_then(|i| row.get(i).cloned()).unwrap_or(Json::Null);
     let s = Sessions::load(sup);
     let mut list = Vec::new();
+    let mut told: HashMap<String, Vec<String>> = HashMap::new();
     for row in out["rows"].as_array().into_iter().flatten().filter_map(Json::as_array) {
         let session = col(row, "session");
         let superseded_by = linked(&col(row, "links"), "superseded_by").into_iter().next();
+        let agent = session.as_str().and_then(|sid| s.agent(sid));
         let text = col(row, "text").as_str().unwrap_or("").to_string();
-        // Yours when you said it ("My decision: …" in a prompt), even in an
-        // agent's session; an agent's otherwise, with your Still right if given.
-        let yours = crate::capsule::by_user(&text, col(row, "tag").as_str().unwrap_or(""), col(row, "ctx").as_str().unwrap_or(""));
+        // Who decided: you when you said it ("My decision: …" in a prompt,
+        // or the note says so), or when it repeats what you told the agent
+        // (a steer or a rule); else the agent, with your Still right if given.
+        let (_, said_you, _) = crate::ask::phrase(&text);
+        let yours = said_you
+            || crate::capsule::by_user(&text, col(row, "tag").as_str().unwrap_or(""), col(row, "ctx").as_str().unwrap_or(""))
+            || agent.is_some_and(|a| {
+                let words = told.entry(a.id.clone()).or_insert_with(|| crate::levels::steers(sup, &a.id).into_iter().map(|x| x.text).collect());
+                let ts = crate::ask::terms(&text);
+                words.iter().any(|w| crate::ask::overlap(&ts, w) >= 3.min(ts.len().max(1)))
+            });
         let id = col(row, "id");
         list.push(json!({
             "id": id,
@@ -842,6 +898,18 @@ pub fn recording(sup: &Supervisor, id: &str, from_ms: Option<u64>, to_ms: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_made_by_a_shell_command_is_found() {
+        let ev = |seq: i64, kind: &str, tool: &str, cmd: &str| Event { id: format!("e{seq}"), seq, ts: seq * 1000, agent: "a1".into(), kind: kind.into(), tool: Some(tool.into()), summary: None, data: Some(json!({ "tool_input": { "command": cmd } }).to_string()) };
+        let heredoc = "python3 - <<'E'\nimport re\np='money.py'\ns=open(p).read()\ns=s.replace('def to_cents', '    \"\"\"Half to even: 2.675 -> 268.\"\"\"')\nopen(p,'w').write(s)\nE";
+        let evs = vec![ev(1, "PreToolUse", "Bash", "cat money.py"), ev(2, "PreToolUse", "Bash", heredoc), ev(3, "PostToolUse", "Bash", heredoc), ev(4, "PreToolUse", "Bash", "python3 -m pytest -q")];
+        let got = bash_event(&evs, "money.py", "\"\"\"Half to even: 2.675 -> 268.\"\"\"").unwrap();
+        assert_eq!((got.seq, got.kind.as_str()), (2, "PreToolUse"));
+        // Without the text: the command that names the file and writes.
+        assert_eq!(bash_event(&evs, "money.py", "x = 1").unwrap().seq, 2);
+        assert!(bash_event(&evs, "cart.py", "x = 1").is_none());
+    }
 
     #[test]
     fn reads_what_became_of_a_record_and_links() {

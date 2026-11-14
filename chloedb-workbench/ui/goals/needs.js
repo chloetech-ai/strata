@@ -69,7 +69,7 @@ export function mount(root, ctx) {
         list.length ? list.map((it) => {
           const card = ctx.needCard(it, { big: true });
           const proj = names[it.repo];
-          return h("div", { class: "g-item" }, proj ? h("div", { class: "g-proj" }, h("a", { href: `#/p/${proj}` }, proj), F.sort === "blocked" && blocked(it, all) > 1 ? h("span", {}, ` · unblocks ${blocked(it, all)}`) : null) : null, card);
+          return h("div", { class: "g-item" }, proj ? h("div", { class: "g-iproj" }, h("a", { href: `#/p/${proj}` }, proj), F.sort === "blocked" && blocked(it, all) > 1 ? h("span", {}, ` · unblocks ${blocked(it, all)}`) : null) : null, card);
         }) : all.length ? h("p", { class: "g-dim" }, "Nothing matches these filters. ", filtered ? h("a", { href: "#/needs", onclick: () => { F.project = F.agent = F.kind = ""; } }, "Show all") : null) : null),
       all.length ? h("p", { class: "g-keys" }, kc("j"), kc("k"), " move · a digit then ", kc("↵"), " answers · ", kc("x"), " selects · ", kc("⇧1"), " answers the selected alike") : null));
   }
@@ -89,8 +89,9 @@ const CSS = `
 .g-sort{display:flex;gap:var(--s-1)}
 .g-list{display:flex;flex-direction:column;gap:var(--s-4);max-width:900px}
 .g-item{display:flex;flex-direction:column;gap:var(--s-1)}
-.g-proj{font:var(--w-mid) var(--fs-xs)/var(--lh-xs) var(--mono);color:var(--text-2)}
-.g-proj a{color:var(--text-2)}
+/* Not .g-proj: that is Continue's page, which turned monospace once this style loaded (Priya). */
+.g-iproj{font:var(--w-mid) var(--fs-xs)/var(--lh-xs) var(--mono);color:var(--text-2)}
+.g-iproj a{color:var(--text-2)}
 .g-needs .g-dim{color:var(--text-2)}
 .g-needs .g-keys{margin-top:var(--s-5);font-size:var(--fs-sm);color:var(--text-2)}
 @media (max-width:640px){.g-f{flex:1 1 140px}.g-f select{min-width:0;width:100%}.g-fbar .sp{display:none}.g-needs .g-keys{display:none}}

@@ -253,6 +253,9 @@ function make(input, opts0) {
     const wantsGhost = GHOSTED.has(field()) && atEnd && !empty;
     if (!force && !empty && !tok.text && !wantsGhost && !(field() === "sql" && /(\bfrom|\bjoin|\.)\s*$/i.test(text.slice(0, cursor))) && !(quick && TRACE_RE.test(text))) { close(); setGhost(null); return; }
     if (empty && field() === "sql") { close(); return; }
+    // Words to an agent: the list opens on `@` or a path-like word only
+    // (Maya: it opened over every sentence she typed to an agent).
+    if (!force && field() === "steer" && !/^@|\/|\.[A-Za-z0-9]{1,6}$/.test(tok.text || "")) { close(); setGhost(null); return; }
     const r = ++S.req;
     let d;
     try {

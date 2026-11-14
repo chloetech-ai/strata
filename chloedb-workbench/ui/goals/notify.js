@@ -252,11 +252,16 @@ export function init(ctx) {
 
   async function open() {
     if (N.open) return;
+    // Held from the click on, so a second click does not open a second sheet.
+    N.open = { kind: "settings", render: () => {} };
     await loadSettings();
-    const close = () => { unesc(); scrim.remove(); N.open = null; };
+    // Leaving the page closes it (Priya: it stayed over the next page).
+    const close = () => { unesc(); window.removeEventListener("hashchange", close); scrim.remove(); N.open = null; };
     const unesc = onEscape(close);
-    const scrim = sheet({ kicker: "Interruptions", title: "Notifications", body: settingsBody(), foot: null, onClose: close });
-    N.open = { kind: "settings", render: () => scrim.querySelector(".nt-bd").replaceChildren(...settingsBody()) };
+    window.addEventListener("hashchange", close);
+    const scrim = sheet({ kicker: "Interruptions", title: "Notifications", body: settingsBody().filter(Boolean), foot: null, onClose: close });
+    // Without the empty rows: replaceChildren(null) writes "null".
+    N.open = { kind: "settings", render: () => scrim.querySelector(".nt-bd").replaceChildren(...settingsBody().filter(Boolean)) };
   }
 
   function itemRow(it) {

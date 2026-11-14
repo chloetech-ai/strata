@@ -152,7 +152,7 @@ export function mount(root, ctx) {
     const embed = !!(ctx.params && ctx.params.embed);
     return h("div", { class: `sy-wrap${embed ? " embed" : ""}` }, embed ? null : agentsBar(),
       h("div", { class: "sy-main" }, embed ? null : header(a), intentLevel(a), storyLevel(), stepsLevel(), embed ? null : terminalLevel(a)),
-      h("aside", { class: "sy-side" }, dejaVu(a), knewCard(), talkCard(a)));
+      h("aside", { class: "sy-side" }, dejaVu(a), knewCard(), embed ? null : talkCard(a)));
   }
 
   function header(a) {
@@ -356,11 +356,11 @@ export function mount(root, ctx) {
   }
 
   function talkCard(a) {
-    const about = S.about ? aboutText() : null;
+    // (The chapter you read is not sent with it: your words go as written.)
     const ta = h("textarea", { class: "sy-ta", rows: 2, "data-key": "talk", placeholder: STEER_HINT[S.level], "aria-label": `Steer ${a.name}` });
     import("./complete.js").then((m) => m.attachComplete(ta, { field: "steer", ctx, agent: S.id, repo: a.repo })).catch(() => {}); // Fifth build: autocomplete
     ta.value = S.talk;
-    ta.addEventListener("input", () => { S.talk = ta.value; });
+    ta.addEventListener("input", () => { S.talk = ta.value; const b = ta.parentNode && ta.parentNode.querySelector('[data-key="send"]'); if (b) b.disabled = S.sending || !S.talk.trim(); });
     const send = async () => {
       const text = ta.value.trim();
       if (!text || S.sending) return;
@@ -370,7 +370,7 @@ export function mount(root, ctx) {
       // says so too.
       try {
         const r = await Promise.race([
-          ctx.api(`/api/agents/${enc(S.id)}/steer`, { method: "POST", body: { text: about ? `(About ${about}.) ${text}` : text } }),
+          ctx.api(`/api/agents/${enc(S.id)}/steer`, { method: "POST", body: { text } }),
           new Promise((_, no) => setTimeout(() => no(new Error(`Workbench did not answer in 15 s; ${a.name} may not have it. Check its terminal.`)), 15000)),
         ]);
         S.talk = "";
@@ -382,9 +382,9 @@ export function mount(root, ctx) {
     };
     ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } if (e.key === "Escape") ta.blur(); });
     return h("section", { class: "lv-card sy-talk" },
-      h("h2", { class: "lv-h" }, "Talk to it at this level"),
-      about ? h("div", { class: "sy-about" }, h("span", {}, "about ", h("b", {}, about)), h("button", { class: "sy-x", "data-key": "about-x", "aria-label": "Not about this", title: "Send it without the context", onclick: () => { S.about = false; render(); } }, "×")) : null,
-      h("div", { class: "sy-tabox" }, ta, h("button", { class: "btn sm primary", "data-key": "send", disabled: S.sending, onclick: send }, S.sending ? "Sending…" : "Send")),
+      h("h2", { class: "lv-h" }, `Tell ${a.name}`),
+      // Your words go exactly as written: no hidden "(About chapter …)" in front.
+      h("div", { class: "sy-tabox" }, ta, h("button", { class: "btn sm primary", "data-key": "send", disabled: S.sending || !S.talk.trim(), onclick: send }, S.sending ? "Sending…" : "Send")),
       S.sent ? h("div", { class: `sy-sent ${S.sent.ok ? (S.sent.warn ? "warn" : "ok") : "bad"}`, role: "status" }, S.sent.ok && !S.sent.warn ? "✓ " : "", S.sent.text)
         : h("div", { class: "muted sy-hint" }, "Goes in as a steer, not a keystroke: a working agent gets it at its next tool call, an idle one as its next prompt."));
   }

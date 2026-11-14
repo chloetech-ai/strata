@@ -968,11 +968,34 @@ pub fn search(sup: &Supervisor, a: &Ask) -> Result<(Vec<Json>, Option<Json>), St
             })
         })
         .collect();
+    let hits = definitions_first(hits, a.q);
     let pack = match a.tokens {
         Some(n) if n > 0 => Some(pack(sup, a, &w, &p, n.clamp(100, 50_000))?),
         _ => None,
     };
     Ok((hits, pack))
+}
+
+/// Whether a path is a test file (`test_x.py`, `x_test.go`, `tests/`, `x.spec.ts`).
+pub fn is_test_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let stem = name.split('.').next().unwrap_or("");
+    stem.starts_with("test_") || stem.ends_with("_test") || stem.ends_with("_spec") || name.contains(".test.") || name.contains(".spec.") || path.split('/').any(|d| matches!(d, "tests" | "test" | "__tests__" | "spec"))
+}
+
+/// The definition a query names comes before the tests that use it (Lee:
+/// `test_fmt` ranked above `def fmt`): a hit whose symbol is a word of the
+/// query, outside the tests, moves to the front; the rest keep BM25's order.
+pub fn definitions_first(hits: Vec<Json>, q: &str) -> Vec<Json> {
+    let words: HashSet<String> = q.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    let names = |h: &Json| -> bool {
+        let sym = h["symbol"].as_str().unwrap_or("").to_lowercase();
+        let last = sym.rsplit(['.', ' ', ':']).next().unwrap_or("").to_string();
+        !sym.is_empty() && (words.contains(&sym) || words.contains(&last)) && !is_test_path(h["path"].as_str().unwrap_or(""))
+    };
+    let (mut first, rest): (Vec<Json>, Vec<Json>) = hits.into_iter().partition(names);
+    first.extend(rest);
+    first
 }
 
 /// `PACK n TOKENS` on the same ranking: the one text an agent gets.
@@ -1238,6 +1261,13 @@ mod tests {
         let md = "# Shop\n\nIntro.\n\n## Totals\n\nRounded half up.\n\n```\n# not a heading\n```\n";
         let c = chunk(md, "markdown");
         assert_eq!(c.iter().map(|c| c.symbol.clone().unwrap()).collect::<Vec<_>>(), ["Shop", "Totals"]);
+    }
+
+    #[test]
+    fn the_definition_comes_before_its_tests() {
+        let hits = vec![json!({"path": "test_money.py", "symbol": "test_fmt"}), json!({"path": "web/index.html", "symbol": null}), json!({"path": "money.py", "symbol": "fmt"})];
+        assert_eq!(definitions_first(hits, "fmt").iter().map(|h| h["path"].as_str().unwrap().to_string()).collect::<Vec<_>>(), ["money.py", "test_money.py", "web/index.html"]);
+        assert!(is_test_path("tests/cart.rs") && is_test_path("web/a.spec.ts") && is_test_path("pkg/x_test.go") && !is_test_path("money.py") && !is_test_path("latest.py"));
     }
 
     #[test]

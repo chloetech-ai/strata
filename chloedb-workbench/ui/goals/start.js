@@ -2,7 +2,7 @@
 // do? Four goals, the one that fits now filled; your projects, most active
 // first; what needs you now, answered in place. With no project known: the
 // folder box and Start a new project, and the setup line.
-import { h, useStyle, page, btn, label, kc, pane, bank, stateDot, since, fmtClock, icon, avatar } from "/levels/common.js";
+import { h, useStyle, page, btn, label, kc, pane, bank, stateDot, since, ago, fmtClock, icon, avatar } from "/levels/common.js";
 import { repoPicker } from "/levels/repos.js";
 
 export function mount(root, ctx) {
@@ -33,7 +33,8 @@ export function mount(root, ctx) {
       title: "Open a project you have",
       why: "A git checkout. Reading needs no agent: search, the map and history work at once.",
       body: () => ({ trust }),
-      onDone: (repo) => { ctx.refreshProjects().then(() => ctx.go(`#/p/${repo.project || ""}${repo.project ? "" : ""}`)); },
+      // The picker hands over the folder's path: land on its project (Lee landed on `#/p/`).
+      onDone: (path) => { ctx.refreshProjects().then(() => { const p = (ctx.projectOf && ctx.projectOf(path)) || ctx.projects().find((x) => x.path === path); ctx.go(p ? `#/p/${p.project}` : "#/p"); }); },
     });
     return page({ kicker: "Workbench", title: "What do you want to do?", sub: "Open a project you have, or start a new one. Once a project is open, this page also offers Review and ship, and Find out why something went wrong." },
       bank(2,
@@ -56,9 +57,9 @@ export function mount(root, ctx) {
     const cont = needP || top;
     const happened = d && d.happened ? (d.story || []).length || (d.tiles ? d.tiles.done + d.tiles.decided : 0) : 0;
     const sub = d && d.last_seen_ms
-      ? `You last looked ${since(d.last_seen_ms)} ago, at ${fmtClock(d.last_seen_ms)}.${happened ? ` ${happened} thing${happened === 1 ? "" : "s"} happened since.` : " Nothing happened since."}`
+      ? `You last looked ${ago(d.last_seen_ms)}, at ${fmtClock(d.last_seen_ms)}.${happened ? ` ${happened} thing${happened === 1 ? "" : "s"} happened since.` : " Nothing happened since."}`
       : "Pick what you came to do.";
-    const contFact = cont ? [h("b", {}, cont.project), `: ${cont.counts ? [cont.needs ? `${cont.needs} need${cont.needs === 1 ? "s" : ""} you` : null, cont.counts.working ? `${cont.counts.working} working` : null, cont.counts.ready ? `${cont.counts.ready} ready` : null].filter(Boolean).join(", ") || cont.last_activity || "no agents yet" : ""}`] : "no project yet";
+    const contFact = cont ? [h("b", {}, cont.project), `: ${cont.counts ? [cont.needs ? `${cont.needs} need${cont.needs === 1 ? "s" : ""} you` : null, cont.counts.working ? `${cont.counts.working} working` : null, cont.counts.ready ? `${cont.counts.ready} ready` : null].filter(Boolean).join(", ") || (cont.last_activity_ms ? `last active ${ago(cont.last_activity_ms)}` : "no agents yet") : ""}`] : "no project yet";
     const tile = (k, key, title, text, fact, b, now) => h("div", { class: `g-goal${now ? " now" : ""}` },
       h("div", { class: "g-k" }, label(k), kc(key)), h("b", { class: "g-gt" }, title), h("p", {}, text), h("div", { class: "g-fact" }, fact), b);
     const goals = bank(4,
@@ -78,7 +79,7 @@ export function mount(root, ctx) {
         h("td", {}, h("b", {}, p.project), dense ? null : h("div", { class: "g-path" }, p.path)),
         h("td", {}, st),
         h("td", { class: "g-hide" }, h("span", { class: "g-avs" }, (ctx.state.agents || []).filter((a) => a.repo === p.path && a.running).slice(0, 5).map((a) => avatar(a, 16)))),
-        h("td", { class: "r num g-dim" }, p.last_activity_ms ? `${since(p.last_activity_ms)} ago` : "—"),
+        h("td", { class: "r num g-dim" }, p.last_activity_ms ? ago(p.last_activity_ms) : "—"),
         h("td", { class: "r" }, h("span", { class: "g-acts" }, btn("Continue", { sm: true, href: `#/p/${p.project}` }), c.ready ? btn(`Review ${c.ready}`, { sm: true, href: `#/p/${p.project}/ship` }) : null)));
     });
     const needs = N.items.slice(0, 4);

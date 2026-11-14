@@ -66,6 +66,14 @@ export function mount(root, ctx) {
       });
       drawRules();
     });
+    // Decide's guarded commands and paths, and the change requests they
+    // make, live here now (`#/decide` comes here).
+    const guardHost = h("div", { class: "g-told" });
+    el.append(guardHost);
+    import("/levels/change-requests.js").then((m) => {
+      if (!alive) return;
+      guardHost.replaceChildren(label("Guarded commands and paths"), h("p", { class: "g-dim" }, "Agents may read a guarded path but not change it; a guarded command is denied and comes here as a request."), m.changeRequests(ctx.levelCtx({ repo: p.path })));
+    }).catch((e) => guardHost.replaceChildren(h("p", { class: "g-bad" }, `The guarded list did not load: ${e.message}`)));
     const drawRules = () => { if (panel && alive) rulesHost.replaceChildren(label("What every agent is told", h("span", { class: "num" }, String(S.rules.length))), panel.view()); };
     ctx.api(`/api/rules?repo=${enc(p.path)}`).then((r) => { S.rules = r.rules || []; drawRules(); }, () => {});
   }

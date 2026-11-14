@@ -17,11 +17,12 @@ export function head(a, o = {}) {
   const word = g === "needs" ? "needs you" : g === "working" ? (a.state === "starting" ? "starting" : "working") : g === "ready" ? "ready to review"
     : m ? `merged into ${m.onto || "main"}${m.commit ? ` as ${String(m.commit).slice(0, 7)}` : ""}` : a.running ? "idle" : "finished";
   const st = o.stat;
-  const primary = g === "ready" && o.ship
-    ? btn("Review and ship", { primary: true, href: o.ship, icon: "ship" })
-    : a.running && o.onTell ? btn(`Tell ${a.name}…`, { primary: g !== "needs", icon: "send", onclick: o.onTell }) : null;
-  // A finished turn can still be told something (a change, a question): Tell stays beside Review.
-  const tell = g === "ready" && o.ship && a.running && o.onTell ? btn(`Tell ${a.name}…`, { icon: "send", onclick: o.onTell }) : null;
+  // Both buttons, always in this order, so the one under the cursor never
+  // turns into the other when the agent's turn ends (Maya clicked Tell and
+  // got Review).
+  const review = o.ship && (g === "ready" || (a.running && o.stat)) ? btn("Review and ship", { primary: g === "ready", href: o.ship, icon: "ship", cls: "ag-rev" }) : null;
+  const tell = a.running && o.onTell ? btn(`Tell ${a.name}…`, { primary: g === "working", icon: "send", onclick: o.onTell, cls: "ag-tell" }) : null;
+  const primary = [review, tell];
   const menu = h("details", { class: "ag-menu" },
     h("summary", { class: "btn", "aria-label": "More for this agent" }, a.running ? [icon("stop", "i sm"), "Stop"] : [icon("rewind", "i sm"), "Restart"], icon("down", "i sm")),
     h("div", { class: "ag-mlist", role: "menu" },
@@ -42,7 +43,7 @@ export function head(a, o = {}) {
         a.state_since && !m ? h("span", { class: "num" }, `${word} for ${since(a.state_since)}`) : null,
         m && o.ship ? h("a", { class: "lv-link", href: o.ship }, "Merged: Undo or see what went in") : null,
         a.read_only ? h("span", {}, "read-only") : null)),
-    h("div", { class: "ag-act" }, primary, tell, menu));
+    h("div", { class: "ag-act" }, primary, menu));
 }
 
 /** The tab links. `cur` is one of TABS' keys; `n` the changed files' count. */

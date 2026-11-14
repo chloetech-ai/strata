@@ -61,7 +61,11 @@ const REWIND_AFTER_MS: i64 = 3_000;
 const MAX_LINES: usize = 6;
 
 pub fn routes() -> Router<App> {
-    Router::new().route("/api/trace", get(trace_route)).route("/api/trace/explain", post(explain_route)).route("/api/trace/commit", get(commit_route))
+    Router::new()
+        .route("/api/trace", get(trace_route))
+        .route("/api/trace/examples", get(examples_route))
+        .route("/api/trace/explain", post(explain_route))
+        .route("/api/trace/commit", get(commit_route))
 }
 
 /// What `GET /api/trace` takes. `x`, `y`, `topic`, `subject` (comma
@@ -84,6 +88,59 @@ pub struct TraceQ {
 async fn trace_route(State(app): State<App>, Query(q): Query<TraceQ>) -> ApiResult {
     let sup = app.sup.clone();
     Ok(Json(blocking(move || trace(&sup, &q)).await?).into_response())
+}
+
+#[derive(Deserialize)]
+struct ExamplesQ {
+    repo: Option<String>,
+}
+
+async fn examples_route(Query(q): Query<ExamplesQ>) -> ApiResult {
+    let v = blocking(move || Ok(examples(&trail::repo_dir(q.repo.as_deref())?))).await?;
+    Ok(Json(v).into_response())
+}
+
+/// `GET /api/trace/examples`: questions to try, made of this repository's
+/// history (Sam: the examples spoke of a cart and money.rs in a repo with
+/// neither): the files changed most often, and a recent commit's subject.
+pub fn examples(repo: &Path) -> Json_ {
+    let log = git(repo, &["log", "-n", "300", "--no-merges", "--format=%x1e%s", "--name-only"]).unwrap_or_default();
+    let mut count: HashMap<String, usize> = HashMap::new();
+    let mut subjects: Vec<String> = Vec::new();
+    for chunk in log.split('\u{1e}').skip(1) {
+        let mut it = chunk.lines();
+        let subj = it.next().unwrap_or("").trim().to_string();
+        if !subj.is_empty() && subjects.len() < 40 {
+            subjects.push(subj);
+        }
+        for f in it.map(str::trim).filter(|f| !f.is_empty()) {
+            let name = f.rsplit('/').next().unwrap_or(f);
+            let generated = name.ends_with(".lock") || name.ends_with("-lock.json") || name.ends_with(".min.js") || name == "go.sum" || name.ends_with(".md") || name.starts_with('.');
+            if !generated && !crate::search::is_test_path(f) {
+                *count.entry(f.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut files: Vec<(String, usize)> = count.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut out: Vec<String> = Vec::new();
+    if let Some((f, _)) = files.first() {
+        out.push(format!("who changed {f} and why?"));
+    }
+    let plain = |s: &&String| {
+        let l = s.to_lowercase();
+        s.split_whitespace().count() >= 3 && !l.starts_with("merge") && !l.starts_with("initial") && !l.starts_with("wip") && !l.starts_with("wb:") && !l.starts_with("revert")
+    };
+    if let Some(s) = subjects.iter().find(plain) {
+        let s = s.trim_end_matches('.');
+        let mut c = s.chars();
+        let lower = c.next().map(|f| f.to_lowercase().collect::<String>() + c.as_str()).unwrap_or_default();
+        out.push(format!("when and why did we {}?", one_line(&lower, 90)));
+    }
+    if let Some((f, _)) = files.get(1) {
+        out.push(format!("when did {f} last change, and how does it work now?"));
+    }
+    json!({ "examples": out, "files": files.iter().take(5).map(|(f, n)| json!({ "path": f, "commits": n })).collect::<Vec<_>>() })
 }
 
 async fn explain_route(State(app): State<App>, body: Bytes) -> ApiResult {
@@ -1197,9 +1254,9 @@ fn answer_of(r: &Reading, ns: &[Needle], items: &[Json_]) -> Option<Json_> {
         }
     }
     // The history, in one line: every commit that changed or brought it in.
-    let mut changes: Vec<&&Json_> = commits.iter().filter(|c| matches!(c["change"].as_str(), Some("changed" | "added" | "removed"))).collect();
+    let mut changes: Vec<&&Json_> = commits.iter().filter(|c| matches!(c["change"].as_str(), Some("changed" | "added" | "removed")) && !import_only(c)).collect();
     if changes.len() < 2 {
-        changes = commits.iter().collect();
+        changes = commits.iter().filter(|c| !import_only(c)).collect();
     }
     changes.sort_by_key(|c| moment(c));
     let history: Vec<Json_> = changes
@@ -1784,6 +1841,31 @@ pub fn evidence_text(t: &Json_) -> String {
     out
 }
 
+/// Hex words of 7 to 40 characters in `text` (with at least one digit and
+/// one letter, so "decade" is not a commit) that start no shown commit.
+fn unshown_commits(text: &str, shown: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let hexy = (7..=40).contains(&w.len()) && w.chars().all(|c| c.is_ascii_hexdigit()) && w.chars().any(|c| c.is_ascii_digit()) && w.chars().any(|c| c.is_ascii_alphabetic());
+        let w = w.to_ascii_lowercase();
+        if hexy && !shown.iter().any(|s| s.to_ascii_lowercase().starts_with(&w)) && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// A commit whose lines about the subject only import or re-export it:
+/// not a change to how it works (Priya: "changed 5 times" counted them).
+fn import_only(c: &Json_) -> bool {
+    let lines: Vec<&str> = c["lines"].as_array().into_iter().flatten().filter_map(|l| l["text"].as_str()).map(str::trim).filter(|t| !t.is_empty()).collect();
+    !lines.is_empty()
+        && lines.iter().all(|t| {
+            let t = t.trim_start_matches(['+', '-']).trim();
+            t.starts_with("import ") || (t.starts_with("from ") && t.contains(" import ")) || t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("#include") || t.contains("require(") || (t.starts_with("export ") && t.contains(" from "))
+        })
+}
+
 /// `POST /api/trace/explain`: the trace, then `chloectx ask --deep --json`
 /// (a model) with the question and the evidence.
 pub fn explain(sup: &Supervisor, q: &TraceQ) -> Result<Json_, ApiError> {
@@ -1800,16 +1882,22 @@ pub fn explain(sup: &Supervisor, q: &TraceQ) -> Result<Json_, ApiError> {
     }
     let tags: Vec<String> = t["timeline"].as_array().into_iter().flatten().map(|i| format!("{} {} {}", i["tag"].as_str().unwrap_or(""), i["kind"].as_str().unwrap_or(""), one_line(i["title"].as_str().unwrap_or(""), 60))).collect();
     let question = format!(
-        "{}\n\nAnswer from the evidence Workbench found below and from memory; cite the evidence as [E1], [E2]. Say when, why and how it works now.\n\n{ev}",
+        "{}\n\nAnswer from the evidence Workbench found below, which is what the person sees; cite it as [E1], [E2]. Name only the commits listed below: if memory speaks of another commit, say it is not in this evidence. Say when, why and how it works now.\n\n{ev}",
         t["question"].as_str().unwrap_or("")
     );
     let bin = &sup.cfg.chloectx_bin;
     match trail::run_chloectx(bin, &main, &["ask", "--deep", "--json", "--", &question], Duration::from_secs(300)) {
-        Ran::Out(v) => Ok(json!({
-            "available": true,
-            "answer": v["answer"], "text": v["text"], "confidence": v["confidence"], "cost_usd": v["cost_usd"], "ids": v["ids"], "ms": v["ms"],
-            "evidence": tags, "missing": [],
-        })),
+        Ran::Out(v) => {
+            // Priya: Explain named commits the timeline did not show. Say so.
+            let shown: Vec<String> = t["timeline"].as_array().into_iter().flatten().filter_map(|i| i["commit"]["sha"].as_str().map(str::to_string)).collect();
+            let said = v["text"].as_str().or(v["answer"].as_str()).unwrap_or("");
+            let missing: Vec<String> = unshown_commits(said, &shown).into_iter().map(|s| format!("the answer names commit {s}, which is not in the evidence shown here")).collect();
+            Ok(json!({
+                "available": true,
+                "answer": v["answer"], "text": v["text"], "confidence": v["confidence"], "cost_usd": v["cost_usd"], "ids": v["ids"], "ms": v["ms"],
+                "evidence": tags, "missing": missing,
+            }))
+        }
         Ran::Missing => Ok(json!({ "available": false, "why": trail::not_installed(bin), "evidence": tags, "missing": [trail::not_installed(bin)] })),
         Ran::Failed(e) => Ok(json!({ "available": false, "why": e, "evidence": tags, "missing": [e] })),
     }

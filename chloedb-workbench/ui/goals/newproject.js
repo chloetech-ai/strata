@@ -9,7 +9,21 @@ const enc = encodeURIComponent;
 const MAX_AT_ONCE = 3;
 
 // What the person typed, kept while they move between the steps.
-const D = { dir: "", idea: "", done: "", who: "lead", plan: null, planFor: "", repo: "", busy: false, err: "" };
+const D = { dir: "", idea: "", done: "", who: "lead", plan: null, planFor: "", repo: "", busy: false, err: "", model: "" };
+
+/** Start a change with "Split it into parts" ticked: the plan of an
+ *  existing project, its words handed over here rather than in the URL
+ *  (Dev: the whole prompt sat in the address bar), with the model chosen
+ *  on the form. */
+export function planFrom({ repo, idea, done, model }) {
+  Object.assign(D, { repo, dir: "", idea, done: done || "", who: "lead", model: model || "", plan: null, planFor: "", busy: false, err: "" });
+}
+
+/** Paths a part names (`src/cart.py`, `cart.py`): two parts that name the
+ *  same file will edit it on two branches. */
+function pathsOf(s) {
+  return [...new Set((String(s || "").match(/[\w./-]+\.[A-Za-z0-9]{1,6}\b/g) || []).filter((w) => /[A-Za-z]/.test(w) && !/^\d/.test(w) && !/^(e\.g|i\.e)\b/.test(w)).map((w) => w.replace(/^\.\//, "")))];
+}
 
 export function mount(root, ctx) {
   useStyle("g-new", CSS);
@@ -22,7 +36,11 @@ export function mount(root, ctx) {
   if (q.get("text") && !D.idea) D.idea = q.get("text");
   let alive = true;
   document.body.classList.add("stepping");
-  ctx.crumbs([{ label: "Start", href: "#/" }, { label: "New project", href: "#/new" }, ...(step === "folder" ? [] : [{ label: step === "what" ? "What to build" : "Plan it", href: location.hash }])]);
+  // A plan for a project Workbench already knows is that project's, not a
+  // new one's (Dev: "New project" over an existing repository).
+  const known = step === "plan" && D.repo && ctx.projectOf ? ctx.projectOf(D.repo) : null;
+  ctx.crumbs(known ? [{ label: "Start", href: "#/" }, { label: known.project, href: `#/p/${known.project}` }, { label: "Plan the parts", href: location.hash }]
+    : [{ label: "Start", href: "#/" }, { label: "New project", href: "#/new" }, ...(step === "folder" ? [] : [{ label: step === "what" ? "What to build" : "Plan it", href: location.hash }])]);
 
   const steps = (now) => ({
     list: [
@@ -91,8 +109,10 @@ export function mount(root, ctx) {
       if (D.who === "single") {
         D.plan = { parts: [{ title: D.idea.split("\n")[0].slice(0, 140), done: D.done || null, after: [], model: null }], drafted_by: "you", missing: [] };
       } else {
-        D.plan = await ctx.api("/api/goals", { method: "POST", body: { repo: D.repo || D.dir, text, plan: "draft" } });
+        D.plan = await ctx.api("/api/goals", { method: "POST", body: { repo: D.repo || D.dir, text, plan: "draft", ...(D.model ? { model: D.model } : {}) } });
       }
+      // The model chosen on the form is each part's, until a chip says otherwise.
+      if (D.model && D.plan) for (const p of D.plan.parts || []) if (!p.model) p.model = D.model;
       D.planFor = text;
     } catch (e) { D.err = e.message; }
     D.busy = false;
@@ -103,8 +123,8 @@ export function mount(root, ctx) {
     const parts = D.plan.parts;
     D.busy = true; draw();
     try {
-      const outcomes = parts.map((p) => ({ title: p.title, detail: p.done || null, after: p.after && p.after.length ? Math.max(...p.after) : null }));
-      const r = await ctx.api("/api/goals", { method: "POST", body: { repo: D.repo || D.dir, text: D.done ? `${D.idea}\n\nDone when: ${D.done}` : D.idea, outcomes, worktree: true } });
+      const outcomes = parts.map((p) => ({ title: p.title, detail: p.done || null, after: p.after && p.after.length ? Math.max(...p.after) : null, model: p.model || null }));
+      const r = await ctx.api("/api/goals", { method: "POST", body: { repo: D.repo || D.dir, text: D.done ? `${D.idea}\n\nDone when: ${D.done}` : D.idea, outcomes, worktree: true, ...(D.model ? { model: D.model } : {}) } });
       const proj = await ctx.refreshProjects().then(() => ctx.projectOf(D.repo || D.dir));
       const n = (r.started || r.agents || []).length;
       ctx.toast(`Started ${n || "the"} agent${n === 1 ? "" : "s"}${(r.missing || []).length ? `; ${r.missing.length} part${r.missing.length === 1 ? "" : "s"} wait` : ""}`);
@@ -121,12 +141,23 @@ export function mount(root, ctx) {
     const move = (i, d) => { const j = i + d; if (j < 0 || j >= parts.length) return; [parts[i], parts[j]] = [parts[j], parts[i]]; for (const p of parts) p.after = (p.after || []).map((x) => (x === i ? j : x === j ? i : x)); draw(); };
     const rm = (i) => { parts.splice(i, 1); for (const p of parts) p.after = (p.after || []).filter((x) => x !== i).map((x) => (x > i ? x - 1 : x)); draw(); };
     const waitWords = (p, i) => (p.after && p.after.length ? `waits for part ${p.after.map((x) => x + 1).join(", ")}` : i === 0 ? "starts first" : "starts at once");
+    // Parts that run at once and name the same file (Dev: warn at plan
+    // time, not at the second merge).
+    const clash = new Map();
+    const named = parts.map((p) => pathsOf(`${p.title} ${p.done || ""}`));
+    for (let i = 0; i < parts.length; i++) for (let j = 0; j < parts.length; j++) {
+      if (i === j || (parts[i].after || []).includes(j) || (parts[j].after || []).includes(i)) continue;
+      for (const f of named[i]) if (named[j].some((g) => g === f || g.endsWith("/" + f) || f.endsWith("/" + g))) { if (!clash.has(i)) clash.set(i, []); if (!clash.get(i).some((c) => c.j === j && c.f === f)) clash.get(i).push({ j, f }); }
+    }
     const rows = parts.map((p, i) => h("div", { class: "g-part", "data-nav": "", tabindex: "0" },
       h("span", { class: "g-pn num" }, String(i + 1).padStart(2, "0")),
       h("div", { class: "g-pt" },
         h("input", { class: "field", value: p.title, "aria-label": `Part ${i + 1}`, oninput: (e) => { p.title = e.target.value; } }),
         h("input", { class: "field g-pd", value: p.done || "", placeholder: "Done when…", "aria-label": `Part ${i + 1}: done when`, oninput: (e) => { p.done = e.target.value; } }),
-        h("div", { class: "g-pm" }, h("span", { class: "chip" }, waitWords(p, i)), h("span", { class: "chip" }, p.model || "Claude Code's default model"))),
+        h("div", { class: "g-pm" }, h("span", { class: "chip" }, waitWords(p, i)),
+          h("select", { class: "chip g-pmodel", "aria-label": `Part ${i + 1}: model`, onchange: (e) => { p.model = e.target.value || null; } },
+            ["", "haiku", "sonnet", "opus"].map((m) => h("option", { value: m, selected: (p.model || "") === m || null }, m || "Claude Code's default model"))),
+          (clash.get(i) || []).length ? h("span", { class: "chip del", title: "Two parts that change one file edit it on two branches, and the second merge conflicts." }, `also in part ${clash.get(i).map((c) => c.j + 1).join(", ")}: ${[...new Set(clash.get(i).map((c) => c.f))].join(", ")}`) : null)),
       h("div", { class: "g-pa" }, btn("↑", { sm: true, ghost: true, title: "Earlier", onclick: () => move(i, -1), disabled: i === 0 }), btn("↓", { sm: true, ghost: true, title: "Later", onclick: () => move(i, 1), disabled: i === parts.length - 1 }), btn("Remove", { sm: true, ghost: true, onclick: () => rm(i) }))));
     const change = h("input", { class: "field", placeholder: "Tell the lead what to change: merge parts 2 and 3, add a receipts page…", "aria-label": "Tell the lead what to change" });
     const n = parts.length;
@@ -136,11 +167,11 @@ export function mount(root, ctx) {
       h("dl", { class: "kv" },
         h("dt", {}, "Memory"), h("dd", {}, "Remembers this project's decisions (ChloeCtx). Its hooks and memory tools go in each session's own settings; yours are not touched."),
         h("dt", {}, "Told"), h("dd", {}, "Your idea, its part, the done check, and the project's rules."),
-        h("dt", {}, "Models"), h("dd", {}, "As set on each part."),
+        h("dt", {}, "Models"), h("dd", {}, D.model ? `${D.model}, as chosen on the form, unless a part says otherwise.` : "As set on each part."),
         h("dt", {}, "Branch"), h("dd", {}, "Its own worktree on wb/<part> from main. Main is never edited."),
         h("dt", {}, "Without asking"), h("dd", {}, "Edit files on its branch and run the tests (python3 -m pytest, npm test, cargo test). It asks for anything else, and never runs git push or pip install."),
         h("dt", {}, "At once"), h("dd", {}, `At most ${MAX_AT_ONCE} agents; a part that waits on another waits.`)))];
-    return page({ steps: steps("plan"), kicker: `New project · ${String(repo || "").split("/").filter(Boolean).pop() || ""}`, title: "Plan it", sub: D.busy && !D.plan ? "The lead is reading the idea…" : D.plan && D.plan.drafted_by === "words" ? "Your own sentences, one part each: edit them, or tell the lead what to change." : "The lead's draft. Reorder, edit or remove parts before anything starts.", inspector: insp, wide: true },
+    return page({ steps: known ? null : steps("plan"), kicker: known ? `${known.project} · Start a change` : `New project · ${String(repo || "").split("/").filter(Boolean).pop() || ""}`, title: known ? "Plan the parts" : "Plan it", sub: D.busy && !D.plan ? "The lead is reading the idea…" : D.plan && D.plan.drafted_by === "words" ? "Your own sentences, one part each: edit them, or tell the lead what to change." : "The lead's draft. Reorder, edit or remove parts before anything starts.", inspector: insp, wide: true },
       D.err ? h("div", { class: "g-err" }, D.err) : null,
       D.plan && (D.plan.missing || []).length ? h("p", { class: "g-dim" }, D.plan.missing.join(" · ")) : null,
       h("div", { class: "pane" }, h("div", { class: "hd" }, label(`The parts (${n})`, D.plan && D.plan.drafted_by === "model" ? h("span", {}, `drafted by ${D.plan.model || "haiku"}`) : null)),
@@ -148,7 +179,7 @@ export function mount(root, ctx) {
         h("div", { class: "bd g-add" }, btn("Add a part", { sm: true, icon: "plus", onclick: () => { parts.push({ title: "", done: "", after: [], model: null }); draw(); } }))),
       D.who === "lead" ? h("form", { class: "gp-sec g-ask2", onsubmit: (e) => { e.preventDefault(); if (change.value.trim()) draft(change.value.trim()); } }, change, btn("Redraft", { type: "submit", sm: true, disabled: D.busy })) : null,
       phone ? null : h("div", { class: "g-foot plain" }, h("span", { class: "g-dim" }, "Nothing has run yet."), h("span", { class: "sp" }), btn(D.busy && D.plan ? "Starting…" : startLabel, { primary: true, disabled: D.busy || !n, onclick: startPlan, kbd: "⌘↵" })),
-      bar(btn("Back", { href: `#/new/what?dir=${enc(repo)}`, icon: "back" }), btn(startLabel, { primary: true, disabled: D.busy || !n, onclick: startPlan })));
+      bar(btn("Back", { href: known ? `#/p/${known.project}/change` : `#/new/what?dir=${enc(repo)}`, icon: "back" }), btn(startLabel, { primary: true, disabled: D.busy || !n, onclick: startPlan })));
   }
 
   function draw() {
@@ -162,6 +193,8 @@ export function mount(root, ctx) {
   return {
     update() {},
     onKey(e) { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { const b = el.querySelector(".g-foot .btn.primary"); if (b) { b.click(); return true; } } return false; },
+    // Esc does not leave a drafted plan (Dev lost one): Back, or a step, does.
+    onEscape() { if (step === "plan" && D.plan && (D.plan.parts || []).length) { ctx.toast("The plan stays until you start it or go Back: Esc does not throw it away."); return true; } return false; },
     unmount: () => { alive = false; document.body.classList.remove("stepping"); el.remove(); },
   };
 }

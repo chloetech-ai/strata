@@ -394,7 +394,11 @@ fn digest_now(sup: &Supervisor, lv: &crate::levels::Levels, now: i64, q: &Json, 
     // Away: the last heartbeat is old.
     if let Some(h) = here {
         if now - h >= AWAY_AFTER_MS && h >= seen {
-            return build(sup, lv, "away", h, now);
+            // One mark: "I'm stepping away", when the heartbeat stopped
+            // soon after it (the page stays open a minute or two after the
+            // tap), is when you left; else the last heartbeat.
+            let mark = crate::digest::get_seen(sup, "away_mark").and_then(|(v, _)| v.parse::<i64>().ok()).filter(|m| *m <= h && h - m < AWAY_AFTER_MS);
+            return build(sup, lv, "away", mark.unwrap_or(h), now);
         }
     }
     Json::Null

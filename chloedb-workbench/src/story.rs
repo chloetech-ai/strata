@@ -291,7 +291,7 @@ pub fn story(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
     let failures: Vec<i64> = all_calls.iter().filter(|c| c.failed).map(|c| c.ended_ms.unwrap_or(c.started_ms)).collect();
     let (knew, deja_vu) = knew(sup, &a, &sessions, &failures, &starts.iter().map(|&s| evs[s].ts).collect::<Vec<_>>(), &mut missing);
 
-    let intent = a.outcome.as_deref().and_then(|o| crate::goals::outcome(sup, o).ok()).map(|o| o.title).or_else(|| a.task.as_deref().map(|t| narrate::sentences(t, 1, 200))).unwrap_or_default();
+    let intent = a.outcome.as_deref().and_then(|o| crate::goals::outcome(sup, o).ok()).map(|o| o.title).or_else(|| a.task.as_deref().map(intent_of)).unwrap_or_default();
     Ok(json!({
         "agent": sup.agent_json_of(id),
         "intent": intent,
@@ -301,6 +301,44 @@ pub fn story(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         "tokens": narrate::tokens_json(tokens),
         "missing": missing,
     }))
+}
+
+/// What a task is for, from the whole task and not its first sentence
+/// (Lee: the intent of a three-part task was its first clause): the
+/// sentences that ask for something, without the ones that only say what
+/// not to do and without the done check, up to about 300 characters.
+pub fn intent_of(task: &str) -> String {
+    let body = task.split("\n\nDone when:").next().unwrap_or(task);
+    let all = narrate::sentences(body, 40, 4000);
+    let mut parts: Vec<String> = Vec::new();
+    let mut s = String::new();
+    for c in all.chars() {
+        s.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            parts.push(std::mem::take(&mut s).trim().to_string());
+        }
+    }
+    if !s.trim().is_empty() {
+        parts.push(s.trim().to_string());
+    }
+    let constraint = |p: &str| {
+        let l = p.to_lowercase();
+        ["don't ", "don\u{2019}t ", "do not ", "never ", "avoid ", "keep ", "leave ", "make sure not", "without ", "no need", "done when", "note:", "p.s."].iter().any(|w| l.starts_with(w))
+    };
+    let asks: Vec<&String> = parts.iter().filter(|p| !p.is_empty() && !constraint(p)).collect();
+    let asks: Vec<&String> = if asks.is_empty() { parts.iter().filter(|p| !p.is_empty()).collect() } else { asks };
+    let mut out = String::new();
+    for p in asks {
+        if !out.is_empty() && out.len() + p.len() > 300 {
+            out.push_str(" …");
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(p);
+    }
+    one_line(&out, 320)
 }
 
 /// Seconds or milliseconds since the epoch, as milliseconds.
@@ -382,6 +420,15 @@ mod tests {
 
     fn ev(seq: i64, kind: &str, tool: Option<&str>, data: Json) -> Event {
         Event { id: format!("a:{seq}"), seq, ts: seq * 1000, agent: "a".into(), kind: kind.into(), tool: tool.map(str::to_string), summary: None, data: Some(data.to_string()) }
+    }
+
+    #[test]
+    fn the_intent_is_the_whole_task() {
+        let t = "Add a coupon field to the checkout. Apply the discount before tax. Don't touch the payment code.\n\nDone when: `pytest -q` passes.";
+        let i = intent_of(t);
+        assert!(i.contains("coupon field") && i.contains("before tax"), "{i}");
+        assert!(!i.contains("payment") && !i.contains("pytest"), "{i}");
+        assert_eq!(intent_of("Fix the login bug"), "Fix the login bug");
     }
 
     #[test]

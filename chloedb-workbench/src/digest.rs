@@ -173,7 +173,9 @@ pub fn digest(sup: &Supervisor, lv: &Levels, since: Option<i64>, repo: Option<&s
     // Your first visit: since the first agent started, not a made-up day.
     let first_start = agents.iter().map(|a| a.started_ms.unwrap_or(a.created)).filter(|t| *t > 0).min();
     let explicit = since.is_some();
-    let since = since.or(seen_at).or(first_start).unwrap_or(now - DEFAULT_WINDOW_MS);
+    // A first look with nothing started: no window at all ("since you left"
+    // makes no sense on a first visit), so nothing is counted twice later.
+    let since = since.or(seen_at).or(first_start).unwrap_or(if repo.is_some() { now } else { now - DEFAULT_WINDOW_MS });
     let here = seen_ms(sup, "here");
     let mark = seen_ms(sup, "away_mark");
     // Away, stepped away (you said so), here all along (the page was in
@@ -293,6 +295,17 @@ pub fn digest(sup: &Supervisor, lv: &Levels, since: Option<i64>, repo: Option<&s
     }
     replay.sort_by_key(|r| r["at_ms"].as_i64().unwrap_or(0));
 
+    // Merges since (Review's notes), and agents that ended since: things
+    // that happened even when no agent is working now.
+    let merged: Vec<Json> = evs
+        .iter()
+        .filter(|e| e.kind == "merged")
+        .filter_map(|e| {
+            let d: Json = e.data.as_deref().and_then(|d| serde_json::from_str(d).ok()).unwrap_or(Json::Null);
+            Some(json!({ "agent": e.agent, "name": by_id(&e.agent)?.name, "branch": d["branch"], "onto": d["onto"], "commit": d["commit"], "ts_ms": e.ts }))
+        })
+        .collect();
+    let ended: Vec<Json> = agents.iter().filter(|a| a.ended.is_some_and(|t| t >= since)).map(|a| json!({ "agent": a.id, "name": a.name, "ended_ms": a.ended })).collect();
     let mut qlist: Vec<Json> = open.iter().map(|q| q.to_json(sup)).collect();
     qlist.extend(decided.iter().map(|q| q.to_json(sup)));
     let blocked = blocked(sup, &agents, &qs, since, now);
@@ -314,6 +327,8 @@ pub fn digest(sup: &Supervisor, lv: &Levels, since: Option<i64>, repo: Option<&s
         "rules": rules.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
         "learned": learned,
         "replay": replay,
+        "merged": merged,
+        "ended": ended,
         "happened": !evs.is_empty() || !done.is_empty() || !decided.is_empty(),
         "missing": missing,
     }))

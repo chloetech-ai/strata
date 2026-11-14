@@ -456,8 +456,11 @@ export function icon(name, cls = "i") {
   return s;
 }
 
-/** A keycap: `kc("⌘↵")`. */
-export function kc(key) { return h("kbd", { class: "kc" }, key); }
+/** The modifier the page's ⌘ keys take here: ⌘ on a Mac, Ctrl elsewhere
+ *  (Dev, on Linux, read "⌘↵" and had no ⌘ key; every handler takes either). */
+export const MOD = /Mac|iPhone|iPad/.test((typeof navigator !== "undefined" && (navigator.platform || navigator.userAgent)) || "") ? "⌘" : "Ctrl";
+/** A keycap: `kc("⌘↵")`, which reads "Ctrl↵" off a Mac. */
+export function kc(key) { return h("kbd", { class: "kc" }, MOD === "⌘" ? key : String(key).replace("⌘", "Ctrl ")); }
 
 /** A small-caps mono label, with an optional right-hand aside: `label("Needs you", h("a", …))`. */
 export function label(text, ...aside) {
@@ -527,6 +530,32 @@ export function since(t) {
   return m < 1 ? "now" : m < 60 ? `${m} min` : m < 48 * 60 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} d`;
 }
 
+/** The one way a past moment is said in a sentence: "just now", "4 min
+ *  ago", "2 h ago", "3 d ago" (never "now ago"); "" without a time. */
+export function ago(t) {
+  const s = since(t);
+  return !s ? "" : s === "now" ? "just now" : `${s} ago`;
+}
+
+/** "12:26 PM, 4 min ago" (a day or more back: "Nov 12, 2 d ago"). */
+export function whenText(t) {
+  const ms = toMs(t);
+  if (!ms) return "";
+  const d = new Date(ms);
+  const day = d.toDateString() === new Date().toDateString() ? fmtClock(ms) : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  return `${day}, ${ago(ms)}`;
+}
+
+/** Whether an option grants more than this one call: the server's
+ *  `grants`, else Claude Code's own words for it ("don't ask again",
+ *  "auto mode", "allow all"; its apostrophe may be curly). */
+export function isWide(o) {
+  if (!o) return false;
+  if (o.grants) return true;
+  const l = String(o.label || "").toLowerCase().replace(/[‘’]/g, "'");
+  return l.startsWith("yes") && /don't ask again|do not ask again|auto mode|auto-accept|bypass|allow all|all edits|during this session|always/.test(l);
+}
+
 /** The options of a question as [{label, n, no}], whatever form the server sent. */
 export function optionsOf(q) {
   const raw = parseJSON(q && q.options, []) || [];
@@ -537,7 +566,7 @@ export function optionsOf(q) {
  *  the file it lands in, and whether it outlives the session. `null` for a
  *  plain yes or no. Shown on the grant sheet before anything is typed. */
 export function grantOf(q, o, agent) {
-  if (!o || !o.grants) return null;
+  if (!isWide(o)) return null;
   const d = parseJSON(q.detail, {}) || {};
   const tool = d.tool || "Bash";
   const l = o.label || "";
@@ -553,6 +582,13 @@ export function grantOf(q, o, agent) {
 }
 
 const LONG = 25;
+/** The questions whose long command was shown in full, for this page's life. */
+const EXPANDED = new Set();
+/** What a wide option grants, as a sentence start. */
+function wideWords(o) {
+  const g = o.grants || (/auto/i.test(o.label) ? "switches the agent to auto mode: it stops asking for the rest of the session" : /session|all edits|allow all/i.test(o.label) ? "allows all of this for the rest of the session" : "stops it asking again for commands like this one");
+  return `${g[0].toUpperCase()}${g.slice(1)}`;
+}
 /** A question as JOURNEYS.md and the UX critique want it, the one card used
  *  everywhere (Start, Continue, the drawer, the agent page, the phone):
  *  - what will run, in full (over 25 lines: the first 25 and "Show all N
@@ -574,25 +610,42 @@ export function questionCard(q, { agent, onAnswer, onGrant, onText, big = false,
   const long = lines.length > LONG;
   const title = q.kind === "permission" ? (d.menu && d.menu.question) || q.text : q.text;
   const kv = [["Tool", d.tool], ["Writes", d.rel || d.file]].filter(([, v]) => v);
-  let typed = null, picked = -1, shown = !long;
-  const pre = cmd ? h("pre", { class: "qc-cmd" }, long ? lines.slice(0, LONG).join("\n") : cmd) : null;
-  const reason = long ? h("div", { class: "qc-wait" }, `Read all ${lines.length} lines to answer.`) : null;
+  // A long command stays shown in full once it was (the card is drawn again
+  // on every change of the list: a batch attempt, a focus move).
+  let typed = null, picked = -1, shown = !long || EXPANDED.has(q.id);
+  const pre = cmd ? h("pre", { class: "qc-cmd" }, shown ? cmd : lines.slice(0, LONG).join("\n")) : null;
+  // The reason sits with the answers it holds back, with its key.
+  const reason = !shown ? h("div", { class: "qc-wait", role: "note" }, `The command is ${lines.length} lines and ${LONG} are shown: read it all before answering. `,
+    h("button", { class: "lv-link", type: "button", onclick: () => expand(true) }, "Show all"), " ", kc("e")) : null;
   const buttons = opts.map((o, i) => h("button", {
-    class: `qc-opt${o.grants ? " wide" : ""}${o.no ? " no" : ""}`, type: "button", "data-n": o.n, "data-i": i, disabled: long || null,
-    onclick: () => (o.grants && onGrant ? onGrant(i, o) : onAnswer && onAnswer(i, o)),
-  }, kc(String(o.n)), h("span", { class: "ol" }, h("span", {}, o.label), o.grants ? h("small", {}, `${o.grants[0].toUpperCase()}${o.grants.slice(1)}.${onGrant ? " Opens a check first." : ""}`) : null)));
-  const showAll = long ? h("button", { class: "lv-link qc-more", type: "button", onclick: () => {
-    pre.textContent = cmd; shown = true; showAll.remove(); reason.remove(); buttons.forEach((b) => { b.disabled = false; });
-  } }, `Show all ${lines.length} lines`) : null;
+    class: `qc-opt${isWide(o) ? " wide" : ""}${o.no ? " no" : ""}${shown ? "" : " locked"}`, type: "button", "data-n": o.n, "data-i": i, "aria-disabled": shown ? null : "true",
+    title: shown ? null : `Read all ${lines.length} lines first`,
+    // Every wider answer opens the grant sheet: nothing wide is typed at once.
+    onclick: () => (!shown ? expand(true) : isWide(o) && onGrant ? onGrant(i, o) : onAnswer && onAnswer(i, o)),
+  }, kc(String(o.n)), h("span", { class: "ol" }, h("span", {}, o.label), isWide(o) ? h("small", {}, `${wideWords(o)}.${onGrant ? " Opens a check first." : ""}`) : null)));
+  const showAll = !shown ? h("button", { class: "lv-link qc-more", type: "button", onclick: () => expand(true) }, `Show all ${lines.length} lines`) : null;
+  function expand(focus) {
+    if (shown) return;
+    shown = true; EXPANDED.add(q.id);
+    pre.textContent = cmd; showAll.remove(); reason.remove();
+    buttons.forEach((b) => { b.classList.remove("locked"); b.removeAttribute("aria-disabled"); b.removeAttribute("title"); });
+    if (focus) { card.focus({ preventScroll: true }); pre.scrollIntoView({ block: "nearest" }); }
+  }
+  // A key on a held-back answer says why, next to the answers, never silently.
+  const nudge = () => { if (!reason) return; reason.classList.remove("nudge"); void reason.offsetWidth; reason.classList.add("nudge"); reason.scrollIntoView({ block: "nearest" }); };
   const pick = (i) => { picked = i; buttons.forEach((b, k) => b.classList.toggle("sel", k === i)); };
   const card = h("div", { class: `qc${big ? " big" : ""}`, "data-q": q.id, tabindex: "0", "aria-label": `${name}: ${title || "a question"}`,
     onkeydown: (e) => {
       if (e.target !== card && e.target.closest("input,textarea")) return;
-      if (/^[1-9]$/.test(e.key) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (/^[1-9]$/.test(e.key) && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
         const i = opts.findIndex((o) => String(o.n) === e.key);
-        if (i >= 0 && shown) { pick(i); e.preventDefault(); e.stopPropagation(); }
+        if (i >= 0) { e.preventDefault(); e.stopPropagation(); if (shown) pick(i); else nudge(); }
+      } else if ((e.key === "e" || (e.key === " " && e.target === card)) && !shown && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault(); e.stopPropagation(); expand(true);
       } else if (e.key === "Enter" && picked >= 0 && e.target === card) {
         e.preventDefault(); e.stopPropagation(); buttons[picked].click();
+      } else if (e.key === "Enter" && !shown && e.target === card) {
+        e.preventDefault(); e.stopPropagation(); nudge();
       } else if (e.key === "Escape" && picked >= 0) {
         e.preventDefault(); e.stopPropagation(); pick(-1);
       }
@@ -757,7 +810,9 @@ textarea.field{height:auto;min-height:96px;padding:var(--s-2) var(--s-3);line-he
 .qc-opt{display:flex;align-items:center;gap:10px;min-height:40px;padding:var(--s-2) var(--s-4);border:0;border-bottom:var(--hair) solid var(--line);background:none;color:var(--text);text-align:left;cursor:pointer;font-size:var(--fs-body)}
 .qc-opt:last-child{border-bottom:0}
 .qc-opt:hover:not(:disabled){background:var(--surface-2)}
-.qc-opt:disabled{color:var(--text-3);cursor:not-allowed}
+.qc-opt:disabled,.qc-opt.locked{color:var(--text-3);cursor:help}
+.qc-wait.nudge{animation:qc-nudge .5s ease 2}
+@keyframes qc-nudge{50%{background:var(--warn-soft)}}
 .qc-opt .ol{display:flex;flex-direction:column;min-width:0}
 .qc-opt small{color:var(--text-2);font-size:var(--fs-sm);line-height:var(--lh-sm)}
 .qc-opt.wide{border-top:var(--hair) solid var(--line-2);margin-top:var(--s-2)}

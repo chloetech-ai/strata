@@ -71,6 +71,7 @@ useStyle("rules-suggest", `
 .gs-title{margin:var(--s-1) 0 0;font:var(--w-title) var(--fs-lg)/var(--lh-lg) var(--sans);letter-spacing:var(--track-md)}
 .gs-bd{padding:var(--s-3) var(--s-5) var(--s-4);display:flex;flex-direction:column;gap:var(--s-4)}
 .gs-rule{padding:var(--s-3);border-radius:var(--r-sm);background:var(--well);font:var(--w-mid) var(--fs-md)/var(--lh-md) var(--mono);overflow-wrap:anywhere}
+.gs-cmd1,.gs-cmd .qc-cmd{margin:0;max-height:240px;overflow:auto}.gs-cmd summary{cursor:pointer;color:var(--text-2);font-size:var(--fs-sm)}.gs-cmd summary code{color:var(--text)}
 .gs .kv{margin:0}
 .gs .kv dd code{font-family:var(--mono);font-size:var(--fs-sm);overflow-wrap:anywhere}
 .gs-wide{padding:var(--s-2) var(--s-3);border-radius:var(--r-sm);background:var(--warn-soft);color:var(--warn-ink);font-size:var(--fs-sm);line-height:var(--lh-sm)}
@@ -187,7 +188,10 @@ export function grantSheet(ctx, opts = {}) {
         h("dt", {}, "Written to"), h("dd", {}, file ? h("code", {}, file) : "the agent's settings"),
         h("dt", {}, "Lasts"), h("dd", {}, lasting ? "until you revoke it (More › Rules)" : "this session only"),
         agentRow ? [h("dt", {}, "Agent"), h("dd", {}, agentRow.name)] : null,
-        command ? [h("dt", {}, "Asked for"), h("dd", {}, h("code", {}, command.split("\n")[0]))] : null),
+        // The whole command (Maya saw line 1 of 2): folded with its count when long.
+        command ? [h("dt", {}, "Asked for"), h("dd", {}, command.split("\n").length > 3
+          ? h("details", { class: "gs-cmd" }, h("summary", {}, h("code", {}, command.split("\n")[0]), ` … ${command.split("\n").length} lines, show all`), h("pre", { class: "qc-cmd" }, command))
+          : h("pre", { class: "qc-cmd gs-cmd1" }, command))] : null),
       info, err,
     ];
     const scrim = sheetFrame({ kicker: "Check before granting", title: opts.title || "This answer writes a rule", body, foot: [cancelBtn, confirmBtn], onClose: cancel });

@@ -4,7 +4,7 @@
 // every page shares: the grant sheet (a wide "don't ask again" answer,
 // agent P's), the batch answer, the keys. One count of what needs you, one count of
 // agents and one set of words for their groups, used on every page.
-import { h, useStyle, avatar, icon, kc, label, btn, stateDot, since, questionCard, optionsOf, parseJSON, GROUP_WORDS, toMs } from "/levels/common.js";
+import { h, useStyle, avatar, icon, kc, label, btn, stateDot, since, questionCard, optionsOf, parseJSON, GROUP_WORDS, toMs, isWide } from "/levels/common.js";
 import * as rules from "/goals/rules-suggest.js";
 
 const $ = (id) => document.getElementById(id);
@@ -116,6 +116,7 @@ export function update() {
   $("agents-lb").textContent = `${active} agent${active === 1 ? "" : "s"}${c.finished ? ` · ${c.finished} done` : ""}`;
   $("agents-btn").title = `${fleetWords(list)} (a)`;
   setCrumbs(O.crumbs);
+  if (GRANTS.size) closeStaleGrants();
   // An open drawer or switcher is drawn again only when what it lists
   // changed, so a card's pick and the focus stay put.
   const key = drawnKey(O.open);
@@ -176,7 +177,7 @@ function drawDrawer() {
         btn("Inbox", { href: "#/needs", ghost: true, sm: true }), btn("", { icon: "x", ghost: true, sm: true, title: "Close (Esc)", onclick: close })),
       body,
       h("div", { class: "dr-foot" },
-        h("span", {}, "Oldest first. ", kc("j"), kc("k"), " move, a digit then ", kc("↵"), " answers, ", kc("x"), " selects, ", kc("⇧1"), " answers the selected alike."),
+        h("span", {}, "Oldest first. ", kc("j"), kc("k"), " move, a digit then ", kc("↵"), " answers, ", kc("e"), " shows a long command, ", kc("x"), " selects, ", kc("⇧1"), " answers the selected alike (identical commands only)."),
         p ? h("a", { class: "lv-link", href: `#/p/${p.project}`, onclick: close }, "Everything since you left →") : null)));
 }
 
@@ -233,6 +234,13 @@ function drawMore() {
  *  prompt, an agent waiting with no question read yet, or an alert. */
 export function needCard(it, { big = false } = {}) {
   if (it.kind === "alert") return alertCard(it);
+  if (it.kind === "waiting" && it.asked) {
+    // Its turn ended with a question to you: answered in words, with Tell.
+    return h("div", { class: "wait-card", tabindex: "0", "data-need": it.id },
+      avatar(it.agent, 22),
+      h("div", { class: "tx" }, h("b", {}, `${it.agent.name} asks you`), h("span", {}, it.text), " ", h("span", { class: "num" }, since(it.since_ms))),
+      btn("Answer it", { sm: true, href: `#/a/${it.agent.id}` }));
+  }
   if (it.kind === "waiting") {
     return h("div", { class: "wait-card", tabindex: "0", "data-need": it.id },
       avatar(it.agent, 22),
@@ -307,10 +315,28 @@ export function closeSheet() { const s = document.querySelector(".gs-ov"); if (s
  *  before a wide answer is typed, the exact rule, the file it lands in,
  *  what else it would have allowed, and the narrower choice. It answers the
  *  question itself on Confirm; this says what was sent and clears the card. */
+// One grant sheet per question: a second click focuses the open one, and
+// the sheet goes when its question is answered or gone (Maya: a stale
+// second check could have typed "2" into the next prompt).
+const GRANTS = new Map(); // question id -> the sheet's scrim
+function closeStaleGrants() {
+  const open = new Set(A.needs().items.map((it) => it.question && it.question.id).filter(Boolean));
+  for (const [qid, scrim] of GRANTS) {
+    if (!scrim.isConnected) { GRANTS.delete(qid); continue; }
+    if (!open.has(qid)) { const c = [...scrim.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel"); if (c) c.click(); else scrim.remove(); GRANTS.delete(qid); }
+  }
+}
 export async function grantSheet(it, i, o) {
+  const qid = it.question && it.question.id;
+  const had = GRANTS.get(qid);
+  if (had && had.isConnected) { (had.querySelector(".btn") || had).focus(); return; }
   const ctx = { api: A.api, get state() { return { agents: A.agents() }; }, project: it.repo ? { path: it.repo } : A.project(), go: (to) => { location.hash = to; } };
   let r;
-  try { r = await rules.grantSheet(ctx, { question: it.question, option: i, agent: it.agent, repo: it.repo }); } catch (e) { A.toast(`The check did not open: ${e.message}`, true); return; }
+  const before = new Set(document.querySelectorAll(".gs-scrim"));
+  const p = rules.grantSheet(ctx, { question: it.question, option: i, agent: it.agent, repo: it.repo });
+  const scrim = [...document.querySelectorAll(".gs-scrim")].find((x) => !before.has(x));
+  if (scrim && qid) GRANTS.set(qid, scrim);
+  try { r = await p; } catch (e) { A.toast(`The check did not open: ${e.message}`, true); return; } finally { if (GRANTS.get(qid) === scrim) GRANTS.delete(qid); }
   const who = it.agent ? it.agent.name : "the agent";
   if (r.choice === "confirm") { A.toast(`Sent “${o.n} ${o.label}” to ${who}${r.pattern ? `: ${r.pattern} is written` : ""}`); A.answered(it.id); }
   else if (r.choice === "narrow") { A.toast(`Allowed ${who} this once, and wrote ${r.pattern} for this project's new agents`); A.answered(it.id); }
@@ -324,12 +350,12 @@ export function batchAnswer(n) {
   const cmd = (it) => it.question && (parseJSON(it.question.detail, {}) || {}).command;
   const first = cmd(items[0]);
   if (!first || items.some((it) => it.kind !== "question" || it.question.kind !== "permission" || cmd(it) !== first)) {
-    A.toast("Only cards that run the identical command can be answered together", true);
+    A.toast("These run different commands, so one answer cannot be given for all: answer them card by card. To stop prompts for a kind of command (reads, the tests), add a rule in More › Rules.", true);
     return;
   }
   const picks = items.map((it) => { const opts = optionsOf(it.question); const k = opts.findIndex((o) => String(o.n) === String(n)); return [it, k, opts[k]]; });
   if (picks.some(([, k, o]) => k < 0 || !o)) { A.toast(`Not every selected prompt has an option ${n}`, true); return; }
-  if (picks.some(([, , o]) => o.grants)) { A.toast(`Option ${n} grants more than one call: answer it card by card, through its check`, true); return; }
+  if (picks.some(([, , o]) => isWide(o))) { A.toast(`Option ${n} grants more than one call: answer it card by card, through its check`, true); return; }
   const names = items.map((it) => it.agent ? it.agent.name : "?");
   sheet({
     kicker: `${items.length} agents ask the same`, title: `Answer “${picks[0][2].label}” on all ${items.length}?`,
@@ -353,7 +379,11 @@ export function toggleSelect(card) {
   if (!id) return;
   if (O.sel.has(id)) O.sel.delete(id); else O.sel.add(id);
   card.classList.toggle("picked", O.sel.has(id));
-  A.toast(`${O.sel.size} selected: ⇧ and an option's number answers them alike`);
+  // Say before the attempt whether a batch answer can apply: identical commands only.
+  const cmds = new Set(A.needs().items.filter((it) => O.sel.has(it.id)).map((it) => (it.question && (parseJSON(it.question.detail, {}) || {}).command) || `?${it.id}`));
+  A.toast(O.sel.size < 2 ? "1 selected: select the other cards that run the same command, then ⇧ and an option's number"
+    : cmds.size === 1 ? `${O.sel.size} selected, all the same command: ⇧ and an option's number answers them alike`
+    : `${O.sel.size} selected, but they run ${cmds.size} different commands: a batch answer needs the identical command. For a kind of command, add a rule (More › Rules).`, cmds.size > 1);
 }
 
 export const KEYS = [

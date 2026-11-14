@@ -605,7 +605,7 @@ export function mount(root, ctx) {
   function emptyState() {
     return h("div", { class: "tr-start" },
       h("p", { class: "tr-mut" }, "Name what changed in your words: quoted text, an identifier, a file, “from x to y”. Trace reads the question without a model, searches git on every branch (agents' wb/* too), Workbench's events and ChloeCtx, and lays out where it happened."),
-      h("div", { class: "tr-ex" }, EXAMPLES.map((q) => h("button", { class: "tr-ex-b", type: "button", onclick: () => { S.q = q; S.over = null; run(); } }, svg(I.search), q))));
+      h("div", { class: "tr-ex" }, (S.examples || EXAMPLES).map((q) => h("button", { class: "tr-ex-b", type: "button", onclick: () => { S.q = q; S.over = null; run(); } }, svg(I.search), q))));
   }
 
   function loading() {
@@ -649,6 +649,8 @@ export function mount(root, ctx) {
   render();
   if (S.q.trim()) run({ keepHash: true });
   else queueMicrotask(() => el.querySelector(".tr-q")?.focus());
+  // Examples made of this repository's own files and commits.
+  ctx.api(`/api/trace/examples${S.repo ? `?repo=${enc(S.repo)}` : ""}`).then((r) => { if (alive && r && (r.examples || []).length) { S.examples = r.examples; const ex = el.querySelector(".tr-ex"); if (ex) ex.replaceChildren(...S.examples.map((q) => h("button", { class: "tr-ex-b", type: "button", onclick: () => { S.q = q; S.over = null; run(); } }, svg(I.search), q))); } }).catch(() => {});
 
   return {
     update(state) { if (state && state.agents) setFleet(state.agents); },

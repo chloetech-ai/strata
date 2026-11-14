@@ -57,6 +57,17 @@ pub fn needs(sup: &Arc<Supervisor>, lv: &Arc<Levels>, repo: Option<&str>) -> Jso
         let Some(a) = sup.agent_json_of(&row.id) else { continue };
         agent_items.push((row.state_since, json!({ "kind": "waiting", "id": format!("w-{}", row.id), "repo": row.repo, "since_ms": row.state_since, "agent": a, "text": row.waiting_for })));
     }
+    // Idle at its prompt after a turn that ended by asking you something
+    // ("Should I also update the README?"): that needs you too (Priya: such
+    // an agent sat under Ready while it waited for her).
+    for row in sup.agent_rows() {
+        if row.state != "idle" || asked.contains(&row.id) || !sup.is_running(&row.id) || !keep(&row.repo) {
+            continue;
+        }
+        let Some(q) = asked_at_end(sup, &row.id, row.state_since) else { continue };
+        let Some(a) = sup.agent_json_of(&row.id) else { continue };
+        agent_items.push((row.state_since, json!({ "kind": "waiting", "asked": true, "id": format!("q-{}", row.id), "repo": row.repo, "since_ms": row.state_since, "agent": a, "text": q })));
+    }
     agent_items.sort_by_key(|(t, _)| *t);
     let mut alert_items: Vec<(i64, Json)> = Vec::new();
     let inc = crate::alerts::list(sup, None, Some("open"));
@@ -80,6 +91,33 @@ pub fn needs(sup: &Arc<Supervisor>, lv: &Arc<Levels>, repo: Option<&str>) -> Jso
     json!({ "count": items.len(), "items": items, "by_repo": by_repo })
 }
 
+/// The question an agent's last turn ended with, when its last message's
+/// last sentence asks one and nothing was said to it since (`idle_since`:
+/// when it went idle).
+fn asked_at_end(sup: &Supervisor, agent: &str, idle_since: i64) -> Option<String> {
+    let p = chloedb::query::Params::new().set("agent", chloedb::Value::Str(agent.to_string()));
+    let rows = sup.db().query("SELECT ts, kind, data FROM events WHERE agent = :agent AND (kind = 'Stop' OR kind = 'UserPromptSubmit' OR kind = 'steer') ORDER BY seq DESC LIMIT 1", &p).ok()?;
+    let r = rows.first()?;
+    if crate::db::get_str(&r[1]).as_deref() != Some("Stop") || crate::db::get_ms(&r[0]).unwrap_or(0) + 600_000 < idle_since {
+        return None;
+    }
+    let d: Json = serde_json::from_str(&crate::db::get_str(&r[2])?).ok()?;
+    last_question(d["last_assistant_message"].as_str()?)
+}
+
+/// The last sentence of a message, when it is a question to you.
+pub fn last_question(msg: &str) -> Option<String> {
+    let last = msg.trim().lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("```")).last()?;
+    let last = last.trim_start_matches(['-', '*', '>', ' ']).trim_end_matches(['*', '_', ' ']).trim();
+    if !last.ends_with('?') {
+        return None;
+    }
+    // The sentence the question mark ends.
+    let start = last[..last.len() - 1].rfind(['.', '!', '?']).map_or(0, |i| i + 1);
+    let q = last[start..].trim();
+    (q.split_whitespace().count() >= 3).then(|| crate::supervisor::one_line(q, 200))
+}
+
 #[derive(Deserialize)]
 struct NeedsQ {
     repo: Option<String>,
@@ -96,4 +134,18 @@ async fn needs_route(State(app): State<App>, Query(q): Query<NeedsQ>) -> ApiResu
     })
     .await?;
     Ok(AxJson(v).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_that_ends_with_a_question_is_found() {
+        assert_eq!(last_question("Done: the totals round half up.\n\nShould I also update the README?").as_deref(), Some("Should I also update the README?"));
+        assert_eq!(last_question("I fixed it. Want me to push it to main?").as_deref(), Some("Want me to push it to main?"));
+        assert_eq!(last_question("All tests pass."), None);
+        assert_eq!(last_question("Why? Because the tax rounds first. Done."), None);
+        assert_eq!(last_question("Ok?"), None);
+    }
 }

@@ -248,7 +248,7 @@ pub enum PlanMode {
 #[serde(untagged)]
 pub enum OutcomeSpec {
     Title(String),
-    Full { title: String, detail: Option<String>, task: Option<String>, after: Option<usize> },
+    Full { title: String, detail: Option<String>, task: Option<String>, after: Option<usize>, model: Option<String> },
 }
 
 impl OutcomeSpec {
@@ -358,6 +358,16 @@ pub fn create(sup: &Arc<Supervisor>, lv: &Levels, b: GoalBody) -> Result<Json, A
     // A part that waits for another (the draft plan's `after`): by index
     // among the outcomes that have a title.
     let afters: Vec<Option<usize>> = given.iter().filter(|o| !o.parts().0.is_empty()).map(|o| match o { OutcomeSpec::Full { after, .. } => *after, _ => None }).collect();
+    // A part's own model (the plan's chip), else the goal's (Dev: the
+    // model picked on the form was not the one that ran).
+    let models: Vec<Option<String>> = given
+        .iter()
+        .filter(|o| !o.parts().0.is_empty())
+        .map(|o| match o {
+            OutcomeSpec::Full { model: Some(m), .. } if !m.trim().is_empty() && m.trim() != "default" => Some(m.trim().to_string()),
+            _ => None,
+        })
+        .collect();
     let specs: Vec<(String, Option<String>, Option<String>)> = given.iter().map(OutcomeSpec::parts).filter(|o| !o.0.is_empty()).collect();
     let attach: Vec<String> = b.agents.unwrap_or_default().into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
     let plan = match &b.plan {
@@ -427,7 +437,7 @@ pub fn create(sup: &Arc<Supervisor>, lv: &Levels, b: GoalBody) -> Result<Json, A
             task: Some(outcome_task(&g, title, detail.as_deref(), task.as_deref())),
             name: Some(name),
             worktree: b.worktree,
-            model: model.clone(),
+            model: models.get(k).cloned().flatten().or_else(|| model.clone()),
             effort: effort.clone(),
             outcome: Some(oid),
             ..SpawnRequest::default()

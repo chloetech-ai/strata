@@ -72,7 +72,7 @@ pub fn with_allowed(mut settings: Json, allow: &[String]) -> Json {
 
 /// The test runners an agent of a worktree runs without asking: Claude
 /// Code's `Bash(<prefix>:*)` rules.
-const TEST_PREFIXES: [&str; 30] = [
+pub(crate) const TEST_PREFIXES: [&str; 30] = [
     "cargo test", "cargo nextest", "pytest", "py.test", "python -m pytest", "python3 -m pytest", "npm test", "npm run test", "yarn test", "pnpm test", "bun test", "deno test",
     "go test", "jest", "vitest", "npx jest", "npx vitest", "mvn test", "./gradlew test", "gradle test", "make test", "make check", "rspec", "bundle exec rspec", "phpunit", "ctest",
     "tox", "mix test", "dotnet test", "uv run pytest",

@@ -1087,7 +1087,69 @@ fn why_maps_chloectxs_blame_to_the_agent_its_lineage_and_its_rewind() {
     assert_eq!(v["answer"], "Because the lead decided so");
     assert_eq!(v["agents"][format!("{sid8}:9")]["id"], json!(cid));
     assert!(v["agents"].get("old0000:31").is_none());
+    // And for a person: the records that share the question's words, each
+    // with who said it, a sentence first, the time in whole milliseconds,
+    // and never the raw context or "null".
+    let mem = v["memory"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert!(mem.iter().any(|m| m["text"] == "Round half up for totals" && m["agent"]["id"] == json!(cid) && m["id"] == json!(format!("{sid8}:9"))), "{v}");
+    assert!(mem.iter().all(|m| m["who"].is_string() && m["what"].is_string()), "{v}");
+    assert!(v["summary"].as_str().is_some_and(|t| !t.is_empty() && !t.contains("null") && !t.starts_with("Notes from earlier sessions")), "{v}");
+    assert!(v["took_ms"].is_u64(), "{v}");
+    assert!(v["code"].is_array() && v["history"]["commits"].is_array(), "{v}");
     assert_eq!(s.post("/api/ask", json!({ "repo": r, "question": " " })).0, 400);
+}
+
+#[test]
+fn a_turn_that_ends_by_asking_you_needs_you_and_trace_offers_this_repos_questions() {
+    let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
+    let (_d, r) = repo();
+    std::fs::write(r.join("money.py"), "def to_cents(x):\n    return round(x * 100)\n").unwrap();
+    git(&r, &["add", "money.py"]);
+    git(&r, &["commit", "-q", "-m", "Round totals half up in money.py"]);
+    let a = s.spawn(json!({ "repo": r, "name": "asker", "task": "say hi" }));
+    let id = a["id"].as_str().unwrap().to_string();
+    s.wait(&id, "idle");
+    assert_eq!(s.get("/api/needs").1["count"], 0);
+    hook_as(&s, &id, json!({ "hook_event_name": "Stop", "last_assistant_message": "The totals round half up now.\n\nShould I also update the README?" }));
+    let n = s.get_until("/api/needs", "the question at the end of the turn", |v| v["count"] == 1);
+    let it = &n["items"][0];
+    assert_eq!((it["kind"].as_str(), it["asked"].as_bool(), it["text"].as_str()), (Some("waiting"), Some(true), Some("Should I also update the README?")), "{n}");
+    // Told something since: it no longer waits on you.
+    hook_as(&s, &id, json!({ "hook_event_name": "UserPromptSubmit", "prompt": "no, leave it" }));
+    s.get_until("/api/needs", "nothing after the answer", |v| v["count"] == 0);
+
+    // Trace's examples are this repository's files and commits.
+    let (status, e) = s.get(&format!("/api/trace/examples?repo={}", r.display()));
+    assert_eq!(status, 200, "{e}");
+    let ex: Vec<&str> = e["examples"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+    assert!(ex.iter().any(|x| x.contains("money.py")), "{e}");
+    assert!(ex.iter().any(|x| x.contains("round totals half up")), "{e}");
+    assert!(!ex.iter().any(|x| x.contains("cart")), "{e}");
+}
+
+#[test]
+fn why_finds_an_edit_an_agent_made_with_a_shell_command() {
+    // Priya: the agent rewrote cart.py with a heredoc, and Why? said there
+    // was no record of it.
+    let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "name": "shelly", "task": "say hi" }));
+    let id = a["id"].as_str().unwrap().to_string();
+    s.wait(&id, "idle");
+    let cwd = PathBuf::from(a["cwd"].as_str().unwrap());
+    let cmd = "cat > cart.py <<'EOF'\ndef total(c):\n    return round(c, 2)\nEOF";
+    std::fs::write(cwd.join("cart.py"), "def total(c):\n    return round(c, 2)\n").unwrap();
+    bash_as(&s, &id, "toolu_sh1", cmd, "", false);
+    let (status, w) = s.get(&format!("/api/why?agent={id}&path=cart.py&line=2"));
+    assert_eq!(status, 200, "{w}");
+    assert_eq!(w["who"]["agent"]["id"], json!(id), "{w}");
+    assert_eq!(w["when"]["tool"], "Bash", "{w}");
+    assert!(w["when"]["command"].as_str().unwrap().contains("cat > cart.py"), "{w}");
+    let missing = w["missing"].as_array().unwrap();
+    assert!(!missing.iter().any(|m| m.as_str().unwrap().contains("no record of an edit")), "{w}");
+    // A line of the main checkout, with no agent named: git answers.
+    let (status, w) = s.get(&format!("/api/why?repo={}&path=README&line=1", r.display()));
+    assert_eq!((status, w["found"].as_str()), (200, Some("git")), "{w}");
 }
 
 #[test]
@@ -1482,6 +1544,9 @@ fn permission_prompts_are_questions_and_steers_reach_the_agent() {
     let (status, v) = s.post(&format!("/api/agents/{id}/steer"), json!({ "text": "also check the docs" }));
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["delivered"], "queued");
+    // It says so, and that nothing was typed into the prompt it shows.
+    let m = v["message"].as_str().unwrap();
+    assert!(m.starts_with("Queued:") && m.contains("nothing was typed"), "{v}");
     // A permission question is answered by choosing its option on the screen.
     let (status, v) = s.post(&format!("/api/questions/{qid}/answer"), json!({ "option": 0 }));
     assert_eq!(status, 200, "{v}");
@@ -1794,6 +1859,12 @@ fn the_digest_tells_what_happened_since_you_last_looked() {
 fn away_counts_from_the_first_agent_says_who_was_blocked_and_marks_stepping_away() {
     let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
     let (_d, r) = repo();
+    // A first look at a project nothing has run in: no window, not "24 h".
+    let (status, d) = s.get(&format!("/api/digest?repo={}", r.display()));
+    assert_eq!(status, 200, "{d}");
+    assert_eq!(d["mode"], "first", "{d}");
+    assert!(d["away_ms"].as_i64().unwrap() < 60_000, "{d}");
+    assert!(d["merged"].as_array().is_some_and(|m| m.is_empty()) && d["ended"].is_array(), "{d}");
     let a = s.spawn(json!({ "repo": r, "name": "rounding", "task": "ASK first", "worktree": false }));
     let id = a["id"].as_str().unwrap().to_string();
     s.wait(&id, "waiting");
@@ -3031,6 +3102,36 @@ fn pre_bash(s: &Server, token: &str, id: &str, cmd: &str) -> Value {
     let (status, v) = call_as(s, "POST", "/api/hook", token, Some(id), Some(json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": cmd }, "session_id": "s" })));
     assert_eq!(status, 200, "{v}");
     v["output"].clone()
+}
+
+#[test]
+fn the_edit_and_test_profile_lets_reads_and_test_loops_run_without_asking() {
+    // Dev's treadmill: `ls; git log`, a loop over pytest and `-k "not …"`
+    // each stopped three agents that were told they could run the tests.
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "name": "prof", "task": "say hi" }));
+    let id = a["id"].as_str().unwrap().to_string();
+    s.wait(&id, "idle");
+    let key = agent_token(&s, &id);
+    for cmd in ["ls; git log --oneline | head -5", "for i in $(seq 1 5); do python3 -m pytest -q -k \"not promo_window\"; done", "cat cart.py && grep -n total *.py", "git status && git diff --stat"] {
+        let out = pre_bash(&s, &key, &id, cmd);
+        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "allow", "{cmd}: {out}");
+    }
+    for cmd in ["curl https://example.com", "rm -f cart.py", "python3 - <<EOF\nopen('cart.py','w')\nEOF", "git push origin wb/prof", "sudo ls"] {
+        let out = pre_bash(&s, &key, &id, cmd);
+        assert_ne!(out["hookSpecificOutput"]["permissionDecision"], "allow", "{cmd}: {out}");
+    }
+    // It was told to edit with Edit and Write, so its edits are its own.
+    let ev = s.events(&id);
+    assert!(ev.iter().any(|e| e["kind"] == "SessionStart"), "{ev:?}");
+
+    // Started with "Ask before edits": the profile is not its own.
+    let b = s.spawn(json!({ "repo": r, "name": "asks", "task": "say hi", "ask_edits": true }));
+    let bid = b["id"].as_str().unwrap().to_string();
+    s.wait(&bid, "idle");
+    let bkey = agent_token(&s, &bid);
+    assert_ne!(pre_bash(&s, &bkey, &bid, "ls; git log --oneline")["hookSpecificOutput"]["permissionDecision"], "allow");
 }
 
 #[test]
@@ -4797,7 +4898,9 @@ fn read_only_agents_and_path_guards_refuse_changes() {
     assert!(denied(&pre_tool(&s, &wt, &wid, "Write", json!({ "file_path": format!("{wcwd}/migrations/0002_cents.sql") }))).contains("migrations/**"));
     assert_eq!(pre_tool(&s, &wt, &wid, "Edit", json!({ "file_path": format!("{wcwd}/cart.py") })), Value::Null);
     assert!(denied(&pre_bash(&s, &wt, &wid, "sed -i 's/floor/round/' money.py")).contains("path guard"));
-    assert_eq!(pre_bash(&s, &wt, &wid, "cat money.py && pytest -q tests/test_cart.py"), Value::Null);
+    // Reading a guarded file is fine, and with the tests it is what the
+    // edit-and-test profile lets run without asking.
+    assert_eq!(pre_bash(&s, &wt, &wid, "cat money.py && pytest -q tests/test_cart.py")["hookSpecificOutput"]["permissionDecision"], "allow");
 }
 
 #[cfg(target_os = "linux")]

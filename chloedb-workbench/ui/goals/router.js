@@ -51,7 +51,9 @@ export function resolve(hash, { project = null, agentIds = [] } = {}) {
       return { page: "more", item: null, query };
     // Today's routes, for a release (JOURNEYS.md, "URL routes").
     case "mission": return { redirect: P("/change") };
-    case "decide": case "away": case "catchup": return { redirect: P() };
+    // Decide's rules and guarded paths live under More › Rules now.
+    case "decide": case "rules": case "guarded": return { redirect: "#/more/rules" };
+    case "away": case "catchup": return { redirect: P() };
     case "trace": case "why": return { redirect: `#/debug/code${q}` };
     case "map": return { redirect: P("/understand") };
     case "story": return { redirect: b ? `#/a/${b}` : P() };

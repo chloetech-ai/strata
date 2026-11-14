@@ -10,7 +10,7 @@ import { openWith, tintLine, marksOf, icon, pathNode, queryWords } from "./libra
 // Sixth build: no repository yet is a picker in the box, not an error (ui/levels/repos.js).
 import { repoPicker, needsRepo } from "./repos.js";
 
-const SCOPES = [["all", "All"], ["code", "Code"], ["docs", "Docs"], ["decisions", "Decisions"]];
+const SCOPES = [["all", "All"], ["code", "Code"], ["docs", "Docs"], ["decisions", "Decisions"], ["history", "History"]];
 const nameOf = (a) => (a && (a.name || a.id)) || "?";
 const hostOf = (u) => { try { return new URL(u).host; } catch { return u; } };
 const pathOfUrl = (u) => { try { return new URL(u).pathname; } catch { return ""; } };
@@ -33,7 +33,8 @@ export function open(ctx, { q } = {}) {
   const S = { q: q ?? last.q, scope: last.scope, data: null, err: null, busy: false, sel: 0 };
   const input = h("input", { type: "search", placeholder: "Search code, docs and decisions…", value: S.q, "aria-label": "Search", spellcheck: "false", autocomplete: "off",
     oninput: () => { S.q = input.value; S.sel = 0; soon(); } });
-  import("./complete.js").then((m) => m.attachComplete(input, { field: "quick", ctx, repo: () => (ctx.repo && ctx.repo()) || "", onGo: (hash) => { close(); ctx.go(hash); } })).catch(() => {}); // Fifth build: autocomplete
+  // No completion list here: the results below are the list (Lee and Priya: a
+  // dropdown covered them, Tab only added a badge, Esc took the focus away).
   const scopes = h("div", { class: "qs-scopes", role: "tablist" });
   const list = h("div", { class: "qs-list", role: "listbox" });
   const foot = h("div", { class: "qs-foot" },
@@ -41,7 +42,7 @@ export function open(ctx, { q } = {}) {
     h("span", null, h("kbd", null, "⇧"), h("kbd", null, "Enter"), " why"), h("span", null, h("kbd", null, "Tab"), " scope"),
     h("span", null, h("kbd", null, "Esc"), " close"),
     h("button", { class: "lv-link qs-lib", onclick: () => { openWith({ tab: "code", q: S.q }); close(); ctx.go("#/library/code"); } }, "Open Library →"));
-  const panel = h("div", { class: "qs-panel", role: "dialog", "aria-label": "Quick search" },
+  const panel = h("div", { class: "qs-panel", role: "dialog", "aria-modal": "true", "aria-label": "Quick search" },
     h("div", { class: "qs-in" }, icon("search"), input, h("span", { class: "qs-spin" }), h("kbd", null, "Esc")), scopes, list, foot);
   const back = h("div", { class: "qs-back", onmousedown: (e) => { if (e.target === back) close(); } }, panel);
   document.body.append(back);
@@ -69,6 +70,8 @@ export function open(ctx, { q } = {}) {
     if (S.scope === "all" || S.scope === "code") for (const c of (d.code || []).slice(0, S.scope === "all" ? 5 : 12)) out.push({ kind: "code", c });
     if (S.scope === "all" || S.scope === "docs") for (const p of (d.docs || []).slice(0, S.scope === "all" ? 4 : 12)) out.push({ kind: "docs", p });
     if (S.scope === "all" || S.scope === "decisions") for (const x of (d.decisions || []).slice(0, S.scope === "all" ? 4 : 12)) out.push({ kind: "decisions", x });
+    // The commits: Trace reads git for the words (Priya: search had no history).
+    if ((S.scope === "all" || S.scope === "history") && S.q.trim()) out.push({ kind: "history" });
     return out;
   }
 
@@ -121,6 +124,12 @@ export function open(ctx, { q } = {}) {
           h("div", { class: "qs-sub" }, (p.text || "").slice(0, 150))),
         h("span", { class: "qs-kind" }, p.library?.name || "docs"));
     }
+    if (it.kind === "history") {
+      return h("div", attrs, h("span", { class: "qs-ic code" }, icon("refresh", "i sm")),
+        h("div", { class: "qs-main" }, h("div", { class: "qs-t" }, h("b", null, `Trace “${S.q.trim()}” through git`)),
+          h("div", { class: "qs-sub" }, "The commits on every branch that changed it, with when, who and why.")),
+        h("span", { class: "qs-kind" }, "commits"));
+    }
     const x = it.x;
     return h("div", attrs, h("span", { class: "qs-ic dec" }, h("i")),
       h("div", { class: "qs-main" }, h("div", { class: "qs-t qs-dec" }, x.text),
@@ -137,6 +146,10 @@ export function open(ctx, { q } = {}) {
       ctx.go("#/library/code");
     } else if (it.kind === "docs") {
       window.open(it.p.url, "_blank", "noopener,noreferrer");
+    } else if (it.kind === "history") {
+      const q = S.q.trim();
+      close();
+      ctx.go(`#/debug/code?q=${encodeURIComponent(q)}`);
     } else {
       close();
       if (it.x.agent) ctx.go(`#/story/${it.x.agent.id}`);
@@ -218,5 +231,5 @@ useStyle("quicksearch", `
 .qs-foot{display:flex;align-items:center;gap:14px;padding:8px 14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);background:var(--surface-2);flex-wrap:wrap}
 .qs-foot span{display:inline-flex;align-items:center;gap:3px}
 .qs-lib{margin-left:auto;font-size:12px}
-@media (max-width:640px){.qs-back{padding-top:12px}.qs-foot span{display:none}}
+@media (max-width:640px){.qs-back{padding-top:12px}.qs-foot span,.qs-in kbd{display:none}}
 `);

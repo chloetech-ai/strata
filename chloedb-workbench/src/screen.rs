@@ -784,7 +784,8 @@ fn clean_label(l: &str) -> String {
 /// How much an option grants beyond this one call, in a few words, or
 /// `None` for a plain yes or no.
 pub fn grants_more(label: &str) -> Option<&'static str> {
-    let l = label.to_lowercase();
+    // Claude Code prints "don’t" with a curly apostrophe: read it as "don't".
+    let l = label.to_lowercase().replace(['\u{2019}', '\u{2018}'], "'");
     if !l.starts_with("yes") {
         return None;
     }
@@ -884,6 +885,8 @@ Enter to confirm · Esc to cancel";
         assert_eq!(m.footer, "Esc to cancel · Tab to amend");
         assert!(grants_more(&m.options[2].label).unwrap().contains("auto mode"));
         assert!(grants_more(&m.options[1].label).unwrap().contains("asking again"));
+        // As Claude Code prints it, with a curly apostrophe (Maya's grant went through unchecked).
+        assert!(grants_more("Yes, and don\u{2019}t ask again for: python3 -c '*'").unwrap().contains("asking again"));
         assert_eq!(grants_more("Yes"), None);
         assert_eq!(grants_more("No"), None);
 

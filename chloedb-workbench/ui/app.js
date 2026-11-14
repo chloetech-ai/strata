@@ -10,6 +10,7 @@
 import { resolve } from "/goals/router.js";
 import * as Shell from "/goals/shell.js";
 import * as AG from "/goals/agent.js";
+import { kc } from "/levels/common.js";
 
 const TOKEN_KEY = "chloedb-workbench-token";
 const REPO_KEY = "chloedb-workbench-repo";
@@ -966,17 +967,45 @@ function setTab(tab, { focus = false } = {}) {
   }
 }
 
-/** "Tell X…": a sentence typed into its terminal, with Enter. */
+/** "Tell X…", the one way to talk to an agent (the story's second box is
+ *  gone): your words exactly as written, through POST /steer, which never
+ *  types into an open 1/2/3 menu. An agent at its prompt gets them typed
+ *  as its next instruction; a working one, or one showing a menu, at its
+ *  next tool call. The sheet closes on Send and says which. */
 function tellSheet(a) {
-  const box = h("textarea", { class: "field", rows: 3, placeholder: `What should ${nameOf(a)} do next?`, "aria-label": `Tell ${nameOf(a)}` });
+  const asking = N.items.some((i) => i.agent && i.agent.id === a.id && i.kind !== "alert") || a.state === "waiting";
+  const box = h("textarea", { class: "field", rows: 3, placeholder: `What should ${nameOf(a)} do next? Your words go exactly as written.`, "aria-label": `Tell ${nameOf(a)}` });
+  const sendBtn = h("button", { class: "btn primary", type: "button", disabled: true }, "Send");
+  const how = asking
+    ? h("div", { class: "callout warn tell-q" }, icon("warn", "i"), h("div", null, h("b", { text: `${nameOf(a)} is asking you something now.` }),
+      h("p", { text: "Nothing is typed into that prompt, where a key would pick an option: your words are queued, and it gets them at its next tool call, once the prompt is answered. Answer its question on the page first." })))
+    : h("p", { class: "muted", text: a.state === "idle" ? "Typed into its prompt as its next instruction." : "It is working: it gets this at its next tool call, or as its next prompt when this turn ends." });
+  let busy = false;
+  // "From now on…", "always", "never": also a rule for every agent of the
+  // project, if you leave it ticked (Dev: his "from now on" became nothing).
+  const ruleTick = h("input", { type: "checkbox", checked: true });
+  const ruleRow = h("label", { class: "tell-rule", hidden: true }, ruleTick, " ", h("span", {}, h("b", {}, "Also make it a rule"), " Every agent of this project is told it, from its next start."));
+  const standing = (t) => /^(from now on|always|never|by default|going forward)\b/i.test(t.trim());
   const send = async (done) => {
     const text = box.value.trim();
-    if (!text) { box.focus(); return; }
-    try { await api(`/api/agents/${encodeURIComponent(a.id)}/input`, { method: "POST", body: { text, enter: true } }); toast(`Sent to ${nameOf(a)}`); noteActive(); done(); }
-    catch (e) { toast(`Not sent: ${e.message}`, true); }
+    if (!text || busy) { box.focus(); return; }
+    busy = true; sendBtn.disabled = true; sendBtn.textContent = "Sending…";
+    try {
+      const r = await api(`/api/agents/${encodeURIComponent(a.id)}/steer`, { method: "POST", body: { text } });
+      let ruled = "";
+      if (standing(text) && ruleTick.checked) {
+        try { await api("/api/rules", { method: "POST", body: { repo: a.repo, text } }); ruled = " It is a rule now too: More › Rules."; }
+        catch (e) { ruled = ` The rule was not made: ${e.message}.`; }
+      }
+      done();
+      noteActive();
+      toast((r && r.message ? r.message : r && r.delivered === "typed" ? `Typed into ${nameOf(a)}'s prompt.` : `Queued: ${nameOf(a)} gets it at its next tool call.`) + ruled);
+    } catch (e) { toast(`Not sent: ${e.message}`, true); busy = false; sendBtn.disabled = false; sendBtn.textContent = "Send"; }
   };
-  const s = Shell.sheet({ kicker: nameOf(a), title: `Tell ${nameOf(a)}`, body: [box, h("p", { text: "Typed into its terminal with Enter, as if you typed it there." })],
-    actions: (done) => [h("button", { class: "btn", type: "button", onclick: done }, "Cancel"), h("button", { class: "btn primary", type: "button", onclick: () => send(done) }, "Send")] });
+  sendBtn.addEventListener("click", () => send(s.close));
+  box.addEventListener("input", () => { sendBtn.disabled = !box.value.trim() || busy; ruleRow.hidden = !standing(box.value); });
+  const s = Shell.sheet({ kicker: nameOf(a), title: `Tell ${nameOf(a)}`, body: [how, box, ruleRow, h("p", { class: "muted tell-k" }, kc("⌘↵"), " sends · ", kc("Esc"), " closes without sending")],
+    actions: (done) => [h("button", { class: "btn", type: "button", onclick: done }, "Don't send"), sendBtn] });
   box.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(s.close); } });
   requestAnimationFrame(() => box.focus());
 }
@@ -1080,7 +1109,10 @@ function cached(map, key, load, fresh) {
 const getDiff = (id, fresh) => cached(cache.diff, id, () => api(`/api/agents/${enc(id)}/diff`), fresh);
 // SPEC.md, "Sixth build: Ship and Trace tell the truth": a line clicked
 // from a commit is read and blamed as that commit has it (commit=).
-const getWhy = (agent, path, line, commit) => cached(cache.why, `${agent}\u0001${path}\u0001${line}\u0001${commit || ""}`, () => api(`/api/why?agent=${enc(agent)}&path=${enc(path)}&line=${line}${commit ? `&commit=${enc(commit)}` : ""}`));
+// A line of the main checkout (Library, Search) has no agent: it is asked of
+// the project (git blame, and the agents' sessions that touched the file).
+const whoOf = (agent) => (agent ? `agent=${enc(agent)}` : `repo=${enc(pickRepo() || currentProject()?.path || "")}`);
+const getWhy = (agent, path, line, commit) => cached(cache.why, `${agent || ""}\u0001${path}\u0001${line}\u0001${commit || ""}`, () => api(`/api/why?${whoOf(agent)}&path=${enc(path)}&line=${line}${commit ? `&commit=${enc(commit)}` : ""}`));
 const getDecisions = (repo, fresh) => cached(cache.dec, repo, () => api(`/api/decisions?repo=${enc(repo)}&limit=200`), fresh);
 
 function forgetAgent(id) {
@@ -2593,6 +2625,9 @@ function trailOnEvent(ev) {
 // Keys for the trail, outside a terminal. Answers true when it used the key.
 function trailKey(e) {
   if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  // A focused question card has its own keys (a digit, Enter, e): they
+  // never reach the diff under it.
+  if (e.target.closest?.(".qc")) return false;
   const k = e.key;
   const inSheet = e.target.closest?.("#sheet");
   if (T.open && T.player && (inSheet || k === "r" || ((k === " " || k === "ArrowLeft" || k === "ArrowRight") && !e.target.closest?.("#ch-scroll, #dec-view")))) {
@@ -2727,6 +2762,7 @@ function escape() {
   if (Shell.closeSheet()) return;
   if (Shell.close()) return;
   if (T.open) { closeSheet(); return; }
+  if (G.view && G.view.onEscape && G.view.onEscape()) return;
   const c = Shell.crumbs();
   if (c.length > 1) go(c[c.length - 2].href);
 }
@@ -2780,6 +2816,11 @@ window.addEventListener("keydown", (e) => {
     Z.sock?.send(e.key);
     return;
   }
+  // A sequence wins over a page's single keys (Dev: `g c` on the agent
+  // page went to its Changes tab), and ] [ go to the cards that need you
+  // before a diff's own keys.
+  if (GP.g && goalKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
+  if ((e.key === "]" || e.key === "[") && !e.shiftKey && moveIn(CARD, e.key === "]" ? 1 : -1)) { e.preventDefault(); e.stopPropagation(); return; }
   if (!inTerm && trailKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
   if (e.key === "Enter" && !$("grid-view").hidden && e.target.closest?.(".tile")) { e.preventDefault(); go(`#/a/${e.target.closest(".tile").dataset.id}/terminal`); return; }
   if (!$("grid-view").hidden && ARROWS[e.key] && (e.target.closest?.(".tile") || e.target === document.body)) { e.preventDefault(); move(ARROWS[e.key]); return; }
@@ -2912,6 +2953,17 @@ setInterval(() => { if (S.token && document.visibilityState === "visible") refre
 /** An answer went through: the card goes at once, the counts follow, and
  *  "Since you left" reads the digest again. */
 function answered(id, { quiet = false } = {}) {
+  // The focus goes to the next card, not to the page (Dev pressed ] after every answer).
+  const cards = visible([...surface().querySelectorAll(CARD)]);
+  const at = cards.findIndex((c) => c.dataset.need === id || c.contains(document.activeElement));
+  const keyOf = (c) => (c ? (c.dataset.need ? `[data-need="${CSS.escape(c.dataset.need)}"]` : c.dataset.q ? `[data-q="${CSS.escape(c.dataset.q)}"]` : null) : null);
+  const nextKey = at >= 0 ? keyOf(cards[at + 1] || cards[at - 1]) : null;
+  if (nextKey) setTimeout(() => {
+    const a = document.activeElement;
+    if (a && a !== document.body && a.isConnected && !a.closest(CARD)) return;
+    const el = surface().querySelector(nextKey);
+    if (el) el.focus({ preventScroll: false });
+  }, 120);
   N.items = N.items.filter((i) => i.id !== id);
   N.count = N.items.length;
   NQ.key = N.items.map((i) => i.id).join(",");
