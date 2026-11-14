@@ -30,8 +30,10 @@
 //! field reaches within n hops (one by default) right after it, if they pass
 //! the query's `WHERE`, decided the same way (**linked from k**). They are
 //! read by key, a hop a query, as a walk through a coordinator reads them. Reading
-//! stops once what is left of the budget is too small for any row, so a
-//! query whose first rows fill the budget reads one slice.
+//! stops once what is left of the budget is too small for any row, or once
+//! 16 rows in a row were turned away for the budget (what is left is too
+//! small for the rows this query finds), so a query whose first rows fill
+//! the budget reads one slice.
 //!
 //! The answer is the rows taken, in that order, with two more columns:
 //! `pack_tokens`, the tokens the row spends, and `pack_decision`. `WITH
@@ -88,6 +90,12 @@ const FOLLOWED: usize = 16;
 const MIN_EXCERPT: usize = 32;
 /// The largest budget.
 const MAX_BUDGET: usize = 10_000_000;
+/// The rows turned away for the budget in a row after which no more are
+/// read: what is left is too small for the rows this query finds (a title
+/// and a description need room for both and an excerpt), and a deeper read
+/// would turn its rows away too, at the cost of ranking up to 1,000 of them
+/// (PRF-11). The rows already read are still decided.
+const TURNED_AWAY: usize = 16;
 /// The most tokens one piece of an excerpt holds: a run of text without
 /// spaces longer than this is cut between its characters.
 const MAX_PIECE: usize = 8;
@@ -493,6 +501,8 @@ pub struct Packer {
     /// have keys: the ones seen are skipped), or the next page.
     reread: Option<bool>,
     exhausted: bool,
+    /// The rows skipped over budget since the last row taken.
+    turned_away: usize,
     pending: Option<Pending>,
     buffer: VecDeque<Candidate>,
     follows: VecDeque<Follow>,
@@ -600,6 +610,7 @@ impl Packer {
             slice: FIRST_SLICE,
             reread: None,
             exhausted: false,
+            turned_away: 0,
             pending: None,
             buffer: VecDeque::new(),
             follows: VecDeque::new(),
@@ -666,7 +677,7 @@ impl Packer {
             return Ok(Some(Next { query: q, params }));
         }
         let first = self.queries == 0;
-        if !first && (self.exhausted || self.read_to >= self.end) {
+        if !first && (self.exhausted || self.read_to >= self.end || self.turned_away >= TURNED_AWAY) {
             return Ok(None);
         }
         // `LIMIT 0` still reads once, for the answer's columns.
@@ -873,6 +884,11 @@ impl Packer {
             }
         };
         let taken = !decision.starts_with("skip");
+        match (taken, tokens == 0 && full > 0) {
+            (true, _) => self.turned_away = 0,
+            (false, true) => self.turned_away += 1,
+            (false, false) => {}
+        }
         let spent = if taken { tokens } else { 0 };
         self.used += spent;
         if taken {
