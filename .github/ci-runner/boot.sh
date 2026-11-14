@@ -26,7 +26,7 @@ for i in $(seq 1 60); do [ -e "$dev" ] && break; sleep 1; done
 blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -q "$dev"
 mkdir -p /mnt/ci
 mount -o discard,defaults,noatime "$dev" /mnt/ci
-install -d -o runner -g runner /mnt/ci/cargo/registry /mnt/ci/cargo/git
+install -d -o runner -g runner /mnt/ci/cargo/registry /mnt/ci/cargo/git /mnt/ci/sccache
 for d in registry git; do
   rm -rf "/home/runner/.cargo/$d"
   ln -s "/mnt/ci/cargo/$d" "/home/runner/.cargo/$d"

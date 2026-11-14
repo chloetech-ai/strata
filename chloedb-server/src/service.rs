@@ -3269,10 +3269,14 @@ impl Service {
             Ok((schema, select)) => self.select(req, schema, select, t0, timeout).await,
             Err(e) => {
                 let secs = t0.elapsed().as_secs_f64();
-                let outcome = telemetry::outcome_of(e.status, false);
+                // A client's deadline that passed while the query was
+                // planned is the client's, as one that passes later is
+                // (a slow runner planned past a 1 ms deadline on 11-14).
+                let meta = self.meta(&req);
+                let outcome = telemetry::outcome_of(e.status, meta.client_deadline);
                 self.metrics.query("invalid", outcome, secs);
                 // Kept with its error, as a query that ran and failed is.
-                self.query_log.add(&req.sql, "invalid", outcome, secs, 0, req.shard, Some(&e.message), false, None, false, &self.meta(&req));
+                self.query_log.add(&req.sql, "invalid", outcome, secs, 0, req.shard, Some(&e.message), false, None, false, &meta);
                 Err(e)
             }
         }
