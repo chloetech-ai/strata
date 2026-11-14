@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Retrieval for RAG · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="A model answers questions about your documents well when it is handed the right passages, with their sources. This recipe splits documents into passages, stores them in ChloeDB with a vector each, and retrieves for a…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/guide/rag.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html" aria-current="page">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Cookbook</span>
+      <h1>Retrieval for RAG</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-documents">The documents</a></li><li><a href="#split-and-store">Split and store</a></li><li><a href="#retrieve">Retrieve</a></li><li><a href="#ask">Ask</a></li><li><a href="#make-it-better">Make it better</a></li></ol></details>
+    <div class="doc-body">
+
+<p>A model answers questions about your documents well when it is handed the right passages, with their sources. This recipe splits documents into passages, stores them in ChloeDB with a vector each, and retrieves for a question by words and meaning at once, at most two passages from any one document, so that the model sees several sources. Then it builds the prompt and, if you have an Anthropic API key, asks Claude.</p>
+<p>You need Python with the <code>chloedb</code> package and <code>chloedb-server</code> on your <code>PATH</code> (<a href="quickstart.html">quickstart</a>).</p>
+<h2 id="the-documents">The documents<a class="anchor" href="#the-documents" aria-label="Link to this section">#</a></h2>
+<p>Any directory of text or Markdown files will do. Here are three short ones:</p>
+<pre data-lang="markdown" data-title="handbook/returns.md"># Returns
+
+Customers can return an item within 30 days of delivery for a full refund.
+Items must be unused and in their original packaging.
+
+## Damaged items
+
+If an item arrives damaged, the customer should send a photo within 7 days.
+We ship a replacement at no cost and do not ask for the damaged item back.</pre>
+<pre data-lang="markdown" data-title="handbook/shipping.md"># Shipping
+
+Orders placed before 2 pm ship the same day from the Rotterdam warehouse.
+Standard delivery takes 2 to 4 working days inside the EU.
+
+## Express
+
+Express delivery arrives the next working day and costs 12 euros.
+It is not available for furniture or other bulky items.</pre>
+<pre data-lang="markdown" data-title="handbook/warranty.md"># Warranty
+
+Electronics carry a two-year warranty against manufacturing defects.
+The warranty does not cover water damage or a cracked screen.
+
+## Claims
+
+To make a claim, the customer needs the order number and a description of the fault.
+A repaired or replaced item keeps the remaining warranty of the original.</pre>
+<h2 id="split-and-store">Split and store<a class="anchor" href="#split-and-store" aria-label="Link to this section">#</a></h2>
+<p>A passage is a section of a file: the text under one heading, cut further if it is long. Each passage keeps its file and heading, so an answer can cite them. The <code>emb</code> field is computed from the heading and the text by the embedding model when a row is written:</p>
+<pre data-lang="python" data-title="ingest.py">import pathlib
+import re
+import chloedb
+
+SCHEMA = {
+    &quot;table&quot;: &quot;passages&quot;,
+    &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;doc&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;heading&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;body&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;n&quot;, &quot;type&quot;: &quot;int&quot;},
+        {&quot;name&quot;: &quot;emb&quot;, &quot;type&quot;: &quot;vector&quot;,
+         &quot;embed&quot;: {&quot;from&quot;: [&quot;heading&quot;, &quot;body&quot;], &quot;model&quot;: &quot;potion-retrieval-32M&quot;}},
+    ],
+}
+
+
+def passages(path, max_chars=800):
+    &quot;&quot;&quot;The sections of a Markdown file, as (heading, text), long ones cut at paragraphs.&quot;&quot;&quot;
+    heading, lines = path.stem, []
+    for line in path.read_text().splitlines() + [&quot;# end&quot;]:
+        if re.match(r&quot;#+ &quot;, line):
+            text = &quot;\n&quot;.join(lines).strip()
+            while text:
+                cut = text.rfind(&quot;\n\n&quot;, 0, max_chars) if len(text) &gt; max_chars else len(text)
+                cut = cut if cut &gt; 0 else max_chars
+                yield heading, text[:cut].strip()
+                text = text[cut:].strip()
+            heading, lines = line.lstrip(&quot;# &quot;).strip(), []
+        else:
+            lines.append(line)
+
+
+db = chloedb.open(&quot;rag.chloedb&quot;, schema=SCHEMA)
+rows = []
+for path in sorted(pathlib.Path(&quot;handbook&quot;).glob(&quot;*.md&quot;)):
+    for n, (heading, body) in enumerate(passages(path)):
+        rows.append({&quot;id&quot;: f&quot;{path.name}#{n}&quot;, &quot;doc&quot;: path.name, &quot;heading&quot;: heading, &quot;body&quot;: body, &quot;n&quot;: n})
+db.upsert(rows)
+print(f&quot;{len(rows)} passages from {len({r[&#x27;doc&#x27;] for r in rows})} files&quot;)
+db.close()</pre>
+<pre data-lang="sh">chloedb-server fetch-model potion-retrieval-32M    # once: about 130 MB</pre>
+<pre data-lang="sh">python3 ingest.py</pre>
+<pre data-lang="text" data-title="Output" class="output">6 passages from 3 files</pre>
+<p><code>upsert</code> replaces a passage with the same key, so running it again after editing a file updates its passages. (A section that disappears from a file stays until you delete it: <code>db.delete(keys)</code>, or <code>DELETE FROM passages WHERE doc = 'returns.md'</code> before writing the file's passages again.)</p>
+<h2 id="retrieve">Retrieve<a class="anchor" href="#retrieve" aria-label="Link to this section">#</a></h2>
+<p>One query does the retrieval. <code>rrf</code> fuses a BM25 ranking over the text with a vector ranking, which finds passages that use the question's words and passages that mean the same thing in others; <code>MAX 2 PER doc</code> keeps at most two passages of a file:</p>
+<pre data-lang="python" data-title="retrieve.py">import chloedb
+
+QUERY = &quot;&quot;&quot;
+SELECT id, doc, heading, body FROM passages
+ORDER BY rrf(bm25(body, :q), bm25(heading, :q), similarity(emb, :v)) DESC
+MAX 2 PER doc
+LIMIT :k
+&quot;&quot;&quot;
+
+
+def retrieve(db, question, k=4):
+    return list(db.query(QUERY, q=question, v={&quot;embed&quot;: question}, k=k))
+
+
+if __name__ == &quot;__main__&quot;:
+    db = chloedb.open(&quot;rag.chloedb&quot;, read_only=True)
+    for row in retrieve(db, &quot;my parcel came broken, what do I do?&quot;):
+        print(row[&quot;id&quot;], &quot;|&quot;, row[&quot;heading&quot;])</pre>
+<pre data-lang="sh">python3 retrieve.py</pre>
+<pre data-lang="text" data-title="Output" class="output">returns.md#1 | Damaged items
+warranty.md#1 | Claims
+returns.md#0 | Returns
+shipping.md#1 | Express</pre>
+<p>The question says <em>parcel</em> and <em>broken</em>, which no passage does: the vector side finds the damaged-items passage by meaning, and BM25 still ranks exact terms such as an order number or a product name first when a question has them.</p>
+<h2 id="ask">Ask<a class="anchor" href="#ask" aria-label="Link to this section">#</a></h2>
+<p>The passages go into the prompt with their sources, and the model is told to answer from them and cite them. Without <code>ANTHROPIC_API_KEY</code> set, the script prints the prompt it would send:</p>
+<pre data-lang="python" data-title="ask.py">import os
+import sys
+import chloedb
+from retrieve import retrieve
+
+question = sys.argv[1]
+db = chloedb.open(&quot;rag.chloedb&quot;, read_only=True)
+sources = &quot;\n\n&quot;.join(
+    f&#x27;&lt;source id=&quot;{r[&quot;id&quot;]}&quot;&gt;\n{r[&quot;heading&quot;]}\n{r[&quot;body&quot;]}\n&lt;/source&gt;&#x27; for r in retrieve(db, question)
+)
+prompt = (
+    &quot;Answer the question from the sources below. Cite each source you use by its id, &quot;
+    &quot;like [returns.md#1]. If the sources do not answer it, say so.\n\n&quot;
+    f&quot;{sources}\n\nQuestion: {question}&quot;
+)
+
+if not os.environ.get(&quot;ANTHROPIC_API_KEY&quot;):
+    print(prompt)
+    sys.exit(0)
+
+import anthropic  # pip install anthropic
+
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model=&quot;claude-opus-5-5&quot;,
+    max_tokens=16000,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}],
+)
+if response.stop_reason == &quot;refusal&quot;:
+    sys.exit(&quot;the model declined to answer&quot;)
+print(&quot;&quot;.join(b.text for b in response.content if b.type == &quot;text&quot;))</pre>
+<pre data-lang="sh">python3 ask.py &quot;Can I get express delivery for a sofa?&quot;</pre>
+<pre data-lang="text" data-title="Output" class="output">Answer the question from the sources below. Cite each source you use by its id, like [returns.md#1]. If the sources do not answer it, say so.
+
+&lt;source id=&quot;shipping.md#1&quot;&gt;
+Express
+Express delivery arrives the next working day and costs 12 euros.
+It is not available for furniture or other bulky items.
+&lt;/source&gt;
+
+&lt;source id=&quot;returns.md#0&quot;&gt;
+Returns
+Customers can return an item within 30 days of delivery for a full refund.
+Items must be unused and in their original packaging.
+&lt;/source&gt;
+
+&lt;source id=&quot;shipping.md#0&quot;&gt;
+Shipping
+Orders placed before 2 pm ship the same day from the Rotterdam warehouse.
+Standard delivery takes 2 to 4 working days inside the EU.
+&lt;/source&gt;
+
+&lt;source id=&quot;returns.md#1&quot;&gt;
+Damaged items
+If an item arrives damaged, the customer should send a photo within 7 days.
+We ship a replacement at no cost and do not ask for the damaged item back.
+&lt;/source&gt;
+
+Question: Can I get express delivery for a sofa?</pre>
+<h2 id="make-it-better">Make it better<a class="anchor" href="#make-it-better" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><strong>Rank by more than text.</strong> Multiply in what you know about a passage: <code>ORDER BY rrf(...) * (1 + 0.2 * is_current) DESC</code>, or decay old ones by date with <a href="sql.html#decayfield-origin-scale--closeness-to-a-value"><code>decay</code></a>.</li>
+<li><strong>Filter before ranking.</strong> A <code>WHERE</code> clause (a product line, a language, what a user may see) is planned with the search, not applied after it: <code>WHERE audience IN ('public', :team)</code>.</li>
+<li><strong>Rerank the top.</strong> A cross-encoder reads the question and each of the top passages together and scores them more precisely, in the same query: <a href="sql.html#rerank-phases">rerank phases</a>.</li>
+<li><strong>Serve it.</strong> The same query runs on chloedb-server over HTTP (<code>chloedb.connect(url)</code> has the same <code>query</code>), so several workers can retrieve from one index, and on a cluster when the documents outgrow a machine.</li>
+<li><strong>Bring your own vectors.</strong> A <code>VECTOR(1024)</code> field without <code>embed</code> takes vectors you computed, and <code>similarity(emb, :v)</code> takes the question's vector as a list. Hosted models (<code>openai/text-embedding-3-small</code>, <code>voyage/voyage-3.5</code> and others) can also fill a field: <a href="server.html#embedded-vector-fields">embedded vector fields</a>.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/guide/rag.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="design.html">← How ChloeDB works</a><a href="agent-memory.html">Memory for an agent →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>chloedb-apps: apps built from a description · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloedb-apps is a prototype app engine on ChloeDB. You describe an app in a sentence (&quot;a stock room: items, suppliers, what is low, purchase orders&quot;), and the engine has a model plan and write it, checks what it…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/apps.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html" aria-current="page">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>chloedb-apps: apps built from a description</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/apps.md">docs/chloedb/apps.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#on-a-cluster">On a cluster</a></li><li><a href="#a-model-and-the-web-per-app">A model and the web, per app</a></li><li><a href="#before-you-share-it">Before you share it</a></li><li><a href="#tests">Tests</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloedb-apps</code> is a prototype app engine on ChloeDB. You describe an app in a sentence ("a stock room: items, suppliers, what is low, purchase orders"), and the engine has a model plan and write it, checks what it wrote, stores every piece in ChloeDB and runs it. You then change it by asking ("add a Check price online button on each item"), and every change is a new version you can go back from.</p>
+<p>Everything an app is lives in ChloeDB, as rows:</p>
+<ul>
+<li><strong>Its pieces are SQL statements.</strong> Screens are <code>CREATE SCREEN</code>, rules are <code>CREATE RULE</code>, tables are <code>CREATE TABLE</code>, and each is a row of <code>sa_capabilities</code>. A version is a row of <code>sa_compositions</code> that lists the pieces it is made of, so going back is one write. Tables only grow, so an app's data survives every change and every step back.</li>
+<li><strong>Pieces are shared.</strong> Components (<code>ui.calendar(props)</code>) and helpers (<code>lib.dates.addDays(day, 1)</code>) are written once and used by every app. They are found for a new request by words (BM25) and by meaning (a vector column), and linked in a graph that ChloeDB walks (<code>REACHABLE</code>, <code>ppr</code>) to offer an app a newer version. 150 of them ship in <code>chloedb-apps/library/</code>.</li>
+<li><strong>What people do is recorded</strong> in ChloeDB (<code>sa_events</code>), and the engine counts patterns in it (a search typed again and again, the same field changed row after row) to suggest changes, or to build one beside the live version for the owner to try, keep or drop.</li>
+<li><strong>Apps get services:</strong> sign-in, files, email (held in an outbox unless a mail server is set), address search and maps, and, when the owner switches them on, a model and the web (below).</li>
+</ul>
+<p>It is a program of its own, in Node.js, that talks to chloedb-server over HTTP. Views run in sandboxed frames in the browser, and server functions run in QuickJS compiled to WebAssembly, with no network and a time limit.</p>
+<p><img loading="lazy" decoding="async" alt="The studio: an app on the left, and on the right the request box, the version's summary, and the Model and web switches" src="../../../assets/img/strata-apps-studio.png" /></p>
+<h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
+<p>You need Node.js 20 or later, chloedb-server, and Claude Code signed in (<code>claude</code> on the PATH). The engine calls <code>claude -p</code>, so it uses that sign-in and needs no API key of its own.</p>
+<pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
+cd chloedb-apps &amp;&amp; npm ci
+./run.sh                     # the studio at http://127.0.0.1:7730/</pre>
+<p><code>run.sh</code> starts a chloedb-server of its own on <code>127.0.0.1:7720</code>, with its database in <code>chloedb-apps/data/</code>. <code>--strata URL</code> uses a server that is already running instead (started with <code>--seq-no</code>, for live updates). Every option is in <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/chloedb-apps/README.md#run-it">the engine's README</a>.</p>
+<p>A first version of a small app takes about a minute and a bigger one 2 to 4 minutes; a change takes 20 seconds to 2 minutes. The time and the cost of each build are on its timeline (Versions → Timeline).</p>
+<h2 id="on-a-cluster">On a cluster<a class="anchor" href="#on-a-cluster" aria-label="Link to this section">#</a></h2>
+<p>A cluster the <a href="server.html#on-kubernetes">operator</a> runs gets the engine from its <code>StrataCluster</code>, beside the crawler and the spreadsheets:</p>
+<pre data-lang="sh">kubectl -n strata create secret generic anthropic --from-literal=key=sk-ant-...   # the model&#x27;s key, once
+kubectl -n strata patch strata demo --type merge -p &#x27;{&quot;spec&quot;: {
+  &quot;secretEnv&quot;: [{&quot;name&quot;: &quot;ANTHROPIC_API_KEY&quot;, &quot;secret&quot;: &quot;anthropic&quot;}],
+  &quot;apps&quot;: {&quot;serviceType&quot;: &quot;NodePort&quot;, &quot;nodePort&quot;: 30731, &quot;publicUrl&quot;: &quot;http://203.0.113.5:30731&quot;}}}&#x27;</pre>
+<p>The operator runs the engine's own image (<code>ghcr.io/chloetech-ai/chloedb-apps</code>: Node, Playwright's Chromium for the drawn checks, and Claude Code) as a Deployment of one pod, <code>&lt;cluster&gt;-apps</code>, behind a Service of that name, and restarts the coordinators so that they list it: <strong>Apps → App creator</strong> appears in the command center.</p>
+<ul>
+<li>
+<p><strong>The app creator is a page of the command center.</strong> Describe an app and build it there: the conversation of changes and builds (each build's progress, its screens drawn while the model writes the rest, its timeline), the app itself on a phone, a tablet or a computer (drawn 1280 px wide and scaled to fit the stage), and what it is made of: <strong>Made of</strong> measures how much of the code that runs the engine generated from the CREATE TABLE, CREATE SCREEN and CREATE RULE statements the agent wrote, how much the agent wrote from scratch (JavaScript, or a screen written out as JSON), and how much is the library's, piece by piece (<code>GET /api/apps/&lt;id&gt;/made</code>, <code>engine/provenance.mjs</code>); <strong>Code</strong> reads each piece's SQL and edits a CREATE SCREEN with no model; <strong>Time</strong> is where its builds' time and cost went; <strong>Data</strong> (the first tab after a build, with each table as a CSV), <strong>Versions</strong>, <strong>Design</strong> and <strong>Reach</strong> are the app's tables, versions, looks and switches. The bar shows what the app's builds cost in all, and its menu renames the app (<code>POST /api/apps/&lt;id&gt;/rename {name}</code>; a name given there, or when the app is made, stays: a later plan does not rename it, and a label that starts the description, like <code>acme-shop</code>, stays in front of the name the plan picks), duplicates it with its rows (<code>POST /api/apps/&lt;id&gt;/duplicate</code>), exports its rows as JSON (<code>GET /api/apps/&lt;id&gt;/export</code>) and deletes it (<code>POST /api/apps/&lt;id&gt;/delete</code>): its own tables <code>app_&lt;id&gt;_*</code> and no other app's, its pieces, versions, use, settings, members and files; the shared library stays. <strong>Usage</strong>, beside the app's screens, is the studio's Activity view over the whole stage: each visit step by step, the paths people take between screens, how easy the app is to use and what needs a look. The app's screens run as they do in the studio: in frames with the studio's sandbox and policy (no same origin, so a view reads nothing of the command center's, its key included, and no network), each read and write sent to the page as a message, which calls the engine for that one app. People's sign-in does not pass through chloedb-server, so the creator shows an app as a visitor sees it; with <code>publicUrl</code>, <strong>Its own page</strong> opens the app as people use it, and <strong>Studio</strong> opens the standalone studio. Live updates come by long polls of <code>GET /api/events</code>, since chloedb-server forwards whole answers.</p>
+</li>
+<li>
+<p><strong>Its apps are rows of the cluster, each read and written with a key of its own.</strong> The engine reaches the coordinators with a key limited to its tables, <code>sa_*</code> and <code>app_*</code> (the operator makes it, <code>&lt;cluster&gt;-apps-credentials</code>, when the coordinators can, <a href="server.html#apps">keys for apps</a>; <code>spec.apps.tables</code> changes it; an operator whose ClusterRole cannot make Secrets gives it the cluster's admin token, <code>tokenSecret</code>, instead), and gives every app a key made from that one (<code>POST /v1/keys/own</code>), limited to the app's tables <code>app_&lt;id&gt;_*</code> (write) and the table its library's table functions read (<code>sa_numbers</code>, read), named <code>apps-app/app-&lt;id&gt;</code>. An app's <code>app.sql</code>, inserts, updates and removes go with its key, so the server refuses another app's rows, the engine's people and sessions, and every other table of the cluster, whatever the engine's rewrite of the SQL lets through; the keys end when the engine's key is revoked. An engine given the admin token (an operator from before such keys, <code>deploy/kube.yaml</code>) makes itself the limited key, follows the feed of changes with it too (the server sends a limited key the operations of its tables alone), and keeps the token only for an older server's feed, and says so in its log; <code>GET /api/status</code> shows which (<code>keys</code>). A coordinator over shards walks no graphs, so the engine walks its own (<code>engine/walk.mjs</code>), and it tells the model that an app reads its links a step at a time.</p>
+</li>
+<li><strong>The studio and each app's own page have an address of their own</strong>, <code>publicUrl</code>, through a node's port, a load balancer, or an Ingress of your own in front of the Service. Files and map tiles the creator's frames show are loaded from there too (without it, through chloedb-server, which needs the key the frames cannot send). <strong>Studio</strong> asks the engine, through chloedb-server and so only with an admin key, for a link that signs the browser in once, within two minutes, for 30 days. Anything else that reaches the studio's address gets a page that says where to sign in.</li>
+<li><strong>Keys limited to tables build apps by their tables.</strong> Beside a cluster the engine checks its callers (<code>"checks_callers": true</code>, <code>engine/callers.mjs</code>): reading an app takes read on its tables (<code>app_&lt;id&gt;_*</code>), using it as its screens do (rows, functions, files) takes write there, and changing, publishing, renaming or deleting it takes admin there; building a new one, or a copy, takes admin on every app's tables (<code>app_*</code>), which the app-owner preset gives. A key limited to tables lists only the apps whose tables it reads, follows one app's events (<code>/api/events?app=&lt;id&gt;</code>), and never gets the studio's login or the graph of every app. A key of every table keeps read to look and admin to change.</li>
+<li><strong>Apps their owners publish are open to everyone, as far as the owner says.</strong> <strong>Publish</strong> in the app creator asks <em>who can see this?</em> (<code>POST /api/apps/&lt;id&gt;/publish {on, access, name, hosts}</code>, <code>engine/publish.mjs</code>): <strong>only me</strong> (not published, the default), <strong>visitors can look</strong> (<code>access: "look"</code>: read what its screens show, no writes), <strong>customers can look and add</strong> (<code>"add"</code>: also add rows, upload files and run its functions, and edit or delete only the rows they added themselves, as <code>sa_events</code> records who added each), or <strong>anyone can do anything</strong> (<code>"change"</code>, which asks for the app's name to be typed). An app that never chose (a publish that names no access, or an app published before the choice existed) is at <code>look</code> until its owner picks more. A visitor who may only look is not offered the app's forms, nor the buttons and row actions that add, change or remove; a call their access does not allow is a 403 marked <code>refused</code> that says what was refused ("read-only for visitors"), shown as a quiet note, never as an error. <strong>See it as a stranger</strong> opens the app's own page as someone with no account would see it under the choice being weighed (each call carries <code>x-sa-as: visitor</code>, which only ever lowers what the studio's session may do), and the tab lists the columns that look like emails, phone numbers or addresses, which a public app shows to anyone. A published app is reached at <code>/a/&lt;id&gt;</code> on the engine's address, at <code>&lt;name&gt;.&lt;domain&gt;</code> when the engine has a domain (<code>spec.apps.publish</code>, below), and at hosts of the owner's own (a CNAME to <code>&lt;name&gt;.&lt;domain&gt;</code>). The public reaches the app as it runs and nothing of how it is made: its page and the runtime's files, its state without its requests, versions, people or outbox, and the calls its screens make under its access, and <code>app.ask</code>, <code>app.fetch</code> and <code>app.email</code> under the app's Reach switches and its model calls a day. What a visitor writes is checked on the server: a column whose forms offer a fixed list of choices takes only those (and the values the app's own code writes to it), a field is at most 10 KB, a row 64 KB and a list 100 items (<code>STRATA_APPS_PUBLIC_FIELD_MAX</code>, <code>STRATA_APPS_PUBLIC_ROW_MAX</code>), and a refusal is a 400 that says why; a failure tells a visitor nothing of shards or physical tables. An error a visitor's browser or call hits is recorded under Usage and never starts a repair, so nothing a stranger sends reaches the model. The app's people (<code>GET /api/apps/&lt;id&gt;/people</code>) are listed only to its signed-in members, with their emails only for its owner; one account serves every app on the engine, but a visitor is a member of an app only once they sign up or in on it, and signing up with an email that has an account signs in with the right password and otherwise says only that the email and password cannot be used. Building and changing it, other apps, versions built to try, the library and the studio stay behind the studio's login. Each visitor is held to 240 calls a minute and 20 of the dear ones (model, web, mail, accounts, uploads); <code>STRATA_APPS_PUBLIC_RATE</code> and <code>STRATA_APPS_PUBLIC_DEAR_RATE</code> change that.</li>
+<li><strong>The model's key is the cluster's</strong> (<code>secretEnv</code>'s <code>ANTHROPIC_API_KEY</code>, as the agents use), and <code>spendCapUsd</code> stops every model call once the engine has spent that much (25 US dollars unless set; 0 for no limit).</li>
+<li><strong>What it keeps outside the cluster</strong> (files people gave its apps, map tiles, what the model has cost, Claude Code's home) is on a volume of its own, <code>&lt;cluster&gt;-apps</code>, kept when <code>spec.apps</code> goes and deleted with the cluster.</li>
+</ul>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th><code>spec.apps</code></th>
+<th>default</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>publicUrl</code></td>
+<td></td>
+<td>where browsers reach the studio and each app's own page; without it the creator works in the command center, but cannot open the studio or an app's own page, and its frames show no files</td>
+</tr>
+<tr>
+<td><code>publish</code></td>
+<td></td>
+<td>open published apps to everyone, at <code>&lt;name&gt;.&lt;domain&gt;</code>: <code>domain</code> is your own (<code>apps.example.com</code>, with a DNS record <code>*.apps.example.com</code> pointing at the load balancer) or <code>sslip</code> (the load balancer's address as a name of sslip.io, <code>kids-reading.203-0-113-5.sslip.io</code>, with no record); <code>email</code> for Let's Encrypt. The operator adds a load balancer, <code>&lt;cluster&gt;-apps-public</code> (ports 80 and 443; most clouds bill for one), and Caddy beside the engine, which gets a published app's certificate the first time someone opens it, after asking the engine whether the host is one of its apps (<code>GET /api/tls/ask</code>), and keeps the certificates on the engine's volume</td>
+</tr>
+<tr>
+<td><code>serviceType</code>, <code>nodePort</code></td>
+<td><code>ClusterIP</code></td>
+<td>the Service's type: <code>ClusterIP</code> (put an Ingress in front), <code>NodePort</code> (30000 to 32767) or <code>LoadBalancer</code> (most clouds bill for one)</td>
+</tr>
+<tr>
+<td><code>spendCapUsd</code></td>
+<td><code>25</code></td>
+<td>what the model may cost, in US dollars, counted across restarts</td>
+</tr>
+<tr>
+<td><code>storage</code></td>
+<td><code>1Gi</code></td>
+<td>its volume's <code>size</code> (it only grows) and <code>storageClassName</code></td>
+</tr>
+<tr>
+<td><code>image</code></td>
+<td><code>ghcr.io/chloetech-ai/chloedb-apps:latest</code></td>
+<td>the engine's image</td>
+</tr>
+<tr>
+<td><code>env</code></td>
+<td></td>
+<td>the engine's own settings (<code>STRATA_APPS_MODEL</code>, <code>STRATA_APPS_SMALL_MODEL</code>, ...); secrets go in <code>secretEnv</code></td>
+</tr>
+<tr>
+<td><code>paused</code></td>
+<td><code>false</code></td>
+<td>no pod for now (the apps stay in their tables)</td>
+</tr>
+<tr>
+<td><code>args</code>, <code>resources</code></td>
+<td></td>
+<td>more arguments of the engine, and its container's resources (250m CPU and 600 MiB asked, 1.5 GiB at most)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The image runs alone as well, with a chloedb-server of its own on its volume: <code>docker run -p 7730:7730 -v apps:/data -e ANTHROPIC_API_KEY ghcr.io/chloetech-ai/chloedb-apps</code> (without <code>STRATA_APP_TOKEN</code> there is no login, so keep that on your own machine).</p>
+<h2 id="a-model-and-the-web-per-app">A model and the web, per app<a class="anchor" href="#a-model-and-the-web-per-app" aria-label="Link to this section">#</a></h2>
+<p>An app's code can ask a model, reach the web and run on a schedule, each only once the app's owner has switched it on in the studio, under <strong>Model and web</strong>:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th>what the app calls</th>
+<th>limits</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A model</td>
+<td><code>app.ask(prompt, {json, system})</code>: a small model (Haiku; <code>STRATA_APPS_ASK_MODEL</code>) summarizes, sorts, extracts or drafts</td>
+<td>the same question gets the kept answer (<code>sa_asks</code>) at no cost; 200 questions a day per app by default (the owner can change it; <code>STRATA_APPS_ASKS_PER_DAY</code>), 20 a minute</td>
+</tr>
+<tr>
+<td>Web search</td>
+<td><code>app.ask(prompt, {web: true})</code>: the model searches the web before it answers</td>
+<td>kept answers expire after 6 hours; a call stops at $0.25</td>
+</tr>
+<tr>
+<td>Web pages and APIs</td>
+<td><code>app.fetch(url, {method, json, headers, secret})</code>: JSON parsed, an HTML page's readable text and title; <code>CREATE SOURCE</code> and <code>PULL</code> read feeds and JSON lists into tables</td>
+<td>the hosts the owner allowed, on public addresses only (below); 2 MB and 10 seconds a request; GET answers kept 10 minutes; 1000 a day per app</td>
+</tr>
+<tr>
+<td>Schedules</td>
+<td><code>EVERY ...</code> on a rule or function, and <code>CREATE SOURCE</code></td>
+<td>at most every 15 minutes; stops after 5 failures in a row</td>
+</tr>
+</tbody>
+</table></div>
+<p>Until the owner switches it on, the call answers that it is off, and the app shows that instead of failing (it is not sent to the repair). A build says which of these the code uses, which are still off, and which hosts and secrets it needs that the owner has not given it. In a build's tests the calls answer empty and reach nothing.</p>
+<p>Under the web, the owner also allows each <strong>host</strong> an app reads from (GET, HEAD) and, separately, each host it may send to (POST); a host covers its subdomains. Hosts the code names, or tried and was refused, are listed for the owner to allow, and every hop of a redirect must be allowed too, so a change (asked for, built from use, or a repair) never widens what an app reaches by itself. Apps switched on before host lists keep "any public host" until the owner replaces it.</p>
+<p>An API key is a <strong>secret</strong>: the owner pastes it once, binds it to the hosts it may go to, and says where it goes (<code>Authorization: Bearer</code>, a header of its own, or a query parameter). Code names it, <code>app.fetch(url, {secret: 'weather'})</code>, and never holds it. Secrets are sealed with AES-256-GCM in ChloeDB, apart from the app's code, with <code>STRATA_APPS_SECRET_KEY</code> (or a key the engine keeps in <code>DATA/secret.key</code>), sent only to their hosts, never shown again, and replaced by <code>[secret]</code> in an answer that echoes them. A key written into code fails the build's checks.</p>
+<p>A fourth switch, <strong>Schedules</strong>, lets rules and functions run on their own: <code>CREATE RULE brief EVERY DAY AT '07:00' TZ 'Europe/Madrid' AS ...</code>, or a source that fills a table from a feed or a JSON API, <code>CREATE SOURCE news FROM FEED 'https://news.example.com/rss' EVERY 1 HOUR INTO stories (title, link, published, summary) KEY link</code> (each item added once, by its key). A schedule runs at most every 15 minutes, under the app's daily limits, and stops after 5 failures in a row; the studio lists each with its next run, its last result, Run now and Pause.</p>
+<p><code>app.fetch</code> refuses addresses on the machine or its networks: loopback, private and link-local ranges, carrier-grade NAT, unique-local and link-local IPv6, and IPv4 inside IPv6. Every address a name resolves to is checked when the connection is made, and again after every redirect, so a name that points inside the network is refused too. Only ports 80, 443, 8080 and 8443 are open, and a URL may not carry a name or password.</p>
+<h2 id="before-you-share-it">Before you share it<a class="anchor" href="#before-you-share-it" aria-label="Link to this section">#</a></h2>
+<p>It is a prototype for one person or a small team:</p>
+<ul>
+<li><strong>Run alone, the studio has no sign-in.</strong> Anyone who can reach it can change any app and spend on the model. Keep it on <code>127.0.0.1</code>, put it behind the shared-key gate in <code>chloedb-apps/deploy/</code> (a link with a key, kept in a cookie), or run it beside a cluster (<a href="#on-a-cluster">above</a>), where it signs in the cluster's admins.</li>
+<li><strong>An app is for the people who run the studio until its owner publishes it.</strong> Beside a cluster, an app's own pages need the studio's sign-in, so only the cluster's admins open them, until its owner publishes it (<a href="#on-a-cluster">above</a>): then anyone with its address uses it as far as the owner chose, and signs up and in with the engine's own accounts. Signing in with Google and others is planned.</li>
+<li><strong>Set a spending limit.</strong> <code>STRATA_APPS_SPEND_CAP_USD</code> stops the model once the engine has spent that much, counted from what Claude Code reports and kept across restarts. The apps' own questions have a share of it of their own (<code>STRATA_APPS_ASK_CAP_USD</code>, a quarter by default) and builds and checks the rest, so a published app's visitors cannot stop the studio's builds, nor builds the apps; one app's questions stop at $2 a day (<code>STRATA_APPS_ASK_USD_PER_DAY</code>). A published app suggests changes from its use rather than building them, unless its owner sets its mode to build.</li>
+<li><strong>App data is checked in code, not on the server.</strong> People sign in to apps, but row rules (<code>lib.access</code>) run in the app's views and functions; the server does not enforce them yet.</li>
+<li><strong>A piece that passes the checks can still be wrong.</strong> The engine opens every view after a build, draws each on a phone and a computer (with Playwright installed), fixes what its rules measure, and runs the app's tests; going back a version is the safety net for the rest.</li>
+</ul>
+<h2 id="tests">Tests<a class="anchor" href="#tests" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">cd chloedb-apps &amp;&amp; npm test</pre>
+<p>The tests that need a chloedb-server find <code>chloedb-server/target/release/chloedb-server</code> (or <code>STRATA_SERVER_BIN</code>) and are skipped without one; CI runs them all against the server it builds (<code>STRATA_APPS_NEED_SERVER=1</code>), and again against a cluster of two shards (<code>STRATA_APPS_TEST_SHARDS=2</code>, which starts the shards and a coordinator over them in place of a server). No test calls a model.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/apps.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="chloectx-receipts.html">← Blame and receipts</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Next items · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="What a user will open, watch or buy next, from what came after the same items before: counts kept in an ordinary table as events arrive, read with backoff from the last two items to the last one. They update with…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/next-items.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html" aria-current="page">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Search and SQL</span>
+      <h1>Next items</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/next-items.md">docs/chloedb/next-items.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#counts-in-a-table">Counts in a table</a></li><li><a href="#reading-with-backoff">Reading with backoff</a></li><li><a href="#measured">Measured</a></li><li><a href="#several-steps-ahead">Several steps ahead</a></li><li><a href="#kept-for-you-create-recommender">Kept for you: CREATE RECOMMENDER</a></li><li><a href="#which-to-use">Which to use</a></li></ol></details>
+    <div class="doc-body">
+
+<p>What a user will open, watch or buy next, from what came after the same items before: counts kept in an ordinary table as events arrive, read with backoff from the last two items to the last one. They update with every event, explain themselves, and are the baseline that a learned sequence model has to beat.</p>
+<h2 id="counts-in-a-table">Counts in a table<a class="anchor" href="#counts-in-a-table" aria-label="Link to this section">#</a></h2>
+<p>Each row counts how often one item came right after one context: the last item, or the last two. The key is the context's items and then the next item, so with <code>cluster_by = 'id'</code> a context's rows sit together.</p>
+<pre data-lang="sql">CREATE TABLE next (
+  id KEYWORD PRIMARY KEY,   -- the context&#x27;s items, then the next item
+  ctx KEYWORD NOT NULL,     -- the last item, or the last two
+  nxt KEYWORD NOT NULL,
+  n FLOAT DEFAULT 0         -- how often (or a decayed weight)
+) OPTIONS(cluster_by = &#x27;id&#x27;);</pre>
+<p>In Python, <code>chloedb.ngrams</code> writes the statement (<code>ngrams.create_table()</code>) or the schema (<code>ngrams.schema()</code>, for <code>chloedb.open</code> or <code>chloedb-server --schema</code>), the writes of an event and the read:</p>
+<pre data-lang="python">import chloedb
+from chloedb import ngrams
+
+db = chloedb.open(&quot;next.chloedb&quot;, ngrams.schema())
+
+# after each event: item &quot;c&quot; after the user&#x27;s history [..., &quot;a&quot;, &quot;b&quot;]
+db.write(ngrams.ops([&quot;a&quot;, &quot;b&quot;], &quot;c&quot;))
+
+chloedb.next_items(db, [&quot;a&quot;, &quot;b&quot;], k=10)   # [(&quot;c&quot;, 1.0), ...]</pre>
+<p><code>ngrams.ops(history, item)</code> returns one <code>add</code> per order, each of which creates its row on the context's first event, so an event costs two writes; <code>order=3</code> also counts the last three items. They are the operations chloedb-server's <code>/v1/write</code> takes (<a href="server.html#writes">writes</a>), so <code>Client.write</code> sends them and <code>Database.write</code> applies them in-process. Items are strings without the two separators the keys use (<code>\x1f</code> between a context's items, <code>\x1e</code> before the next item).</p>
+<p>Counts can decay in place, so that recent behaviour weighs more: <code>UPDATE next SET n = n * 0.9</code> rewrites no row, and a row whose weight reaches 0 is no longer read.</p>
+<h2 id="reading-with-backoff">Reading with backoff<a class="anchor" href="#reading-with-backoff" aria-label="Link to this section">#</a></h2>
+<p><code>next_items(db, history, k=10, order=2, backoff=0.4)</code> scores each item by stupid backoff (<a href="https://aclanthology.org/D07-1090/">Brants et al., 2007</a>): an item seen after the last two items scores its share of that context's weight; one seen only after the last item scores its share there times 0.4; a pair never seen backs off the same way. It returns <code>(item, score)</code> pairs, best first, ties by item.</p>
+<p>The answer is the same as scoring every item of both contexts, but it reads less. Per context it runs a sum and then reads rows best first, a page at a time, and stops at the first row that cannot reach the top <code>k</code>. Then it checks that the items it takes from the last item's context have no row in the pair's context, by their keys. Over a server it is the same SQL, which any language can run:</p>
+<pre data-lang="sql">SELECT SUM(n) FROM next WHERE ctx = :c AND n &gt; 0;
+SELECT nxt, n FROM next WHERE ctx = :c AND n &gt; 0 ORDER BY n DESC, id LIMIT 64 OFFSET 0;   -- ties by key: by item
+SELECT nxt FROM next WHERE id IN (...) AND n &gt; 0;   -- the candidates&#x27; keys under the longer context</pre>
+<h2 id="measured">Measured<a class="anchor" href="#measured" aria-label="Link to this section">#</a></h2>
+<p>On Amazon Beauty (22,363 users' reviews of 12,101 products in time order, the 5-core set sequential recommenders report on), each user's last item predicted from the items before it, ranked among all items, with the counts in-process on one thread of a 4-core cloud VM (Intel Xeon @ 2.10GHz):</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>counts from</th>
+<th style="text-align: right;">order</th>
+<th style="text-align: right;">Recall@10</th>
+<th style="text-align: right;">NDCG@10</th>
+<th style="text-align: right;">p50 ms</th>
+<th style="text-align: right;">p99 ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>every transition before each user's last item</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.0688</td>
+<td style="text-align: right;">0.0459</td>
+<td style="text-align: right;">0.57</td>
+<td style="text-align: right;">1.46</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.0694</td>
+<td style="text-align: right;">0.0450</td>
+<td style="text-align: right;">0.64</td>
+<td style="text-align: right;">1.69</td>
+</tr>
+<tr>
+<td>only those before the last two, as SASRec trains</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.0607</td>
+<td style="text-align: right;">0.0404</td>
+<td style="text-align: right;">0.49</td>
+<td style="text-align: right;">1.23</td>
+</tr>
+<tr>
+<td></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.0613</td>
+<td style="text-align: right;">0.0398</td>
+<td style="text-align: right;">0.57</td>
+<td style="text-align: right;">1.38</td>
+</tr>
+</tbody>
+</table></div>
+<p>SASRec's published numbers on the same split are 0.0605 and 0.0318 (as <a href="https://arxiv.org/abs/2305.05065">TIGER</a> reports them, from P5), so counted the way SASRec trains, counts match its recall and beat its NDCG: a strong baseline on this data. Two caveats: 43.5% of users wrote their last two reviews on the same day, which the usual preprocessing leaves in product order and which favours counted transitions; and with under nine reviews per user, the pair's context adds little over the last item's (order 3 adds nothing). Answers were the same as scoring every item for the first 2,000 users. Fewer than 10 scored items were filled with the most frequent ones. Script and results: <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb/results/sequence"><code>results/sequence/ngrams_beauty.py</code> and <code>ngrams-beauty.json</code></a>.</p>
+<p>A sequence model (<a href="sql.html#sequence-models-encodemodel-history"><code>encode()</code></a>) trained on the same split, reading items only, has 0.0662 and 0.0406 (<a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb/results/sequence">results</a>), at 0.6 ms a query.</p>
+<p>On Beauty, Sports and Toys, the walk of the next section ranks above both that model and a generative decoder over <a href="server.html#semantic-ids">semantic IDs</a>, and <code>rrf</code> of the model's scores and the walk's ranks above the walk: on Beauty, Recall@10 0.0834 and NDCG@10 0.0511, and Recall@10 0.0855 with the decoder's answer added (<a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb/results/generative">results</a>).</p>
+<h2 id="several-steps-ahead">Several steps ahead<a class="anchor" href="#several-steps-ahead" aria-label="Link to this section">#</a></h2>
+<p>Counts predict the next item. For items further ahead, or for "seen together", the same events can feed an <a href="sql.html#edge-tables">edge table</a>, whose edges are directed: adding 1/<em>g</em> to the edge from the item <em>g</em> steps back to the new one records what comes after what, and <code>ppr(cooc, :x, dir =&gt; 'out')</code> walks forward from the last items. <code>dir =&gt; 'both'</code>, <code>ppr</code>'s default, reads the same edges as seen together.</p>
+<pre data-lang="sql">SELECT id FROM items
+ORDER BY ppr(cooc, (SELECT item FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 5), dir =&gt; &#x27;out&#x27;, eps =&gt; 1e-6) DESC
+LIMIT 20;</pre>
+<p>A walk runs on one database: a coordinator refuses <code>ppr</code> and the other graph queries (<a href="graphs.html#on-a-cluster">graphs on a cluster</a>), while the counts above run anywhere.</p>
+<p>Personalized PageRank pushes a row only while its share of the walk is at least <code>eps</code> (1e-4 by default) times the sum of its edges' weights, so a single seed whose edges add up to more than 10,000 is never pushed and the walk returns nothing. Pass a smaller <code>eps</code>, as above, or keep the weights decayed or normalised.</p>
+<h2 id="kept-for-you-create-recommender">Kept for you: <code>CREATE RECOMMENDER</code><a class="anchor" href="#kept-for-you-create-recommender" aria-label="Link to this section">#</a></h2>
+<p><code>CREATE RECOMMENDER shop ON events(usr, item, ts) ITEMS items(emb)</code> keeps the counts of order 1 and items seen together from the writes of an events table, and <code>ORDER BY recommend('shop', :u)</code> fuses them with the similarity of the user's recent items and with popularity, leaving out what the user had (<a href="sql.html#recommenders-create-recommender-and-recommend">recommenders</a>). It runs on one database; a coordinator refuses it, and the tables of this page are what a cluster uses.</p>
+<h2 id="which-to-use">Which to use<a class="anchor" href="#which-to-use" aria-label="Link to this section">#</a></h2>
+<p>Counts are exact and live: an event changes the next answer, and each suggestion is explained by a count. They know only the last one or two items and nothing about a context never seen, where they fall back to the last item alone. A walk over directed edges reaches several steps ahead and related items, at five writes per event. Learned sequence models, which read long histories and combine what they have not seen together, are the next step; these counts are the baseline they have to beat.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/next-items.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="graphs.html">← Graphs</a><a href="slices.html">Search on the device →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Parquet and S3 · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeDB reads Parquet files, and directories of them as Spark, DuckDB, polars and pandas write them, into a table, making the table&#x27;s schema from the columns&#x27; types and values when it does not exist, and writes a…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/parquet.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html" aria-current="page">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Server and cluster</span>
+      <h1>Parquet and S3</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/parquet.md">docs/chloedb/parquet.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#import">Import</a></li><li><a href="#export">Export</a></li><li><a href="#s3-and-s3-compatible-stores">S3 and S3-compatible stores</a></li><li><a href="#over-http-and-in-the-ui">Over HTTP and in the UI</a></li><li><a href="#arrow-from-python">Arrow from Python</a></li><li><a href="#with-spark">With Spark</a></li><li><a href="#what-it-does-not-do">What it does not do</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeDB reads Parquet files, and directories of them as Spark, DuckDB, polars and pandas write them, into a table, making the table's schema from the columns' types and values when it does not exist, and writes a table to a Parquet file that any of those tools reads. An export keeps the table's ChloeDB schema in the file, so importing it back gives the same schema and rows. Wherever a file is read or written, an <code>s3://</code> URL works too: an object, or every object under a prefix, on AWS S3 or any store that speaks its API.</p>
+<h2 id="import">Import<a class="anchor" href="#import" aria-label="Link to this section">#</a></h2>
+<p>From the command line, into a database no server has open:</p>
+<pre data-lang="sh">chloedb-server import --db lake.chloedb events.parquet                   # a new database, its table named events
+chloedb-server import --db lake.chloedb --table clicks out/clicks/       # a directory: every part file, one table
+chloedb-server import --db lake.chloedb s3://lake/raw/events/            # every object under the prefix
+chloedb-server import --db lake.chloedb --key event_id events.parquet    # the key of a table it creates
+chloedb-server import --db lake.chloedb --plan events.parquet &gt; plan.json  # what it would do; writes nothing
+chloedb-server import --db lake.chloedb --schema plan.json events.parquet  # with the plan, edited</pre>
+<p>A Parquet file is recognised by its name (<code>.parquet</code>), its first bytes or <code>--format parquet</code>, and a directory by the Parquet files in it, at any depth; names starting with <code>_</code> or <code>.</code>, such as Spark's <code>_SUCCESS</code> and its <code>.crc</code> checksums, are passed over. The files of a directory make one table, read in the order of their paths, and may differ in columns: each file's columns fill the fields of their names. Parquet and SQLite files, and JSON and CSV files, can be mixed in one command. The rows go into the table <code>--table</code> names, else the one an <a href="#export">export</a> kept in the file, else a table named for the file or directory (<code>events.snappy.parquet</code> and <code>events/</code> make <code>events</code>):</p>
+<ul>
+<li><strong>A table ChloeDB has</strong> keeps its schema: each column fills the field of its name (in any case), the others are left out and listed. The rows are upserted by key (inserted, in a table without one), 10,000 a transaction, or bulk-loaded when the table is empty.</li>
+<li><strong>A table ChloeDB lacks</strong> is created, with the schema <code>--schema</code> gives, or the one an export kept in the file, or else one made from the columns, and its rows are bulk-loaded in one commit: a value that does not fit is reported with its file and row, and nothing is written.</li>
+</ul>
+<p>A database that does not exist is created with the first Parquet file's table. In Python, <code>chloedb.from_parquet("events.parquet", "lake.chloedb")</code> creates a database, <code>db.import_parquet("out/clicks/", table="clicks")</code> imports into an open one, and <code>chloedb.plan_parquet("events.parquet")</code> returns the plan (<a href="python.html">Python</a>). From Rust it is <code>chloedb::parquet</code> (feature <code>parquet</code>): <code>import_new</code>, <code>import</code>, <code>plan</code> and <code>Source</code> for each step.</p>
+<h3 id="how-parquet-columns-become-fields">How Parquet columns become fields<a class="anchor" href="#how-parquet-columns-become-fields" aria-label="Link to this section">#</a></h3>
+<p>Parquet columns have types, so a table made from a file takes them, and reads the first 100,000 rows only to choose between a few:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>Parquet / Arrow column</th>
+<th>ChloeDB field</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>integers of any width, decimals with no scale</td>
+<td><code>INT</code></td>
+</tr>
+<tr>
+<td>floats, other decimals</td>
+<td><code>FLOAT</code> (a decimal as a double: the plan notes it)</td>
+</tr>
+<tr>
+<td>booleans</td>
+<td><code>BOOL</code></td>
+</tr>
+<tr>
+<td>dates, timestamps of any unit or time zone</td>
+<td><code>TIMESTAMP</code> (a date at midnight UTC)</td>
+</tr>
+<tr>
+<td>text that is the key, dictionary-encoded, or labels rather than prose</td>
+<td><code>KEYWORD</code></td>
+</tr>
+<tr>
+<td>other text</td>
+<td><code>TEXT</code></td>
+</tr>
+<tr>
+<td>fixed-size lists of numbers, or lists of numbers all of one length</td>
+<td><code>VECTOR(n)</code></td>
+</tr>
+<tr>
+<td>lists of text or of integers</td>
+<td>multi-valued <code>KEYWORD</code> or <code>INT</code></td>
+</tr>
+<tr>
+<td>lists of vectors</td>
+<td>multi-vector <code>VECTOR(n)[]</code></td>
+</tr>
+<tr>
+<td>structs, maps, other lists</td>
+<td><code>JSON</code></td>
+</tr>
+<tr>
+<td>binary</td>
+<td>left out (ChloeDB has no binary type), or base64 text in a stored <code>KEYWORD</code> with <code>--blobs-base64</code></td>
+</tr>
+<tr>
+<td>times of day, durations, intervals, columns of NULLs only</td>
+<td>left out</td>
+</tr>
+</tbody>
+</table></div>
+<p>Text reads as labels when no value is over 256 bytes and the values have 2.5 words or fewer on average, or each value repeats ten times on average (as the <a href="sqlite.html#how-sqlite-columns-become-fields">SQLite import</a> judges). Column names that are not ChloeDB identifiers are respelled (<code>City Name</code> becomes <code>City_Name</code>; the plan lists each). A column named <code>id</code> (in any case) of integers or text without NULLs in the sample is the key; <code>--key</code> names another, and <code>--key ""</code> makes a table without one. A NaN or infinite float is read as NULL, and the import says how many were.</p>
+<p>Into a table that exists, a column fills its field when its values do: any integer, float or decimal for a number, dates, timestamps and ISO 8601 text for a <code>TIMESTAMP</code>, a list of <code>n</code> numbers (or <code>4n</code> little-endian float32 bytes) for a <code>VECTOR(n)</code>, a list for a multi-valued field, structs, maps and lists for a <code>JSON</code> field. Integers that are Unix times (seconds, milliseconds or microseconds, by their size) fill a <code>TIMESTAMP</code> too.</p>
+<h3 id="directories-and-hive-partitions">Directories and Hive partitions<a class="anchor" href="#directories-and-hive-partitions" aria-label="Link to this section">#</a></h3>
+<p>A directory Spark writes with <code>partitionBy</code> holds its files under <code>key=value</code> directories (<code>year=2026/month=11/part-00000-….snappy.parquet</code>). Each key becomes a field, <code>INT</code> when every value is an integer and <code>KEYWORD</code> otherwise, and each row takes its file's values; <code>__HIVE_DEFAULT_PARTITION__</code> is NULL. Into a table that exists, a key fills the field of its name. A directory whose files keep different ChloeDB tables (an export of several, below) is refused: import its files one at a time.</p>
+<h2 id="export">Export<a class="anchor" href="#export" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloedb-server export --db lake.chloedb --tables events events.parquet   # one table, one file
+chloedb-server export --db lake.chloedb out/                             # every table: out/&lt;table&gt;.parquet
+chloedb-server export --db lake.chloedb --format parquet --tables events s3://lake/exports/events.parquet
+chloedb-server export --db lake.chloedb --no-schemas events.parquet      # without the kept schema</pre>
+<p>An export reads the rows of one snapshot. It writes a <code>.parquet</code> file when the name says so (one table), and otherwise a new directory with a <code>&lt;table&gt;.parquet</code> file a table (<code>--format parquet</code>, or a name ending in <code>/</code>; without either, the export is a <a href="sqlite.html#export">SQLite file</a>). The files are compressed with Zstandard, in row groups of about 128 MB, and written under another name and renamed into place when complete; an existing file or directory is an error, but for an empty directory. In Python it is <code>db.export_parquet("events.parquet", tables="events")</code>, from Rust <code>chloedb::parquet::export</code>.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>ChloeDB field</th>
+<th>Parquet / Arrow column</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>INT</code></td>
+<td><code>INT64</code></td>
+</tr>
+<tr>
+<td><code>FLOAT</code></td>
+<td><code>DOUBLE</code></td>
+</tr>
+<tr>
+<td><code>BOOL</code></td>
+<td><code>BOOLEAN</code></td>
+</tr>
+<tr>
+<td><code>TIMESTAMP</code></td>
+<td><code>TIMESTAMP(MICROS, UTC)</code></td>
+</tr>
+<tr>
+<td><code>TEXT</code>, <code>KEYWORD</code></td>
+<td><code>STRING</code></td>
+</tr>
+<tr>
+<td><code>VECTOR(n)</code></td>
+<td>a list of <code>n</code> floats (Arrow <code>FixedSizeList(Float32, n)</code>, which NumPy, PyTorch and Spark's <code>array&lt;float&gt;</code> take)</td>
+</tr>
+<tr>
+<td><code>VECTOR(n)[]</code></td>
+<td>a list of those</td>
+</tr>
+<tr>
+<td>multi-valued <code>KEYWORD</code>, <code>INT</code></td>
+<td>a list of <code>STRING</code>, of <code>INT64</code></td>
+</tr>
+<tr>
+<td><code>JSON</code>, <code>SPARSE</code>, <code>EDGES</code>, <code>MEDIA</code></td>
+<td><code>STRING</code>, the value's JSON text</td>
+</tr>
+</tbody>
+</table></div>
+<p>Only the key's column is not nullable. Each file keeps its table's ChloeDB schema as JSON in its key-value metadata (<code>strata.schema</code>), which other tools ignore and an import restores: analyzers, vector indexes and their kinds, embedding models, references, defaults and generated fields' definitions, which Parquet has no place for. A field neither stored nor recoverable from an index is NULL, and a generated field holds its text; the export's notes list what does not carry over.</p>
+<h2 id="s3-and-s3-compatible-stores">S3 and S3-compatible stores<a class="anchor" href="#s3-and-s3-compatible-stores" aria-label="Link to this section">#</a></h2>
+<p><code>s3://bucket/key</code> (or <code>s3a://</code>, as Spark writes) works wherever a file does: <code>chloedb-server import</code> and <code>export</code>, and in Python <code>from_parquet</code>, <code>import_parquet</code>, <code>export_parquet</code>, <code>from_sqlite</code>, <code>import_sqlite</code>, <code>export_sqlite</code> and <code>import_file</code>. A URL names one object, or every object under a prefix: one that ends in <code>/</code>, or that names no object (<code>s3://lake/raw/events</code> reads <code>raw/events/year=2026/part-0.parquet</code> and the rest). The objects are read into a temporary directory, keeping their paths under the prefix, eight at once, and imported from there; an export is written to a temporary file or directory and then sent, in parts of 16 MB for large files. An object already at the URL of an export, or under its prefix, is an error, checked before anything is sent.</p>
+<p>The store is configured as the AWS tools are, by environment variables:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>variable</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>, <code>AWS_SESSION_TOKEN</code></td>
+<td>the credentials; without them, a web identity (<code>AWS_WEB_IDENTITY_TOKEN_FILE</code> and <code>AWS_ROLE_ARN</code>, as EKS gives pods), ECS task credentials, or EC2 instance metadata</td>
+</tr>
+<tr>
+<td><code>AWS_REGION</code> (or <code>AWS_DEFAULT_REGION</code>)</td>
+<td>the bucket's region</td>
+</tr>
+<tr>
+<td><code>AWS_ENDPOINT_URL</code></td>
+<td>a store other than AWS S3: <code>https://nyc3.digitaloceanspaces.com</code> for DigitalOcean Spaces, <code>https://&lt;account&gt;.r2.cloudflarestorage.com</code> for Cloudflare R2, MinIO's or Ceph's address</td>
+</tr>
+<tr>
+<td><code>AWS_ALLOW_HTTP=true</code></td>
+<td>for an endpoint over plain <code>http://</code>, such as a local MinIO</td>
+</tr>
+<tr>
+<td><code>AWS_VIRTUAL_HOSTED_STYLE_REQUEST=true</code></td>
+<td><code>bucket.host</code> addresses instead of <code>host/bucket</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Profiles in <code>~/.aws</code> are not read. The S3 client is <a href="https://docs.rs/object_store">object_store</a>'s, in ChloeDB's feature <code>s3</code> (on by default in chloedb-server and the Python package).</p>
+<h2 id="over-http-and-in-the-ui">Over HTTP and in the UI<a class="anchor" href="#over-http-and-in-the-ui" aria-label="Link to this section">#</a></h2>
+<p><code>POST /v1/import</code> takes a Parquet file in the body (<code>application/vnd.apache.parquet</code>, or recognised by its first bytes; up to the server's <code>--max-body-mb</code>), into the table <code>?table=</code> names or the one an export kept in the file, with <code>?key=</code>, <code>?blobs_base64=true</code> and <code>?plan=true</code> as on the command line. The rows are checked before any is written and then written through the writer, so a value that does not fit writes nothing; an import that creates the table needs an admin key, and a coordinator imports into tables its shards have. <code>GET /v1/export?format=parquet&amp;tables=events</code> answers one table as a Parquet file (a database of one table may leave out <code>tables</code>), and <code>?schemas=false</code> leaves out the kept schema. From Python's client: <code>client.import_parquet(path, table=None, key=None)</code>, <code>client.plan_parquet(path)</code> and <code>client.export_parquet(path, table=None)</code>.</p>
+<p>The command center's Import view reads a dropped Parquet file's plan from the server: the table it goes to (named in a box, which re-plans), each column's field and type, the key and what is left out, then imports it with its progress. Its Export card writes SQLite or Parquet, a Parquet file a table chosen.</p>
+<h2 id="arrow-from-python">Arrow from Python<a class="anchor" href="#arrow-from-python" aria-label="Link to this section">#</a></h2>
+<p><code>db.import_arrow(data, table=None)</code> writes the rows of anything that gives an Arrow stream (<code>__arrow_c_stream__</code>): a pyarrow Table, RecordBatch or RecordBatchReader, a polars DataFrame, a DuckDB relation, an answer of <code>query_arrow</code>, and a pandas DataFrame through pyarrow. Each column fills the field of its name, read as an import reads a Parquet column; the others are left out and listed. Into an empty table the rows are bulk-loaded in one commit, otherwise upserted by key. With <code>query_arrow</code> going the other way, a table moves between ChloeDB and dataframe libraries without JSON in between.</p>
+<h2 id="with-spark">With Spark<a class="anchor" href="#with-spark" aria-label="Link to this section">#</a></h2>
+<p>Spark reads an export as it reads any Parquet (<code>spark.read.parquet("s3a://lake/exports/events.parquet")</code>): vectors as <code>array&lt;float&gt;</code>, timestamps as <code>timestamp</code>, lists as arrays, JSON as strings to <code>from_json</code>. What Spark writes (<code>df.write.partitionBy("year").parquet("s3a://lake/raw/events")</code>) imports as a directory, partitions and all. A data source that lets Spark read from and write to a running server is a later step.</p>
+<h2 id="what-it-does-not-do">What it does not do<a class="anchor" href="#what-it-does-not-do" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><strong>Read Parquet in place.</strong> An import copies the rows into ChloeDB's own files, which hold the indexes Parquet has none of; a query never reads a Parquet file.</li>
+<li><strong>Several tables from one directory.</strong> A directory is one table, as Spark, DuckDB and polars read one; an export of several tables is a directory of files, imported a file at a time.</li>
+<li><strong>Partitioned exports.</strong> An export writes one file a table, in row groups; it does not split a table by a column into <code>key=value</code> directories.</li>
+<li><strong>Stream from S3.</strong> An import reads all the objects to local disk before it reads them, and an export writes the file locally before it sends it, so both need the space.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/parquet.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="sqlite.html">← SQLite in and out</a><a href="postgres.html">Following Postgres →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>
