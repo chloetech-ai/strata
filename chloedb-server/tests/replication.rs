@@ -1452,16 +1452,20 @@ fn kept(dir: &Path, name: &str) -> Json {
 /// started with --replica on a database that had no part in replication
 /// yet. So if the first primary stops before any replica heard from it,
 /// the replicas still elect another (the simulator's
-/// `waits-for-a-first-call`). A server made a replica to join a serving
-/// shard (Configure) grants no vote until it caught up with a primary.
+/// `waits-for-a-first-call`), if they heard from no primary either: a
+/// replica that lost its volume starts as a first copy too (N-E2). A
+/// server made a replica to join a serving shard (Configure) grants no
+/// vote until it caught up with a primary.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shards_first_copies_vote_from_the_start() {
     let dir = tempfile::tempdir().unwrap();
     let opts = |name: &str| server::Options { db: Some(dir.path().join(name)), demo: Some(20), seq_no: true, timeout_ms: 5000, ..Default::default() };
     let r = server::service(&server::Options { replica: true, ..opts("r.strata") }).await.unwrap();
     assert_eq!(kept(dir.path(), "r.strata")["member"], json!(true));
-    let a = r.vote(ask(2, "x", (9, 9), false)).await.unwrap();
+    let a = r.vote(ask(2, "x", (0, 0), false)).await.unwrap();
     assert!(a.granted, "{a:?}");
+    let a = r.vote(ask(3, "x", (9, 9), false)).await.unwrap();
+    assert!(!a.granted && a.reason.contains("may have lost its volume"), "{a:?}");
     let p = server::service(&server::Options { replicas: vec!["http://127.0.0.1:1".into()], ..opts("p.strata") }).await.unwrap();
     assert_eq!(p.role(), pb::Role::Primary);
     assert_eq!(kept(dir.path(), "p.strata")["member"], json!(true), "a primary counts itself, as a replica once it starts again");
@@ -1475,6 +1479,63 @@ async fn a_shards_first_copies_vote_from_the_start() {
     let a = again.vote(&ask(2, "x", (9, 9), false), Duration::ZERO).await.unwrap();
     assert!(!a.granted && a.reason.contains("has not caught up with a primary"), "{a:?}");
     assert_eq!(kept(dir.path(), "j.strata")["member"], Json::Null);
+}
+
+/// N-E2: a replica started with --replica loses its volume, its database
+/// and the part it keeps beside it, and starts again with the same flag
+/// on an empty database, as one of its shard's first copies. Its primary
+/// still counts it a member. It votes for no copy that heard from a
+/// primary (one behind could be elected without the writes it
+/// acknowledged), and counts itself a member again once a call of its
+/// primary finds it caught up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_that_lost_its_volume_votes_once_it_caught_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let vol = dir.path().join("volume");
+    std::fs::create_dir(&vol).unwrap();
+    let file = |dir: &Path, name: &str| replication::file_of(&dir.join(name));
+    let first = |db: Arc<Db>, file: &Path| {
+        let mut svc = service(db.clone(), Duration::from_secs(10));
+        svc.set_replication(Replication::Replica(Arc::new(Follow::open_first(db, Some(file)).unwrap())));
+        Arc::new(svc)
+    };
+    let (u, addr) = nobody().await;
+    let rdb = create(&vol, "r.strata");
+    let r = first(rdb.clone(), &file(&vol, "r.strata"));
+    let served = tokio::spawn(server::serve_grpc(r.clone(), TcpListener::bind(addr).await.unwrap(), Access::default()));
+    let pdb = create(dir.path(), "p.strata");
+    let p = primary(pdb.clone(), Some(&file(dir.path(), "p.strata")), ships_to(&[&u], Acks::Majority), Duration::from_secs(5));
+    for v in 1..=3 {
+        p.write_ops(vec![set("p0000001", "sold", json!(v))], None).await.unwrap();
+    }
+    assert_eq!(last(&rdb), 3, "acknowledged by a majority: the replica holds them");
+    assert_eq!(kept(&vol, "r.strata")["member"], json!(true));
+
+    // The volume is lost, and the server starts again with --replica.
+    served.abort();
+    let _ = served.await;
+    drop((r, rdb));
+    std::fs::remove_dir_all(&vol).unwrap();
+    std::fs::create_dir(&vol).unwrap();
+    let rdb = create(&vol, "r.strata");
+    let r = first(rdb.clone(), &file(&vol, "r.strata"));
+    assert_eq!((last(&rdb), &kept(&vol, "r.strata")["member"]), (0, &json!(true)), "a first copy, empty");
+    assert_eq!(follower(&p, 0).await["member"], json!(true), "its primary counts it a member still");
+    // A copy that heard from the primary and lacks the writes it had
+    // acknowledged asks for its vote: refused.
+    let behind = pb::VoteRequest { config: 1, copies: 3, ..ask(2, "behind", (1, 1), false) };
+    let a = r.vote(behind).await.unwrap();
+    assert!(!a.granted && a.reason.contains("may have lost its volume"), "{a:?}");
+
+    // Its primary calls it again: it is sent what it lacks, and counts
+    // itself a member once caught up.
+    let served = tokio::spawn(server::serve_grpc(r.clone(), TcpListener::bind(addr).await.unwrap(), Access::default()));
+    until("the replica holds the writes again and counts itself a member", || async { last(&rdb) == 3 && kept(&vol, "r.strata")["member"] == json!(true) }).await;
+    until("its primary counts it in sync", || async { follower(&p, 0).await["in_sync"] == json!(true) }).await;
+    assert!(kept(&vol, "r.strata")["follows"].is_object(), "{}", kept(&vol, "r.strata"));
+    p.write_ops(vec![set("p0000001", "sold", json!(4))], None).await.unwrap();
+    assert_eq!(last(&rdb), 4);
+    served.abort();
 }
 
 /// A replica is made the primary of a new term by hand. It refuses while a

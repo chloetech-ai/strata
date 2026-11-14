@@ -184,3 +184,32 @@ fn set_operators_say_what_is_wrong() {
     assert!(e.contains("another field"), "{e}");
 }
 
+
+/// Lists of a hundred thousand values (finding N-B4): binding `@>` and `<@`
+/// compared each value with every one before it, and each `AND` child with
+/// every earlier child, and `<@` complemented and intersected a set per
+/// value. They answer the rows, in seconds rather than many minutes.
+#[test]
+fn long_lists_bind_and_run_in_linear_time() {
+    let docs: Vec<Document> = (0..3000).map(doc).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("l.strata"), schema(), DbOptions { segment_max_docs: 1000, sync: false, ..DbOptions::default() }).unwrap();
+    db.load(docs.iter().cloned()).unwrap();
+    const N: i64 = 100_000;
+    // Groups 2, 4, 8 and 10, many times each, and odd ones above 9 that no
+    // row has.
+    let allowed: Vec<Value> = (0..N).map(|i| Value::Int(if i % 3 == 0 { 11 + 2 * i } else { 2 * (i % 6) })).collect();
+    let even: Vec<i64> = vec![2, 4, 8, 10];
+    let t0 = std::time::Instant::now();
+    let p = Params::new().set("allowed", Value::List(allowed));
+    assert_eq!(ids_with(&db, "SELECT id FROM items WHERE groups <@ :allowed", &p), want(&docs, |d| groups(d).iter().all(|g| even.contains(g))));
+    assert_eq!(ids_with(&db, "SELECT id FROM items WHERE NOT (groups <@ :allowed)", &p), want(&docs, |d| !groups(d).iter().all(|g| even.contains(g))));
+    // Many tags, all of which a row must have: none has them all.
+    let many: Vec<Value> = (0..N).map(|i| Value::Str(if i % 2 == 0 { TAGS[(i % 6) as usize].to_string() } else { format!("t{i}") })).collect();
+    let p = Params::new().set("many", Value::List(many));
+    assert_eq!(ids_with(&db, "SELECT id FROM items WHERE tags @> :many", &p), Vec::<String>::new());
+    let few = Params::new().set("few", Value::List((0..N).map(|i| Value::Str(["red", "sale"][(i % 2) as usize].into())).collect()));
+    assert_eq!(ids_with(&db, "SELECT id FROM items WHERE tags @> :few", &few), want(&docs, |d| tags(d).contains(&"red") && tags(d).contains(&"sale")));
+    let took = t0.elapsed();
+    assert!(took < std::time::Duration::from_secs(if cfg!(debug_assertions) { 120 } else { 15 }), "{took:?}");
+}

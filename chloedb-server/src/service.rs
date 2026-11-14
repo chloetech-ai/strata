@@ -620,6 +620,12 @@ pub struct Service {
     /// above a coordinator's shards ([`Engine`]; `CHLOEDB_ENGINE`, by
     /// default `auto`).
     pub engine: Engine,
+    /// The longest statement a request may send, in bytes, and the most
+    /// elements (words, values and symbols) it may hold
+    /// ([`chloedb::query::parse::check_size`]; `--max-statement-bytes`,
+    /// `--max-statement-elements`; 0: no bound).
+    pub max_statement_bytes: usize,
+    pub max_statement_elements: usize,
     /// The most write requests in the write path at once (embedding,
     /// waiting for the writer or being applied); more are refused with 429.
     pub max_queued_writes: usize,
@@ -815,6 +821,8 @@ impl Service {
             max_groups: None,
             query_memory: None,
             engine: Engine::from_env(),
+            max_statement_bytes: chloedb::query::parse::STATEMENT_BYTES,
+            max_statement_elements: chloedb::query::parse::STATEMENT_ELEMENTS,
             max_queued_writes: usize::MAX,
             max_body: 256 << 20,
             otlp_retain: None,
@@ -2862,12 +2870,23 @@ impl Service {
         Ok(out)
     }
 
+    /// A query error (400, `query_invalid`) when the statement `sql` a
+    /// request sent is longer than [`Self::max_statement_bytes`] or holds
+    /// more than [`Self::max_statement_elements`] elements, before any of
+    /// it is parsed.
+    pub fn statement_fits(&self, sql: &str) -> Result<(), ApiError> {
+        Ok(chloedb::query::parse::check_size(sql, self.max_statement_bytes, self.max_statement_elements, "the server's --max-statement-bytes and --max-statement-elements")?)
+    }
+
     /// Runs a query, or its plan when it has one. A coordinator plans a
     /// query by a rank profile with the profile its shards held when it
     /// last asked; when a shard refuses the plan because its profile has
     /// changed since (through another coordinator, or on that shard), the
     /// coordinator asks again and plans once more.
     pub async fn query(self: &Arc<Self>, req: QueryReq) -> Result<Answer, ApiError> {
+        if req.plan.is_none() {
+            self.statement_fits(&req.sql)?;
+        }
         let skip = req.skip_steps;
         let mut a = self.query_steps(req).await?;
         if skip {
@@ -4114,6 +4133,7 @@ impl Service {
     /// is kept under the key ([`Coordinator::sql`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn sql_in(self: &Arc<Self>, who: &Principal, sql: &str, params: &Params, after: After, timeout_ms: u64, slots: Option<Vec<usize>>, key: Option<String>) -> Result<SqlAnswer, ApiError> {
+        self.statement_fits(sql)?;
         if let Some(st) = chloedb::query::classify::parse_statement(sql)? {
             return self.classifier_statement(who, &st, timeout_ms).await;
         }

@@ -106,6 +106,15 @@ pub struct Config {
     /// Cuts placed by hand besides the drawn ones: copy `.0` cut off from
     /// every other node, both ways, from `.1` for `.2`.
     pub isolate: Vec<(usize, Duration, Duration)>,
+    /// Crashes placed by hand besides the drawn ones: copy `.0` crashes at
+    /// `.1` and starts again `.2` later.
+    pub crashes: Vec<(usize, Duration, Duration)>,
+    /// Volumes lost: copy `.0` (not copy 0, started as the primary with
+    /// `--replicas`) crashes at `.1` and starts again `.2` later with the
+    /// same `--replica` on an empty database, with nothing kept beside it
+    /// (finding N-E2), while the other copies are sound
+    /// ([`Sim::may_lose_volume`]).
+    pub lost_volumes: Vec<(usize, Duration, Duration)>,
 }
 
 /// A bug the simulator found, put back with [`Config::bugs`] to check
@@ -176,10 +185,18 @@ pub enum Bug {
     /// acknowledged since, and an election the replica then wins loses
     /// them (seed 624036738 of the nightly run, finding E-0g).
     InstallsALateCopy,
+    /// A replica started with `--replica` on a database with no part kept
+    /// counts itself a member and votes for any copy holding what it holds,
+    /// and a replica counts itself a member at the first call that says so,
+    /// caught up or not ([`crate::cores::shard::Replica::joined`]): a
+    /// replica whose volume was lost starts again empty and votes, and a
+    /// copy without the writes it had acknowledged is elected (finding
+    /// N-E2).
+    VotesWithALostVolume,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 9] = [
+    pub const ALL: [Bug; 10] = [
         Bug::AsksAKnownTerm,
         Bug::TakesWritesInALease,
         Bug::RefusesOlderTerms,
@@ -189,6 +206,7 @@ impl Bug {
         Bug::CommitsAfterSteppingDown,
         Bug::TrustsTheSameTerm,
         Bug::InstallsALateCopy,
+        Bug::VotesWithALostVolume,
     ];
 
     pub fn name(self) -> &'static str {
@@ -202,6 +220,7 @@ impl Bug {
             Bug::CommitsAfterSteppingDown => "commits-after-stepping-down",
             Bug::TrustsTheSameTerm => "trusts-the-same-term",
             Bug::InstallsALateCopy => "installs-a-late-copy",
+            Bug::VotesWithALostVolume => "votes-with-a-lost-volume",
         }
     }
 
@@ -241,6 +260,8 @@ impl Config {
             promote_ppm: r.below(5_000),
             bugs: Vec::new(),
             isolate: Vec::new(),
+            crashes: Vec::new(),
+            lost_volumes: Vec::new(),
             // Drawn last, so that the draws above give what they gave
             // before pauses and slow links; each in half the seeds, so that
             // the runs without them (which find other bugs) stay as many.
@@ -269,6 +290,36 @@ impl Config {
             call_timeout: Duration::from_millis(500),
             copy_retry: Duration::from_millis(200),
             held_per_mille: 300,
+            ..Config::of(seed)
+        }
+    }
+}
+
+impl Config {
+    /// Seed `seed` where a replica loses its volume (`chloedb-sim
+    /// --lost-volume`): three copies acknowledged by a majority, three
+    /// clients, the drawn faults, and at 4 to 12 s copy 2 cut off for 1 to
+    /// 3 s, so that it lacks what copies 0 and 1 acknowledge meanwhile;
+    /// copy 1 losing its volume a moment before that cut ends, empty for
+    /// 50 ms to 1 s; and copy 0, usually the primary, crashing within that
+    /// time, for 2 to 5 s. Copy 2 then asks to be elected while copy 0 is
+    /// down: with [`Bug::VotesWithALostVolume`] put back, copy 1's vote
+    /// elects it and the writes it lacks are lost in about one seed in
+    /// five; without, copy 1 refuses it, and copy 0 is elected once back.
+    pub fn lost_volume(seed: u64) -> Config {
+        let mut r = Rng::new(seed ^ 0x10_57_70_1c);
+        let at = r.ms(4000, 12_000);
+        let cut = r.ms(1000, 3000);
+        let lost = at + cut - r.ms(100, 900);
+        let empty = r.ms(50, 1000);
+        let crash = lost + r.part_of(empty);
+        Config {
+            copies: 3,
+            clients: 3,
+            acks: Acks::Majority,
+            isolate: vec![(2, at, cut)],
+            lost_volumes: vec![(1, lost, empty)],
+            crashes: vec![(0, crash, r.ms(2000, 5000))],
             ..Config::of(seed)
         }
     }
@@ -361,6 +412,9 @@ enum Event {
     Timer { at: usize, inc: u64, timer: Timer },
     Crash(usize),
     Restart(usize),
+    /// Copy `i` crashes and loses its volume: its database and what it
+    /// keeps beside it ([`Config::lost_volumes`]).
+    LoseVolume(usize),
     /// Calls from each of `from` to each of `to` are lost (and back, unless
     /// `one_way`), until `Heal`.
     Cut { from: Vec<usize>, to: Vec<usize>, one_way: bool },
@@ -535,6 +589,14 @@ impl Sim {
             self.at(t, Event::Slow { from, to, one_way, extra, lasts });
             t += lasts + us(r.ms(10, 2 * self.cfg.slow_every.as_millis() as u64));
         }
+        for &(i, at, down) in &self.cfg.crashes.clone() {
+            self.at(us(at), Event::Crash(i));
+            self.at(us(at + down), Event::Restart(i));
+        }
+        for &(i, at, down) in &self.cfg.lost_volumes.clone() {
+            self.at(us(at), Event::LoseVolume(i));
+            self.at(us(at + down), Event::Restart(i));
+        }
         for &(i, from, lasts) in &self.cfg.isolate.clone() {
             let to = (0..self.nodes()).filter(|&x| x != i).collect();
             self.at(us(from), Event::Cut { from: vec![i], to, one_way: false });
@@ -674,6 +736,14 @@ impl Sim {
                     self.crash(i);
                 }
             }
+            Event::LoseVolume(i) => {
+                if self.faults && i != 0 && self.copies[i].up && self.may_lose_volume(i) {
+                    self.note(|| format!("s{i} crashes and loses its volume"));
+                    self.paused[i] = 0;
+                    self.crash(i);
+                    self.lose_volume(i);
+                }
+            }
             Event::Restart(i) => {
                 if !self.copies[i].up {
                     self.note(|| format!("s{i} starts again"));
@@ -735,6 +805,24 @@ impl Sim {
                 self.quiet = true;
             }
         }
+    }
+
+    /// Whether copy `i` may lose its volume now: one copy forgetting what
+    /// it kept is a fault the shard is to survive while the others are
+    /// sound, which a copy cannot tell from here when (a) another copy
+    /// has heard from no primary yet: the two, empty, could elect one of
+    /// them, as a shard's first copies do; or (b) a copy serves as the
+    /// primary of an older term than the newest one the copies know: the
+    /// copy that lost its volume forgot that term, takes that primary's
+    /// calls and counts toward its majority again. Raft has both holes for
+    /// a member that lost its state, which must join again as a new one
+    /// (here: started without --replica and added, `Configure`).
+    fn may_lose_volume(&self, i: usize) -> bool {
+        let others = || self.copies.iter().enumerate().filter(move |(j, _)| *j != i).map(|(_, c)| c);
+        let heard = others().all(|c| c.kept.as_ref().is_some_and(|k| k.config.is_some()));
+        let newest = others().map(|c| c.kept.as_ref().map_or(c.db.numbering.term, |k| k.newest(c.db.numbering.term))).max().unwrap_or(0);
+        let stale = others().any(|c| c.up && c.role_primary().is_some() && c.db.numbering.term < newest);
+        heard && !stale
     }
 
     /// The answer to call `id` reached node `at` (an error: none came).

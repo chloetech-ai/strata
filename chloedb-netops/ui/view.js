@@ -31,6 +31,18 @@ const CSS = `
 .no-head h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
 .no-head .sub { color: var(--muted); font-size: 12.5px; }
 .no-head .tools { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.no-hmenu { display: none; }
+@media (max-width: 600px) {
+  .no-head { flex-wrap: nowrap; gap: 8px; margin-bottom: 8px; }
+  .no-head h1 { font-size: 17px; white-space: nowrap; }
+  .no-head .sub { display: none; }
+  .no-head .tools { flex-wrap: nowrap; }
+  .no-head .tools > :not(.no-hmenu) { display: none; }
+  .no-head .no-hmenu { display: inline-flex; }
+  .no-root .tabs { margin-bottom: 10px; }
+}
+.no-root .tabs .no-more { margin-left: auto; position: sticky; right: 0; background: var(--bg, var(--surface)); }
+.no-root .tabs .no-more .i { width: 14px; height: 14px; }
 .no-synth { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px dashed var(--line-2); color: var(--text-2); }
 .no-sim { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
 .no-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 12px; margin-bottom: 14px; }
@@ -362,6 +374,8 @@ const T = (x) => (x ? Date.parse(x) : null);
 const SEV = { critical: "bad", major: "serious", minor: "warn", sev1: "bad", sev2: "serious", sev3: "warn" };
 const STATUS = { investigating: ["warn", "Investigating"], identified: ["info", "Cause identified"], mitigated: ["ok", "Mitigated"], resolved: ["good", "Resolved"] };
 const KIND = { fiber_cut: "Fibre cut", bad_change: "Bad change", optic_degrade: "Failing optic", ddos: "DDoS", cpu_bug: "Software defect", power: "Power", "": "Unknown", capacity: "Capacity", estate: "Estate outage" };
+/** What a page asks for first, for the pages a deep link opens most. */
+const FIRST = { "": "/v1/shift", diagnose: "/v1/where", network: "/v1/overview", incidents: "/v1/incidents", alerts: "/v1/alerts?status=firing", customers: "/v1/customers", carriers: "/v1/maintenance", services: "/v1/services", devices: "/v1/devices", agents: "/v1/agents", data: "/v1/data", leadership: "/v1/leadership", topology: "/v1/topology", changes: "/v1/changes" };
 const PAGES = [["", "My shift"], ["map", "Map"], ["dash", "Dashboards"], ["diagnose", "Diagnose"], ["network", "Network"], ["incidents", "Incidents"], ["alerts", "Alerts"], ["changes", "Changes"], ["customers", "Customers"], ["carriers", "Carriers"], ["topology", "Topology"], ["services", "Services"], ["explore", "Explore"], ["devices", "Devices"], ["agents", "Agents"], ["data", "Data"]];
 const gbps = (bps) => (bps == null ? "–" : bps >= 1e12 ? (bps / 1e12).toFixed(2) + " Tb/s" : bps >= 1e9 ? (bps / 1e9).toFixed(1) + " Gb/s" : (bps / 1e6).toFixed(0) + " Mb/s");
 const pct = (v, d = 0) => (v == null || Number.isNaN(v) ? "–" : (v * 100).toFixed(d) + "%");
@@ -386,14 +400,31 @@ function render(el, ctx) {
   const tabs = h("div", { class: "tabs", role: "tablist" });
   const body = h("div");
   const synth = h("span", { class: "no-synth", title: "Everything on these pages is made up: a simulated carrier network, written into ChloeDB tables every minute" }, "synthetic data");
+  // On a phone the header's actions fold into one menu, so the page starts on the first screen.
+  const headMenu = h("button", { class: "btn sm no-hmenu", title: "The view, the simulator and the SQL", "aria-label": "Menu", "aria-haspopup": "menu" }, C.icon("menu"));
+  headMenu.onclick = () => {
+    const page = (current || [])[0] || "", sim = app.status?.sim;
+    C.menu(headMenu, [
+      page === "leadership" ? { label: "Engineer view", icon: "user", onclick: () => app.go() } : { label: "Leadership view", icon: "overview", onclick: () => app.go("leadership") },
+      sim?.simulate && sim.fault_active ? { label: `End the fault (${sim.fault_phase})`, icon: "stop", onclick: async () => { try { await ctx.api("/v1/sim/end", { body: {} }); C.toast("The fault was repaired; its alerts clear within a few minutes", "ok"); poll(); } catch (e) { C.toast(e.message, "bad"); } } } : null,
+      sim?.simulate ? { label: "Inject a fault…", icon: "bolt", onclick: () => injectMenu(app, headMenu) } : null,
+      { label: sqlN.textContent, icon: "sql", onclick: () => showSql(app) },
+    ].filter(Boolean));
+  };
   el.append(h("div", { class: "no-head" }, h("h1", {}, "Network operations"), sub, synth,
-    h("div", { class: "tools" }, alt, simEl, injectBtn, sqlBtn)), h("div", { class: "no-cmdrow" }, cmd.el, agentBtn), tabs, body);
+    h("div", { class: "tools" }, alt, simEl, injectBtn, sqlBtn, headMenu)), h("div", { class: "no-cmdrow" }, cmd.el, agentBtn), tabs, body);
   el.classList.add("no-root");
   assistant(app, el);
 
+  // The page opened first asks for its answer beside /v1/status rather than after it: one round trip less on a deep link.
+  const pre = new Map(), opened = Date.now();
+  const firstPath = FIRST[(ctx.path() || [])[0] || ""];
+  if (firstPath && !(ctx.path() || [])[1]) { const p = ctx.api(firstPath); p.catch(() => {}); pre.set(firstPath, p); }
   /** The app's API, keeping the queries each answer says it ran. */
   app.call = async (path, opts) => {
-    const j = await ctx.api(path, opts);
+    const early = !opts && pre.get(path);
+    if (early) pre.delete(path);
+    const j = early && Date.now() - opened < 10000 ? await early.catch(() => ctx.api(path, opts)) : await ctx.api(path, opts);
     if (j && Array.isArray(j.queries)) {
       app.queries.set(path.split("?")[0], j.queries);
       let n = 0, ms = 0;
@@ -417,8 +448,9 @@ function render(el, ctx) {
     const main = el.closest("main");
     if (main) main.scrollTop = 0;
     const page = path[0] || "";
-    for (const b of tabs.children) b.setAttribute("aria-selected", String(b.dataset.p === page));
+    for (const b of tabs.querySelectorAll("button[data-p]")) b.setAttribute("aria-selected", String(b.dataset.p === page));
     tabs.style.display = page === "leadership" ? "none" : "";
+    fitTabs();
     drawAlt(page);
     if (!ready) return;
     if (page !== "map") app.map = null;
@@ -426,12 +458,32 @@ function render(el, ctx) {
     const f = { "": shiftPage, map: mapPage, dash: dashPage, diagnose: diagnosePage, network: overviewPage, customers: customersPage, carriers: carriersPage, leadership: leadershipPage, incidents: path[1] ? incidentRoom : incidentsPage, topology: topologyPage, alerts: alertsPage, changes: changesPage, services: servicesPage, explore: explorePage, devices: devicesPage, agents: agentsPage, data: dataPage }[page] || shiftPage;
     stop = f(body, app, path);
   };
+  // The tabs that do not fit go into a "More" menu at the end of the row, the page in view always shown.
+  const more = h("button", { class: "no-more", "aria-haspopup": "menu", title: "The other pages" }, "More", h("span", { class: "n", hidden: true }), C.icon("down"));
+  const fitTabs = () => {
+    const btns = [...tabs.querySelectorAll("button[data-p]")];
+    for (const b of btns) b.style.display = "";
+    more.style.display = "none";
+    if (!tabs.clientWidth || tabs.scrollWidth <= tabs.clientWidth + 1) return;
+    more.style.display = "";
+    const page = (current || [])[0] || "";
+    for (let k = btns.length - 1; k >= 0 && tabs.scrollWidth > tabs.clientWidth + 1; k--) if (btns[k].dataset.p !== page) btns[k].style.display = "none";
+    const rest = btns.filter((b) => b.style.display === "none");
+    const flagged = rest.filter((b) => b.querySelector(".n")).length;
+    const n = more.querySelector(".n");
+    n.hidden = !flagged; n.textContent = String(flagged);
+    more.title = `The other pages: ${rest.map((b) => b.dataset.label).join(", ")}`;
+    more.onclick = () => C.menu(more, rest.map((b) => ({ label: b.dataset.label + (b.querySelector(".n") ? ` (${b.querySelector(".n").textContent})` : ""), onclick: () => b.click() })));
+  };
   const drawTabs = (st) => {
     const badge = { map: st?.estate?.broken || 0, diagnose: st?.open_incidents ? "!" : 0, incidents: st?.open_incidents || 0, alerts: st?.firing || 0, "": st?.waiting || 0, carriers: st?.notices || 0 };
     const page = (current || [])[0] || "";
-    tabs.replaceChildren(...PAGES.map(([p, label]) => h("button", { role: "tab", dataset: { p }, "aria-selected": String(p === page), onclick: () => app.go(...(p ? [p] : [])) }, label, badge[p] ? h("span", { class: "n", style: p === "incidents" ? { background: "var(--crit-soft)", color: "var(--crit-ink)" } : null }, String(badge[p])) : null)));
+    tabs.replaceChildren(...PAGES.map(([p, label]) => h("button", { role: "tab", dataset: { p, label }, "aria-selected": String(p === page), onclick: () => app.go(...(p ? [p] : [])) }, label, badge[p] ? h("span", { class: "n", style: p === "incidents" ? { background: "var(--crit-soft)", color: "var(--crit-ink)" } : null }, String(badge[p])) : null)), more);
+    fitTabs();
   };
   drawTabs(null);
+  const tabsSeen = typeof ResizeObserver === "function" ? new ResizeObserver(() => fitTabs()) : null;
+  tabsSeen?.observe(tabs);
   const setup = h("div", { class: "no-setup" });
   const poll = async () => {
     let st;
@@ -451,6 +503,7 @@ function render(el, ctx) {
       setup.replaceChildren(C.icon("db", "lg"), h("h2", {}, "Building the network"), h("div", { class: "dim" }, st.phase + "…"), h("div", { class: "bar" }, h("i", { style: { width: Math.round(st.progress * 100) + "%" } })),
         h("div", { class: "small muted" }, st.error || "Creating 39 tables, a month of history, the last hours of telemetry, and the estate behind the backbone with two months of its faults and changes. This takes about a minute."));
       if (!setup.isConnected) body.replaceChildren(setup);
+      pre.clear();
       return;
     }
     if (!ready) { ready = true; show(ctx.path()); }
@@ -459,7 +512,7 @@ function render(el, ctx) {
   const stopPoll = C.every(5000, poll, true, { always: true });
   current = ctx.path();
   ctx.onPath(show);
-  return () => { stopPoll(); app.agent?.stop(); try { stop?.(); } catch (e) { console.warn(e); } };
+  return () => { stopPoll(); tabsSeen?.disconnect(); app.agent?.stop(); try { stop?.(); } catch (e) { console.warn(e); } };
 }
 
 // ---------------------------------------------------------------- shared pieces
@@ -517,14 +570,17 @@ function logLines(app, lines, mark) {
   return h("div", { class: "no-log" }, lines.map((l) => h("div", { class: "ln s" + (l.sev ?? 6) }, h("span", { class: "muted", title: l.ts }, C.when(T(l.ts))), h("span", {}, l.device ? h("a", { class: "no-link", onclick: () => deviceDrawer(app, l.device) }, l.device) : (l.severity || "")), h("span", { class: "m" }, hl(l.message)))));
 }
 
-/** An agent's steps: what it asked, what it found, and the SQL on a click. */
-function steps(app, list) {
+/** An agent's steps: what it asked, what it found, and the SQL on a click.
+ * `open`, when given, is a Set of the steps shown open, kept by the caller so
+ * that a step stays open when the list is drawn again. */
+function steps(app, list, open) {
   const { h, C } = app;
   if (!list.length) return C.empty("agent", "No steps kept");
   return h("div", {}, list.map((st) => {
     const code = st.sql_text ? C.sqlBlock(st.sql_text) : null;
-    if (code) code.style.display = "none";
-    const top = h("div", { class: "top", title: st.sql_text ? "Show the SQL" : null, onclick: () => { if (code) code.style.display = code.style.display === "none" ? "" : "none"; } },
+    const key = `${st.n}:${st.tool}:${st.title}`;
+    if (code && !open?.has(key)) code.style.display = "none";
+    const top = h("div", { class: "top", title: st.sql_text ? "Show the SQL" : null, onclick: () => { if (!code) return; const show = code.style.display === "none"; code.style.display = show ? "" : "none"; if (open) { if (show) open.add(key); else open.delete(key); } } },
       h("span", { class: "n" }, st.n), h("span", { class: "no-tool " + st.tool }, st.tool === "reason" ? "think" : st.tool), h("b", {}, st.title),
       h("span", { class: "small muted", style: { whiteSpace: "nowrap" } }, st.tool === "reason" ? "" : `${C.fmt.n(st.row_count)} rows · ${C.fmt.ms(st.ms)}`));
     return h("div", { class: "no-step" }, top, st.detail ? h("div", { class: "find" }, st.detail) : null, code);
@@ -715,6 +771,16 @@ function mapLegend(app, mode) {
 
 /** replaceChildren that takes nested lists and skips what is absent. */
 function put(el, ...kids) { el.replaceChildren(...kids.flat(Infinity).filter((k) => k != null && k !== false)); }
+
+/** Draw into el only when what it shows changed: a page that refreshes keeps
+ * what was opened, scrolled or hovered in a piece whose rows are the same. */
+function putIf(el, rows, build) {
+  const sig = JSON.stringify(rows ?? null);
+  if (el._sig === sig) return false;
+  el._sig = sig;
+  put(el, build());
+  return true;
+}
 
 
 /** Fetch a path now and every `ms`; draw(answer, first). Returns its stop. */
@@ -921,6 +987,10 @@ function incidentRoom(body, app, path) {
   const map = topoMap(app, { mode: "live" });
   const causeEl = h("div"), actionsEl = h("div"), chartsEl = h("div", { class: "no-mini" }), stepsEl = h("div"), rcptEl = h("div"), logsEl = h("div");
   const replayEl = h("div"), keyEl = h("div");
+  // The right column, a holder per card, each drawn again only when its rows change.
+  const R = Object.fromEntries(["timeline", "alerts", "blast", "change", "runbook", "similar", "judgments"].map((k) => [k, h("div")]));
+  right.append(...Object.values(R));
+  const openSteps = new Set();
   const mapCard = C.card({ title: "Where it is", sub: "the devices the incident touches, their neighbours dimmed", body: [replayEl, map, mapLegend(app, "live")] });
   const stepsSub = h("span", { class: "sub" });
   const board = boardCard(app, id);
@@ -1018,7 +1088,7 @@ function incidentRoom(body, app, path) {
     const rc = j.runs.filter((r) => r.agent === "root-cause").pop();
     const last = j.steps[j.steps.length - 1];
     const because = last && last.tool === "reason" && last.detail.includes("Because:") ? last.detail.split("Because:")[1].split(";").map((x) => x.trim().replace(/\.$/, "")).filter(Boolean) : [];
-    put(causeEl, i.root_cause ? h("div", {}, h("div", { class: "no-cause" }, i.root_cause),
+    putIf(causeEl, [i.root_cause, i.confidence, because, rc], () => i.root_cause ? h("div", {}, h("div", { class: "no-cause" }, i.root_cause),
       h("div", { class: "no-conf", style: { marginTop: "10px" } }, h("div", { class: "meter" }, h("i", { style: { width: i.confidence * 100 + "%", background: i.confidence >= 0.8 ? "var(--good)" : i.confidence >= 0.5 ? "var(--warn)" : "var(--crit)" } })), h("b", {}, pct(i.confidence) + " confident")),
       because.length ? h("ul", { class: "no-why" }, because.map((b) => h("li", {}, b))) : null,
       rc ? runFacts(app, rc) : null)
@@ -1028,7 +1098,7 @@ function incidentRoom(body, app, path) {
     else if (!keyEl.firstChild) put(keyEl, h("button", { class: "btn xs", style: { marginTop: "10px" }, title: "The simulator knows what it broke. The agent is never shown this.", onclick: () => checkKey(i) }, C.icon("eye"), "Check against the simulator's answer key"));
     stepsSub.textContent = rc ? `${rc.queries ?? j.steps.length - 1} queries, ${C.fmt.ms(rc.ms)} in the database. Click a step for its SQL.` : "";
     // Actions.
-    put(actionsEl, j.actions.length ? j.actions.map((a) => actionCard(app, a, () => stop.run())) : C.empty("bolt", "No actions proposed"));
+    putIf(actionsEl, j.actions, () => j.actions.length ? j.actions.map((a) => actionCard(app, a, () => stop.run())) : C.empty("bolt", "No actions proposed"));
     focusMap();
     // Charts: rebuilt only when the set of series changes.
     const mark = () => [{ t: T(i.started), label: "detected" }, i.resolved ? { t: T(i.resolved), label: "resolved" } : null].filter(Boolean);
@@ -1052,24 +1122,24 @@ function incidentRoom(body, app, path) {
       for (const r of rows) { const t = T(r.ts); const p = at.get(t) || { t }; p[r[c.key]] = c.get(r); at.set(t, p); }
       c.ch.update([...at.values()].sort((a, b) => a.t - b.t));
     }
-    put(stepsEl, steps(app, j.steps));
-    put(rcptEl, receipt(app, j.receipts));
-    put(logsEl, logLines(app, j.logs));
+    // What was opened or scrolled stays so: a piece is drawn again only when its rows change.
+    putIf(stepsEl, j.steps, () => steps(app, j.steps, openSteps));
+    putIf(rcptEl, j.receipts, () => receipt(app, j.receipts));
+    putIf(logsEl, j.logs, () => logLines(app, j.logs));
     // The right column.
-    put(right, 
-      C.card({ title: "Timeline", body: timeline(app, j.timeline) }),
-      C.card({ title: "Alerts", sub: `${j.alerts.length} grouped into this incident`, body: h("ul", { class: "no-list" }, j.alerts.map((a) => h("li", {}, h("div", { class: "row between nw" }, h("b", { class: "ellipsis" }, a.rule_name), sevPill(app, a.severity)),
-        h("div", { class: "small muted" }, h("a", { class: "no-link", onclick: () => (a.entity_kind === "link" ? linkDrawer(app, a.entity) : a.entity_kind === "device" ? deviceDrawer(app, a.entity) : a.entity_kind === "service" ? serviceDrawer(app, a.entity) : null) }, a.entity), ` · ${C.fmt.n(a.reading)} ${a.unit} against ${C.fmt.n(a.threshold)} · ${a.status === "firing" ? "firing since " + hhmm(T(a.started)) : "cleared " + hhmm(T(a.ended))}`)))) }),
-      C.card({ title: "Blast radius", sub: "one graph walk from the alerting devices", body: [
+    putIf(R.timeline, j.timeline, () => C.card({ title: "Timeline", body: timeline(app, j.timeline) }));
+    putIf(R.alerts, j.alerts, () => C.card({ title: "Alerts", sub: `${j.alerts.length} grouped into this incident`, body: h("ul", { class: "no-list" }, j.alerts.map((a) => h("li", {}, h("div", { class: "row between nw" }, h("b", { class: "ellipsis" }, a.rule_name), sevPill(app, a.severity)),
+        h("div", { class: "small muted" }, h("a", { class: "no-link", onclick: () => (a.entity_kind === "link" ? linkDrawer(app, a.entity) : a.entity_kind === "device" ? deviceDrawer(app, a.entity) : a.entity_kind === "service" ? serviceDrawer(app, a.entity) : null) }, a.entity), ` · ${C.fmt.n(a.reading)} ${a.unit} against ${C.fmt.n(a.threshold)} · ${a.status === "firing" ? "firing since " + hhmm(T(a.started)) : "cleared " + hhmm(T(a.ended))}`)))) }));
+    putIf(R.blast, [j.blast, j.customers], () => C.card({ title: "Blast radius", sub: "one graph walk from the alerting devices", body: [
         h("div", { class: "no-sec" }, "Services that ride on them"), h("ul", { class: "no-list" }, j.blast.map((s) => h("li", { class: "row between nw" }, h("a", { class: "no-link", onclick: () => serviceDrawer(app, s.id) }, s.name, h("span", { class: "muted small" }, ` · tier ${s.tier} · ${s.customers} customers`)), h("span", { class: "num small" }, money(s.revenue_per_min) + "/min")))),
-        j.customers.length ? [h("div", { class: "no-sec" }, "Customers attached there"), h("ul", { class: "no-list" }, j.customers.slice(0, 6).map((c) => h("li", { class: "row between nw" }, h("span", { class: "ellipsis" }, c.name, h("span", { class: "muted small" }, ` · ${c.tier} · ${c.device}`)), h("span", { class: "num small" }, money(c.mrr) + "/mo"))))] : null] }),
-      j.change ? C.card({ title: "The change", sub: j.change.id, body: [h("b", {}, j.change.title), h("div", { class: "small dim", style: { margin: "4px 0 8px" } }, j.change.description),
-        kv(app, [["Owner", j.change.owner], ["Approved by", j.change.approver], ["Executed", C.when(T(j.change.executed))], ["Risk declared", j.change.risk], ["Roll back with", j.change.rollback_plan]]), h("div", { class: "no-sec" }, "What it changed"), diffBlock(app, j.change.diff)] }) : null,
-      j.runbook ? C.card({ title: "Runbook", sub: `${j.runbook.id} · closed ${j.runbook.wins} of the ${j.runbook.uses} incidents it was used on`, body: [h("b", {}, j.runbook.title), h("div", { class: "small", style: { whiteSpace: "pre-wrap", marginTop: "6px", color: "var(--text-2)", lineHeight: 1.5 } }, j.runbook.body)],
-        foot: h("button", { class: "btn sm", onclick: () => closeDrawer(i, j.runbook, j.similar) }, C.icon("check"), "It worked") }) : null,
-      C.card({ title: "It looks like", sub: "past incidents, by words and meaning", body: j.similar.length ? h("ul", { class: "no-list" }, j.similar.map((s) => h("li", {}, h("a", { class: "no-link", href: app.ctx.href("incidents", s.id) }, s.title),
-        h("div", { class: "small muted" }, `${s.id} · ${KIND[s.category] || s.category} · ${C.fmt.ago(T(s.started))} · resolved in ${mins(s.mttr_min)}${s.runbook ? " with " + s.runbook : ""}`)))) : C.empty("search", "Nothing similar") }),
-      j.judgments.length ? C.card({ title: "Judgments", sub: "who said which runbook worked", body: h("ul", { class: "no-list" }, j.judgments.map((g) => h("li", { class: "small" }, `${g.judge || g.who || "Someone"}: ${g.runbook || g.doc_id} graded ${g.grade}`))) }) : null);
+        j.customers.length ? [h("div", { class: "no-sec" }, "Customers attached there"), h("ul", { class: "no-list" }, j.customers.slice(0, 6).map((c) => h("li", { class: "row between nw" }, h("span", { class: "ellipsis" }, c.name, h("span", { class: "muted small" }, ` · ${c.tier} · ${c.device}`)), h("span", { class: "num small" }, money(c.mrr) + "/mo"))))] : null] }));
+    putIf(R.change, j.change, () => j.change ? C.card({ title: "The change", sub: j.change.id, body: [h("b", {}, j.change.title), h("div", { class: "small dim", style: { margin: "4px 0 8px" } }, j.change.description),
+        kv(app, [["Owner", j.change.owner], ["Approved by", j.change.approver], ["Executed", C.when(T(j.change.executed))], ["Risk declared", j.change.risk], ["Roll back with", j.change.rollback_plan]]), h("div", { class: "no-sec" }, "What it changed"), diffBlock(app, j.change.diff)] }) : null);
+    putIf(R.runbook, [j.runbook, j.similar, i.resolved], () => j.runbook ? C.card({ title: "Runbook", sub: `${j.runbook.id} · closed ${j.runbook.wins} of the ${j.runbook.uses} incidents it was used on`, body: [h("b", {}, j.runbook.title), h("div", { class: "small", style: { whiteSpace: "pre-wrap", marginTop: "6px", color: "var(--text-2)", lineHeight: 1.5 } }, j.runbook.body)],
+        foot: h("button", { class: "btn sm", onclick: () => closeDrawer(i, j.runbook, j.similar) }, C.icon("check"), "It worked") }) : null);
+    putIf(R.similar, j.similar, () => C.card({ title: "It looks like", sub: "past incidents, by words and meaning", body: j.similar.length ? h("ul", { class: "no-list" }, j.similar.map((s) => h("li", {}, h("a", { class: "no-link", href: app.ctx.href("incidents", s.id) }, s.title),
+        h("div", { class: "small muted" }, `${s.id} · ${KIND[s.category] || s.category} · ${C.fmt.ago(T(s.started))} · resolved in ${mins(s.mttr_min)}${s.runbook ? " with " + s.runbook : ""}`)))) : C.empty("search", "Nothing similar") }));
+    putIf(R.judgments, j.judgments, () => j.judgments.length ? C.card({ title: "Judgments", sub: "who said which runbook worked", body: h("ul", { class: "no-list" }, j.judgments.map((g) => h("li", { class: "small" }, `${g.judge || g.who || "Someone"}: ${g.runbook || g.doc_id} graded ${g.grade}`))) }) : null);
   }, 12000);
   return () => { stop(); stopTopo(); stopReplay(); board.stop(); };
 }
@@ -1724,17 +1794,24 @@ const STATE_COLOR = { ok: "var(--good)", warn: "var(--warn)", bad: "var(--crit)"
 function diagnosePage(body, app, path) {
   const { h, C, charts } = app;
   const hero = h("div"), grid = h("div"), listEl = h("div"), inv = h("div"), estateEl = h("div"), side = h("div", { class: "no-col" });
+  // The investigation, and a note above it when what it is about has moved on.
+  const invNote = h("div"), invBody = h("div");
+  inv.append(invNote, invBody);
   body.append(hero, h("div", { class: "no-cols wide" }, h("div", { class: "no-col" }, C.card({ title: "The stack, by place", sub: "customers at the top, power at the bottom: a fault shows on its own layer and on every layer above it", body: [grid, listEl] }), inv), side));
   let sel = null, picked = null, last = null, auto = true;
+  // What the card investigates: whether the page picked it (auto), whether it was the start then, and when.
+  let pickedAuto = false, pickedStart = false, pickedAt = 0;
+  const keyOf = (o) => (o ? `${o.kind}:${o.id}` : "");
   const openIt = (o) => o.kind === "link" ? linkDrawer(app, o.id) : o.kind === "device" ? deviceDrawer(app, o.id) : o.kind === "service" ? serviceDrawer(app, o.id) : app.go("customers", o.id);
 
   // One broken thing, asked five ways of the same database.
-  const investigate = async (o) => {
-    picked = o;
+  const investigate = async (o, how = {}) => {
     if (o.kind === "customer") { app.go("customers", o.id); return; }
-    put(inv, C.card({ title: `Investigating ${o.id}`, body: h("div", { class: "muted" }, "Asking the graph, the logs, the history and the past…") }));
+    picked = o; pickedAuto = !!how.auto; pickedStart = how.start ?? keyOf(o) === keyOf(last?.start?.first); pickedAt = Date.now();
+    put(invNote);
+    put(invBody, C.card({ title: `Investigating ${o.id}`, body: h("div", { class: "muted" }, "Asking the graph, the logs, the history and the past…") }));
     let j;
-    try { j = await app.call(`/v1/investigate?kind=${o.kind}&id=${encodeURIComponent(o.id)}`); } catch (e) { put(inv, C.failure(e, "The investigation")); return; }
+    try { j = await app.call(`/v1/investigate?kind=${o.kind}&id=${encodeURIComponent(o.id)}`); } catch (e) { if (picked === o) put(invBody, C.failure(e, "The investigation")); return; }
     if (picked !== o) return;
     const L = Object.fromEntries(j.lenses.map((l) => [l.id, l]));
     const total = j.lenses.reduce((a, l) => a + l.ms, 0), nq = j.lenses.reduce((a, l) => a + l.queries, 0);
@@ -1746,7 +1823,7 @@ function diagnosePage(body, app, path) {
     const fields = j.kind === "link" ? [["loss", "Loss", (v) => v.toFixed(2) + "%"], ["rx_dbm", "Receive power", (v) => v.toFixed(1) + " dBm"], ["util", "Load", (v) => pct(v)], ["errors", "Errors", (v) => C.fmt.n(v)]]
       : j.kind === "device" ? [["cpu", "CPU", (v) => v.toFixed(0) + "%"], ["bgp_up", "BGP sessions", (v) => String(v)], ["temp_c", "Temperature", (v) => v.toFixed(0) + " °C"]]
       : [["errors", "Failing requests", (v) => C.fmt.n(v)], ["latency_p95", "p95 latency", (v) => v.toFixed(0) + " ms"]];
-    put(inv, C.card({ title: j.title, sub: j.now.length ? j.now.join(" · ") : "nothing wrong with it in the last three minutes",
+    put(invBody, C.card({ title: j.title, sub: j.now.length ? j.now.join(" · ") : "nothing wrong with it in the last three minutes",
       tools: h("span", { class: "row nw", style: { gap: "6px" } }, j.incident ? h("button", { class: "btn xs primary", onclick: () => app.go("incidents", j.incident) }, `Open ${j.incident}`) : null, h("button", { class: "btn xs", onclick: () => openIt(o) }, "Open it")),
       body: [
         h("div", { class: "no-lenses" },
@@ -1782,9 +1859,17 @@ function diagnosePage(body, app, path) {
         h("div", { class: "row", style: { gap: "8px", marginBottom: "4px" } }, C.pill(s.state === "bad" ? "bad" : "warn", "start here"), h("span", { class: "small muted" }, `the lowest layer where something is ${s.state === "bad" ? "broken" : "worn"} · as of ${utc(j.at)} UTC`)),
         h("h2", {}, `${s.layer_name}, ${colName}: ${f.id} ${f.reading}`),
         h("p", {}, `${f.where}${f.circuit ? ` · circuit ${f.circuit} from ${f.provider}` : ""}. `, s.above.length ? `What shows on ${s.above.join(", ")} above it most likely follows from this.` : "Nothing above it is affected yet.", f.change ? ` ${f.change.id} was carried out here ${C.fmt.ago(T(f.change.executed))}.` : "")),
-        h("div", { class: "row", style: { gap: "8px" } }, f.incident ? h("button", { class: "btn", onclick: () => app.go("incidents", f.incident) }, `Open ${f.incident}`) : null, h("button", { class: "btn primary", onclick: () => { auto = false; investigate(f); } }, C.icon("search"), "Investigate"))));
-      if (auto && !picked) investigate(f);
+        h("div", { class: "row", style: { gap: "8px" } }, f.incident ? h("button", { class: "btn", onclick: () => app.go("incidents", f.incident) }, `Open ${f.incident}`) : null, h("button", { class: "btn primary", onclick: () => { auto = false; investigate(f, { start: true }); } }, C.icon("search"), "Investigate"))));
     } else put(hero, h("div", { class: "no-hero calm" }, h("div", {}, h("h2", {}, "Nothing is broken on any layer"), h("p", {}, `Every link, device and service was inside its limits in the last three minutes (as of ${utc(j.at)} UTC). Trace a path on the right, or inject a fault at the top to see this page work.`))));
+    // The investigation follows the start while the page picks it; one picked by hand stays, marked when it has moved on.
+    const startKey = keyOf(s?.first);
+    if (s && auto && (!picked || (pickedAuto && keyOf(picked) !== startKey))) investigate(s.first, { auto: true, start: true });
+    else if (picked) {
+      const pk = keyOf(picked), broken = j.offenders.some((o) => keyOf(o) === pk);
+      const why = !broken ? `${picked.id} is no longer broken` : pickedStart && pk !== startKey ? `${picked.id} is no longer where to start` : "";
+      putIf(invNote, [why, startKey, pickedAt], () => why ? h("div", { class: "banner no-stale", style: { marginBottom: "8px", borderColor: "var(--warn)" } }, C.icon("clock"), h("span", {}, ` This investigation is as of ${utc(new Date(pickedAt).toISOString())} UTC: ${why}${s ? `; the start now is ${s.first.id}` : "; nothing is broken on any layer now"}. `),
+        h("span", { class: "row nw", style: { gap: "6px", display: "inline-flex" } }, h("button", { class: "btn xs", onclick: () => investigate(picked, { auto: pickedAuto, start: false }) }, C.icon("refresh"), "Investigate it again"), s ? h("button", { class: "btn xs primary", onclick: () => { auto = true; investigate(s.first, { auto: true, start: true }); } }, `Investigate ${s.first.id}`) : null)) : null);
+    }
     const layers = [...j.layers].reverse();
     put(grid, h("div", { class: "no-stack", style: { gridTemplateColumns: `170px repeat(${j.cols.length}, minmax(44px, 1fr))` } },
       h("span", {}), j.cols.map((c) => h("span", { class: "ch", title: c.city }, c.name)),
@@ -1813,7 +1898,7 @@ function diagnosePage(body, app, path) {
         h("div", {}, h("b", {}, "Or follow a path. "), "Trace walks from a customer or a device to another, hop by hop, and marks the hop where it goes wrong.")) }));
   };
   const stop = live(app, body, "/v1/where", draw, 20000);
-  if (path[1] && path[2]) { auto = false; investigate({ kind: path[1], id: decodeURIComponent(path[2]) }); }
+  if (path[1] && path[2]) { auto = false; investigate({ kind: path[1], id: decodeURIComponent(path[2]) }, { start: false }); }
   return stop;
 }
 
@@ -2109,7 +2194,7 @@ function leadershipPage(body, app) {
     const cannot = j.risk.failover.filter((f) => !f.survives);
     note.textContent = `${j.days} days of records; measured rates over the ${j.kept_hours} hours of telemetry kept`;
     put(kpis,
-      kpi(app, "Services on target", `${met}/${j.services.length}`, "for the period"),
+      kpi(app, "Services on target", `${met}/${j.services.length}`, `measured over ${j.kept_hours} h, incidents over ${j.days} days`),
       kpi(app, "Incidents", String(inc.count), `${inc.sev1} sev1 · ${j.days} days`),
       kpi(app, "Time to detect", Math.round(inc.ttd) + " s", "mean"),
       kpi(app, "Time to resolve", mins(inc.mttr), "mean"),
@@ -2118,14 +2203,14 @@ function leadershipPage(body, app) {
       kpi(app, "Changes as planned", total ? pct(ch.completed / total) : "–", `${ch.rolled_back} of ${total} rolled back`),
       kpi(app, "Spans that cannot fail over", `${cannot.length}/${j.risk.failover.length}`, "at their measured peak"));
     put(main,
-      C.card({ title: "Are we meeting what we sold?", sub: "each service against its objective; the budget is the failure its objective allows", flush: true, body: C.table([
+      C.card({ title: "Are we meeting what we sold?", sub: `each service against its objective, over two windows: the rate and the budget it spent over the ${j.kept_hours} h of telemetry kept, and the minutes of incidents over ${j.days} days against what the objective allows`, flush: true, body: C.table([
         { key: "name", label: "Service", render: (r) => h("span", {}, h("b", {}, r.name), " ", h("span", { class: "muted small" }, `tier ${r.tier} · ${r.owner}`)) },
         { key: "slo_target", label: "Objective", num: true, render: (r) => (r.slo_target * 100).toFixed(2) + "%" },
-        { key: "success", label: "Measured", num: true, render: (r) => h("span", { style: r.met ? null : { color: "var(--crit-ink)", fontWeight: 600 } }, (r.success * 100).toFixed(3) + "%") },
-        { key: "budget_used", label: "Error budget spent", render: (r) => h("span", { class: "row nw", style: { gap: "8px" } }, bar(r.budget_used), h("span", { class: "small" }, pct(r.budget_used))), sort: (r) => r.budget_used },
-        { key: "degraded_min", label: "Incident minutes", num: true, render: (r) => h("span", { title: `its objective allows ${r.allowed_min} minutes over the period`, style: r.period_used > 1 ? { color: "var(--crit-ink)", fontWeight: 600 } : null }, `${Math.abs(r.degraded_min)} of ${r.allowed_min}`), sort: (r) => r.period_used },
+        { key: "success", label: `Measured, last ${j.kept_hours} h`, num: true, render: (r) => h("span", { style: r.met ? null : { color: "var(--crit-ink)", fontWeight: 600 } }, (r.success * 100).toFixed(3) + "%") },
+        { key: "budget_used", label: `Budget spent, last ${j.kept_hours} h`, render: (r) => h("span", { class: "row nw", style: { gap: "8px" } }, bar(r.budget_used), h("span", { class: "small" }, pct(r.budget_used))), sort: (r) => r.budget_used },
+        { key: "degraded_min", label: `Incident minutes, ${j.days} days`, num: true, render: (r) => h("span", { title: `its objective allows ${r.allowed_min} minutes in ${j.days} days`, style: r.period_used > 1 ? { color: "var(--crit-ink)", fontWeight: 600 } : null }, `${Math.abs(r.degraded_min)} of ${r.allowed_min}`), sort: (r) => r.period_used },
         { key: "customers", label: "Customers", num: true },
-        { key: "revenue_exposed", label: "Revenue exposed", num: true, render: (r) => money(Math.abs(r.revenue_exposed)) },
+        { key: "revenue_exposed", label: `Revenue exposed, ${j.days} days`, num: true, render: (r) => money(Math.abs(r.revenue_exposed)) },
       ], { rows: j.services, compact: true, sortKey: "degraded_min", desc: true, onRow: (r) => serviceDrawer(app, r.id) }) }),
       h("div", { class: "no-cols even" },
         C.card({ title: "What incidents cost", sub: "a week at a time", body: [trend, inc.by_change.length ? h("div", { class: "small", style: { marginTop: "8px" } }, h("b", {}, `${inc.by_change.length} began with a change: `), inc.by_change.map((x, i) => [i ? ", " : "", app.link(x.incident, "incidents", x.incident), " (", h("a", { class: "no-link", onclick: () => changeDrawer(app, x.change) }, x.change), ")"])) : null,
@@ -2569,9 +2654,39 @@ function mapPage(body, app, path) {
     Object.assign(view, { k, tx: px - wx(px) * k, ty: py - wy(py) * k });
     draw(); moved();
   }, { passive: false });
-  canvas.addEventListener("pointerdown", (e) => { const [px, py] = pos(e); drag = { px, py, tx: view.tx, ty: view.ty, moved: false }; canvas.setPointerCapture(e.pointerId); });
+  // Two fingers pinch: the place under their middle stays under it while the scale follows their distance.
+  const fingers = new Map();
+  let pinch = null;
+  const pair = () => { const [a, b] = [...fingers.values()]; return { d: Math.hypot(a[0] - b[0], a[1] - b[1]) || 1, mx: (a[0] + b[0]) / 2, my: (a[1] + b[1]) / 2 }; };
+  canvas.addEventListener("pointerdown", (e) => {
+    const [px, py] = pos(e);
+    fingers.set(e.pointerId, [px, py]);
+    canvas.setPointerCapture(e.pointerId);
+    if (fingers.size === 2) {
+      const q = pair();
+      cancelAnimationFrame(anim);
+      pinch = { d: q.d, k: view.k, wx: wx(q.mx), wy: wy(q.my) };
+      drag = null; tip.style.display = "none";
+      return;
+    }
+    if (fingers.size === 1) drag = { px, py, tx: view.tx, ty: view.ty, moved: false };
+  });
+  const lift = (e) => {
+    fingers.delete(e.pointerId);
+    if (pinch && fingers.size < 2) { pinch = null; drag = null; moved(); return true; }
+    return !!pinch;
+  };
+  canvas.addEventListener("pointercancel", (e) => { lift(e); drag = null; });
   canvas.addEventListener("pointermove", (e) => {
     const [px, py] = pos(e);
+    if (fingers.has(e.pointerId)) fingers.set(e.pointerId, [px, py]);
+    if (pinch) {
+      if (fingers.size < 2) return;
+      const q = pair(), k = Math.max(fitK * 0.6, Math.min(base ? 260 / base.site_r : 400, pinch.k * q.d / pinch.d));
+      Object.assign(view, { k, tx: q.mx - pinch.wx * k, ty: q.my - pinch.wy * k });
+      draw();
+      return;
+    }
     if (drag) {
       if (Math.hypot(px - drag.px, py - drag.py) > 3) drag.moved = true;
       if (drag.moved) { cancelAnimationFrame(anim); view.tx = drag.tx + px - drag.px; view.ty = drag.ty + py - drag.py; draw(); }
@@ -2587,6 +2702,7 @@ function mapPage(body, app, path) {
     tip.style.left = Math.min(W - 260, px + 14) + "px"; tip.style.top = Math.min(H - 50, py + 14) + "px";
   });
   canvas.addEventListener("pointerup", (e) => {
+    if (lift(e)) return;
     const d = drag; drag = null;
     if (!d) return;
     if (d.moved) { moved(); return; }
@@ -3131,7 +3247,8 @@ function intentOf(text) {
   return "";
 }
 
-const ID_RE = /\b((?:[a-z]+\d*-)+[a-z0-9]+(?:--[a-z0-9-]+)?)\b/g;
+// An id: a word that starts with a letter, then parts after dashes (cpe-019-s09-h02-waw, cr1-par--cr1-fra).
+const ID_RE = /\b([a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:--[a-z0-9-]+)?)\b/g;
 
 /** One answer: its paragraphs, its buttons and the queries it ran. */
 async function answer(app, text, hooks) {
@@ -3142,12 +3259,19 @@ async function answer(app, text, hooks) {
   // The object asked about: one named in the question, or the one picked.
   let id = null;
   for (const m of text.matchAll(ID_RE)) if (/\d/.test(m[1]) || /^(cr|br|ag|fw|sp|lf)\d/.test(m[1])) { id = m[1]; break; }
+  const named = id;
   const t = app.target();
-  if (!id && t && !/\b(network|everywhere|incidents)\b/.test(lower) && !/\bin (the )?[A-Z]/.test(text)) id = t.id;
   const intent = intentOf(text);
   const show = (oid) => h("button", { class: "btn xs", onclick: () => { if (app.map) app.map.open(oid); else { app.pending = { open: oid }; app.go("map", oid); } } }, C.icon("node"), "Show on the map");
   const p = (...kids) => h("p", {}, ...kids);
   const place = app.scope();
+
+  // The shift's own questions, about no object: what fires, and a customer by name.
+  if (/\balerts?\b/.test(lower) && !/\brules?\b/.test(lower)) return alertsAnswer(app, call, queries, named);
+  const who = await customerIn(app, text);
+  const forWho = who ? await customerAnswer(app, call, queries, who) : null;
+  if (forWho) return forWho;
+  if (!id && t && !/\b(network|everywhere|incidents)\b/.test(lower) && !/\bin (the )?[A-Z]/.test(text)) id = t.id;
 
   if (id && intent) {
     let j;
@@ -3199,7 +3323,7 @@ async function answer(app, text, hooks) {
         if (cause && cause.id !== n.id) steps.push(`Work on ${cause.id}, not on ${n.id}: it is ${cause.hop} ${cause.hop === 1 ? "hop" : "hops"} up and is ${cause.state}.`);
         if (j.suspect) steps.push(`Check the change ${j.suspect.minutes_before} min before it began (${j.suspect.ticket || j.suspect.text}) and roll it back if it touched ${j.suspect.node}.`);
         const ended = (j.before?.ended || [])[0];
-        if (ended) steps.push(`Faults like this on ${(KIND_NAME[j.before.kind] || j.before.kind).toLowerCase()}s most often were ${ended.cause} and cleared in ${mins(ended.minutes)} on average (${C.fmt.n(ended.n)} times).`);
+        if (ended) steps.push(`Of the ${C.fmt.n(j.before.matched ?? ended.n)} faults on ${(KIND_NAME[j.before.kind] || j.before.kind).toLowerCase()}s that read most like this one, ${C.fmt.n(ended.n)} were ${ended.cause} and cleared in ${mins(ended.minutes)} on average.`);
         if (j.incident || cause?.incident) steps.push(`It is part of ${(j.incident || cause.incident).id}: post in its room rather than opening a new one.`);
         else if (j.downstream.not_ok >= 20) steps.push(`${C.fmt.n(j.downstream.not_ok)} objects behind it are not ok: open an incident and tell the customers' account teams.`);
       }
@@ -3213,7 +3337,7 @@ async function answer(app, text, hooks) {
       const body = [];
       if (!b.words) body.push(p(`${n.id} has had no fault to compare in thirty days.`));
       else {
-        body.push(p(`Faults on ${(KIND_NAME[b.kind] || b.kind).toLowerCase()}s that read like “${b.words}”:`));
+        body.push(p(`The ${b.matched != null ? C.fmt.n(b.matched) + " " : ""}faults on ${(KIND_NAME[b.kind] || b.kind).toLowerCase()}s that read most like “${b.words}”, by how they ended:`));
         if ((b.ended || []).length) body.push(h("ul", { class: "no-ag-ul" }, b.ended.slice(0, 5).map((e) => h("li", {}, `${e.cause}: ${C.fmt.n(e.n)} times, cleared in ${mins(e.minutes)} on average, ${mins(e.longest)} at the longest`))));
         if ((b.like || []).length) body.push(p(h("b", {}, "The closest: "), b.like.slice(0, 3).map((e) => `${e.node} ${C.fmt.ago(T(e.ts))} (${e.text})`).join("; "), "."));
       }
@@ -3253,12 +3377,80 @@ async function answer(app, text, hooks) {
   else if (where && !/\bin [A-Z]/.test(asked)) asked += where;
   const j = await call("/v1/map/ask", { body: { q: asked } });
   if (j.refused) return { body: [p(j.hint)], queries };
+  // What changed: the backbone's change calendar as well as the estate's events.
+  const changedIn = /^everything changed in the last (day|week)/.exec(asked);
+  const backbone = changedIn ? await backboneChanges(app, call, changedIn[1] === "week" ? 7 : 1) : null;
   if (!j.understood) return { body: [p(`I did not understand that. ${j.hint || ""}`), p("I can answer, about the object picked: what is wrong and why, what changed before it started, who is affected, what to do, how it went before, what depends on it; or search the network in a sentence.")], queries };
   const body = [p(h("b", {}, `${C.fmt.n(j.total)} ${j.total === 1 ? "match" : "matches"}`), ` for “${j.asked}”, read as: ${j.read.map((r) => r.text).join(", ")}.`)];
+  if (backbone) body.unshift(...backbone);
   const caveat = askCaveat(h, j);
   if (caveat) body.push(caveat);
   if (j.rows.length) body.push(h("ul", { class: "no-ag-ul" }, j.rows.slice(0, 6).map((r) => h("li", {}, h("a", { class: "no-link", onclick: () => app.map ? app.map.open(r.id) : app.go("map", r.id) }, r.id), ` · ${KIND_NAME[r.kind] || r.kind} · ${r.state}${r.latency_ms ? " · " + fms(r.latency_ms) : ""}`))));
   return { body, acts: [h("button", { class: "btn xs", onclick: () => { if (app.map) app.map.ask(asked); else { app.pending = { ask: asked }; app.go("map"); } } }, C.icon("search"), "Show them on the map")], queries, how: "the sentence became one statement" };
+}
+
+/** What fires now, the worst first; about one object when the question names one. */
+async function alertsAnswer(app, call, queries, named) {
+  const { h, C } = app;
+  const j = await call("/v1/alerts?status=firing");
+  const rank = { critical: 0, major: 1, minor: 2 };
+  const all = (j.alerts || []).filter((a) => !named || a.entity === named || (a.entity || "").split("--").includes(named)).sort((a, b) => (rank[a.severity] ?? 3) - (rank[b.severity] ?? 3) || T(b.started) - T(a.started));
+  const by = {};
+  for (const a of all) by[a.severity] = (by[a.severity] || 0) + 1;
+  const counts = Object.entries(by).sort((a, b) => (rank[a[0]] ?? 3) - (rank[b[0]] ?? 3)).map(([s, n]) => `${n} ${s}`).join(", ");
+  const of = named ? ` on ${named}` : "";
+  const body = [h("p", {}, h("b", {}, all.length ? `${all.length} ${all.length === 1 ? "alert is" : "alerts are"} firing${of}` : `No alert is firing${of}.`), all.length ? `: ${counts}.` : "")];
+  if (all.length) body.push(h("ul", { class: "no-ag-ul" }, all.slice(0, 6).map((a) => h("li", {}, h("b", {}, a.rule_name), ` on ${a.entity} · ${a.severity} · since ${hhmm(T(a.started))}`, a.incident ? h("span", {}, " · ", app.link(a.incident, "incidents", a.incident)) : h("span", { class: "muted" }, " · no incident"), a.acked_by ? h("span", { class: "muted" }, ` · acknowledged by ${a.acked_by}`) : null))));
+  const unowned = all.filter((a) => !a.acked_by && !a.incident).length;
+  if (unowned) body.push(h("p", {}, `${unowned} of them ${unowned === 1 ? "has" : "have"} neither an owner nor an incident.`));
+  return { body, acts: [h("button", { class: "btn xs", onclick: () => app.go("alerts") }, C.icon("alerts"), "Open Alerts")], queries, how: "netops_alerts WHERE status = 'firing'" };
+}
+
+/** A customer the question names: one of the backbone's, by its whole name, or one of the estate's ("Is Northwind Energy affected?"). */
+async function customerIn(app, text) {
+  const lower = text.toLowerCase();
+  try { app.customerList ||= (await app.ctx.api("/v1/customers")).customers || []; } catch { app.customerList = []; }
+  const c = [...app.customerList].sort((a, b) => b.name.length - a.name.length).find((c) => lower.includes(c.name.toLowerCase()));
+  if (c) return { backbone: c };
+  const m = /\b(?:[Cc]ustomer\s+|(?:[Ii]s|[Aa]re|[Ww]as|[Ww]ere|[Hh]ow (?:is|are)|[Ww]hat about)\s+)((?:[A-Z][\w&'.-]*)(?:\s+[A-Z][\w&'.-]*){0,3})(?:'s)?\b/.exec(text);
+  if (!m || /^(The|It|This|That|Anything|Everything|Anyone|Everyone|There|What|Which|Who)\b/.test(m[1])) return null;
+  if (!/^customer\s/i.test(m[0]) && !/\b(affected|hurt|impacted|ok|okay|down|fine|up|having|broken|degraded|trouble|issues?)\b/i.test(text)) return null;
+  return { estate: m[1], said: /^customer\s/i.test(m[0]) };
+}
+
+async function customerAnswer(app, call, queries, who) {
+  const { h, C } = app;
+  if (who.backbone) {
+    const c = who.backbone;
+    const j = await call(`/v1/customers/${encodeURIComponent(c.id)}`);
+    const body = [h("p", {}, h("b", {}, j.headline || `${c.name}: ${j.verdict}`), ` (${c.name} attaches at ${c.device}, ${c.site.toUpperCase()}, ${c.tier}).`)];
+    if ((j.reasons || []).length) body.push(h("ul", { class: "no-ag-ul" }, j.reasons.slice(0, 5).map((r) => h("li", {}, typeof r === "string" ? r : r.text || r.reason || JSON.stringify(r)))));
+    if ((j.incidents || []).length) body.push(h("p", {}, `Incidents that touch it: ${j.incidents.slice(0, 3).map((i) => i.id).join(", ")}.`));
+    return { body, acts: [h("button", { class: "btn xs", onclick: () => app.go("customers", c.id) }, C.icon("user"), `Open ${c.name}`)], queries, how: "the customer's check: its path, its services, alerts, incidents and changes" };
+  }
+  const name = who.estate;
+  const [bad, all] = await Promise.all([call(`/v1/map/ask?q=${encodeURIComponent(`${name} sites that are not ok`)}`), call(`/v1/map/ask?q=${encodeURIComponent(`customer ${name}`)}`)]);
+  // A name the estate does not know is a customer only when the question says so; else it is asked as any other question.
+  if (bad.refused || all.refused || !bad.understood || !all.understood || !bad.plan?.customer) return who.said ? { body: [h("p", {}, bad.hint || all.hint || bad.refused || `I could not find a customer called ${name}.`)], queries } : null;
+  const body = [h("p", {}, h("b", {}, bad.total ? `${name}: ${C.fmt.n(bad.total)} of its ${C.fmt.n(all.total)} sites are not ok now` : `${name} is not affected now`), bad.total ? "." : `: all ${C.fmt.n(all.total)} of its sites are ok.`)];
+  const caveat = askCaveat(h, bad);
+  if (caveat) body.push(caveat);
+  if (bad.rows.length) body.push(h("ul", { class: "no-ag-ul" }, bad.rows.slice(0, 6).map((r) => h("li", {}, h("a", { class: "no-link", onclick: () => app.map ? app.map.open(r.id) : app.go("map", r.id) }, r.id), ` · ${KIND_NAME[r.kind] || r.kind} · ${r.state}${r.reason ? " · " + r.reason : ""}`))));
+  const asked = `${name} sites that are not ok`;
+  return { body, acts: bad.total ? [h("button", { class: "btn xs", onclick: () => { if (app.map) app.map.ask(asked); else { app.pending = { ask: asked }; app.go("map"); } } }, C.icon("search"), "Show them on the map")] : [], queries, how: "the customer's sites in the estate, and those not ok" };
+}
+
+/** The backbone's changes carried out in the last days, for "what changed": the estate's are its events. */
+async function backboneChanges(app, call, days) {
+  const { h } = app;
+  let j;
+  try { j = await call("/v1/changes"); } catch { return null; }
+  const since = Date.now() - days * 86400e3;
+  const done = (j.changes || []).filter((c) => c.executed && T(c.executed) >= since && T(c.executed) <= Date.now()).sort((a, b) => T(b.executed) - T(a.executed));
+  const out = [h("p", {}, h("b", {}, done.length ? `On the backbone, ${done.length} ${done.length === 1 ? "change was" : "changes were"} carried out in the last ${days === 1 ? "day" : "week"}` : `No change was carried out on the backbone in the last ${days === 1 ? "day" : "week"}.`), done.length ? ":" : "")];
+  if (done.length) out.push(h("ul", { class: "no-ag-ul" }, done.slice(0, 5).map((c) => h("li", {}, h("a", { class: "no-link", onclick: () => changeDrawer(app, c.id) }, c.id), ` ${c.title} · ${c.status.replace("_", " ")} · ${hhmm(T(c.executed))}`))));
+  out.push(h("p", { class: "muted" }, "In the estate behind it:"));
+  return out;
 }
 
 // ---------------------------------------------------------------- dashboards

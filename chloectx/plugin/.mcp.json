@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "chloectx": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/chloectx-launch",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

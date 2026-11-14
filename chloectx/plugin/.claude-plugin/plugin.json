@@ -1,0 +1,14 @@
+{
+  "name": "chloectx",
+  "displayName": "ChloeCtx",
+  "version": "0.3.3",
+  "description": "Long-term memory for Claude Code, stored in ChloeDB: hooks record each session into a local store per project, recall what bears on each prompt and write down decisions and rules; the memory_* tools search that history",
+  "author": {
+    "name": "ChloeTech",
+    "url": "https://github.com/chloetech-ai"
+  },
+  "homepage": "https://chloetech-ai.github.io/chloedb/site/docs/chloectx-setup.html",
+  "repository": "https://github.com/chloetech-ai/chloedb",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "context", "recall", "chloedb"]
+}

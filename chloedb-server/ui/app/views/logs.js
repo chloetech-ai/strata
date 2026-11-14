@@ -113,7 +113,9 @@ export function logTables(ts) {
 function sourcePicker(current) {
   const sel = h("select", { class: "select sm", title: "Whose lines: the servers' own, or a table with a time and a message (otel_logs, your events)", "aria-label": "Lines of" }, h("option", { value: "" }, "The servers' own lines"));
   catalogTables().then((ts) => {
-    for (const x of logTables(ts)) sel.append(h("option", { value: x.table, selected: x.table === current }, `Table ${x.table}`));
+    // Your own tables first; an app's says whose it is (LIV-12).
+    const all = logTables(ts).map((x) => ({ ...x, o: ownerOf(x.table) })).sort((a, b) => !!a.o - !!b.o);
+    for (const x of all) sel.append(h("option", { value: x.table, selected: x.table === current }, `Table ${x.table}${x.o ? ` (${x.o.owner})` : ""}`));
     sel.value = current || "";
     if (sel.options.length < 2) sel.remove();
   }).catch(() => sel.remove());

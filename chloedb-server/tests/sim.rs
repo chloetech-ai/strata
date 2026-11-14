@@ -99,6 +99,36 @@ fn a_late_copy_installed_is_found_again() {
     assert!(r.violations.iter().any(|v| v.contains("is not held by")), "{:?}", r.violations);
 }
 
+/// Finding N-E2: a replica that loses its volume as its primary stops,
+/// while the shard's third copy is behind (`Config::lost_volume`). It
+/// starts again empty with the same `--replica`, and must not elect the
+/// copy that is behind: no seed loses a write or fails to settle.
+#[test]
+fn a_replica_that_lost_its_volume_elects_no_copy_behind() {
+    let lost = std::sync::atomic::AtomicU64::new(0);
+    let failed = std::sync::Mutex::new(Vec::new());
+    sim::on_seeds(0..400, jobs(), &|seed| {
+        let r = sim::run(Config::lost_volume(seed), false);
+        lost.fetch_add(r.stats.lost_volumes, std::sync::atomic::Ordering::Relaxed);
+        if !r.ok() {
+            failed.lock().unwrap().push(r);
+        }
+    });
+    let failed = failed.into_inner().unwrap();
+    assert!(failed.is_empty(), "{} of 400 seeds with a lost volume broke a promise:{}", failed.len(), explain(&failed));
+    let lost = lost.into_inner();
+    assert!(lost > 200, "only {lost} volumes were lost in 400 seeds: the setup no longer tests them");
+}
+
+/// The bug of N-E2 put back: the replica's vote elects the copy behind,
+/// and the writes it lacks are lost; or, having forgotten the vote it gave
+/// in a term, it votes in that term again, for another copy.
+#[test]
+fn a_lost_volume_that_votes_is_found_again() {
+    let r = finds_with(Bug::VotesWithALostVolume, 1000, Config::lost_volume).expect("a seed that loses an acknowledged write to a replica that lost its volume");
+    assert!(r.violations.iter().any(|v| v.contains("is not held by") || v.contains("both began it")), "{:?}", r.violations);
+}
+
 #[test]
 fn a_seed_replays_exactly() {
     for seed in 0..4 {

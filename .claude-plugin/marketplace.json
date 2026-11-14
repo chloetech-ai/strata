@@ -1,0 +1,17 @@
+{
+  "name": "chloedb",
+  "owner": {
+    "name": "ChloeTech",
+    "url": "https://github.com/chloetech-ai"
+  },
+  "description": "Claude Code plugins from the ChloeDB repository: ChloeCtx, long-term memory for Claude Code",
+  "plugins": [
+    {
+      "name": "chloectx",
+      "source": "./chloectx/plugin",
+      "description": "Long-term memory for Claude Code: records each session into a local ChloeDB store per project, recalls what bears on each prompt, and writes down decisions and rules",
+      "category": "memory",
+      "tags": ["memory", "context", "recall", "chloedb"]
+    }
+  ]
+}

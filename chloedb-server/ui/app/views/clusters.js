@@ -116,6 +116,12 @@ function render(page) {
     try {
       const [stats, tables, syn, alerts] = await Promise.all([at("/v1/health"), at("/v1/tables"), at("/v1/synonyms").catch(() => null), at("/v1/alerts").catch(() => null)]);
       out.stats = stats;
+      // LIV-13: the tables it lists, and the rows of them all: its health
+      // counts them (a coordinator from this version on), else the sizes
+      // it keeps of each table (`docs` counts its first table only).
+      out.tableCount = (tables.tables || []).length;
+      out.rows = stats.rows ?? null;
+      if (out.rows == null) { const ix = await at("/v1/index/tables").catch(() => null); if (ix?.tables) out.rows = ix.tables.reduce((a, t) => a + (t.docs || 0), 0); }
       const items = {};
       for (const t of tables.tables || []) items[`table:${t.table}`] = { kind: "table", name: t.table, value: t.sql, shard_by: t.shard_by };
       if (syn) items["synonyms:"] = { kind: "synonyms", name: "rules", value: (syn.text || "").trim(), rules: syn.rules, raw: syn.text || "" };
@@ -142,8 +148,8 @@ function render(page) {
         h("div", { class: "small dim" }, [e.conn?.cluster?.name, e.env].filter(Boolean).join(" · ") || (e.conn ? "unnamed cluster" : location.host)),
         s?.error ? h("div", { class: "small error" }, s.error)
           : st ? h("div", { class: "fleet-nums" },
-            h("div", {}, h("b", { class: "num" }, fmt.n(st.rows ?? st.docs ?? 0)), h("span", { class: "small dim" }, " rows")),
-            h("div", {}, h("b", { class: "num" }, fmt.n(Object.keys(st.tables || {}).length)), h("span", { class: "small dim" }, Object.keys(st.tables || {}).length === 1 ? " table" : " tables")),
+            h("div", { title: s.rows == null ? "This server does not count the rows of every table" : "" }, h("b", { class: "num" }, s.rows == null ? "–" : fmt.n(s.rows)), h("span", { class: "small dim" }, " rows")),
+            h("div", {}, h("b", { class: "num" }, fmt.n(s.tableCount)), h("span", { class: "small dim" }, s.tableCount === 1 ? " table" : " tables")),
             h("div", {}, h("span", { class: "small dim" }, st.role === "coordinator" ? "a cluster" : "one server")))
           : null,
         p ? h("div", { class: "row nw small", style: { gap: "6px" } }, icon("share"), "follows ", h("b", {}, p.srcLabel), pill(p.tone, p.text))

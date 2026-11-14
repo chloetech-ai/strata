@@ -36,6 +36,43 @@ pub const SET_OP_LEVELS: usize = 8;
 /// ORDER BY: `__max_per(k, field)` ([`crate::query::compound`]).
 pub const PER_CAP: &str = "__max_per";
 
+/// The most a statement sent to a server may hold, by default: its text in
+/// bytes, and its elements (words, values and symbols, the leaves of what
+/// it parses into: ClickHouse's `max_ast_elements` counts nodes, 50,000 by
+/// default, and its `max_query_size` is 256 KiB). A statement holds no
+/// more than its text's bytes in elements. A list of ids made into the
+/// statement, `id IN ('a', 'b', ...)`, is two elements an id; one passed as
+/// a parameter (`id IN (:ids)`) is none, and costs as little to bind.
+pub const STATEMENT_BYTES: usize = 1 << 20;
+
+/// [`STATEMENT_BYTES`]' bound on elements.
+pub const STATEMENT_ELEMENTS: usize = 250_000;
+
+/// A query error when `sql` is longer than `max_bytes` or holds more than
+/// `max_elements` elements ([`STATEMENT_ELEMENTS`]); 0 is no bound. It
+/// reads the text as the parser's tokenizer does; a text no longer than
+/// `max_elements` bytes cannot hold more, and is not read. `what` names the settings that
+/// raise them, for the error.
+pub fn check_size(sql: &str, max_bytes: usize, max_elements: usize, what: &str) -> Result<()> {
+    if max_bytes > 0 && sql.len() > max_bytes {
+        return Err(Error::Query(format!(
+            "the statement is {} bytes, more than the {max_bytes} a statement may be ({what}): pass long lists of values as a parameter (`id IN (:ids)`, with `ids` a list), or split it",
+            sql.len()
+        )));
+    }
+    if max_elements == 0 || sql.len() <= max_elements {
+        return Ok(());
+    }
+    // A text that does not tokenize says so when it is parsed.
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { return Ok(()) };
+    if tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).count() > max_elements {
+        return Err(Error::Query(format!(
+            "the statement holds more than {max_elements} elements (words, values and symbols), the most a statement may hold ({what}): pass long lists of values as a parameter (`id IN (:ids)`, with `ids` a list), or split it"
+        )));
+    }
+    Ok(())
+}
+
 /// Parses `sql_text` into its statements (generic SQL dialect).
 pub fn parse(sql_text: &str) -> Result<Vec<Statement>> {
     let dialect = GenericDialect {};
@@ -628,6 +665,24 @@ mod tests {
         assert_eq!(hint("SELECT id FROM t WHERE MATCH(body, 'red mug')", 3, false), None);
         assert!(hint("SELECT id, score() FROM t WHERE MATCH(body, 'red')", 3, true).is_some_and(|h| h.contains("ORDER BY bm25")));
         assert_eq!(hint("SELECT id, score() FROM t WHERE MATCH(body, 'red') ORDER BY bm25(body, 'red') DESC", 3, true), None);
+    }
+
+    #[test]
+    fn statements_are_bounded_in_bytes_and_elements() {
+        let ids = |n: usize| format!("SELECT id FROM t WHERE id IN ({})", (0..n).map(|i| format!("'k{i}'")).collect::<Vec<_>>().join(", "));
+        // 1,000 ids and their 999 commas, and 9 more elements, in 9 KB.
+        let sql = ids(1_000);
+        assert!(check_size(&sql, 0, 2_008, "x").is_ok());
+        let e = check_size(&sql, 0, 2_007, "the flags").unwrap_err().to_string();
+        assert!(e.contains("more than 2007 elements") && e.contains("(the flags)") && e.contains(":ids"), "{e}");
+        let e = check_size(&sql, 100, 0, "the flags").unwrap_err().to_string();
+        assert!(e.contains(&format!("is {} bytes, more than the 100", sql.len())), "{e}");
+        assert!(check_size(&sql, 0, 0, "x").is_ok(), "0 is no bound");
+        // Whitespace and a comment's text are not elements; a short text is
+        // not read.
+        assert!(check_size(&format!("SELECT 1 {}-- {}", " ".repeat(5000), "x".repeat(5000)), 0, 10, "x").is_ok());
+        // The defaults take a long IN list made into the statement.
+        assert!(check_size(&ids(50_000), STATEMENT_BYTES, STATEMENT_ELEMENTS, "x").is_ok());
     }
 
     #[test]

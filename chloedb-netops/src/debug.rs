@@ -101,6 +101,27 @@ fn judge_device(r: &Row, sessions_before: Option<i64>) -> Vec<(&'static str, &'s
     out
 }
 
+/// Fewer failed requests than this in five minutes say nothing about a
+/// service's objective, whatever share of its requests they are.
+const SERVICE_FLOOR: f64 = 5.0;
+
+/// What a service's last five minutes say against its objective: (state,
+/// reading), or nothing while it keeps to it. A miss counts once it is
+/// above the share of requests the objective lets fail, and by at least
+/// SERVICE_FLOOR requests; five times the share is broken.
+pub fn judge_service(s: &crate::world::Service, errors: f64, requests: f64, p95: f64) -> Option<(&'static str, String)> {
+    let budget = 1.0 - s.slo;
+    let rate = errors / requests.max(1.0);
+    let failing = rate > budget && errors >= SERVICE_FLOOR;
+    let slow = s.latency_slo_ms > 0.0 && p95 > s.latency_slo_ms;
+    if !failing && !slow {
+        return None;
+    }
+    let state = if failing && rate > 5.0 * budget { "bad" } else { "warn" };
+    let reading = if failing { format!("{:.2}% failing (objective {:.2}%)", rate * 100.0, s.slo * 100.0) } else { format!("p95 {p95:.0} ms (objective {:.0} ms)", s.latency_slo_ms) };
+    Some((state, reading))
+}
+
 async fn where_(State(svc): State<Shared>) -> Answer {
     let q = Q::new(&svc);
     let e = q.e.clone();
@@ -165,12 +186,7 @@ async fn where_(State(svc): State<Shared>) -> Answer {
             *totals.entry(("services", site.to_string())).or_default() += 1;
         }
         let Some(row) = services.iter().find(|x| x.s("service") == s.id) else { continue };
-        let (errors, requests) = (row.f("errors"), row.f("requests").max(1.0));
-        let rate = errors / requests;
-        let slow = s.latency_slo_ms > 0.0 && row.f("p95") > s.latency_slo_ms;
-        if rate > (1.0 - s.slo) || slow {
-            let state = if rate > 5.0 * (1.0 - s.slo) { "bad" } else { "warn" };
-            let reading = if rate > (1.0 - s.slo) { format!("{:.2}% failing (objective {:.2}%)", rate * 100.0, s.slo * 100.0) } else { format!("p95 {:.0} ms (objective {:.0} ms)", row.f("p95"), s.latency_slo_ms) };
+        if let Some((state, reading)) = judge_service(s, row.f("errors"), row.f("requests"), row.f("p95")) {
             let al = alert_of(s.id);
             // A service is drawn at each site it runs in where something below is broken, or at all of them.
             let hit: Vec<&&str> = s.sites.iter().filter(|site| off.iter().any(|o| o["col"] == **site && o["state"] == "bad")).collect();
@@ -463,4 +479,44 @@ async fn investigate(State(svc): State<Shared>, Query(p): Query<HashMap<String, 
 
     q.done(json!({"kind": kind, "id": id, "title": title, "now": now, "symptom": symptom, "alerts": mine.iter().map(|a| json!({"rule": a.s("rule_name"), "severity": a.s("severity"), "incident": a.s("incident")})).collect::<Vec<_>>(),
         "incident": mine.iter().map(|a| a.s("incident")).find(|i| !i.is_empty()).unwrap_or_default(), "lenses": lens.out, "at": iso(m)}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::{effects, service_points};
+    use crate::world::World;
+
+    /// A calm network keeps to every objective, so Diagnose can say so: the
+    /// simulator's background errors stay inside each service's budget in
+    /// every five minutes of a day, by day and by night.
+    #[test]
+    fn a_calm_network_misses_no_objective() {
+        let w = World::build();
+        let t0 = 1_800_000_000 / 60 * 60;
+        let mut sums: Vec<std::collections::VecDeque<(f64, f64, f64)>> = vec![Default::default(); w.services.len()];
+        for k in 0..24 * 60 {
+            let t = t0 + k * 60;
+            for (i, p) in service_points(&w, &effects(&w, &[], t), t).iter().enumerate() {
+                let win = &mut sums[i];
+                win.push_back((p["errors"].as_f64().unwrap(), p["requests"].as_f64().unwrap(), p["latency_p95"].as_f64().unwrap()));
+                if win.len() > 5 {
+                    win.pop_front();
+                }
+                let (e, r, p95) = win.iter().fold((0.0, 0.0, 0.0f64), |a, x| (a.0 + x.0, a.1 + x.1, a.2.max(x.2)));
+                let s = &w.services[i];
+                assert!(judge_service(s, e, r, p95).is_none(), "{} at minute {k}: {:?} ({e} of {r} failed, p95 {p95})", s.id, judge_service(s, e, r, p95));
+            }
+        }
+    }
+
+    #[test]
+    fn a_few_failed_requests_are_not_a_miss_but_a_burn_is() {
+        let w = World::build();
+        let wave = w.services.iter().find(|s| s.id == "wave").unwrap();
+        assert!(judge_service(wave, 2.0, 1000.0, 10.0).is_none(), "two failures are noise, whatever the share");
+        assert_eq!(judge_service(wave, 30.0, 100_000.0, 10.0).unwrap().0, "warn", "three times the budget");
+        assert_eq!(judge_service(wave, 300.0, 100_000.0, 10.0).unwrap().0, "bad", "thirty times the budget");
+        assert_eq!(judge_service(wave, 0.0, 100_000.0, 500.0).unwrap().1, "p95 500 ms (objective 40 ms)");
+    }
 }

@@ -4,7 +4,14 @@
 
 ## Run it
 
-On one machine, build both programs, then start the crawler with a cluster of its own (on Kubernetes, one field of the cluster's resource starts it: [below](#on-kubernetes)):
+On one machine, install both programs, then start the crawler with a cluster of its own (on Kubernetes, one field of the cluster's resource starts it: [below](#on-kubernetes)). <!-- since 0.3.2 --> The installer puts both in `~/.local/bin` prebuilt, and the crawler finds the server beside it:
+
+```bash
+curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with crawl
+~/.local/bin/chloedb-crawl serve --local ./crawl-cluster
+```
+
+Or build both from a checkout (any platform with Rust; the only way before release 0.3.2):
 
 ```bash
 (cd chloedb-server && cargo build --release)

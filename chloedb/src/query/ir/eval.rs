@@ -186,7 +186,7 @@ pub fn eval(e: &Expr, row: &Row) -> Result<Value> {
             let x = eval(expr, row)?;
             match eval(pattern, row)? {
                 Value::Str(p) => {
-                    let fold = |s: &str| if *case_insensitive { s.to_lowercase() } else { s.to_string() };
+                    let fold = |s: &str| if *case_insensitive { fold_case(s) } else { s.to_string() };
                     let p: Vec<char> = fold(&p).chars().collect();
                     any(&x, |v| Ok(if let Value::Str(s) = v { Some(like(&fold(s).chars().collect::<Vec<_>>(), &p)) } else { None }))?
                 }
@@ -580,6 +580,22 @@ fn vector(v: &Value) -> Result<Option<std::borrow::Cow<'_, [f32]>>> {
         Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) => Some(xs.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()),
         v => return Err(err(format!("dot takes vectors, not {}", sv(&v)))),
     })
+}
+
+/// `s` as `ILIKE` compares it: each character by itself lowercased to one
+/// character (the first of its lowercase: a capital `İ` is an `i`), and a
+/// final sigma as the other sigma. `str::to_lowercase` lowercases a capital
+/// sigma by where its word ends, so a pattern's `Σ` before a `%` or `_`
+/// (which are not letters) was always final, and a value's in the middle of
+/// a word never: `'ΟΔΟΣΑ' ILIKE 'ΟΔΟΣ%'` did not hold. PostgreSQL folds a
+/// character at a time too.
+pub(crate) fn fold_case(s: &str) -> String {
+    s.chars()
+        .map(|c| match c.to_lowercase().next().unwrap_or(c) {
+            'ς' => 'σ',
+            c => c,
+        })
+        .collect()
 }
 
 /// SQL LIKE: `%` any run, `_` one character. Greedy matching that backs

@@ -233,6 +233,51 @@ pub struct GraphQuery {
     pub min_sim: f64,
 }
 
+/// `ps` with each condition once, in their order. A few are compared with
+/// each other; many (`tags @> :list` of a list of thousands is an `AND` of
+/// as many) are first told apart by a hash of how they print, so that only
+/// conditions that print alike are compared: comparing each with every one
+/// before was quadratic (finding N-B4).
+fn once(ps: Vec<Pred>) -> Vec<Pred> {
+    const FEW: usize = 16;
+    let mut out: Vec<Pred> = Vec::with_capacity(ps.len());
+    if ps.len() <= FEW {
+        for p in ps {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        return out;
+    }
+    let mut seen: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::with_capacity(ps.len());
+    for p in ps {
+        let h = printed_hash(&p);
+        let same = seen.entry(h).or_default();
+        if same.iter().any(|&i| out[i] == p) {
+            continue;
+        }
+        same.push(out.len());
+        out.push(p);
+    }
+    out
+}
+
+/// A hash of `p` as `{:?}` prints it, without making the text: equal
+/// conditions print alike.
+fn printed_hash(p: &Pred) -> u64 {
+    use std::hash::Hasher;
+    struct Hashing(std::collections::hash_map::DefaultHasher);
+    impl std::fmt::Write for Hashing {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut h = Hashing(std::collections::hash_map::DefaultHasher::new());
+    let _ = std::fmt::write(&mut h, format_args!("{p:?}"));
+    h.0.finish()
+}
+
 impl Pred {
     /// The rows for which `self`, read with SQL's three-valued logic, is
     /// TRUE, as a predicate of plain sets. A comparison with NULL is
@@ -345,13 +390,7 @@ impl Pred {
                 }
                 // A condition twice is once (`x IS NOT NULL` that SQL's
                 // NOT adds beside one already there).
-                let mut once: Vec<Pred> = Vec::with_capacity(out.len());
-                for p in out {
-                    if !once.contains(&p) {
-                        once.push(p);
-                    }
-                }
-                let mut out = once;
+                let mut out = once(out);
                 match out.len() {
                     0 => Pred::True,
                     1 => out.pop().unwrap(),

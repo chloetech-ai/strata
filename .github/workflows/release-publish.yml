@@ -1,0 +1,236 @@
+name: Release publish
+
+# A version's GitHub releases are made as drafts (server-release.yml,
+# py-release.yml and js-release.yml), and this publishes them, only once
+# everything the docs and the installers name for that version exists:
+# scripts/check-doc-urls.py --version <version> --drafts, run on main's
+# docs (what GitHub Pages serves), must pass. That is the server, Python
+# and JavaScript releases, the archive of every program `install.sh --with`
+# installs on every platform, each download the docs pin, the image's tags
+# on ghcr.io, PyPI's chloedb at the version (and npm's and crates.io's,
+# where the docs name them). A draft cannot be downloaded by anyone else,
+# so until then the docs' commands for the version fail as they would
+# without it, and the Docs URLs check says so.
+#
+# Then, in order: the drafts are published (the server's last, marked
+# GitHub's latest release); the Homebrew formula goes to the tap, when one
+# is configured; and a pull request moves docs/site/versions.json to the
+# version, with the release's docs snapshot (build_docs.py --snapshot):
+# only this workflow moves "latest", after the release is public.
+#
+# It runs after each release workflow and the image's finish for a tag
+# (whichever finishes last finds everything there), and by hand:
+#   gh workflow run release-publish.yml -f version=0.3.4
+# After a release workflow, a version that is still missing something
+# while another of its release runs is going (or waiting for a reviewer)
+# is left as drafts quietly; once none is, it fails and its summary says
+# what is missing. By hand, it fails at once.
+on:
+  workflow_run:
+    workflows: [chloedb-server release, chloedb-py release, chloedb-js release, Image]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to publish, e.g. 0.3.4: the drafts chloedb-server-v, chloedb-py-v and chloedb-js-v of it"
+        required: true
+
+permissions:
+  contents: read
+
+# One at a time: each run checks the whole version again.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish the drafts
+    # After a run for a release tag that passed (its head branch is the tag:
+    # chloedb-py-v0.3.4); Image's runs after CI on main are not one.
+    if: >-
+      github.event_name == 'workflow_dispatch' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+        contains(github.event.workflow_run.head_branch, '-v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # To see and publish drafts (a token that can push sees them).
+      contents: write
+      # To see which release runs are still going.
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      published: ${{ steps.publish.outputs.published }}
+    steps:
+      - name: Which version
+        id: version
+        env:
+          INPUT: ${{ inputs.version }}
+          HEAD: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [ -n "$INPUT" ]; then v="${INPUT#v}"; else v="${HEAD##*-v}"; fi
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [ -n "$INPUT" ]; then echo "::error::'$INPUT' is not a version (0.3.4)"; exit 1; fi
+            echo "$HEAD is not a release tag: nothing to publish."
+            exit 0
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Version $v."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: steps.version.outputs.version
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Everything the docs name for it exists (drafts count)
+        id: check
+        if: steps.version.outputs.version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          V: ${{ steps.version.outputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set +e
+          python3 -I scripts/check-doc-urls.py --version "$V" --drafts | tee check.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" = 0 ]; then echo "ready=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          {
+            echo "### $V is not published yet"
+            echo
+            echo "What the docs and the installers name for $V and is not there (scripts/check-doc-urls.py --version $V --drafts):"
+            echo
+            echo '```'
+            grep -A1 '^FAIL' check.txt || cat check.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$status" = 1 ] || { echo "::error::the check could not run (exit $status)"; exit 1; }
+          if [ "$EVENT" = workflow_run ]; then
+            # Release runs of this version that have not finished yet (one
+            # waiting for a reviewer of its registry upload among them).
+            pending=$(for s in queued in_progress waiting requested pending; do
+              gh api "repos/$REPO/actions/runs?status=$s&per_page=100" --jq \
+                '.workflow_runs[] | select(.name == "chloedb-server release" or .name == "chloedb-py release" or .name == "chloedb-js release" or .name == "Image") | select(.head_branch | endswith("-v'"$V"'")) | "\(.name) (\(.status)) \(.html_url)"'
+            done | sort -u)
+            if [ -n "$pending" ]; then
+              echo "Still going for $V:"
+              echo "$pending"
+              echo "::notice::$V stays a draft until these finish: $(echo "$pending" | cut -d' ' -f1-3 | paste -sd, -)"
+              exit 0
+            fi
+          fi
+          echo "::error::$V is missing what the docs name (above), and no release run of it is going: publish what is missing, then run: gh workflow run release-publish.yml -f version=$V"
+          exit 1
+      - name: Publish the drafts
+        id: publish
+        if: steps.check.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          # The packages first, the server last: it is GitHub's latest release.
+          for tag in "chloedb-js-v$V" "chloedb-py-v$V" "chloedb-server-v$V"; do
+            draft=$(gh release view "$tag" --repo "$REPO" --json isDraft --jq .isDraft)
+            if [ "$draft" != true ]; then echo "$tag is published already"; continue; fi
+            latest=false
+            case "$tag" in chloedb-server-v*) latest=true ;; esac
+            gh release edit "$tag" --repo "$REPO" --draft=false --latest="$latest"
+            echo "published $tag"
+          done
+          echo "published=true" >> "$GITHUB_OUTPUT"
+      # The check again, as anybody sees it now: no drafts.
+      - name: As the public sees it
+        if: steps.check.outputs.ready == 'true'
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: python3 -I scripts/check-doc-urls.py --version "$V"
+
+  # The formula of the release (server-release.yml attached it) committed to
+  # the tap when the repository variable CHLOEDB_HOMEBREW_TAP names one
+  # (owner/name: chloetech-ai/homebrew-tap for `brew install
+  # chloetech-ai/tap/chloedb`) and the secret HOMEBREW_TAP_TOKEN can push to
+  # it. Until both are set, nothing leaves this repository.
+  homebrew-tap:
+    name: Homebrew tap
+    needs: publish
+    if: needs.publish.outputs.published == 'true' && vars.CHLOEDB_HOMEBREW_TAP != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Commit the formula to the tap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAP: ${{ vars.CHLOEDB_HOMEBREW_TAP }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          V: ${{ needs.publish.outputs.version }}
+        run: |
+          test -n "$TAP_TOKEN" || { echo "::error::CHLOEDB_HOMEBREW_TAP is set but the secret HOMEBREW_TAP_TOKEN is not"; exit 1; }
+          mkdir formula
+          gh release download "chloedb-server-v$V" --repo "$REPO" --pattern chloedb.rb --dir formula
+          git clone --depth 1 "https://x-access-token:$TAP_TOKEN@github.com/$TAP.git" tap
+          mkdir -p tap/Formula
+          cp formula/chloedb.rb tap/Formula/chloedb.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/chloedb.rb
+          if git diff --cached --quiet; then echo "The tap already has this formula."; exit 0; fi
+          git commit -m "chloedb $V"
+          git push origin HEAD
+
+  # The docs of this release, kept beside main's: docs/site/docs/v<version>/
+  # rendered from the tag (build_docs.py --snapshot), and versions.json's
+  # latest release moved to it, so that main's pages say which release is
+  # out and link to its docs. GitHub Pages publishes main's docs/, so this
+  # opens a pull request with them rather than pushing to main (the
+  # repository's Actions settings must let workflows open pull requests).
+  docs-snapshot:
+    name: Docs of the release
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - name: Render the release's docs and open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.publish.outputs.version }}
+        run: |
+          TAG="chloedb-server-v$V"
+          branch="docs/v$V"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            echo "the branch $branch is there already (its pull request is open or merged)"
+            exit 0
+          fi
+          pip install -r docs/site/scripts/requirements.txt
+          python docs/site/scripts/build_docs.py --snapshot "$TAG"
+          python - "$V" <<'PY'
+          import json, sys
+          p = "docs/site/versions.json"
+          json.dump({"latest": sys.argv[1]}, open(p, "w"))
+          open(p, "a").write("\n")
+          PY
+          python docs/site/scripts/build_docs.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add docs/site
+          if git diff --cached --quiet; then echo "the docs of $V are there already"; exit 0; fi
+          git commit -m "Docs: the snapshot of release $V, and main's pages say it is the latest"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "Docs of release $V" --body "docs/site/docs/v$V/ rendered from $TAG by build_docs.py --snapshot, and docs/site/versions.json's latest release set to $V (main's pages link to it). Opened by release-publish.yml once the release's drafts were published."

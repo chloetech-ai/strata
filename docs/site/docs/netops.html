@@ -108,7 +108,7 @@
 <p>Like <a href="crawler.html">the crawler</a> and <a href="sheets.html">the spreadsheets</a>, it is a program of its own, in Rust, that talks to chloedb-server over HTTP only, and the command center shows it as an app.</p>
 <p><img loading="lazy" decoding="async" alt="My shift: the handover written from the tables, what waits most urgent first, the changes and carrier windows coming up, and notes for the next shift" src="../../assets/img/netops-shift.png" /></p>
 <h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
-<p>Build both programs, then start chloedb-netops with a server of its own:</p>
+<p>Build both programs, then start chloedb-netops with a server of its own (releases after 0.3.2 carry it prebuilt too: the installer's <code>--with netops</code> puts it beside the server, which it then finds without <code>--server-bin</code>):</p>
 <pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
 cd chloedb-netops &amp;&amp; cargo build --release
 target/release/chloedb-netops serve --local ./netops-data --server-bin ../chloedb-server/target/release/chloedb-server</pre>

@@ -43,8 +43,9 @@ want before running anything:**
 |---|---|---|
 | every session on this machine | `./install.sh` | merges hooks, a permission and `env.CHLOECTX_DISTILL_MODEL` into `~/.claude/settings.json` (backed up first as `settings.json.chloectx-<time>.bak`) and registers the `chloectx` MCP server at user scope |
 | one project (good for a first try) | `./install.sh --project /absolute/path` | writes the project's `.claude/settings.local.json` and `.mcp.json` only |
+| every session, as a Claude Code plugin (no Rust needed) | `claude plugin marketplace add chloetech-ai/chloedb && claude plugin install chloectx@chloedb` | Claude Code adds the marketplace and `enabledPlugins` to `~/.claude/settings.json`; the plugin (`chloectx/plugin/`) downloads the release's prebuilt chloectx and the model on its first session ([docs](docs/chloectx/setup.md#as-a-claude-code-plugin)) |
 
-Both install the binary to `~/.local/bin/chloectx` and download a 129 MB
+All three install the binary to `~/.local/bin/chloectx` and download a 129 MB
 embedding model into `~/.local/share/chloectx/models` (on a machine that
 already has `~/.local/share/engram`, from before the rename, into that one).
 
@@ -54,7 +55,7 @@ Check, and do not install anything without asking the user:
 
 ```bash
 uname -s                 # Darwin or Linux (on Windows, work inside WSL 2)
-cargo --version          # Rust, stable; if missing, ask before installing it from https://rustup.rs
+cargo --version          # Rust, stable, to build; if missing, install.sh takes the release's prebuilt binary, or ask before installing Rust from https://rustup.rs
 cc --version             # a C compiler (macOS: xcode-select --install; Debian/Ubuntu: build-essential)
 curl --version
 claude auth status       # must show "loggedIn": true
@@ -76,7 +77,11 @@ for several minutes (a release build), so give the command a long timeout
 ```
 
 Options: `--distill-model NAME` (default `haiku`), `--prefix DIR` (default
-`~/.local`), `--no-wire` (build and install the binary only). The script stops
+`~/.local`), `--no-wire` (install the binary only), `--no-model` (skip the
+model download), `--prebuilt` or `--source` (take the release's prebuilt
+binary, or build; by default it takes the prebuilt one for a checkout of a
+release tag, `chloedb-server-v<version>`, or where there is no Rust, and
+builds otherwise, so Rust and a C compiler are needed only to build). The script stops
 at the first failed step with a message saying what is missing, ends by running
 `chloectx doctor`, and exits non-zero if any doctor check failed.
 
@@ -124,6 +129,7 @@ editing their settings by hand.
 |---|---|
 | `chloectx/` | the memory system (Rust crate): hooks client, per-project daemon, MCP server, recall, distiller, `chloectx ui`, `chloectx doctor` |
 | `chloectx/src/app.rs`, `chloectx/ui/view.js` | `chloectx app`: ChloeCtx as an app of a cluster (`chloedb-server --app chloectx=URL`), its spaces in the cluster's tables (`ctx_<space>`, through `Store::open_remote` and `src/cluster.rs`), with Context and Seen before; the view is compiled in (`CHLOECTX_UI_DIR=chloectx/ui` reads it from disk); `tests/app_cluster.rs` runs it against a real cluster; on Kubernetes the operator's `spec.chloectx` runs it beside a cluster, from chloedb-server's image, which builds it too ([docs](docs/chloectx/app.md)) |
+| `chloectx/plugin/`, `.claude-plugin/marketplace.json` | ChloeCtx as a Claude Code plugin (`chloectx@chloedb`): its hooks and MCP server run `scripts/chloectx-launch`, which finds chloectx or downloads the release's prebuilt one (SHA-256 checked); `plugin.json`'s version is the crate's (`src/plugin.rs` tests that, and that its hooks are `chloectx install`'s); `tests/plugin_launcher.rs` runs the launcher against a release in a folder |
 | `chloectx/demo/index.html` | the inspector page; it is compiled into the binary with `include_str!`, so rebuild after editing it |
 | `chloedb/` | the database (Rust crate), including the posting-list study in `src/postings/` |
 | `chloedb/fuzz/` | cargo-fuzz targets (nightly: `cargo +nightly fuzz run <target>` there) feeding ChloeDB damaged files and arbitrary SQL; `chloedb/tests/corrupt_input.rs` runs the same targets on stable |
@@ -138,7 +144,7 @@ editing their settings by hand.
 | `.github/workflows/ci.yml` | CI: tests and clippy for the crates (chloedb, chloectx, chloedb-server, chloedb-crawl, chloedb-sheets) on Linux and macOS, ChloeDB's fault-injection tests (`--features fault-injection`), a relevance gate (BM25 on three BEIR collections, and the analyzers of other languages on two MIRACL collections), Miri over ChloeDB's byte views (nightly; tests sized for it are named `miri_*`), the Python and Java packages' tests, and a server smoke test; a change only under an app or a package runs that one's jobs and the jobs that use it (`.github/scripts/ci_changes.py`), chloedb-server's binary is built once per source tree (job `server-bin`) and its longest jobs run on an on-demand DigitalOcean runner when it is set up ([.github/ci-runner](.github/ci-runner/README.md)); one job, `CI result`, sums them up and is the check main requires (a pull request and the merge queue run nothing on macOS; a push to main runs ChloeDB's macOS tests, which it does not wait for, and the nightly run all of them) |
 | `.github/workflows/demos.yml`, `doors.yml`, `.github/scripts/door_check.py` | the demo train: chloedb-netops, chloedb-swarm, examples/feature-store and examples/parley are tested by `Demos` (on a pull request that touches one, and nightly) against a server of the same commit, not by `CI result`, and a change only under them runs nothing in CI; an app's manifest says `"maturity": "demo"` to be marked as one. `One-way doors` fails a pull request whose template box disagrees with its diff: the doors are the `# door:` sections of `.github/CODEOWNERS` (a new door path goes there); `python3 .github/scripts/door_check.py --self-test` checks the rules and that every door path exists |
 | `.github/workflows/chaos.yml` | every night (or by hand, with a list of scenarios), `chloedb-chaos run` plays the chaos monkey's scenarios on a local cluster on one runner, as root, and fails when a write was lost or applied twice; its results.md is the run's summary |
-| `.github/workflows/fuzz.yml`, `supply-chain.yml`, `docs-urls.yml`, `nightly-report.yml`, `release-gate.yml` | every night `cargo fuzz` runs each target in `chloedb/fuzz/` for 20 minutes on a corpus kept between nights (a crash is uploaded as an artifact with the command to replay it); every day `cargo deny` checks each crate's Cargo.lock against RustSec's advisories and the licences and sources in `deny.toml` (fix an advisory with `cargo update -p <crate>`; ignore one in `deny.toml` only with its reason); every night, on a push to main that changes the docs and after each release, `scripts/check-doc-urls.py` checks that the downloads, image tags, Homebrew tap and PyPI release the docs tell people to install exist (`--list` shows what it reads); a failed scheduled run of CI, Chaos, Fuzz, Supply chain or Docs URLs opens or updates an issue labelled `nightly-failure`, and the next green night closes it; a release tag (and an image's version tag) builds only a commit of main on which CI's full matrix passed, a nightly run or one by hand (`gh workflow run ci.yml --ref <tag>`) |
+| `.github/workflows/fuzz.yml`, `supply-chain.yml`, `docs-urls.yml`, `nightly-report.yml`, `release-gate.yml`, `release-publish.yml` | every night `cargo fuzz` runs each target in `chloedb/fuzz/` for 20 minutes on a corpus kept between nights (a crash is uploaded as an artifact with the command to replay it); every day `cargo deny` checks each crate's Cargo.lock against RustSec's advisories and the licences and sources in `deny.toml` (fix an advisory with `cargo update -p <crate>`; ignore one in `deny.toml` only with its reason); every night, on a push to main that changes the docs and after each release, `scripts/check-doc-urls.py` checks that the downloads, image tags, Homebrew tap and PyPI release the docs tell people to install exist (`--list` shows what it reads); a failed scheduled run of CI, Chaos, Fuzz, Supply chain or Docs URLs opens or updates an issue labelled `nightly-failure`, and the next green night closes it; a release tag (and an image's version tag) builds only a commit of main on which CI's full matrix passed, a nightly run or one by hand (`gh workflow run ci.yml --ref <tag>`), and its GitHub releases are drafts until `release-publish.yml` finds everything the docs and installers name for the version (`check-doc-urls.py --version <v> --drafts`), publishes them and opens the pull request that moves `docs/site/versions.json` (by hand: `gh workflow run release-publish.yml -f version=<v>`) |
 | `.github/workflows/perf.yml`, `scripts/perf-gate.py` | the speed gate: two commits built and timed in turns on one runner (BM25 through SQL on the relevance gate's collections, loads, and `chloedb-server-bench` on SciFact over HTTP), failing when the head is more than 10% slower on its median and slower in every round; every night main against main 24 hours earlier, on a pull request labelled `perf`, or by hand (`gh workflow run perf.yml -f base=<ref> -f head=<ref>`); locally, `scripts/perf-gate.py --base DIR --head DIR --beir DIR` with each build's binaries in a directory |
 | `scripts/fetch-build.sh` | fetches the Linux x86-64 build of a recent commit of main (CI's job `main-builds` keeps the last 40 in the pre-release `main-builds`: chloedb-server, chloedb-sim, chloectx, chloedb-crawl, chloedb-sheets, chloedb-netops), to replay a seed or bisect without compiling |
 | `scripts/ci-local.sh` | CI's jobs on this machine (macOS or Linux), on the merge of a commit into main; `--post-status` records the result on GitHub as commit status `ci-local`, `--list` lists the jobs, and the header says what a Mac cannot test |

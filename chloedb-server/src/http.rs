@@ -963,7 +963,7 @@ async fn auth(State(app): State<App>, mut req: Request, next: Next) -> Response 
         Some(w) if w.limited() && !crate::scoped::route_ok(&method, route) && !w.allowed_route(&method, route) => w.may_server(&format!("{method} {route}")).err(),
         // A key for operations: the server's views, and for `ops` the
         // bounded actions ([`crate::ops::role_may`]).
-        Some(w) if w.scope < need && !crate::ops::role_may(w.role, &method, route) => w.may(need, &format!("{method} {route}")).err(),
+        Some(w) if w.scope < need && !crate::ops::role_may(w.role, &method, route) => w.may_by_role(need, &format!("{method} {route}"), crate::ops::role_may(Some(keys::Role::Ops), &method, route)).err(),
         // A tier 3 action (it loses data or costs money) is never an
         // agent's alone, whatever its key (audit X-D2): it files a change
         // request, which a person applies with their own key.
@@ -1203,6 +1203,9 @@ fn who(req_who: Option<axum::Extension<Principal>>) -> Principal {
 /// Refuses statement `sql` for a key limited to tables when it names a
 /// table the key may not read ([`crate::scoped::check_reads`]).
 async fn reads_ok(app: &App, who: &Principal, sql: &str) -> Result<(), ApiError> {
+    // Before a limited key's tables are read from the statement, which
+    // parses it.
+    app.svc.statement_fits(sql)?;
     if !who.limited() {
         return Ok(());
     }

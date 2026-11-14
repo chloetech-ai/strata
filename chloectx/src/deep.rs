@@ -107,8 +107,14 @@ impl Default for DeepConfig {
 impl DeepConfig {
     /// The configuration with environment overrides applied.
     pub fn resolved(&self) -> DeepConfig {
+        self.resolved_with(|k| std::env::var(k).ok())
+    }
+
+    /// [`resolved`](Self::resolved) with the settings read through `get`
+    /// (`doctor` adds those of Claude Code's settings files).
+    pub fn resolved_with(&self, get: impl Fn(&str) -> Option<String>) -> DeepConfig {
         let mut c = self.clone();
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let env = |k: &str| get(k).filter(|v| !v.is_empty());
         if let Some(m) = env("CHLOECTX_DEEP") {
             c.mode = m;
         }

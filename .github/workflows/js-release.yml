@@ -7,8 +7,9 @@ name: chloedb-js release
 #
 # A tag chloedb-js-v<version> (chloedb-js/package.json's version; the old
 # name, strata-js-v<version>, works too) builds and tests every platform
-# and attaches the tarballs to the tag's GitHub release; a run started
-# by hand does the same and keeps them as the run's artifacts.
+# and attaches the tarballs to the tag's GitHub release (a draft until
+# release-publish.yml finds the whole version there); a run started by
+# hand does the same and keeps them as the run's artifacts.
 # A tag builds nothing unless it is on main and CI's full matrix passed on
 # its commit (release-gate.yml): the tests here check the packages, CI's
 # check the code.
@@ -19,16 +20,30 @@ name: chloedb-js release
 # as an optional dependency, so that `npm install chloedb` installs the one
 # of its machine. A tag publishes them, platforms first, once the
 # repository variable CHLOEDB_PUBLISH_NPM is `true`; until then nothing goes
-# to npm. Setup, once: on npmjs.com, the organization `chloedb` (for the
-# scope) and a token that may publish `chloedb` and `@chloedb/*`, stored as
-# the secret NPM_TOKEN of the environment `npm` (with required reviewers, so
-# that each publish waits for a person); then the variable. npm refuses a
-# version it already holds, and the job skips a package npm has at this
-# version, so running it again finishes a publish that stopped partway.
+# to npm. A run started by hand on the release's tag publishes them too,
+# when asked to (the first publish, or one that stopped partway), without
+# touching the GitHub release:
+#
+#   gh workflow run js-release.yml --ref chloedb-js-v0.3.4 -f npm=true
+#
+# Setup, once: on npmjs.com, the organization `chloedb` (for the scope
+# @chloedb, which does not exist yet) and a granular token that may publish
+# `chloedb` (whose 0.0.x placeholders came from packaging/chloedb/npm: the
+# token's account must be one of its maintainers) and `@chloedb/*`, stored
+# as the secret NPM_TOKEN of the environment `npm` (with required
+# reviewers, so that each publish waits for a person); then, for tags, the
+# variable. npm refuses a version it already holds, and the job skips a
+# package npm has at this version, so running it again finishes a publish
+# that stopped partway.
 on:
   push:
     tags: ["chloedb-js-v*", "strata-js-v*"]
   workflow_dispatch:
+    inputs:
+      npm:
+        description: "Publish to npm (only on a release tag, chloedb-js-v<version>)"
+        type: boolean
+        default: false
   # A change to the release itself builds every platform as a release does,
   # without releasing.
   pull_request:
@@ -144,10 +159,12 @@ jobs:
           path: chloedb-js/dist/npm/*.tgz
           if-no-files-found: error
 
+  # Only for the tag's push: a run by hand on the tag (to publish to npm)
+  # leaves the release's tarballs as they are.
   release:
     name: GitHub release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -166,19 +183,23 @@ jobs:
         run: |
           ls -la dist
           if ! gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-            gh release create "$TAG" --repo "$REPO" --title "chloedb for JavaScript ${TAG##*-v}" --notes "Prebuilt chloedb (ChloeDB, formerly Strata) for Node, Bun and Deno: \`npm install\` the tarball of your platform (its URL works too); no Rust needed. Platforms: linux-x64-gnu, linux-arm64-gnu (glibc 2.35 or later), darwin-arm64, darwin-x64 (macOS 11 or later)."
+            # A draft: release-publish.yml publishes it with the version's others.
+            gh release create "$TAG" --repo "$REPO" --draft --latest=false --title "chloedb for JavaScript ${TAG##*-v}" --notes "Prebuilt chloedb (ChloeDB, formerly Strata) for Node, Bun and Deno: \`npm install\` the tarball of your platform (its URL works too); no Rust needed. Platforms: linux-x64-gnu, linux-arm64-gnu (glibc 2.35 or later), darwin-arm64, darwin-x64 (macOS 11 or later)."
           fi
           # A checksum of each tarball, to check a download by (sha256sum -c).
           (cd dist && sha256sum *.tgz > SHA256SUMS && cat SHA256SUMS)
           gh release upload "$TAG" dist/*.tgz dist/SHA256SUMS --repo "$REPO" --clobber
 
-  # To npm, once the repository variable CHLOEDB_PUBLISH_NPM is `true` (the
-  # header says what else it needs): each platform's package, then
-  # `chloedb`, which depends on them.
+  # To npm, for a tag once the repository variable CHLOEDB_PUBLISH_NPM is
+  # `true`, or on a run by hand on a tag with npm=true (the header says what
+  # else it needs): each platform's package, then `chloedb`, which depends
+  # on them.
   npm:
     name: npm
     needs: build
-    if: startsWith(github.ref, 'refs/tags/') && vars.CHLOEDB_PUBLISH_NPM == 'true'
+    if: >-
+      startsWith(github.ref, 'refs/tags/') &&
+      (vars.CHLOEDB_PUBLISH_NPM == 'true' || (github.event_name == 'workflow_dispatch' && inputs.npm))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
@@ -202,6 +223,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           test -n "$NODE_AUTH_TOKEN" || { echo "::error::the npm environment's secret NPM_TOKEN is not set"; exit 1; }
+          npm whoami > /dev/null || { echo "::error::npm does not take NPM_TOKEN (expired, or not a publish token)"; exit 1; }
           ls -la npm
           publish() {
             name=$(tar -xzOf "$1" package/package.json | node -p 'const p = JSON.parse(require("fs").readFileSync(0, "utf8")); p.name + "@" + p.version')

@@ -1,0 +1,118 @@
+name: chloedb crate release
+
+# The chloedb crate (chloedb/, the database engine) on crates.io, so that a
+# Rust program can say `chloedb = "0.3"` instead of a git dependency. It
+# has no tag of its own: it carries the release's version, and is published
+# from the release's tag, chloedb-server-v<version>, by a run started by
+# hand, after the release:
+#
+#   gh workflow run crate-release.yml --ref chloedb-server-v0.3.4 -f publish=true
+#
+# Every run packages the crate (`cargo package`: what crates.io would get,
+# only src/ and the manifest, see chloedb/Cargo.toml's `include`), checks
+# its size against crates.io's 10 MB, and builds it from the package alone,
+# as crates.io's users will. With publish=true on a release tag (on main,
+# with CI's full matrix passed on it: release-gate.yml), it then publishes
+# that version, unless crates.io has it already.
+#
+# Setup, once: a crates.io API token with the publish-update scope for the
+# crate chloedb, from an account that owns it (the 0.0.x placeholders of
+# packaging/chloedb/rust are under that name, so the account that published
+# them, or one it added with `cargo owner --add`), stored as the secret
+# CARGO_REGISTRY_TOKEN of an environment `crates-io` in this repository's
+# settings (with required reviewers, so that each publish waits for a
+# person). crates.io refuses a version it already holds, and keeps every
+# version it took: a mistake is yanked (`cargo yank`), never replaced.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to crates.io (only on a release tag, chloedb-server-v<version>); otherwise package and verify only"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/crate-release.yml
+
+permissions:
+  contents: read
+
+env:
+  # The Rust every job builds with (as the other release workflows).
+  RUST_TOOLCHAIN: "1.100.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # A tag publishes only a commit of main on which CI's full matrix passed.
+  gate:
+    uses: ./.github/workflows/release-gate.yml
+    permissions:
+      contents: read
+      actions: read
+
+  package:
+    name: package and verify
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: To publish, the tag names Cargo.toml's version
+        if: inputs.publish
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' chloedb/Cargo.toml | head -1)
+          if [ "$GITHUB_REF" != "refs/tags/chloedb-server-v$v" ]; then
+            echo "::error::publish=true needs a run on the release tag of chloedb $v: gh workflow run crate-release.yml --ref chloedb-server-v$v -f publish=true (this run is on $GITHUB_REF)"
+            exit 1
+          fi
+      # What crates.io would get, built from the package alone.
+      - name: cargo package
+        working-directory: chloedb
+        run: |
+          cargo package --locked --list
+          cargo package --locked
+          ls -la target/package/*.crate
+          size=$(stat -c %s target/package/chloedb-*.crate)
+          echo "The crate is $size bytes."
+          test "$size" -lt 10000000 || { echo "::error::the crate is $size bytes, and crates.io takes at most 10 MB: narrow chloedb/Cargo.toml's include"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: chloedb-crate
+          path: chloedb/target/package/chloedb-*.crate
+          if-no-files-found: error
+
+  publish:
+    name: crates.io
+    needs: package
+    if: inputs.publish && startsWith(github.ref, 'refs/tags/chloedb-server-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/chloedb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: cargo publish
+        working-directory: chloedb
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo "::error::the crates-io environment's secret CARGO_REGISTRY_TOKEN is not set (this workflow's header says how)"; exit 1; }
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if curl -fsS -A "chloedb-release (github.com/chloetech-ai/chloedb)" "https://crates.io/api/v1/crates/chloedb/$v" > /dev/null 2>&1; then
+            echo "crates.io has chloedb $v already."
+            exit 0
+          fi
+          # The package job verified the build; this publishes the same sources.
+          cargo publish --locked --no-verify

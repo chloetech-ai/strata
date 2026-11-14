@@ -22,7 +22,7 @@ Like [the crawler](crawler.md) and [the spreadsheets](sheets.md), it is a progra
 
 ## Run it
 
-Build both programs, then start chloedb-netops with a server of its own:
+Build both programs, then start chloedb-netops with a server of its own (releases after 0.3.2 carry it prebuilt too: the installer's `--with netops` puts it beside the server, which it then finds without `--server-bin`):
 
 ```bash
 (cd chloedb-server && cargo build --release)

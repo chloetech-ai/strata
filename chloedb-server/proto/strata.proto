@@ -305,7 +305,8 @@ message ReplicateRequest {
   bool pin = 8;
   // Protocol 9: the primary counts the replica among the copies a
   // majority is counted of: it has caught up once since it joined. A
-  // replica grants votes (Vote) once a call says so, and keeps that.
+  // replica grants votes (Vote) once a call says so and finds it caught
+  // up (applied, and not behind), and keeps that.
   bool member = 9;
   // The version of the shard's membership: one more each time a primary
   // is given other replicas (Configure), which it takes only once a

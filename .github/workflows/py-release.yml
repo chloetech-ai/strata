@@ -7,7 +7,8 @@ name: chloedb-py release
 #
 # A tag chloedb-py-v<version> (chloedb-py/pyproject.toml's version; the
 # old name, strata-py-v<version>, works too) builds and tests every
-# platform and attaches the wheels to the tag's GitHub release, from
+# platform and attaches the wheels to the tag's GitHub release (a draft
+# until release-publish.yml finds the whole version there), from
 # which `pip install chloedb -f <the release's assets page>` picks the
 # one for its machine; a run started by hand does the same and keeps
 # them as the run's artifacts.
@@ -166,7 +167,8 @@ jobs:
         run: |
           ls -la dist
           if ! gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-            gh release create "$TAG" --repo "$REPO" --title "chloedb for Python ${TAG##*-v}" --notes "Prebuilt chloedb (ChloeDB, formerly Strata) wheels for CPython 3.10 and later; no Rust needed: \`pip install chloedb -f https://github.com/$REPO/releases/expanded_assets/$TAG\` picks the one for your machine. Platforms: Linux x86_64 and aarch64 (glibc 2.28 or later), macOS arm64 and x86_64 (macOS 11 or later)."
+            # A draft: release-publish.yml publishes it with the version's others.
+            gh release create "$TAG" --repo "$REPO" --draft --latest=false --title "chloedb for Python ${TAG##*-v}" --notes "Prebuilt chloedb (ChloeDB, formerly Strata) wheels for CPython 3.10 and later; no Rust needed: \`pip install chloedb -f https://github.com/$REPO/releases/expanded_assets/$TAG\` picks the one for your machine. Platforms: Linux x86_64 and aarch64 (glibc 2.28 or later), macOS arm64 and x86_64 (macOS 11 or later)."
           fi
           # A checksum of each wheel, to check a download by (sha256sum -c).
           (cd dist && sha256sum *.whl > SHA256SUMS && cat SHA256SUMS)
