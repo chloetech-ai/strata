@@ -1202,6 +1202,8 @@ With `extraCopies: false`, a shard of two copies serves no reads and takes no wr
 
 ### Autoscaling
 
+> **Experimental.** The autoscaler (the spec's `autoscale`, `/v1/admin/kube/autoscale/*`, `/v1/admin/autoscale/replay`) has no compatibility promise yet: its routes, settings and what it stores may change in any release, with no upgrade path promised. Its answers carry `x-chloedb-experimental`, and `GET /v1/catalog` marks its routes ([compatibility](../compatibility.md#experimental-features)).
+
 The spec's `autoscale` holds rules that change the cluster's copies, shards or volumes from how busy and how full its servers are. Each is a sentence, and a rule left out does nothing:
 
 | rule | fields (default) | what it does |
@@ -1236,6 +1238,8 @@ The settings are the profile's (`profile`: `search-app`, `rag` or `today`, the f
 What the model leaves out: a copy that the coordinator sends fewer reads (the balance check says so), caches warming at another size, the HTTP or gRPC of real clients at the coordinator (the test's requests start inside it), and machines of another CPU family than the test's. A test on a cluster that serves traffic shares its cores with it: the page asks first, and a steady rate the cluster has room for measures without pushing it to its limit.
 
 ### In the cloud
+
+> **Experimental.** Making clusters in the cloud (`/v1/admin/cloud/*`, `/v1/admin/aws/*`, `/v1/admin/digitalocean/*`) has no compatibility promise yet: its routes, settings and what it stores may change in any release, with no upgrade path promised. Its answers carry `x-chloedb-experimental`, and `GET /v1/catalog` marks its routes ([compatibility](../compatibility.md#experimental-features)).
 
 The command center's **Cloud** view plans a cluster on Amazon EKS or on DigitalOcean Kubernetes (DOKS), picked at its top, from what the cloud says now, and writes the files that make it. It also [makes the cluster itself](#making-it-from-the-view), installs ChloeDB on it and deletes it, once the cluster's name is typed again. Both clouds lay the copies out the same way: copy *c* of shard *s* goes on node (*s* + *c*) mod *nodes*, so a shard's copies are on different nodes while there are at least as many nodes as copies, and each copy's requests are 90% of its share of what its node has left for it: its memory and CPU less what the node keeps for itself and its cloud's agents, and less the coordinators, the operator and CoreDNS that may run beside it. With fewer than three copies a shard, a node's share is split one way more, for the extra copy an [upgrade](#upgrades) adds beside a shard's copies. Their routes need the admin scope.
 
@@ -1321,6 +1325,8 @@ The view's read-only keys are not enough to make a cluster:
 The nodes pull the plan's image (`ghcr.io/chloetech-ai/chloedb-server:latest` unless changed), so it must be one they can reach. The repository's `Image` workflow (`.github/workflows/image.yml`) publishes it: each push to `main` that changes ChloeDB or the server builds it for x86-64 and arm64 (Graviton) and tags it `latest` and the commit's sha, and a run started by hand publishes its branch under its sha. The nodes pull it without credentials once the package is public (the package's settings on GitHub, once, after its first publish); for a private one, give the cluster an image pull secret, or name an image of your own in the plan.
 
 ### Many clusters from one command center
+
+> **Experimental.** The hub (`/v1/admin/hub/*`, `/c/<name>/`) has no compatibility promise yet: its routes, settings and what it stores may change in any release, with no upgrade path promised. Its answers carry `x-chloedb-experimental`, and `GET /v1/catalog` marks its routes ([compatibility](../compatibility.md#experimental-features)).
 
 A chloedb-server, typically the one on your laptop, is a **hub**: its command center reaches other clusters as well as its own. Its **Connections** view keeps a book of them, each an address and an API key of that cluster, and opens each one's command center at `/c/<name>/`, where every call goes through the hub, which adds that cluster's key. The browser never holds a cluster's key. The hub keeps the keys in the macOS Keychain or the Secret Service (`secret-tool`) where there is one, else in `<db>.hub-keys.json`, readable by its owner only; the book itself, `<db>.hub.json` (`--hub-file`), holds no secret. Each forwarded call names the hub in `x-strata-via: hub <device>` (`--hub-device`, else `$USER@<host>`), so the cluster's audit log shows where it came from.
 
@@ -1843,6 +1849,8 @@ curl -s localhost:7700/v1/judge -H 'content-type: application/json' -d '{"query"
 On 25 TREC-COVID queries, pooling the top 10 of BM25 and of dense retrieval (464 rows), `claude-haiku-5-5`'s grades agreed with TREC's on "relevant" for 84% of the rows TREC judged (Cohen's kappa 0.57), were the more lenient (27% of the rows TREC judged not relevant got 2 or 3), and named the same winner of the two rankings on 21 of the 24 queries TREC's judgments decide; they reproduce the size of a gap less well (Kendall's tau 0.32 between the per-query differences). They are a good stand-in for telling which ranking is better on queries nobody has judged, and a weaker one for absolute nDCG. The study (`chloedb-server/results/judge/`) sent the prompts through Claude Code, where the model thinks before most answers; the endpoint asks without thinking.
 
 ## The on-call agent
+
+> **Experimental.** The on-call agent (`/v1/admin/oncall/*`) has no compatibility promise yet: its routes, settings and what it stores may change in any release, with no upgrade path promised. Its answers carry `x-chloedb-experimental`, and `GET /v1/catalog` marks its routes ([compatibility](../compatibility.md#experimental-features)).
 
 `POST /v1/admin/oncall` (admin) has a Claude model look into a firing alert (`{"alert": "<rule>"}`) or a question about the cluster (`{"question": "why did p99 double at 14:05?"}`) the way an operator would, and report what it found and what it would do. It has the read-only views of this page as tools: health (`fleet` for every coordinator's), the cluster's shards and copies, each copy's load, the host, the alerts and one rule's events, the events timeline, the running, slow and recent queries and the statistics by statement, this server's log lines, the metrics series and the contain rules. Each tool call is a request to the server's own route with the caller's key, through the same checks and audit as any other, named `oncall` in the query log (`x-chloedb-app`), and the model sees at most 12,000 characters of each answer.
 

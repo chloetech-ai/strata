@@ -645,7 +645,7 @@ const routes = [
   ['POST', /^\/api\/handoff$/, async (b, m, url, cx) => login.handoff(cx.req, String(b.next || ''))],
   ['GET', /^\/api\/status$/, async () => ({ model: MODEL, strata: strataUrl, cluster: ON_CLUSTER, feed: engine.feed, keys: appKeys.status(), data: child ? DATA : null, autorepair: AUTOREPAIR,
     login: login.on ? { publicUrl: login.publicUrl } : null,
-    spend: spend.cap ? { usd: Math.round(spend.usd * 100) / 100, cap: spend.cap, asksUsd: Math.round(spend.asksUsd * 100) / 100, asksCap: spend.asksCap, calls: spend.calls, refused: spend.refused, since: spend.since } : null })],
+    spend: spend.cap ? { usd: Math.round(spend.usd * 100) / 100, cap: spend.cap, asksUsd: Math.round(spend.asksUsd * 100) / 100, asksToday: Math.round(spend.asksDayUsd * 100) / 100, asksCap: spend.asksCap, calls: spend.calls, refused: spend.refused, since: spend.since } : null })],
   ['GET', /^\/api\/apps$/, async (b, m, url, cx) => {
     const costs = await engine.store.costs();
     // A key limited to tables lists the apps whose tables it reads.
@@ -793,6 +793,9 @@ const routes = [
     if (cx.public && !user) throw Object.assign(new Error('Sign in first'), { status: 401 });
     return { member: await services.addToCompany(id, b.company, cx.public ? user.id : null, b) };
   }],
+  // A company that invited the signed-in person (an admin added them on the
+  // app's page): they join it themselves.
+  ['POST', /^\/api\/apps\/([a-z0-9]+)\/companies\/join$/, async (b, [id], url, cx) => ({ member: await services.joinCompany(id, b.company, (await cx.user(id))?.id) })],
   ['POST', /^\/api\/apps\/([a-z0-9]+)\/companies\/members\/remove$/, async (b, [id], url, cx) => {
     const user = await cx.user(id);
     if (cx.public && !user) throw Object.assign(new Error('Sign in first'), { status: 401 });
@@ -826,7 +829,7 @@ const routes = [
   ['POST', /^\/api\/apps\/([a-z0-9]+)\/email$/, async (b, [id], url, cx) => {
     const user = await cx.user(id);
     if (!user) throw Object.assign(new Error('email: sign in to send email from this app'), { status: 401 });
-    return { email: await services.email(id, b, user.id) };
+    return { email: await services.email(id, b, user.id, { sender: cx.public ? await cx.as(id) : null }) };
   }],
   // What people did in the app, in its own words, for the Activity view.
   ['GET', /^\/api\/apps\/([a-z0-9]+)\/activity$/, async (b, [id], url, cx) => {

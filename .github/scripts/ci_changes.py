@@ -13,7 +13,7 @@ $GITHUB_OUTPUT. The JSON names each group of jobs and whether it runs:
              whether there is any
   server     a chloedb-server binary is needed (job `server-bin`)
   smoke      the smoke test runs, and which of its parts: smoke_crawl,
-             smoke_sheets, smoke_netops, smoke_ctx, smoke_apps, smoke_swarm
+             smoke_sheets, smoke_ctx, smoke_apps
   python, javascript, java, docs
              those jobs
 
@@ -22,6 +22,13 @@ the jobs that use it: chloectx, chloedb-crawl and chloedb-sheets are run by
 the smoke test and by the guide's pages (job `docs`), and the Python package
 by the guide's pages too. The documentation site, Markdown files and
 benchmark results run nothing, as before (see the top of ci.yml).
+
+The demos (chloedb-netops, chloedb-swarm, examples/feature-store,
+examples/parley) are on a release train of their own: CI and its required
+check `CI result` do not test them, and a change only under them runs
+nothing here. The workflow Demos (demos.yml) tests them, on a pull request
+that touches one and every night, and a failure there does not hold a
+ChloeDB release (docs/compatibility.md, "Demos").
 
 `python3 .github/scripts/ci_changes.py --self-test` checks the rules.
 """
@@ -36,15 +43,15 @@ APPS = {
     "chloectx/": ({"chloectx"}, {"smoke_ctx", "docs"}),
     "chloedb-crawl/": ({"chloedb-crawl"}, {"smoke_crawl", "docs"}),
     "chloedb-sheets/": ({"chloedb-sheets"}, {"smoke_sheets", "docs"}),
-    "chloedb-netops/": ({"chloedb-netops"}, {"smoke_netops"}),
     "chloedb-apps/": (set(), {"smoke_apps"}),
-    "chloedb-swarm/": (set(), {"smoke_swarm"}),
     "chloedb-py/": (set(), {"python", "docs"}),
     "chloedb-js/": (set(), {"javascript"}),
     "chloedb-java/": (set(), {"java"}),
 }
-CRATES = ["chloedb", "chloectx", "chloedb-server", "chloedb-crawl", "chloedb-sheets", "chloedb-netops"]
-SMOKE = ["smoke_crawl", "smoke_sheets", "smoke_netops", "smoke_ctx", "smoke_apps", "smoke_swarm"]
+CRATES = ["chloedb", "chloectx", "chloedb-server", "chloedb-crawl", "chloedb-sheets"]
+SMOKE = ["smoke_crawl", "smoke_sheets", "smoke_ctx", "smoke_apps"]
+# The demo train (demos.yml): nothing in CI.
+DEMOS = ("chloedb-netops/", "chloedb-swarm/", "examples/feature-store/", "examples/parley/")
 JOBS = ["python", "javascript", "java", "docs"]
 # The guide's pages run as scripts: a change to them or to the site's
 # generator runs the docs job even though it is documentation.
@@ -69,6 +76,8 @@ def plan(paths, everything=False):
         if p.startswith("docs/") or p.endswith(".md"):
             continue
         if RESULTS.match(p) and not RESULTS_CODE.match(p):
+            continue
+        if p.startswith(DEMOS):
             continue
         for prefix, (cs, gs) in APPS.items():
             if p.startswith(prefix):
@@ -104,11 +113,13 @@ def self_test():
     assert on(["docs/guide/search.md"]) == {"any", "docs", "server"}
     assert on(["chloedb/results/sequence/gate.py"]) == every
     assert on(["chloedb-sheets/src/lib.rs"]) == {"any", "test:chloedb-sheets", "smoke", "smoke_sheets", "docs", "server"}
-    assert on(["chloedb-netops/src/lib.rs"]) == {"any", "test:chloedb-netops", "smoke", "smoke_netops", "server"}
+    assert on(["chloedb-netops/src/lib.rs"]) == set()
+    assert on(["examples/parley/parley/app.py", "examples/feature-store/featurestore.py"]) == set()
+    assert on(["chloedb-netops/src/lib.rs", "chloedb-sheets/src/lib.rs"]) == {"any", "test:chloedb-sheets", "smoke", "smoke_sheets", "docs", "server"}
     assert on(["chloedb-crawl/src/lib.rs"]) == {"any", "test:chloedb-crawl", "smoke", "smoke_crawl", "docs", "server"}
     assert on(["chloectx/src/app.rs"]) == {"any", "test:chloectx", "smoke", "smoke_ctx", "docs", "server"}
     assert on(["chloedb-apps/src/x.js"]) == {"any", "smoke", "smoke_apps", "server"}
-    assert on(["chloedb-swarm/x.js"]) == {"any", "smoke", "smoke_swarm", "server"}
+    assert on(["chloedb-swarm/x.js"]) == set()
     assert on(["chloedb-py/python/chloedb/x.py"]) == {"any", "python", "docs", "server"}
     assert on(["chloedb-js/client.js"]) == {"any", "javascript", "server"}
     assert on(["chloedb-java/pom.xml"]) == {"any", "java"}

@@ -2330,27 +2330,40 @@ test('apps reach a model and the web only when switched on: cached answers, dail
   await assert.rejects(reach.ask('a1', 'One more, about the menu'), (e) => e.refused && e.status === 429 && /cost \$5\.00 today, its limit \(\$2\)/.test(e.message));
 });
 
-test("apps' own model calls have a share of the spending limit of their own, and builds the rest", async () => {
+test("apps' own model calls have a day's share of the spending limit of their own, and builds the rest", async () => {
   const { spend, overCap } = await import('../engine/llm.mjs');
   const was = { ...spend };
   try {
-    Object.assign(spend, { cap: 10, asksCap: 2.5, usd: 0, asksUsd: 0, refused: 0, file: null });
+    const day = new Date().toISOString().slice(0, 10);
+    Object.assign(spend, { cap: 10, asksCap: 2.5, usd: 0, asksUsd: 0, asksDay: day, asksDayUsd: 0, refused: 0, file: null });
     assert.equal(overCap('build'), null);
     assert.equal(overCap('asks'), null);
-    // the apps spend their share: they stop, the builds go on
-    Object.assign(spend, { usd: 2.5, asksUsd: 2.5 });
-    assert.match(overCap('asks').message, /apps have reached their share/);
+    // the apps spend their share of the day: they stop, the builds go on
+    Object.assign(spend, { usd: 2.5, asksUsd: 2.5, asksDayUsd: 2.5 });
+    assert.match(overCap('asks').message, /apps have reached their spending limit for the model today .*\$2\.5 a day/);
     assert.equal(overCap('asks').status, 402);
     assert.equal(overCap('build'), null);
+    // the share is a day's, not a lifetime's (audit 4, X-G5): the next day
+    // the apps ask again, though they spent as much before
+    Object.assign(spend, { asksDay: '2000-01-01' });
+    assert.equal(overCap('asks'), null);
+    assert.equal(spend.asksDayUsd, 0);
+    assert.equal(spend.asksUsd, 2.5, 'what they spent still counts against the cap');
     // builds spend theirs: they stop, and apps that have some left go on
-    Object.assign(spend, { usd: 8, asksUsd: 0.5 });
+    Object.assign(spend, { usd: 8, asksUsd: 0.5, asksDayUsd: 0.5 });
     assert.match(overCap('build').message, /\$7\.50 of \$7\.5 for builds/);
     assert.equal(overCap('asks'), null);
-    Object.assign(spend, { usd: 10, asksUsd: 1 });
+    Object.assign(spend, { usd: 10, asksUsd: 1, asksDayUsd: 1 });
     assert.match(overCap('asks').message, /reached its spending limit/);
-    // no cap: nothing is refused
-    Object.assign(spend, { cap: 0, asksCap: 0, usd: 100, asksUsd: 100 });
+    // no studio cap: builds are not refused, and the apps still stop at
+    // their day's dollars (a published app always has a dollar stop)
+    Object.assign(spend, { cap: 0, asksCap: 20, usd: 100, asksUsd: 100, asksDayUsd: 20 });
     assert.equal(overCap('build'), null);
+    assert.match(overCap('asks').message, /today/);
+    Object.assign(spend, { asksDayUsd: 19 });
+    assert.equal(overCap('asks'), null);
+    // 0 is no daily stop, when whoever runs the engine says so
+    Object.assign(spend, { asksCap: 0, asksDayUsd: 100 });
     assert.equal(overCap('asks'), null);
   } finally {
     Object.assign(spend, was);

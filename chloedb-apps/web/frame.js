@@ -190,6 +190,8 @@
     createCompany: (name) => rpc('createCompany', [String(name || '')]),
     useCompany: (id) => rpc('useCompany', [String(id || '')]),
     addToCompany: (company, email, role) => rpc('addToCompany', [String(company || ''), String(email || ''), role || 'member']),
+    // a company that invited the person (app.companies() lists it with invited)
+    joinCompany: (id) => rpc('joinCompany', [String(id || '')]),
     // files: upload(File | FileList | File[]) -> {id, name, type, size, url}
     upload: (f) => (f && typeof f.length === 'number' && !(f instanceof Blob) ? Promise.all(Array.from(f).map(one)) : one(f)),
     fileUrl: (id, opts) => (!id ? '' : /^(https?:|data:|blob:)/.test(String(id)) ? String(id) : `${files}${encodeURIComponent(id)}${opts && opts.download ? '?download' : ''}`),

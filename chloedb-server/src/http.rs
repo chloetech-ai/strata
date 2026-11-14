@@ -572,6 +572,10 @@ async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
     if let Ok(v) = header::HeaderValue::from_str(&id) {
         res.headers_mut().insert(obs::HEADER, v);
     }
+    // A feature with no compatibility promise yet says so (crate::catalog::EXPERIMENTAL).
+    if let Some(f) = crate::catalog::experimental(route) {
+        res.headers_mut().insert(header::HeaderName::from_static(crate::catalog::EXPERIMENTAL_HEADER), header::HeaderValue::from_static(f));
+    }
     close_when_draining(&mut res);
     let _in = span.enter();
     match res.extensions().get::<Failure>() {

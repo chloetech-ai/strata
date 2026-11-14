@@ -182,6 +182,9 @@ async fn manifest() -> Json<Value> {
         "icon_svg": ICON,
         "view": "ui/view.js",
         "version": env!("CARGO_PKG_VERSION"),
+        // On the demo train: tested by the Demos workflow, not by CI's
+        // required check, and marked as a demo in the command center.
+        "maturity": "demo",
     }))
 }
 

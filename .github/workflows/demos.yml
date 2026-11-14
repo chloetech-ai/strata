@@ -1,0 +1,198 @@
+name: Demos
+
+# The demo train: the apps that show what ChloeDB can do and are not part of
+# its releases' promises (docs/compatibility.md, "Demos"):
+#
+#   chloedb-netops           network operations on a simulated carrier network
+#   chloedb-swarm            simulated users, an internal test instrument
+#   examples/feature-store   a shop ranked on features ChloeDB keeps
+#   examples/parley          a social network of LLM agents
+#
+# CI (ci.yml) and its required check `CI result` do not test them, and a
+# change only under them runs nothing there (.github/scripts/ci_changes.py):
+# a demo's fault does not hold a change to the engine or a release tag, and
+# fixing one does not wait for the engine's matrix. This workflow tests them
+# against a chloedb-server of the same commit, on a pull request that
+# touches a demo (or this file), every night against main (a failed night
+# opens an issue, nightly-report.yml), and by hand. Its summary check is
+# `Demo result`, which no ruleset requires.
+on:
+  pull_request:
+    paths:
+      - "chloedb-netops/**"
+      - "chloedb-swarm/**"
+      - "examples/feature-store/**"
+      - "examples/parley/**"
+      - ".github/workflows/demos.yml"
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demos-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # As ci.yml's: the Rust every job builds with.
+  RUST_TOOLCHAIN: "1.100.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # chloedb-server of this commit. CI's job server-bin keys its cache by the
+  # trees of chloedb/, chloedb-server/ and docs/chloedb/, so a pull request
+  # that changes only demos finds main's binary there and builds nothing;
+  # this job only reads that cache.
+  server:
+    name: chloedb-server binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Source key
+        id: key
+        run: echo "key=chloedb-server-bin-${{ runner.os }}-${RUST_TOOLCHAIN}-$(git rev-parse HEAD:chloedb HEAD:chloedb-server HEAD:docs/chloedb | sha256sum | cut -c1-24)" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        id: cache
+        with:
+          path: .server-bin
+          key: ${{ steps.key.outputs.key }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: chloedb-server
+        run: |
+          cargo build --locked --release
+          mkdir -p ../.server-bin
+          cp target/release/chloedb-server ../.server-bin/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: chloedb-server-demos
+          path: .server-bin/chloedb-server
+          retention-days: 2
+          if-no-files-found: error
+
+  # Network operations: its tests and clippy, and its 31 tables, the
+  # topology found from logs, each of the simulator's six faults diagnosed
+  # against its answer key, an action approved and a restart, on a server
+  # of this commit (tests/cluster.rs).
+  netops:
+    name: chloedb-netops
+    needs: server
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: chloedb-netops
+          shared-key: chloedb-netops-demos
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: chloedb-server-demos
+          path: .server-bin
+      - name: Tests
+        working-directory: chloedb-netops
+        env:
+          CHLOEDB_SERVER_BIN: ${{ github.workspace }}/.server-bin/chloedb-server
+          CHLOEDB_NETOPS_NEED_SERVER: "1"
+        run: |
+          chmod +x "$CHLOEDB_SERVER_BIN"
+          cargo test --locked --profile ci --no-fail-fast
+      - name: Clippy
+        working-directory: chloedb-netops
+        run: cargo clippy --locked --profile ci --all-targets -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
+
+  # Swarm: a run of simulated users with a scripted model in place of the
+  # API, each session in a sandbox server of this commit, its checks,
+  # reviews and findings stored in another one.
+  swarm:
+    name: chloedb-swarm
+    needs: server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: chloedb-server-demos
+          path: .server-bin
+      - name: Tests
+        working-directory: chloedb-swarm
+        env:
+          CHLOEDB_SERVER_BIN: ${{ github.workspace }}/.server-bin/chloedb-server
+          CHLOEDB_SWARM_NEED_SERVER: "1"
+        run: |
+          chmod +x "$CHLOEDB_SERVER_BIN"
+          npm ci
+          npm test
+
+  # The feature store and Parley, in Python's standard library (and, for
+  # Parley, the HTTP client of chloedb-py/python, which needs no build): each
+  # against a server of this commit; Parley also on a coordinator over two
+  # shards. Parley's in-process backend needs the compiled extension and is
+  # skipped here.
+  python:
+    name: ${{ matrix.demo }}
+    needs: server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        demo: [feature-store, parley]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: chloedb-server-demos
+          path: .server-bin
+      - name: Tests
+        working-directory: examples/${{ matrix.demo }}
+        env:
+          CHLOEDB_SERVER_BIN: ${{ github.workspace }}/.server-bin/chloedb-server
+          CHLOEDB_SERVER: ${{ github.workspace }}/.server-bin/chloedb-server
+        run: |
+          chmod +x "$CHLOEDB_SERVER_BIN"
+          # Parley's posts are searched by meaning with a static model on
+          # the server, which must be there before the tests write rows.
+          if [ "${{ matrix.demo }}" = parley ]; then
+            for i in 1 2 3; do "$CHLOEDB_SERVER_BIN" fetch-model potion-base-8M && break; sleep 10; done
+          fi
+          python3 -m pip install pytest
+          python3 -m pytest -q tests
+
+  demo-result:
+    name: Demo result
+    if: always()
+    needs: [server, netops, swarm, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every demo passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c '
+          import json, sys
+          bad = {k: v["result"] for k, v in json.load(sys.stdin).items() if v["result"] != "success"}
+          for k, r in sorted(bad.items()):
+              print(f"{k}: {r}")
+          sys.exit(1 if bad else 0)
+          '

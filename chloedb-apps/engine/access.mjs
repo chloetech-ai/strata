@@ -24,15 +24,23 @@
 //   else; a change or remove reaches those rows only and cannot move a row
 //   out of them.
 //
-// A table with no statement is as tables were before access was declared:
-// whoever reaches the app (as its publish choice says) reaches the table. A
-// table with one statement or more lets only what its statements allow.
+// A table with no statement, in an app that declares no access anywhere, is
+// as tables were before access was declared: whoever reaches the app (as its
+// publish choice says) reaches the table. Once any table of the app declares
+// access, a table that declares none is read by everyone and written only by
+// the app's owner (audit 4, X-G2: an app that says who may write some tables
+// does not leave the others open to every visitor). A table with one
+// statement or more lets only what its statements allow.
 // The studio (the app's builder and owner, not through the public path)
 // always has every row: the statements are for the app's people.
 //
 // Server functions called by people run as them (their reads and writes are
-// held to the same statements); triggers and schedules run as the app,
-// since they answer a write that was allowed or the clock, not a person.
+// held to the same statements), and so do the triggers their writes set off
+// (audit 4, X-G4): a trigger reaches only what the person whose write fired
+// it may reach, unless the app marks it to run as the app ("as": "app", or
+// RUNS AS APP in a CREATE RULE), for a trigger that keeps a total over
+// everyone's rows. Schedules, and triggers of the studio's writes, run as the
+// app.
 
 export const ACTIONS = ['read', 'add', 'change', 'remove'];
 const ACTION_WORDS = { READ: ['read'], SELECT: ['read'], ADD: ['add'], INSERT: ['add'], CHANGE: ['change'], UPDATE: ['change'], EDIT: ['change'],
@@ -139,8 +147,12 @@ const refusal = (status, message) => Object.assign(new Error(message), { status,
 // What `who` may do: {all: true} (every row), {scope: [{col, by}]} (those
 // rows), or a thrown 401 (sign in first) / 403. who is {role, user, company}
 // (a person of the app, or role visitor and no user); null is the studio.
-export function decide(spec, action, who) {
-  const rules = rulesOf(spec);
+//
+// closed: the app declares access on some table, so a table that declares
+// none is read by everyone and written by the owner only (CLOSED).
+const CLOSED = ['ALLOW READ ON t TO everyone', 'ALLOW WRITE ON t TO owner'].map(parseAllow);
+export function decide(spec, action, who, { closed = false } = {}) {
+  const rules = rulesOf(spec) || (closed ? CLOSED : null);
   if (!rules || !who) return { all: true };
   const table = spec.name;
   const mine = rules.filter((r) => r.actions.includes(action));
@@ -148,6 +160,7 @@ export function decide(spec, action, who) {
   if (!fits.length) {
     const least = mine.length ? mine.map((r) => WHO.indexOf(r.who)).sort()[0] : -1;
     const whom = least >= 0 ? PEOPLE[WHO[least]] : null;
+    if (rules === CLOSED) throw refusal(403, `${table} is read-only here: only the app's owner can ${VERB[action]} it`);
     if (!who.user) throw refusal(401, `Sign in first: ${whom ? `only ${whom} can ${VERB[action]} ${table}` : `${table} is not open to visitors`}`);
     throw refusal(403, whom ? `Only ${whom} can ${VERB[action]} ${table}` : `Nobody can ${VERB[action]} ${table} here`);
   }

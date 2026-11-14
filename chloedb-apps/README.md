@@ -103,8 +103,11 @@ each other in a graph that ChloeDB walks.
   the owner, each including the ones after it; WHERE keeps a person to their
   own rows or their company's. The engine holds every read and write of the
   app's people to it (`/sql`, `/insert`, `/update`, `/remove`, and `/call`,
-  whose functions and rules run as the person who called them; triggers and
-  schedules run as the app): a read of a table they may not see is a 401
+  whose functions and rules run as the person who called them, as do the
+  triggers their writes set off, unless the app marks a trigger to run as the
+  app with `"as": "app"` or `RUNS AS APP` in its CREATE RULE, for a total over
+  everyone's rows; schedules, and triggers of the studio's writes, run as the
+  app): a read of a table they may not see is a 401
   ("Sign in first: ...") for a visitor and a 403 for a member; a scoped read
   gets the scope's condition joined to the WHERE of every SELECT that reads
   the table (so MATCH, bm25 and joins keep working on its scan); an add
@@ -115,15 +118,26 @@ each other in a graph that ChloeDB walks.
   names one with nobody signed in is refused as a 401 "Sign in first", not
   sent to ChloeDB unbound. Companies are the engine's, never the app's:
   `sa_companies` and `sa_memberships`, a person making one becomes its admin
-  and adds people who have an account (`GET/POST /api/apps/<id>/companies`,
-  `POST .../companies/members {company, email, role}`,
-  `.../companies/members/remove`; `app.companies()`, `app.company()`,
-  `app.createCompany(name)`, `app.useCompany(id)`, `app.addToCompany(...)` in
-  views), and the one a person works in now is the `x-sa-company` header's
-  when they belong to it, else their first. A table with no ALLOW statement is
-  as tables were before (open to whoever the publish choice lets in), so apps
-  built before keep working; the studio (the builder, not the public path)
-  has every row. A request that asks for signed-in people only, roles or
+  and invites people who have an account, who join it themselves
+  (`GET/POST /api/apps/<id>/companies`, `POST .../companies/members {company,
+  email, role}`, `POST .../companies/join {company}`,
+  `.../companies/members/remove`; `app.companies()` (an invitation not taken
+  is listed with `invited` and no role), `app.company()`,
+  `app.createCompany(name)`, `app.useCompany(id)`, `app.addToCompany(...)`,
+  `app.joinCompany(id)` in views; the studio adds people at once), and the
+  one a person works in now is the `x-sa-company` header's when they belong
+  to it, else their first. Company scope keeps companies apart from each
+  other, not from their own admins: a company's admins decide who is in it,
+  and anyone signed in may make companies of their own. In an app that
+  declares no access at all, a table is as tables were before (open to
+  whoever the publish choice lets in), so apps built before keep working;
+  once any table of the app declares access, a table with no ALLOW statement
+  is read by everyone and written only by the app's owner. The studio (the
+  builder, not the public path) has every row. A visitor's rows are dated by
+  the engine (`created` is not theirs to give). A person on the public path
+  emails only the app's own people (its members' addresses), from a view or
+  through a function or trigger their action runs; the app's admins and
+  owner, the studio and schedules email anyone. A request that asks for signed-in people only, roles or
   companies fails the build's checks until the plan declares access for every
   table. On a laptop with no login every caller is the studio, so access
   applies to a published app's public beside a cluster and to "See it as a
@@ -239,7 +253,7 @@ on `127.0.0.1:7730`. The engine gives each app a key of its own
 | `STRATA_APPS_PHOTOS=builtin` | photos from the built-in set only (no Wikimedia Commons) |
 | `STRATA_APPS_PHOTO_CACHE` | where found photos and searches are cached (default `photo-cache/` beside the data) |
 | `STRATA_APPS_SPEND_CAP_USD` | stop the model once the engine has spent this much, in US dollars, counted from what Claude Code reports and kept in `DATA/spend.json` across restarts; apps' own questions (`app.ask`) have a share of it of their own and builds and checks the rest, so that one never stops the other |
-| `STRATA_APPS_ASK_CAP_USD`, `STRATA_APPS_ASK_USD_PER_DAY` | that share for apps' own questions (default a quarter of `STRATA_APPS_SPEND_CAP_USD`), and what one app's questions may cost in a day (default $2), whatever its count of questions |
+| `STRATA_APPS_ASK_CAP_USD`, `STRATA_APPS_ASK_USD_PER_DAY` | what all the apps' own questions may cost in a day (default a quarter of `STRATA_APPS_SPEND_CAP_USD`, and $20 with no cap; 0 is no daily stop), and what one app's questions may cost in a day (default $2), whatever its count of questions |
 | `STRATA_APPS_ASK_MODEL`, `STRATA_APPS_ASKS_PER_DAY`, `STRATA_APPS_FETCHES_PER_DAY` | apps' own model (`app.ask`, default `claude-haiku-5-5`), the questions an app may ask it each day unless its owner sets another number (default 200), and the pages an app may fetch each day (default 1000); see [A model and the web](../docs/chloedb/apps.md#a-model-and-the-web-per-app) |
 | `STRATA_APPS_SECRET_KEY` | what apps' secrets (API keys) are sealed with; without it the engine makes a key in `DATA/secret.key` (mode 0600) on first start. Beside a cluster, set it from a Kubernetes secret so a new pod can open them |
 | `STRATA_APPS_SCHEDULES=off` | do not run apps' schedules (sources included) in this engine |

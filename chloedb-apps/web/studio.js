@@ -1716,6 +1716,7 @@ window.addEventListener('message', async (e) => {
         case 'createCompany': value = (await api('POST', `${base}/companies`, { name: a })).company; S.company = value.id; authChanged(); break;
         case 'useCompany': S.company = a || null; value = (await api('GET', `${base}/companies`, null, companyHeader())).current; authChanged(); break;
         case 'addToCompany': value = (await api('POST', `${base}/companies/members`, { company: a, email: b, role: c || 'member' })).member; break;
+        case 'joinCompany': value = (await api('POST', `${base}/companies/join`, { company: a })).member; S.company = value.company; authChanged(); break;
         case 'files': value = (await api('POST', `${base}/files/info`, { ids: a })).files.map((f) => ({ ...f, url: location.origin + f.url })); break;
         case 'email': value = (await api('POST', `${base}/email`, a)).email; break;
         case 'geocode': value = (await api('GET', `/api/geocode?q=${encodeURIComponent(a || '')}`)).places; break;
