@@ -230,6 +230,23 @@ data.state.kube = { managed: true, namespace: "chloedb", name: "e2e" };
 assert.equal(data.howToSet({ flag: "--environment", field: "spec.environment", value: "production", or: "staging" }), "set spec.environment: production (or staging) in the StrataCluster chloedb/e2e");
 data.state.kube = null;
 
+// CCB-17: a save of the definition there now makes no version, and the
+// dialog knows it; another body, or another description, does.
+const savedView = await import(new URL("views/saved.js", app));
+const v1 = { version: 3, signature: "jacket_search(q TEXT, k INT DEFAULT 10)", description: "Finds jackets.", body: "SELECT id, score() FROM products ORDER BY bm25(body, :q) DESC LIMIT :k" };
+const jacket = { name: "jacket_search", params: [{ name: "q", ty: "TEXT" }, { name: "k", ty: "INT", default: 10 }], body: "SELECT id, score()\nFROM products\nORDER BY bm25(body, :q) DESC\nLIMIT :k", description: " Finds jackets. " };
+assert.ok(savedView.sameDefinition(v1, jacket));
+assert.ok(!savedView.sameDefinition(v1, { ...jacket, body: jacket.body.replace("LIMIT", "WHERE price < 9 LIMIT") }));
+assert.ok(!savedView.sameDefinition(v1, { ...jacket, description: "Finds coats." }));
+assert.ok(!savedView.sameDefinition(undefined, jacket));
+// CCB-18: two versions, each kept on one line, compare a clause a line:
+// what both share is not marked.
+const oldDef = "CREATE FUNCTION f(q TEXT) RETURNS TABLE AS SELECT id, title, score() FROM products ORDER BY bm25(body, :q) DESC LIMIT 10";
+const newDef = "CREATE FUNCTION f(q TEXT) RETURNS TABLE AS SELECT id, title, score() FROM products WHERE price < 200 ORDER BY bm25(body, :q) DESC LIMIT 10";
+const lines = savedView.versionDiff(oldDef, newDef, sqlView.formatSql);
+assert.deepEqual(lines.filter(([k]) => k !== " ").map(([k, l]) => k + l), ["+WHERE price < 200"]);
+assert.ok(lines.length >= 5, JSON.stringify(lines));
+
 // CCW-10: the shell knows each view before its code loads: what views/index.js
 // says of a view (its title, icon, layout, the words the palette finds it by)
 // is what the view's module says, and each view's code loads.
