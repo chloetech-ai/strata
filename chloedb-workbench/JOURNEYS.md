@@ -966,6 +966,90 @@ Inside the Terminal tab every key goes to the agent, and a bar says so.
 Removed: `z`, `c`, `t`, `d`, `[` and `]` as bare keys. They typed into
 terminals, and they named concepts the user had not met.
 
+## Rules and notifications
+
+Two goal modules, served at `/goals/<file>` (`GOALS` in `src/server.rs`,
+next to R1's list; when R1's list exists, its two entries move there).
+They take the level ctx (`{ api, state, params, go }`) plus R1's
+`{ project, crumbs }`, and use only `common.js`'s pieces and the tokens.
+
+### What R1 calls
+
+```js
+import * as rules from "/goals/rules-suggest.js";
+import * as notify from "/goals/notify.js";
+
+// More › Rules (#/more/rules): mount it under Decide's text rules, with
+// its own heading ("What agents may run"); both are about rules.
+rules.mount(root, ctx);
+
+// Start and Continue: a one-line card ("12 of 14 waits were pytest.
+// Review a rule"); an empty node when there is nothing to suggest.
+col.append(rules.card(ctx));
+
+// Every question card: the wide option ("Yes, and don't ask again…")
+// opens the grant sheet before anything is typed.
+questionCard(q, { agent, onAnswer, onGrant: (i) => rules.grantSheet(ctx, { question: q, option: i, agent }) });
+
+// Once, at start.
+const n = notify.init(ctx);
+topBar.append(n.control);        // on a phone: in More instead
+stream.on("change", n.poke);     // re-read at once on the stream's changes
+```
+
+- `grantSheet(ctx, { question, option, agent })` answers the question
+  itself (`POST /api/questions/:id/answer`) on Confirm, and resolves
+  `{ choice: "confirm" | "narrow" | "cancel", pattern, result }`. Other
+  callers pass `{ pattern, agent, file, command, repo, onConfirm }`.
+- A notification's click calls `ctx.go("#/a/<agent>?q=<question>")`,
+  fires `wb:focus-question` on `window` (`detail: { question, agent,
+  href }`), then focuses `.qc[data-q="<question>"]` and adds the class
+  `focus` once the card is on the page. The agent page should show that
+  question's card when `?q=` names it.
+- `n.open()` opens the Notifications sheet (a More entry on a phone);
+  the digest opens by itself when there is one.
+
+### The API
+
+| route | what |
+|---|---|
+| `GET /api/rules/suggested?repo=` | Rules worth adding: the narrowest pattern its approvals support (`Bash(python3 -m pytest:*)`, never `Bash(python3:*)`), and for 7 and 30 days every command it would allow (risky first: migrations, databases, network, deletes, root, writes outside the worktree), the prompts it removes and the wait it saves. A rule that covers a command you said No to is split or dropped. |
+| `POST /api/rules/suggested/:id/accept` | `{ repo, pattern }`: writes only when `pattern` is the suggestion's exact pattern (400 without, 409 when it changed). |
+| `POST /api/rules/suggested/:id/dismiss` | Not suggested again for that project. |
+| `GET /api/rules/check?repo=&pattern=&agent=&command=` | The grant sheet's data: the file, whether the rule is too wide and why, what it would allow, a narrower rule. |
+| `GET /api/rules/grants?repo=` | Every grant: Workbench's, Claude Code's `.claude/settings.local.json` lines, session-wide answers; who, when, where, how often used, and whether Workbench can revoke it. |
+| `POST /api/rules/grants` | `{ repo, pattern }`: the sheet's narrower choice; refuses a too-wide rule. |
+| `DELETE /api/rules/grants/:id?repo=` | Revoke. A line in your own checkout's settings is not edited: 409, with what to remove. |
+| `GET`/`PUT /api/notify/settings` | `{ default: {level, minutes}, projects: [...], desktop }`; PUT `{ repo?, level: "all" \| "blocked" \| "alerts", minutes, reset?, desktop? }`. |
+| `POST /api/notify/quiet` | `{ minutes }` (25 by default in the UI; 0 ends it). Critical alerts still notify. |
+| `GET /api/notify/pending?repo=` | `notify`, `later` (with `due_ms`), `held` (quiet), `silent`, `quiet`, `presence`, and `digest` when you come back from quiet or from 5 min without the heartbeat. |
+| `POST /api/notify/seen` | `{ until_ms }`: the digest was read. |
+
+`GET /api/rules` and `DELETE /api/rules/:id` already belong to Decide's
+text rules, so the grants live under `/api/rules/grants`.
+
+### Built
+
+- An accepted rule goes to the mark `allow:<repo>`, which `spawn` merges
+  (`flow::with_allowed`) into `permissions.allow` of the agent's own
+  `<data>/sessions/<id>/settings.json`, where Flow's applied rules go.
+  Agents started afterwards get it; running agents keep theirs. Nothing is
+  written to `~/.claude` or the project's `.claude` files.
+- Grants are rows of `grants` (`src/rulesuggest.rs`); settings, quiet and
+  the digest's last read are marks (`src/notify.rs`).
+- Approved means answered Yes on a card, or in the terminal followed by
+  the call running; refused means a new prompt or a Stop came first.
+- Notification permission is asked only from the "Notify me" switch. A
+  notification shows the agent, what it asks, the command and Claude
+  Code's options, and says that nothing is answered from it.
+- The dev harness is `ui/dev/rules-notify.html`, over a fixture recorded
+  from a real server by `ui/dev/rules-notify-shoot.cjs --record`.
+- Not built: `Edit`, `WebFetch` and MCP prompts get a suggestion (a
+  folder, a host, the tool) but no test, and the sheet's narrower choice
+  is for Bash commands only; the away digest (no heartbeat for 5 min) is
+  built like the quiet one but has no test of its own; notifications have
+  no action buttons, by design.
+
 ## What the rewrite changes
 
 ### `ui/app.js`

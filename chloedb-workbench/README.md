@@ -352,8 +352,31 @@ a model.
   "away". "I'm stepping away" (`POST /api/away/leave`) marks the moment
   and lists the agents likely to need you while you are gone; it answers
   nothing for you.
+- **Rules**: More › Rules suggests a rule when you approved the same kind
+  of command again and again, and always the narrowest one its approvals
+  support (`Bash(python3 -m pytest:*)`, never `Bash(python3:*)`). Each
+  suggestion lists every command it would have allowed in the last 7 or
+  30 days, risky ones first (migrations, databases, network, deletes,
+  root, writes outside the worktree), with the prompts and the waiting it
+  would have saved. Nothing is written until you confirm the exact rule;
+  it goes to the session settings of agents started afterwards in that
+  repository, never to `~/.claude` or the project's `.claude` files. The
+  same page lists every grant (Workbench's, the "don't ask again" lines
+  Claude Code wrote, session-wide answers) with who, when, where and how
+  often it was used, and Revoke. A question option that grants more than
+  one call opens a check first: the rule, the file, what else it would
+  allow, and a narrower choice.
+- **Notifications**: the bell in the top bar. Per project: every question,
+  only an agent blocked for over N minutes (2 by default), or only alerts.
+  Quiet (25 minutes) holds everything but critical alerts, and a digest
+  sums up what happened when it ends or when you come back after 5
+  minutes away. Desktop notifications start only after you turn on
+  "Notify me"; they show the command and Claude Code's options, answer
+  nothing, and a click opens the question's card to answer with its digit
+  and Enter.
 
-SPEC.md, "The levels' backend as built", has the JSON shapes.
+SPEC.md, "The levels' backend as built", has the JSON shapes;
+JOURNEYS.md, "Rules and notifications", has the routes of the last two.
 
 ## What Health's numbers count
 

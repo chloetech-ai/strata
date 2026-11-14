@@ -5190,3 +5190,250 @@ fn the_threshold_is_set_for_the_project_and_undone() {
     assert_eq!(cfg["knowledge"]["min_cos"], 0.6);
     assert_eq!(s.put("/api/repos/proj/threshold", json!({ "value": 0.99 })).0, 400);
 }
+
+// The rewrite (JOURNEYS.md, "Rules and notifications"): suggested rules from
+// evidence, every grant, and the interrupt model.
+
+fn delete(s: &Server, path: &str) -> (u16, Value) {
+    let mut r = http().delete(format!("{}{path}", s.url)).header("authorization", format!("Bearer {TOKEN}")).call().unwrap();
+    let status = r.status().as_u16();
+    (status, r.body_mut().read_json().unwrap_or(Value::Null))
+}
+
+/// Waits for the fake session's own SessionStart hook: one arriving between
+/// a PreToolUse and its Notification would part them.
+fn session_started(s: &Server, id: &str) {
+    let end = Instant::now() + Duration::from_secs(30);
+    while !kinds(&s.events(id)).iter().any(|k| k == "SessionStart") {
+        assert!(Instant::now() < end, "{id}'s session never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A permission prompt for `command`, answered in the agent's terminal:
+/// approved (the call ran), refused (a new prompt came first), or left open.
+fn prompt_as(s: &Server, id: &str, use_id: &str, command: &str, answer: Option<bool>) {
+    hook_as(s, id, json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": use_id, "tool_input": { "command": command, "description": "Run it" } }));
+    hook_as(s, id, json!({ "hook_event_name": "Notification", "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash" }));
+    s.get_until(&format!("/api/questions?agent={id}&state=open"), "the prompt's question", |v| v["questions"].as_array().is_some_and(|q| q.len() == 1));
+    match answer {
+        Some(true) => hook_as(s, id, json!({ "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": use_id, "tool_input": { "command": command }, "tool_response": { "stdout": "ok", "stderr": "", "interrupted": false } })),
+        Some(false) => hook_as(s, id, json!({ "hook_event_name": "UserPromptSubmit", "prompt": "no, not that" })),
+        None => {}
+    }
+}
+
+#[test]
+fn suggested_rules_are_the_narrowest_flag_risky_commands_and_accept_revoke_and_dismiss() {
+    let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
+    let (_d, r) = repo();
+    let id = s.spawn(json!({ "repo": r, "name": "cents", "worktree": false }))["id"].as_str().unwrap().to_string();
+    session_started(&s, &id);
+    let cd = format!("cd {} && python3 -m pytest -q", r.display());
+    let mut n = 0;
+    let mut ask = |cmd: &str, ok: Option<bool>| {
+        n += 1;
+        prompt_as(&s, &id, &format!("t{n}"), cmd, ok);
+    };
+    // pytest approved four times, in four forms.
+    for cmd in ["python3 -m pytest tests/test_promo.py -q", "python3 -m pytest tests/test_promo.py -q", "python3 -m pytest tests/test_cart.py", cd.as_str()] {
+        ask(cmd, Some(true));
+    }
+    // A migration approved once: python3, but not pytest.
+    ask("python3 -m orders.migrate --db dev.sqlite3", Some(true));
+    // cargo test approved three times, and refused once in a form a
+    // `cargo test` rule would cover.
+    for cmd in ["cargo test -p a", "cargo test -p b", "cargo test --release"] {
+        ask(cmd, Some(true));
+    }
+    ask("cargo test -p payments -- --ignored", Some(false));
+    // npm run lint approved three times; npm run deploy refused.
+    for _ in 0..3 {
+        ask("npm run lint", Some(true));
+    }
+    ask("npm run deploy", Some(false));
+    // Two pytest runs that never asked: a rule for pytest allows them too.
+    bash_as(&s, &id, "x1", "python3 -m pytest tests/test_migrations.py --create-db", "ok", false);
+    bash_as(&s, &id, "x2", "python3 -m pytest -q > /etc/pytest.log", "ok", false);
+
+    let path = format!("/api/rules/suggested?repo={}", enc(r.to_str().unwrap()));
+    let (status, v) = s.get(&path);
+    assert_eq!(status, 200, "{v}");
+    let list = v["suggestions"].as_array().unwrap();
+    let patterns: Vec<&str> = list.iter().map(|x| x["pattern"].as_str().unwrap()).collect();
+    // The narrowest pattern: pytest, never python3; nothing that covers a refused command.
+    assert!(patterns.contains(&"Bash(python3 -m pytest:*)"), "{v}");
+    assert!(patterns.contains(&"Bash(npm run lint)"), "{v}");
+    assert!(!patterns.iter().any(|p| *p == "Bash(python3:*)" || p.starts_with("Bash(cargo test") || p.starts_with("Bash(npm run:") || p.contains("migrate")), "{v}");
+    let py = find(&v["suggestions"], "/pattern", "Bash(python3 -m pytest:*)");
+    let w = &py["windows"]["7"];
+    assert_eq!(w["prompts"], 4, "{py}");
+    assert_eq!(w["refused"], 0, "{py}");
+    assert_eq!(w["all_prompts"], 13, "{py}");
+    assert!(w["wait_ms"].as_i64().unwrap() >= 0, "{py}");
+    assert_eq!(py["windows"]["30"]["prompts"], 4);
+    // Every distinct command it would have allowed, the risky ones first.
+    let cmds = w["commands"].as_array().unwrap();
+    let texts: Vec<&str> = cmds.iter().map(|c| c["command"].as_str().unwrap()).collect();
+    assert_eq!(w["distinct"], 5, "{texts:?}");
+    assert!(!texts.iter().any(|c| c.contains("orders.migrate")), "{texts:?}");
+    assert_eq!(cmds[0]["risky"], true, "{texts:?}");
+    assert_eq!(cmds[1]["risky"], true, "{texts:?}");
+    assert_eq!(w["risky"], 2);
+    let risks = |cmd: &str| find(&w["commands"], "/command", cmd)["risks"].clone();
+    assert_eq!(risks("python3 -m pytest tests/test_migrations.py --create-db"), json!(["migration"]));
+    assert_eq!(risks("python3 -m pytest -q > /etc/pytest.log"), json!(["writes outside the worktree"]));
+    assert_eq!(risks("python3 -m pytest tests/test_cart.py"), json!([]));
+    assert_eq!(find(&w["commands"], "/command", "python3 -m pytest tests/test_promo.py -q")["asked"], true);
+    assert!(py["where"]["file"].as_str().unwrap().ends_with("sessions/<agent>/settings.json"), "{py}");
+    assert_eq!(v["prompts"]["7"]["prompts"], 13);
+
+    // The grant sheet: a wide rule says what else it allows, and the narrower choice.
+    let (status, c) = s.get(&format!("/api/rules/check?repo={}&agent={id}&pattern={}&command={}", enc(r.to_str().unwrap()), enc("Bash(python3:*)"), enc("python3 -m pytest tests/test_promo.py -q")));
+    assert_eq!(status, 200, "{c}");
+    assert!(c["too_wide"].as_str().unwrap().contains("any program"), "{c}");
+    assert_eq!(c["file"], json!(format!("{}/.claude/settings.local.json", r.display())));
+    let all: Vec<&str> = c["window"]["commands"].as_array().unwrap().iter().map(|x| x["command"].as_str().unwrap()).collect();
+    assert!(all.contains(&"python3 -m orders.migrate --db dev.sqlite3"), "{all:?}");
+    assert_eq!(c["window"]["commands"][0]["risky"], true, "{c}");
+    assert_eq!(c["narrower"]["pattern"], "Bash(python3 -m pytest:*)", "{c}");
+    assert_eq!(s.post("/api/rules/grants", json!({ "repo": r, "pattern": "Bash(python3:*)" })).0, 400);
+
+    // Accept writes nothing without the exact pattern the sheet showed.
+    let sid = py["id"].as_str().unwrap().to_string();
+    let accept = format!("/api/rules/suggested/{sid}/accept");
+    assert_eq!(s.post(&accept, json!({ "repo": r })).0, 400);
+    let (status, e) = s.post(&accept, json!({ "repo": r, "pattern": "Bash(python3:*)" }));
+    assert_eq!(status, 409, "{e}");
+    let grants_path = format!("/api/rules/grants?repo={}", enc(r.to_str().unwrap()));
+    assert_eq!(s.get(&grants_path).1["grants"], json!([]));
+    let (status, a) = s.post(&accept, json!({ "repo": r, "pattern": "Bash(python3 -m pytest:*)" }));
+    assert_eq!(status, 200, "{a}");
+    assert_eq!(a["allowed"], json!(["Bash(python3 -m pytest:*)"]));
+    // Where flow.rs and supervisor.rs put allowed rules: new agents' own settings.
+    let b = s.spawn(json!({ "repo": r, "name": "later", "worktree": false }));
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(s.data.join("sessions").join(b["id"].as_str().unwrap()).join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["permissions"]["allow"], json!(["Bash(python3 -m pytest:*)"]));
+    let (_, v) = s.get(&path);
+    assert!(!v["suggestions"].as_array().unwrap().iter().any(|x| x["pattern"] == "Bash(python3 -m pytest:*)"), "{v}");
+
+    // Every grant: who, when, where, how often used; and one Claude Code wrote.
+    std::fs::create_dir_all(r.join(".claude")).unwrap();
+    std::fs::write(r.join(".claude/settings.local.json"), json!({ "permissions": { "allow": ["Bash(python3:*)"] } }).to_string()).unwrap();
+    let (status, g) = s.get(&grants_path);
+    assert_eq!(status, 200, "{g}");
+    let wb = find(&g["grants"], "/kind", "workbench");
+    assert_eq!((wb["pattern"].as_str(), wb["granted_by"].as_str(), wb["via"].as_str(), wb["revocable"].as_bool()), (Some("Bash(python3 -m pytest:*)"), Some("you"), Some("a suggested rule"), Some(true)), "{wb}");
+    assert!(wb["created_ms"].as_i64().is_some() && wb["used"].is_u64(), "{wb}");
+    let cc = find(&g["grants"], "/kind", "claude-code");
+    assert_eq!((cc["pattern"].as_str(), cc["revocable"].as_bool()), (Some("Bash(python3:*)"), Some(false)), "{cc}");
+    assert!(cc["how"].as_str().unwrap().contains("yourself"), "{cc}");
+    assert_eq!(delete(&s, &format!("/api/rules/grants/{}?repo={}", cc["id"].as_str().unwrap(), enc(r.to_str().unwrap()))).0, 409);
+    assert!(std::fs::read_to_string(r.join(".claude/settings.local.json")).unwrap().contains("Bash(python3:*)"));
+
+    // Revoke.
+    let (status, x) = delete(&s, &format!("/api/rules/grants/{}?repo={}", wb["id"].as_str().unwrap(), enc(r.to_str().unwrap())));
+    assert_eq!(status, 200, "{x}");
+    assert_eq!(x["allowed"], json!([]));
+    let (_, g) = s.get(&grants_path);
+    assert!(!g["grants"].as_array().unwrap().iter().any(|x| x["kind"] == "workbench"), "{g}");
+    assert_eq!(g["revoked"][0]["pattern"], "Bash(python3 -m pytest:*)", "{g}");
+    let c2 = s.spawn(json!({ "repo": r, "name": "after", "worktree": false }));
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(s.data.join("sessions").join(c2["id"].as_str().unwrap()).join("settings.json")).unwrap()).unwrap();
+    assert!(settings.get("permissions").is_none(), "{settings}");
+
+    // Dismiss: not suggested again.
+    let (_, v) = s.get(&path);
+    let lint = find(&v["suggestions"], "/pattern", "Bash(npm run lint)")["id"].as_str().unwrap().to_string();
+    let (status, d) = s.post(&format!("/api/rules/suggested/{lint}/dismiss"), json!({ "repo": r }));
+    assert_eq!(status, 200, "{d}");
+    let (_, v) = s.get(&path);
+    assert!(!v["suggestions"].as_array().unwrap().iter().any(|x| x["pattern"] == "Bash(npm run lint)"), "{v}");
+    assert_eq!(v["dismissed"], json!(["Bash(npm run lint)"]));
+    assert_eq!(s.post(&format!("/api/rules/suggested/{lint}/accept"), json!({ "repo": r, "pattern": "Bash(npm run lint)" })).0, 404);
+}
+
+#[test]
+fn notifications_follow_the_level_quiet_holds_all_but_critical_and_a_digest_follows() {
+    let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "name": "paybutton", "worktree": false }))["id"].as_str().unwrap().to_string();
+    let b = s.spawn(json!({ "repo": r, "name": "freeship", "worktree": false }))["id"].as_str().unwrap().to_string();
+    session_started(&s, &a);
+    session_started(&s, &b);
+
+    // The default: only when blocked over 2 min.
+    let (status, st) = s.get("/api/notify/settings");
+    assert_eq!(status, 200, "{st}");
+    assert_eq!(st["default"], json!({ "level": "blocked", "minutes": 2 }));
+    assert_eq!(st["levels"].as_array().unwrap().len(), 3);
+    // A minor alert that needs you (two agents edit one file): no notification at that level.
+    for who in [&a, &b] {
+        hook_as(&s, who, json!({ "hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": { "file_path": r.join("src/totals.rs"), "old_string": "a", "new_string": "b" }, "tool_response": {} }));
+    }
+    let (_, c) = s.post("/api/alerts/check", json!({}));
+    assert_eq!(c["counts"]["open"], 1, "{c}");
+    prompt_as(&s, &a, "p1", "python3 -m orders.migrate --db dev.sqlite3", None);
+    let (_, p) = s.get("/api/notify/pending");
+    assert_eq!(p["notify"], json!([]), "{p}");
+    assert_eq!(p["silent"][0]["kind"], "alert", "{p}");
+    let later = &p["later"][0];
+    assert_eq!((later["kind"].as_str(), later["agent"].as_str()), (Some("question"), Some(a.as_str())), "{p}");
+    assert!(later["due_ms"].as_i64().unwrap() > p["now_ms"].as_i64().unwrap(), "{later}");
+
+    // Every question, for this project: they notify now, the question with its command.
+    let (status, st) = s.put("/api/notify/settings", json!({ "repo": r, "level": "all" }));
+    assert_eq!(status, 200, "{st}");
+    assert_eq!(find(&st["projects"], "/name", "proj")["level"], "all");
+    assert_eq!(s.put("/api/notify/settings", json!({ "level": "loud" })).0, 400);
+    let (_, p) = s.get("/api/notify/pending");
+    let kinds: Vec<&str> = p["notify"].as_array().unwrap().iter().map(|x| x["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["alert", "question"], "{p}");
+    let q = &p["notify"][1];
+    assert_eq!(q["command"]["text"], "python3 -m orders.migrate --db dev.sqlite3", "{p}");
+    assert!(q["href"].as_str().unwrap().starts_with(&format!("#/a/{a}?q=")), "{q}");
+
+    // Quiet: everything is held.
+    let (status, qv) = s.post("/api/notify/quiet", json!({ "minutes": 25 }));
+    assert_eq!(status, 200, "{qv}");
+    assert_eq!(qv["quiet"]["on"], true);
+    assert!(qv["quiet"]["left_ms"].as_i64().unwrap() > 24 * 60_000);
+    prompt_as(&s, &b, "p2", "npm run deploy", None);
+    let (_, p) = s.get("/api/notify/pending");
+    assert_eq!(p["notify"], json!([]), "{p}");
+    assert_eq!(p["held"].as_array().unwrap().len(), 3, "{p}");
+    // ... except a critical alert.
+    let (status, rule) = s.post("/api/alerts/rules", json!({ "repo": r, "name": "Disk almost full", "sql": "SELECT kind AS entity, COUNT(*) AS v FROM events WHERE ts >= :since AND kind = 'spawned' GROUP BY kind", "cmp": ">=", "threshold": 1.0, "window_s": 3600, "severity": "critical", "action": "notify" }));
+    assert_eq!(status, 201, "{rule}");
+    let (_, c) = s.post("/api/alerts/check", json!({}));
+    assert_eq!(c["counts"]["open"], 2, "{c}");
+    let (_, p) = s.get("/api/notify/pending");
+    let n = p["notify"].as_array().unwrap();
+    assert_eq!(n.len(), 1, "{p}");
+    assert_eq!((n[0]["kind"].as_str(), n[0]["critical"].as_bool()), (Some("alert"), Some(true)), "{p}");
+    assert_eq!(p["held"].as_array().unwrap().len(), 3, "{p}");
+    assert_eq!(p["digest"], Value::Null, "{p}");
+
+    // Quiet ends: one digest of what happened.
+    let (_, qv) = s.post("/api/notify/quiet", json!({ "minutes": 0 }));
+    assert_eq!(qv["quiet"]["on"], false);
+    let (_, p) = s.get("/api/notify/pending");
+    let d = &p["digest"];
+    assert_eq!(d["reason"], "quiet", "{p}");
+    assert_eq!(d["counts"]["prompts"], 1, "{d}");
+    assert_eq!(d["counts"]["waiting"], 2, "{d}");
+    assert_eq!(d["counts"]["critical"], 1, "{d}");
+    let waiting: Vec<&str> = d["waiting"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+    assert_eq!(waiting, ["paybutton", "freeship"], "{d}");
+    let sentence = d["sentence"].as_str().unwrap();
+    assert!(sentence.starts_with("While you were quiet"), "{sentence}");
+    assert!(sentence.contains("2 still wait: paybutton for"), "{sentence}");
+    assert!(sentence.contains("1 critical"), "{sentence}");
+    // Not seen twice.
+    let (status, _) = s.post("/api/notify/seen", json!({ "until_ms": d["until_ms"] }));
+    assert_eq!(status, 200);
+    let (_, p) = s.get("/api/notify/pending");
+    assert_eq!(p["digest"], Value::Null, "{p}");
+    // Out of quiet with level all, the questions notify again.
+    assert_eq!(p["notify"].as_array().unwrap().iter().filter(|x| x["kind"] == "question").count(), 2, "{p}");
+}

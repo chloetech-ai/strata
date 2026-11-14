@@ -161,6 +161,10 @@ pub fn router(app: App) -> Router {
         // The goals rewrite (R2): Review and ship; Debug's turns, records and threshold.
         .merge(crate::review::routes())
         .merge(crate::turns::routes())
+        // The rewrite: suggested rules and grants, and the interrupt model.
+        .merge(crate::rulesuggest::routes())
+        .merge(crate::notify::routes())
+        .route("/goals/:file", get(ui_goal))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -228,6 +232,22 @@ const LEVELS: &[(&str, &str)] = &[
     ("guide.js", include_str!("../ui/levels/guide.js")),
     ("lifecycle.js", include_str!("../ui/levels/lifecycle.js")),
 ];
+
+/// The goal pages' modules (`ui/goals/*.js`), compiled in. (R1's list;
+/// rules-suggest.js and notify.js are agent P's.)
+const GOALS: &[(&str, &str)] = &[
+    ("rules-suggest.js", include_str!("../ui/goals/rules-suggest.js")),
+    ("notify.js", include_str!("../ui/goals/notify.js")),
+    ("review.js", include_str!("../ui/goals/review.js")),
+    ("debug.js", include_str!("../ui/goals/debug.js")),
+];
+
+async fn ui_goal(State(app): State<App>, Path(file): Path<String>) -> Response {
+    match GOALS.iter().find(|(n, _)| *n == file) {
+        Some((name, body)) => ui_file(&app, &format!("goals/{name}"), body, "text/javascript; charset=utf-8"),
+        None => ApiError::not_found("no such page").into_response(),
+    }
+}
 
 /// The user guide (GUIDE.md), compiled in; `#/guide` renders it.
 const GUIDE: &str = include_str!("../GUIDE.md");

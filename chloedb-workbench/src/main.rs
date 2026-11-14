@@ -48,6 +48,9 @@ mod screen;
 // The goals rewrite (JOURNEYS.md): Review and ship; Debug's turns and records.
 mod review;
 mod turns;
+// The rewrite (JOURNEYS.md, "Rules and notifications"): suggested rules and the interrupt model.
+mod notify;
+mod rulesuggest;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

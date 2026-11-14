@@ -343,6 +343,8 @@ impl StateDb {
         db.sql(COMPLETE_EVENTS, &Params::new()).map_err(e)?;
         // Sixth build: repositories opened without an agent (src/repos.rs).
         db.sql(crate::repos::TABLE, &Params::new()).map_err(e)?;
+        // The rewrite: Workbench's grants (src/rulesuggest.rs).
+        db.sql(crate::rulesuggest::TABLE, &Params::new()).map_err(e)?;
         let db = Arc::new(db);
         db.spawn_flusher();
         db.spawn_merger(MergerOptions { threads: 1, ..MergerOptions::default() });

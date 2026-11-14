@@ -1,0 +1,918 @@
+{
+ "repo": "/home/you/src/shop",
+ "suggested": {
+  "dismissed": [],
+  "min_approvals": 3,
+  "prompts": {
+   "7": {
+    "prompts": 17,
+    "wait_ms": 42079
+   },
+   "30": {
+    "prompts": 17,
+    "wait_ms": 42079
+   }
+  },
+  "repo": "/home/you/src/shop",
+  "suggestions": [
+   {
+    "agents": [
+     "freeship",
+     "paybutton",
+     "cents"
+    ],
+    "exact": false,
+    "id": "rs33297705",
+    "label": "python3 -m pytest",
+    "pattern": "Bash(python3 -m pytest:*)",
+    "repo": "/home/you/src/shop",
+    "risky": 2,
+    "short": "pytest",
+    "tool": "Bash",
+    "where": {
+     "file": "/home/you/.local/share/chloedb-workbench/sessions/<agent>/settings.json",
+     "kind": "workbench",
+     "note": "Agents started from now on in this repository get it; running agents keep the settings they started with. Your ~/.claude and the project's .claude files are not touched.",
+     "text": "permissions.allow of each new agent's own session settings, for shop"
+    },
+    "why": "You approved it 12 times in 30 days (12 in the last 7), and it covers no command you said No to.",
+    "windows": {
+     "7": {
+      "all_prompts": 17,
+      "all_wait_ms": 42079,
+      "commands": [
+       {
+        "agents": [
+         "freeship"
+        ],
+        "asked": false,
+        "command": "python3 -m pytest -q > /tmp/pytest.log",
+        "last_ms": 1794654825638,
+        "risks": [
+         "writes outside the worktree"
+        ],
+        "risky": true,
+        "times": 1
+       },
+       {
+        "agents": [
+         "cents"
+        ],
+        "asked": false,
+        "command": "python3 -m pytest tests/test_migrations.py --create-db",
+        "last_ms": 1794654825623,
+        "risks": [
+         "migration"
+        ],
+        "risky": true,
+        "times": 1
+       },
+       {
+        "agents": [
+         "freeship"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_money.py",
+        "last_ms": 1794654813489,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "paybutton"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_promo.py -k rounding",
+        "last_ms": 1794654810156,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "cents"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest -q",
+        "last_ms": 1794654807737,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "freeship"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_cart.py",
+        "last_ms": 1794654806213,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "paybutton"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_money.py -q",
+        "last_ms": 1794654801993,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "cents"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_promo.py -q",
+        "last_ms": 1794654798674,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       }
+      ],
+      "days": 7,
+      "distinct": 8,
+      "prompts": 12,
+      "refused": 0,
+      "risky": 2,
+      "wait_ms": 34257
+     },
+     "30": {
+      "all_prompts": 17,
+      "all_wait_ms": 42079,
+      "commands": [
+       {
+        "agents": [
+         "freeship"
+        ],
+        "asked": false,
+        "command": "python3 -m pytest -q > /tmp/pytest.log",
+        "last_ms": 1794654825638,
+        "risks": [
+         "writes outside the worktree"
+        ],
+        "risky": true,
+        "times": 1
+       },
+       {
+        "agents": [
+         "cents"
+        ],
+        "asked": false,
+        "command": "python3 -m pytest tests/test_migrations.py --create-db",
+        "last_ms": 1794654825623,
+        "risks": [
+         "migration"
+        ],
+        "risky": true,
+        "times": 1
+       },
+       {
+        "agents": [
+         "freeship"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_money.py",
+        "last_ms": 1794654813489,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "paybutton"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_promo.py -k rounding",
+        "last_ms": 1794654810156,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "cents"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest -q",
+        "last_ms": 1794654807737,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "freeship"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_cart.py",
+        "last_ms": 1794654806213,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "paybutton"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_money.py -q",
+        "last_ms": 1794654801993,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       },
+       {
+        "agents": [
+         "cents"
+        ],
+        "asked": true,
+        "command": "python3 -m pytest tests/test_promo.py -q",
+        "last_ms": 1794654798674,
+        "risks": [],
+        "risky": false,
+        "times": 2
+       }
+      ],
+      "days": 30,
+      "distinct": 8,
+      "prompts": 12,
+      "refused": 0,
+      "risky": 2,
+      "wait_ms": 34257
+     }
+    }
+   }
+  ]
+ },
+ "grants": {
+  "defaults": {
+   "rules": null,
+   "text": "In a worktree Workbench made, agents edit and read files there, run the tests and use git locally without asking (unless started with “Ask before edits”). Guarded commands still stop."
+  },
+  "grants": [
+   {
+    "created": "2026-11-14T11:13:45.671Z",
+    "created_ms": 1794654825671,
+    "granted_by": "you",
+    "id": "gwf4a435a8",
+    "kind": "workbench",
+    "last_used_ms": null,
+    "lasting": true,
+    "pattern": "Bash(npm run lint)",
+    "question": null,
+    "repo": "/home/you/src/shop",
+    "revocable": true,
+    "state": "active",
+    "used": 0,
+    "via": "the grant sheet",
+    "where": {
+     "file": "/home/you/.local/share/chloedb-workbench/sessions/<agent>/settings.json",
+     "kind": "workbench",
+     "note": "Agents started from now on in this repository get it; running agents keep the settings they started with. Your ~/.claude and the project's .claude files are not touched.",
+     "text": "permissions.allow of each new agent's own session settings, for shop"
+    }
+   },
+   {
+    "created": "2026-11-14T11:13:45.667Z",
+    "created_ms": 1794654825667,
+    "granted_by": "Claude Code",
+    "how": "Workbench does not edit your own checkout: remove the line from settings.local.json yourself.",
+    "id": "gc030c1589",
+    "kind": "claude-code",
+    "last_used_ms": null,
+    "lasting": true,
+    "pattern": "Bash(python3:*)",
+    "question": null,
+    "repo": "/home/you/src/shop",
+    "revocable": false,
+    "state": "active",
+    "used": 0,
+    "via": "a “don't ask again” answer",
+    "where": {
+     "file": "/home/you/src/shop/.claude/settings.local.json",
+     "kind": "claude-code",
+     "text": "shop's .claude/settings.local.json"
+    }
+   }
+  ],
+  "repo": "/home/you/src/shop",
+  "revoked": []
+ },
+ "check": {
+  "file": "/home/you/src/shop/.claude/settings.local.json",
+  "lasting": true,
+  "narrower": {
+   "commands": [
+    {
+     "agents": [
+      "paybutton"
+     ],
+     "asked": true,
+     "command": "python3 -m orders.migrate --db dev.sqlite3",
+     "last_ms": 1794654817712,
+     "risks": [
+      "migration"
+     ],
+     "risky": true,
+     "times": 1
+    }
+   ],
+   "distinct": 1,
+   "pattern": "Bash(python3 -m orders.migrate --db dev.sqlite3)",
+   "prompts": 1,
+   "risky": 1,
+   "wait_ms": 3007
+  },
+  "repo": "/home/you/src/shop",
+  "rule": "Bash(python3:*)",
+  "too_wide": "`python3` alone runs any program at all; name a module (`python3 -m pytest`) or a script",
+  "window": {
+   "all_prompts": 17,
+   "all_wait_ms": 42079,
+   "commands": [
+    {
+     "agents": [
+      "freeship"
+     ],
+     "asked": false,
+     "command": "python3 -m pytest -q > /tmp/pytest.log",
+     "last_ms": 1794654825638,
+     "risks": [
+      "writes outside the worktree"
+     ],
+     "risky": true,
+     "times": 1
+    },
+    {
+     "agents": [
+      "cents"
+     ],
+     "asked": false,
+     "command": "python3 -m pytest tests/test_migrations.py --create-db",
+     "last_ms": 1794654825623,
+     "risks": [
+      "migration"
+     ],
+     "risky": true,
+     "times": 1
+    },
+    {
+     "agents": [
+      "paybutton"
+     ],
+     "asked": true,
+     "command": "python3 -m orders.migrate --db dev.sqlite3",
+     "last_ms": 1794654817712,
+     "risks": [
+      "migration"
+     ],
+     "risky": true,
+     "times": 1
+    },
+    {
+     "agents": [
+      "freeship"
+     ],
+     "asked": true,
+     "command": "python3 -m pytest tests/test_money.py",
+     "last_ms": 1794654813489,
+     "risks": [],
+     "risky": false,
+     "times": 2
+    },
+    {
+     "agents": [
+      "paybutton"
+     ],
+     "asked": true,
+     "command": "python3 -m pytest tests/test_promo.py -k rounding",
+     "last_ms": 1794654810156,
+     "risks": [],
+     "risky": false,
+     "times": 2
+    },
+    {
+     "agents": [
+      "cents"
+     ],
+     "asked": true,
+     "command": "python3 -m pytest -q",
+     "last_ms": 1794654807737,
+     "risks": [],
+     "risky": false,
+     "times": 2
+    },
+    {
+     "agents": [
+      "freeship"
+     ],
+     "asked": true,
+     "command": "python3 -m pytest tests/test_cart.py",
+     "last_ms": 1794654806213,
+     "risks": [],
+     "risky": false,
+     "times": 2
+    },
+    {
+     "agents": [
+      "paybutton"
+     ],
+     "asked": true,
+     "command": "python3 -m pytest tests/test_money.py -q",
+     "last_ms": 1794654801993,
+     "risks": [],
+     "risky": false,
+     "times": 2
+    },
+    {
+     "agents": [
+      "cents"
+     ],
+     "asked": true,
+     "command": "python3 -m pytest tests/test_promo.py -q",
+     "last_ms": 1794654798674,
+     "risks": [],
+     "risky": false,
+     "times": 2
+    }
+   ],
+   "days": 30,
+   "distinct": 9,
+   "prompts": 13,
+   "refused": 0,
+   "risky": 3,
+   "wait_ms": 37264
+  },
+  "workbench_where": {
+   "file": "/home/you/.local/share/chloedb-workbench/sessions/<agent>/settings.json",
+   "kind": "workbench",
+   "note": "Agents started from now on in this repository get it; running agents keep the settings they started with. Your ~/.claude and the project's .claude files are not touched.",
+   "text": "permissions.allow of each new agent's own session settings, for shop"
+  }
+ },
+ "settings": {
+  "critical_always": true,
+  "default": {
+   "level": "blocked",
+   "minutes": 2
+  },
+  "desktop": false,
+  "levels": [
+   {
+    "id": "all",
+    "label": "Every question",
+    "says": "Each permission prompt and question as it comes, and every alert that needs you."
+   },
+   {
+    "id": "blocked",
+    "label": "Only when an agent is blocked",
+    "says": "An agent that has waited on you for more than N minutes, and major or critical alerts."
+   },
+   {
+    "id": "alerts",
+    "label": "Only alerts",
+    "says": "Alerts that need you. Questions wait in Needs you without a notification."
+   }
+  ],
+  "projects": [
+   {
+    "level": "all",
+    "minutes": 2,
+    "name": "shop",
+    "own": true,
+    "repo": "/home/you/src/shop"
+   }
+  ],
+  "quiet": {
+   "ended_ms": null,
+   "from_ms": null,
+   "left_ms": null,
+   "on": false,
+   "until_ms": null
+  }
+ },
+ "pending": {
+  "digest": null,
+  "held": [],
+  "later": [],
+  "notify": [
+   {
+    "agent": "aa4a593a0",
+    "ask": "Claude needs your permission to use Bash",
+    "command": {
+     "cut": false,
+     "lines": 1,
+     "text": "python3 -m orders.migrate --db dev.sqlite3"
+    },
+    "href": "#/a/aa4a593a0?q=q16af5b25",
+    "id": "q:q16af5b25",
+    "kind": "question",
+    "level": "all",
+    "name": "paybutton",
+    "options": [],
+    "project": "shop",
+    "qkind": "permission",
+    "question": "q16af5b25",
+    "repo": "/home/you/src/shop",
+    "running": true,
+    "since_ms": 1794654825717,
+    "title": "paybutton waits for you",
+    "tool": "Bash",
+    "waited_ms": 37,
+    "why": "every question and alert"
+   },
+   {
+    "ask": "freeship and cents both edit shop/money.py",
+    "command": null,
+    "critical": false,
+    "href": "#/debug/failing",
+    "id": "i:i5593f018",
+    "incident": "i5593f018",
+    "kind": "alert",
+    "level": "all",
+    "options": [],
+    "project": "shop",
+    "repo": "/home/you/src/shop",
+    "severity": "minor",
+    "since_ms": 1794654825729,
+    "title": "minor alert",
+    "waited_ms": 25,
+    "why": "every question and alert"
+   }
+  ],
+  "now_ms": 1794654825754,
+  "presence": {
+   "away_after_ms": 300000,
+   "here": false,
+   "here_ms": null
+  },
+  "quiet": {
+   "ended_ms": null,
+   "from_ms": null,
+   "left_ms": null,
+   "on": false,
+   "until_ms": null
+  },
+  "silent": []
+ },
+ "question": {
+  "agent": "aa4a593a0",
+  "agent_name": "paybutton",
+  "answer": null,
+  "answered": null,
+  "answered_by": null,
+  "answered_ms": null,
+  "context": "Bash: python3 -m orders.migrate --db dev.sqlite3",
+  "created": "2026-11-14T11:13:45.717Z",
+  "created_ms": 1794654825717,
+  "detail": {
+   "command": "python3 -m orders.migrate --db dev.sqlite3",
+   "description": "Run it",
+   "summary": "Bash: python3 -m orders.migrate --db dev.sqlite3",
+   "tool": "Bash"
+  },
+  "id": "q16af5b25",
+  "kind": "permission",
+  "options": [
+   {
+    "label": "Yes",
+    "n": 1,
+    "no": false
+   },
+   {
+    "label": "Yes, and don't ask again for python3 commands in /home/you/src/shop",
+    "n": 2,
+    "no": false,
+    "grants": "stops it asking again for commands like this one"
+   },
+   {
+    "label": "No, and tell Claude what to do differently (esc)",
+    "n": 3,
+    "no": true
+   }
+  ],
+  "outcome": null,
+  "precedent": {
+   "agents": {},
+   "ids": [],
+   "missing": [
+    "ChloeCtx is not installed (no program chloectx), so there are no memory records, notes or receipts to show"
+   ],
+   "rules": [],
+   "text": ""
+  },
+  "recommended": null,
+  "repo": "/home/you/src/shop",
+  "rule": null,
+  "state": "open",
+  "text": "Claude needs your permission to use Bash"
+ },
+ "agent": {
+  "base": "0b9bde0283928baf3e441a53ea4b8de43d269390",
+  "branch": "main",
+  "children": [],
+  "created": "2026-11-14T11:13:01.757Z",
+  "cwd": "/home/you/src/shop",
+  "depth": 0,
+  "ended": null,
+  "exit_code": null,
+  "goal": null,
+  "id": "aa4a593a0",
+  "last_event": "Claude needs your permission to use Bash",
+  "model": null,
+  "name": "paybutton",
+  "narration": "Claude needs your permission to use Bash",
+  "narration_ts": "2026-11-14T11:13:45.718Z",
+  "outcome": null,
+  "parent": null,
+  "pid": 20120,
+  "preview_url": null,
+  "repo": "/home/you/src/shop",
+  "running": true,
+  "session_id": "8ad3a947-fd0a-47fd-a6ed-169a00102edb",
+  "started_ms": 1794654781756,
+  "state": "waiting",
+  "state_since": "2026-11-14T11:13:45.717Z",
+  "task": null,
+  "waiting_for": "Claude needs your permission to use Bash"
+ },
+ "pending_quiet": {
+  "digest": null,
+  "held": [
+   {
+    "agent": "aa4a593a0",
+    "ask": "Claude needs your permission to use Bash",
+    "command": {
+     "cut": false,
+     "lines": 1,
+     "text": "python3 -m orders.migrate --db dev.sqlite3"
+    },
+    "href": "#/a/aa4a593a0?q=q16af5b25",
+    "id": "q:q16af5b25",
+    "kind": "question",
+    "level": "all",
+    "name": "paybutton",
+    "options": [],
+    "project": "shop",
+    "qkind": "permission",
+    "question": "q16af5b25",
+    "repo": "/home/you/src/shop",
+    "running": true,
+    "since_ms": 1794654825717,
+    "title": "paybutton waits for you",
+    "tool": "Bash",
+    "waited_ms": 62,
+    "why": "quiet: kept for the digest"
+   },
+   {
+    "ask": "freeship and cents both edit shop/money.py",
+    "command": null,
+    "critical": false,
+    "href": "#/debug/failing",
+    "id": "i:i5593f018",
+    "incident": "i5593f018",
+    "kind": "alert",
+    "level": "all",
+    "options": [],
+    "project": "shop",
+    "repo": "/home/you/src/shop",
+    "severity": "minor",
+    "since_ms": 1794654825729,
+    "title": "minor alert",
+    "waited_ms": 50,
+    "why": "quiet: kept for the digest"
+   },
+   {
+    "agent": "a6cd55576",
+    "ask": "Claude needs your permission to use Bash",
+    "command": {
+     "cut": false,
+     "lines": 1,
+     "text": "python3 scripts/seed_coupons.py --env staging"
+    },
+    "href": "#/a/a6cd55576?q=q8fc8852a",
+    "id": "q:q8fc8852a",
+    "kind": "question",
+    "level": "all",
+    "name": "freeship",
+    "options": [],
+    "project": "shop",
+    "qkind": "permission",
+    "question": "q8fc8852a",
+    "repo": "/home/you/src/shop",
+    "running": true,
+    "since_ms": 1794654825778,
+    "title": "freeship waits for you",
+    "tool": "Bash",
+    "waited_ms": 1,
+    "why": "quiet: kept for the digest"
+   }
+  ],
+  "later": [],
+  "notify": [],
+  "now_ms": 1794654825779,
+  "presence": {
+   "away_after_ms": 300000,
+   "here": false,
+   "here_ms": null
+  },
+  "quiet": {
+   "ended_ms": null,
+   "from_ms": 1794654825761,
+   "left_ms": 1499982,
+   "on": true,
+   "until_ms": 1794656325761
+  },
+  "silent": []
+ },
+ "pending_digest": {
+  "digest": {
+   "alerts": [
+    {
+     "critical": true,
+     "id": "i5d35e557",
+     "severity": "critical",
+     "started_ms": 1794654825787,
+     "state": "open",
+     "title": "spawned: Payments sandbox down"
+    }
+   ],
+   "counts": {
+    "agents": 1,
+    "alerts": 1,
+    "by_rule": 0,
+    "by_terminal": 0,
+    "by_you": 0,
+    "critical": 1,
+    "expired": 0,
+    "finished": 0,
+    "prompts": 1,
+    "waiting": 2
+   },
+   "finished": [],
+   "minutes": 0,
+   "reason": "quiet",
+   "sentence": "While you were quiet (under a minute): 1 prompt from 1 agent. 2 still wait: paybutton for under a minute, freeship for under a minute. 1 alert (1 critical, which interrupted you).",
+   "since": "2026-11-14T11:13:45.761Z",
+   "since_ms": 1794654825761,
+   "until_ms": 1794654827806,
+   "waiting": [
+    {
+     "agent": "aa4a593a0",
+     "ask": "Claude needs your permission to use Bash",
+     "command": {
+      "cut": false,
+      "lines": 1,
+      "text": "python3 -m orders.migrate --db dev.sqlite3"
+     },
+     "href": "#/a/aa4a593a0?q=q16af5b25",
+     "id": "q:q16af5b25",
+     "kind": "question",
+     "name": "paybutton",
+     "options": [],
+     "project": "shop",
+     "qkind": "permission",
+     "question": "q16af5b25",
+     "repo": "/home/you/src/shop",
+     "running": true,
+     "since_ms": 1794654825717,
+     "title": "paybutton waits for you",
+     "tool": "Bash",
+     "waited_ms": 2089
+    },
+    {
+     "agent": "a6cd55576",
+     "ask": "Claude needs your permission to use Bash",
+     "command": {
+      "cut": false,
+      "lines": 1,
+      "text": "python3 scripts/seed_coupons.py --env staging"
+     },
+     "href": "#/a/a6cd55576?q=q8fc8852a",
+     "id": "q:q8fc8852a",
+     "kind": "question",
+     "name": "freeship",
+     "options": [],
+     "project": "shop",
+     "qkind": "permission",
+     "question": "q8fc8852a",
+     "repo": "/home/you/src/shop",
+     "running": true,
+     "since_ms": 1794654825778,
+     "title": "freeship waits for you",
+     "tool": "Bash",
+     "waited_ms": 2028
+    }
+   ]
+  },
+  "held": [],
+  "later": [],
+  "notify": [
+   {
+    "agent": "aa4a593a0",
+    "ask": "Claude needs your permission to use Bash",
+    "command": {
+     "cut": false,
+     "lines": 1,
+     "text": "python3 -m orders.migrate --db dev.sqlite3"
+    },
+    "href": "#/a/aa4a593a0?q=q16af5b25",
+    "id": "q:q16af5b25",
+    "kind": "question",
+    "level": "all",
+    "name": "paybutton",
+    "options": [],
+    "project": "shop",
+    "qkind": "permission",
+    "question": "q16af5b25",
+    "repo": "/home/you/src/shop",
+    "running": true,
+    "since_ms": 1794654825717,
+    "title": "paybutton waits for you",
+    "tool": "Bash",
+    "waited_ms": 2089,
+    "why": "every question and alert"
+   },
+   {
+    "ask": "freeship and cents both edit shop/money.py",
+    "command": null,
+    "critical": false,
+    "href": "#/debug/failing",
+    "id": "i:i5593f018",
+    "incident": "i5593f018",
+    "kind": "alert",
+    "level": "all",
+    "options": [],
+    "project": "shop",
+    "repo": "/home/you/src/shop",
+    "severity": "minor",
+    "since_ms": 1794654825729,
+    "title": "minor alert",
+    "waited_ms": 2077,
+    "why": "every question and alert"
+   },
+   {
+    "agent": "a6cd55576",
+    "ask": "Claude needs your permission to use Bash",
+    "command": {
+     "cut": false,
+     "lines": 1,
+     "text": "python3 scripts/seed_coupons.py --env staging"
+    },
+    "href": "#/a/a6cd55576?q=q8fc8852a",
+    "id": "q:q8fc8852a",
+    "kind": "question",
+    "level": "all",
+    "name": "freeship",
+    "options": [],
+    "project": "shop",
+    "qkind": "permission",
+    "question": "q8fc8852a",
+    "repo": "/home/you/src/shop",
+    "running": true,
+    "since_ms": 1794654825778,
+    "title": "freeship waits for you",
+    "tool": "Bash",
+    "waited_ms": 2028,
+    "why": "every question and alert"
+   },
+   {
+    "ask": "spawned: Payments sandbox down",
+    "command": null,
+    "critical": true,
+    "href": "#/debug/failing",
+    "id": "i:i5d35e557",
+    "incident": "i5d35e557",
+    "kind": "alert",
+    "level": "all",
+    "options": [],
+    "project": "shop",
+    "repo": "/home/you/src/shop",
+    "severity": "critical",
+    "since_ms": 1794654825787,
+    "title": "Critical alert",
+    "waited_ms": 2019,
+    "why": "a critical alert interrupts at every level, quiet or not"
+   }
+  ],
+  "now_ms": 1794654827806,
+  "presence": {
+   "away_after_ms": 300000,
+   "here": false,
+   "here_ms": null
+  },
+  "quiet": {
+   "ended_ms": 1794654827804,
+   "from_ms": 1794654825761,
+   "left_ms": null,
+   "on": false,
+   "until_ms": 1794654827804
+  },
+  "silent": []
+ }
+}

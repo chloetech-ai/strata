@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rules and notifications</title>
+<!--
+  A dev harness for ui/goals/rules-suggest.js and ui/goals/notify.js
+  (JOURNEYS.md, "Rules and notifications"). Serve ui/ as the root (e.g.
+  `node ui/dev/rules-notify-shoot.cjs` does) and open
+  /dev/rules-notify.html?v=rules|grant|card|notify|digest&t=light|dark.
+  The API answers come from ui/dev/fixtures/rules-notify.json, which was
+  recorded from a real `chloedb-workbench serve` (see the shoot script).
+  The tokens below are direction C, "Instrument", as JOURNEYS.md "Tokens"
+  names them; the app's own are in ui/style.css (R1's).
+-->
+<style>
+@font-face { font-family: "Geist"; src: url("/fonts/Geist-normal.woff2") format("woff2"); font-weight: 100 900; font-display: block; }
+@font-face { font-family: "Geist Mono"; src: url("/fonts/GeistMono-normal.woff2") format("woff2"); font-weight: 100 900; font-display: block; }
+:root {
+  color-scheme: light;
+  --sans: "Geist", system-ui, sans-serif; --mono: "Geist Mono", ui-monospace, monospace; --sans-features: "ss01";
+  --fs-xs: 11px; --lh-xs: 16px; --fs-sm: 12px; --lh-sm: 18px; --fs-body: 13px; --lh-body: 20px; --fs-md: 15px; --lh-md: 22px; --fs-lg: 20px; --lh-lg: 26px; --fs-xl: 28px; --lh-xl: 34px;
+  --track-xl: -.022em; --track-md: -.011em; --track-label: .06em; --w-text: 400; --w-mid: 500; --w-title: 600;
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px; --s-6: 32px; --s-7: 40px;
+  --ctl-h: 30px; --ctl-h-lg: 36px; --touch: 44px; --kc-h: 18px; --top: 48px; --tabh: 56px; --insp-w: 360px; --page-w: 1040px; --sheet-w: 600px;
+  --r: 10px; --r-sm: 6px; --r-xs: 4px; --r-pill: 999px; --hair: 1px;
+  --bg: #f2f2f3; --surface: #ffffff; --surface-2: #f7f7f8; --surface-3: #ececef; --sunken: #ececee; --well: #efeff1;
+  --glass: rgba(250, 250, 251, .72); --glass-in: rgba(255, 255, 255, .6); --glass-blur: saturate(180%) blur(20px); --scrim: rgba(17, 17, 19, .32);
+  --text: #111113; --text-2: #5b5b64; --muted: #5b5b64; --text-3: #6b6b74; --line: rgba(17, 17, 19, .085); --line-2: rgba(17, 17, 19, .16);
+  --accent: #4a4bd6; --accent-2: #3d3ec4; --accent-ink: #ffffff; --accent-text: #4243c4; --accent-soft: rgba(74, 75, 214, .09); --accent-line: rgba(74, 75, 214, .45); --focus: #4a4bd6;
+  --good: #18794e; --good-ink: #146c45; --good-soft: rgba(24, 121, 78, .1);
+  --warn: #a35f00; --warn-ink: #8a5000; --warn-soft: rgba(163, 95, 0, .08); --warn-line: rgba(163, 95, 0, .35); --on-warn: #ffffff;
+  --crit: #cd2b31; --crit-ink: #b4232a; --crit-soft: rgba(205, 43, 49, .08); --ctx: #7c3aed;
+  --shadow-1: none; --shadow-2: 0 0 0 .5px rgba(0, 0, 0, .06), 0 12px 32px -8px rgba(0, 0, 0, .12); --shadow-3: 0 0 0 .5px rgba(0, 0, 0, .08), 0 24px 64px -12px rgba(0, 0, 0, .3);
+  --av-ink: #111113; --lane-1: #4a4bd6;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0b0d; --surface: #141416; --surface-2: #19191c; --surface-3: #232327; --sunken: #101012; --well: #1f1f23;
+  --glass: rgba(20, 20, 23, .7); --glass-in: rgba(28, 28, 32, .6); --scrim: rgba(0, 0, 0, .55);
+  --text: #ededef; --text-2: #a1a1ab; --muted: #a1a1ab; --text-3: #8a8a94; --line: rgba(255, 255, 255, .07); --line-2: rgba(255, 255, 255, .13);
+  --accent: #5b5ce6; --accent-2: #6d6ef0; --accent-ink: #ffffff; --accent-text: #9d9eff; --accent-soft: rgba(143, 144, 255, .12); --accent-line: rgba(143, 144, 255, .5); --focus: #9d9eff;
+  --good: #4cc38a; --good-ink: #5fd39a; --good-soft: rgba(76, 195, 138, .12);
+  --warn: #f1a10d; --warn-ink: #f5b544; --warn-soft: rgba(241, 161, 13, .1); --warn-line: rgba(241, 161, 13, .4); --on-warn: #111113;
+  --crit: #ff6369; --crit-ink: #ff8589; --crit-soft: rgba(255, 99, 105, .1); --ctx: #b08cff;
+  --shadow-2: 0 0 0 .5px rgba(255, 255, 255, .06), 0 16px 40px -8px rgba(0, 0, 0, .6); --shadow-3: 0 0 0 .5px rgba(255, 255, 255, .08), 0 24px 64px -12px rgba(0, 0, 0, .7);
+  --av-ink: #111113;
+}
+@media (max-width: 640px) { :root { --fs-body: 15px; --lh-body: 22px; --ctl-h: 44px; } }
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: var(--w-text) var(--fs-body)/var(--lh-body) var(--sans); font-feature-settings: var(--sans-features); -webkit-font-smoothing: antialiased; }
+code, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+svg.i { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+svg.i.sm { width: 13px; height: 13px; }
+.kc { display: inline-grid; place-items: center; min-width: var(--kc-h); height: var(--kc-h); padding: 0 4px; border-radius: var(--r-xs); border: var(--hair) solid var(--line-2); font: var(--w-mid) var(--fs-xs)/1 var(--mono); color: var(--text-2); background: var(--surface-2); }
+.btn { display: inline-flex; align-items: center; gap: var(--s-2); height: var(--ctl-h); padding: 0 var(--s-3); border-radius: var(--r-sm); border: var(--hair) solid var(--line-2); background: var(--surface); color: var(--text); font: var(--w-mid) var(--fs-body)/1 var(--sans); cursor: pointer; text-decoration: none; }
+.btn:hover { background: var(--surface-2); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
+.btn.sm { height: 26px; padding: 0 var(--s-2); font-size: var(--fs-sm); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.lv-link { border: 0; background: none; padding: 0; color: var(--accent-text); cursor: pointer; font: inherit; font-weight: var(--w-mid); text-decoration: none; }
+/* The harness's frame: a top bar like the app's, and the page. */
+.hx-top { position: sticky; top: 0; z-index: 5; height: var(--top); display: flex; align-items: center; gap: var(--s-3); padding: 0 max(16px, env(safe-area-inset-right)) 0 max(16px, env(safe-area-inset-left)); background: var(--glass); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); border-bottom: var(--hair) solid var(--line); }
+.hx-top b { font-weight: var(--w-title); }
+.hx-crumb { color: var(--text-2); font-size: var(--fs-sm); }
+.hx-sp { flex: 1; }
+.hx-main { max-width: 1120px; margin: 0 auto; }
+.hx-col { padding: var(--s-6) var(--s-7); display: flex; flex-direction: column; gap: var(--s-4); max-width: 760px; }
+@media (max-width: 640px) { .hx-col { padding: var(--s-4); } .hx-crumb { display: none; } }
+</style>
+</head>
+<body>
+<header class="hx-top"><b>Workbench</b><span class="hx-crumb" id="crumb">Home › shop</span><span class="hx-sp"></span><span id="bell"></span></header>
+<main class="hx-main" id="root"></main>
+<script type="module">
+import { questionCard } from "/levels/common.js";
+import * as rules from "/goals/rules-suggest.js";
+import * as notify from "/goals/notify.js";
+
+const qs = new URLSearchParams(location.search);
+const view = qs.get("v") || "rules";
+document.documentElement.dataset.theme = qs.get("t") === "dark" ? "dark" : "light";
+const F = await (await fetch("/dev/fixtures/rules-notify.json")).json();
+
+// A fake API over the recorded answers: writes say what they would do and
+// change nothing.
+async function api(path, { method = "GET", body } = {}) {
+  await new Promise((r) => setTimeout(r, 20));
+  const p = path.split("?")[0];
+  if (method !== "GET") {
+    if (p.startsWith("/api/notify/settings")) return F.settings;
+    if (p.startsWith("/api/notify/quiet")) return { ok: true, quiet: F.pending_quiet.quiet };
+    return { ok: true, note: "dev harness: nothing written", body };
+  }
+  if (p === "/api/rules/suggested") return F.suggested;
+  if (p === "/api/rules/grants") return F.grants;
+  if (p === "/api/rules/check") return F.check;
+  if (p === "/api/notify/settings") return F.settings;
+  if (p === "/api/notify/pending") return view === "digest" ? F.pending_digest : view === "notify" ? F.pending_quiet : F.pending;
+  throw Object.assign(new Error(`no fixture for ${path}`), { status: 404 });
+}
+const root = document.getElementById("root");
+const agent = F.agent;
+const ctx = { api, state: { agents: [agent], events: [] }, params: { repo: F.repo }, project: { name: "shop", path: F.repo }, go: (h) => { location.hash = h; }, crumbs: () => {} };
+
+// Headless Chromium denies notifications outright; show the state a person
+// sees before they first press "Notify me".
+if (window.Notification && Notification.permission === "denied") {
+  try { Object.defineProperty(Notification, "permission", { get: () => "default" }); } catch { /* keep the browser's */ }
+}
+const n = notify.init(ctx);
+document.getElementById("bell").append(n.control);
+if (view === "rules" || view === "grant") {
+  document.getElementById("crumb").textContent = "Home › shop › More › Rules";
+  rules.mount(root, ctx);
+}
+if (view === "card" || view === "grant") {
+  const col = document.createElement("div");
+  col.className = "hx-col";
+  if (view === "card") root.append(col);
+  col.append(rules.card(ctx));
+  const q = F.question;
+  col.append(questionCard(q, { agent, onAnswer: () => {}, onGrant: (i) => rules.grantSheet(ctx, { question: q, option: i, agent }) }));
+  if (view === "grant") setTimeout(() => rules.grantSheet(ctx, { question: q, option: 1, agent }), 300);
+}
+if (view === "notify") setTimeout(() => n.open(), 200);
+if (view === "digest") { /* opens by itself: the fixture has a digest */ }
+// Ready when the view's sheet (if it has one) is up, then a beat for layout.
+const want = { grant: ".gs .gs-info .rs-cmds", notify: ".nt-proj", digest: ".nt-bd" }[view];
+window.__ready = async () => {
+  for (let i = 0; i < 100 && want && !document.querySelector(want); i++) await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => setTimeout(r, 900));
+};
+</script>
+</body>
+</html>
