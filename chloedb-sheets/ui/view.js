@@ -115,6 +115,9 @@ const CSS = `
   .sx-tools { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; }
   .sx-tools > * { flex: none; }
   .sx-home-grid .card > .hd { flex-wrap: wrap; row-gap: 8px; }
+  /* the workbooks' name, owner, when changed and menu in view; where one
+     came from and its cells are on the workbook */
+  .sx-books th:nth-child(2), .sx-books td:nth-child(2), .sx-books th:nth-child(4), .sx-books td:nth-child(4) { display: none; }
 }`;
 
 // ---------------------------------------------------------------- small things
@@ -3272,6 +3275,7 @@ function homePage(root, ctx) {
           { label: "Delete", icon: "trash", danger: true, onclick: async () => { if (!(await core.confirm({ title: `Delete ${b.name}?`, body: "Its sheets, charts and queries are deleted from ChloeDB. This cannot be undone.", ok: "Delete", danger: true }))) return; try { await ctx.api(`/v1/books/${encodeURIComponent(b.id)}`, { method: "DELETE" }); toast(`Deleted ${b.name}`, "ok"); loadBooks(); } catch (err) { toast(err.message, "bad"); } } },
         ]) }, icon("dots")) },
       ], { rows: list, sortKey: "updated_ms", desc: true, onRow: (b) => { location.hash = ctx.href("b", b.id); }, empty: core.empty("table", whose === "mine" ? "No workbooks of yours yet" : whose === "shared" ? "No one else's workbooks to open" : "No workbooks yet", "Make one, or import an Excel, CSV or SQLite file.", newBtn.cloneNode(true)) });
+      t.classList.add("sx-books");
       t.querySelector(".empty button")?.addEventListener("click", newBook);
       books.replaceChildren(t);
     } catch (e) { if (!gone) books.replaceChildren(core.failure ? core.failure(e, "The workbooks") : h("p", {}, e.message)); }

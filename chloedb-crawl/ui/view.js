@@ -40,6 +40,13 @@ const CSS = `
   .cr-list li { grid-template-columns: 56px minmax(0, 1fr); }
   .cr-list li > :nth-child(2) { display: none; }
   .cr-url { max-width: 240px; }
+}
+/* a phone keeps a crawl's table, phase, rows and start in view: pages,
+   queued and pages/s are on the crawl's own page */
+@media (max-width: 600px) {
+  .cr-crawls th:nth-child(3), .cr-crawls td:nth-child(3), .cr-crawls th:nth-child(5), .cr-crawls td:nth-child(5), .cr-crawls th:nth-child(6), .cr-crawls td:nth-child(6) { display: none; }
+  .cr-crawls .cr-url { max-width: 120px; }
+  .cr-crawls td:first-child { max-width: 144px; overflow-wrap: anywhere; }
 }`;
 
 const PHASE = { sampling: ["info", "reading a sample"], crawling: ["ok", "crawling"], paused: ["warn", "paused"], stopping: ["pending", "stopping"], done: ["good", "done"], stopped: ["", "stopped"], failed: ["bad", "failed"] };
@@ -274,6 +281,7 @@ function homePage(root, ctx) {
     { key: "rate", label: "Pages/s", num: true, sort: (c) => c.rate?.fetched, render: (c) => (ACTIVE.has(c.phase) ? fmt.si(c.rate?.fetched || 0) : "–") },
     { key: "started_ms", label: "Started", num: true, render: (c) => h("span", { title: fmt.datetime(c.started_ms) }, fmt.ago(c.started_ms)) },
   ], { rows: [], empty: empty("route", "No crawls yet", "Start one above: the table and its shards show here as it fills."), onRow: (c) => { location.hash = ctx.href(c.id); } });
+  crawls.classList.add("cr-crawls");
   const cluster = h("div");
   const growEvents = h("div");
   const policy = h("span", { class: "sub" });
