@@ -21,6 +21,7 @@ pub struct Proc {
 
 /// Every process now (Linux; none elsewhere, and the guard says nothing).
 pub fn processes() -> Vec<Proc> {
+    #[allow(unused_mut)] // filled on Linux only
     let mut out = Vec::new();
     #[cfg(target_os = "linux")]
     if let Ok(rd) = std::fs::read_dir("/proc") {
