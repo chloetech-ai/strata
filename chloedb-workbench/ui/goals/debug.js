@@ -458,14 +458,19 @@ export function mount(root, ctx) {
       else line = `Every test passed on its last run (${plural(tot.tests || 0, "test")}, ${plural(tot.runs || 0, "run")})${tot.flaky ? `; ${tot.flaky} flaky` : ""}.`;
     }
     const host = h("div", { class: "db-child" });
-    const key = `failing:${proj()}`;
+    // ?incident=<id> (an alert's Open in Debug) opens that incident;
+    // ?tab=incidents|rules|hotspots|tests one of Health's tabs.
+    const inc = route.q && route.q.get("incident");
+    const tab = route.q && route.q.get("tab");
+    const first = inc && /^i[0-9a-f]{8}$/.test(inc) ? inc : ["incidents", "rules", "hotspots", "tests"].includes(tab) ? tab : "tests";
+    const key = `failing:${proj()}:${first}`;
     const node = page({ kicker: `Find out why · ${name}`, title: "What is failing", sub: line, wide: true }, host);
     if (childKey !== key) {
       unmountChild();
       childKey = key;
       import("/levels/health.js").then((m) => {
         if (!alive || childKey !== key) return;
-        child = m.mount(host, { ...ctx, params: { ...(ctx.params || {}), agent: "tests", repo: proj() } });
+        child = m.mount(host, { ...ctx, params: { ...(ctx.params || {}), agent: first, repo: proj() } });
       }).catch((e) => host.replaceChildren(none(`Health could not be loaded: ${e.message}.`)));
     } else {
       const old = el.querySelector(".db-child");

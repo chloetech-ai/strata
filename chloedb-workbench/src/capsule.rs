@@ -595,27 +595,37 @@ fn branch_tests(sup: &Supervisor, dir: &Path, mine: &[Agent], head: Option<&str>
         by_test.entry(r.test.as_str()).or_default().push(r);
     }
     let mut tests = Vec::new();
-    for (name, rs) in &by_test {
+    for (name, all) in &by_test {
+        // Its normal runs decide (a run with an environment of its own, a
+        // skip check with a module made missing on purpose, is not the
+        // branch's result), unless it has none.
+        let normal: Vec<&blast::Run> = all.iter().copied().filter(|r| r.env.is_empty()).collect();
+        let rs: &[&blast::Run] = if normal.is_empty() { all } else { &normal };
         let last = rs.last().unwrap();
-        let mut fixed = false;
-        let mut failed_before = false;
-        let mut commits: HashMap<&str, (bool, bool)> = HashMap::new();
+        // Flaky: passed and failed on the same code (commit, uncommitted
+        // changes); a failure, then a pass after the code changed, is a fix.
+        let mut codes: HashMap<(&str, &str, &str), (bool, bool)> = HashMap::new();
         for r in rs {
-            let e = commits.entry(r.commit.as_str()).or_default();
+            let e = codes.entry(r.code()).or_default();
             if r.passed {
                 e.0 = true;
-                fixed |= failed_before;
             } else {
                 e.1 = true;
-                failed_before = true;
-                fixed = false;
             }
         }
-        let flaky = commits.values().any(|(p, f)| *p && *f);
+        let mixed = |k: &(&str, &str, &str)| codes.get(k).is_some_and(|(p, f)| *p && *f);
+        // Flaky on the code of its last run; flaky only on older code (where
+        // the branch started) and passing since is "was flaky", fixed.
+        let flaky = mixed(&last.code());
+        let was_flaky = !flaky && codes.keys().any(|k| *k != last.code() && mixed(k));
+        let failed_before = rs.iter().any(|r| !r.passed && r.code() != last.code());
+        let fixed = last.passed && !flaky && failed_before && !codes.get(&last.code()).is_some_and(|c| c.1);
         let passed = rs.iter().filter(|r| r.passed).count();
         tests.push(json!({
             "kind": "test", "name": name, "ok": last.passed, "runs": rs.len(), "passed": passed, "failed": rs.len() - passed,
-            "fixed": fixed && last.passed && !flaky, "flaky": flaky, "ts": iso(last.ts),
+            "fixed": fixed, "flaky": flaky, "was_flaky": was_flaky, "ts": iso(last.ts),
+            "error": if last.passed { None } else { last.error.clone() },
+            "other_env_runs": all.len() - rs.len(),
             "on_head": head.is_some_and(|h| !last.commit.is_empty() && (h.starts_with(&last.commit) || last.commit.starts_with(h))),
         }));
     }

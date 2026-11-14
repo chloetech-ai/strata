@@ -603,11 +603,27 @@ fn words(sup: &Supervisor, r: &Rule, h: &Hit, agents: &[String], now: i64) -> (S
             let lead = match &who {
                 Some(n) if *n != what && h.agent.as_deref() != Some(what.as_str()) => format!("{n}: {what}"),
                 Some(n) => n.clone(),
-                None => what,
+                None => what.clone(),
             };
-            (format!("{lead}: {} {} {} in {w}", short_num(h.v), r.cmp, short_num(r.threshold)), format!("{}: {}", who.unwrap_or_else(|| h.entity.clone()), r.name))
+            // A rule over the test runs is about a test: its title names it.
+            let title = if reads_tests(r) { format!("{what}: {}", r.name) } else { format!("{}: {}", who.unwrap_or_else(|| h.entity.clone()), r.name) };
+            (format!("{lead}: {} {} {} in {w}", short_num(h.v), r.cmp, short_num(r.threshold)), title)
         }
     }
+}
+
+/// Whether a rule reads the test runs (its rows name tests).
+fn reads_tests(r: &Rule) -> bool {
+    r.id == "test-refail" || r.sql.to_lowercase().contains("test_runs")
+}
+
+/// The tests a set of firings of test rules fired on, each once.
+fn tests_of<'a>(firings: impl Iterator<Item = &'a Firing>, rules: &HashMap<String, Rule>) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in firings.filter(|f| f.rule == "test-refail" || rules.get(&f.rule).is_some_and(reads_tests)) {
+        add_unique(&mut out, f.detail.as_deref().unwrap_or(&f.entity));
+    }
+    out
 }
 
 fn open_question_text(sup: &Supervisor, agent: &str) -> Option<String> {
@@ -681,7 +697,27 @@ impl Incident {
         fs.sort_by(|a, b| b.started.cmp(&a.started));
         let mut actions = self.actions.clone();
         actions.reverse();
+        // Its tests, and where each passes and fails now: an incident that
+        // an agent's branch fixed says so, and does not lead with that agent.
+        let tests = tests_of(fs.iter().copied(), rules);
+        let wheres: Vec<Json> = if self.state == "open" { tests.iter().take(3).filter_map(|t| crate::testruns::where_now(sup, &self.repo, t)).collect() } else { Vec::new() };
+        let mut fixed_by: Vec<String> = Vec::new();
+        for w in &wheres {
+            for a in w["fixed_by"].as_array().into_iter().flatten().filter_map(Json::as_str) {
+                add_unique(&mut fixed_by, a);
+            }
+        }
+        let summary = wheres
+            .iter()
+            .map(|w| {
+                let s = w["sentence"].as_str().unwrap_or("");
+                if wheres.len() > 1 { format!("{}: {s}", w["test"].as_str().unwrap_or("")) } else { s.to_string() }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let summary = if summary.is_empty() { fs.iter().find(|f| f.state == "firing").or(fs.first()).map(|f| f.summary.clone()).unwrap_or_default() } else { summary };
         json!({
+            "tests": tests, "where": wheres, "fixed_by": fixed_by, "summary": summary,
             "id": self.id, "repo": self.repo, "title": self.title, "severity": self.severity, "state": self.state,
             "started": iso(self.started), "started_ms": self.started, "updated": iso(self.updated), "updated_ms": self.updated,
             "resolved": self.resolved.map(iso), "resolved_ms": self.resolved,
@@ -910,15 +946,21 @@ pub fn evaluate(sup: &Arc<Supervisor>, lv: &Arc<Levels>) -> usize {
 /// action as recorded.
 fn act(sup: &Arc<Supervisor>, lv: &Arc<Levels>, iid: &str, kind: &str, agent: Option<&str>, rule: Option<&str>) -> Result<Json, ApiError> {
     let mut inc = incident(sup, iid)?;
-    let agent = agent.map(str::to_string).or_else(|| inc.agents.first().cloned());
+    let firings = firings_where(sup, "incident = :i", &Params::new().set("i", Value::Str(iid.to_string())));
+    let (fixed_by, where_words) = where_of(sup, &inc, &firings);
+    // The agent it is about: not one whose branch fixed its test, when
+    // another is in it.
+    let agent = agent.map(str::to_string).or_else(|| inc.agents.iter().find(|a| !fixed_by.contains(a)).or(inc.agents.first()).cloned());
     let name = agent.as_deref().map(|a| name_of(sup, a));
+    let fixer = agent.as_ref().is_some_and(|a| fixed_by.contains(a));
     let now = now_ms();
-    let lead = firings_where(sup, "incident = :i", &Params::new().set("i", Value::Str(iid.to_string())))
+    let lead = firings
         .into_iter()
         .filter(|f| rule.is_none_or(|r| f.rule == r))
         .max_by_key(|f| f.started)
         .map(|f| f.summary)
         .unwrap_or_else(|| inc.title.clone());
+    let lead = if where_words.is_empty() { lead } else { format!("{}. {where_words}", lead.trim_end_matches('.')) };
     let mut action = json!({ "kind": kind, "at_ms": now, "at": iso(now), "agent": agent, "rule": rule, "ref": null, "state": "done", "by": if rule.is_some() { "rule" } else { "you" } });
     match kind {
         "notify" => {
@@ -928,20 +970,37 @@ fn act(sup: &Arc<Supervisor>, lv: &Arc<Levels>, iid: &str, kind: &str, agent: Op
         "ask" => {
             let a = agent.as_deref().and_then(|a| sup.agent_row(a)).ok_or_else(|| ApiError::bad("the incident has no agent to ask about"))?;
             let n = a.name.clone();
+            // Its branch fixed the test: what is left is to merge the fix,
+            // and pausing it is not offered first.
+            let (options, recommended) = if fixer {
+                (
+                    json!([
+                        { "label": format!("Tell {n} to get its fix merged"), "detail": "It is told its branch passes the test and the project's checkout still fails, and to commit the fix and open a pull request", "matches_precedent": false },
+                        { "label": "Let it carry on", "detail": "Nothing is sent; the incident stays open until its rules stop firing", "matches_precedent": false },
+                        { "label": format!("Pause {n}"), "detail": "Esc in its terminal: it stops what it is doing and waits for you", "matches_precedent": false },
+                    ]),
+                    0,
+                )
+            } else {
+                (
+                    json!([
+                        { "label": format!("Pause {n}"), "detail": "Esc in its terminal: it stops what it is doing and waits for you", "matches_precedent": false },
+                        { "label": format!("Tell {n} to stop and report"), "detail": "It is told to stop retrying and say what it found", "matches_precedent": false },
+                        { "label": "Let it carry on", "detail": "Nothing is sent; the incident stays open until its rules stop firing", "matches_precedent": false },
+                    ]),
+                    1,
+                )
+            };
             let q = Question {
                 id: new_id("q"),
                 agent: Some(a.id.clone()),
                 outcome: a.outcome.clone(),
                 repo: Some(a.repo.clone()),
                 kind: "alert".into(),
-                text: format!("{}. What should {n} do?", one_line(&lead, 300).trim_end_matches('.')),
+                text: format!("{}. What should {n} do?", one_line(&lead, 400).trim_end_matches('.')),
                 context: Some(format!("Health: {} (incident {})", inc.title, inc.id)),
-                options: json!([
-                    { "label": format!("Pause {n}"), "detail": "Esc in its terminal: it stops what it is doing and waits for you", "matches_precedent": false },
-                    { "label": format!("Tell {n} to stop and report"), "detail": "It is told to stop retrying and say what it found", "matches_precedent": false },
-                    { "label": "Let it carry on", "detail": "Nothing is sent; the incident stays open until its rules stop firing", "matches_precedent": false },
-                ]),
-                recommended: Some(1),
+                options,
+                recommended: Some(recommended),
                 precedent: None,
                 state: "open".into(),
                 created: now,
@@ -957,6 +1016,12 @@ fn act(sup: &Arc<Supervisor>, lv: &Arc<Levels>, iid: &str, kind: &str, agent: Op
             action["ref"] = json!(q.id);
             action["state"] = json!("open");
             action["detail"] = json!(format!("Asked you in Decide: what should {n} do?"));
+        }
+        "pause" if fixer && rule.is_some() => {
+            // A rule does not pause the agent whose branch fixed the test.
+            let n = name.clone().unwrap_or_default();
+            action["state"] = json!("skipped");
+            action["detail"] = json!(format!("Not paused: {n}'s branch fixed it. {where_words}"));
         }
         "pause" => {
             let a = agent.clone().ok_or_else(|| ApiError::bad("the incident has no agent to pause"))?;
@@ -978,6 +1043,22 @@ fn act(sup: &Arc<Supervisor>, lv: &Arc<Levels>, iid: &str, kind: &str, agent: Op
     inc.updated = now;
     inc.put(sup);
     Ok(action)
+}
+
+/// The agents whose branch fixed an incident's tests, and where its tests
+/// pass and fail now, in a sentence ("" when it names no test).
+fn where_of(sup: &Supervisor, inc: &Incident, firings: &[Firing]) -> (Vec<String>, String) {
+    let rules = rules_by_id(sup);
+    let mut fixed_by = Vec::new();
+    let mut words = Vec::new();
+    for t in tests_of(firings.iter(), &rules).iter().take(3) {
+        let Some(w) = crate::testruns::where_now(sup, &inc.repo, t) else { continue };
+        for a in w["fixed_by"].as_array().into_iter().flatten().filter_map(Json::as_str) {
+            add_unique(&mut fixed_by, a);
+        }
+        words.push(format!("{t}: {}", w["sentence"].as_str().unwrap_or("")));
+    }
+    (fixed_by, words.join(" "))
 }
 
 /// An alert's question was answered: Pause sends Esc, "Tell … to stop and
@@ -1011,6 +1092,9 @@ fn answer_of(sup: &Arc<Supervisor>, lv: &Arc<Levels>, mut inc: Incident, q: &Que
     let rest = answer.lines().skip(1).collect::<Vec<_>>().join("\n");
     if first == format!("Pause {n}") {
         let _ = act(sup, lv, &inc.id, "pause", Some(&agent), None);
+    } else if first == format!("Tell {n} to get its fix merged") {
+        let text = if rest.trim().is_empty() { "Your branch passes the test this alert is about, and the project's checkout still fails it. Get the fix merged: commit it, open a pull request, and say if anything is left.".to_string() } else { rest };
+        let _ = crate::levels::steer(sup, lv, &agent, &text);
     } else if first == format!("Tell {n} to stop and report") {
         let text = if rest.trim().is_empty() { "Stop retrying. Report what you found so far: what fails, what you tried, and what you think is wrong.".to_string() } else { rest };
         let _ = crate::levels::steer(sup, lv, &agent, &text);
@@ -1227,7 +1311,7 @@ pub fn board(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         events.drain(..events.len() - 150);
     }
     // The tests its test rules fired on.
-    let tests_named: Vec<String> = firings.iter().filter(|f| f.rule == "test-refail" || rules.get(&f.rule).is_some_and(|r| r.sql.contains("test_runs"))).map(|f| f.detail.clone().unwrap_or_else(|| f.entity.clone())).collect();
+    let tests_named = tests_of(firings.iter(), &rules);
     let tests = crate::testruns::board_tests(sup, &inc.repo, &tests_named);
     let error = tests.iter().find_map(|t| t["error"].as_str().map(str::to_string));
     let related = related(sup, &inc, &mut missing);

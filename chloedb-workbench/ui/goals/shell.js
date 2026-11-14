@@ -20,9 +20,12 @@ export function groupOf(a) {
   if (!a) return "finished";
   const need = A && A.needs().items.some((i) => i.agent && i.agent.id === a.id);
   if (a.running && (need || a.state === "waiting")) return "needs";
-  const g = A && A.groups()[a.id];
-  if (g) return g;
+  // The live state first: the projects' groups are read every few seconds,
+  // and an agent that just finished its turn is not "working" any more.
   if (a.running && (a.state === "working" || a.state === "starting")) return "working";
+  const g = A && A.groups()[a.id];
+  if (g && !(a.running && g === "working")) return g;
+  if (a.running && a.state === "idle") return "idle";
   if (a.running) return "ready";
   return "finished";
 }
@@ -42,9 +45,9 @@ export function fleet(repo) {
   return [...byName.values()].filter((a) => a.running || (toMs(a.ended || a.state_since) || 0) > cut);
 }
 
-export const ORDER = ["needs", "working", "ready", "finished"];
+export const ORDER = ["needs", "working", "ready", "idle", "finished"];
 export function counts(list) {
-  const c = { needs: 0, working: 0, ready: 0, finished: 0 };
+  const c = { needs: 0, working: 0, ready: 0, idle: 0, finished: 0 };
   for (const a of list) c[groupOf(a)]++;
   return c;
 }
@@ -209,6 +212,7 @@ export const MORE = [
   ["time", "clock", "Where the time went", "Waiting on you, thinking, tools and tests, per agent"],
   ["decisions", "branch", "Decisions timeline", "Every decision of the project, one lane per agent"],
   ["library", "book", "Library", "Docs, notes and code search"],
+  ["tests", "warn", "Tests and alerts", "Flaky and failing tests, Run it N times, alert rules, incidents, hotspots"],
   ["rules", "check", "Rules and grants", "What agents are told, and what they may do without asking; Revoke"],
   ["harness", "spark", "Optimize the harness", "What cost time this week; permissions, memory and versions"],
   ["settings", "gear", "Settings", "Open on the inbox, compact rows"],
@@ -253,6 +257,7 @@ function alertCard(it) {
   return h("div", { class: "alert-card", tabindex: "0", "data-need": it.id },
     h("div", { class: "hd" }, icon("warn", "i sm"), h("b", {}, `Alert · ${i.severity || "asks you"}`), h("span", { class: "t" }, since(it.since_ms))),
     h("div", { class: "ti" }, i.title || "An alert asks you"),
+    (i.tests || []).length ? h("div", { class: "qc-what" }, i.tests.slice(0, 3).map((t) => h("code", {}, t)), (i.fixed_by || []).length ? " · fixed on a branch, not on the project's checkout" : null) : null,
     i.summary || i.detail ? h("p", { class: "qc-what" }, i.summary || i.detail) : null,
     h("div", { class: "act" },
       btn("Open in Debug", { sm: true, href: `#/debug/failing?incident=${enc(i.id || "")}` }),

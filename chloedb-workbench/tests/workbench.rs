@@ -2435,11 +2435,12 @@ fn health_counts_tests_by_name_without_permission_waits_and_runs_one_again() {
     assert_eq!((rr["rerun"]["state"].as_str(), rr["rerun"]["passed"].as_i64(), rr["rerun"]["failed"].as_i64()), (Some("done"), Some(5), Some(0)), "{rr}");
     let v = s.get(&radar).1;
     let promo = find(&v["tests"], "/test", "test_coupons.py::test_promo_window");
-    // Stable since its last failure: the passes after it, with how likely
-    // they were had nothing changed.
-    assert_eq!(promo["stable"]["runs"], 8, "{promo}");
-    assert_eq!(promo["stable"]["by_workbench"], 5, "{promo}");
-    assert!(promo["stable"]["chance_if_unchanged"].as_f64().is_some(), "{promo}");
+    // Stable on the code of its last run only (the repository's own
+    // pytest makes its tree another): those 6 passes, against the 2 of 10
+    // failures before, which take 14 passes in a row to tell from luck.
+    let st = &promo["stable"];
+    assert_eq!((st["runs"].as_i64(), st["by_workbench"].as_i64(), st["after_failure"].as_bool()), (Some(6), Some(5), Some(true)), "{promo}");
+    assert_eq!((st["failed_before"].as_i64(), st["runs_before"].as_i64(), st["needed"].as_i64(), st["enough"].as_bool()), (Some(2), Some(10), Some(14), Some(false)), "{promo}");
     assert_eq!(s.post("/api/tests/rerun", json!({ "repo": r, "test": "nosuch" })).0, 404);
 }
 
@@ -5960,4 +5961,131 @@ fn harness_pages_are_served_under_goals() {
         assert_eq!(r.status().as_u16(), 200, "{f}");
     }
     assert_eq!(http().get(format!("{}/goals/harness/nope.js", s.url)).call().unwrap().status().as_u16(), 404);
+}
+
+// Sam's findings: a loop of runs, Run it N times in a chosen checkout with
+// the command shown, a fix on a branch, and the alert that names it.
+
+/// pytest -v of test_coupons.py, once per entry: test_promo_window passing
+/// or failing.
+fn pytest_v(runs: &[bool]) -> String {
+    let mut out = String::new();
+    for ok in runs {
+        if *ok {
+            out += "test_coupons.py::test_a PASSED [ 50%]\ntest_coupons.py::test_promo_window PASSED [100%]\n==== 2 passed in 0.01s ====\n";
+        } else {
+            out += "test_coupons.py::test_a PASSED [ 50%]\ntest_coupons.py::test_promo_window FAILED [100%]\n___ test_promo_window ___\nE   assert 0.08 > 0.2\n=== short test summary info ===\nFAILED test_coupons.py::test_promo_window - assert 0.08 > 0.2\n==== 1 failed, 1 passed in 0.02s ====\n";
+        }
+    }
+    out
+}
+
+#[test]
+fn a_loop_is_a_run_each_and_a_fix_on_a_branch_is_said_on_the_alert() {
+    let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "name": "hunt" }));
+    let id = a["id"].as_str().unwrap().to_string();
+    let wt = PathBuf::from(a["cwd"].as_str().unwrap());
+    s.until(&id, "started", |a| a["session_id"].is_string());
+    let base = git(&r, &["rev-parse", "HEAD"]);
+    let radar = format!("/api/tests?repo={}", r.display());
+    let test = "test_coupons.py::test_promo_window";
+
+    // One command, three pytest runs in a loop: three runs, two failing,
+    // on one commit with the same code (flaky there).
+    bash_as(&s, &id, "loop", "for i in 1 2 3; do python3 -m pytest -v test_coupons.py; done", &pytest_v(&[true, false, false]), true);
+    let v = s.get_until(&radar, "the loop", |v| v["totals"]["commands"] == 3);
+    let promo = find(&v["tests"], "/test", test);
+    assert_eq!((promo["runs"].as_i64(), promo["failed"].as_i64(), promo["flaky"].as_bool()), (Some(3), Some(2), Some(true)), "{promo}");
+    assert_eq!(find(&v["tests"], "/test", "test_coupons.py::test_a")["runs"], 3, "{v}");
+
+    // Its history: the command for that one test, no shell words in it,
+    // and the checkouts it can run in.
+    let hist = format!("/api/tests/history?repo={}&test={test}", r.display());
+    let (status, h) = s.get(&hist);
+    assert_eq!(status, 200, "{h}");
+    assert_eq!(h["rerun"], format!("python3 -m pytest -q -rA -p no:cacheprovider {test}"), "{h}");
+    let ids: Vec<&str> = h["checkouts"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["main", id.as_str()], "{h}");
+    assert_eq!(h["codes"][0]["commit"], json!(base), "{h}");
+    assert_eq!((h["codes"][0]["runs"].as_i64(), h["codes"][0]["failed"].as_i64()), (Some(3), Some(2)), "{h}");
+
+    // hunt fixes it on its branch: a commit there. Run it N times there,
+    // with the command as the user wrote it (a pytest of the branch's).
+    std::fs::write(wt.join("pt"), "#!/bin/sh\nfor a; do t=$a; done\necho \"PASSED $t\"\necho '1 passed in 0.01s'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(wt.join("pt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(&wt, &["add", "pt"]);
+    git(&wt, &["commit", "-q", "-m", "test: make test_promo_window deterministic"]);
+    let fix = git(&wt, &["rev-parse", "HEAD"]);
+    // Shell words are refused, not sliced.
+    let (status, e) = s.post("/api/tests/rerun", json!({ "repo": r, "test": test, "n": 3, "checkout": id, "command": format!("./pt {test}; rm -rf /") }));
+    assert_eq!(status, 400, "{e}");
+    let (status, rr) = s.post("/api/tests/rerun", json!({ "repo": r, "test": test, "n": 3, "checkout": id, "command": format!("./pt -q {test}") }));
+    assert_eq!(status, 200, "{rr}");
+    let rid = rr["rerun"]["id"].as_str().unwrap().to_string();
+    let rr = s.get_until(&format!("/api/tests/rerun/{rid}"), "three runs", |v| v["rerun"]["state"] != "running");
+    let run = &rr["rerun"];
+    assert_eq!((run["state"].as_str(), run["passed"].as_i64(), run["failed"].as_i64()), (Some("done"), Some(3), Some(0)), "{rr}");
+    assert_eq!((run["commit"].as_str(), run["branch"].as_str(), run["checkout"].as_str()), (Some(fix.as_str()), Some("wb/hunt"), Some(id.as_str())), "{rr}");
+    assert_eq!(run["checkout_label"], "hunt's worktree", "{rr}");
+
+    // Stable on the fix's commit only, against the commit it failed on: 2 of
+    // 3 failed there, so 3 passes in a row are enough to call it fixed.
+    let (_, h) = s.get(&hist);
+    let st = &h["stable"];
+    assert_eq!((st["since_commit"].as_str(), st["runs"].as_i64(), st["by_workbench"].as_i64()), (Some(fix.as_str()), Some(3), Some(3)), "{h}");
+    assert_eq!((st["before_commit"].as_str(), st["failed_before"].as_i64(), st["runs_before"].as_i64()), (Some(base.as_str()), Some(2), Some(3)), "{h}");
+    assert_eq!((st["needed"].as_i64(), st["enough"].as_bool()), (Some(3), Some(true)), "{h}");
+    // Fail then pass across a code change is fixed, not flaky, on the
+    // branch's code; the runs per commit say where each was.
+    let codes = h["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 2, "{h}");
+    assert_eq!((codes[0]["commit"].as_str(), codes[0]["failed"].as_i64()), (Some(fix.as_str()), Some(0)), "{h}");
+
+    // "A test failing twice in an hour": the incident names the test, says
+    // where it is fixed and where not, and does not offer to pause the
+    // agent that fixed it first.
+    let sql = "SELECT test AS entity, repo, test AS detail, MAX(agent) AS agent, COUNT(*) AS v\nFROM test_runs\nWHERE outcome = 'failed' AND ts >= :since\nGROUP BY repo, test";
+    let (_, t) = s.post("/api/alerts/test", json!({ "sql": sql, "cmp": ">=", "threshold": 2, "window_s": 3600 }));
+    assert_eq!(t["ok"], true, "{t}");
+    let (status, v) = s.post("/api/alerts/rules", json!({ "name": "A test failing twice in an hour", "sql": sql, "cmp": ">=", "threshold": 2, "window_s": 3600, "action": "ask", "severity": "major" }));
+    assert_eq!(status, 201, "{v}");
+    let (_, c) = s.post("/api/alerts/check", json!({}));
+    let inc = c["incidents"].as_array().unwrap().iter().find(|i| i["tests"] == json!([test])).unwrap_or_else(|| panic!("no incident on the test: {c}")).clone();
+    assert_eq!(inc["title"], format!("{test}: A test failing twice in an hour"), "{inc}");
+    assert_eq!(inc["fixed_by"], json!([id]), "{inc}");
+    let said = inc["summary"].as_str().unwrap();
+    assert!(said.starts_with(&format!("Fixed on wb/hunt ({}), not merged: 3 runs, no failure; main ({}) still fails: 2 of 3 runs failed", &fix[..8], &base[..8])), "{said}");
+    let ask = inc["actions"].as_array().unwrap().iter().find(|a| a["kind"] == "ask").unwrap_or_else(|| panic!("no ask: {inc}")).clone();
+    let (_, qs) = s.get("/api/questions?state=open");
+    let q = find(&qs["questions"], "/id", ask["ref"].as_str().unwrap());
+    assert_eq!(q["options"][0]["label"], "Tell hunt to get its fix merged", "{q}");
+    assert_eq!(q["recommended"], 0, "{q}");
+    assert!(q["text"].as_str().unwrap().contains("still fails"), "{q}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_agent_may_not_kill_processes_it_did_not_start() {
+    let s = Server::start(&["--chloectx-bin", "/nonexistent/chloectx"]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "name": "preview", "worktree": false }));
+    let id = a["id"].as_str().unwrap().to_string();
+    s.until(&id, "started", |a| a["pid"].is_number());
+    let key = agent_token(&s, &id);
+    // Someone else's process (here the test's own), matched by its command line.
+    let mut other = Command::new("sleep").arg("317.25").spawn().unwrap();
+    let out = pre_bash(&s, &key, &id, "pkill -f \"sleep 317.25\"");
+    assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny", "{out}");
+    let why = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+    assert!(why.contains(&format!("pid {}", other.id())) && why.contains("kill <pid>"), "{why}");
+    // A pattern that matches nothing of anyone else's is not stopped.
+    let out = pre_bash(&s, &key, &id, "pkill -f nothing-runs-by-this-name-31725");
+    assert_ne!(out["hookSpecificOutput"]["permissionDecision"], "deny", "{out}");
+    other.kill().unwrap();
+    let _ = other.wait();
 }

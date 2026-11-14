@@ -46,6 +46,7 @@ export function resolve(hash, { project = null, agentIds = [] } = {}) {
     case "harness": return { page: "harness", rest: parts.slice(1), project: query.get("project") || p, query };
     case "more":
       if (b === "harness") return { redirect: "#/harness" };
+      if (b === "tests") return { redirect: "#/debug/failing?tab=tests" };
       if (MORE.includes(b)) return { page: "more", item: b, query };
       return { page: "more", item: null, query };
     // Today's routes, for a release (JOURNEYS.md, "URL routes").
@@ -56,7 +57,7 @@ export function resolve(hash, { project = null, agentIds = [] } = {}) {
     case "story": return { redirect: b ? `#/a/${b}` : P() };
     case "preview": return { redirect: b ? `#/a/${b}/preview` : P() };
     case "ship": return { redirect: b ? P(`/ship/${b}`) : P("/ship") };
-    case "health": return { redirect: "#/debug/failing" };
+    case "health": return { redirect: b && /^i[0-9a-f]{8}$/.test(b) ? `#/debug/failing?incident=${b}` : b ? `#/debug/failing?tab=${encodeURIComponent(b)}` : "#/debug/failing" };
     case "flow": return { redirect: "#/more/time" };
     case "library": return { redirect: `#/more/library${q}` };
     case "grid": return { redirect: "#/more/terminals" };

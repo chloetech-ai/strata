@@ -16,6 +16,8 @@ export function projectSteps(p, now) {
     tab("continue", `#/p/${p.project}`, "Since you left"),
     tab("understand", `#/p/${p.project}/understand`, "Understand"),
     tab("change", `#/p/${p.project}/change`, "Start a change"),
+    // Health: the tests the agents ran, the alert rules and incidents.
+    tab("tests", "#/debug/failing?tab=tests", "Tests and alerts"),
     h("span", { class: "sp" }),
     h("a", { href: `#/p/${p.project}/ship`, class: `g-ship${now === "ship" ? " on" : ""}` }, `Review and ship${ready ? ` (${ready} ready)` : ""}`, icon("chev", "i sm")));
 }
@@ -73,6 +75,7 @@ export function mount(root, ctx) {
       else if (g === "ready") bits.push(`${a.name} is ready to review`);
       else if (g === "working") bits.push(`${a.name} is working`);
       else if (merged[a.id] && Date.now() - (merged[a.id].ts || 0) < 86400000) bits.push(`${a.name} was merged into ${merged[a.id].onto || "main"}`);
+      else if (g === "idle") bits.push(`${a.name} is idle, its turn over`);
     }
     const done = d ? (d.done || []).length : 0;
     if (done) bits.push(`${done} outcome${done === 1 ? "" : "s"} done`);

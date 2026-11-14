@@ -870,6 +870,19 @@ pub(crate) struct Run {
     pub passed: bool,
     pub ms: Option<i64>,
     pub ts: i64,
+    /// Its uncommitted changes (`clean` or a hash of them).
+    pub tree: String,
+    /// The environment its command set for the runner (testruns::variant):
+    /// empty for a normal run.
+    pub env: String,
+    pub error: Option<String>,
+}
+
+impl Run {
+    /// "The same code": commit, uncommitted changes and environment.
+    pub fn code(&self) -> (&str, &str, &str) {
+        (self.commit.as_str(), self.tree.as_str(), self.env.as_str())
+    }
 }
 
 /// The rows of Health's `test_runs`, oldest first, or `None` when there is
@@ -877,7 +890,8 @@ pub(crate) struct Run {
 /// command as one test (`runner = 'other'`, the test is the command) are
 /// left out: they are counts, not tests.
 pub(crate) fn test_runs(sup: &Supervisor) -> Option<Vec<Run>> {
-    let rows = sup.db().query("SELECT test, agent, \"commit\", passed, ms, ts, runner, command FROM test_runs LIMIT 50000", &chloedb::query::Params::new()).ok()?;
+    let rows = sup.db().query("SELECT test, agent, \"commit\", passed, ms, ts, runner, command, tree, error FROM test_runs LIMIT 50000", &chloedb::query::Params::new()).ok()?;
+    let mut variants: HashMap<String, String> = HashMap::new();
     let mut out: Vec<Run> = rows
         .iter()
         .filter(|r| !(crate::db::get_str(&r[6]).as_deref() == Some("other") && crate::db::get_str(&r[0]) == crate::db::get_str(&r[7])))
@@ -891,6 +905,12 @@ pub(crate) fn test_runs(sup: &Supervisor) -> Option<Vec<Run>> {
             },
             ms: crate::db::get_int(&r[4]),
             ts: crate::db::get_ms(&r[5]).unwrap_or(0),
+            tree: crate::db::get_str(&r[8]).unwrap_or_else(|| "clean".into()),
+            env: {
+                let c = crate::db::get_str(&r[7]).unwrap_or_default();
+                variants.entry(c.clone()).or_insert_with(|| crate::testruns::variant(&c)).clone()
+            },
+            error: crate::db::get_str(&r[9]),
         })
         .collect();
     out.sort_by_key(|r| r.ts);
@@ -910,9 +930,9 @@ fn runs_json(runs: &[&Run], head: Option<&str>) -> Json {
         return Json::Null;
     }
     let passed = runs.iter().filter(|r| r.passed).count();
-    let mut by: HashMap<(&str, &str), (bool, bool)> = HashMap::new();
+    let mut by: HashMap<(&str, (&str, &str, &str)), (bool, bool)> = HashMap::new();
     for r in runs {
-        let e = by.entry((r.test.as_str(), r.commit.as_str())).or_default();
+        let e = by.entry((r.test.as_str(), r.code())).or_default();
         if r.passed {
             e.0 = true;
         } else {
@@ -930,10 +950,13 @@ fn runs_json(runs: &[&Run], head: Option<&str>) -> Json {
     // another commit (not a flaky pair) is "fixed".
     let mut last: BTreeMap<&str, &Run> = BTreeMap::new();
     let mut fixed: BTreeSet<&str> = BTreeSet::new();
-    for r in runs {
+    // Runs with an environment of their own (a skip check) do not decide
+    // a test's last result when it has normal runs.
+    let normal: HashSet<&str> = runs.iter().filter(|r| r.env.is_empty()).map(|r| r.test.as_str()).collect();
+    for r in runs.iter().filter(|r| r.env.is_empty() || !normal.contains(r.test.as_str())) {
         if let Some(prev) = last.get(r.test.as_str()) {
-            let flaky_here = by.get(&(r.test.as_str(), r.commit.as_str())).is_some_and(|(p, f)| *p && *f);
-            if !prev.passed && r.passed && prev.commit != r.commit && !flaky_here {
+            let flaky_here = by.get(&(r.test.as_str(), r.code())).is_some_and(|(p, f)| *p && *f);
+            if !prev.passed && r.passed && prev.code() != r.code() && !flaky_here {
                 fixed.insert(r.test.as_str());
             }
         }
@@ -1081,6 +1104,33 @@ fn compute(sup: &Supervisor, a: &crate::db::Agent, dir: &Path, main: &Path, land
             let names: Vec<&str> = covers.iter().map(|c| c.rsplit('#').next().unwrap_or(c)).collect();
             tests.push(json!({ "path": name, "score": 1, "covers": covers, "why": [format!("test_runs: names {}", names.join(", "))], "runs": runs_json(&rs, head.as_deref()), "from": "test_runs" }));
         }
+    }
+    // A changed test function is a test: its file is one of the tests to
+    // run, covering it, with that test's runs.
+    let mut by_file: BTreeMap<&str, Vec<&Func>> = BTreeMap::new();
+    for f in test_funcs.iter().filter(|f| f.status != "deleted") {
+        by_file.entry(f.path.as_str()).or_default().push(f);
+    }
+    for (path, fs) in by_file {
+        let ids: Vec<String> = fs.iter().map(|f| f.id.clone()).collect();
+        let why = format!("changed here: {}", fs.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "));
+        if let Some(t) = tests.iter_mut().find(|t| t["path"] == path) {
+            if let Some(c) = t["covers"].as_array_mut() {
+                c.extend(ids.into_iter().map(Json::from));
+            }
+            if let Some(w) = t["why"].as_array_mut() {
+                w.push(json!(why));
+            }
+            t["changed"] = json!(true);
+            continue;
+        }
+        let p = path.to_ascii_lowercase();
+        let names: Vec<String> = fs.iter().map(|f| f.name.to_ascii_lowercase()).filter(|n| n.len() >= 3).collect();
+        let mine: Vec<&Run> = runs.iter().flatten().filter(|r| {
+            let t = r.test.to_ascii_lowercase();
+            t.contains(&p) || names.iter().any(|n| t.contains(n.as_str()))
+        }).collect();
+        tests.push(json!({ "path": path, "score": 3, "covers": ids, "why": [why], "runs": runs_json(&mine, head.as_deref()), "changed": true }));
     }
     let tests_of = |fid: &str| -> Vec<String> { tests.iter().filter(|t| t["covers"].as_array().is_some_and(|c| c.iter().any(|x| x == fid))).filter_map(|t| t["path"].as_str().map(str::to_string)).collect() };
 
@@ -1297,11 +1347,12 @@ fn compute(sup: &Supervisor, a: &crate::db::Agent, dir: &Path, main: &Path, land
         .iter()
         .map(|f| json!({ "id": f.id, "name": f.name, "kind": f.kind, "path": f.path, "line": f.line, "status": f.status, "added": f.added, "removed": f.removed }))
         .collect();
+    // Its functions count the test functions it changed too.
     let totals = json!({
-        "files": files.len(), "added": added, "removed": removed, "functions": funcs.len(), "callers": callers, "test_callers": test_callers,
+        "files": files.len(), "added": added, "removed": removed, "functions": funcs.len() + test_funcs.len(), "callers": callers, "test_callers": test_callers,
         "tests": tests.len(), "decisions": decs.len(), "agents": agents.len(), "test_functions": test_funcs.len(),
     });
-    let mut risk = risk(&functions, &tests, &decisions, &agents, callers);
+    let mut risk = risk(&functions, &test_functions, &tests, &decisions, &agents, callers);
     if let Some(l) = land.line() {
         risk["stack"] = json!(l);
     }
@@ -1406,7 +1457,7 @@ fn graph_decisions(g: &Json, dir: &Path, main: &Path, changed: &HashSet<&str>, f
 }
 
 /// The risk: a level, a score, a sentence, and its reasons.
-fn risk(functions: &[Json], tests: &[Json], decisions: &[Json], agents: &[Json], callers: usize) -> Json {
+fn risk(functions: &[Json], test_functions: &[Json], tests: &[Json], decisions: &[Json], agents: &[Json], callers: usize) -> Json {
     // Uses in test files are counted apart, on each function.
     let test_callers: usize = functions.iter().filter_map(|f| f["test_callers"].as_u64()).sum::<u64>() as usize;
     let mut score = 0i64;
@@ -1462,7 +1513,12 @@ fn risk(functions: &[Json], tests: &[Json], decisions: &[Json], agents: &[Json],
     let callers_said = if callers == 0 && test_callers > 0 { format!("no caller outside tests and {} in tests", test_callers) } else { plural(callers, "caller") };
     let mut parts = vec![format!("{} changed with {callers_said}", plural(functions.len(), "function"))];
     if functions.is_empty() {
-        parts[0] = "no function changed".into();
+        let names = names_of(&test_functions.iter().collect::<Vec<_>>());
+        parts[0] = match names.len() {
+            0 => "no function changed".into(),
+            1 => format!("only a test changed: {}", names[0]),
+            n => format!("only tests changed: {} test functions ({})", n, join_and(&names[..n.min(3)])),
+        };
     }
     if !untested.is_empty() {
         let n = names_of(&untested);
@@ -1565,12 +1621,15 @@ mod tests {
     #[test]
     fn says_the_risk_in_a_sentence() {
         let f = |name: &str, tests: Json| json!({ "name": name, "status": "changed", "tests": tests, "callers_total": 3 });
-        let r = risk(&[f("cartTotal", json!(["t"])), f("rateFor", json!([]))], &[], &[], &[json!({ "agent": { "name": "cart-ui" }, "kinds": ["same_file"], "files": ["src/cart.ts"], "functions": ["a#cartTotal"], "detail": "cart-ui also changed src/cart.ts" })], 12);
+        let r = risk(&[f("cartTotal", json!(["t"])), f("rateFor", json!([]))], &[], &[], &[], &[json!({ "agent": { "name": "cart-ui" }, "kinds": ["same_file"], "files": ["src/cart.ts"], "functions": ["a#cartTotal"], "detail": "cart-ui also changed src/cart.ts" })], 12);
         assert_eq!(r["level"], "medium");
         assert_eq!(r["line"], "Medium risk: 2 functions changed with 12 callers; rateFor has no test that names it and cart-ui changes src/cart.ts too.");
-        let r = risk(&[f("cartTotal", json!(["t"]))], &[], &[], &[], 1);
+        let r = risk(&[f("cartTotal", json!(["t"]))], &[], &[], &[], &[], 1);
         assert_eq!(r["level"], "low");
         assert_eq!(r["line"], "Low risk: 1 function changed with 1 caller.");
+        // A diff that only rewrites a test's body says so.
+        let r = risk(&[], &[json!({ "name": "test_promo_window", "status": "changed" })], &[], &[], &[], 0);
+        assert_eq!(r["line"], "Low risk: only a test changed: test_promo_window.");
     }
 
     #[test]
@@ -1578,7 +1637,7 @@ mod tests {
         // Callers only in tests are callers; a branch proven to merge is a note.
         let f = json!({ "name": "add", "status": "changed", "tests": ["t"], "callers_total": 0, "test_callers": 12 });
         let g = json!({ "agent": { "name": "freeship" }, "kinds": ["same_file"], "files": ["cart.py"], "functions": [], "detail": "freeship also changed cart.py", "merges_clean": true });
-        let r = risk(&[f], &[], &[], &[g], 0);
+        let r = risk(&[f], &[], &[], &[], &[g], 0);
         assert_eq!(r["level"], "low", "{r}");
         assert_eq!(r["line"], "Low risk: 1 function changed with no caller outside tests and 12 in tests; freeship changes cart.py too, and the two branches merge without a conflict.");
     }

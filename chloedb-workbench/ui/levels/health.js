@@ -31,12 +31,21 @@ const CMPS = [">=", ">", "<=", "<", "=", "!="];
 const TABLES = {
   events: "id, seq, ts, agent, kind, tool, summary, data",
   agents: "id, name, repo, cwd, branch, task, parent, state, state_since, narration, model, goal, outcome …",
-  test_runs: "id, run, repo, agent, commit, tree, runner, command, test, outcome, passed, ms, own_ms, run_ms, exit_code, ts, seq",
+  test_runs: "id, run, repo, agent, \"commit\", tree, runner, command, test, outcome, passed, ms, own_ms, run_ms, exit_code, error, use_id, ts, seq",
   file_edits: "id, repo, agent, file, tool, ts, seq",
   token_use: "id, repo, agent, input, output, cache_read, ts",
   questions: "id, agent, repo, kind, text, state, created, answered …",
   outcomes: "id, goal, title, state, agent, progress …",
 };
+// Rules to start a new one from: [label, name, sql, cmp, threshold, window_s, severity].
+const TEMPLATES = [
+  ["A test failing twice in an hour", "A test failing twice in an hour",
+    "SELECT test AS entity, repo, test AS detail, MAX(agent) AS agent, COUNT(*) AS v\nFROM test_runs\nWHERE outcome = 'failed' AND ts >= :since\nGROUP BY repo, test", ">=", 2, 3600, "major"],
+  ["An agent's tools failing", "An agent's tools failing 3 times in 30 min",
+    "SELECT agent AS entity, agent, COUNT(*) AS v\nFROM events\nWHERE kind = 'PostToolUseFailure' AND ts >= :since\nGROUP BY agent", ">=", 3, 1800, "minor"],
+  ["A file edited by several agents", "A file edited by 3 agents in an hour",
+    "SELECT file AS entity, repo, file, COUNT(DISTINCT agent) AS v\nFROM file_edits\nWHERE ts >= :since\nGROUP BY repo, file", ">=", 3, 3600, "minor"],
+];
 const nameOf = (a) => (a && (a.name || a.id)) || "?";
 const sevTone = (s) => (s === "major" || s === "critical" ? "crit" : "warn");
 /** 4 ms, 640 ms, 3.4 s, 1 m 16 s. */
@@ -53,7 +62,7 @@ function mountHealth(root, ctx) {
     sel: first && /^i[0-9a-f]{8}$/.test(first) ? first : null,
     inc: null, incErr: null, boards: new Map(), showResolved: false,
     rules: null, rulesErr: null, ruleSel: null, draft: null, result: null, testing: false, saving: false, ruleMsg: null,
-    tests: null, testsErr: null, filter: "", only: "all", testSel: null, hist: new Map(), reruns: new Map(), rerunN: 10,
+    tests: null, testsErr: null, filter: "", only: "all", testSel: null, hist: new Map(), reruns: new Map(), rerunN: 10, rrCmd: new Map(), rrCheckout: new Map(),
     acting: new Set(), actErr: null, agents: new Map(),
   };
   if (S.sel) S.tab = "incidents";
@@ -121,11 +130,13 @@ function mountHealth(root, ctx) {
     render();
   }
   // Run it N times: Workbench runs the test itself, then reads it again.
-  async function rerun(test, n) {
+  async function rerun(test, n, opts = {}) {
     S.reruns.set(test, { state: "starting", n, done: 0 });
     render();
     try {
       const body = { test, n };
+      if (opts.command) body.command = opts.command;
+      if (opts.checkout) body.checkout = opts.checkout;
       const r = repoOf(ctx); if (r) body.repo = r;
       const d = await ctx.api("/api/tests/rerun", { method: "POST", body });
       S.reruns.set(test, d.rerun);
@@ -228,7 +239,10 @@ function mountHealth(root, ctx) {
     const b = d?.board;
     const inc = d?.incident || i;
     const agents = inc.agents || [];
-    const lead = agents[0];
+    // The agent to pause: never one whose branch fixed its test.
+    const fixers = new Set(inc.fixed_by || []);
+    const lead = agents.find((a) => !fixers.has(a.id));
+    const fixer = agents.find((a) => fixers.has(a.id));
     const busy = (k) => S.acting.has(`${i.id}:${k}`);
     const open = inc.state === "open";
     const head = h("div", { class: "hl-bh" },
@@ -236,8 +250,9 @@ function mountHealth(root, ctx) {
         pill(open ? (inc.severity || "minor") : "resolved", open ? sevTone(inc.severity) : "good"),
         h("span", { class: "lv-sub" }, open ? `open · started ${fmtClock(inc.started_ms)}, ${fmtAgo(inc.started_ms)} · ${inc.firing_now} rule${inc.firing_now === 1 ? "" : "s"} firing` : `${fmtClock(inc.started_ms)} – ${fmtClock(inc.resolved_ms)} · lasted ${fmtDur(inc.resolved_ms - inc.started_ms)}`)),
       open ? h("div", { class: "hl-acts" },
+        fixer ? h("a", { class: "btn sm", href: `#/ship/${enc(fixer.id)}`, title: `${nameOf(fixer)}'s branch passes it: review and merge it` }, `Review ${nameOf(fixer)}'s fix`) : null,
         lead && lead.running !== false ? h("button", { class: "btn sm warn", disabled: busy("pause") || null, title: `Send Esc to ${nameOf(lead)}: it stops what it is doing and waits`, onclick: () => act(i, "pause", lead.id) }, busy("pause") ? "Pausing…" : `Pause ${nameOf(lead)}`) : null,
-        h("button", { class: "btn sm", disabled: busy("ask") || null, title: "A question in Decide, with what to tell the agent", onclick: () => act(i, "ask", lead?.id) }, busy("ask") ? "Asking…" : "Ask me in Decide"),
+        h("button", { class: "btn sm", disabled: busy("ask") || null, title: "A question in Decide, with what to tell the agent", onclick: () => act(i, "ask", (lead || fixer)?.id) }, busy("ask") ? "Asking…" : "Ask me in Decide"),
         h("button", { class: "btn sm", disabled: busy("resolve") || null, onclick: () => resolve(i) }, busy("resolve") ? "Resolving…" : "Resolve")) : null);
     if (!d) return h("section", { class: "lv-card hl-board" }, head, h("h2", { class: "hl-bt" }, inc.title), empty("Reading its board…"));
     if (d.error) return h("section", { class: "lv-card hl-board" }, head, h("h2", { class: "hl-bt" }, inc.title), h("div", { class: "err" }, d.error));
@@ -245,12 +260,21 @@ function mountHealth(root, ctx) {
       head,
       h("h2", { class: "hl-bt" }, inc.title),
       inc.files?.length ? h("div", { class: "hl-files" }, inc.files.map((f) => h("code", { class: "lv-code" }, f))) : null,
+      whereCard(inc),
       S.actErr ? h("div", { class: "err" }, S.actErr) : null,
       sentences(b.sentences || []),
       h("div", { class: "hl-bgrid" },
         h("div", { class: "hl-bcol" }, firingsCard(b.firings || inc.firings || []), b.error ? errorCard(b.error) : null, (b.tests || []).length ? testsCard(b.tests) : null, actionsCard(inc)),
         h("div", { class: "hl-bcol" }, eventsCard(b, inc), relatedCard(b))),
       (b.missing || []).length ? h("div", { class: "hl-missing" }, b.missing.join(" ")) : null);
+  }
+
+  // Where its tests pass and fail now, checkout by checkout.
+  function whereCard(inc) {
+    const ws = inc.where || [];
+    if (!ws.length) return null;
+    return h("div", { class: "hl-where" }, ws.map((w) => h("div", { class: "hl-where-r" },
+      h("code", { class: "lv-code" }, w.test), " ", (w.fixed_by || []).length ? pill("fixed on a branch", "good") : null, " ", w.sentence)));
   }
 
   function sentences(list) {
@@ -381,7 +405,8 @@ function mountHealth(root, ctx) {
   }
   function newRule() {
     S.ruleSel = null; S.result = null; S.ruleMsg = null;
-    S.draft = { id: null, name: "", description: "", sql: "SELECT agent AS entity, agent, COUNT(*) AS v\nFROM events\nWHERE kind = 'PostToolUseFailure' AND ts >= :since\nGROUP BY agent", cmp: ">=", threshold: 3, window_s: 1800, action: "notify", severity: "minor", enabled: true, builtin: false, dirty: true };
+    const [, , sql, cmp, threshold, window_s, severity] = TEMPLATES[1];
+    S.draft = { id: null, name: "", description: "", sql, cmp, threshold, window_s, action: "notify", severity, enabled: true, builtin: false, dirty: true };
     render();
     requestAnimationFrame(() => el.querySelector(".hl-rname")?.focus());
   }
@@ -418,6 +443,19 @@ function mountHealth(root, ctx) {
     const sql = h("textarea", { class: "hl-sql", rows: String(Math.max(5, d.sql.split("\n").length + 1)), spellcheck: "false", "aria-label": "The rule's SQL" }, d.sql);
     import("./complete.js").then((m) => m.attachComplete(sql, { field: "sql", ctx })).catch(() => {}); // Fifth build: autocomplete
     sql.addEventListener("input", () => { set("sql", sql.value); sql.rows = Math.max(5, sql.value.split("\n").length + 1); });
+    // Where the cursor was in the SQL, kept across renders: a column is
+    // put there, and only when you pick one.
+    const keep = () => { d.cur = { start: sql.selectionStart, end: sql.selectionEnd }; };
+    for (const ev of ["input", "keyup", "click", "select", "blur"]) sql.addEventListener(ev, keep);
+    const insert = (text) => {
+      const at = d.cur ? Math.min(d.cur.start, sql.value.length) : sql.value.length;
+      const to = d.cur ? Math.min(d.cur.end, sql.value.length) : at;
+      const before = sql.value.slice(0, at);
+      const pad = before && !/\s$/.test(before) && !/[(,]$/.test(before) ? " " : "";
+      sql.setRangeText(pad + text, at, to, "end");
+      set("sql", sql.value); keep(); sql.focus();
+    };
+    const open = S.tblOpen && TABLES[S.tblOpen] ? S.tblOpen : null;
     sql.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); testNow(); } });
     const cmp = h("select", { class: "hl-sel", "aria-label": "Compare" }, CMPS.map((c) => h("option", { value: c, selected: c === d.cmp || null }, c)));
     cmp.addEventListener("change", () => set("cmp", cmp.value));
@@ -433,15 +471,18 @@ function mountHealth(root, ctx) {
         h("div", { class: "hl-ed-t" }, name, desc),
         h("label", { class: "hl-tog", title: d.enabled ? "On: it runs every 30 s" : "Off" },
           h("input", { type: "checkbox", checked: d.enabled || null, onchange: (e) => { set("enabled", e.target.checked); if (d.id) save({ enabled: e.target.checked }); } }), h("span", null, d.enabled ? "on" : "off"))),
+      !d.id ? h("div", { class: "hl-tpl" }, h("span", { class: "lv-sub" }, "Start from:"), TEMPLATES.map(([label, nm, q, c, t, w, sv]) =>
+        h("button", { class: "hl-tb", onclick: () => { d.sql = q; d.cmp = c; d.threshold = t; d.window_s = w; d.severity = sv; if (!d.name.trim()) d.name = nm; d.cur = null; d.dirty = true; S.result = null; render(); } }, label))) : null,
       h("div", { class: "hl-sqlw" },
         h("div", { class: "hl-sql-h" }, h("span", null, "SQL"), h("span", { class: "lv-sub" }, "returns ", h("code", { class: "lv-code" }, "entity"), " and ", h("code", { class: "lv-code" }, "v"), "; ", h("code", { class: "lv-code" }, "agent"), ", ", h("code", { class: "lv-code" }, "file"), ", ", h("code", { class: "lv-code" }, "repo"), " and ", h("code", { class: "lv-code" }, "detail"), " when it has them · ", h("code", { class: "lv-code" }, ":since"), " is now less the window")),
         sql,
-        h("div", { class: "hl-tables" }, h("span", { class: "lv-sub" }, "Tables:"), Object.entries(TABLES).map(([t, cols]) => {
-          const b = h("button", { class: "hl-tb", onclick: () => { const at = sql.selectionStart ?? sql.value.length; sql.setRangeText(t, at, sql.selectionEnd ?? at, "end"); set("sql", sql.value); sql.focus(); } }, t);
-          b.addEventListener("mousemove", (e) => tip.show([h("b", null, t), h("div", { class: "hl-tip-c" }, cols)], e.clientX, e.clientY));
-          b.addEventListener("mouseleave", () => tip.hide());
-          return b;
-        }))),
+        h("div", { class: "hl-tables" }, h("span", { class: "lv-sub" }, "Tables:"), Object.keys(TABLES).map((t) =>
+          h("button", { class: `hl-tb${open === t ? " on" : ""}`, "aria-expanded": open === t ? "true" : "false", title: `Show the columns of ${t}`, onclick: () => { S.tblOpen = open === t ? null : t; render(); } }, t))),
+        open ? h("div", { class: "hl-cols" },
+          h("span", { class: "lv-sub" }, `${open}:`),
+          h("button", { class: "hl-col tbl", title: `Put ${open} where the cursor is in the SQL`, onclick: () => insert(open) }, `+ ${open}`),
+          TABLES[open].split(", ").filter((c) => c !== "…" && !c.endsWith("…")).map((c) => h("button", { class: "hl-col", title: `Put ${c} where the cursor is in the SQL`, onclick: () => insert(c) }, c)),
+          h("span", { class: "lv-sub" }, d.cur ? "Click one to put it at the cursor." : "Click one to put it at the end of the SQL, or click in the SQL first.")) : null),
       h("div", { class: "hl-when" },
         h("span", null, "Fire for each row whose ", h("code", { class: "lv-code" }, "v"), " is"), cmp, th, h("span", null, "over the last"), win, h("span", null, "· severity"), sev),
       h("div", { class: "hl-then" }, h("span", { class: "hl-then-l" }, "Then"),
@@ -684,13 +725,14 @@ function mountHealth(root, ctx) {
     const runs = d.runs || [];
     return h("div", { class: "hl-hist" },
       t.flaky_why ? h("div", { class: "hl-why" }, h("b", null, "Flaky: "), t.flaky_why) : null,
-      stableLine(d.stable || t.stable, d),
+      stableLine(d.stable, d),
+      codesBox(d),
       rerunBox(t, d),
       h("table", { class: "hl-tbl hl-ht" },
         h("thead", null, h("tr", null, h("th", null, "When"), h("th", null, "Agent"), h("th", null, "Outcome"), h("th", { class: "num" }, "Time"), h("th", null, "Commit"), h("th", null, "Command"))),
         h("tbody", null, runs.slice(0, 30).map((r) => h("tr", null,
           h("td", null, `${fmtClock(r.ts_ms)} · ${fmtAgo(r.ts_ms)}`),
-          h("td", null, h("span", { class: "hl-ag" }, avatar(agentOf(r.agent), 14), r.by_workbench ? `Workbench, in ${nameOf(agentOf(r.agent))}'s checkout` : nameOf(agentOf(r.agent)))),
+          h("td", null, h("span", { class: "hl-ag" }, avatar(agentOf(r.agent), 14), r.by_workbench ? (r.agent ? `Workbench, in ${nameOf(agentOf(r.agent))}'s worktree` : "Workbench, in the project's checkout") : nameOf(agentOf(r.agent)))),
           h("td", null, h("span", { class: r.outcome === "failed" ? "hl-bad" : r.outcome === "passed" ? "hl-ok" : "lv-sub" }, r.outcome),
             r.fixed ? h("span", { class: "lv-sub", title: "the same agent changed the code and it passed: not counted against the pass rate" }, " · fixed in this session") : null),
           h("td", { class: "num", title: r.wait_ms ? `the command also waited ${fmtSpan(r.wait_ms)} for your permission, not counted` : "" }, r.ms == null ? "—" : fmtMs(r.ms), r.wait_ms ? h("span", { class: "lv-sub" }, ` +${fmtSpan(r.wait_ms)} wait`) : null),
@@ -698,47 +740,82 @@ function mountHealth(root, ctx) {
           h("td", null, h("code", { class: "hl-cmd" }, r.command)))))));
   }
 
-  // Stable since <commit>: N runs, 0 failures (and how likely that was if
-  // nothing had changed, for a test that was flaky).
+  // The code of its last normal run, when it never failed there: its runs
+  // on that commit only (never another commit's), against the commit it
+  // last failed on, and whether that many passes in a row tell a fix from
+  // luck. "Not enough runs yet" when they do not.
+  const sha = (c) => (c ? String(c).slice(0, 8) : "no commit");
+  const branchOf = (d, c) => { const k = (d.checkouts || []).find((x) => c && x.commit && x.commit === c); return k ? k.branch : null; };
   function stableLine(s, d) {
     if (!s || !s.runs) return null;
-    const commit = s.since_commit ? String(s.since_commit).slice(0, 8) : "the first run";
-    const dirty = s.since_tree && s.since_tree !== "clean" ? " (with uncommitted changes)" : "";
-    const parts = [h("b", null, "Stable since "), h("code", { class: "lv-code" }, commit), `${dirty}, ${fmtAgo(s.since_ms)}: ${s.runs} run${s.runs === 1 ? "" : "s"}, 0 failures`,
-      s.by_workbench ? ` (${s.by_workbench} by Run it N times)` : "", "."];
-    if (s.after_failure) parts.push(` Before that it failed ${s.failed_before} of ${s.runs_before} runs.`);
-    if (s.chance_if_unchanged != null) parts.push(` A test still failing that often would pass ${s.runs} times in a row ${pct(s.chance_if_unchanged)} of the time${s.chance_if_unchanged > 0.2 ? ": run it more before you call it fixed" : ""}.`);
-    return h("div", { class: `hl-stable${d.flaky ? " warn" : ""}` }, ...parts);
+    const dirty = s.since_tree && s.since_tree !== "clean" ? " with uncommitted changes" : "";
+    const br = branchOf(d, s.since_commit);
+    const parts = [h("b", null, "On "), h("code", { class: "lv-code" }, sha(s.since_commit)), br ? ` (${br})` : "", dirty, s.env ? ` with ${s.env}` : "",
+      `: ${s.runs} run${s.runs === 1 ? "" : "s"}, no failure`, s.by_workbench ? ` (${s.by_workbench} by Run it N times)` : "", "."];
+    let ok = false;
+    if (s.after_failure) {
+      parts.push(" On ", h("code", { class: "lv-code" }, sha(s.before_commit)), ` it failed ${s.failed_before} of ${s.runs_before} runs.`);
+      if (s.enough) { ok = true; parts.push(` A test still failing that often passes ${s.runs} times in a row less than 5% of the time: it looks fixed on ${sha(s.since_commit)}.`); }
+      else if (s.needed) parts.push(h("b", null, " Not enough runs yet"), ` to call it fixed: it needs ${s.needed} passes in a row on this code to tell it from that, and has ${s.runs}.`);
+    } else if (s.runs >= 10 && s.upper_95 != null) { ok = true; parts.push(` It fails less than ${pct(s.upper_95)} of the time on this code (95% confidence).`); }
+    else parts.push(h("b", null, " Not enough runs yet"), " to say how often it fails.");
+    return h("div", { class: `hl-stable${ok ? "" : " warn"}` }, ...parts);
   }
-  // Run it N times: the button, its progress and its result.
+  // Its runs per commit, newest first: where it passes and where it fails.
+  function codesBox(d) {
+    const codes = d.codes || [];
+    if (codes.length < 2) return null;
+    return h("ul", { class: "hl-codes" }, codes.slice(0, 6).map((c) => {
+      const br = branchOf(d, c.commit);
+      return h("li", null, h("code", { class: "lv-code" }, sha(c.commit)), br ? h("span", { class: "lv-sub" }, ` ${br}`) : null,
+        c.tree && c.tree !== "clean" ? h("span", { class: "lv-sub", title: "uncommitted changes: the hash of git diff" }, ` +${String(c.tree).slice(0, 4)}`) : null,
+        c.env ? h("span", { class: "lv-sub" }, ` with ${c.env}`) : null, " · ",
+        h("span", { class: c.failed ? "hl-bad" : "hl-ok" }, c.failed ? `${c.failed} of ${c.runs} failed` : `${c.runs} passed`),
+        c.failed && c.passed ? h("span", { class: "lv-sub" }, " · flaky here") : null,
+        h("span", { class: "lv-sub" }, ` · last ${fmtAgo(c.last_ms)}`));
+    }));
+  }
+  // Run it N times: the command for that one test (editable; no shell),
+  // the checkout it runs in, its progress and its result on that commit.
   function rerunBox(t, d) {
     const r = S.reruns.get(t.test);
     const running = r && (r.state === "running" || r.state === "starting");
     const n = h("select", { class: "hl-in hl-rn", "aria-label": "How many times", disabled: running ? true : null, onchange: (e) => { S.rerunN = Number(e.target.value); } },
       [5, 10, 20, 50].map((k) => h("option", { value: String(k), selected: S.rerunN === k ? true : null }, `${k} times`)));
+    const cos = d.checkouts || [];
+    const pick = S.rrCheckout.get(t.test) || d.checkout || (cos[0] && cos[0].id);
+    const where = h("select", { class: "hl-in hl-rco", "aria-label": "Which checkout it runs in", disabled: running ? true : null, onchange: (e) => { S.rrCheckout.set(t.test, e.target.value); } },
+      cos.map((c) => h("option", { value: c.id, selected: c.id === pick ? true : null }, `${c.label}${c.branch ? ` · ${c.branch}` : ""} · ${sha(c.commit)}${c.dirty ? " +changes" : ""}`)));
+    const cmd = h("input", { class: "hl-in hl-rcmd", "aria-label": "The command Workbench runs, without a shell", spellcheck: "false", disabled: running ? true : null,
+      value: S.rrCmd.has(t.test) ? S.rrCmd.get(t.test) : d.rerun || "", placeholder: `the command that runs ${t.test} by itself`,
+      oninput: (e) => { S.rrCmd.set(t.test, e.target.value); } });
     const last = (d.runs || [])[0];
     const ask = last && agentOf(last.agent);
-    const askBtn = ask && ask.running !== false ? h("button", { class: "btn sm ghost", onclick: async (e) => {
+    const askBtn = ask && ask.id && ask.running !== false ? h("button", { class: "btn sm ghost", onclick: async (e) => {
       const b = e.currentTarget; b.disabled = true;
-      try { await ctx.api(`/api/agents/${enc(ask.id)}/steer`, { method: "POST", body: { text: `Please run ${t.test} 10 times in a row (only that test) and tell me how many runs failed, with the output of a failure if there is one.` } }); b.textContent = `Asked ${nameOf(ask)}`; } catch (err) { b.textContent = err.message || String(err); }
+      try { await ctx.api(`/api/agents/${enc(ask.id)}/steer`, { method: "POST", body: { text: `Please run ${t.test} 10 times in a row, each run as its own command (only that test), and tell me how many runs failed, with the output of a failure if there is one.` } }); b.textContent = `Asked ${nameOf(ask)}`; } catch (err) { b.textContent = err.message || String(err); }
     } }, `Ask ${nameOf(ask)} to run it 10 times`) : null;
     let res = null;
     if (r && r.state === "failed") res = h("span", { class: "err" }, r.error || "It did not run.");
     else if (r && r.state === "starting") res = h("span", { class: "lv-sub" }, "Starting…");
     else if (r) {
       const fin = r.state !== "running";
+      const on = `${r.commit ? ` on ${sha(r.commit)}` : ""}${r.dirty ? " with uncommitted changes" : ""}${r.branch ? ` (${r.branch}, ${r.checkout_label || "its checkout"})` : r.checkout_label ? ` (${r.checkout_label})` : ""}`;
       res = h("span", { class: "hl-rr-res" },
         h("span", { class: "lv-bar hl-rr-bar" }, h("b", { style: { width: `${(r.done / r.n) * 100}%`, background: r.failed ? "var(--crit)" : "var(--good)" } })),
-        h("span", { class: r.failed ? "hl-bad" : fin ? "hl-ok" : "lv-sub" }, fin ? `${r.passed} of ${r.n} passed${r.failed ? `, ${r.failed} failed` : ""}${r.commit ? ` on ${String(r.commit).slice(0, 8)}` : ""}` : `run ${r.done + 1} of ${r.n}: ${r.passed} passed, ${r.failed} failed so far`),
-        fin && !r.failed ? h("span", { class: "lv-sub" }, r.n >= 20 ? " · stable on this code" : " · more runs make it surer") : null);
+        h("span", { class: r.failed ? "hl-bad" : fin ? "hl-ok" : "lv-sub" }, fin ? `${r.passed} of ${r.n} passed${r.failed ? `, ${r.failed} failed` : ""}${on}` : `run ${r.done + 1} of ${r.n}${on}: ${r.passed} passed, ${r.failed} failed so far`));
     }
+    const go = () => rerun(t.test, S.rerunN, { command: cmd.value.trim(), checkout: where.value || pick });
     return h("div", { class: "hl-rr" },
-      d.rerun ? [h("button", { class: "btn sm", disabled: running ? true : null, onclick: () => rerun(t.test, S.rerunN) }, running ? "Running…" : "Run it N times"), n,
-        h("code", { class: "hl-cmd hl-rr-c", title: "what Workbench runs, in the checkout of the agent that ran it last, without a shell" }, d.rerun)]
-        : [h("span", { class: "lv-sub" }, `Workbench cannot run one ${d.runner || ""} test by itself.`), askBtn],
+      h("div", { class: "hl-rr-row" }, cmd),
+      h("div", { class: "hl-rr-row" },
+        h("button", { class: "btn sm", disabled: running ? true : null, onclick: go }, running ? "Running…" : "Run it N times"), n,
+        cos.length ? [h("span", { class: "lv-sub" }, "in"), where] : null,
+        !d.rerun ? h("span", { class: "lv-sub" }, `Workbench cannot aim this ${d.runner || ""} command at one test: write it above, or`) : null,
+        !d.rerun ? askBtn : null),
+      h("div", { class: "lv-sub hl-rr-note" }, "Workbench runs it without a shell, one run after another, and records each run on the commit it ran on."),
       res);
   }
-
   function recent(cmds) {
     if (!cmds.length) return null;
     return h("section", { class: "lv-card hl-recent" },
@@ -820,6 +897,7 @@ useStyle("health", `
 .btn.warn{border-color:color-mix(in srgb,var(--warn) 55%,var(--line-2));color:var(--warn-ink);background:var(--warn-soft)}
 .hl-bt{margin:-4px 0 0;font-size:19px;font-weight:680;letter-spacing:-.01em;line-height:1.3}
 .hl-files{display:flex;gap:6px;flex-wrap:wrap;margin-top:-6px}
+.hl-where{display:flex;flex-direction:column;gap:4px;font-size:13px}
 .hl-says{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:10px;background:var(--surface-2);padding:6px 12px}
 .hl-say{display:flex;align-items:center;gap:11px;padding:7px 0}
 .hl-say+.hl-say{border-top:1px solid var(--line)}
@@ -890,8 +968,13 @@ useStyle("health", `
 .hl-sql-h>span:first-child{font-weight:700;letter-spacing:.06em;color:var(--muted);font-size:11px}
 .hl-sql{display:block;width:100%;border:0;background:none;color:var(--term-fg);font:13px/1.6 var(--mono);padding:10px 12px;resize:vertical;outline:none;tab-size:2}
 .hl-tables{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:7px 12px;border-top:1px solid var(--term-line)}
+.hl-cols{display:flex;gap:4px;align-items:center;flex-wrap:wrap;padding:6px 12px;border-top:1px solid var(--term-line)}
+.hl-col{border:1px solid var(--term-line);background:none;color:inherit;border-radius:4px;padding:1px 6px;font:12px var(--mono,monospace);cursor:pointer}
+.hl-col.tbl{font-weight:600}
+.hl-tpl{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .hl-tb{border:1px solid var(--line);background:var(--surface);color:var(--text-2);border-radius:6px;padding:1px 7px;font:11.5px var(--mono);cursor:pointer}
 .hl-tb:hover{color:var(--text);border-color:var(--line-2)}
+.hl-tb.on{color:var(--accent);border-color:var(--accent)}
 .hl-tip-c,.hl-tip-t{font:11.5px var(--mono);overflow-wrap:anywhere}
 .hl-when{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--text-2)}
 .hl-sel{border:1px solid var(--line-2);border-radius:7px;background:var(--surface);color:var(--text);font:inherit;padding:3px 6px}
@@ -977,6 +1060,12 @@ useStyle("health", `
 .hl-rr{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:13px;margin:8px 0}
 .hl-rr .hl-rn{width:auto;padding:4px 8px}
 .hl-rr-c{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hl-rr{flex-direction:column;align-items:stretch}
+.hl-rr-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.hl-rcmd{width:100%;font-family:var(--mono,monospace);font-size:12px}
+.hl-rco{width:auto;max-width:100%;padding:4px 8px}
+.hl-rr-note{font-size:12px}
+.hl-codes{list-style:none;margin:6px 0;padding:0;font-size:13px;display:flex;flex-direction:column;gap:2px}
 .hl-rr-res{display:inline-flex;align-items:center;gap:8px}
 .hl-rr-bar{width:120px}
 .hl-run{font:11px var(--mono);background:var(--surface-3);border-radius:4px;padding:1px 6px;color:var(--text-2)}
