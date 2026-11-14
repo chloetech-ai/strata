@@ -358,7 +358,11 @@ fn app_in_a_cluster() {
     let refused = call("ctx_billing=read", "remember", json!({"kind": "fact", "text": "x"}));
     assert_eq!(refused["result"]["isError"], true, "{refused}");
     assert_eq!(mcp("payroll", "ctx_billing=admin", json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})).0, 403);
-    assert_eq!(http.call("GET", &format!("{app_url}/v1/memory"), None, &[("authorization", &auth), ("x-chloedb-tables", "ctx_billing=admin")]).0, 403);
+    // The synced projects it lists are those whose tables it reads: none.
+    let (s, mem) = http.call("GET", &format!("{app_url}/v1/memory"), None, &[("authorization", &auth), ("x-chloedb-tables", "ctx_billing=admin")]);
+    assert_eq!((s, mem["projects"].as_array().map(|a| a.len())), (200, Some(0)), "{mem}");
+    // A key for operations reads no Claude Code sessions (X-F1).
+    assert_eq!(http.call("GET", &format!("{app_url}/v1/memory"), None, &[("authorization", &auth), ("x-chloedb-scope", "read"), ("x-chloedb-role", "ops")]).0, 403);
     assert_eq!(http.call("POST", &format!("{app_url}/v1/spaces"), Some(&json!({"name": "other"})), &[("authorization", &auth), ("x-chloedb-tables", "ctx_*=admin")]).0, 403);
     let (_, mine) = http.call("GET", &format!("{app_url}/v1/spaces"), None, &[("authorization", &auth), ("x-chloedb-tables", "ctx_billing=read")]);
     assert_eq!(mine["spaces"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect::<Vec<_>>(), ["billing"], "{mine}");

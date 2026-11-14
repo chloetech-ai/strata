@@ -403,7 +403,9 @@ pub fn search_with(store: &Store, query: &str, tail: Option<&Tail>, filter: &Fil
     let qterms: HashSet<String> = terms.iter().cloned().collect();
     // Envelopes a harness wrapped prompts in, stored before they were
     // cleaned off ([`crate::envelope`]), are machinery, not earlier work.
-    let useful = |r: &Record| r.tag != "uncertain" && r.tag != "superseded" && !same_question(r, &qterms) && !crate::envelope::is_envelope_record(r);
+    // A rule or decision another machine pushed waits for a person to
+    // accept that machine (`chloectx sync accept`).
+    let useful = |r: &Record| r.tag != "uncertain" && r.tag != "superseded" && !same_question(r, &qterms) && !crate::envelope::is_envelope_record(r) && !crate::sync::held_back(r);
     bm.retain(|(r, _)| useful(r));
     dv.retain(|(r, _)| useful(r));
     td.retain(|(r, _)| useful(r));
@@ -909,7 +911,7 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
     let mut section = |title: &str, recs: Vec<Record>, n: usize, keep: usize, s: &mut String, stale: &mut Vec<(Record, String)>, unshown: &mut Vec<Record>| {
         let mut lines = Vec::new();
         for r in recs {
-            if r.tag == "superseded" || r.tag == "done" || (distilled && r.tag == "cue") || crate::envelope::is_envelope_record(&r) || !seen.insert(norm(&r.text)) {
+            if r.tag == "superseded" || r.tag == "done" || (distilled && r.tag == "cue") || crate::envelope::is_envelope_record(&r) || crate::sync::held_back(&r) || !seen.insert(norm(&r.text)) {
                 continue;
             }
             let fresh = match check.as_deref_mut() {

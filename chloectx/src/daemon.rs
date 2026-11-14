@@ -214,6 +214,16 @@ pub struct Daemon {
 /// Work to do after the response is sent (so hooks return at once).
 pub type Deferred = Box<dyn FnOnce() + Send>;
 
+/// Releases a [`crate::snapshots::Snapshots::hold`] when a forget fails
+/// before it hands the hold to its compaction.
+struct Held<'a>(&'a crate::snapshots::Snapshots);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl Daemon {
     pub fn open(dir: &Path, project: &str) -> Result<Daemon> {
         let paths = StorePaths::new(dir);
@@ -221,6 +231,11 @@ impl Daemon {
         let cfg = Config::load(&paths.config);
         let embedder: Arc<dyn embed::Embedder> = Arc::from(embed::open(&cfg.embedder)?);
         let store = Arc::new(Store::open(&paths.db, embedder, StoreOptions { sync: cfg.sync, ..Default::default() })?);
+        // A forgotten record's bytes must leave the file: pages freed by a
+        // rewrite are zeroed, and so is the tail of every page written after.
+        if let Some(db) = store.db() {
+            db.storage().set_zero_page_tails(true);
+        }
         let state: State = std::fs::read_to_string(&paths.state).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let receipts = std::sync::OnceLock::new();
         if cfg.receipts.enabled || dir.join(crate::receipt::BOOK_FILE).exists() {
@@ -261,7 +276,7 @@ impl Daemon {
     /// receipts off must not keep the old ones for good.
     pub fn housekeep(&self) {
         let swept = self.snapshots.sweep();
-        let pruned = self.snapshots.prune(&self.cfg.receipts.snapshots).unwrap_or_else(|e| {
+        let pruned = self.snapshots.prune(&self.cfg.receipts.snapshots, self.store_bytes()).unwrap_or_else(|e| {
             self.log(&json!({"ts": now(), "error": e.to_string(), "event": "snapshot_prune"}));
             0
         });
@@ -276,6 +291,14 @@ impl Daemon {
         if swept + pruned + receipts > 0 {
             self.log(&json!({"ts": now(), "event": "housekeep", "snapshot_dirs_swept": swept, "snapshots_pruned": pruned, "receipts_pruned": receipts}));
         }
+    }
+
+    /// The size of the store's file and log, for the snapshots' budget.
+    fn store_bytes(&self) -> u64 {
+        self.store.db().map_or(0, |db| {
+            let fs = db.storage().file_stats();
+            fs.file_bytes + fs.wal_bytes
+        })
     }
 
     /// Whether receipts are written now.
@@ -353,7 +376,7 @@ impl Daemon {
             "timeline" => self.op_timeline(req).map(|r| (r, None)),
             "sql" => self.op_sql(req).map(|r| (r, None)),
             "remember" => self.op_remember(req).map(|r| (r, None)),
-            "forget" => self.op_forget(req).map(|r| (r, None)),
+            "forget" => self.op_forget(req),
             "find" => self.op_find(req).map(|r| (r, None)),
             "receipts_switch" => self.op_receipts_switch(req).map(|r| (r, None)),
             "redact" => self.op_redact(req).map(|r| (r, None)),
@@ -440,6 +463,26 @@ impl Daemon {
     /// `{"op": "sync", "what": "status" | "push" | "pull"}`.
     fn op_sync(&self, req: &Json) -> Result<Json> {
         let what = req.get("what").and_then(|v| v.as_str()).unwrap_or("status");
+        if what == "accept" {
+            let origins: Vec<String> = req.get("origins").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            let by = crate::sync::accept(&crate::paths::home(), &self.store, &origins)?;
+            let mut text = String::new();
+            if by.is_empty() {
+                text = "No records from other machines wait to be accepted.".into();
+            }
+            for (o, n, some) in &by {
+                let done = origins.iter().any(|x| x == "*" || x == o);
+                text += &format!("{o}: {n} record{}{}\n", if *n == 1 { "" } else { "s" }, if done { ", accepted" } else { "" });
+                for t in some {
+                    text += &format!("    {}\n", crate::envelope::defuse(t));
+                }
+            }
+            if origins.is_empty() && !by.is_empty() {
+                text += "Accept a machine's records (its rules and decisions then reach the briefing): chloectx sync accept --origin ID, or --all";
+            }
+            let me = crate::sync::origin(&crate::paths::home());
+            return Ok(json!({"text": text.trim_end(), "this_machine": me, "pending": by.iter().map(|(o, n, _)| json!({"origin": o, "records": n})).collect::<Vec<_>>()}));
+        }
         let Some(remote) = crate::sync::remote(&crate::paths::home()) else {
             return Ok(json!({"server": null, "note": "no server set up: chloectx sync setup --url URL"}));
         };
@@ -1267,9 +1310,14 @@ impl Daemon {
         if !self.keep_pending.swap(false, Ordering::AcqRel) {
             return;
         }
+        // A forget is rewriting the store: the next recall keeps one.
+        if self.snapshots.held() {
+            self.keep_pending.store(true, Ordering::Release);
+            return;
+        }
         let Some(db) = self.store.db() else { return };
         let r = &self.cfg.receipts.snapshots;
-        if let Err(e) = self.snapshots.prune(r) {
+        if let Err(e) = self.snapshots.prune(r, self.store_bytes()) {
             self.log(&json!({"ts": now(), "error": e.to_string(), "event": "snapshot_prune"}));
         }
         if !self.receipts_on() {
@@ -1542,10 +1590,9 @@ impl Daemon {
     /// After a record is forgotten or records are redacted: the receipts'
     /// copies of their text are scrubbed (whether receipts are on now or
     /// not), and the automatic snapshots, which hold the old text, are
-    /// dropped. For a forget, the store's segments that held the record
-    /// are first rewritten without it, with no snapshot being taken
-    /// meanwhile, so that no later snapshot copies its bytes. What it did,
-    /// in words.
+    /// dropped. A forget then rewrites the store's segments that held the
+    /// record ([`Daemon::compact_forgotten`]), no snapshot being taken
+    /// until it has. What it did, in words.
     fn scrub_history(&self, forgotten: Option<&crate::receipt::Forgotten>) -> String {
         let mut out = Vec::new();
         self.save_receipts();
@@ -1556,17 +1603,18 @@ impl Daemon {
                 Err(e) => out.push(format!("scrubbing the receipts failed: {e}")),
             }
         }
-        let compact = || -> Option<String> {
-            forgotten?;
-            let db = self.store.db()?;
-            match compact_deleted(db) {
-                Ok(_) => None,
-                Err(e) => Some(format!("compacting the store failed ({e}): the record's bytes stay in its file until a merge rewrites them")),
-            }
-        };
-        match self.snapshots.drop_automatic_after(compact) {
-            Ok((failed, dropped, named)) => {
-                out.extend(failed);
+        out.extend(self.drop_automatic(|| None));
+        out.join("; ")
+    }
+
+    /// Drops the automatic snapshots after `first` (run with no snapshot
+    /// being taken), in words: what `first` said, what was dropped, and
+    /// the named snapshots that still hold the old text.
+    fn drop_automatic(&self, first: impl FnOnce() -> Option<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.snapshots.drop_automatic_after(first) {
+            Ok((said, dropped, named)) => {
+                out.extend(said);
                 if dropped > 0 {
                     out.push(format!("{dropped} automatic snapshot{} dropped", if dropped == 1 { "" } else { "s" }));
                 }
@@ -1576,7 +1624,35 @@ impl Daemon {
             }
             Err(e) => out.push(format!("dropping the automatic snapshots failed: {e}")),
         }
-        out.join("; ")
+        out
+    }
+
+    /// The second half of a forget: the segments that held the forgotten
+    /// records are rewritten without them, and the file's free pages,
+    /// where their old copies were, are written with zeros
+    /// ([`compact_forgotten`]). No snapshot is taken from the forget's
+    /// start until this is done ([`crate::snapshots::Snapshots::hold`]),
+    /// which releases the hold. What went wrong, in words (empty when
+    /// nothing did).
+    fn compact_forgotten(&self, before: &SegmentsLive) -> String {
+        let said = self.drop_automatic(|| {
+            let db = self.store.db()?;
+            match compact_forgotten(db, before) {
+                Ok(c) if c.pending_bytes > 0 => Some(format!(
+                    "{} KB of the file's freed pages are still read by an open snapshot and keep their old bytes until the next forget or `chloectx redact`",
+                    c.pending_bytes.div_ceil(1024)
+                )),
+                Ok(_) => None,
+                Err(e) => Some(format!("compacting the store failed ({e}): the record's bytes stay in its file until a merge rewrites them")),
+            }
+        });
+        self.snapshots.release();
+        // What the answer said already (snapshots dropped) is no news.
+        let said: Vec<String> = said.into_iter().filter(|s| !s.contains("snapshot") || s.contains("open snapshot")).collect();
+        if !said.is_empty() {
+            self.log(&json!({"ts": now(), "event": "forget_compact", "said": said}));
+        }
+        said.join("; ")
     }
 
     fn op_timeline(&self, req: &Json) -> Result<Json> {
@@ -1626,13 +1702,23 @@ impl Daemon {
 
     /// `{"op": "forget", "id": ID}`, or `{"op": "forget", "ids": [...]}` for
     /// several at once: each record is deleted and scrubbed from the
-    /// receipts, and the automatic snapshots are dropped and the store
-    /// compacted once for all of them. Answers `deleted` and `missing`.
-    fn op_forget(&self, req: &Json) -> Result<Json> {
+    /// receipts, and the automatic snapshots are dropped; the answer
+    /// (`deleted` and `missing`) goes then, and the segments that held the
+    /// records are rewritten without them after it, once for all, with no
+    /// snapshot taken until that is done. `"wait": true` answers only once
+    /// it is (`chloectx forget`); MCP's 20 s deadline is not spent on it.
+    fn op_forget(self: &Arc<Self>, req: &Json) -> Result<(Json, Option<Deferred>)> {
         let ids: Vec<String> = match req.get("ids").and_then(|v| v.as_array()) {
             Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
             None => vec![req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()],
         };
+        let wait = req.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Which segment holds how many live rows before the deletes: those
+        // whose count falls hold the forgotten records.
+        let before = self.store.db().map(|db| segments_live(db)).unwrap_or_default();
+        // No snapshot from here until the segments are rewritten.
+        self.snapshots.hold();
+        let held = Held(&self.snapshots);
         let (mut deleted, mut missing, mut forgotten) = (Vec::new(), Vec::new(), Vec::new());
         for id in &ids {
             let rec = self.store.get(&[id.clone()])?.pop();
@@ -1644,7 +1730,7 @@ impl Daemon {
             forgotten.push(crate::receipt::Forgotten { id: id.clone(), prompt: rec.filter(|r| r.kind == Kind::Prompt).map(|r| r.text) });
         }
         // The receipts are scrubbed of each record; the automatic snapshots
-        // are dropped and the store compacted once, after the last.
+        // are dropped once, after the last.
         let mut scrubbed = Vec::new();
         if let Some((last, rest)) = forgotten.split_last() {
             if !rest.is_empty() {
@@ -1664,6 +1750,21 @@ impl Daemon {
             }
             scrubbed.push(self.scrub_history(Some(last)));
         }
+        let mut later = None;
+        if !deleted.is_empty() {
+            // The hold passes to the compaction, which releases it.
+            std::mem::forget(held);
+            let what = if deleted.len() == 1 { "the segment that held it" } else { "the segments that held them" };
+            if wait {
+                let failed = self.compact_forgotten(&before);
+                scrubbed.push(if failed.is_empty() { format!("{what} rewritten without it") } else { failed });
+            } else {
+                later = Some(self.after(move |me| {
+                    me.compact_forgotten(&before);
+                }));
+                scrubbed.push(format!("{what} being rewritten"));
+            }
+        }
         let scrubbed: Vec<String> = scrubbed.into_iter().filter(|s| !s.is_empty()).collect();
         let text = match (deleted.as_slice(), missing.as_slice()) {
             ([], [m]) => format!("No record {m}."),
@@ -1679,7 +1780,7 @@ impl Daemon {
                 t + "."
             }
         };
-        Ok(json!({"text": text, "deleted": deleted, "missing": missing}))
+        Ok((json!({"text": text, "deleted": deleted, "missing": missing}), later))
     }
 
     /// `{"op": "find", "text": TEXT}`: the records whose text or context
@@ -1976,6 +2077,9 @@ impl Daemon {
             "snapshots": {
                 "automatic": snaps.iter().filter(|k| k.auto).count(), "named": snaps.iter().filter(|k| !k.auto).count(),
                 "bytes": self.snapshots.bytes(), "retention": self.cfg.receipts.snapshots,
+                "budget": self.cfg.receipts.snapshots.budget(fs.file_bytes + fs.wal_bytes),
+                "last_copied": snaps.iter().rev().find(|k| k.auto).is_some_and(|k| k.copied),
+                "newest": snaps.iter().rev().find(|k| k.auto).map(|k| k.ts),
             },
             "total_bytes": fs.file_bytes + fs.wal_bytes + receipt_file + receipt_wal + self.snapshots.bytes(),
             // The model CLI as this daemon resolves it (its PATH is the one
@@ -2217,54 +2321,104 @@ pub fn request_running(dir: &Path, req: &Json, timeout: Duration) -> Result<Json
     try_request(&StorePaths::new(dir).socket, req, Instant::now() + timeout).map_err(|e| err(format!("daemon: {e}")))
 }
 
-/// Rewrites the store's segments that hold deleted records, without them
-/// (after a forget): the memtable is flushed, each segment with a deleted
-/// row is merged alone, and the space freed is returned to the file system.
-/// Segments with no deleted row are left alone, unlike `optimize`, which
-/// merges the whole table. The pages the old segments were on are free but
-/// keep their bytes until a later write reuses them; `chloectx redact`
-/// rewrites the whole file for that.
+/// The live rows of each on-disk segment of the store, by segment id.
+pub type SegmentsLive = std::collections::HashMap<u64, u32>;
+
+/// [`SegmentsLive`] of `db` now.
+pub fn segments_live(db: &chloedb::db::Db) -> SegmentsLive {
+    let snap = db.storage().snapshot();
+    let names: Vec<String> = snap.schemas().map(|s| s.table.clone()).collect();
+    let mut out = SegmentsLive::new();
+    for n in names {
+        if let Some(t) = snap.table(&n) {
+            out.extend(t.segments().iter().filter(|v| !v.in_memory).map(|v| (v.id, v.n_live)));
+        }
+    }
+    out
+}
+
+/// The segments a forget rewrites: those with deleted rows whose live
+/// rows fell since `before`, or that are new since (the flush of what the
+/// memtable held, a merge installed meanwhile, which kept the deleted
+/// rows' bytes). Other segments' deleted rows are older than the forget
+/// and are left to the merges that take them anyway.
+fn forgotten_segments(db: &chloedb::db::Db, before: &SegmentsLive) -> std::collections::HashSet<u64> {
+    let snap = db.storage().snapshot();
+    let names: Vec<String> = snap.schemas().map(|s| s.table.clone()).collect();
+    let mut out = std::collections::HashSet::new();
+    for n in names {
+        let Some(t) = snap.table(&n) else { continue };
+        for v in t.segments().iter().filter(|v| !v.in_memory) {
+            let deleted = (v.n_live as usize) < v.file.n_docs();
+            if deleted && before.get(&v.id).is_none_or(|&was| v.n_live < was) {
+                out.insert(v.id);
+            }
+        }
+    }
+    out
+}
+
+/// What [`compact_forgotten`] did.
+#[derive(Debug, Default)]
+pub struct Compacted {
+    pub merge: chloedb::storage::MergeStats,
+    /// Freed bytes written with zeros.
+    pub zeroed_bytes: u64,
+    /// Freed bytes an open snapshot still reads, left as they were.
+    pub pending_bytes: u64,
+}
+
+/// After records were deleted (a forget): rewrites the segments that held
+/// them, and no others ([`forgotten_segments`]), so that no later
+/// checkpoint (a kept snapshot) copies their bytes, then writes zeros over
+/// the file's free pages, where the old segments were
+/// ([`chloedb::storage::Database::zero_free_pages`]). The cost is the
+/// size of those segments and of the free pages, not of the file.
 ///
-/// The store's background merger is woken by the flush and may claim the
-/// segment that held the record; a merge here leaves the segments another
+/// The store's background merger is woken by the flush and may claim a
+/// segment that held a record; a merge here leaves the segments another
 /// one holds alone, and until that merge is installed the old segment,
 /// record and all, is the one a checkpoint copies. So this returns only
-/// once no merge is running and none is left to do: a merge claimed after
-/// the delete rebuilds the segment from its live rows, without the record.
-pub fn compact_deleted(db: &chloedb::db::Db) -> Result<chloedb::storage::MergeStats> {
+/// once no merge is running and no such segment is left: a merge
+/// installed meanwhile wrote a new segment that still holds the record,
+/// marked deleted, which is then rewritten too.
+pub fn compact_forgotten(db: &chloedb::db::Db, before: &SegmentsLive) -> Result<Compacted> {
     let wait = Duration::from_secs(60);
     let s = db.storage();
     s.flush()?;
     let policy = chloedb::storage::MergePolicy { merge_factor: 1 << 40, max_deleted_ratio: 0.0, ..Default::default() };
     let deadline = Instant::now() + wait;
-    let idle = || -> Result<()> {
+    let mut out = Compacted::default();
+    loop {
         while s.merge_status().running > 0 {
             if Instant::now() >= deadline {
                 return Err(err(format!("a background merge still holds the store's segments after {} s", wait.as_secs())));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Ok(())
-    };
-    let mut stats = chloedb::storage::MergeStats::default();
-    loop {
-        idle()?;
-        let m = s.merge(&policy)?;
-        let done = m.merges == 0;
-        stats.merges += m.merges;
-        stats.segments_in += m.segments_in;
-        stats.docs_merged += m.docs_merged;
-        stats.docs_dropped += m.docs_dropped;
-        stats.bytes_written += m.bytes_written;
-        stats.seconds += m.seconds;
-        // Nothing left to merge, and no merge started meanwhile on a
-        // segment this one then skipped.
-        if done && s.merge_status().running == 0 {
-            break;
+        let targets = forgotten_segments(db, before);
+        if targets.is_empty() {
+            // And no merge started meanwhile on one of them.
+            if s.merge_status().running == 0 {
+                break;
+            }
+            continue;
+        }
+        let m = s.merge_only(&policy, &|id| targets.contains(&id))?;
+        out.merge.merges += m.merges;
+        out.merge.segments_in += m.segments_in;
+        out.merge.docs_merged += m.docs_merged;
+        out.merge.docs_dropped += m.docs_dropped;
+        out.merge.bytes_written += m.bytes_written;
+        out.merge.seconds += m.seconds;
+        if Instant::now() >= deadline {
+            return Err(err(format!("the segments that held the record were not all rewritten within {} s", wait.as_secs())));
         }
     }
-    s.vacuum()?;
-    Ok(stats)
+    let z = s.zero_free_pages()?;
+    out.zeroed_bytes = z.zeroed_bytes;
+    out.pending_bytes = z.pending_bytes;
+    Ok(out)
 }
 
 /// Replaces the store's file with a fresh copy of its live rows, after a

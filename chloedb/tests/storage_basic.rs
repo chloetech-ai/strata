@@ -342,6 +342,71 @@ fn vacuum_returns_space_and_spares_snapshots() {
     db.check().unwrap();
 }
 
+/// A forget's merge: only the segments named are rewritten, and the pages
+/// the old ones freed are written with zeros, so the deleted document's
+/// bytes are in no page of the file (nor in the tail of a page a later
+/// manifest reused); another segment's deleted document, not named, stays
+/// until a merge takes it.
+#[test]
+fn merge_only_rewrites_the_segments_named_and_free_pages_are_zeroed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.strata");
+    let src = Arc::new(MapSource::default());
+    let db = Database::create(&path, schema(), opts(&src)).unwrap();
+    for r in 0..3u64 {
+        let mut tx = db.begin().unwrap();
+        for i in r * 100..r * 100 + 100 {
+            let d = doc(i, 0);
+            src.put(&d);
+            tx.insert(d).unwrap();
+        }
+        tx.commit().unwrap();
+        db.flush().unwrap();
+    }
+    let ids: Vec<u64> = db.snapshot().segments().iter().map(|v| v.id).collect();
+    assert_eq!(ids.len(), 3);
+    let mut tx = db.begin().unwrap();
+    assert!(tx.delete(&Value::Str(key(10))).unwrap());
+    assert!(tx.delete(&Value::Str(key(250))).unwrap());
+    tx.commit().unwrap();
+    db.flush().unwrap();
+    let file_has = |s: &str| std::fs::read(&path).unwrap().windows(s.len()).any(|w| w == s.as_bytes());
+    let policy = MergePolicy { merge_factor: 1 << 40, max_deleted_ratio: 0.0, ..MergePolicy::default() };
+    let stats = db.merge_only(&policy, &|id| id == ids[2]).unwrap();
+    assert_eq!((stats.merges, stats.docs_dropped), (1, 1), "{stats:?}");
+    let now: Vec<u64> = db.snapshot().segments().iter().map(|v| v.id).collect();
+    assert!(now.contains(&ids[0]) && now.contains(&ids[1]) && !now.contains(&ids[2]), "{ids:?} -> {now:?}");
+    let z = db.zero_free_pages().unwrap();
+    assert!(z.zeroed_bytes > 0 && z.pending_bytes == 0, "{z:?}");
+    // Keys are stored as they are (texts compressed).
+    assert!(!file_has(&key(250)), "the rewritten segment's old pages still hold the deleted document");
+    assert!(file_has(&key(10)), "the segment not named was rewritten");
+    let mut want = keys(0..300);
+    want.remove(&key(10));
+    want.remove(&key(250));
+    assert_keys(&db.snapshot(), &want);
+    db.check().unwrap();
+    // A snapshot held: the pages it reads are left, and counted.
+    let mut tx = db.begin().unwrap();
+    assert!(tx.delete(&Value::Str(key(150))).unwrap());
+    tx.commit().unwrap();
+    db.flush().unwrap();
+    let held = db.snapshot();
+    db.merge_only(&policy, &|id| id == ids[1]).unwrap();
+    assert!(db.zero_free_pages().unwrap().pending_bytes > 0);
+    assert_keys(&held, &{
+        let mut w = want.clone();
+        w.remove(&key(150));
+        w
+    });
+    drop(held);
+    assert_eq!(db.zero_free_pages().unwrap().pending_bytes, 0);
+    assert!(!file_has(&key(150)));
+    drop(db);
+    let db = Database::open(&path, opts(&src)).unwrap();
+    db.check().unwrap();
+}
+
 #[test]
 fn merge_with_document_source() {
     let dir = tempfile::tempdir().unwrap();

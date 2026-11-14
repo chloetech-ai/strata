@@ -192,8 +192,9 @@ pub fn grants(app: &str) -> &'static [(&'static str, crate::keys::Scope)] {
         "crawler" => &[("crawl_*", Admin)],
         // Sheets opens any table as a live sheet.
         "sheets" => &[("sheets_*", Admin), ("*", Read)],
-        // The Inspector reads what chloectx sync copied.
-        "chloectx" => &[("ctx_*", Admin), ("chloectx_memory", Read)],
+        // The Inspector reads what chloectx sync copied: a table per
+        // project, and the one projects shared before 0.3.4.
+        "chloectx" => &[("ctx_*", Admin), ("chloectx_memory", Read), ("chloectx_mem_*", Read)],
         _ => &[],
     }
 }

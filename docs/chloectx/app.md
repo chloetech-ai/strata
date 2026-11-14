@@ -5,7 +5,7 @@
 Its first page lists every memory it can read, as *spaces* to pick from, and a space opens on what it knows now:
 
 - **Team spaces.** Memory that any agent writes notes and conversations to and asks for context before a task, within a token budget: a table of the cluster each. An answer is found by search alone (BM25 and vectors, no model call), and it says what went in, why, and what was left out.
-- **Claude Code projects.** What Claude Code sessions remembered: a project `chloectx sync` copied into the cluster (table `chloectx_memory`), and, with `--local-stores`, the stores of the machine the app runs on, where Receipts, Blame and capsules are too ([Receipts and blame](receipts.md#in-the-command-center)). A store and its synced copy show as one project.
+- **Claude Code projects.** What Claude Code sessions remembered: a project `chloectx sync` copied into the cluster (a table per project, `chloectx_mem_<project>`; `chloectx_memory` for one synced before 0.3.4), and, with `--local-stores`, the stores of the machine the app runs on, where Receipts, Blame and capsules are too ([Receipts and blame](receipts.md#in-the-command-center)). A store and its synced copy show as one project.
 - **Seen before**, a page of its own: the cluster's firing alerts, each beside the past incidents it looks like and the fix that worked. One button hands the alert to the cluster's on-call agent with those incidents as its context.
 
 ![A team space's Ask tab: the question "Who approves a refund of 1,200 EUR?", answered first by the current refund decision with the 500 EUR version it replaced struck through, then the notes that also bear on it, the past conversations folded, and the context's size](../assets/img/chloectx-app-context.png)
@@ -14,7 +14,7 @@ Its first page lists every memory it can read, as *spaces* to pick from, and a s
 
 ## Start it
 
-A chloedb-server with `chloectx` installed beside it (in the same directory, as an install puts them) starts it by itself, with a token and a key of its own ([apps the server starts](../chloedb/server.md#apps-the-server-starts)); its key may make and write `ctx_*` tables and read `chloectx_memory`, so the on-call hand-off of Seen before, which needs an admin key, is refused there. Started by hand:
+A chloedb-server with `chloectx` installed beside it (in the same directory, as an install puts them) starts it by itself, with a token and a key of its own ([apps the server starts](../chloedb/server.md#apps-the-server-starts)); its key may make and write `ctx_*` tables and read `chloectx_mem_*` and `chloectx_memory`, so the on-call hand-off of Seen before, which needs an admin key, is refused there. Started by hand:
 
 ```bash
 cd chloectx && cargo build --release
@@ -109,7 +109,7 @@ A space's page in the command center has a **Connect Claude Code** card that mak
 
 ### Keys limited to tables
 
-chloedb-server lets a key limited to tables call the app, because the app's manifest says `"limited_keys": true`: it tells the app the key's grants (`x-chloedb-tables`), and the app, which writes with a key of its own, holds the caller to them: a space is its table `ctx_<space>` (read to read and ask it, MCP included, write to add, replace or retire notes and hand over exchanges), the incidents are `ctx_incidents` (read, write to record or draft), the Claude Code projects read `chloectx_memory`. Creating a space and building apps from one take an unlimited admin's key, and no limited key reads the machine's local stores (Receipts, Blame). `GET /v1/spaces` lists the spaces the key may read. A caller with no such header (an admin's key, the server's token) is not limited.
+chloedb-server lets a key limited to tables call the app, because the app's manifest says `"limited_keys": true`: it tells the app the key's grants (`x-chloedb-tables`), and the app, which writes with a key of its own, holds the caller to them: a space is its table `ctx_<space>` (read to read and ask it, MCP included, write to add, replace or retire notes and hand over exchanges), the incidents are `ctx_incidents` (read, write to record or draft), a Claude Code project is read from its table (`chloectx_mem_<project>`, or `chloectx_memory` for one synced before 0.3.4), and `GET /v1/memory` lists the projects whose tables the key reads. A key for operations (role `propose` or `ops`, which the server says in `x-chloedb-role`) reads no Claude Code project and no local store: those are people's sessions. Creating a space and building apps from one take an unlimited admin's key, and no limited key reads the machine's local stores (Receipts, Blame). `GET /v1/spaces` lists the spaces the key may read. A caller with no such header (an admin's key, the server's token) is not limited.
 
 ## Spaces and what each shows
 
@@ -125,7 +125,7 @@ chloedb-server lets a key limited to tables call the app, because the app's mani
 
 The older links (`#/app/chloectx/inspector/<project>`, `…/receipts/<store>`, `…/blame/<store>`) open the same space's tab.
 
-Until a project is synced, the projects group offers a setup instead: a button (for an admin) makes the table `chloectx_memory` and a key that may write only it, and shows the `chloectx sync setup` command with the key filled in; `sync` needs ChloeCtx 0.2.0 or later. A project is its git repository, so every checkout shares one memory ([keep the memory on a ChloeDB server](setup.md#keep-the-memory-on-a-chloedb-server)).
+Until a project is synced, the projects group offers a setup instead: given the project (`owner/name`) and the machine, a button (for an admin) makes the project's table and a key that may read and write only it, named for the machine, and shows the `chloectx sync setup` command with the key filled in. One key per project and machine: a key of one project reads no other's sessions, and a key revoked stops one machine. Rules and decisions one machine sends reach another's sessions once someone there accepts it (`chloectx sync accept`). This needs ChloeCtx 0.3.4 or later; an older one syncs every project into `chloectx_memory`. `GET /v1/memory/table?project=` answers the table's name and CREATE TABLE. A project is its git repository, so every checkout shares one memory ([keep the memory on a ChloeDB server](setup.md#keep-the-memory-on-a-chloedb-server)).
 
 What the tabs read, beside the space calls above:
 

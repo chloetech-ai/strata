@@ -309,7 +309,7 @@
                         "x-kubernetes-preserve-unknown-fields": true
                       },
                       "tables": {
-                        "description": "The tables the app's own key may touch, as table=scope (a name, a prefix and *, or *; read, write or admin). Default: ctx_*=admin, chloectx_memory=read.",
+                        "description": "The tables the app's own key may touch, as table=scope (a name, a prefix and *, or *; read, write or admin). Default: ctx_*=admin, chloectx_memory=read, chloectx_mem_*=read.",
                         "items": {
                           "type": "string"
                         },

@@ -386,6 +386,14 @@ pub fn caller_headers(who: &crate::keys::Principal) -> Vec<(&'static str, String
     if let Some(t) = &who.tables {
         out.push(("x-chloedb-tables", t.iter().map(|g| format!("{}={}", g.table, g.scope.name())).collect::<Vec<_>>().join(",")));
     }
+    // A key for operations reads tables as a read key does; an app may hold
+    // it to less (ChloeCtx keeps sessions' transcripts from it).
+    if let Some(r) = who.role {
+        out.push(("x-chloedb-role", match r {
+            crate::keys::Role::Propose => "propose",
+            crate::keys::Role::Ops => "ops",
+        }.to_string()));
+    }
     out
 }
 
@@ -444,6 +452,9 @@ mod caller_tests {
         assert!(h.contains(&("x-chloedb-principal", "ana?x".into())));
         assert!(h.contains(&("x-chloedb-scope", "write".into())) && h.contains(&("x-chloedb-key", "0a1b".into())));
         assert!(h.contains(&("x-chloedb-tables", "sheets_*=write".into())));
+        assert!(!h.iter().any(|(k, _)| *k == "x-chloedb-role"));
+        let ops = Principal { role: Some(crate::keys::Role::Ops), ..p.clone() };
+        assert!(caller_headers(&ops).contains(&("x-chloedb-role", "ops".into())));
         assert_eq!(caller_headers(&Principal::open()).len(), 2);
     }
 }

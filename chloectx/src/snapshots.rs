@@ -48,6 +48,14 @@ pub struct Kept {
     /// Kept automatically after a recall (pruned), or by name (kept).
     pub auto: bool,
     pub records: u64,
+    /// Bytes the snapshot wrote (segments linked from the one before it
+    /// are not counted): about the store's size when it linked nothing.
+    #[serde(default)]
+    pub bytes_written: u64,
+    /// It had one before it to link from but linked none of its segments
+    /// (a file system without hard links copies the whole store each time).
+    #[serde(default)]
+    pub copied: bool,
 }
 
 /// How long automatic snapshots are kept.
@@ -66,11 +74,38 @@ pub struct Retention {
     pub keep_days: i64,
     /// At most this many automatic snapshots (the oldest go first).
     pub max_auto: usize,
+    /// Automatic snapshots older than this many days are thinned to one a
+    /// day (the last of each day, UTC); 0 keeps them all.
+    pub daily_after_days: i64,
+    /// The most bytes the snapshots take, as a multiple of the store's
+    /// file (each file counted once, however many snapshots link it): past
+    /// it, the oldest automatic snapshots go, though never the newest
+    /// one. 0 sets no budget. Hourly snapshots of a store in use took
+    /// about 3 times the store after a week with no budget.
+    pub budget_store_ratio: f64,
+    /// A budget in bytes, in place of the ratio (0: the ratio's, and at
+    /// least [`MIN_BUDGET`]).
+    pub max_bytes: u64,
 }
+
+/// The least a budget from [`Retention::budget_store_ratio`] allows, so
+/// that a small store keeps a few snapshots.
+pub const MIN_BUDGET: u64 = 32 << 20;
 
 impl Default for Retention {
     fn default() -> Self {
-        Retention { after_recall: true, min_interval_secs: 3600, keep_days: 30, max_auto: 2000 }
+        Retention { after_recall: true, min_interval_secs: 3600, keep_days: 30, max_auto: 2000, daily_after_days: 3, budget_store_ratio: 1.0, max_bytes: 0 }
+    }
+}
+
+impl Retention {
+    /// The snapshots' budget in bytes for a store of `store_bytes`, or
+    /// `None` for no budget.
+    pub fn budget(&self, store_bytes: u64) -> Option<u64> {
+        if self.max_bytes > 0 {
+            return Some(self.max_bytes);
+        }
+        (self.budget_store_ratio > 0.0).then(|| ((store_bytes as f64 * self.budget_store_ratio) as u64).max(MIN_BUDGET))
     }
 }
 
@@ -78,6 +113,8 @@ impl Default for Retention {
 pub struct Snapshots {
     dir: PathBuf,
     lock: Mutex<()>,
+    /// Forgets whose segments are not rewritten yet ([`Snapshots::hold`]).
+    holds: std::sync::atomic::AtomicUsize,
 }
 
 /// A name a person gives a snapshot: letters, digits, `.`, `_` and `-`,
@@ -89,7 +126,31 @@ pub fn valid_name(name: &str) -> bool {
 impl Snapshots {
     /// The snapshots of the store in `store_dir`.
     pub fn new(store_dir: &Path) -> Snapshots {
-        Snapshots { dir: store_dir.join("snapshots"), lock: Mutex::new(()) }
+        Snapshots { dir: store_dir.join("snapshots"), lock: Mutex::new(()), holds: Default::default() }
+    }
+
+    /// No snapshot is taken until [`Snapshots::release`]: a forget holds
+    /// them from its delete until the segments that held the record are
+    /// rewritten, which happens after its answer, so that none copies the
+    /// record's bytes meanwhile.
+    pub fn hold(&self) {
+        self.holds.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub fn release(&self) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut n = self.holds.load(Acquire);
+        while n > 0 {
+            match self.holds.compare_exchange_weak(n, n - 1, AcqRel, Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// Whether a forget holds snapshots off now.
+    pub fn held(&self) -> bool {
+        self.holds.load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
     fn index_path(&self) -> PathBuf {
@@ -144,6 +205,9 @@ impl Snapshots {
     /// `min_interval` of the last automatic one.
     pub fn keep(&self, db: &Db, name: Option<&str>, r: &Retention) -> Result<Kept> {
         let _g = self.lock.lock().unwrap();
+        if self.held() {
+            return Err(err("a forget is rewriting the store's segments: no snapshot until it is done; try again in a moment"));
+        }
         crate::paths::create_private_dir(&self.dir)?;
         let mut all = self.list();
         let auto = name.is_none();
@@ -177,21 +241,52 @@ impl Snapshots {
         // write that committed after `at` was read is in the copy, so a
         // receipt read at `at` would not replay on it exactly.
         let at = if stats.source_txn > 0 { stats.source_txn } else { at };
-        let k = Kept { name, txn: stats.txn, at, ts: now(), auto, records: stats.live_docs };
+        let copied = link_from.is_some() && stats.segments > 0 && stats.segments_linked == 0;
+        let k = Kept { name, txn: stats.txn, at, ts: now(), auto, records: stats.live_docs, bytes_written: stats.bytes_written, copied };
         all.push(k.clone());
         self.write_index(&all)?;
         Ok(k)
     }
 
-    /// Drops the automatic snapshots past their retention.
-    pub fn prune(&self, r: &Retention) -> Result<usize> {
+    /// Drops the automatic snapshots past their retention: older than
+    /// `keep_days`, past `max_auto`, all but the last of each day once
+    /// older than `daily_after_days`, then the oldest while the snapshots
+    /// take more than the budget for a store of `store_bytes`
+    /// ([`Retention::budget`]), keeping the newest. Named snapshots are
+    /// kept, and count toward the budget.
+    pub fn prune(&self, r: &Retention, store_bytes: u64) -> Result<usize> {
         let _g = self.lock.lock().unwrap();
         let all = self.list();
         let autos: Vec<&Kept> = all.iter().filter(|k| k.auto).collect();
         let over = autos.len().saturating_sub(r.max_auto);
-        let old = now() - r.keep_days.max(0) * 86_400;
-        let gone: Vec<String> = autos.iter().enumerate().filter(|(i, k)| *i < over || k.ts < old).map(|(_, k)| k.name.clone()).collect();
-        self.remove(all, &gone)
+        let t = now();
+        let old = t - r.keep_days.max(0) * 86_400;
+        let mut gone: Vec<String> = autos.iter().enumerate().filter(|(i, k)| *i < over || k.ts < old).map(|(_, k)| k.name.clone()).collect();
+        // One a day past `daily_after_days`: the last of each day (they are
+        // listed oldest first, so a later one of the same day replaces it).
+        if r.daily_after_days > 0 {
+            let thin = t - r.daily_after_days * 86_400;
+            let mut last_of_day: std::collections::HashMap<i64, &str> = Default::default();
+            let mut thinned = Vec::new();
+            for k in autos.iter().filter(|k| k.ts < thin && !gone.contains(&k.name)) {
+                if let Some(prev) = last_of_day.insert(k.ts.div_euclid(86_400), &k.name) {
+                    thinned.push(prev.to_string());
+                }
+            }
+            gone.extend(thinned);
+        }
+        let mut n = self.remove(all, &gone)?;
+        if let Some(budget) = r.budget(store_bytes) {
+            loop {
+                let all = self.list();
+                let autos: Vec<String> = all.iter().filter(|k| k.auto).map(|k| k.name.clone()).collect();
+                if autos.len() <= 1 || self.bytes() <= budget {
+                    break;
+                }
+                n += self.remove(all, &autos[..1])?;
+            }
+        }
+        Ok(n)
     }
 
     /// Removes snapshots: the index first, then their directories, so that
@@ -297,5 +392,72 @@ impl Snapshots {
     /// Opens a kept snapshot to read.
     pub fn open(&self, k: &Kept, embedder: Arc<dyn Embedder>) -> Result<Store> {
         Store::open_read_only(&self.dir.join(&k.name), embedder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot `name` taken `age` seconds ago holding `bytes` bytes.
+    fn fake(s: &Snapshots, name: &str, age: i64, bytes: usize, auto: bool) -> Kept {
+        let d = s.dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("seg"), vec![7u8; bytes]).unwrap();
+        Kept { name: name.into(), txn: 1, at: 1, ts: now() - age, auto, records: 1, bytes_written: bytes as u64, copied: false }
+    }
+
+    #[test]
+    fn old_snapshots_thin_to_one_a_day_and_all_keep_to_a_budget() {
+        // X-F3: hourly snapshots took about 3 times the store after a
+        // week, with no cap in bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Snapshots::new(dir.path());
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let day = 86_400;
+        let mut all = Vec::new();
+        // Five days of hourly snapshots, ten an (8-hour) day, 1 KB each.
+        for d in 0..5 {
+            for h in 0..10 {
+                // From the newest day back; within a day, an hour apart.
+                let age = d * day + (10 - h) * 3600 + 60;
+                all.push(fake(&s, &format!("auto-{d}-{h}"), age, 1024, true));
+            }
+        }
+        all.push(fake(&s, "release", 6 * day, 1024, false));
+        all.sort_by_key(|k| k.ts);
+        s.write_index(&all).unwrap();
+        let r = Retention { budget_store_ratio: 0.0, ..Retention::default() };
+        s.prune(&r, 0).unwrap();
+        let left = s.list();
+        // Days 3 and 4 (older than 3 days) keep one each; days 0..=2 all ten;
+        // the named one stays.
+        let autos: Vec<&Kept> = left.iter().filter(|k| k.auto).collect();
+        let by_day = |d: i64| autos.iter().filter(|k| k.name.starts_with(&format!("auto-{d}-"))).count();
+        let days: Vec<usize> = (0..5).map(by_day).collect();
+        assert_eq!(&days[..3], &[10, 10, 10], "{days:?}");
+        // The older two span 33 hours: two or three UTC days, one each.
+        assert!((2..=3).contains(&(days[3] + days[4])), "{days:?}");
+        assert!(left.iter().any(|k| k.name == "release"));
+        // A budget of 8 KB: the oldest automatic ones go, never the newest,
+        // and the named one is kept (and counted).
+        let r = Retention { max_bytes: 8 * 1024, ..Retention::default() };
+        s.prune(&r, 0).unwrap();
+        assert!(s.bytes() <= 8 * 1024 + 512, "{}", s.bytes());
+        let left = s.list();
+        assert!(left.iter().any(|k| k.name == "release") && left.iter().any(|k| k.name == "auto-0-9"), "{:?}", left.iter().map(|k| &k.name).collect::<Vec<_>>());
+        // Past the budget with one automatic snapshot left: it stays.
+        let r = Retention { max_bytes: 1, ..Retention::default() };
+        s.prune(&r, 0).unwrap();
+        assert_eq!(s.list().iter().filter(|k| k.auto).count(), 1);
+    }
+
+    #[test]
+    fn the_budget_follows_the_store() {
+        let r = Retention::default();
+        assert_eq!(r.budget(1 << 30), Some(1 << 30));
+        assert_eq!(r.budget(1 << 10), Some(MIN_BUDGET));
+        assert_eq!(Retention { budget_store_ratio: 0.0, ..r.clone() }.budget(1 << 30), None);
+        assert_eq!(Retention { max_bytes: 5, ..r }.budget(1 << 30), Some(5));
     }
 }

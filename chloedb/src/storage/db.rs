@@ -310,6 +310,16 @@ pub struct CheckpointStats {
     pub seconds: f64,
 }
 
+/// What [`Database::zero_free_pages`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FreeZeroed {
+    /// Free pages written with zeros, in bytes.
+    pub zeroed_bytes: u64,
+    /// Freed pages left as they were, because a live snapshot could still
+    /// read them, in bytes: a later call zeros them once it is gone.
+    pub pending_bytes: u64,
+}
+
 /// Space use of the file and the WAL.
 #[derive(Clone, Debug, Serialize)]
 pub struct FileStats {
@@ -413,6 +423,11 @@ pub struct Database {
     /// it ([`Database::try_writer`]).
     background_waiting: AtomicUsize,
     background_holding: AtomicUsize,
+    /// Extents written in the one file zero the rest of their last page
+    /// ([`Database::set_zero_page_tails`]); `zeroing` counts calls of
+    /// [`Database::zero_free_pages`] running, which do too.
+    zero_tails: AtomicBool,
+    zeroing: AtomicUsize,
     /// Told the term and number of each numbered transaction once it is
     /// committed ([`Database::on_commit`]).
     commit_hook: RwLock<Option<CommitHook>>,
@@ -603,6 +618,22 @@ impl std::io::Write for ImageOut<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.drain()
     }
+}
+
+/// Writes zeros from `end` to the end of its page in `file`, past the
+/// last byte of an extent written in the database's one file: the page
+/// may be reused, and what an older extent left past the new one's end
+/// (a forgotten record's segment, under a manifest written there) would
+/// otherwise stay in the file ([`Database::zero_free_pages`]). Nothing
+/// reads those bytes. Only when [`Database::set_zero_page_tails`] is on,
+/// or while `zero_free_pages` runs: otherwise the file's bytes are what
+/// they were (the format fixtures compare them byte for byte).
+fn zero_page_tail(file: &File, end: u64) -> std::io::Result<()> {
+    let tail = (PAGE - end % PAGE) % PAGE;
+    if tail == 0 {
+        return Ok(());
+    }
+    io::write_at(file, &vec![0u8; tail as usize], end)
 }
 
 /// The background merger's settings and wake-ups ([`Database::spawn_merger`]).
@@ -1120,6 +1151,8 @@ impl Database {
             flusher: Mutex::new(None),
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
+            zero_tails: AtomicBool::new(false),
+            zeroing: AtomicUsize::new(0),
             commit_hook: RwLock::new(None),
             feeds: RwLock::new(Arc::new(Vec::new())),
             codebooks: RwLock::new(Vec::new()),
@@ -1484,6 +1517,8 @@ impl Database {
             flusher: Mutex::new(None),
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
+            zero_tails: AtomicBool::new(false),
+            zeroing: AtomicUsize::new(0),
             commit_hook: RwLock::new(None),
             feeds: RwLock::new(Arc::new(Vec::new())),
             codebooks: RwLock::new(Vec::new()),
@@ -3080,7 +3115,22 @@ impl Database {
     /// written and before it is installed; the merge is given up when it
     /// returns false (tests write, check and fail there).
     #[doc(hidden)]
-    pub fn merge_with(&self, policy: &MergePolicy, mut between: impl FnMut() -> bool) -> Result<MergeStats> {
+    pub fn merge_with(&self, policy: &MergePolicy, between: impl FnMut() -> bool) -> Result<MergeStats> {
+        self.merge_within(policy, None, between)
+    }
+
+    /// [`Database::merge`] of only the segments `only` says yes to (by
+    /// segment id, [`SegmentView::id`]): those of the rows a forget
+    /// deleted, rewritten alone without them (with
+    /// `max_deleted_ratio: 0.0` and a `merge_factor` no tier reaches),
+    /// rather than every segment with any deleted row. The others are
+    /// left as they are, so the cost is the size of those segments, not of
+    /// the table.
+    pub fn merge_only(&self, policy: &MergePolicy, only: &dyn Fn(u64) -> bool) -> Result<MergeStats> {
+        self.merge_within(policy, Some(only), || true)
+    }
+
+    fn merge_within(&self, policy: &MergePolicy, only: Option<&dyn Fn(u64) -> bool>, mut between: impl FnMut() -> bool) -> Result<MergeStats> {
         let source = self.opts.doc_source.clone().ok_or_else(|| Error::Schema("merging needs DbOptions::doc_source".into()))?;
         // A database that cannot commit would build the merged segment
         // only to throw it away.
@@ -3096,7 +3146,7 @@ impl Database {
             let mut rounds = 2 * n + 1;
             while rounds > 0 {
                 rounds -= 1;
-                let Some(claim) = self.claim_merge(table, policy, None) else { break };
+                let Some(claim) = self.claim_merge(table, policy, None, only) else { break };
                 self.merge_group(&claim, source.as_ref(), pacer, &mut between, &mut stats)?;
             }
         }
@@ -3188,14 +3238,14 @@ impl Database {
         }
         let tables: Vec<u32> = lock(&self.state).tables.iter().map(|t| t.id).collect();
         let first = m.next_table.fetch_add(1, Ordering::Relaxed);
-        (0..tables.len()).find_map(|i| self.claim_merge(tables[(first + i) % tables.len()], &m.policy, m.budget))
+        (0..tables.len()).find_map(|i| self.claim_merge(tables[(first + i) % tables.len()], &m.policy, m.budget, None))
     }
 
     /// Claims the next group of `table`'s segments that `policy` selects
     /// among those no running merge holds, cut to fit what is left of
     /// `budget` and the record of interrupted merges ([`MergeRecord`]).
     /// The merge is recorded as running until the claim is dropped.
-    fn claim_merge(&self, table: u32, policy: &MergePolicy, budget: Option<u64>) -> Option<MergeClaim<'_>> {
+    fn claim_merge(&self, table: u32, policy: &MergePolicy, budget: Option<u64>, only: Option<&dyn Fn(u64) -> bool>) -> Option<MergeClaim<'_>> {
         // The snapshot is taken under the lock that claims are given up
         // under: a merge installed (and its claim given up) after a snapshot
         // taken before the lock would leave its inputs, gone by then, to
@@ -3235,7 +3285,7 @@ impl Database {
             f.extend(lock(&self.offloading).iter().copied());
             f
         };
-        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id) || frozen.contains(&id), cap, threads, spill);
+        let (group, cut) = policy.select_within(&infos, |id| m.claimed(id) || frozen.contains(&id) || only.is_some_and(|f| !f(id)), cap, threads, spill);
         let mut group = group?;
         let memory = merge_memory(&infos.iter().filter(|s| group.contains(&s.id)).copied().collect::<Vec<_>>(), threads, spill);
         // It fits the budget alone: it waits for running merges to finish.
@@ -3602,6 +3652,9 @@ impl Database {
             let mut out = ImageOut { file: f, at: base, buf: Vec::with_capacity(IMAGE_CHUNK), pacer, crc: crc32fast::Hasher::new() };
             sections.write_to(&mut out)?;
             out.drain()?;
+            if self.dir.is_none() && self.zeroes_tails() {
+                zero_page_tail(f, out.at)?;
+            }
             match self.dir {
                 // The database's one file, shared with every other writer:
                 // a failed sync poisons the handle, as in a commit.
@@ -3894,6 +3947,82 @@ impl Database {
             idle = if moved > 0 || shrank || wait > 0 { 0 } else { idle + 1 };
         }
         Ok(before.saturating_sub(lock(&self.state).meta.page_count) * PAGE)
+    }
+
+    /// Makes every extent written in the database's one file write zeros
+    /// over the rest of its last page (off by default): a page freed by a
+    /// rewrite and reused by a smaller extent (a manifest) keeps no bytes
+    /// of what it held. A store that forgets what it held turns it on
+    /// ([`Database::zero_free_pages`] turns it on while it runs). Costs a
+    /// write of at most a page per extent; nothing in the format changes.
+    pub fn set_zero_page_tails(&self, on: bool) {
+        self.zero_tails.store(on, Ordering::Release);
+    }
+
+    fn zeroes_tails(&self) -> bool {
+        self.zero_tails.load(Ordering::Acquire) || self.zeroing.load(Ordering::Acquire) > 0
+    }
+
+    /// Writes zeros over the file's free pages, so that what deleted rows
+    /// and rewritten segments left there cannot be read back from the
+    /// file (a forget of a secret: [`Database::merge_only`] rewrites the
+    /// segment without it, and its old pages are free but hold its
+    /// bytes until a later write reuses them). Pages a commit freed are
+    /// reusable two commits on, so this commits three times (versions that
+    /// change nothing) first; pages a live snapshot can still reach, here
+    /// or in a reader's process, are left, and counted in
+    /// [`FreeZeroed::pending_bytes`]. It holds the writer lock while it
+    /// writes, which costs the size of the free pages, not of the file.
+    /// A database in directory layout frees a segment by removing its
+    /// file: nothing to do. The file's length is unchanged.
+    pub fn zero_free_pages(&self) -> Result<FreeZeroed> {
+        struct On<'a>(&'a AtomicUsize);
+        impl Drop for On<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.zeroing.fetch_add(1, Ordering::AcqRel);
+        let _on = On(&self.zeroing);
+        let mut wal = self.try_writer()?;
+        self.check_poisoned()?;
+        if self.dir.is_some() {
+            return Ok(FreeZeroed::default());
+        }
+        // A segment a merge replaced is freed by the commit after the one
+        // that installed the merge, once nothing reads it, and its pages
+        // are reusable two commits after that: three commits that change
+        // nothing. What the last two free is their own metadata.
+        let mut first = 0;
+        for i in 0..3 {
+            let vw = VersionWriter::begin(self);
+            let c = vw.commit(&mut wal)?;
+            self.publish(c, |_| {})?;
+            if i == 0 {
+                first = lock(&self.state).meta.txn;
+            }
+        }
+        // Merges reserve pages from the free runs without the writer lock,
+        // under the state's: it is held while the zeros are written.
+        let st = lock(&self.state);
+        let held: u64 = st.freelist.pending().iter().filter(|p| p.freed_at <= first).map(|p| p.pages).sum();
+        let mut out = FreeZeroed { pending_bytes: held * PAGE, ..Default::default() };
+        let zeros = vec![0u8; (256 * PAGE) as usize];
+        for (start, len) in st.freelist.runs() {
+            let (mut at, end) = (start * PAGE, (start + len) * PAGE);
+            while at < end {
+                let n = (end - at).min(zeros.len() as u64);
+                io::write_at(&self.file, &zeros[..n as usize], at)?;
+                at += n;
+            }
+            out.zeroed_bytes += len * PAGE;
+        }
+        drop(st);
+        if out.zeroed_bytes > 0 {
+            io::sync(&self.file)?;
+        }
+        drop(wal);
+        Ok(out)
     }
 
     /// The size of the WAL, sealed files included.
@@ -5657,6 +5786,9 @@ impl<'a> VersionWriter<'a> {
         let page = self.fl.alloc(pages_for(bytes.len()));
         self.grow()?;
         io::write_at(&self.db.file, bytes, page * PAGE)?;
+        if self.db.zeroes_tails() {
+            zero_page_tail(&self.db.file, page * PAGE + bytes.len() as u64)?;
+        }
         self.bytes_written += bytes.len() as u64;
         Ok(Extent { page, len: bytes.len() as u64 })
     }
@@ -5830,6 +5962,9 @@ impl<'a> VersionWriter<'a> {
         // a mapping of the same file can deadlock in the kernel.
         let bytes = map[e.range()].to_vec();
         io::write_at(&self.db.file, &bytes, page * PAGE)?;
+        if self.db.zeroes_tails() {
+            zero_page_tail(&self.db.file, page * PAGE + bytes.len() as u64)?;
+        }
         self.bytes_written += e.len;
         self.fl.defer(self.txn, e);
         let to = Extent { page, len: e.len };
@@ -5977,6 +6112,9 @@ impl<'a> VersionWriter<'a> {
             let page = self.fl.alloc_low(pages_for(mbytes.len()));
             self.grow()?;
             io::write_at(&db.file, &mbytes, page * PAGE)?;
+            if db.zeroes_tails() {
+                zero_page_tail(&db.file, page * PAGE + mbytes.len() as u64)?;
+            }
             self.bytes_written += mbytes.len() as u64;
             Extent { page, len: mbytes.len() as u64 }
         } else {
@@ -5986,6 +6124,9 @@ impl<'a> VersionWriter<'a> {
         let (freelist, fbytes) = place_freelist(&mut self.fl, &reserved, self.meta_low);
         self.grow()?;
         io::write_at(&db.file, &fbytes, freelist.page * PAGE)?;
+        if db.zeroes_tails() {
+            zero_page_tail(&db.file, freelist.page * PAGE + fbytes.len() as u64)?;
+        }
         self.bytes_written += fbytes.len() as u64;
         // A failed sync of the file is fatal for the handle: the kernel may
         // have dropped dirty pages of any writer on it (a merge's image

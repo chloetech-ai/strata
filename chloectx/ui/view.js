@@ -502,7 +502,7 @@ function spacesPage(root, ctx) {
     const p = sp.p;
     return h("a", { class: "card cx-space", href },
       h("div", { class: "cx-sphd" }, h("h4", { class: "mono" }, sp.title), h("span", { class: "badge accent" }, "synced")),
-      h("p", {}, "Claude Code's memory of this repository, as chloectx sync copies it into the table chloectx_memory"),
+      h("p", {}, `Claude Code's memory of this repository, as chloectx sync copies it into the table ${sp.p?.table || "chloectx_memory"}`),
       h("div", { class: "cx-counts" }, h("span", {}, h("b", {}, fmt.n(p.sessions)), p.sessions === 1 ? " session" : " sessions"), h("span", {}, fmt.plural(p.records, "record")), p.last ? h("span", {}, "last " + when(p.last)) : null));
   };
   const draw = () => {
@@ -601,7 +601,7 @@ function spacePage(root, ctx, src, rest) {
         if (me.synced) badges.append(h("a", { class: "badge accent", href: ctx.href("project", me.synced), title: "The copy chloectx sync keeps in this cluster" }, `synced as ${me.synced}`));
         if (!me.s.running) badges.append(h("span", { class: "badge", title: "Reading it started its daemon" }, "daemon started for this page"));
       } else {
-        lede.textContent = "Claude Code's memory of this repository, as chloectx sync copies it from each machine into the table chloectx_memory. Read only.";
+        lede.textContent = "Claude Code's memory of this repository, as chloectx sync copies it from each machine into its table on this cluster. Read only.";
       }
     }
     const opt = (x) => h("option", { value: `${x.type}/${x.id}`, selected: x.type === src.type && x.id === src.id }, x.type === "store" ? `${x.title} (this machine)` : x.title);
@@ -1295,17 +1295,24 @@ function connectTab(page, ctx, src) {
         title: "Share it", sub: "with the cluster, or as a capsule",
         body: h("div", { class: "stack", style: { gap: "8px" } },
           h("div", { class: "cx-hint" }, "Copy it into this cluster, where the Spaces page lists it as a synced project, for teammates and other machines:"),
-          copyable(ctx, `printf %s "$KEY" | chloectx sync setup --url ${location.origin} --token-stdin\nchloectx sync push`),
+          copyable(ctx, `printf %s "$KEY" | chloectx sync setup --url ${location.origin} --token-stdin\nchloectx sync push    # $KEY: an admin's, or one the Spaces page makes for this project`),
           h("div", { class: "cx-hint" }, "Or cut a capsule (under Snapshots and capsules) and mount it in another agent: a read-only copy of the notes and the conversation, redacted again.")),
       })));
     return null;
   }
+  const hint = h("div", { class: "cx-hint" }, "Each machine's ChloeCtx daemon sends what it records to this cluster every 30 seconds.");
+  const rows = h("div");
   page.append(card({
     title: "Where it comes from", sub: "chloectx sync, on each machine that records the project",
     body: h("div", { class: "stack", style: { gap: "8px" } },
-      h("div", { class: "cx-hint" }, `Each machine's ChloeCtx daemon sends what it records to this cluster every 30 seconds. The page only reads; every row of ${src.id} is in the table chloectx_memory:`),
-      sqlBlock(`SELECT session, kind, content, ts FROM chloectx_memory WHERE project = '${src.id.replace(/'/g, "''")}' AND kind IN ('decision', 'preference', 'fact') ORDER BY ts DESC LIMIT 20`)),
+      hint, rows),
   }));
+  // Its own table, or (synced before 0.3.4) the one projects shared.
+  ctx.api(`/v1/memory/table?project=${encodeURIComponent(src.id)}`).then((t) => {
+    const table = src.table || t.table;
+    hint.textContent = `Each machine's ChloeCtx daemon sends what it records to this cluster every 30 seconds, with a key that may read and write only this project's table. The page only reads; every row of ${src.id} is in the table ${table}:`;
+    rows.replaceChildren(sqlBlock(`SELECT session, kind, content, origin, ts FROM ${table} WHERE project = '${src.id.replace(/'/g, "''")}' AND kind IN ('decision', 'preference', 'fact') ORDER BY ts DESC LIMIT 20`.replace(", origin", table === "chloectx_memory" ? "" : ", origin")));
+  }).catch(() => {});
   return null;
 }
 
@@ -1685,31 +1692,40 @@ function incidentForm(ctx, old, done, from) {
  */
 function syncSetup(ctx, j, server) {
   const { h, card, toast } = ctx.core;
-  const cmd = (secret) => `printf %s ${secret ? `'${secret}'` : '"$KEY"'} | chloectx sync setup --url ${server} --token-stdin\nchloectx sync push    # in a project's folder: now, rather than within 30 s`;
+  const cmd = (secret) => `printf %s ${secret ? `'${secret}'` : '"$KEY"'} | chloectx sync setup --url ${server} --token-stdin --no-create\nchloectx sync push    # in the project's folder: now, rather than within 30 s`;
   const code = copyable(ctx, cmd(null));
-  const said = h("span", {}, "Any key that may write ", h("span", { class: "mono" }, j.table), " works; an admin's key also creates the table.");
+  // A key per project and machine: it reads and writes that project's
+  // table only, so a laptop's key reads no other project's sessions, and
+  // what it writes reaches other machines marked as from it.
+  const project = h("input", { class: "input mono", placeholder: "owner/name, as chloectx sync status says", style: { maxWidth: "280px" } });
+  const machine = h("input", { class: "input", placeholder: "whose machine (e.g. ana-laptop)", style: { maxWidth: "220px" } });
+  const said = h("span", {}, "One key per project and machine: it may read and write that project's table only (", h("span", { class: "mono" }, `${j.prefix || "chloectx_mem_"}…`), "). An admin makes the table with it.");
   const make = h("button", { class: "btn sm primary" }, "Make a sync key");
   make.onclick = async () => {
+    const p = project.value.trim(), who = machine.value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40);
+    if (!p) { toast("Name the project: its repository, owner/name, as chloectx sync status says it syncs", "bad", 6000); project.focus(); return; }
+    if (!who) { toast("Name the machine the key is for, to revoke it alone later", "bad", 6000); machine.focus(); return; }
     make.disabled = true;
     try {
+      const t = await ctx.api(`/v1/memory/table?project=${encodeURIComponent(p)}`);
       // The table first, so that a key limited to it can write.
-      if (!j.exists && j.create) await ctx.core.api("/v1/sql", { body: { sql: j.create } });
-      const k = await ctx.core.api("/v1/admin/keys", { body: { name: `chloectx-sync-${new Date().toISOString().slice(0, 10)}`, scope: "write", tables: { [j.table]: "write" }, note: "chloectx sync, made on the Inspector page" } });
+      await ctx.core.api("/v1/sql", { body: { sql: t.create } });
+      const k = await ctx.core.api("/v1/admin/keys", { body: { name: `chloectx-sync-${who}-${t.table.slice(-8)}`, scope: "write", tables: { [t.table]: "write" }, note: `chloectx sync of ${t.project} from ${who}, made on the Inspector page` } });
       code.set(cmd(k.secret));
       keyStep.classList.add("done");
-      said.replaceChildren(h("b", {}, "Shown once: "), "this key may only write ", h("span", { class: "mono" }, j.table), ". Revoke it under Access and audit.");
-      make.remove();
+      said.replaceChildren(h("b", {}, "Shown once: "), "this key may read and write only ", h("span", { class: "mono" }, t.table), ` (${t.project}). Revoke it under Access and audit.`);
+      make.remove(); project.disabled = true; machine.disabled = true;
     } catch (e) { toast(`The key: ${e.message}`, "bad", 8000); make.disabled = false; }
   };
   if (!ctx.core.can("admin")) { make.disabled = true; make.title = ctx.core.needs("admin"); }
-  const keyStep = h("li", {}, h("span", { class: "cx-n" }, "1"), h("div", {}, h("b", {}, "A key that may write only the memory table"), h("div", {}, make), said));
+  const keyStep = h("li", {}, h("span", { class: "cx-n" }, "1"), h("div", {}, h("b", {}, "A key for one project, on one machine"), h("div", { class: "row", style: { gap: "6px", flexWrap: "wrap" } }, project, machine, make), said));
   return card({
     title: j.exists ? "No project synced yet" : "Nothing synced to this cluster yet",
     sub: "three steps, on a machine where ChloeCtx records Claude Code",
     body: h("ol", { class: "cx-steps" },
       keyStep,
-      h("li", {}, h("span", { class: "cx-n" }, "2"), h("div", {}, h("b", {}, "ChloeCtx 0.2.0 or later"), h("span", {}, h("span", { class: "mono" }, "chloectx doctor"), " says which you have; an older one has no ", h("span", { class: "mono" }, "sync"), ": run ", h("span", { class: "mono" }, "git pull && ./install.sh"), " in its checkout."))),
-      h("li", {}, h("span", { class: "cx-n" }, "3"), h("div", {}, h("b", {}, "Point it here, once"), h("span", {}, "Each project's daemon then sends what it records every 30 seconds, and the projects appear on this page."), code))),
+      h("li", {}, h("span", { class: "cx-n" }, "2"), h("div", {}, h("b", {}, "ChloeCtx 0.3.4 or later"), h("span", {}, h("span", { class: "mono" }, "chloectx doctor"), " says which you have; an older one syncs every project into one shared table: run ", h("span", { class: "mono" }, "chloectx upgrade"), "."))),
+      h("li", {}, h("span", { class: "cx-n" }, "3"), h("div", {}, h("b", {}, "Point it here, once"), h("span", {}, "The project's daemon then sends what it records every 30 seconds, and the project appears on this page. Rules and decisions another machine sent reach a session's context once someone there runs ", h("span", { class: "mono" }, "chloectx sync accept"), "."), code))),
   });
 }
 

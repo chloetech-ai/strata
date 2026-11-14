@@ -308,12 +308,14 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
     });
     let (notes, messages, answers, rules) = (notes?, messages?, answers?, rules?);
     let signals = signals.into_inner().unwrap_or_else(|e| e.into_inner());
-    let live = |r: &Record| r.tag != "superseded" && r.tag != "uncertain" && r.tag != "cue";
+    // A rule or decision another machine pushed waits for a person to
+    // accept that machine (`chloectx sync accept`).
+    let live = |r: &Record| r.tag != "superseded" && r.tag != "uncertain" && r.tag != "cue" && !crate::sync::held_back(r);
     let mut left_out: Vec<(Record, &'static str)> = Vec::new();
     let mut gone: HashSet<String> = HashSet::new();
     for r in notes.iter().chain(rules.iter().filter(|(_, c)| *c >= p.rule_min_cos).map(|(r, _)| r)) {
         if !live(r) && r.tag != "cue" && gone.insert(r.id.clone()) {
-            left_out.push((r.clone(), if r.tag == "superseded" { "superseded" } else { "uncertain" }));
+            left_out.push((r.clone(), if r.tag == "superseded" { "superseded" } else if crate::sync::held_back(r) { "from another machine, not accepted" } else { "uncertain" }));
         }
     }
     let rule_cos: HashMap<String, f64> = rules.iter().map(|(r, c)| (r.id.clone(), *c)).collect();
