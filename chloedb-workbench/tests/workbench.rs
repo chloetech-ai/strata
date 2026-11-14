@@ -5436,4 +5436,222 @@ fn notifications_follow_the_level_quiet_holds_all_but_critical_and_a_digest_foll
     assert_eq!(p["digest"], Value::Null, "{p}");
     // Out of quiet with level all, the questions notify again.
     assert_eq!(p["notify"].as_array().unwrap().iter().filter(|x| x["kind"] == "question").count(), 2, "{p}");
+// The rewrite (JOURNEYS.md): what needs you as one list, projects with
+// their counts, repo trust, a new project, the permission profile, the
+// draft plan, grants, the CLI's routes and the goal pages' files.
+
+#[test]
+fn needs_lists_permission_and_trust_prompts_oldest_first_in_the_prompts_order() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "task": "PERM3 first", "worktree": false, "name": "perm" }));
+    let aid = a["id"].as_str().unwrap().to_string();
+    open_prompt(&s, &aid);
+    let b = s.spawn(json!({ "repo": r, "task": "TRUST me", "worktree": false, "name": "trusty" }));
+    let bid = b["id"].as_str().unwrap().to_string();
+    open_prompt(&s, &bid);
+    let v = s.get_until("/api/needs", "both prompts", |v| v["items"].as_array().is_some_and(|i| i.iter().filter(|x| x["question"]["options"].as_array().is_some_and(|o| !o.is_empty())).count() == 2));
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(v["count"], json!(items.len()), "{v}");
+    let kinds: Vec<&str> = items.iter().map(|i| i["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["question", "trust"], "oldest first: {v}");
+    assert_eq!(items[0]["agent"]["name"], "perm");
+    // Claude Code's options, in the prompt's order, with its labels.
+    assert_eq!(labels_of(&items[0]["question"]), ["Yes", "Yes, and switch to auto mode", "No"]);
+    assert_eq!(labels_of(&items[1]["question"]), ["No, exit", "Yes, I trust this folder"]);
+    let since: Vec<i64> = items.iter().map(|i| i["since_ms"].as_i64().unwrap()).collect();
+    assert!(since.windows(2).all(|w| w[0] <= w[1]), "{since:?}");
+    assert_eq!(v["by_repo"][r.to_str().unwrap()], json!(2), "{v}");
+    // One project's share, and another's.
+    let (_, mine) = s.get(&format!("/api/needs?repo={}", r.display()));
+    assert_eq!(mine["count"], json!(2), "{mine}");
+    let (_d2, other) = repo();
+    let (_, none) = s.get(&format!("/api/needs?repo={}", other.display()));
+    assert_eq!(none["count"], json!(0), "{none}");
+}
+
+#[test]
+fn projects_have_a_name_counts_and_trust_and_a_trusted_projects_folder_is_trusted() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let (status, v) = s.post("/api/repos", json!({ "path": r, "trust": true }));
+    assert!(status == 200 || status == 201, "{v}");
+    assert_eq!((v["repo"]["project"].as_str(), v["repo"]["trusted"].as_bool()), (Some("proj"), Some(true)), "{v}");
+    let (_, list) = s.get("/api/repos");
+    let p = list["repos"].as_array().unwrap().iter().find(|x| x["path"] == json!(r)).cloned().unwrap_or_else(|| panic!("{list}"));
+    assert_eq!(p["project"], "proj");
+    assert_eq!(p["trusted"], true);
+    for k in ["needs", "working", "ready", "finished", "running"] {
+        assert!(p["counts"][k].is_number(), "counts.{k}: {p}");
+    }
+    assert!(p["needs"].is_number() && p["last_activity_ms"].is_number() && p["ready"].is_array() && p["unmerged"].is_array(), "{p}");
+    // Claude Code's "trust this folder?" in the trusted project's own
+    // checkout: answered for it.
+    let a = s.spawn(json!({ "repo": r, "task": "TRUST me", "worktree": false }));
+    let id = a["id"].as_str().unwrap().to_string();
+    ws_read_until(&s, &id, "CHOSE: Yes, I trust this folder", &[]);
+    s.wait(&id, "idle");
+    let (_, after) = s.get("/api/repos");
+    let p = after["repos"].as_array().unwrap().iter().find(|x| x["path"] == json!(r)).cloned().unwrap();
+    assert!(p["counts"]["running"].as_i64().unwrap() >= 1, "{p}");
+    assert!(p["last_activity_ms"].as_i64().unwrap() > 0, "{p}");
+}
+
+#[test]
+fn a_new_project_is_a_folder_with_git_and_a_first_commit() {
+    let s = Server::start(&[]);
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("ledger");
+    let (status, v) = s.post("/api/repos", json!({ "path": dir, "init": true, "trust": true }));
+    assert!(status == 200 || status == 201, "{v}");
+    assert!(dir.join(".git").exists(), "{v}");
+    assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(v["repo"]["project"], "ledger");
+    // A relative folder is refused.
+    assert_eq!(s.post("/api/repos", json!({ "path": "ledger2", "init": true })).0, 400);
+}
+
+#[test]
+fn a_permission_profile_lands_in_the_sessions_settings_and_a_bad_rule_is_refused() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "task": "hello", "permissions": { "allow": ["Bash(npm test:*)"], "deny": ["Bash(git push:*)", "Bash(rm -rf:*)"] } }));
+    let id = a["id"].as_str().unwrap().to_string();
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(s.data.join("sessions").join(&id).join("settings.json")).unwrap()).unwrap();
+    let has = |k: &str, rule: &str| settings["permissions"][k].as_array().is_some_and(|l| l.contains(&json!(rule)));
+    assert!(has("allow", "Bash(npm test:*)"), "{settings}");
+    assert!(has("deny", "Bash(git push:*)") && has("deny", "Bash(rm -rf:*)"), "{settings}");
+    // Read-only keeps its allow list narrow; deny still applies.
+    let b = s.spawn(json!({ "repo": r, "task": "hello", "read_only": true, "name": "ro", "permissions": { "allow": ["Bash(npm test:*)"], "deny": ["WebFetch"] } }));
+    let rs: Value = serde_json::from_str(&std::fs::read_to_string(s.data.join("sessions").join(b["id"].as_str().unwrap()).join("settings.json")).unwrap()).unwrap();
+    assert!(!rs["permissions"]["allow"].as_array().is_some_and(|l| l.contains(&json!("Bash(npm test:*)"))), "{rs}");
+    assert!(rs["permissions"]["deny"].as_array().unwrap().contains(&json!("WebFetch")), "{rs}");
+    for bad in [json!({ "allow": ["not a rule!"] }), json!({ "deny": ["Bash(git push"] }), json!({ "allow": [], "sometimes": [] })] {
+        let (status, v) = s.post("/api/agents", json!({ "repo": r, "task": "x", "permissions": bad }));
+        assert_eq!(status, 400, "{bad}: {v}");
+    }
+}
+
+#[test]
+fn a_draft_plan_starts_nothing() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let text = "A ledger that records refunds. Then a report of refunds per day. Then an export to CSV.";
+    let (status, v) = s.post("/api/goals", json!({ "repo": r, "text": text, "plan": "draft" }));
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["draft"], true, "{v}");
+    let parts = v["parts"].as_array().unwrap();
+    assert!(!parts.is_empty(), "{v}");
+    assert!(parts.iter().all(|p| p["title"].as_str().is_some_and(|t| !t.is_empty())), "{v}");
+    // The fake's answer is not a plan: the parts are the person's sentences.
+    assert_eq!(v["drafted_by"], "words", "{v}");
+    let (_, goals) = s.get("/api/goals");
+    assert!(goals["goals"].as_array().unwrap().is_empty(), "{goals}");
+    let (_, agents) = s.get("/api/agents?all=1");
+    assert!(agents["agents"].as_array().unwrap().is_empty(), "{agents}");
+}
+
+#[test]
+fn grants_are_listed_revoked_and_previewed_from_what_agents_asked() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let a = s.spawn(json!({ "repo": r, "task": "hello", "name": "wt" }));
+    let id = a["id"].as_str().unwrap().to_string();
+    let a = s.wait(&id, "idle");
+    let cwd = PathBuf::from(a["cwd"].as_str().unwrap());
+    assert_ne!(cwd, r);
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(cwd.join(".claude/settings.local.json"), r#"{"permissions":{"allow":["Bash(npm test:*)","Bash(echo:*)"]},"other":1}"#).unwrap();
+    let (_, v) = s.get(&format!("/api/grants?repo={}", r.display()));
+    let rules: Vec<&str> = v["grants"].as_array().unwrap().iter().map(|g| g["rule"].as_str().unwrap()).collect();
+    assert_eq!(rules, ["Bash(npm test:*)", "Bash(echo:*)"], "{v}");
+    assert_eq!(v["grants"][0]["name"], "wt");
+    let (status, v) = s.post("/api/grants/revoke", json!({ "agent": id, "rule": "Bash(echo:*)" }));
+    assert_eq!(status, 200, "{v}");
+    let left: Value = serde_json::from_str(&std::fs::read_to_string(cwd.join(".claude/settings.local.json")).unwrap()).unwrap();
+    assert_eq!(left["permissions"]["allow"], json!(["Bash(npm test:*)"]));
+    assert_eq!(left["other"], 1, "the rest of the file stays");
+    // An agent in the repository's own checkout has no grants of Workbench's to revoke.
+    let b = s.spawn(json!({ "repo": r, "task": "PERM3 first", "worktree": false, "name": "here" }));
+    let bid = b["id"].as_str().unwrap().to_string();
+    open_prompt(&s, &bid);
+    assert_eq!(s.post("/api/grants/revoke", json!({ "agent": bid, "rule": "Bash(echo:*)" })).0, 400);
+    // What a "don't ask again for echo" would also allow: what was asked.
+    let (_, p) = s.get(&format!("/api/grants/preview?repo={}&prefix=echo", r.display()));
+    let cmds: Vec<&str> = p["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
+    assert_eq!(cmds, ["echo hi"], "{p}");
+    assert_eq!(p["commands"][0]["risky"], false);
+}
+
+#[test]
+fn open_and_new_print_the_page_to_open_on_the_running_server() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(BIN).args(args).arg("--data-dir").arg(&s.data).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let rs = r.to_str().unwrap();
+    let url = run(&["open", rs]);
+    assert!(url.starts_with(&format!("{}/?token=", s.url)) && url.ends_with("#/p/proj"), "{url}");
+    assert!(run(&["open", "--review", rs]).ends_with("#/p/proj/ship"));
+    assert!(run(&["open", "--debug", "why is tax rounded", rs]).ends_with("#/debug/code?q=why%20is%20tax%20rounded"));
+    let d = tempfile::tempdir().unwrap();
+    let fresh = d.path().join("fresh");
+    let url = run(&["new", fresh.to_str().unwrap()]);
+    assert!(url.contains("#/new/what?dir="), "{url}");
+    assert!(fresh.join(".git").exists());
+}
+
+#[test]
+fn serve_with_a_path_opens_that_project() {
+    let (_d, r) = repo();
+    let dir = tempfile::tempdir().unwrap();
+    let fake = write_fake(dir.path());
+    let mut child = Command::new(BIN)
+        .args(["serve", "--addr", "127.0.0.1:0", "--token", TOKEN, "--no-chloectx"])
+        .arg("--data-dir")
+        .arg(dir.path().join("data"))
+        .arg("--claude-bin")
+        .arg(&fake)
+        .arg(&r)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut lines = Vec::new();
+    for _ in 0..6 {
+        let mut l = String::new();
+        if out.read_line(&mut l).unwrap() == 0 {
+            break;
+        }
+        let done = l.starts_with("open: ");
+        lines.push(l.trim().to_string());
+        if done {
+            break;
+        }
+    }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let _ = child.wait();
+    assert!(lines[0].starts_with("Workbench: "), "{lines:?}");
+    let open = lines.iter().find(|l| l.starts_with("open: ")).unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(open.ends_with("#/p/proj"), "{lines:?}");
+}
+
+#[test]
+fn the_goal_pages_and_fonts_are_served_without_the_token() {
+    let s = Server::start(&[]);
+    for f in ["router.js", "shell.js", "start.js", "newproject.js", "continue.js", "agent.js", "more.js", "needs.js"] {
+        let r = http().get(format!("{}/goals/{f}", s.url)).call().unwrap();
+        assert_eq!(r.status().as_u16(), 200, "{f}");
+        assert!(r.headers().get("content-type").unwrap().to_str().unwrap().starts_with("text/javascript"), "{f}");
+    }
+    let r = http().get(format!("{}/fonts/Geist-normal.woff2", s.url)).call().unwrap();
+    assert_eq!((r.status().as_u16(), r.headers().get("content-type").unwrap().to_str().unwrap()), (200, "font/woff2"));
+    assert_eq!(http().get(format!("{}/goals/nope.js", s.url)).call().unwrap().status().as_u16(), 404);
+    assert_eq!(http().get(format!("{}/fonts/nope.woff2", s.url)).call().unwrap().status().as_u16(), 404);
 }

@@ -50,7 +50,7 @@ export function counts(list) {
 /** "5 agents: 1 needs you, 2 working, 1 ready, 1 finished". */
 export function fleetWords(list) {
   const c = counts(list);
-  const parts = ORDER.filter((g) => c[g]).map((g) => `${c[g]} ${GROUP_WORDS[g]}`);
+  const parts = ORDER.filter((g) => c[g]).map((g) => `${c[g]} ${g === "needs" ? "waiting on you" : GROUP_WORDS[g]}`);
   return `${list.length} agent${list.length === 1 ? "" : "s"}${parts.length ? ": " + parts.join(", ") : ""}`;
 }
 
@@ -80,7 +80,7 @@ export function setCrumbs(list) {
   nav.replaceChildren(...O.crumbs.flatMap((c, i) => [
     i ? h("span", { class: "sl" }, "/") : null,
     i === O.crumbs.length - 1 ? h("b", { "aria-current": "page" }, c.label) : h("a", { href: c.href }, c.label),
-  ]));
+  ]).filter(Boolean));
   const last = O.crumbs[O.crumbs.length - 1];
   const parent = O.crumbs[O.crumbs.length - 2];
   $("tb-title").textContent = last ? last.label : "Workbench";
@@ -106,7 +106,9 @@ export function update() {
   const running = list.filter((a) => a.running);
   $("agents-avs").replaceChildren(...running.slice(0, 4).map((a) => avatar(a, 16)));
   const c = counts(list);
-  $("agents-lb").textContent = `${list.length} agent${list.length === 1 ? "" : "s"}${c.needs ? ` · ${c.needs} need${c.needs === 1 ? "s" : ""} you` : ""}`;
+  // One count of what needs you, on the Needs-you button only (UX critique, issue 4).
+  $("agents-lb").textContent = `${list.length} agent${list.length === 1 ? "" : "s"}`;
+  $("agents-btn").title = `${fleetWords(list)} (a)`;
   setCrumbs(O.crumbs);
   // An open drawer or switcher is drawn again only when what it lists
   // changed, so a card's pick and the focus stay put.
@@ -392,4 +394,5 @@ const CSS = `
 .keys2 dt{display:flex;gap:4px;align-items:center;text-transform:none;letter-spacing:0}
 .gs-ov{z-index:40}
 .dr-body .qc,.dr-body .alert-card,.dr-body .wait-card{flex:none}
+@media (max-width:640px),(pointer:coarse){.dr-foot>span:first-child{display:none}}
 `;

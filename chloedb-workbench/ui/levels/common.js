@@ -606,10 +606,12 @@ export function questionCard(q, { agent, onAnswer, onGrant, onText, big = false,
     q.context && !cmd ? h("p", { class: "qc-what" }, q.context) : null,
     d.description ? h("p", { class: "qc-what" }, h("span", { class: "qc-prov" }, "Claude's summary, not checked: "), d.description) : null,
     big && kv.length ? h("dl", { class: "kv" }, kv.map(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : null,
-    opts.length ? h("div", { class: "qc-opts", role: "group", "aria-label": "Claude Code's options" }, reason, buttons) : null,
+    opts.length ? h("div", { class: "qc-opts", role: "group", "aria-label": "Claude Code's options" }, reason, buttons)
+      : q.kind === "permission" ? h("div", { class: "qc-wait" }, "Workbench has not read Claude Code's options for this prompt. ",
+        q.agent ? h("a", { class: "lv-link", href: `#/a/${q.agent}/terminal` }, "Answer it in its terminal") : "Answer it in its terminal.") : null,
     q.kind === "ask" || onText ? h("form", { class: "qc-type", onsubmit: (e) => { e.preventDefault(); const v = typed.value.trim(); if (v && onText) onText(v); } },
       typed = h("input", { class: "field", placeholder: q.kind === "ask" ? "Answer in your words" : "Or tell it what to do instead", "aria-label": "Answer in your words" })) : null,
-    q.kind === "permission" ? h("div", { class: "qc-foot" }, "The numbers are Claude Code's own. Pick one with its key and Enter, or click it. Workbench types it, and only while this prompt is still open.") : null);
+    q.kind === "permission" && opts.length ? h("div", { class: "qc-foot" }, "The numbers are Claude Code's own. Pick one with its key and Enter, or click it. Workbench types it, and only while this prompt is still open.") : null);
   return card;
 }
 

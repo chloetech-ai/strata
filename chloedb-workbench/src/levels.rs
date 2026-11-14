@@ -133,7 +133,13 @@ async fn goals_list(State(app): State<App>, Query(q): Query<RepoQ>) -> ApiResult
 async fn goals_create(State(app): State<App>, body: Bytes) -> ApiResult {
     let b: goals::GoalBody = parse_body(&body)?;
     let (sup, lv) = (app.sup.clone(), app.lv.clone());
-    created(blocking(move || goals::create(&sup, &lv, b)).await?)
+    let v = blocking(move || goals::create(&sup, &lv, b)).await?;
+    // A draft (`plan: "draft"`) creates nothing.
+    if v["draft"] == true {
+        json_ok(v)
+    } else {
+        created(v)
+    }
 }
 
 async fn goal_get(State(app): State<App>, Path(id): Path<String>) -> ApiResult {

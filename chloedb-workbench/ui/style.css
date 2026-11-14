@@ -311,8 +311,8 @@ main { position: absolute; inset: 0; min-width: 0; overflow: hidden; }
 .ag-tabs .n:empty { display: none; }
 .ag-tabs .hint { margin-left: auto; align-self: center; font-size: var(--fs-xs); color: var(--text-2); display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
 .zbody { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) var(--insp-w); position: relative; }
-.zbody > .ag-host { display: none; grid-column: 1 / -1; position: relative; overflow: auto; min-height: 0; }
-.zbody[data-tab="progress"] > .ag-host, .zbody[data-tab="preview"] > .ag-host { display: block; }
+.zbody > .ag-host { display: none; grid-column: 1 / -1; grid-row: 1; position: relative; overflow: auto; min-height: 0; }
+.zbody[data-tab="progress"] > #ag-progress, .zbody[data-tab="preview"] > #ag-preview { display: block; }
 .zbody[data-tab="progress"] > :not(.ag-host), .zbody[data-tab="preview"] > :not(.ag-host) { display: none !important; }
 .zbody[data-tab="changes"] > .termbox, .zbody[data-tab="term"] > .changes, .zbody[data-tab="events"] > .changes { display: none; }
 .zbody[data-tab="changes"] > .changes { display: flex; }
@@ -532,10 +532,10 @@ code.rid { font-size: .92em; color: var(--text-2); background: var(--surface-3);
 .cf-head .from { color: var(--muted); font: 11.5px var(--mono); white-space: nowrap; }
 .cf-head .ut { font-size: 10.5px; color: var(--muted); border: 1px solid var(--line-2); border-radius: 99px; padding: 0 6px; }
 .cf-head .cnt { margin-left: auto; display: inline-flex; gap: 7px; }
-.st { font: 700 10.5px var(--mono); width: 18px; height: 18px; border-radius: 5px; display: inline-grid; place-items: center; flex: none; background: var(--surface-3); color: var(--text-2); }
-.st-A { background: var(--add-gut); color: var(--add-ink); }
-.st-D { background: var(--del-gut); color: var(--del-ink); }
-.st-R { background: var(--accent-soft); color: var(--accent); }
+.fst { font: 700 10.5px var(--mono); width: 18px; height: 18px; border-radius: 5px; display: inline-grid; place-items: center; flex: none; background: var(--surface-3); color: var(--text-2); }
+.fst-A { background: var(--add-gut); color: var(--add-ink); }
+.fst-D { background: var(--del-gut); color: var(--del-ink); }
+.fst-R { background: var(--accent-soft); color: var(--accent); }
 .cf-body { overflow-x: auto; }
 .cf-inner { width: max-content; min-width: 100%; font: 12.5px/20px var(--mono); padding-bottom: 4px; }
 .cf-note { padding: 10px 16px; font: 12.5px var(--sans); color: var(--muted); }
@@ -881,7 +881,7 @@ button.flag.warn:hover { border-color: var(--warn-line); }
   .top .sp { display: none; }
   .tb-search { display: inline-flex; }
   .tb, .tb.icon { height: var(--touch); min-width: var(--touch); justify-content: center; font-size: var(--fs-body); }
-  .tb.need .lb { display: none; }
+  .tb.need .tlb { display: none; }
   .tabbar { display: grid; }
   .shell { bottom: calc(var(--tabh) + env(safe-area-inset-bottom)); }
   body.stepping .tabbar { display: none; }
@@ -908,7 +908,7 @@ button.flag.warn:hover { border-color: var(--warn-line); }
   .ag-tabs { padding: 0 var(--s-4); gap: var(--s-4); }
   .ag-tabs a { min-height: var(--touch); }
   .zbody { display: flex; flex-direction: column; }
-  .zbody > .termbox, .zbody > .side, .zbody > .changes { flex: 1; min-height: 0; }
+  .zbody > .termbox, .zbody > .side, .zbody > .changes, .zbody > .ag-host { flex: 1; min-height: 0; }
   .zbody[data-tab="term"] > .side { display: none; }
   .zbody[data-tab="events"] > .termbox { display: none; }
   .side { border-left: 0; }

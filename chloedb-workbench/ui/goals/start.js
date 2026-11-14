@@ -111,6 +111,7 @@ const CSS = `
 .g-trust b{color:var(--text);font-weight:var(--w-mid)}
 .g-path{font:var(--w-text) var(--fs-xs)/var(--lh-xs) var(--mono);color:var(--text-2);margin-top:2px;overflow-wrap:anywhere}
 .g-dim{color:var(--text-2)}
+.g-start .tbl td{white-space:nowrap}.g-start .tbl td:first-child{white-space:normal;width:100%}
 .g-acts{display:inline-flex;gap:var(--s-2)}
 .g-avs{display:inline-flex}.g-avs .lv-av{border-radius:50%;box-shadow:0 0 0 1.5px var(--surface)}.g-avs .lv-av+.lv-av{margin-left:-5px}
 .g-setup{font-size:var(--fs-sm);color:var(--text-2);display:flex;gap:var(--s-2);align-items:center;flex-wrap:wrap}

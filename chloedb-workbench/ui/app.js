@@ -1278,7 +1278,7 @@ function fileBlock(f, fi) {
   const collapsed = C.collapsed.has(path);
   const head = h("button", { class: "cf-head", type: "button", "aria-expanded": String(!collapsed), title: collapsed ? "Show this file" : "Fold this file" },
     icon("chev", "i sm tw"),
-    h("span", { class: `st st-${code}`, title: label, text: code }),
+    h("span", { class: `fst fst-${code}`, title: label, text: code }),
     h("span", { class: "path" }, slash >= 0 ? h("span", { class: "dir", text: path.slice(0, slash + 1) }) : null, h("b", { text: path.slice(slash + 1) })),
     f.old_path && f.old_path !== path ? h("span", { class: "from", text: `from ${f.old_path}` }) : null,
     f.untracked ? h("span", { class: "ut", title: "Not yet added to git", text: "untracked" }) : null,
@@ -2805,7 +2805,6 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
 // Search (fourth build): the top bar's quick search over code, docs and decisions; `/` opens it.
 const quickCtx = () => ({ api, go, openWhy: ({ agent, path, line, text, commit }) => openLineCard(agent, path, line, { text, commit }), repo: () => pickRepo() || "", openDecisions: () => openDecisions() });
 function openQuickSearch() { import("/levels/quicksearch.js").then((m) => m.open(quickCtx())).catch((err) => console.error(err)); }
-import("/levels/quicksearch.js").then((m) => m.install(quickCtx())).catch(() => {});
 const L = { recent: [] };
 
 /** The context the old screens (ui/levels/) are mounted with. */
@@ -2977,6 +2976,7 @@ async function route(hash) {
   if (T.open) closeSheet({ focus: false });
   document.body.classList.remove("stepping");
   G.r = r;
+  Shell.update(); // the tab bar follows the page
   if (r.project) { const p = projectByName(r.project); if (p) store("local", PROJECT_KEY, p.path); }
 
   if (r.page === "agent") {

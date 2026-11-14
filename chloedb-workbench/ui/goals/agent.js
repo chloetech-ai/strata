@@ -46,7 +46,7 @@ export function tabs(a, cur, { n, preview } = {}) {
     ...TABS.filter(([k]) => k !== "preview" || preview !== false).map(([k, t]) => h("a", {
       role: "tab", href: `#/a/${a.id}${k === "progress" ? "" : "/" + k}`, "aria-selected": String(k === cur), class: k === "events" ? "narrow-tab" : null,
     }, t, k === "changes" ? h("span", { class: "n" }, n ? String(n) : "") : null)),
-    h("span", { class: "hint" }, cur === "terminal" ? [kc("Ctrl-b"), kc("Esc"), " leaves the terminal"] : [kc("g t"), " terminal"]),
+    cur === "terminal" ? null : h("span", { class: "hint" }, kc("t"), " terminal ", kc("c"), " changes"),
   ];
 }
 

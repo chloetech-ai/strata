@@ -115,7 +115,7 @@ export function mount(root, ctx) {
       h("section", {}, btn("I'm stepping away: notify me", { onclick: async () => { try { await ctx.api("/api/away/leave", { method: "POST", body: {} }); ctx.toast("Marked. Since you left counts from now."); ctx.notify && ctx.notify(); } catch (e) { ctx.toast(e.message, true); } } })),
       ctx.slot("rules-suggest"),
     ];
-    return page({ kicker: p.path, title: `Continue ${p.project}`, sub: sinceSentence(list), aside: ready && !mine.length ? btn(`Review and ship (${ready})`, { primary: true, href: `#/p/${p.project}/ship`, kbd: "g r" }) : null, inspector: insp, wide: true },
+    return page({ kicker: "Project", title: `Continue ${p.project}`, sub: sinceSentence(list), aside: ready && !mine.length ? btn(`Review and ship (${ready})`, { primary: true, href: `#/p/${p.project}/ship`, kbd: "g r" }) : null, inspector: insp, wide: true },
       projectSteps(p, "continue"), ask,
       h("div", { class: "gp-sec" }, label(fleetWords(list))),
       mine.length ? h("div", { class: "g-needs" }, label("Needs you", h("span", { class: "num" }, String(mine.length))), mine.map((it) => ctx.needCard(it))) : null,
