@@ -1447,8 +1447,9 @@ impl Db {
     /// to [`ExecOptions::max_rows`].
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         // A statement that nests deep runs on a thread with the stack for
-        // it, and its planning stops at its deadline as its run does.
-        crate::query::parse::deep_stack(crate::query::parse::nests_deep(sql), || crate::query::compound::planning_under(opts, || self.query_at_here(snap, sql, params, opts)))
+        // it, its planning stops at its deadline as its run does, and it
+        // is held to its budget.
+        crate::query::budget::guarded(sql, opts, |opts| self.query_at_here(snap, sql, params, opts))
     }
 
     /// [`Db::query_at`] on this thread.
@@ -1583,7 +1584,14 @@ impl Db {
     /// its rows taken to fill the budget, and the receipt of how they were
     /// chosen. A query without the clause is an error.
     pub fn pack(&self, sql: &str, params: &Params) -> Result<crate::query::pack::Packed> {
-        self.pack_at(&self.snapshot(), sql, params, &self.exec)?.ok_or_else(|| Error::Query("the query has no PACK n TOKENS clause".into()))
+        self.pack_with(sql, params, &self.exec)
+    }
+
+    /// [`Db::pack`] with `opts` (its deadline, cancel flag, memory and
+    /// statement budget), planned as every statement is.
+    pub fn pack_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<crate::query::pack::Packed> {
+        let snap = self.snapshot();
+        crate::query::budget::guarded(sql, opts, |opts| self.pack_at(&snap, sql, params, opts))?.ok_or_else(|| Error::Query("the query has no PACK n TOKENS clause".into()))
     }
 
     /// [`Db::pack`] against a given snapshot, `None` for a query without
@@ -1819,6 +1827,13 @@ impl Db {
     /// [`Db::query_leaf`] with `opts`, as [`Db::query_with`].
     #[cfg(feature = "datafusion")]
     pub fn query_leaf_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<Leaf> {
+        // Planned as every statement is (finding X-B12).
+        crate::query::budget::guarded(sql, opts, |opts| self.query_leaf_here(sql, params, opts))
+    }
+
+    /// [`Db::query_leaf_with`] on this thread.
+    #[cfg(feature = "datafusion")]
+    fn query_leaf_here(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<Leaf> {
         let snap = self.snapshot();
         if let Some(call) = crate::query::paths::Call::of_sql(sql)? {
             return self.json_paths_at(&snap, &call, params, opts).map(|p| Leaf::Rows(p.to_result()));
@@ -1928,8 +1943,9 @@ impl Db {
     /// memory budget); any other statement runs as [`Db::sql`] runs it.
     pub fn sql_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<SqlResult> {
         // A statement that nests deep runs on a thread with the stack for
-        // it, and its planning stops at its deadline as its run does.
-        crate::query::parse::deep_stack(crate::query::parse::nests_deep(sql), || crate::query::compound::planning_under(opts, || self.sql_with_here(sql, params, opts)))
+        // it, its planning stops at its deadline as its run does, and it
+        // is held to its budget.
+        crate::query::budget::guarded(sql, opts, |opts| self.sql_with_here(sql, params, opts))
     }
 
     /// [`Db::sql_with`] on this thread.
@@ -1966,6 +1982,9 @@ impl Db {
         }
         let catalog = self.catalog();
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
+        // A write is held to its budget's shape as written (a query, once
+        // written out, as it plans).
+        crate::query::compound::check_statement(sql, params)?;
         match bind_command(sql, &tables, params)? {
             Command::Query => self.query_with(sql, params, opts).map(SqlResult::Rows),
             Command::Explain { json } => {
@@ -2052,7 +2071,7 @@ impl Db {
                     if !r.as_ref().is_err_and(|e| altered_while_running(&e.to_string())) {
                         break;
                     }
-                    let Some(p) = self.prepare_write(sql, params)? else { break };
+                    let Some(p) = self.prepare_write_here(sql, params)? else { break };
                     r = self.write_queued(writes::Job::Sql(p));
                 }
                 r.map(|(n, _)| SqlResult::Written(n))
@@ -2066,7 +2085,16 @@ impl Db {
     /// SELECT (`WITH`, a subquery, a join, `SELECT DISTINCT`) plans into
     /// operators over single-table queries ([`crate::query::compound`]).
     pub fn explain(&self, sql: &str, params: &Params) -> Result<Plan> {
-        self.explain_statement(&qsql::parse_one(sql)?, params)
+        self.explain_with(sql, params, &self.exec)
+    }
+
+    /// [`Db::explain`] planned under `opts`' deadline, cancel flag and
+    /// statement budget, as the statement would run (finding X-B12).
+    pub fn explain_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<Plan> {
+        crate::query::budget::guarded(sql, opts, |_| {
+            crate::query::compound::check_statement(sql, params)?;
+            self.explain_statement(&qsql::parse_one(sql)?, params)
+        })
     }
 
     /// `CREATE CLASSIFIER`, which trains on the table's rows and keeps the
@@ -2206,6 +2234,20 @@ impl Db {
     /// writer lock: a model is slow, and every other write waits while the
     /// lock is held. `None` for any other statement. [`Db::sql`] does both.
     pub fn prepare_write(&self, sql: &str, params: &Params) -> Result<Option<PreparedWrite>> {
+        self.prepare_write_with(sql, params, &self.exec)
+    }
+
+    /// [`Db::prepare_write`], bound under `opts`' deadline, cancel flag
+    /// and statement budget, on the stack a deep statement needs
+    /// (finding X-B12).
+    pub fn prepare_write_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<Option<PreparedWrite>> {
+        crate::query::budget::guarded(sql, opts, |_| {
+            crate::query::compound::check_statement(sql, params)?;
+            self.prepare_write_here(sql, params)
+        })
+    }
+
+    fn prepare_write_here(&self, sql: &str, params: &Params) -> Result<Option<PreparedWrite>> {
         let catalog = self.catalog();
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
         let Command::Write { table, write } = bind_command(sql, &tables, params)? else { return Ok(None) };

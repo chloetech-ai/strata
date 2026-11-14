@@ -615,6 +615,12 @@ pub struct Key {
     pub agent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
+    /// What one statement it sends may cost ([`chloedb::query::budget`]):
+    /// a request may ask for less, never more, and the server's
+    /// `--statement-budget` holds as well. A key another key made has its
+    /// maker's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<chloedb::query::budget::Budget>,
 }
 
 /// What a key made for an agent or for operations has beyond a plain key
@@ -626,6 +632,8 @@ pub struct AgentKey {
     pub on_behalf_of: Option<String>,
     /// What a key limited to tables reaches beyond them ([`Allow`]).
     pub allow: Option<Allow>,
+    /// Its statement budget ([`Key::budget`]).
+    pub budget: Option<chloedb::query::budget::Budget>,
 }
 
 impl Key {
@@ -661,6 +669,9 @@ impl Key {
         }
         if let Some(p) = &self.parent {
             j["parent"] = json!(p);
+        }
+        if let Some(b) = self.budget.filter(|b| !b.is_none()) {
+            j["budget"] = json!(b);
         }
         j
     }
@@ -807,6 +818,15 @@ impl KeySet {
                         x.on_behalf_of = k.on_behalf_of.clone();
                         changed = true;
                     }
+                    // Its budget is the tighter of the two (one lowered on
+                    // either side; a server from before budgets drops it).
+                    if let Some(b) = k.budget {
+                        let tighter = x.budget.unwrap_or_default().within(b);
+                        if x.budget != Some(tighter) {
+                            x.budget = Some(tighter);
+                            changed = true;
+                        }
+                    }
                     // And without the key that made it.
                     if x.parent.is_none() && k.parent.is_some() {
                         x.parent = k.parent.clone();
@@ -912,6 +932,35 @@ impl Keys {
         self.lock().keys.is_empty()
     }
 
+    /// The statement budget of key `id` ([`Key::budget`]); none for a key
+    /// it does not hold.
+    pub fn budget_of(&self, id: &str) -> chloedb::query::budget::Budget {
+        self.lock().keys.iter().find(|k| k.id == id).and_then(|k| k.budget).unwrap_or_default()
+    }
+
+    /// Lowers key `id`'s statement budget (its id or name) to within
+    /// `budget`, and that of every key it made; `None` when it holds no
+    /// such key, else the budget it has now. A budget is lowered, never
+    /// raised, as an expiry is brought nearer: the servers of a cluster
+    /// merge a key's budgets to the tighter ([`KeySet::merged`]), so a
+    /// raise would not reach them. A key that needs more is a new key.
+    pub fn lower_budget(&self, id: &str, budget: chloedb::query::budget::Budget) -> Result<Option<chloedb::query::budget::Budget>, ApiError> {
+        let mut set = self.lock();
+        let mut next = set.clone();
+        let Some(k) = next.keys.iter_mut().find(|k| k.id == id || k.name == id) else { return Ok(None) };
+        let now = k.budget.unwrap_or_default().within(budget);
+        k.budget = Some(now).filter(|b| !b.is_none());
+        let kid = k.id.clone();
+        for c in next.keys.iter_mut().filter(|c| c.parent.as_deref() == Some(kid.as_str())) {
+            c.budget = Some(c.budget.unwrap_or_default().within(now)).filter(|b| !b.is_none());
+        }
+        self.save(&next)?;
+        *set = next;
+        drop(set);
+        self.changed.notify_one();
+        Ok(Some(now))
+    }
+
     pub fn list(&self) -> Vec<Json> {
         let mut out: Vec<Json> = self.lock().keys.iter().map(Key::json).collect();
         out.extend(self.ephemeral().iter().map(|k| {
@@ -956,7 +1005,7 @@ impl Keys {
         let secret = hex(&random(24)?);
         let full = format!("sk_{id}_{secret}");
         let scope = widest(&tables);
-        let key = Key { id, name: name.to_string(), scope, created_ms: now_ms(), expires_ms: None, sha256: stored_digest(&secret, true, false), last_used_ms: 0, owner: Some(name.to_string()), note: Some(note), last_addr: None, tables: Some(tables), parent: None, role: None, agent: false, on_behalf_of: None, allow: None };
+        let key = Key { id, name: name.to_string(), scope, created_ms: now_ms(), expires_ms: None, sha256: stored_digest(&secret, true, false), last_used_ms: 0, owner: Some(name.to_string()), note: Some(note), last_addr: None, tables: Some(tables), parent: None, role: None, agent: false, on_behalf_of: None, allow: None, budget: None };
         let mut e = self.ephemeral();
         e.retain(|k| k.name != name);
         e.push(key);
@@ -1115,6 +1164,7 @@ impl Keys {
             agent: more.agent || more.role.is_some(),
             on_behalf_of: more.on_behalf_of.map(|p| p.trim().to_string()),
             allow,
+            budget: more.budget.filter(|b| !b.is_none()),
         };
         let mut next = set.clone();
         next.keys.push(key.clone());
@@ -1188,7 +1238,7 @@ impl Keys {
         let full = format!("sk_{id}_{secret}");
         let now = now_ms();
         let scope = widest(&tables);
-        let key = Key { id, name: full_name, scope, created_ms: now, expires_ms: parent.expires_ms, sha256: stored_digest(&secret, true, true), last_used_ms: 0, owner: Some(parent.name.clone()), note, last_addr: None, tables: Some(tables), parent: Some(parent_id), role: None, agent: parent.agent, on_behalf_of: parent.on_behalf_of.clone(), allow: None };
+        let key = Key { id, name: full_name, scope, created_ms: now, expires_ms: parent.expires_ms, sha256: stored_digest(&secret, true, true), last_used_ms: 0, owner: Some(parent.name.clone()), note, last_addr: None, tables: Some(tables), parent: Some(parent_id), role: None, agent: parent.agent, on_behalf_of: parent.on_behalf_of.clone(), allow: None, budget: parent.budget };
         let mut next = set.clone();
         next.keys.retain(|k| !before.iter().any(|b| b.id == k.id));
         for b in before {

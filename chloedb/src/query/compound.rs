@@ -34,6 +34,7 @@
 //! tables runs as one within a table does.
 
 use super::function::FunctionSet;
+use super::budget::Budget;
 use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -1104,7 +1105,9 @@ pub fn plan(sql_text: &str, schema: &Schema, params: &Params) -> Result<ir::Plan
 
 /// [`plan`] of a query that may read any of the tables of `catalog`.
 pub fn plan_in(sql_text: &str, catalog: &[&Schema], params: &Params) -> Result<ir::Plan> {
-    plan_query(&*parse(sql_text)?, catalog, params)
+    let q = parse(sql_text)?;
+    check_budget(&q, params)?;
+    plan_query(&q, catalog, params)
 }
 
 /// A table's rank profile by name, the table and the name in any case
@@ -1124,42 +1127,98 @@ pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params, profiles:
     plan_read_calling(sql_text, catalog, params, profiles, &FunctionSet::default())
 }
 
+/// The limits of the plans made on one thread ([`planning_under`]).
+#[derive(Clone, Default)]
+struct Planning {
+    deadline: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
+    /// The statement's budget ([`super::budget`]).
+    budget: Budget,
+    /// When the plan's `plan_ms` runs out, and the budget.
+    plan_by: Option<(Instant, u64)>,
+}
+
 thread_local! {
-    /// The deadline and cancel flag of the plans made on this thread
-    /// ([`planning_under`]).
-    static PLANNING: RefCell<(Option<Instant>, Option<Arc<AtomicBool>>)> = const { RefCell::new((None, None)) };
+    /// The deadline, cancel flag and budget of the plans made on this
+    /// thread ([`planning_under`]).
+    static PLANNING: RefCell<Planning> = RefCell::new(Planning::default());
 }
 
 /// `f`, whose plans ([`plan_read_calling`] and the rest) stop with
-/// [`Error::Timeout`] once `opts`' deadline passes or its cancel flag is
-/// set: a statement whose planning takes long (thousands of `WITH`
-/// results, say) gives up when its query would, rather than holding a
-/// thread past the caller's wait.
+/// [`Error::Timeout`] once `opts`' deadline passes, its cancel flag is
+/// set or its budget's `plan_ms` runs out from now, and are refused once
+/// written out past its budget's `nodes`, `depth` or `list`
+/// ([`super::budget`]): a statement whose planning takes long (thousands
+/// of `WITH` results, say) gives up when its query would, rather than
+/// holding a thread past the caller's wait.
 pub fn planning_under<T>(opts: &ExecOptions, f: impl FnOnce() -> T) -> T {
-    struct Restore((Option<Instant>, Option<Arc<AtomicBool>>));
+    struct Restore(Planning);
     impl Drop for Restore {
         fn drop(&mut self) {
             let before = std::mem::take(&mut self.0);
             PLANNING.with(|p| *p.borrow_mut() = before);
         }
     }
-    let _restore = Restore(PLANNING.with(|p| p.replace((opts.deadline, opts.cancel.clone()))));
+    let now = Planning {
+        deadline: opts.deadline,
+        cancel: opts.cancel.clone(),
+        budget: opts.budget,
+        plan_by: opts.budget.plan_ms.map(|ms| (Instant::now() + std::time::Duration::from_millis(ms), ms)),
+    };
+    let _restore = Restore(PLANNING.with(|p| p.replace(now)));
     f()
 }
 
+/// The budget of the statement being planned on this thread
+/// ([`planning_under`]).
+pub(crate) fn planning_budget() -> Budget {
+    PLANNING.with(|p| p.borrow().budget)
+}
+
 /// [`Error::Timeout`] once the plan being made ran past the deadline or
-/// was cancelled ([`planning_under`]).
-fn check_planning() -> Result<()> {
+/// its budget's `plan_ms`, or was cancelled ([`planning_under`]).
+pub(crate) fn check_planning() -> Result<()> {
     PLANNING.with(|p| {
         let p = p.borrow();
-        if p.1.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        if p.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             return Err(Error::Timeout("the query was cancelled while it was planned".into()));
         }
-        match p.0 {
-            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline while it was planned".into())),
+        let now = Instant::now();
+        if let Some((_, ms)) = p.plan_by.filter(|(by, _)| now >= *by) {
+            return Err(Error::Timeout(format!("the statement took more than {ms} ms to plan, its budget (plan_ms): write it with fewer WITH results, set operations or calls, or raise the budget")));
+        }
+        match p.deadline {
+            Some(d) if now >= d => Err(Error::Timeout("the query ran past its deadline while it was planned".into())),
             _ => Ok(()),
         }
     })
+}
+
+/// [`check_planning`] every 1,024 calls of `n` (a loop over values as
+/// a statement binds).
+pub(crate) fn check_planning_every(n: usize) -> Result<()> {
+    match n % 1024 {
+        1023 => check_planning(),
+        _ => Ok(()),
+    }
+}
+
+/// A query error when statement `sql` as written (a write, which calls
+/// no stored function) is past the shape the budget of the statement
+/// being planned allows; nothing is parsed when it bounds none.
+pub(crate) fn check_statement(sql_text: &str, params: &Params) -> Result<()> {
+    super::budget::check_text(&planning_budget(), sql_text, params)
+}
+
+/// A query error when `q`, written out, is past the shape the budget of
+/// the statement being planned allows ([`super::budget::check_shape`]).
+fn check_budget(q: &sql::Query, params: &Params) -> Result<()> {
+    let b = planning_budget();
+    if b.is_none() {
+        return Ok(());
+    }
+    check_planning()?;
+    super::budget::check_shape(&b, q, params)
 }
 
 /// [`plan_read`] of a query that may call the stored functions of
@@ -1200,6 +1259,8 @@ fn plan_read_with(q: &sql::Query, catalog: &[&Schema], params: &Params, profiles
         let table = super::tables::read_by(&q).first().cloned().unwrap_or_default();
         return Ok(super::profile::mark(plan_read_query(&q, catalog, params, &|_, _| None, functions)?, &table, &r));
     }
+    // Written out, the statement is held to its budget.
+    check_budget(q, params)?;
     let schema = match super::tables::read_by(q).first() {
         None => *catalog.first().ok_or_else(|| err("the database has no tables"))?,
         Some(t) => catalog.iter().copied().find(|s| s.table.eq_ignore_ascii_case(t)).ok_or_else(|| err(hint::no_table(t, catalog.iter().map(|s| s.table.as_str()))))?,

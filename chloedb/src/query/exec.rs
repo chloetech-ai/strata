@@ -488,6 +488,14 @@ pub struct ExecOptions {
     pub now: Option<i64>,
     /// Keep expired rows: what deletes them looks for them with it.
     pub expired: bool,
+    /// What one statement run with these options may cost
+    /// ([`crate::query::budget`]): its shape once written out, the time
+    /// its plans take, the rows it reads. Default: no bound.
+    pub budget: crate::query::budget::Budget,
+    /// The rows the statement read so far, against its budget's
+    /// `rows_read` ([`crate::query::budget::guarded`] makes it); shared by
+    /// its parts. `None`: not counted.
+    pub reads: Option<Arc<crate::query::budget::Reads>>,
 }
 
 /// The engine of a plan's operators ([`crate::query::ops`] or
@@ -561,6 +569,8 @@ impl Default for ExecOptions {
             engine: Engine::from_env(),
             now: None,
             expired: false,
+            budget: crate::query::budget::Budget::default(),
+            reads: None,
         }
     }
 }
@@ -650,6 +660,19 @@ pub struct Ticker<'o> {
     opts: &'o ExecOptions,
     every: u32,
     n: u32,
+    /// Each step is a row read, counted against the statement's
+    /// `rows_read` ([`ExecOptions::reads`]).
+    counts: bool,
+}
+
+impl Drop for Ticker<'_> {
+    fn drop(&mut self) {
+        // The steps since the last check; the next check, or the answer's,
+        // holds them to the budget.
+        if let (true, Some(r)) = (self.counts, &self.opts.reads) {
+            r.add(self.n as u64);
+        }
+    }
 }
 
 impl<'o> Ticker<'o> {
@@ -658,7 +681,13 @@ impl<'o> Ticker<'o> {
     pub const DOCS: u32 = 1024;
 
     pub fn new(opts: &'o ExecOptions, every: u32) -> Ticker<'o> {
-        Ticker { opts, every: every.max(1), n: 0 }
+        Ticker { opts, every: every.max(1), n: 0, counts: true }
+    }
+
+    /// [`Ticker::new`] of a loop whose steps are not rows read (rows
+    /// already read, projected).
+    pub fn uncounted(opts: &'o ExecOptions, every: u32) -> Ticker<'o> {
+        Ticker { opts, every: every.max(1), n: 0, counts: false }
     }
 
     /// One step: [`ExecOptions::check`] every `every` steps.
@@ -669,6 +698,9 @@ impl<'o> Ticker<'o> {
             return Ok(());
         }
         self.n = 0;
+        if let (true, Some(r)) = (self.counts, &self.opts.reads) {
+            r.charge(self.every as u64)?;
+        }
         self.opts.check()
     }
 }
@@ -1615,7 +1647,7 @@ impl<'a> Executor<'a> {
     }
 
     pub fn execute(self, q: &Select) -> Result<ResultSet> {
-        match self.answer(q, None)? {
+        match self.answer_counted(q, None)? {
             Leaf::Rows(rs) => Ok(rs),
             #[cfg(feature = "datafusion")]
             Leaf::Arrow(_) => unreachable!("rows asked for"),
@@ -1629,7 +1661,24 @@ impl<'a> Executor<'a> {
     /// the rows being made first.
     #[cfg(feature = "datafusion")]
     pub fn execute_arrow(self, q: &Select, over: usize) -> Result<Leaf> {
-        self.answer(q, Some(over))
+        self.answer_counted(q, Some(over))
+    }
+
+    /// [`Executor::answer`], its rows counted as read against the
+    /// statement's `rows_read` ([`ExecOptions::reads`]), with what its
+    /// loops read since their last check.
+    fn answer_counted(self, q: &Select, arrow_over: Option<usize>) -> Result<Leaf> {
+        let reads = self.opts.reads.clone();
+        let leaf = self.answer(q, arrow_over)?;
+        if let Some(r) = reads {
+            let n = match &leaf {
+                Leaf::Rows(rs) => rs.rows.len(),
+                #[cfg(feature = "datafusion")]
+                Leaf::Arrow(a) => a.rows,
+            };
+            r.charge(n as u64)?;
+        }
+        Ok(leaf)
     }
 
     fn answer(mut self, q: &Select, arrow_over: Option<usize>) -> Result<Leaf> {
@@ -4701,7 +4750,8 @@ impl<'a> Executor<'a> {
         let mut at: Option<Seg<'a>> = None;
         // A filter the leaf cannot answer (`LIKE '%x%'` on a KEYWORD
         // field) projects every row of a segment for the operator above.
-        let mut tick = self.ticker();
+        // Rows projected are counted as read once, in the answer.
+        let mut tick = Ticker::uncounted(self.opts, Ticker::DOCS);
         for (r, h) in hits.iter().enumerate() {
             tick.tick()?;
             if at.as_ref().is_none_or(|s| s.ord != h.seg) {

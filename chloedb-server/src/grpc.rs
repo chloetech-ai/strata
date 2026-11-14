@@ -316,6 +316,9 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         who: None,
         // A client's, held to the server's limits.
         own_read: false,
+        // The server's and the caller's key's statement budget
+        // ([`Service::budget_for`]); a gRPC request asks for none of its own.
+        budget: Default::default(),
     })
 }
 

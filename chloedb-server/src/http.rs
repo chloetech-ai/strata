@@ -96,7 +96,7 @@
 //! | `GET /v1/events?from=&to=&kind=&limit=`, `POST /v1/events/notes` | `{text, ts_ms?, where?}` | what happened, the newest first: copies down and back, new primaries, changes, notes ([`crate::events`]) |
 //! | `GET /v1/health/fleet` | | `{status, headline, since_ms, checks, problems, coordinators}`: whether the cluster is all right and what is wrong first ([`crate::fleet`]) |
 //! | `GET /v1/admin/model-budget` | | the model calls each API key made today with the server's credentials, by key id, and how many it may (`per_day`, [`crate::budget`]) |
-//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id`, `POST /v1/admin/keys/:id/rotate` | `{name, scope, expires_days?, owner?, note?}`, rotate `{grace_minutes?}` | the API keys, how many were revoked, and how the last merge of keys went with each server of the cluster (`peers`, [`crate::keysync`]); a new one's secret is answered once; each key with its owner, note and last address, and the revoked ones (who revoked them, when); a rotation answers a new key of the same name and scope, the old one expiring after the grace (60 min) |
+//! | `GET /v1/admin/keys`, `POST /v1/admin/keys`, `DELETE /v1/admin/keys/:id`, `POST /v1/admin/keys/:id/rotate`, `POST /v1/admin/keys/:id/budget` | `{name, scope, expires_days?, owner?, note?, budget?}`, rotate `{grace_minutes?}`, budget `{nodes?, depth?, list?, plan_ms?, rows_read?}` (lowers it) | the API keys, how many were revoked, and how the last merge of keys went with each server of the cluster (`peers`, [`crate::keysync`]); a new one's secret is answered once; each key with its owner, note and last address, and the revoked ones (who revoked them, when); a rotation answers a new key of the same name and scope, the old one expiring after the grace (60 min) |
 //! | `GET /v1/admin/keys/clients?hours=24` | | which clients sent each key over the last `hours` (1 to 168): by key id, each client's app, client, address, calls, failed calls, first and last; every query counts, not a sample; on a coordinator every coordinator's summed, each client naming the `coordinators` it went through (`coordinators` says which answered; `local=1` for this one's); `since_ms`: from when every coordinator counted |
 //! | `GET /v1/admin/audit?kind=&from=&to=&who=&q=&limit=n` | | the changes, notes and refused requests, the newest first, with `kind` (change, note, refusal), who, addr, client, reason, object, before and after; older than memory holds from the log store's `audit`; on a coordinator every coordinator's, each entry naming its `coordinator` (`coordinators` says which answered; `local=1` for this one's) |
 //! | `GET /v1/alerts`, `PUT /v1/alerts/rules` | `{rules}` | the alert rules with their states and the latest changes ([`crate::alerts`]); `brief=1`: each rule's state, and of those not ok what the bell shows; on a coordinator the PUT answers how many copies took them (`pushed`) |
@@ -495,6 +495,7 @@ fn api(app: &App) -> Router<App> {
         .route("/v1/events", get(events_list))
         .route("/v1/events/notes", post(events_note))
         .route("/v1/admin/keys/:id/rotate", post(rotate_key))
+        .route("/v1/admin/keys/:id/budget", post(lower_key_budget))
         .route("/v1/load", get(copies_load))
         .route("/v1/admin/kube/versions", get(kube_versions))
         .route("/v1/admin/plan", post(admin_plan))
@@ -1123,6 +1124,13 @@ struct ClientError(Arc<str>);
 struct Audited(String);
 
 /// The answer `j`, with what the audit log says of it.
+/// The statement budget a request's body asks for (`"budget": {"nodes":
+/// 1000, ...}` or `"budget": "nodes=1000"`, [`chloedb::query::budget`]),
+/// within its key's and the server's; none when it asks for none.
+fn body_budget(b: &Json) -> Result<chloedb::query::budget::Budget, ApiError> {
+    Ok(b.get("budget").map(chloedb::query::budget::Budget::from_json).transpose()?.unwrap_or_default())
+}
+
 fn audited(j: Json, detail: String) -> Response {
     let mut r = AxJson(j).into_response();
     r.extensions_mut().insert(Audited(detail));
@@ -1683,6 +1691,7 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
         profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true),
         scroll: page.map(|page| crate::service::ScrollAsk { page, keep_alive, owner: crate::service::scroll_owner(&who) }),
         who: Some(who.clone()),
+        budget: body_budget(&b)?,
         ..Default::default()
     };
     // The answer cache knows the query by its SQL and the statistics it
@@ -2126,7 +2135,7 @@ async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, head
         audit_ui_write(statement, None, None);
     }
     let key = body_key(&b, &headers)?;
-    let (r, partial) = crate::coord::with_partial(app.svc.sql_in(&w, statement, &params, after(&b)?, body_u64(&b, "timeout_ms")?, None, key)).await;
+    let (r, partial) = crate::coord::with_partial(app.svc.sql_budgeted(&w, statement, &params, after(&b)?, body_u64(&b, "timeout_ms")?, None, key, body_budget(&b)?)).await;
     match r {
         Ok(SqlAnswer::Rows(mut a)) => {
             hide_hosts(&w, &mut a.rs.stats.steps);
@@ -3199,10 +3208,11 @@ fn source_json(s: chloedb::db::Source) -> Json {
 
 /// Whether a statement would run on this deployment, without running it
 /// ([`crate::sql_check`]): `{runs, deployment, kind, error?, notes}`.
-async fn sql_check(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
+async fn sql_check(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(None, b.get("params")).await?;
-    Ok(AxJson(crate::sql_check::check(&app.svc, sql, &params)))
+    let budget = app.svc.budget_for(Some(&who(w)), body_budget(&b)?);
+    Ok(AxJson(app.svc.sql_check(sql, &params, body_u64(&b, "timeout_ms")?, budget).await?))
 }
 
 /// A schema validated, in both JSON forms and as the `CREATE TABLE`
@@ -3352,8 +3362,12 @@ async fn explain(State(app): State<App>, w: Option<axum::Extension<Principal>>, 
     // A compound query is operators over single-table queries; what each
     // of those ran is in "plan".
     let profiles = |t: &str, n: &str| app.svc.rank_profile(t, n);
-    // The plan names the files of its ranking models.
-    let plan = app.svc.open_ranking_models(std::sync::Arc::new(chloedb::query::compound::plan_read_calling(sql, &tables, &params, &profiles, &app.svc.functions())?), false)?;
+    // The plan names the files of its ranking models. It is made as the
+    // query's would be: off the request's thread when it may take long,
+    // stopped at the deadline, within the statement's budget (X-B12).
+    let budget = body_budget(&b)?;
+    let timeout_ms = body_u64(&b, "timeout_ms")?;
+    let plan = app.svc.open_ranking_models(std::sync::Arc::new(app.svc.plan_for_explain(sql, &params, timeout_ms, app.svc.budget_for(Some(&who), budget)).await?), false)?;
     let logical = match plan.root.uses_operators() {
         true => "a compound query: operators over single-table queries (\"tree\"), whose runs are in \"plan\"".to_string(),
         false => {
@@ -3373,7 +3387,7 @@ async fn explain(State(app): State<App>, w: Option<axum::Extension<Principal>>, 
         _ if !chloedb::query::sql::ranks(sql) => None,
         n => {
             let asked = match chloedb::query::sql::with_features(sql) {
-                Ok(sql) => app.svc.query(QueryReq { sql, params: params.clone(), timeout_ms: body_u64(&b, "timeout_ms")?, ..Default::default() }).await,
+                Ok(sql) => app.svc.query(QueryReq { sql, params: params.clone(), timeout_ms, who: Some(who.clone()), budget, ..Default::default() }).await,
                 Err(e) => Err(ApiError::from(e)),
             };
             match asked {
@@ -3390,7 +3404,7 @@ async fn explain(State(app): State<App>, w: Option<axum::Extension<Principal>>, 
             }
         }
     };
-    let mut a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms")?, profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true),         ..Default::default() }).await?;
+    let mut a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms, profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true), who: Some(who.clone()), budget, ..Default::default() }).await?;
     hide_hosts(&who, &mut a.rs.stats.steps);
     let mut out = json!({
         "kind": a.kind,
@@ -6355,13 +6369,25 @@ async fn rotate_key(State(app): State<App>, w: Option<axum::Extension<Principal>
     Ok(audited(json!({"key": key.json(), "secret": secret, "old": old.json()}), detail))
 }
 
+/// `POST /v1/admin/keys/:id/budget {"rows_read": 1000000, ...}`: lowers
+/// the statement budget of key `:id` (its id or name) and of the keys it
+/// made ([`keys::Keys::lower_budget`]); answers the budget it has now.
+async fn lower_key_budget(State(app): State<App>, w: Option<axum::Extension<Principal>>, axum::extract::Path(id): axum::extract::Path<String>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let asked = chloedb::query::budget::Budget::from_json(&b)?;
+    let Some(now) = app.svc.keys.lower_budget(&id, asked)? else { return Err(ApiError { code: None, status: 404, message: format!("no key {id}") }) };
+    let by = keys::audit_name(&who(w));
+    keys::note_change(keys::Change { object: Some(format!("key {id}")), after: Some(json!({"budget": now})), ..Default::default() });
+    tracing::info!(key = %id, by = %by, budget = %now.spec(), "API key budget lowered");
+    Ok(audited(json!({"key": id, "budget": now}), format!("lowered the statement budget of key {id} to {}", if now.is_none() { "none".to_string() } else { now.spec() })))
+}
+
 /// `{"name": ..., "scope": "feed" | "read" | "write" | "admin",
 /// "expires_days": n}`: a new key; its secret is in this answer only.
 async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
     // A misspelt field would otherwise be left out without a word, and a
     // key without its limits reads every table: refuse what is not a
     // field of a key.
-    const FIELDS: &[&str] = &["name", "scope", "tables", "routes", "apps", "preset", "prefix", "expires_days", "expires_minutes", "agent", "owner", "note", "on_behalf_of", "reason"];
+    const FIELDS: &[&str] = &["name", "scope", "tables", "routes", "apps", "preset", "prefix", "expires_days", "expires_minutes", "agent", "owner", "note", "on_behalf_of", "reason", "budget"];
     let Json::Object(fields) = &b else { return Err(ApiError::bad("a key is a JSON object: {\"name\": ..., \"scope\": ...}")) };
     if let Some(k) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
         return Err(ApiError::bad(format!("{k:?} is not a field of a key: {}", FIELDS.join(", "))));
@@ -6415,13 +6441,15 @@ async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<R
     // A shard, or a copy in replication, whose callers send no credential.
     let in_cluster = app.svc.slots().is_some() || app.svc.role() != crate::pb::Role::Standalone;
     let text = |k: &str| b.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(|v| v.chars().take(200).collect::<String>());
-    let more = keys::AgentKey { role, agent, on_behalf_of: text("on_behalf_of"), allow: Some(allow) };
+    // What one statement it sends may cost ([`chloedb::query::budget`]).
+    let budget = b.get("budget").map(chloedb::query::budget::Budget::from_json).transpose()?.filter(|b| !b.is_none());
+    let more = keys::AgentKey { role, agent, on_behalf_of: text("on_behalf_of"), allow: Some(allow), budget };
     let (key, secret) = app.svc.keys.create_full(name, scope, tables, expires, text("owner"), text("note"), more, app.guarded(), in_cluster)?;
     let scope = key.scope_name();
     let limits = key.tables.as_deref().map(keys::grants_json);
     keys::note_change(keys::Change {
         object: Some(format!("key {}", key.name)),
-        after: Some(json!({"id": key.id, "scope": scope, "tables": limits, "allow": key.allow.as_ref().map(keys::Allow::json), "owner": key.owner, "expires_ms": key.expires_ms, "agent": key.agent, "on_behalf_of": key.on_behalf_of})),
+        after: Some(json!({"id": key.id, "scope": scope, "tables": limits, "allow": key.allow.as_ref().map(keys::Allow::json), "owner": key.owner, "expires_ms": key.expires_ms, "agent": key.agent, "on_behalf_of": key.on_behalf_of, "budget": key.budget})),
         ..Default::default()
     });
     tracing::info!(key = %key.id, name = %key.name, scope, limited = key.tables.is_some(), agent = key.agent, "API key created");

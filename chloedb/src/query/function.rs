@@ -1024,6 +1024,8 @@ impl Expansion<'_> {
     /// call of a few bytes could plan 16,000 levels and overflow the
     /// stack).
     fn check(&mut self, name: &str, out: &mut Expr, pos: usize) -> Result<()> {
+        // Each call written out: the deadline and plan_ms too (X-B3).
+        super::compound::check_planning()?;
         let room = super::parse::MAX_EXPR_DEPTH.saturating_sub(pos);
         if depth_of(out, room, &mut self.nodes) > room {
             return Err(err(format!(
