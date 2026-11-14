@@ -264,6 +264,17 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     assert!(sug["items"].as_array().unwrap().iter().any(|i| i["text"] == "OLTs that are not ok"), "a state follows 'not': {}", sug["items"]);
     let sug = api.get(&format!("/v1/suggest?q={}", q("kind:ol"))).await;
     assert_eq!(sug["items"][0]["text"], "kind:olt", "a filter's values: {}", sug["items"]);
+    // A customer by the start of its name; and, once read, a keystroke
+    // counts nothing over every object again (NET-24).
+    let firm = api.http.post(format!("{}/v1/query", app.strata)).json(&json!({"objects": true, "sql": "SELECT customer, COUNT(*) AS n FROM netops_estate_nodes WHERE customer != '' GROUP BY customer ORDER BY n DESC LIMIT 1"})).send().await.unwrap().json::<Value>().await.unwrap()["rows"][0]["customer"].as_str().unwrap().to_string();
+    let typed: String = firm.chars().take(4).collect();
+    for round in 0..2 {
+        let sug = api.get(&format!("/v1/suggest?q={}", q(&typed))).await;
+        assert!(sug["items"].as_array().unwrap().iter().any(|i| i["kind"] == "customer" && i["text"].as_str().unwrap().contains(&firm)), "{typed} completes to {firm}: {}", sug["items"]);
+        if round == 1 {
+            assert!(sug["queries"].as_array().unwrap().iter().all(|x| !x["sql"].as_str().unwrap().contains("GROUP BY")), "a keystroke groups nothing: {}", sug["queries"]);
+        }
+    }
     let sug = api.get(&format!("/v1/suggest?q=&mode=ask&sel={fid}&prev={}", q("What is wrong with it, and why?"))).await;
     assert_eq!(sug["items"][0]["intent"], "changed", "after what is wrong, what changed: {}", sug["items"]);
     let det = api.get(&format!("/v1/map/detail?id={fid}")).await;

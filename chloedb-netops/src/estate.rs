@@ -588,11 +588,19 @@ pub async fn ensure(e: &Engine) -> Result<()> {
     let mut done = 0usize;
     let mut rng = Rng::new(31);
     const PART: usize = 5000;
+    // Said as the map says it: the objects, without the places that hold them.
+    let places = est.nodes.len() - objects;
+    let objects_text = format!("{} objects and {} places", thousands(objects), thousands(places));
     for (what, n) in [("objects", est.nodes.len()), ("links", est.edges.len()), ("two months of faults and changes", objects)] {
         let mut from = 0;
         while from < n {
             let to = (from + PART).min(n);
-            e.phase(&format!("Writing the estate: {n} {what}"), 0.97 * done as f64 / total);
+            let text = match what {
+                "objects" => objects_text.clone(),
+                "links" => format!("{} links", thousands(n)),
+                _ => format!("two months of faults and changes on {} objects", thousands(objects)),
+            };
+            e.phase(&format!("Writing the estate: {text}"), 0.97 * done as f64 / total);
             match what {
                 "objects" => e.db.upsert(NODES, est.node_rows(from..to, &mut rng)).await?,
                 "links" => e.db.upsert(EDGES, est.edge_rows(from..to)).await?,
@@ -810,6 +818,19 @@ pub async fn diagnose(e: &Engine, incident: &str, m: i64) -> Result<()> {
     }
     run.finish("done", &format!("{title} ({cause})"), 0.9).await?;
     Ok(())
+}
+
+/// A count with its thousands separated: 170,337.
+pub fn thousands(n: usize) -> String {
+    let d = n.to_string();
+    let mut out = String::new();
+    for (k, c) in d.chars().enumerate() {
+        if k > 0 && (d.len() - k) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ---- walking where the server does not (a coordinator)
@@ -1223,4 +1244,35 @@ async fn node(State(svc): State<Shared>, Query(a): Query<NodeQ>) -> Answer {
     }
     q.done(json!({"node": n, "engine": engine, "incident": own, "cause": cause, "suspect": suspect, "upstream": upstream, "downstream": {"rows": downstream, "total": total, "not_ok": not_ok},
         "near": near, "history": history, "changes": changes, "before": before}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_are_said_with_their_thousands() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(170_337), "170,337");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    /// A walk is read by the places that hold it: the hub of what hangs
+    /// from one hub router, the metro of what a metro's backbone carries.
+    #[test]
+    fn a_walk_is_held_by_its_hubs_or_its_metro() {
+        let est = Estate::build(&World::build(), 4000);
+        let hr = est.find("hr1-h01-ams").expect("a hub router");
+        let below = est.below(hr, 100_000);
+        assert!(!below.is_empty());
+        assert_eq!(est.places_of(&below).as_deref(), Some("hub IN ('h01-ams')"));
+        let ag = est.find("ag1-ams").expect("an aggregation router");
+        let all = est.walk(ag, 6, 100_000, true, false);
+        let place = est.places_of(&all).expect("a place holds it");
+        assert!(place.starts_with("hub IN (") || place == "metro IN ('m-ams')", "{place}");
+        assert!(all.iter().all(|&i| est.places(i)[1] == "m-ams" || est.nodes[i as usize].layer == "core"));
+        assert_eq!(est.places_of(&[]), None);
+    }
 }

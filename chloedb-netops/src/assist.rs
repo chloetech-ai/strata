@@ -44,6 +44,42 @@ async fn vocab(q: &Q) -> Arc<Vocabulary> {
     VOCAB.get_or_init(|| v).clone()
 }
 
+/// The estate's customers and how many sites each has, and its kinds and
+/// how many of each there are in a place: what an object is and where it
+/// sits do not change, so each is read once (NET-24: a GROUP BY over every
+/// object, per keystroke, is slow through a coordinator).
+static CUSTOMERS: OnceLock<Arc<Vec<(String, i64)>>> = OnceLock::new();
+static KIND_COUNTS: std::sync::Mutex<BTreeMap<String, Arc<Vec<Row>>>> = std::sync::Mutex::new(BTreeMap::new());
+
+async fn customers(q: &Q) -> Arc<Vec<(String, i64)>> {
+    if let Some(c) = CUSTOMERS.get() {
+        return c.clone();
+    }
+    let rows = q.soft("Customers and their sites (GROUP BY, read once)", &format!("SELECT customer, COUNT(*) AS n FROM {NODES}\nWHERE customer != ''\nGROUP BY customer LIMIT 5000"), json!({})).await;
+    let c = Arc::new(rows.iter().map(|r| (r.s("customer"), r.i("n"))).filter(|c| !c.0.is_empty()).collect::<Vec<_>>());
+    if c.is_empty() {
+        return c;
+    }
+    CUSTOMERS.get_or_init(|| c).clone()
+}
+
+/// The kinds of object in a place (`scope_sql` narrows it), the most first.
+async fn kinds_in(q: &Q, scope_sql: &str, scope_p: &Value) -> Arc<Vec<Row>> {
+    let key = format!("{scope_sql}={scope_p}");
+    if let Some(k) = KIND_COUNTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return k.clone();
+    }
+    let rows = Arc::new(q.soft("Kinds in view, by how many (GROUP BY, read once a place)", &format!("SELECT kind, COUNT(*) AS n FROM {NODES}\nWHERE layer != 'container'{scope_sql}\nGROUP BY kind ORDER BY n DESC LIMIT 30"), json!({"scope": scope_p})).await);
+    if !rows.is_empty() {
+        let mut all = KIND_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        if all.len() > 2000 {
+            all.clear();
+        }
+        all.insert(key, rows.clone());
+    }
+    rows
+}
+
 /// Only what may sit inside a quoted literal or a parameter.
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '\'' | '\\' | '\0')).take(120).collect()
@@ -182,7 +218,7 @@ async fn suggest(State(svc): State<Shared>, Query(a): Query<SuggestQ>) -> Answer
         let part_l = part.to_lowercase();
         match field.to_lowercase().as_str() {
             "kind" => {
-                let rows = q.soft("Kinds in view, by how many (GROUP BY)", &format!("SELECT kind, COUNT(*) AS n FROM {NODES}\nWHERE layer != 'container'{scope_sql}\nGROUP BY kind ORDER BY n DESC LIMIT 30"), json!({"scope": scope_p})).await;
+                let rows = kinds_in(&q, &scope_sql, &scope_p).await;
                 for r in rows.iter().filter(|r| r.s("kind").starts_with(&part_l)) {
                     items.add("filter", join(&format!("kind:{}", r.s("kind"))), format!("kind:{}", r.s("kind")), format!("{} {}", r.i("n"), plural(&r.s("kind"))), 50.0 + r.f("n").log10(), json!({"n": r.i("n")}));
                 }
@@ -220,7 +256,27 @@ async fn suggest(State(svc): State<Shared>, Query(a): Query<SuggestQ>) -> Answer
     if wl.len() >= 2 && wants_object {
         // A name matches where one of its words starts with what is typed.
         let p = json!({"w": wl, "scope": scope_p, "pre": format!("{wl}%"), "mid": format!("% {wl}%")});
-        let mut rows = q.soft("Objects by the start of their id (PREFIX over the dictionary)", &format!("SELECT id, kind, name, state, reason, metro, hub FROM {NODES}\nWHERE PREFIX(id, :w) AND layer != 'container'{scope_sql}\nORDER BY CASE WHEN state = 'ok' THEN 0 ELSE 1 END DESC, tier, id LIMIT 6"), p.clone()).await;
+        // The objects, the places and the circuits are asked at once.
+        let three = wl.len() >= 3;
+        let by_id = format!("SELECT id, kind, name, state, reason, metro, hub FROM {NODES}\nWHERE PREFIX(id, :w) AND layer != 'container'{scope_sql}\nORDER BY CASE WHEN state = 'ok' THEN 0 ELSE 1 END DESC, tier, id LIMIT 6");
+        let (rows, places, circ) = tokio::join!(
+            q.soft("Objects by the start of their id (PREFIX over the dictionary)", &by_id, p.clone()),
+            async {
+                if three {
+                    q.soft("Places by any part of their name (ILIKE over the substring index)", &format!("SELECT id, kind, name, children FROM {NODES}\nWHERE (name ILIKE :pre OR name ILIKE :mid) AND layer = 'container'{scope_sql}\nORDER BY tier, id LIMIT 5"), p.clone()).await
+                } else {
+                    Vec::new()
+                }
+            },
+            async {
+                if three && scope.is_none() {
+                    q.soft("Circuits by the start of their id (PREFIX)", "SELECT id, circuit, provider, plane, status FROM netops_links\nWHERE PREFIX(circuit, :w) LIMIT 4", json!({"w": w.to_uppercase()})).await
+                } else {
+                    Vec::new()
+                }
+            }
+        );
+        let mut rows = rows;
         let mut fuzzy = false;
         if rows.is_empty() && wl.len() >= 4 {
             rows = q.soft("Objects by the start of their id, with a typo (PREFIX, fuzzy)", &format!("SELECT id, kind, name, state, reason, metro, hub FROM {NODES}\nWHERE PREFIX(id, :w, fuzzy => 'auto') AND layer != 'container'{scope_sql}\nORDER BY tier, id LIMIT 5"), p.clone()).await;
@@ -231,8 +287,7 @@ async fn suggest(State(svc): State<Shared>, Query(a): Query<SuggestQ>) -> Answer
             let sub = [crate::assist::kind_name(&r.s("kind")).to_string(), if st == "ok" { String::new() } else { st.clone() }, r.s("hub"), r.s("metro").trim_start_matches("m-").to_string()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
             items.add("object", join(&r.s("id")), r.s("id"), sub, if st == "ok" { 40.0 } else { 45.0 } - if fuzzy { 5.0 } else { 0.0 }, json!({"id": r.s("id"), "state": st, "fuzzy": fuzzy}));
         }
-        if wl.len() >= 3 {
-            let places = q.soft("Places by any part of their name (ILIKE over the substring index)", &format!("SELECT id, kind, name, children FROM {NODES}\nWHERE (name ILIKE :pre OR name ILIKE :mid) AND layer = 'container'{scope_sql}\nORDER BY tier, id LIMIT 5"), p.clone()).await;
+        if three {
             for r in &places {
                 // A metro or a region is said by its name; a hub or a site by its hub's id, which the reader knows.
                 let word = match r.s("kind").as_str() {
@@ -243,13 +298,22 @@ async fn suggest(State(svc): State<Shared>, Query(a): Query<SuggestQ>) -> Answer
                 let sub = if word == r.s("name") { format!("{} · {} objects", kind_name(&r.s("kind")), r.i("children")) } else { format!("{} · {} · {} objects", r.s("name"), kind_name(&r.s("kind")), r.i("children")) };
                 items.add("place", join(&word), word, sub, 38.0 + r.f("children").max(1.0).log10() * 0.1, json!({"id": r.s("id")}));
             }
-            let cust = if !head.is_empty() && prev_word != "customer" && prev_word != "for" { Vec::new() } else { q.soft("Customers by any part of their name (ILIKE over the substring index)", &format!("SELECT customer, COUNT(*) AS n FROM {NODES}\nWHERE (customer ILIKE :pre OR customer ILIKE :mid){scope_sql}\nGROUP BY customer ORDER BY n DESC LIMIT 4"), p.clone()).await };
+            // Customers by any part of their name: in a place, ILIKE over the
+            // substring index; everywhere, the list read once.
+            let cust: Vec<Row> = if !head.is_empty() && prev_word != "customer" && prev_word != "for" {
+                Vec::new()
+            } else if scope.is_some() {
+                q.soft("Customers by any part of their name (ILIKE over the substring index)", &format!("SELECT customer, COUNT(*) AS n FROM {NODES}\nWHERE (customer ILIKE :pre OR customer ILIKE :mid){scope_sql}\nGROUP BY customer ORDER BY n DESC LIMIT 4"), p.clone()).await
+            } else {
+                let all = customers(&q).await;
+                let mut hits: Vec<&(String, i64)> = all.iter().filter(|(c, _)| { let c = c.to_lowercase(); c.starts_with(&wl) || c.contains(&format!(" {wl}")) }).collect();
+                hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                hits.into_iter().take(4).map(|(c, n)| json!({"customer": c, "n": n}).as_object().cloned().unwrap_or_default()).collect()
+            };
             for r in &cust {
                 items.add("customer", join(&if prev_word == "customer" { r.s("customer") } else { format!("customer {}", r.s("customer")) }), r.s("customer"), format!("customer · {} sites", r.i("n")), 36.0, json!({"customer": r.s("customer")}));
             }
             if scope.is_none() {
-                let up = json!({"w": w.to_uppercase()});
-                let circ = q.soft("Circuits by the start of their id (PREFIX)", "SELECT id, circuit, provider, plane, status FROM netops_links\nWHERE PREFIX(circuit, :w) LIMIT 4", up).await;
                 for r in &circ {
                     items.add("circuit", join(&r.s("circuit")), r.s("circuit"), format!("{} circuit · {} · plane {}", r.s("provider"), r.s("id"), r.s("plane")), 42.0, json!({"id": r.s("id")}));
                 }
@@ -302,7 +366,7 @@ async fn suggest(State(svc): State<Shared>, Query(a): Query<SuggestQ>) -> Answer
     let plan: Plan = if head.is_empty() { Plan::default() } else { read(&head, &v, &known) };
     let mut next: Vec<(String, f64)> = Vec::new();
     if plan.kinds.is_empty() {
-        let rows = q.soft("Kinds in view, by how many (GROUP BY)", &format!("SELECT kind, COUNT(*) AS n FROM {NODES}\nWHERE layer != 'container'{scope_sql}\nGROUP BY kind ORDER BY n DESC LIMIT 20"), json!({"scope": scope_p})).await;
+        let rows = kinds_in(&q, &scope_sql, &scope_p).await;
         for r in rows.iter().filter(|r| r.s("kind") != "core") {
             let name = plural(&r.s("kind"));
             let cap = name[..1].to_uppercase() + &name[1..];
