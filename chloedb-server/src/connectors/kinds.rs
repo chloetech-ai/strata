@@ -319,7 +319,15 @@ pub struct Fetched {
     pub cursor: Option<String>,
     /// It stopped at the limit: run again soon.
     pub more: bool,
+    /// What went well but looks wrong: a records path that matched
+    /// nothing in an answer that had a body.
+    pub warning: Option<String>,
 }
+
+/// How the error of a push whose body has no records at its connector's
+/// path starts (answered 422: a sender misconfigured once would never
+/// find out from a 200 with 0 records).
+pub const NO_RECORDS: &str = "the body has no records:";
 
 impl Ctx<'_> {
     fn s(&self, key: &str) -> Option<&str> {
@@ -535,6 +543,9 @@ async fn push_unredacted(ctx: &Ctx<'_>, body: &[u8], content_type: &str) -> Resu
         "webhook" => {
             let b = as_json()?;
             let path = ctx.s("records").map(str::to_string).or_else(|| (ctx.c.config["preset"] == "alertmanager").then(|| "$.alerts".to_string()));
+            if let Some(why) = map::unmatched(&b, path.as_deref()).or_else(|| b.is_null().then(|| "the body is null".to_string())) {
+                return Err(format!("{NO_RECORDS} {why}"));
+            }
             Ok(map::records(&b, path.as_deref()))
         }
         "mail" => {
@@ -547,6 +558,9 @@ async fn push_unredacted(ctx: &Ctx<'_>, body: &[u8], content_type: &str) -> Resu
             } else {
                 vec![body.to_vec()]
             };
+            if raws.is_empty() || raws.iter().all(|r| r.iter().all(u8::is_ascii_whitespace)) {
+                return Err(format!("{NO_RECORDS} it has no message (a JSON body is {{\"raw\": \"<the message>\"}}, or a list of them)"));
+            }
             Ok(raws.iter().map(|r| super::mail::parse(r, ctx.now_us)).collect())
         }
         "oxidized" => {
@@ -656,7 +670,7 @@ async fn prometheus(ctx: &Ctx<'_>) -> Result<Fetched, String> {
     }
     let records: Vec<Json> = rows.into_values().map(Json::Object).collect();
     let more = end < now_end;
-    Ok(Fetched { records, cursor: Some(end.to_string()), more })
+    Ok(Fetched { records, cursor: Some(end.to_string()), more, warning: None })
 }
 
 /// Keeps the records of the earliest steps that fit in `limit`, and
@@ -942,7 +956,7 @@ async fn oxidized(ctx: &Ctx<'_>, one: Option<(String, Option<String>)>) -> Resul
         let meta = nodes.as_array().and_then(|a| a.iter().find(|n| n["name"] == name.as_str())).cloned().unwrap_or_else(|| json!({"name": name, "group": group}));
         let group = group.or_else(|| meta["group"].as_str().map(str::to_string));
         let text = ctx.text(&fetch_url(&name, group.as_deref())).await?;
-        return Ok(Fetched { records: vec![config_record(&name, &meta, &text, ctx.now_us)], cursor: None, more: false });
+        return Ok(Fetched { records: vec![config_record(&name, &meta, &text, ctx.now_us)], cursor: None, more: false, warning: None });
     }
     let nodes = ctx.json(&format!("{base}/nodes.json")).await?;
     let nodes = nodes.as_array().cloned().ok_or("Oxidized's /nodes.json answered no list")?;
@@ -1034,6 +1048,7 @@ async fn http_json(ctx: &Ctx<'_>) -> Result<Fetched, String> {
     // on the configured origin: an upstream that answers
     // `"next": "https://elsewhere/?k={secret:password}"` gets none.
     let named = secret_names(url0);
+    let mut unmatched = None;
     for page in 0..1000 {
         let asked = match page == 0 && resume.is_none() {
             true => ctx.with_secrets(&url),
@@ -1042,6 +1057,9 @@ async fn http_json(ctx: &Ctx<'_>) -> Result<Fetched, String> {
         };
         let j = ctx.json(&asked).await?;
         let batch = map::records(&j, records_path.as_deref());
+        if page == 0 {
+            unmatched = map::unmatched(&j, records_path.as_deref());
+        }
         if let Some(cp) = ctx.s("cursor") {
             for r in &batch {
                 let v = map::path(r, cp);
@@ -1086,6 +1104,11 @@ async fn http_json(ctx: &Ctx<'_>) -> Result<Fetched, String> {
         }
         // The last page: the pass is over.
         None => out.cursor = Some(pass_best.unwrap_or_default()),
+    }
+    // A run that read nothing because its path finds nothing says so,
+    // rather than go well with 0 records (DAP-13).
+    if out.records.is_empty() {
+        out.warning = unmatched;
     }
     Ok(out)
 }
@@ -1213,6 +1236,8 @@ mod tests {
         let e = pull(&ctx).await.unwrap_err();
         assert!(!e.contains("SUPERSECRET123") && !e.contains("api_key"), "{e}");
         assert!(e.starts_with(&format!("GET http://127.0.0.1:{port}/x: error sending request")), "{e}");
+        // Why it failed, from the error's causes (DAP-13).
+        assert!(e.to_lowercase().contains("connection refused"), "{e}");
     }
 
     /// A Prometheus answering `series` series, a point each step.

@@ -117,6 +117,30 @@ pub fn records(body: &Json, records: Option<&str>) -> Vec<Json> {
     }
 }
 
+/// Why `records` finds nothing in `body`, when it is a path that matched
+/// nothing there (no key of that name: not a list that is empty): the
+/// path and what the body has instead, for a message. None when it
+/// matched, or names no path, or the body is empty.
+pub fn unmatched(body: &Json, records: Option<&str>) -> Option<String> {
+    let p = records.map(str::trim).filter(|p| !p.is_empty() && *p != "$")?;
+    if body.is_null() || !path(body, p).is_null() {
+        return None;
+    }
+    let has = match body {
+        Json::Object(o) if o.is_empty() => "the body is an empty object".to_string(),
+        Json::Object(o) => {
+            let mut keys: Vec<&str> = o.keys().map(String::as_str).take(12).collect();
+            if o.len() > keys.len() {
+                keys.push("...");
+            }
+            format!("the top-level keys are {}", keys.join(", "))
+        }
+        Json::Array(a) => format!("the body is a list of {} (\"records\": \"$\" reads it)", a.len()),
+        v => format!("the body is {}", v.to_string().chars().take(60).collect::<String>()),
+    };
+    Some(format!("the records path {p} matched nothing; {has}"))
+}
+
 /// A value as text: a string as it is, a number or a bool as JSON writes
 /// it, null as nothing, anything else as compact JSON.
 pub fn text(v: &Json) -> String {
@@ -521,6 +545,19 @@ mod tests {
         assert_eq!(path(&r, "$.nope.deeper"), Json::Null);
         assert_eq!(records(&json!({"alerts": [1, 2]}), Some("$.alerts")), vec![json!(1), json!(2)]);
         assert_eq!(records(&json!({"one": 1}), None), vec![json!({"one": 1})]);
+    }
+
+    #[test]
+    fn a_records_path_that_matches_nothing_says_what_the_body_has() {
+        let body = json!({"data": {"items": [1]}, "next": null});
+        assert_eq!(unmatched(&body, Some("$.items")).as_deref(), Some("the records path $.items matched nothing; the top-level keys are data, next"));
+        assert_eq!(unmatched(&body, Some("$.data.items")), None);
+        assert_eq!(unmatched(&json!({"items": []}), Some("$.items")), None, "an empty list is no records, not a wrong path");
+        assert_eq!(unmatched(&body, None), None);
+        assert_eq!(unmatched(&body, Some("$")), None);
+        assert_eq!(unmatched(&Json::Null, Some("$.items")), None);
+        assert!(unmatched(&json!([1, 2]), Some("$.items")).unwrap().contains("a list of 2"));
+        assert!(unmatched(&json!({}), Some("$.alerts")).unwrap().contains("an empty object"));
     }
 
     #[test]

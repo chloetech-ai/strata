@@ -480,6 +480,8 @@ async fn a_failed_pull_names_no_secret_and_a_mapped_target_has_its_columns() {
     assert_eq!(r["ok"], false, "{r}");
     let e = r["error"].as_str().unwrap();
     assert!(e.contains(&format!("127.0.0.1:{port}/x")) && e.contains("error sending request"), "it still says what failed: {e}");
+    // And why: reqwest's causes, connection refused here (DAP-13).
+    assert!(e.to_lowercase().contains("connection refused"), "it says why: {e}");
     let (_, dry) = post(&c, &admin("/test"), ROOT, json!({"name": "leaky"})).await;
     let mut seen = vec![r.to_string(), dry.to_string()];
     for q in ["SELECT connector, error FROM chloedb_connector_runs", "SELECT id, last_error FROM chloedb_connector_state"] {
@@ -509,6 +511,68 @@ async fn a_failed_pull_names_no_secret_and_a_mapped_target_has_its_columns() {
     assert_eq!(rows[0]["title"], "item 7");
     assert_eq!(rows[0]["n"], 7);
     assert!(rows[0]["when"].as_str().unwrap().starts_with("2026-11-"), "{}", rows[0]);
+}
+
+/// A records path that matches nothing in a pull's answer is a warning,
+/// in the run, its row, the state and the health, not a run that went
+/// well with 0 records; a push with no records at its path is refused
+/// with 422, not taken with 0; a pull run by hand is "pending" before
+/// its first run, not "waiting" for a push (DAP-13, DAP-18, DAP-19).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_records_path_that_matches_nothing_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _svc) = start(dir.path(), false).await;
+    let c = reqwest::Client::new();
+    let admin = |p: &str| format!("{base}/v1/admin/connectors{p}");
+    let up = items(5).await;
+    let (s, j) = post(&c, &admin(""), ROOT, json!({"name": "wrong", "kind": "http_json", "target": "wrong_t", "every_s": 0,
+        "config": {"allow_internal": true, "url": format!("{up}/items"), "records": "$.items", "create_target": true, "map": {"id": "$.id"}}})).await;
+    assert_eq!(s, 200, "{j}");
+    let (_, one) = call(&c, reqwest::Method::GET, &admin("/wrong"), ROOT, None).await;
+    assert_eq!((one["health"].clone(), one["pulls"].clone()), (json!("pending"), json!(false)), "run by hand, not run yet: {one}");
+
+    let said = "the records path $.items matched nothing; the top-level keys are data, next";
+    let (_, r) = post(&c, &admin("/wrong/run"), ROOT, json!({})).await;
+    assert_eq!((r["ok"].clone(), r["records"].clone()), (json!(true), json!(0)), "{r}");
+    assert_eq!(r["warning"], said, "{r}");
+    let (_, one) = call(&c, reqwest::Method::GET, &admin("/wrong"), ROOT, None).await;
+    assert_eq!(one["health"], "warning", "{one}");
+    assert_eq!(one["state"]["last_warning"], said, "{one}");
+    assert_eq!(one["runs"][0]["warning"], said, "the run's row keeps it: {one}");
+    let (s, t) = post(&c, &admin("/test"), ROOT, json!({"name": "wrong"})).await;
+    assert_eq!((s, t["warning"].clone()), (200, json!(said)), "a dry run says it too: {t}");
+
+    // The right path: rows, and the warning goes.
+    let (s, j) = post(&c, &admin("/wrong"), ROOT, json!({"config": {"allow_internal": true, "url": format!("{up}/items"), "records": "$.data.items", "map": {"id": "$.id"}}})).await;
+    assert_eq!(s, 200, "{j}");
+    let (_, r) = post(&c, &admin("/wrong/run"), ROOT, json!({})).await;
+    assert_eq!((r["ok"].clone(), r["rows"].clone(), r["warning"].clone()), (json!(true), json!(5), Json::Null), "{r}");
+    let (_, one) = call(&c, reqwest::Method::GET, &admin("/wrong"), ROOT, None).await;
+    assert_eq!(one["health"], "ok", "{one}");
+
+    // Pushes with nothing at their path: 422, and the run is a failure.
+    let (s, j) = post(&c, &admin(""), ROOT, json!({"name": "am", "kind": "webhook", "config": {"preset": "alertmanager"}})).await;
+    assert_eq!(s, 200, "{j}");
+    let am_key = j["push_secret"].as_str().unwrap().to_string();
+    let (s, e) = post(&c, &format!("{base}/v1/connectors/am/push"), &am_key, json!({"status": "firing", "groupLabels": {}})).await;
+    assert_eq!(s, 422, "{e}");
+    assert!(e["error"].as_str().unwrap().contains("the records path $.alerts matched nothing; the top-level keys are groupLabels, status"), "{e}");
+    let (_, one) = call(&c, reqwest::Method::GET, &admin("/am"), ROOT, None).await;
+    assert_eq!(one["health"], "failing", "{one}");
+    let (s, r) = post(&c, &format!("{base}/v1/connectors/am/push"), &am_key, json!({"status": "resolved", "alerts": []})).await;
+    assert_eq!((s, r["records"].clone()), (200, json!(0)), "an empty list is no alerts, not a wrong shape: {r}");
+    let (s, j) = post(&c, &admin(""), ROOT, json!({"name": "hook", "kind": "webhook", "target": "hook_t", "config": {"records": "$.items", "create_target": true, "map": {"id": "$.id"}}})).await;
+    assert_eq!(s, 200, "{j}");
+    let key = j["push_secret"].as_str().unwrap().to_string();
+    let (s, e) = post(&c, &format!("{base}/v1/connectors/hook/push"), &key, json!({"data": {"items": [{"id": "1"}]}})).await;
+    assert_eq!(s, 422, "{e}");
+    let (s, e) = post(&c, &admin("/test"), ROOT, json!({"name": "hook", "sample": {"data": {}}})).await;
+    assert_eq!(s, 422, "a dry run's sample too: {e}");
+    let (s, j) = post(&c, &admin(""), ROOT, json!({"name": "mailbox", "kind": "mail"})).await;
+    assert_eq!(s, 200, "{j}");
+    let key = j["push_secret"].as_str().unwrap().to_string();
+    let (s, e) = post(&c, &format!("{base}/v1/connectors/mailbox/push"), &key, json!([])).await;
+    assert_eq!(s, 422, "{e}");
 }
 
 /// A server that records each request's path, query and Authorization,
