@@ -1,8 +1,10 @@
 //! The Inspector page's API: the memory Claude Code sessions recorded, as
-//! `chloectx sync` copies it into the cluster's table [`TABLE`]
-//! (`chloectx_memory`, one row per record, keyed `<project>:<id>`), read
-//! the way `chloectx ui` reads a local store: by project, by session in
-//! the order it was recorded, by kind, and by search.
+//! `chloectx sync` copies it into the cluster: a table per project
+//! (`chloectx_mem_<project>`, [`crate::sync::table_for`]), or, from before
+//! 0.3.4, the table projects shared, [`TABLE`] (`chloectx_memory`); one
+//! row per record, keyed `<project>:<id>`. Read the way `chloectx ui`
+//! reads a local store: by project, by session in the order it was
+//! recorded, by kind, and by search.
 //!
 //! | call | answer |
 //! |---|---|
@@ -10,8 +12,9 @@
 //! | `GET /v1/memory/sessions?project=` | `{sessions: [{session, records, first, last, turns}]}`, the latest first |
 //! | `GET /v1/memory/records?project=&session=&kind=&q=&limit=&before=` | `{records}`: a session's in the order recorded, else the latest first (`before`: a `seq` to page back from), or the best matches for `q` |
 //!
-//! Only reads: the page changes nothing, and a key that may only read
-//! `chloectx_memory` is enough.
+//! Only reads: the page changes nothing, and a key that may read a
+//! project's table is enough for that project; the list shows the projects
+//! whose tables the caller reads.
 
 use std::collections::HashMap;
 
@@ -57,20 +60,43 @@ fn record(row: &[Value]) -> Json {
 }
 
 impl App {
-    fn memory_exists(&self) -> Result<bool, super::Fail> {
-        Ok(self.cluster.tables()?.iter().any(|t| t == TABLE))
+    /// The table project `project` is read from: its own, else the shared
+    /// one of before 0.3.4; `None` when neither exists.
+    pub fn memory_table(&self, project: &str) -> Result<Option<String>, super::Fail> {
+        let tables = self.cluster.tables()?;
+        let own = crate::sync::table_for(project);
+        Ok(if tables.iter().any(|t| *t == own) {
+            Some(own)
+        } else if tables.iter().any(|t| t == TABLE) {
+            Some(TABLE.to_string())
+        } else {
+            None
+        })
     }
 
-    /// `GET /v1/memory`: the projects synced to the cluster.
-    pub fn memory(&self) -> Answer {
-        if !self.memory_exists()? {
-            return Ok(json!({"table": TABLE, "exists": false, "projects": [], "create": crate::sync::CREATE}));
+    /// `GET /v1/memory`: the projects synced to the cluster whose tables
+    /// `caller` reads, each with its table (`table`) and `create`, the
+    /// CREATE TABLE of a project's table (with `{project}` for its name's
+    /// place: [`crate::sync::table_for`]).
+    pub fn memory(&self, caller: &super::Caller) -> Answer {
+        let tables: Vec<String> = self.cluster.tables()?.into_iter().filter(|t| t == TABLE || t.starts_with(crate::sync::PREFIX)).collect();
+        let mut by: HashMap<String, Json> = HashMap::new();
+        for t in tables.iter().filter(|t| caller.reads_table(t)) {
+            let rs = self.cluster.query(&format!("SELECT project, COUNT(*), COUNT(DISTINCT session), MAX(ts) FROM {t} GROUP BY project LIMIT 1000"), &Params::new())?;
+            for r in &rs.rows {
+                let project = str_of(r.first());
+                // A project with a table of its own is read from it; its
+                // rows in the shared table are older copies.
+                let own = crate::sync::table_for(&project);
+                if (t == TABLE && tables.contains(&own)) || (t != TABLE && *t != own) {
+                    continue;
+                }
+                by.insert(project.clone(), json!({"project": project, "table": t, "records": int_of(r.get(1)), "sessions": int_of(r.get(2)), "last": int_of(r.get(3))}));
+            }
         }
-        let rs = self.cluster.query(&format!("SELECT project, COUNT(*), COUNT(DISTINCT session), MAX(ts) FROM {TABLE} GROUP BY project LIMIT 1000"), &Params::new())?;
-        let mut projects: Vec<Json> =
-            rs.rows.iter().map(|r| json!({"project": str_of(r.first()), "records": int_of(r.get(1)), "sessions": int_of(r.get(2)), "last": int_of(r.get(3))})).collect();
+        let mut projects: Vec<Json> = by.into_values().collect();
         projects.sort_by_key(|p| std::cmp::Reverse(p["last"].as_i64().unwrap_or(0)));
-        Ok(json!({"table": TABLE, "exists": true, "projects": projects, "create": crate::sync::CREATE}))
+        Ok(json!({"exists": !tables.is_empty(), "projects": projects, "prefix": crate::sync::PREFIX, "create": crate::sync::create_for("{project}")}))
     }
 
     /// `GET /v1/memory/sessions?project=`: a project's sessions, the
@@ -79,11 +105,11 @@ impl App {
         if project.is_empty() {
             return Err(bad("which project? (?project=owner/name)"));
         }
-        if !self.memory_exists()? {
+        let Some(t) = self.memory_table(project)? else {
             return Ok(json!({"sessions": []}));
-        }
+        };
         let rs = self.cluster.query(
-            &format!("SELECT session, COUNT(*), MIN(ts), MAX(ts) FROM {TABLE} WHERE project = :p AND kind != 'entity' GROUP BY session LIMIT 5000"),
+            &format!("SELECT session, COUNT(*), MIN(ts), MAX(ts) FROM {t} WHERE project = :p AND kind != 'entity' GROUP BY session LIMIT 5000"),
             &Params::new().set("p", Value::Str(project.to_string())),
         )?;
         let mut sessions: Vec<Json> = rs
@@ -93,7 +119,7 @@ impl App {
             .collect();
         // Each session's first prompt, a line of it, as its title.
         let prompts = self.cluster.query(
-            &format!("SELECT session, seq, content FROM {TABLE} WHERE project = :p AND kind = 'prompt' ORDER BY seq ASC LIMIT 10000"),
+            &format!("SELECT session, seq, content FROM {t} WHERE project = :p AND kind = 'prompt' ORDER BY seq ASC LIMIT 10000"),
             &Params::new().set("p", Value::Str(project.to_string())),
         )?;
         let mut titles: HashMap<String, String> = HashMap::new();
@@ -112,7 +138,7 @@ impl App {
         }
         sessions.sort_by_key(|s| std::cmp::Reverse(s["last"].as_i64().unwrap_or(0)));
         // What each kind of the project counts, for the page's filters.
-        let kinds = self.cluster.query(&format!("SELECT kind, COUNT(*) FROM {TABLE} WHERE project = :p GROUP BY kind LIMIT 50"), &Params::new().set("p", Value::Str(project.to_string())))?;
+        let kinds = self.cluster.query(&format!("SELECT kind, COUNT(*) FROM {t} WHERE project = :p GROUP BY kind LIMIT 50"), &Params::new().set("p", Value::Str(project.to_string())))?;
         let by_kind: HashMap<String, i64> = kinds.rows.iter().map(|r| (str_of(r.first()), int_of(r.get(1)))).collect();
         Ok(json!({"project": project, "sessions": sessions, "by_kind": by_kind}))
     }
@@ -124,9 +150,9 @@ impl App {
         if project.is_empty() {
             return Err(bad("which project? (?project=owner/name)"));
         }
-        if !self.memory_exists()? {
+        let Some(t) = self.memory_table(project)? else {
             return Ok(json!({"records": []}));
-        }
+        };
         let limit = limit.clamp(1, MAX_RECORDS);
         let mut conds = vec!["project = :p".to_string()];
         let mut params = Params::new().set("p", Value::Str(project.to_string()));
@@ -148,9 +174,9 @@ impl App {
         let wher = conds.join(" AND ");
         let q = q.map(str::trim).filter(|q| !q.is_empty());
         let sql = match q {
-            Some(_) => format!("SELECT {COLUMNS} FROM {TABLE} WHERE {wher} ORDER BY bm25(content, :q, syntax => 'plain') DESC LIMIT {limit}"),
-            None if session.is_some_and(|s| !s.is_empty()) => format!("SELECT {COLUMNS} FROM {TABLE} WHERE {wher} ORDER BY seq ASC LIMIT {limit}"),
-            None => format!("SELECT {COLUMNS} FROM {TABLE} WHERE {wher} ORDER BY seq DESC LIMIT {limit}"),
+            Some(_) => format!("SELECT {COLUMNS} FROM {t} WHERE {wher} ORDER BY bm25(content, :q, syntax => 'plain') DESC LIMIT {limit}"),
+            None if session.is_some_and(|s| !s.is_empty()) => format!("SELECT {COLUMNS} FROM {t} WHERE {wher} ORDER BY seq ASC LIMIT {limit}"),
+            None => format!("SELECT {COLUMNS} FROM {t} WHERE {wher} ORDER BY seq DESC LIMIT {limit}"),
         };
         if let Some(q) = q {
             params = params.set("q", Value::Str(q.to_string()));
@@ -167,9 +193,9 @@ impl App {
         if project.is_empty() {
             return Err(bad("which project? (?project=owner/name)"));
         }
-        if !self.memory_exists()? {
+        let Some(t) = self.memory_table(project)? else {
             return Ok(json!({"notes": []}));
-        }
+        };
         let kinds = match kind.filter(|k| !k.is_empty()) {
             Some("rule" | "preference") => "'preference'".to_string(),
             Some(k @ ("decision" | "fact" | "todo" | "note")) => format!("'{k}'"),
@@ -177,7 +203,7 @@ impl App {
             None => "'decision', 'preference', 'fact', 'todo', 'note'".to_string(),
         };
         let rs = self.cluster.query(
-            &format!("SELECT {COLUMNS} FROM {TABLE} WHERE project = :p AND kind IN ({kinds}) ORDER BY seq DESC LIMIT 2000"),
+            &format!("SELECT {COLUMNS} FROM {t} WHERE project = :p AND kind IN ({kinds}) ORDER BY seq DESC LIMIT 2000"),
             &Params::new().set("p", Value::Str(project.to_string())),
         )?;
         let mut notes: Vec<Json> = rs.rows.iter().map(|r| note(r)).collect();
@@ -209,14 +235,14 @@ impl App {
         if project.is_empty() {
             return Err(bad("which project? (?project=owner/name)"));
         }
-        if !self.memory_exists()? {
+        let Some(t) = self.memory_table(project)? else {
             return Ok(json!({"records": 0, "sessions": 0, "by_kind": {}, "live": {}, "rules": [], "decisions": [], "facts": [], "todos": [], "notes": [], "changes": [], "recent_sessions": []}));
-        }
+        };
         let p = || Params::new().set("p", Value::Str(project.to_string()));
-        let span = self.cluster.query(&format!("SELECT MIN(ts), MAX(ts), COUNT(*) FROM {TABLE} WHERE project = :p AND kind != 'entity'"), &p())?;
+        let span = self.cluster.query(&format!("SELECT MIN(ts), MAX(ts), COUNT(*) FROM {t} WHERE project = :p AND kind != 'entity'"), &p())?;
         let (first, last, records) = span.rows.first().map_or((0, 0, 0), |r| (int_of(r.first()), int_of(r.get(1)), int_of(r.get(2))));
         let rs = self.cluster.query(
-            &format!("SELECT {COLUMNS} FROM {TABLE} WHERE project = :p AND kind IN ('decision', 'preference', 'fact', 'todo', 'note') ORDER BY seq DESC LIMIT 5000"),
+            &format!("SELECT {COLUMNS} FROM {t} WHERE project = :p AND kind IN ('decision', 'preference', 'fact', 'todo', 'note') ORDER BY seq DESC LIMIT 5000"),
             &p(),
         )?;
         let notes: Vec<Json> = rs.rows.iter().map(|r| note(r)).collect();
@@ -264,12 +290,12 @@ impl App {
         if project.is_empty() {
             return Err(bad("which project? (?project=owner/name)"));
         }
-        if !self.memory_exists()? {
+        let Some(t) = self.memory_table(project)? else {
             return Ok(json!({"nodes": [], "edges": []}));
-        }
+        };
         let p = || Params::new().set("p", Value::Str(project.to_string()));
         let rs = self.cluster.query(
-            &format!("SELECT {COLUMNS} FROM {TABLE} WHERE project = :p AND kind IN ('decision', 'preference', 'fact', 'todo', 'note') ORDER BY seq DESC LIMIT {}", super::view::GRAPH_NOTES),
+            &format!("SELECT {COLUMNS} FROM {t} WHERE project = :p AND kind IN ('decision', 'preference', 'fact', 'todo', 'note') ORDER BY seq DESC LIMIT {}", super::view::GRAPH_NOTES),
             &p(),
         )?;
         let notes: Vec<super::view::GraphNote> = rs
@@ -293,7 +319,7 @@ impl App {
             .collect();
         let names: HashMap<String, String> = self
             .cluster
-            .query(&format!("SELECT rid, content FROM {TABLE} WHERE project = :p AND kind = 'entity' LIMIT 10000"), &p())?
+            .query(&format!("SELECT rid, content FROM {t} WHERE project = :p AND kind = 'entity' LIMIT 10000"), &p())?
             .rows
             .iter()
             .map(|r| (str_of(r.first()), str_of(r.get(1))))

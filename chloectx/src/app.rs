@@ -1007,6 +1007,9 @@ pub struct Caller {
     /// A key limited to tables: each grant's table (a name, or a prefix and
     /// `*`) and scope.
     tables: Option<Vec<(String, u8)>>,
+    /// A key for operations (`propose`, `ops`: `x-chloedb-role`), which
+    /// reads tables as a read key does but not Claude Code's sessions.
+    role: Option<String>,
 }
 
 fn level(scope: &str) -> u8 {
@@ -1032,7 +1035,28 @@ impl Caller {
                 })
                 .collect()
         });
-        Caller { scope, tables }
+        let role = req.header("x-chloedb-role").map(|r| r.trim().to_ascii_lowercase()).filter(|r| !r.is_empty());
+        Caller { scope, tables, role }
+    }
+
+    /// Refuses a key for operations what holds Claude Code sessions'
+    /// transcripts: the synced memory and this machine's stores. An on-call
+    /// agent's key reads the cluster's tables, not people's sessions.
+    fn not_ops(&self, what: &str) -> std::result::Result<(), Fail> {
+        match &self.role {
+            Some(r) => Err(Fail(403, format!("{what} reads Claude Code sessions' transcripts, which a key for operations (role {r}) does not: use a read key limited to the project's table"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuses (403) a read of synced table `table`.
+    pub(crate) fn may_read(&self, table: &str, what: &str) -> std::result::Result<(), Fail> {
+        self.may(1, Some(table), what)
+    }
+
+    /// Whether it may read table `table`.
+    pub(crate) fn reads_table(&self, table: &str) -> bool {
+        self.on(table) >= 1
     }
 
     /// What it may do to table `table`.
@@ -1093,6 +1117,9 @@ fn allowed(caller: &Caller, m: &str, p: &[&str], req: &Request) -> std::result::
             None => None,
         })
     };
+    if matches!(p, ["v1", "memory" | "local", ..]) {
+        caller.not_ops(&format!("{m} {}", req.path))?;
+    }
     let incidents = table_of(&named()?.unwrap_or_else(|| INCIDENTS.to_string()));
     let (need, table): (u8, Option<String>) = match (m, p) {
         ("GET", ["v1", "info"]) | ("GET", ["v1", "spaces"]) => return Ok(()),
@@ -1104,7 +1131,9 @@ fn allowed(caller: &Caller, m: &str, p: &[&str], req: &Request) -> std::result::
         ("GET", ["v1", "spaces", s, "notes" | "overview" | "sessions" | "records" | "graph", ..]) | ("GET" | "POST", ["v1", "spaces", s, "ask"]) | ("GET", ["v1", "spaces", s, "apps"]) | ("GET", ["v1", "spaces", s, "apps", "estimate"]) => (1, Some(table_of(s))),
         ("POST", ["v1", "spaces", s, "notes"]) | ("DELETE", ["v1", "spaces", s, "notes", _]) | ("POST", ["v1", "spaces", s, "exchanges"]) => (2, Some(table_of(s))),
         ("GET", ["v1", "incidents", ..]) => (1, Some(incidents)),
-        ("GET", ["v1", "memory", ..]) => (1, Some("chloectx_memory".to_string())),
+        // Each project's table is checked as the call reads it (the list
+        // shows the projects the caller reads).
+        ("GET", ["v1", "memory", ..]) => return Ok(()),
         ("POST", ["v1", "incidents"]) | ("POST", ["v1", "incidents", "draft"]) => (2, Some(incidents)),
         // Asking a store of this machine reads it.
         ("GET", _) | ("POST", ["v1", "local", _, "ask"]) => (1, None),
@@ -1156,6 +1185,13 @@ fn route(app: &Arc<App>, req: &Request) -> Answer {
     let num = |k: &str, d: usize| req.param(k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let caller = Caller::of(req);
     allowed(&caller, m, &p, req)?;
+    // A synced project is read from its table, which the caller must read.
+    if let ("GET", ["v1", "memory", _]) = (m, p.as_slice()) {
+        let project = req.param("project").unwrap_or("");
+        if let Some(t) = app.memory_table(project)? {
+            caller.may_read(&t, &format!("{m} {} of project {project}", req.path))?;
+        }
+    }
     match (m, p.as_slice()) {
         ("GET", ["v1", "info"]) => Ok(app.info()),
         ("GET", ["v1", "spaces"]) => {
@@ -1166,7 +1202,15 @@ fn route(app: &Arc<App>, req: &Request) -> Answer {
             }
             Ok(j)
         }
-        ("GET", ["v1", "memory"]) => app.memory(),
+        ("GET", ["v1", "memory"]) => app.memory(&caller),
+        // A project's table, for the Inspector's setup to make it and a key.
+        ("GET", ["v1", "memory", "table"]) => {
+            let project = req.param("project").unwrap_or("").trim().to_string();
+            if project.is_empty() {
+                return Err(bad("which project? (?project=owner/name, as `chloectx sync status` says it syncs)"));
+            }
+            Ok(json!({"project": project, "table": crate::sync::table_for(&project), "create": crate::sync::create_for(&project)}))
+        }
         ("GET", ["v1", "memory", "sessions"]) => app.memory_sessions(req.param("project").unwrap_or("")),
         ("GET", ["v1", "memory", "notes"]) => app.memory_notes(req.param("project").unwrap_or(""), req.param("kind"), req.param("all").is_some_and(|v| v == "1" || v == "true")),
         ("GET", ["v1", "memory", "overview"]) => app.memory_overview(req.param("project").unwrap_or("")),
@@ -1527,6 +1571,33 @@ mod tests {
         assert!(check("POST", "/v1/spaces", &[], r#"{"name": "x"}"#).is_ok());
         let c = Caller::of(&request("GET", "/v1/spaces", &own, ""));
         assert!(c.reads("ops_a") && !c.reads("other"));
+    }
+
+    #[test]
+    fn keys_for_operations_read_no_sessions_and_a_project_key_reads_its_project() {
+        // X-F1: an on-call agent's `ops` key read every synced transcript,
+        // and with --local-stores every session on the machine.
+        let ops = [("x-chloedb-scope", "read"), ("x-chloedb-role", "ops")];
+        let propose = [("x-chloedb-scope", "read"), ("x-chloedb-role", "propose")];
+        for h in [&ops[..], &propose[..]] {
+            for p in ["/v1/memory", "/v1/memory/sessions?project=acme/web", "/v1/memory/records?project=acme/web", "/v1/local", "/v1/local/x/overview"] {
+                assert_eq!(check("GET", p, h, ""), Err(403), "{p} {h:?}");
+            }
+            // The spaces are the cluster's tables, read as before.
+            assert!(check("GET", "/v1/spaces/any/notes", h, "").is_ok());
+        }
+        let reader = [("x-chloedb-scope", "read")];
+        assert!(check("GET", "/v1/memory", &reader, "").is_ok());
+        assert!(check("GET", "/v1/local", &reader, "").is_ok());
+        // A key limited to one project's table passes the gate; the route
+        // checks the table the project is read from.
+        let t = crate::sync::table_for("acme/web");
+        let grant = format!("{t}=write");
+        let project_key = [("x-chloedb-scope", "write"), ("x-chloedb-tables", grant.as_str())];
+        assert!(check("GET", "/v1/memory/overview?project=acme/web", &project_key, "").is_ok());
+        let c = Caller::of(&request("GET", "/v1/memory", &project_key, ""));
+        assert!(c.reads_table(&t) && !c.reads_table(&crate::sync::table_for("acme/payroll")) && !c.reads_table(crate::sync::TABLE));
+        assert_eq!(c.may_read(&crate::sync::table_for("acme/payroll"), "GET").map_err(|f| f.0), Err(403));
     }
 
     #[test]

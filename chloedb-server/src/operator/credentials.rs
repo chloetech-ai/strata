@@ -82,8 +82,9 @@ pub fn default_tables(app: &str) -> &'static [&'static str] {
         // Workbooks in sheets_books and sheets_cells; the cluster's tables
         // open in it as sheets (read).
         super::sheets::APP => &["sheets_*=admin", "*=read"],
-        // Its spaces, and the memory `chloectx sync` pushes.
-        super::chloectx::APP => &["ctx_*=admin", "chloectx_memory=read"],
+        // Its spaces, and the memory `chloectx sync` pushes (each
+        // project's table, and the one projects shared before 0.3.4).
+        super::chloectx::APP => &["ctx_*=admin", "chloectx_memory=read", "chloectx_mem_*=read"],
         // The network, its telemetry, its incidents and its agents' runs.
         super::netops::APP => &["netops_*=admin"],
         // The engine's own tables and its apps' rows.

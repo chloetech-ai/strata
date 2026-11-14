@@ -44,7 +44,7 @@ pub mod wal;
 
 use std::sync::{Mutex, MutexGuard};
 
-pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, DropOptions, FileStats, Layout, ScrubReport, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
+pub use db::{CheckpointOptions, CheckpointStats, Database, DbOptions, DocumentSource, DropOptions, FileStats, FreeZeroed, Layout, ScrubReport, SegmentStats, TableTxn, WriteTxn, LOCK_WAIT};
 pub use cold::{open_store, ColdOptions, ColdStats, DirStore, ObjectStore};
 pub use live::LiveDocs;
 pub use manifest::{functions_schema, sources_schema, Numbering, RankProfile, SeqNo, FUNCTIONS, FUNCTIONS_ID, SOURCES, SOURCES_ID};

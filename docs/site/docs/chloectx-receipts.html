@@ -191,24 +191,42 @@ since the last one.</p>
   it that no merge has replaced since, and writes the rest. The live store
   is a single file, which a directory snapshot cannot share bytes with, so
   the first snapshot is a full copy, and every segment a merge writes is
-  copied again by the next snapshot while older ones keep its inputs.
-  Taken after every turn (<code>min_interval_secs: 0</code>), each flush also makes a
-  small segment the store's merges rewrite several times more; a week of
-  daily use then takes several times the store's size. <code>chloectx stats</code>
-  shows the bytes of receipts and snapshots (<code>receipts</code>, <code>snapshots</code>,
-  <code>total_bytes</code>).</li>
+  copied again by the next snapshot while older ones keep its inputs. The
+  store's smallest merge tier spans up to 8,000 live rows, so each
+  snapshot's flush makes a small segment that is merged again and again
+  within it, and each snapshot keeps one of those outputs. With no budget,
+  a simulation of the merge policy at 50 turns a day, 60 records a turn
+  and hourly snapshots over an 8-hour day (the fourth audit, not a
+  measurement) gave snapshots of about 3 times the store after a week
+  (143 MB beside 46.5 MB) and 4 times after 30 days (1.16 GB beside
+  279 MB); taken after every turn (<code>min_interval_secs: 0</code>), about 10
+  times after a week. On a file system where hard links fail (some
+  network and FUSE mounts, exFAT), every snapshot is a full copy, and
+  <code>chloectx doctor</code> says so.</li>
 </ul>
-<p>Automatic snapshots older than <code>keep_days</code>, or past the newest <code>max_auto</code>,
-are dropped when the daemon starts and before each new one, whatever the
+<p>So the automatic snapshots are kept to a budget: at most the store's size
+(<code>budget_store_ratio</code>, 1.0; at least 32 MB; <code>max_bytes</code> sets one in bytes,
+and 0 for both sets none), counting each file once however many snapshots
+link it, and counting named snapshots too, which are never dropped for it.
+Past it, the oldest automatic ones go, never the newest. Automatic
+snapshots older than 3 days are thinned to the last of each day
+(<code>daily_after_days</code>; 0 keeps them as taken). Those older than <code>keep_days</code>
+(30), or past the newest <code>max_auto</code> (2,000), are dropped too. All of this
+runs when the daemon starts and before each new snapshot, whatever the
 settings say now. Anything under <code>snapshots/</code> that no snapshot owns (a
 checkpoint a stopped daemon left half written) is removed when the daemon
-starts.</p>
+starts. <code>chloectx stats</code> shows the bytes of the store, the receipts and the
+snapshots, and the budget (<code>receipts</code>, <code>snapshots</code>, <code>total_bytes</code>), and
+<code>chloectx doctor</code> says them in one line, <code>disk</code>.</p>
 <p>A receipt replays exactly on the snapshot kept at its commit: the replay
 runs the same retrieval code (<code>receipt::retrieve</code>, which the recall itself
 runs) with the receipt's inputs, and must give the same rows, scores and
 decisions. When no snapshot was kept at that commit (a recall that showed
 nothing, or one inside <code>min_interval_secs</code>), it replays on the nearest
-later one and says so. It is also replayed on today's store, which shows
+later one and says so. With hourly snapshots that is most receipts: about
+one in six replays exactly at 6 recalls an hour, and the rest on the next
+snapshot, whose store holds the records written since; after 3 days only
+the last snapshot of each day is left, and after the budget fills, fewer. It is also replayed on today's store, which shows
 what has changed since: a record superseded, deleted or outranked.</p>
 <p><code>chloectx snapshot keep NAME</code> keeps one by name, until <code>chloectx snapshot
 drop NAME</code>; <code>chloectx snapshot list</code> lists them.</p>
@@ -329,11 +347,17 @@ tool's output; the web for <code>WebFetch</code> and <code>WebSearch</code>).</p
 forgotten record (their rows keep ids and scores, and lose the record's
 text hash), removes a forgotten prompt from the query of the receipts it
 was asked as, rewrites the store's segments that held the record without
-it, and only then drops every automatic snapshot, with no snapshot taken
-meanwhile, so no snapshot taken afterwards holds its bytes. Named
-snapshots are kept and listed, for you to drop. The rewritten segments'
-old pages are free in the store's file until later writes reuse them;
-<code>chloectx redact</code> rewrites the whole file.
+drops every automatic snapshot, and rewrites the store's segments that
+held the record without it, with no snapshot taken until that is done, so
+no snapshot taken afterwards holds its bytes. Only the segments that held
+it are rewritten (those whose live rows fell with the delete, and those a
+flush or a merge wrote since that still hold it, marked deleted), not every
+segment with an older delete, and then the free pages of the store's file,
+where the old segments were, are written with zeros
+(<code>Database::zero_free_pages</code>); pages an open snapshot still reads are left,
+and said. <code>memory_forget</code> answers before the rewrite, which runs after the
+answer, and <code>chloectx forget</code> waits for it. Named snapshots are kept and
+listed, for you to drop.
 <code>chloectx redact</code> redacts the receipts as it does the records, and drops
 the automatic snapshots too. Replays of the receipts before then can no
 longer be exact.</p>

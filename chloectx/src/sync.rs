@@ -1,14 +1,28 @@
 //! Copies a project's memory to a ChloeDB server or cluster, and back.
 //!
 //! The store stays a local file, so that hooks and recall never wait on the
-//! network. The daemon pushes the records it has not sent yet to the table
-//! [`TABLE`] of the server set up with `chloectx sync setup --url URL`
-//! every [`PUSH_EVERY`] and as it exits, and when it starts it pulls the
-//! records of its project the store lacks, which a store made on another
-//! machine (or a cloud container started afresh) wrote, and embeds them
-//! here. Records are keyed `<project>:<id>`, so projects share the table;
-//! a project is its git repository (`owner/name`, see [`project_key`]), so
-//! every checkout of it, under any folder or an old name, shares one memory.
+//! network. The daemon pushes the records it has not sent yet to its
+//! project's table ([`table_for`], `chloectx_mem_<project>`) on the server
+//! set up with `chloectx sync setup --url URL` every [`PUSH_EVERY`] and as
+//! it exits, and when it starts it pulls the records of its project the
+//! store lacks, which a store made on another machine (or a cloud
+//! container started afresh) wrote, and embeds them here. A project is its
+//! git repository (`owner/name`, see [`project_key`]), so every checkout
+//! of it, under any folder or an old name, shares one memory.
+//!
+//! A table per project is the boundary: a key limited to one project's
+//! table (`{"chloectx_mem_<project>": "write"}`, which the Inspector makes
+//! per machine) reads and writes that project only. Before 0.3.4 every
+//! project shared one table, [`TABLE`] (`chloectx_memory`), which any sync
+//! key read all of; its rows of the project are still pulled where the
+//! key may read them, and nothing is pushed there.
+//!
+//! Each row names the machine that pushed it (`origin`, [`origin`]). A
+//! pulled record from another machine is linked `synced_from` it, and its
+//! rules and decisions stay out of the briefing and the prompt's context
+//! until a person accepts that machine (`chloectx sync accept`,
+//! [`pending`]): a key that may write the table could otherwise plant a
+//! "user preference" that every other machine shows as its own.
 //!
 //! What is sent is what the store holds: text from the sessions it
 //! recorded, which can include whatever passed through them. It is
@@ -36,8 +50,6 @@ use crate::record::{Kind, Link, Record, COLUMNS};
 use crate::store::Store;
 use crate::{err, Result};
 
-/// The server's table of memory records.
-pub const TABLE: &str = "chloectx_memory";
 /// How often the daemon pushes what it recorded since.
 pub const PUSH_EVERY: Duration = Duration::from_secs(30);
 /// Records per request.
@@ -45,10 +57,91 @@ const BATCH: usize = 500;
 /// A request's deadline.
 const TIMEOUT_SECS: u64 = 30;
 
-/// The table [`TABLE`], as `chloectx sync setup` creates it (and the
-/// command center's Inspector, for a key that may only write it).
+/// The table every project shared before 0.3.4 (pulled from, where the
+/// key reads it; never written).
+pub const TABLE: &str = "chloectx_memory";
+/// The prefix of the projects' tables ([`table_for`]).
+pub const PREFIX: &str = "chloectx_mem_";
+
+/// The table [`TABLE`], as `chloectx sync setup` created it.
 pub const CREATE: &str = "CREATE TABLE IF NOT EXISTS chloectx_memory (id KEYWORD PRIMARY KEY, project KEYWORD, rid KEYWORD, session KEYWORD, kind KEYWORD, tag KEYWORD, turn INT, seq INT, ts INT, importance FLOAT, files TEXT, content TEXT, context TEXT, links_json TEXT)";
 const REMOTE_COLUMNS: &str = "rid, session, kind, tag, turn, seq, ts, importance, files, content, context, links_json";
+/// A project's table adds who pushed each row.
+const PROJECT_COLUMNS: &str = "rid, session, kind, tag, turn, seq, ts, importance, files, content, context, links_json, origin";
+
+/// The table of project `project` (its [`project_key`]): `chloectx_mem_`,
+/// then the key in lowercase letters, digits and `_` (at most 40), then 8
+/// hex digits of its hash, so that two keys that read the same there
+/// (`acme/web-app`, `acme/web_app`) are two tables.
+pub fn table_for(project: &str) -> String {
+    let mut slug = String::new();
+    for c in project.trim().to_lowercase().chars() {
+        let c = if c.is_ascii_alphanumeric() { c } else { '_' };
+        if c == '_' && (slug.is_empty() || slug.ends_with('_')) {
+            continue;
+        }
+        slug.push(c);
+    }
+    let slug: String = slug.trim_end_matches('_').chars().take(40).collect();
+    format!("{PREFIX}{}_{:08x}", slug.trim_end_matches('_'), fnv(project.trim()) as u32)
+}
+
+/// Project `project`'s table, as the setup (an admin's key) creates it.
+pub fn create_for(project: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} (id KEYWORD PRIMARY KEY, project KEYWORD, rid KEYWORD, session KEYWORD, kind KEYWORD, tag KEYWORD, turn INT, seq INT, ts INT, importance FLOAT, files TEXT, content TEXT, context TEXT, links_json TEXT, origin KEYWORD)",
+        table_for(project)
+    )
+}
+
+/// The label of the link a record pulled from another machine carries to
+/// that machine's [`origin`], until it is accepted ([`ACCEPTED`]).
+pub const SYNCED_FROM: &str = "synced_from";
+/// The label once a person accepted the machine (`chloectx sync accept`).
+pub const ACCEPTED: &str = "accepted_from";
+
+/// This machine, as the rows it pushes name it: `$CHLOECTX_SYNC_ORIGIN`
+/// (a cloud environment started afresh each time sets one), else a random
+/// id kept in `sync-origin` in ChloeCtx's home, made on first use.
+pub fn origin(home: &Path) -> String {
+    if let Some(o) = std::env::var("CHLOECTX_SYNC_ORIGIN").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        return o;
+    }
+    let p = home.join("sync-origin");
+    if let Some(o) = std::fs::read_to_string(&p).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        return o;
+    }
+    let mut b = [0u8; 6];
+    let _ = getrandom(&mut b);
+    let o = format!("m-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+    let _ = crate::paths::create_private_dir(home);
+    let _ = std::fs::write(&p, &o);
+    o
+}
+
+fn getrandom(b: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(b)
+}
+
+/// Whether `r` came from another machine whose records were not accepted
+/// yet: its rules and decisions stay out of the briefing, the prompt's
+/// context and searches until then ([`held_back`]); `chloectx sync
+/// accept` lists them.
+pub fn pending(r: &Record) -> bool {
+    r.links.iter().any(|l| l.label == SYNCED_FROM)
+}
+
+/// Whether `r` is a rule or decision from a machine not accepted yet,
+/// which the briefing and the prompt's context leave out ([`pending`]).
+pub fn held_back(r: &Record) -> bool {
+    matches!(r.kind, Kind::Preference | Kind::Decision) && pending(r)
+}
+
+/// The machine a pending record came from.
+pub fn pending_origin(r: &Record) -> Option<&str> {
+    r.links.iter().find(|l| l.label == SYNCED_FROM).map(|l| l.to.as_str())
+}
 
 /// Where the sync is set up: `sync.json` (the URL) and `sync.token` (the
 /// key, readable by its owner only) in ChloeCtx's home.
@@ -72,9 +165,13 @@ pub struct SyncConfig {
     /// either name syncs as the new one.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub renames: std::collections::BTreeMap<String, String>,
+    /// Machines ([`origin`]) whose records a pull takes as this one's own
+    /// (`chloectx sync accept --origin`), `*` for every machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted: Vec<String>,
 }
 
-fn load_config(home: &Path) -> SyncConfig {
+pub fn load_config(home: &Path) -> SyncConfig {
     std::fs::read_to_string(config_path(home)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
@@ -149,7 +246,8 @@ pub fn setup(home: &Path, url: &str, token: Option<&str>, token_env: &str, renam
         let (old, new) = r.split_once('=').ok_or_else(|| err(format!("--rename {r}: give OLD=NEW, as owner/old=owner/new")))?;
         map.insert(old.trim().to_lowercase(), new.trim().to_lowercase());
     }
-    let cfg = SyncConfig { url: url.trim().to_string(), token_env: token_env.trim().to_string(), renames: map };
+    let trusted = load_config(home).trusted;
+    let cfg = SyncConfig { url: url.trim().to_string(), token_env: token_env.trim().to_string(), renames: map, trusted };
     std::fs::write(config_path(home), serde_json::to_string_pretty(&cfg).unwrap_or_default())?;
     if let Some(t) = token {
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(token_path(home))?;
@@ -220,9 +318,9 @@ impl Remote {
         Ok(j)
     }
 
-    /// Creates the table (once; needs the `admin` scope).
-    pub fn create_table(&self) -> Result<()> {
-        self.post("/v1/sql", &json!({ "sql": CREATE })).map(|_| ())
+    /// Creates project `project`'s table (once; needs the `admin` scope).
+    pub fn create_table(&self, project: &str) -> Result<()> {
+        self.post("/v1/sql", &json!({ "sql": create_for(project) })).map(|_| ())
     }
 
     fn rows(&self, sql: &str, params: Json) -> Result<Vec<Vec<Json>>> {
@@ -232,7 +330,7 @@ impl Remote {
 
     /// How many records of `project` the server holds.
     pub fn count(&self, project: &str) -> Result<i64> {
-        let rows = self.rows(&format!("SELECT COUNT(*) FROM {TABLE} WHERE project = :p"), json!({ "p": project }))?;
+        let rows = self.rows(&format!("SELECT COUNT(*) FROM {} WHERE project = :p", table_for(project)), json!({ "p": project }))?;
         Ok(rows.first().and_then(|r| r.first()).and_then(|v| v.as_i64()).unwrap_or(0))
     }
 }
@@ -271,11 +369,15 @@ pub fn save_state(store_dir: &Path, s: &SyncState) {
     }
 }
 
-/// A record as the server's row, redacted.
-fn remote_doc(project: &str, r: &Record) -> Json {
+/// A record as the server's row, redacted, pushed by machine `origin`.
+/// A record this store pulled keeps the machine it came from.
+fn remote_doc(project: &str, origin: &str, r: &Record) -> Json {
     let mut r = r.clone();
     crate::redact::redact_record(&mut r);
+    let origin = r.links.iter().find(|l| l.label == SYNCED_FROM || l.label == ACCEPTED).map_or(origin.to_string(), |l| l.to.clone());
+    r.links.retain(|l| l.label != SYNCED_FROM && l.label != ACCEPTED);
     json!({
+        "origin": origin,
         "id": format!("{project}:{}", r.id),
         "project": project,
         "rid": r.id,
@@ -314,18 +416,20 @@ fn remote_record(row: &[Json]) -> Option<Record> {
     })
 }
 
-/// Whether `e` says the server has no table [`TABLE`].
-fn no_table(e: &crate::Error) -> bool {
-    let m = e.to_string();
-    m.contains(&format!("no such table: {TABLE}"))
+/// Whether `e` says the server has no table `table`.
+fn no_table(e: &crate::Error, table: &str) -> bool {
+    e.to_string().contains(&format!("no such table: {table}"))
 }
 
-/// [`push_once`], creating the table first where the server lacks it (a
-/// key with the `admin` scope can).
+/// [`push_once`], creating the project's table first where the server
+/// lacks it (a key with the `admin` scope can; the Inspector does it as it
+/// makes a project's key).
 pub fn push(remote: &Remote, store: &Store, project: &str, st: &mut SyncState) -> Result<usize> {
     match push_once(remote, store, project, st) {
-        Err(e) if no_table(&e) => {
-            remote.create_table().map_err(|c| err(format!("{e}; creating it failed too (it needs a key with the admin scope): {c}")))?;
+        Err(e) if no_table(&e, &table_for(project)) => {
+            remote.create_table(project).map_err(|c| {
+                err(format!("{e}; creating it failed too ({c}): an admin makes it, and a key for it, with \"Make a sync key\" on the command center's ChloeCtx page, or with `chloectx sync setup` and an admin's key"))
+            })?;
             push_once(remote, store, project, st)
         }
         r => r,
@@ -334,13 +438,15 @@ pub fn push(remote: &Remote, store: &Store, project: &str, st: &mut SyncState) -
 
 /// Sends the records of `store` after `st.pushed_seq`; how many.
 fn push_once(remote: &Remote, store: &Store, project: &str, st: &mut SyncState) -> Result<usize> {
+    let table = table_for(project);
+    let me = origin(&remote.header_dir);
     let mut sent = 0;
     loop {
         let rs = store.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE seq > :s ORDER BY seq ASC LIMIT {BATCH}"), &Params::new().set("s", chloedb::Value::Int(st.pushed_seq)))?;
         let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).collect();
         let Some(top) = rs.rows.iter().filter_map(|r| r.get(5).and_then(|v| v.as_i64())).max() else { break };
         if !recs.is_empty() {
-            let ops: Vec<Json> = recs.iter().map(|r| json!({"op": "upsert", "table": TABLE, "doc": remote_doc(project, r)})).collect();
+            let ops: Vec<Json> = recs.iter().map(|r| json!({"op": "upsert", "table": table, "doc": remote_doc(project, &me, r)})).collect();
             // Named by the records it holds: a retry of this batch is the
             // same request, and another machine's batch of the same
             // project and sequence numbers (each store numbers its own) is
@@ -363,55 +469,77 @@ fn push_once(remote: &Remote, store: &Store, project: &str, st: &mut SyncState) 
 /// Sends `recs` again, replacing the server's rows with the same ids (the
 /// records `chloectx redact` rewrote); how many.
 pub fn push_records(remote: &Remote, project: &str, recs: &[Record]) -> Result<usize> {
+    let (table, me) = (table_for(project), origin(&remote.header_dir));
     for batch in recs.chunks(BATCH) {
-        let ops: Vec<Json> = batch.iter().map(|r| json!({"op": "upsert", "table": TABLE, "doc": remote_doc(project, r)})).collect();
+        let ops: Vec<Json> = batch.iter().map(|r| json!({"op": "upsert", "table": table, "doc": remote_doc(project, &me, r)})).collect();
         let ids = batch.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(",");
         remote.post("/v1/write", &json!({ "ops": ops, "idempotency_key": format!("chloectx-redact-{:016x}-{:016x}-{}", fnv(project), fnv(&ids), crate::now()) }))?;
     }
     Ok(recs.len())
 }
 
-/// [`pull_once`]; a server without the table holds nothing to pull.
+/// Stores the records of `project` the server holds and `store` lacks:
+/// from the project's table, then from the table projects shared before
+/// 0.3.4 ([`TABLE`]) where the key may read it. A server without a table
+/// holds nothing to pull from it.
 pub fn pull(remote: &Remote, store: &Store, project: &str, st: &mut SyncState) -> Result<usize> {
-    match pull_once(remote, store, project, st) {
-        Err(e) if no_table(&e) => Ok(0),
-        r => r,
-    }
-}
-
-/// Stores the records of `project` the server holds and `store` lacks,
-/// embedded here; how many. Paged by sequence number: each machine numbers
-/// its own records, so the server holds several of one number, and a full
-/// page may end inside them, so its last number's records are read whole
-/// before the next page starts after it.
-fn pull_once(remote: &Remote, store: &Store, project: &str, st: &mut SyncState) -> Result<usize> {
-    let mut got = 0;
-    let mut after = i64::MIN;
-    loop {
-        let mut rows = remote.rows(&format!("SELECT {REMOTE_COLUMNS} FROM {TABLE} WHERE project = :p AND seq > :s ORDER BY seq ASC LIMIT {BATCH}"), json!({ "p": project, "s": after }))?;
-        let full = rows.len() >= BATCH;
-        let Some(top) = rows.iter().filter_map(|r| r.get(5).and_then(|v| v.as_i64())).max() else { break };
-        if full {
-            rows.retain(|r| r.get(5).and_then(|v| v.as_i64()) != Some(top));
-            rows.extend(remote.rows(&format!("SELECT {REMOTE_COLUMNS} FROM {TABLE} WHERE project = :p AND seq = :s LIMIT 10000"), json!({ "p": project, "s": top }))?);
-        }
-        got += store_new(store, &rows)?;
-        after = top;
-        if !full {
-            break;
-        }
-    }
+    let cfg = load_config(&remote.header_dir);
+    let me = origin(&remote.header_dir);
+    let table = table_for(project);
+    let mut got = match pull_once(remote, store, project, &table, PROJECT_COLUMNS, &me, &cfg.trusted) {
+        Err(e) if no_table(&e, &table) => 0,
+        r => r?,
+    };
+    // The shared table may be gone, or not for this key (a project's key
+    // is refused it): neither is an error of this project's sync.
+    got += pull_once(remote, store, project, TABLE, REMOTE_COLUMNS, &me, &cfg.trusted).unwrap_or(0);
     st.pulled += got as u64;
     st.last_pull = crate::now();
     Ok(got)
 }
 
+/// The records of `project` in `table`, read as `cols`, that `store`
+/// lacks, stored. Paged by sequence number: each machine numbers its own
+/// records, so the server holds several of one number, and a full page
+/// may end inside them, so its last number's records are read whole
+/// before the next page starts after it.
+fn pull_once(remote: &Remote, store: &Store, project: &str, table: &str, cols: &str, me: &str, trusted: &[String]) -> Result<usize> {
+    let mut got = 0;
+    let mut after = i64::MIN;
+    loop {
+        let mut rows = remote.rows(&format!("SELECT {cols} FROM {table} WHERE project = :p AND seq > :s ORDER BY seq ASC LIMIT {BATCH}"), json!({ "p": project, "s": after }))?;
+        let full = rows.len() >= BATCH;
+        let Some(top) = rows.iter().filter_map(|r| r.get(5).and_then(|v| v.as_i64())).max() else { break };
+        if full {
+            rows.retain(|r| r.get(5).and_then(|v| v.as_i64()) != Some(top));
+            rows.extend(remote.rows(&format!("SELECT {cols} FROM {table} WHERE project = :p AND seq = :s LIMIT 10000"), json!({ "p": project, "s": top }))?);
+        }
+        got += store_new(store, &rows, me, trusted)?;
+        after = top;
+        if !full {
+            break;
+        }
+    }
+    Ok(got)
+}
+
 /// Stores the server's `rows` that `store` lacks, redacted and embedded
-/// here; how many.
-fn store_new(store: &Store, rows: &[Vec<Json>]) -> Result<usize> {
-    let mut recs: Vec<Record> = rows.iter().filter_map(|r| remote_record(r)).collect();
-    for r in &mut recs {
-        crate::redact::redact_record(r);
+/// here; how many. A row another machine pushed (its `origin`, the
+/// thirteenth column, is not `me`; a row of the shared table names none)
+/// is linked [`SYNCED_FROM`] that machine, or [`ACCEPTED`] when it is in
+/// `trusted`.
+fn store_new(store: &Store, rows: &[Vec<Json>], me: &str, trusted: &[String]) -> Result<usize> {
+    let mut recs: Vec<Record> = Vec::new();
+    for row in rows {
+        let Some(mut r) = remote_record(row) else { continue };
+        crate::redact::redact_record(&mut r);
+        let from = row.get(12).and_then(|v| v.as_str()).filter(|o| !o.is_empty()).unwrap_or("unknown");
+        if from != me {
+            let ok = trusted.iter().any(|t| t == "*" || t == from);
+            r.links.retain(|l| l.label != SYNCED_FROM && l.label != ACCEPTED);
+            r.links.push(Link { label: if ok { ACCEPTED } else { SYNCED_FROM }.into(), to: from.to_string() });
+        }
+        recs.push(r);
     }
     let ids: Vec<String> = recs.iter().map(|r| r.id.clone()).collect();
     let have: std::collections::HashSet<String> = store.get(&ids)?.into_iter().map(|r| r.id).collect();
@@ -424,6 +552,68 @@ fn store_new(store: &Store, rows: &[Vec<Json>]) -> Result<usize> {
     let embs = store.embedder.embed(&refs)?;
     store.bulk_insert(&new, embs)?;
     Ok(new.len())
+}
+
+/// `chloectx sync accept`: the store's records pulled from machines not
+/// accepted yet, by machine (`origin`, count, a few of their texts); with
+/// `origins` (`*` for all), those machines' records are accepted, and the
+/// machines added to `sync.json`'s `trusted`, so that later pulls take
+/// theirs as accepted too. Returns the machines and how many records each
+/// had pending.
+pub fn accept(home: &Path, store: &Store, origins: &[String]) -> Result<Vec<(String, usize, Vec<String>)>> {
+    // Pulled records keep the server's sequence numbers: paged by them.
+    let mut recs: Vec<Record> = Vec::new();
+    let mut after = i64::MIN;
+    loop {
+        let rs = store.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE seq > :s ORDER BY seq ASC LIMIT 5000"), &Params::new().set("s", chloedb::Value::Int(after)))?;
+        let mut page: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).collect();
+        let Some(top) = page.iter().map(|r| r.seq).max() else { break };
+        let full = page.len() >= 5000;
+        if full {
+            // Several machines' records share a number: the last one's whole.
+            page.retain(|r| r.seq != top);
+            let rest = store.query_with(&format!("SELECT {COLUMNS} FROM memory WHERE seq = :s LIMIT 100000"), &Params::new().set("s", chloedb::Value::Int(top)))?;
+            page.extend(rest.rows.iter().filter_map(|r| crate::store::row_record(r)));
+        }
+        recs.extend(page.into_iter().filter(pending));
+        if !full {
+            break;
+        }
+        after = top;
+    }
+    let mut by: std::collections::BTreeMap<String, (usize, Vec<String>)> = Default::default();
+    for r in &recs {
+        let e = by.entry(pending_origin(r).unwrap_or("unknown").to_string()).or_default();
+        e.0 += 1;
+        if e.1.len() < 3 && r.kind.is_knowledge() {
+            e.1.push(r.text.chars().take(120).collect());
+        }
+    }
+    if !origins.is_empty() {
+        let all = origins.iter().any(|o| o == "*");
+        let mut changed = Vec::new();
+        for mut r in recs {
+            let from = pending_origin(&r).unwrap_or("unknown").to_string();
+            if all || origins.contains(&from) {
+                for l in r.links.iter_mut().filter(|l| l.label == SYNCED_FROM) {
+                    l.label = ACCEPTED.into();
+                }
+                changed.push(r);
+            }
+        }
+        if !changed.is_empty() {
+            store.insert(&changed)?;
+        }
+        let mut cfg = load_config(home);
+        for o in origins {
+            if !cfg.trusted.contains(o) {
+                cfg.trusted.push(o.clone());
+            }
+        }
+        crate::paths::create_private_dir(home)?;
+        std::fs::write(config_path(home), serde_json::to_string_pretty(&cfg).unwrap_or_default())?;
+    }
+    Ok(by.into_iter().map(|(o, (n, t))| (o, n, t)).collect())
 }
 
 /// Whether `t` is an Anthropic API key, which a ChloeDB server never takes:
@@ -446,6 +636,18 @@ mod tests {
             assert_eq!(repo_of(u).as_deref(), Some("chloetech-ai/strata"), "{u}");
         }
         assert_eq!(repo_of("strata"), None);
+    }
+
+    #[test]
+    fn each_project_has_a_table_of_its_own() {
+        assert_eq!(table_for("chloetech-ai/chloedb"), format!("chloectx_mem_chloetech_ai_chloedb_{:08x}", fnv("chloetech-ai/chloedb") as u32));
+        assert_ne!(table_for("acme/web-app"), table_for("acme/web_app"));
+        let t = table_for("/home/someone/a folder/with a very long name that goes on and on and on");
+        assert!(t.starts_with(PREFIX) && t.len() <= PREFIX.len() + 40 + 9, "{t}");
+        assert!(t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'), "{t}");
+        // Not a space's table (`ctx_*`), nor the shared one.
+        assert!(!t.starts_with("ctx_") && !t.starts_with(TABLE));
+        assert!(create_for("acme/web").contains(&table_for("acme/web")));
     }
 
     #[test]
@@ -486,7 +688,8 @@ mod tests {
             ctx: "Turn 3".into(),
             links: vec![Link { label: "about".into(), to: "e:chloedb".into() }],
         };
-        let d = remote_doc("/home/me/p", &r);
+        let d = remote_doc("/home/me/p", "m-1", &r);
+        assert_eq!(d["origin"], "m-1");
         assert_eq!(d["id"], "/home/me/p:abcd1234:7");
         let row: Vec<Json> = REMOTE_COLUMNS.split(", ").map(|c| d[c].clone()).collect();
         let back = remote_record(&row).unwrap();
@@ -515,7 +718,7 @@ mod tests {
             ctx: format!("Turn 3 request: use the key {key}"),
             links: Vec::new(),
         };
-        let d = remote_doc("p", &r).to_string();
+        let d = remote_doc("p", "m-1", &r).to_string();
         assert!(!d.contains(&pw) && !d.contains(&key), "{d}");
         assert!(d.contains("DB_PASSWORD=[REDACTED:password]") && d.contains("use the key [REDACTED:chloedb-key]"), "{d}");
     }

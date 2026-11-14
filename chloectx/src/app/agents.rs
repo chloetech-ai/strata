@@ -118,7 +118,8 @@ pub fn check(g: &Grants, method: &str, p: &[&str]) -> Result<(), Fail> {
         (_, ["v1", "spaces", s, ..]) => g.need(&space(s), Scope::Write, &format!("change the space {s}")),
         ("GET", ["v1", "incidents", ..]) => g.need(&space("incidents"), Scope::Read, "read the incidents"),
         (_, ["v1", "incidents", ..]) => g.need(&space("incidents"), Scope::Write, "record or draft incidents"),
-        ("GET", ["v1", "memory", ..]) => g.need(crate::sync::TABLE, Scope::Read, "read the synced memory"),
+        // Each project's table, as the call reads it (`App::memory_table`).
+        ("GET", ["v1", "memory", ..]) => Ok(()),
         (_, ["v1", "local", ..]) => Err(Fail(403, "the local stores are this machine's sessions: no key limited to tables reads them".into())),
         _ => Err(Fail(403, "a key limited to tables may not call this".into())),
     }
@@ -264,7 +265,10 @@ mod tests {
         assert!(ok("GET", "/v1/spaces") && ok("GET", "/v1/info"));
         assert!(ok("GET", "/v1/spaces/billing/notes") && ok("POST", "/v1/spaces/billing/notes") && ok("POST", "/v1/spaces/billing/mcp") && ok("DELETE", "/v1/spaces/billing/notes/api:1"));
         assert!(!ok("POST", "/v1/spaces/billing/apps") && !ok("POST", "/v1/spaces") && !ok("GET", "/v1/spaces/payroll/notes") && !ok("POST", "/v1/spaces/payroll/mcp"));
-        assert!(!ok("GET", "/v1/memory") && !ok("GET", "/v1/local") && !ok("POST", "/v1/incidents") && !ok("GET", "/v1/incidents"));
+        assert!(!ok("GET", "/v1/local") && !ok("POST", "/v1/incidents") && !ok("GET", "/v1/incidents"));
+        // The synced projects: the route lists those whose tables the key
+        // reads (none here), and reads a project only from a table it may.
+        assert!(ok("GET", "/v1/memory"));
         let reader = Grants::parse("ctx_billing=read");
         let path = p("/v1/spaces/billing/notes");
         let path: Vec<&str> = path.iter().map(|s| s.as_str()).collect();

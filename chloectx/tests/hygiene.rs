@@ -291,3 +291,52 @@ fn blame_resolves_a_relative_target_against_the_project_and_wants_an_added_line(
     let b = ok(call(&d, json!({"op": "blame", "target": "src/lib.rs:1"})));
     assert!(b["how"].as_str().unwrap().starts_with("no recorded edit"), "the edit kept line 1, it did not write it: {b}");
 }
+
+/// The ids of the store's on-disk segments.
+fn segment_ids(d: &Arc<Daemon>) -> Vec<u64> {
+    let mut v: Vec<u64> = chloectx::daemon::segments_live(d.store.db().unwrap()).into_keys().collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_forget_rewrites_only_the_segments_that_held_the_record_and_leaves_its_text_in_no_file() {
+    // X-F2: the forget rewrote every segment with any deleted row, then
+    // vacuumed the whole file, before it answered. N-F2 (a): the live
+    // file's freed pages were never checked.
+    let store = tempfile::tempdir().unwrap();
+    config(store.path(), r#", "receipts": {"snapshots": {"min_interval_secs": 0}}"#);
+    let d = Arc::new(Daemon::open(store.path(), "/proj").unwrap());
+    let db = d.store.db().unwrap().clone();
+    // An old segment with a deleted row of its own (a superseded note).
+    let old = ok(call(&d, json!({"op": "remember", "kind": "note", "text": "Old note about the build cache, replaced later."})))["id"].as_str().unwrap().to_string();
+    ok(call(&d, json!({"op": "remember", "kind": "decision", "text": "Payments retries back off exponentially, capped at five seconds."})));
+    db.storage().flush().unwrap();
+    ok(call(&d, json!({"op": "forget", "id": old})));
+    let after_first = segment_ids(&d);
+    // A second segment holds the secret.
+    let secret = ok(call(&d, json!({"op": "remember", "kind": "fact", "text": "The staging database password is quokka-zebra-7731 for the payments cluster."})))["id"].as_str().unwrap().to_string();
+    ok(call(&d, json!({"op": "remember", "kind": "note", "text": "The deploy window is Tuesday afternoons."})));
+    db.storage().flush().unwrap();
+    // A third, after it, with a deleted row too.
+    let other = ok(call(&d, json!({"op": "remember", "kind": "note", "text": "Temporary note, deleted by hand."})))["id"].as_str().unwrap().to_string();
+    ok(call(&d, json!({"op": "remember", "kind": "note", "text": "Lint runs before tests."})));
+    db.storage().flush().unwrap();
+    assert!(d.store.delete(&other).unwrap());
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s1", "prompt": "What is the staging database password for the payments cluster?"}));
+    assert!(!files_holding(store.path(), "quokka-zebra-7731").is_empty());
+    let before = segment_ids(&d);
+
+    let f = ok(call(&d, json!({"op": "forget", "id": secret})));
+    let text = f["text"].as_str().unwrap();
+    assert!(text.contains("being rewritten"), "{text}");
+    let now = segment_ids(&d);
+    // The segments from before the secret's, and the one after it, are
+    // the same segments: only the secret's was rewritten.
+    for id in &after_first {
+        assert!(now.contains(id), "segment {id} of the first flush was rewritten: {before:?} -> {now:?}");
+    }
+    assert_eq!(before.iter().filter(|id| !now.contains(id)).count(), 1, "{before:?} -> {now:?}");
+    let left = files_holding(store.path(), "quokka-zebra-7731");
+    assert!(left.is_empty(), "the forgotten text is in {left:?}");
+}

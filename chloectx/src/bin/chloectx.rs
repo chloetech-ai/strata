@@ -435,6 +435,16 @@ enum SyncCmd {
     Push,
     /// Push, then store the project's records the server holds and the store lacks.
     Pull,
+    /// The records pulled from other machines whose rules and decisions are
+    /// kept out of the briefing until accepted, by machine; with --origin
+    /// (repeatable) or --all, accept those machines' records, now and on
+    /// later pulls.
+    Accept {
+        #[arg(long = "origin")]
+        origins: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn send(project: &std::path::Path, req: Json, secs: u64) -> Json {
@@ -589,8 +599,9 @@ fn main() {
             }
             let remote = chloectx::sync::remote(&home).expect("just set up");
             if !no_create {
-                if let Err(e) = remote.create_table() {
-                    eprintln!("chloectx sync: could not create the table {} on {}: {e}", chloectx::sync::TABLE, remote.url);
+                let key = chloectx::sync::project_key(&home, &project.to_string_lossy());
+                if let Err(e) = remote.create_table(&key) {
+                    eprintln!("chloectx sync: could not create the table {} on {}: {e}", chloectx::sync::table_for(&key), remote.url);
                     std::process::exit(1);
                 }
             }
@@ -607,12 +618,19 @@ fn main() {
                 send(&project, json!({"op": "shutdown"}), 10);
             }
         }
+        Cmd::Sync { what: SyncCmd::Accept { mut origins, all } } => {
+            if all {
+                origins = vec!["*".into()];
+            }
+            let r = send(&project, json!({"op": "sync", "what": "accept", "origins": origins}), 600);
+            println!("{}", r["text"].as_str().unwrap_or(""));
+        }
         Cmd::Sync { what } => {
             let w = match what {
                 SyncCmd::Status => "status",
                 SyncCmd::Push => "push",
                 SyncCmd::Pull => "pull",
-                SyncCmd::Setup { .. } => unreachable!(),
+                SyncCmd::Setup { .. } | SyncCmd::Accept { .. } => unreachable!(),
             };
             println!("{}", serde_json::to_string_pretty(&send(&project, json!({"op": "sync", "what": w}), 600)).unwrap());
         }
@@ -635,7 +653,7 @@ fn main() {
             }
             let mut missing = 0;
             for id in &ids {
-                let r = send(&project, json!({"op": "forget", "id": id}), 120);
+                let r = send(&project, json!({"op": "forget", "id": id, "wait": true}), 120);
                 let t = r["text"].as_str().unwrap_or("");
                 println!("{t}");
                 missing += usize::from(t.starts_with("No record"));

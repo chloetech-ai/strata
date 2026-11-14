@@ -428,6 +428,37 @@ pub fn run(project: &Path) -> i32 {
                     "store",
                     format!("{} ({}, {}; daemon answered in {} ms)", store.display(), plural(n(&s["records"]), "record"), plural(n(&s["sessions"]), "session"), t0.elapsed().as_millis()),
                 );
+                // What the store, its receipts and its snapshots take on
+                // disk, and against what budget (N-F9, X-F3).
+                let h = |b: u64| crate::stores::human(b);
+                let store_b = n(&s["file_bytes"]) + n(&s["wal_bytes"]);
+                let rc = &s["receipts"];
+                let rc_b = n(&rc["file_bytes"]) + n(&rc["wal_bytes"]);
+                let sn = &s["snapshots"];
+                let (autos, named, snap_b) = (n(&sn["automatic"]), n(&sn["named"]), n(&sn["bytes"]));
+                let receipts = if rc["on"] == json!(true) { format!("{} in {}", h(rc_b), plural(n(&rc["count"]), "receipt")) } else { format!("off ({} kept)", h(rc_b)) };
+                let budget = sn["budget"].as_u64();
+                let snaps = format!(
+                    "{} in {} automatic and {} named snapshot{} (at most one every {} min, {}; budget {})",
+                    h(snap_b),
+                    autos,
+                    named,
+                    if named == 1 { "" } else { "s" },
+                    sn.pointer("/retention/min_interval_secs").and_then(|v| v.as_i64()).unwrap_or(0) / 60,
+                    match sn.pointer("/retention/daily_after_days").and_then(|v| v.as_i64()).unwrap_or(0) {
+                        0 => "kept as taken".to_string(),
+                        d => format!("one a day after {d} days"),
+                    },
+                    budget.map_or("none".to_string(), h)
+                );
+                let line = format!("store {}, receipts {receipts}, snapshots {snaps}; {} in all", h(store_b), h(n(&s["total_bytes"])));
+                if sn["last_copied"] == json!(true) {
+                    r.warn("disk", format!("{line}. The last snapshot linked none of the one before's files (hard links fail on this file system), so each one copies the whole store: set receipts.snapshots.after_recall to false in the store's config.json, or keep the store on a local disk"));
+                } else if budget.is_some_and(|b| snap_b > b + b / 4) {
+                    r.warn("disk", format!("{line}. The snapshots are over their budget, which the next one prunes to: named ones count toward it and are kept (`chloectx snapshot drop NAME`)"));
+                } else {
+                    r.ok("disk", line);
+                }
                 // The running daemon resolves the CLI with the environment
                 // of whatever started it (CTX-3).
                 if let Some(e) = s.pointer("/claude/error").and_then(|v| v.as_str()) {
@@ -455,6 +486,23 @@ pub fn run(project: &Path) -> i32 {
             ),
             Ok(s) => r.fail("daemon", s["error"].to_string()),
             Err(e) => r.fail("daemon", format!("{e}: {}", log.trim())),
+        }
+    }
+
+    // Sync: where this project's memory goes, with what (X-F1).
+    if let Some(remote) = crate::sync::remote(&home) {
+        let key = crate::sync::project_key(&home, &project.to_string_lossy());
+        let st = crate::sync::load_state(&store, &remote.url);
+        let line = format!(
+            "{}: this project syncs as {key} into the table {}, as machine {} (rules and decisions other machines send wait for `chloectx sync accept`)",
+            remote.url,
+            crate::sync::table_for(&key),
+            crate::sync::origin(&home)
+        );
+        if st.last_error.is_empty() {
+            r.ok("sync", line);
+        } else {
+            r.warn("sync", format!("{line}; the last sync failed: {}", st.last_error));
         }
     }
 

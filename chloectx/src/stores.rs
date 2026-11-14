@@ -450,7 +450,7 @@ pub fn forget_everywhere(home: &Path, what: &[String], o: &ForgetOptions) -> i32
         } else {
             f.matches.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect()
         };
-        match crate::daemon::request(&f.entry.info.dir, f.entry.info.project.as_deref().unwrap_or(""), &json!({"op": "forget", "ids": ids}), Duration::from_secs(600)) {
+        match crate::daemon::request(&f.entry.info.dir, f.entry.info.project.as_deref().unwrap_or(""), &json!({"op": "forget", "ids": ids, "wait": true}), Duration::from_secs(600)) {
             Ok(r) if r.get("error").is_none() => {
                 let d = r["deleted"].as_array().map_or(0, |a| a.len());
                 forgotten += d;
