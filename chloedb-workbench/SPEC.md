@@ -282,7 +282,13 @@ agent, its task, the time from git) and says what it could not find.
   [[...]]}`).
 - `POST /api/ask {repo, question}`: `chloectx ask --json` in the repo,
   answered as it prints it, plus the Workbench agents its records' sessions
-  map to.
+  map to; and the answer for a person (`src/ask.rs`): `summary` (one
+  sentence), `memory` (the records that share the question's words, at most
+  five notes and the transcripts, each `{id, kind, what, who, agent, text,
+  ts, ts_ms, files, transcript}`, phrased without "The agent X said:"),
+  `code` (the top five `search::quick` hits with `path, symbol, line,
+  snippet`), `history` (`{answer, commits}` from Trace), `terms`,
+  `missing` and `took_ms` (an integer). No model is called.
 - All four read only, token as the other routes. Tests use a fake
   `chloectx` script that prints canned JSON.
 
@@ -1581,8 +1587,15 @@ only when the user presses Explain.
 - `POST /api/trace/explain` takes the same fields as JSON, traces again
   and runs `chloectx ask --deep --json -- <question and the evidence,
   tagged E1..>` (5 minutes at most), answering `{available, answer, text,
-  ids, confidence, cost_usd, ms, evidence}`, or `{available: false, why}`
-  when ChloeCtx is not installed or fails.
+  ids, confidence, cost_usd, ms, evidence, missing}`, or `{available: false, why}`
+  when ChloeCtx is not installed or fails. The question tells the model to
+  name only the listed commits, and `missing` names any commit the answer
+  names that the timeline does not show.
+- `GET /api/trace/examples?repo` answers `{examples, files}`: questions to
+  try made of the repository's history (its most-changed files, not tests
+  or lock files, and a recent commit's subject).
+- The answer's history line ("x changed 3 times: …") leaves out commits
+  whose lines about the subject only import or re-export it.
 - `GET /api/trace/commit?repo|agent&sha` answers one commit's diff
   (`git show -U0`, parsed); the sha must be hex.
 

@@ -933,7 +933,8 @@ Today's routes redirect for a release:
 | today | redirects to |
 |---|---|
 | `#/mission` | `#/p/<p>/change` |
-| `#/decide`, `#/away`, `#/catchup` | `#/p/<p>` |
+| `#/decide`, `#/rules`, `#/guarded` | `#/more/rules` (rules, grants, guarded commands and paths) |
+| `#/away`, `#/catchup` | `#/p/<p>` |
 | `#/trace`, `#/why` | `#/debug/code` |
 | `#/map` | `#/p/<p>/understand` |
 | `#/story/<id>`, `#<agent id>` | `#/a/<id>` |

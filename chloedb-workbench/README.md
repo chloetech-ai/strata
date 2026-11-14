@@ -87,9 +87,17 @@ Every page answers one question, and the goal comes first:
   builds it (one agent, or a lead that plans the parts), and the plan,
   which you read before anything runs.
 - **Continue** (`#/p/<project>`): since you left, what needs you, what is
-  ready and what is still working. **Understand** asks about the project
-  and shows who is changing which file; **Start a change** says what
-  should change and how you will know it is done.
+  ready and what is still working (a first visit says so, rather than
+  counting from a made-up day). **Understand** asks about the project
+  (`POST /api/ask`: the records ChloeCtx keeps that share the question's
+  words, each with who said it and when, the code that matches, and the
+  commits Trace finds; no model) and shows who is changing which file;
+  **Start a change** says what should change and how you will know it is
+  done. Before it starts anything it checks the sentences against the
+  project's rules, its guarded paths and the verbs that destroy, without a
+  model, and you confirm or edit; it suggests a model from past tasks
+  (`GET /api/route`), warns when the done check runs a flaky test, offers
+  Read only, and keeps the draft per project while you look elsewhere.
 - **The agent page** (`#/a/<agent>`): the agent, the question it asks, and
   its tabs: Progress, Changes, Preview, Terminal, Events. On a phone the
   terminal is read-only until **Type**.
@@ -183,8 +191,9 @@ origin when that request would change something.
   path, git checkouts first
 - `GET /api/needs`: everything that needs you, as one list and one count:
   questions and permission prompts (with Claude Code's numbered options),
-  trust prompts, agents waiting on a prompt not read yet, and alerts that
-  ask you, oldest first
+  trust prompts, agents waiting on a prompt not read yet, agents idle after
+  a turn whose last sentence asked you something (`asked: true`), and
+  alerts that ask you, oldest first
 - `GET /api/wait?agent=&until=idle|waiting|exited|any&timeout_s=`
 - `POST /api/hook`: what `chloedb-workbench hook` posts
 - `GET /api/stream`: server-sent events (`snapshot`, `agent`, `event`)
@@ -227,7 +236,8 @@ installed, these routes answer for any line an agent wrote:
 - `GET /api/decisions?repo=&limit=`: the repository's decision notes, through
   `chloectx sql --json`
 - `POST /api/ask {repo, question}`: `chloectx ask --json`, plus the agent of
-  each record whose session is one of Workbench's
+  each record whose session is one of Workbench's, and the answer for a
+  person: `summary`, `memory`, `code`, `history` and `took_ms` (SPEC.md)
 
 Ship (`#/ship/<agent>`) is where you decide a merge. It counts only the
 branch's own change: when a branch was rebased onto another agent's branch,

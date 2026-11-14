@@ -2,159 +2,134 @@
 
 Workbench runs several Claude Code agents side by side, each in its own
 terminal and most often its own git worktree, and shows you what they are
-doing at the level you want to read it: the goal, the questions waiting for
-you, the story of one agent, the map of the code, the diff, or the terminal
-itself. This page says what each screen is for and when to open it. The
-README beside this guide is the reference for installing it and for its HTTP API.
+doing: what needs you, what happened since you left, what is ready to
+review, and why the code is like it is. This page says what each place is
+for and when to open it. The README beside this guide is the reference for
+installing it and for its HTTP API; [JOURNEYS.md](JOURNEYS.md) is the
+design.
 
-> You can read a repository without starting any agent. Search, Map,
-> Trace and Library each offer **Open a repository**: type the folder of a
-> git checkout (Tab completes folders, git checkouts come first) and
-> Workbench indexes it.
+> You can read a project without starting any agent. Open its folder
+> (Start, or `#/p`; Search and Debug offer **Open a repository**), then
+> **Understand** answers questions about it from
+> memory, the code and git, and **Search** (<kbd>/</kbd>) finds code, docs
+> and decisions.
 
 ## The first ten minutes
 
 1. **Start the server and open its link.** `chloedb-workbench serve` prints
-   a URL with a token. Open it. The left rail lists the screens; the right
-   rail, **Needs you**, lists what is waiting for you.
-2. **Open your repository first, if you want to look before you change
-   anything.** Press <kbd>/</kbd> to search, or open [Map](#/map) or
-   [Library](#/library). Each one asks for the repository the first time.
-   Search finds code, the docs of its libraries and past decisions; Map
-   shows the files sized by lines; [Trace](#/trace) answers "when and why
-   did this change" from git history.
-3. **Start an agent.** Press <kbd>n</kbd> (New agent). Give the repository,
-   a task in a sentence or two, a short name (`cents`, `paybutton`), and a
-   model if you have one in mind. It starts in its own worktree on the
-   branch `wb/<name>`, so it cannot step on your checkout or on other
-   agents.
-4. **Answer what it asks.** When it needs a permission or a decision, a
-   card appears in **Needs you** and the [Decide](#/decide) badge counts it.
-   Answer there rather than in the terminal: Decide shows what the agent
-   wants to run and what was decided before.
-5. **Follow it.** [Story](#/story) tells one agent's work as chapters, a
-   chapter per turn. Pick the agent at the top. "Talk to it at this level"
-   steers it without typing into the terminal.
-6. **Check the result.** [Ship](#/ship) shows an agent's changes, what they
-   touch and the draft of a pull request. If the agent started a web app,
-   [Preview](#/preview) shows it.
-7. **Several agents?** Set a goal on [Mission](#/mission) and see every
-   outcome move from Next to Done.
+   a URL with a token. Open it. **Start** asks what you came to do.
+2. **Open a project.** Type the folder of a git checkout (<kbd>Tab</kbd>
+   completes folders, git checkouts come first) and press Open. You land on
+   the project's page, **Since you left**. On a first visit it says so;
+   later it counts from when you last looked.
+3. **Understand it first, if you like.** **Understand** has a box: ask
+   "why does the total round half up?" and the answer comes as cards, each
+   with its source: what ChloeCtx remembers (who said it, when), the code
+   (file and line), and the commits that changed it. No model is called.
+4. **Start a change.** Say what should change and how you will know it is
+   done (a command in backticks makes the agent run it). Before anything
+   starts, Workbench checks your sentences against the project's rules,
+   its guarded paths and the verbs that destroy (delete, drop, force-push):
+   a sentence that matches is shown, and you remove it, start read only,
+   or start anyway. The form also suggests a model from this project's past
+   tasks, warns when the done check runs a flaky test, and keeps your draft
+   if you leave the page. <kbd>⌘</kbd><kbd>↵</kbd> (<kbd>Ctrl</kbd><kbd>↵</kbd>
+   off a Mac) from any field starts it. Tick **Split it into parts** and a
+   lead drafts the parts first; you edit them, and each part's model,
+   before anything runs.
+5. **Answer what it asks.** A question appears as a card in **Needs you**
+   (the top bar's button, and the project's page). Press a digit, then
+   <kbd>↵</kbd>. A long command must be read first: <kbd>e</kbd> or
+   <kbd>Space</kbd> shows it all. An answer that widens what the agent may
+   do (“don't ask again for …”) opens a check of the exact rule first.
+6. **Tell it something.** On the agent's page, **Tell** sends your words
+   exactly as written: typed into its prompt when it waits there, or given
+   at its next tool call when it works. When it is showing a question,
+   your words are queued, and nothing is typed into that question. A
+   sentence that begins "From now on", "Always" or "Never" can also become
+   a rule for every agent of the project.
+7. **Review and ship.** When an agent is done, **Review and ship** shows its
+   changes, the decisions behind them and the merge.
 
-## The screens
+## The places
 
-### Mission: what the fleet is for
+### Start
 
-The goal, its outcomes in four columns (Done, In motion, Needs you, Next),
-one live sentence per agent, the questions waiting for you and what the
-fleet learned today. Open it when you run several agents toward one end.
+What you came to do: continue a project, review what is ready, start a new
+project, or find out why something went wrong.
 
-A goal can be staffed three ways (**Set a goal**, or **+ New goal** on a
-goal):
+### A project: Since you left, Understand, Start a change
 
-| choice | what happens | when |
-|---|---|---|
-| A lead plans it | a lead agent reads the code, breaks the goal into 3 to 8 outcomes and starts an agent for each | you know the end, not the steps |
-| I know the outcomes | you type the outcomes, one per line (after " — ", how to tell it is done); one agent starts per outcome, no planner | you already know the split, and don't want to pay a planner to find it again |
-| Agents already running | you tick agents that are already working; each becomes an outcome | you started agents by hand and want to see them as one goal |
+`#/p/<project>` is **Since you left**: one sentence on what happened since
+you last looked (agents that ended, branches merged, outcomes done), the
+cards that need you, the agents by state, and the decisions made. **I'm
+stepping away** marks the moment; it asks the browser for notifications and
+says plainly what will reach you (a desktop notification while the tab is
+open; nothing by phone or email).
 
-The lead's (or the agents') model and effort are picked in the same form.
+**Understand** answers questions about the project without starting an
+agent, and shows who is changing which file.
 
-### Decide: questions and rules
+**Start a change** is described above. **May do without asking** decides
+the permissions: **Edit files on its branch and run the tests** lets it
+edit with the Edit and Write tools and run reading commands, the tests and
+local git, alone or chained; anything on the network, a delete or a guarded
+command still asks. **Read only** starts it changing nothing.
 
-Every question an agent asked you (a permission, or `ask_human` with
-options), with what ChloeCtx remembers about it. Answer in one click; tick
-"Make it a rule" and every agent of the repository is told it.
+### The agent page
 
-**Rules** lists the repository's rules. Add one directly in the box at its
-top (no question needed), edit one, turn it off, or delete it. An edited
-rule is told again to every agent at its next step.
+`#/a/<agent>`: its task, the question it asks you, its Progress (a chapter
+per turn), Changes, Preview and Terminal. **Review and ship** and **Tell**
+stay side by side in that order, so one never turns into the other under
+the pointer.
 
-### Trace: when and why something changed
+### Review and ship
 
-Ask in your own words: "cart total rounding from floor to half-up",
-"`to_cents`", "money.py". Trace reads git on every branch (the agents'
-`wb/*` ones too), Workbench's events and ChloeCtx's decisions, and lays out
-where it happened, oldest first, with who decided it and why. Use it
-before you change something that changed before.
+An agent's diff, its blast radius, the decisions behind it, and the merge.
 
-### Map: who works where
+### Debug: find out why
 
-The repository's tracked files, sized by lines, tinted by the agent
-changing each one; collisions (two agents in one file, or one heading into
-a file another changed) are hatched red, and ◆ marks the decisions ChloeCtx
-can explain. Click a folder to go in, a file for who touched it, a ◆ for
-why. Small files fold into "… n small" only in big folders; click the fold
-to open it. **Heat** shows the files agents keep correcting.
+Pick an agent and a turn, and Debug walks to where it went wrong.
+**Why the code is like this** (Trace) answers "when and why did this
+change" from git on every branch, Workbench's events and ChloeCtx; its
+example questions come from this project's own most-changed files and
+commits. **What is failing** lists the tests the agents ran, flaky ones
+marked. **What agents remember** is ChloeCtx's records.
 
-### Story: one agent, at four levels
+On a line of a diff, **Why?** says who wrote it and why: the agent's edit
+(an edit made with a shell command counts too), its decision, or
+`git blame` and the commit when no agent touched it.
 
-Intent (why it exists), Story (a chapter per turn), Steps (its tool calls,
-grouped) and Terminal. <kbd>]</kbd> goes a level deeper, <kbd>[</kbd> back
-up. The row at the top picks the agent. The side shows what ChloeCtx put
-in its context and a box to steer it at the level you are reading.
+### More
 
-### Preview: the app an agent runs
+**Terminals** (every agent's live terminal), **Where the time went**,
+**Decisions** (a timeline per agent), **Library** (code and docs search),
+**Rules** (what every agent is told, what they may run without asking,
+every grant with Revoke, and the guarded commands and paths), **Guide**
+(this page), **Keys** and **Setup**.
 
-When an agent starts a dev server and sets its preview, the page shows
-here. Click an element to ask for a change to it; turn the overlay off to
-use the page as is. **Test with a persona** sends a simulated customer
-through it.
-
-### Ship: is this ready to merge
-
-An agent's diff, its blast radius (the functions it changed, their callers
-and tests), the decisions behind it and a pull request draft you can copy.
-
-### Flow: where the time went
-
-The last hour per agent: the model thinking, tools, tests, waiting on you,
-redoing a failed step, idle. A coach suggests what to change, such as
-allowing a command you approved many times.
-
-### Health: tests and alerts
-
-Rules written as SQL over Workbench's tables (a test failing twice in an
-hour, a file three agents edited), the incidents they open, every test the
-agents ran (flaky ones, slow ones) and the hotspots.
-
-### Library: code and docs search
-
-The repository's code, chunked and ranked in Workbench's own ChloeDB (no
-model), as each agent's worktree sees it, and the docs of its libraries.
-The same search the agents use.
-
-### Away: what happened while you were gone
-
-When you come back, a summary since you last looked: outcomes done,
-questions decided and still open, a line per agent, and moments to replay.
-
-### Terminals and Decisions
-
-**Terminals** is the grid of every agent's live terminal; <kbd>z</kbd>
-zooms one. The **Decisions** button in the top bar is the repository's
-decisions on a timeline, one lane per agent, with **Ask why**.
-
-### Search
-
-<kbd>/</kbd> anywhere (outside a text box) opens one box over code, docs
-and decisions. Enter opens a hit; <kbd>⇧</kbd><kbd>Enter</kbd> on a line of
-code tells why it is like this.
+Old addresses still work: `#/decide` opens More › Rules, `#/trace` opens
+Why the code is like this, `#/mission` opens Start a change.
 
 ## The keyboard
 
 | keys | what |
 |---|---|
-| <kbd>n</kbd> | New agent |
-| <kbd>z</kbd> | zoom the selected agent's terminal, or back to the grid |
-| <kbd>/</kbd> | search |
-| <kbd>?</kbd> | the list of keys |
-| <kbd>[</kbd> <kbd>]</kbd> | up or down a level (Intent, Plan, Story, Changes, Terminal) |
-| <kbd>j</kbd> <kbd>k</kbd> | the next or previous item on a screen |
-| <kbd>1</kbd>…<kbd>9</kbd> | on Decide, pick an option |
-| <kbd>Ctrl</kbd><kbd>b</kbd> then a key | the same commands from inside a terminal, as in tmux: <kbd>z</kbd> leaves a zoomed terminal, <kbd>x</kbd> stops an agent (asks first), <kbd>1</kbd>…<kbd>9</kbd> zooms agent 1 to 9, <kbd>d</kbd> opens Decisions |
+| <kbd>/</kbd> | Search: <kbd>↑</kbd> <kbd>↓</kbd> move, <kbd>↵</kbd> opens, <kbd>⇧</kbd><kbd>↵</kbd> on code says why it is like this, <kbd>Tab</kbd> changes the scope, <kbd>Esc</kbd> closes |
+| <kbd>.</kbd> | Needs you |
+| <kbd>a</kbd> | Agents |
+| <kbd>n</kbd> | Start a change in this project |
+| <kbd>g</kbd> then <kbd>s</kbd> <kbd>c</kbd> <kbd>r</kbd> <kbd>d</kbd> | go to Start, Continue, Review, Debug |
+| <kbd>j</kbd> <kbd>k</kbd> | the next or previous card, else item |
+| <kbd>]</kbd> <kbd>[</kbd> | the next or previous card that needs you |
+| <kbd>1</kbd>…<kbd>9</kbd> then <kbd>↵</kbd> | on a focused question card, Claude Code's option |
+| <kbd>e</kbd> or <kbd>Space</kbd> | on a question card, show the whole command |
+| <kbd>x</kbd>, then <kbd>⇧</kbd><kbd>1</kbd>… | select cards, then answer them alike (identical commands only) |
+| <kbd>Esc</kbd> | close the sheet or drawer; else up one level |
+| <kbd>?</kbd> | Keys |
+| <kbd>Ctrl</kbd><kbd>b</kbd> then <kbd>Esc</kbd> | leave a terminal |
 
-Single keys act only outside a terminal or a text box: inside a terminal
+Single keys act only outside a text box and a terminal: inside a terminal
 every key goes to the agent (Claude Code uses <kbd>Esc</kbd> to interrupt).
 
 ## Words
@@ -162,9 +137,11 @@ every key goes to the agent (Claude Code uses <kbd>Esc</kbd> to interrupt).
 - **Agent**: one Claude Code session Workbench started, with a name.
 - **Worktree**: a second checkout of the repository on its own branch
   (`wb/<name>`), so agents don't edit the same files on disk.
-- **Goal** and **outcome**: what you want, and the results that make it
-  true, each with an agent.
+- **Goal** and **part**: what you want, and the pieces a lead split it into,
+  each with an agent.
 - **Rule**: something you decided once, told to every agent of the
-  repository.
+  project.
+- **Guarded path** or **command**: agents may read the path but not change
+  it; the command is denied and comes to you as a request.
 - **ChloeCtx**: Workbench's memory: what was decided, by whom and why,
   across sessions.
