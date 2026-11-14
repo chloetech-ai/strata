@@ -9,7 +9,7 @@ import { holds, fill, runChecks } from '../src/checks.mjs';
 import { costOf, Spend, useClient, modelId } from '../src/model.mjs';
 import { expand, rates } from '../src/runner.mjs';
 import { runSession } from '../src/agent.mjs';
-import { why } from '../src/surfaces/browser.mjs';
+import { why, subtree, fit } from '../src/surfaces/browser.mjs';
 import { markdown } from '../src/report.mjs';
 import { scripted, FakeSurface, persona, task } from './helpers.mjs';
 
@@ -160,6 +160,20 @@ test('browser: Playwright\'s failures in a person\'s words', () => {
   assert.match(why('locator.click: Timeout 8000ms exceeded.\nCall log:\n  - <div class="modal-back"></div> intercepts pointer events\n'), /covered by another one.*<div class="modal-back">/);
   assert.match(why("locator.click: Timeout 8000ms exceeded.\nCall log:\n  - waiting for locator('aria-ref=e161')"), /no element has that reference/);
   assert.equal(why('page.goto: net::ERR_FAILED'), 'page.goto: net::ERR_FAILED');
+});
+
+test('browser: a part of the page whole, and an open dialog first when the page is cut', () => {
+  const rows = Array.from({ length: 400 }, (_, i) => `      - row "t-${i}" [ref=e${100 + i}]`).join('\n');
+  const tree = `- generic [ref=e1]:\n  - main [ref=e2]:\n    - table [ref=e3]:\n${rows}\n    - button "Create a key" [ref=e9]\n  - dialog [ref=e600]:\n    - textbox "Name" [ref=e601]\n    - button "Create" [ref=e602]`;
+  assert.equal(subtree(tree, 'e600'), '  - dialog [ref=e600]:\n    - textbox "Name" [ref=e601]\n    - button "Create" [ref=e602]');
+  assert.equal(subtree(tree, 'e3').split('\n').length, 401);
+  assert.equal(subtree(tree, 'e999'), null);
+  const page = fit(tree, 3000);
+  assert.ok(page.startsWith('A dialog is open:\n  - dialog [ref=e600]'), page.slice(0, 80));
+  assert.match(page, /textbox "Name" \[ref=e601\]/);
+  assert.match(page, /the rest is cut: look with a part/);
+  assert.ok(page.length < 3300);
+  assert.equal(fit('- button "x" [ref=e1]', 3000), '- button "x" [ref=e1]');
 });
 
 test('report: a run as Markdown', () => {

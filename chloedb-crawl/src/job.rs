@@ -21,6 +21,9 @@ use crate::infer::{Fetched, Plan, Source, Stats};
 use crate::strata::Strata;
 use crate::urls::{self, Scope};
 
+/// Links past `max_depth` remembered at most (to count them).
+const MAX_BEYOND: usize = 1_000_000;
+
 /// The longest robots.txt `Crawl-delay` honoured; a site that asks for more
 /// gets this.
 const MAX_CRAWL_DELAY: Duration = Duration::from_secs(600);
@@ -283,6 +286,8 @@ struct State {
     /// `data` paths whose column could not be added.
     failed: HashSet<String>,
     finished_ms: Option<u64>,
+    /// Why a crawl that ran to its end ended ([`Job::why_done`]).
+    why_done: Option<String>,
 }
 
 pub struct Job {
@@ -296,6 +301,8 @@ pub struct Job {
     sampling: AtomicBool,
     template: RwLock<Arc<Vec<TemplateField>>>,
     hashes: Mutex<HashSet<u64>>,
+    /// Links not followed because they were past `max_depth` (hashes).
+    beyond: Mutex<HashSet<u64>>,
     seeds: Vec<Url>,
     include: Vec<Regex>,
     exclude: Vec<Regex>,
@@ -343,10 +350,12 @@ impl Job {
                 template: Vec::new(),
                 failed: HashSet::new(),
                 finished_ms: None,
+                why_done: None,
             }),
             sampling: AtomicBool::new(true),
             template: RwLock::new(Arc::new(Vec::new())),
             hashes: Mutex::new(HashSet::new()),
+            beyond: Mutex::new(HashSet::new()),
             include: re(&spec.include),
             exclude: re(&spec.exclude),
             keep: re(&spec.keep),
@@ -513,8 +522,14 @@ impl Job {
             Ok(()) => {
                 g.phase = if g.phase == Phase::Stopping { Phase::Stopped } else { Phase::Done };
                 let c = &g.counts;
-                let text = format!("{}: {} pages fetched, {} rows written", if g.phase == Phase::Stopped { "stopped" } else { "done" }, c.fetched, c.written);
+                let mut text = format!("{}: {} pages fetched, {} rows written", if g.phase == Phase::Stopped { "stopped" } else { "done" }, c.fetched, c.written);
+                let done = g.phase == Phase::Done;
                 drop(g);
+                if done {
+                    let why = self.why_done();
+                    text = format!("{text}; {why}");
+                    self.st().why_done = Some(why);
+                }
                 self.event("done", text, None);
             }
             Err(e) => {
@@ -583,14 +598,22 @@ impl Job {
             self.problem(url.as_str(), "parse", "the page could not be read".into());
             return;
         };
-        if item.depth < self.spec.max_depth {
-            // Queued in turn from each shape of link, so that the pages
-            // read first (the sample the table is made from) are a list's
-            // items as well as its other lists.
-            let follow: Vec<Url> = page.links.iter().filter(|l| self.follows(l)).cloned().collect();
-            let n = follow.len();
-            for l in spread(follow, n, usize::MAX) {
-                self.frontier.push(Item::new(l, item.depth + 1));
+        // Queued in turn from each shape of link, so that the pages read
+        // first (the sample the table is made from) are a list's items as
+        // well as its other lists. A list's next page is as deep as the
+        // list; a link past `max_depth` is counted, so that the crawl can
+        // say what the depth left out.
+        let follow: Vec<Url> = page.links.iter().filter(|l| self.follows(l)).cloned().collect();
+        let n = follow.len();
+        for l in spread(follow, n, usize::MAX) {
+            let depth = if page.next.contains(&l) { item.depth } else { item.depth + 1 };
+            if depth <= self.spec.max_depth {
+                self.frontier.push(Item::new(l, depth));
+            } else if !self.frontier.seen(l.as_str()) {
+                let mut b = self.beyond.lock().unwrap_or_else(|e| e.into_inner());
+                if b.len() < MAX_BEYOND {
+                    b.insert(urls::hash(l.as_str()));
+                }
             }
         }
         {
@@ -903,6 +926,32 @@ impl Job {
         added
     }
 
+    /// Links on the deepest pages that were not followed (and were not
+    /// reached another way).
+    fn beyond_depth(&self) -> usize {
+        let b = self.beyond.lock().unwrap_or_else(|e| e.into_inner());
+        self.frontier.unseen(&b)
+    }
+
+    /// Why a crawl that was not stopped ended: the page limit, the depth
+    /// limit (with the links it left out), a full queue, or no links left.
+    fn why_done(&self) -> String {
+        let f = self.frontier.counts();
+        let beyond = self.beyond_depth();
+        let limit = self.frontier.limit();
+        if f.handed >= limit && f.queued > 0 {
+            format!("it reached max pages ({limit}) with {} links still queued: raise max pages to read them", f.queued)
+        } else if beyond > 0 {
+            format!("it reached max depth ({}): {beyond} links on the deepest pages were not followed; raise max depth to reach them", self.spec.max_depth)
+        } else if f.dropped > 0 {
+            format!("the queue was full: {} links were dropped", f.dropped)
+        } else if f.handed >= limit {
+            format!("it reached max pages ({limit})")
+        } else {
+            "it followed every link in scope".into()
+        }
+    }
+
     /// A line for lists.
     pub fn summary(&self) -> Value {
         let g = self.st();
@@ -938,6 +987,8 @@ impl Job {
             "finished_ms": g.finished_ms,
             "counts": g.counts,
             "frontier": f,
+            "beyond_depth": self.beyond_depth(),
+            "why_done": g.why_done,
             "rate": rate(&g.series),
             "series": g.series.iter().rev().take(600).rev().collect::<Vec<_>>(),
             "plan": g.plan,
@@ -1050,46 +1101,64 @@ pub async fn preview(spec: &Spec, n: usize) -> Result<Value, String> {
     let include: Vec<Regex> = spec.include.iter().filter_map(|r| Regex::new(r).ok()).collect();
     let exclude: Vec<Regex> = spec.exclude.iter().filter_map(|r| Regex::new(r).ok()).collect();
     let keep: Vec<Regex> = spec.keep.iter().filter_map(|r| Regex::new(r).ok()).collect();
-    let links: Vec<Url> = page
-        .links
-        .iter()
-        .filter(|l| {
-            let s = l.as_str();
-            **l != fu && !urls::not_a_page(l) && urls::in_scope(spec.scope, &seeds, l) && (include.is_empty() || include.iter().any(|r| r.is_match(s))) && !exclude.iter().any(|r| r.is_match(s))
-        })
-        .cloned()
-        .collect();
+    let follows = |l: &Url| {
+        let s = l.as_str();
+        !urls::not_a_page(l) && urls::in_scope(spec.scope, &seeds, l) && (include.is_empty() || include.iter().any(|r| r.is_match(s))) && !exclude.iter().any(|r| r.is_match(s))
+    };
     let kept = |u: &Url| keep.is_empty() || keep.iter().any(|r| r.is_match(u.as_str()));
-    let want = n.saturating_sub(1).min(links.len());
-    let picked = spread(links.into_iter().filter(|u| kept(u)).collect(), want, 4);
+    let mut seen: HashSet<String> = HashSet::from([fu.to_string()]);
+    let mut next: Vec<Url> = page.links.iter().filter(|l| follows(l)).cloned().collect();
     pages.push(to_fetched(&fu, &first, page, 0));
-    let mut set = tokio::task::JoinSet::new();
     let fetcher = Arc::new(fetcher);
-    for u in picked {
-        let fetcher = fetcher.clone();
-        let rules = spec.rules.clone();
-        set.spawn(async move {
-            let got = fetcher.page(&u).await;
-            match got {
-                Ok(g) => {
-                    let page = tokio::task::spawn_blocking({
-                        let body = g.body.clone();
-                        let u = u.clone();
-                        move || extract::extract(&body, &u, &extract::Options { rules: &rules, template: &[], learn: opts_learn, max_text: 200_000 })
-                    })
-                    .await
-                    .map_err(|_| (u.to_string(), "could not be read".to_string()))?;
-                    Ok((u, g, page))
+    // Two levels within the budget: a shop's home links to its lists, whose
+    // links are its products (DAP-14: the preview read the home and a list,
+    // and showed no product's fields). A level's pages are its links that
+    // would be rows, spread over their shapes; links that would not be
+    // rows are read only when nothing else is left, for their links.
+    for depth in 1..=2u32 {
+        let room = n.saturating_sub(pages.len());
+        if room == 0 || next.is_empty() {
+            break;
+        }
+        next.retain(|u| seen.insert(u.to_string()));
+        let (rows, others): (Vec<Url>, Vec<Url>) = next.drain(..).partition(|u| kept(u));
+        let mut picked = spread(rows, room, 4);
+        picked.truncate(room);
+        if picked.len() < room && depth == 1 {
+            // the lists the rows are on (a shop's keep is its products)
+            let mut more = spread(others, room - picked.len(), 4);
+            picked.append(&mut more);
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for u in picked {
+            let fetcher = fetcher.clone();
+            let rules = spec.rules.clone();
+            set.spawn(async move {
+                let got = fetcher.page(&u).await;
+                match got {
+                    Ok(g) => {
+                        let page = tokio::task::spawn_blocking({
+                            let body = g.body.clone();
+                            let u = u.clone();
+                            move || extract::extract(&body, &u, &extract::Options { rules: &rules, template: &[], learn: opts_learn, max_text: 200_000 })
+                        })
+                        .await
+                        .map_err(|_| (u.to_string(), "could not be read".to_string()))?;
+                        Ok((u, g, page))
+                    }
+                    Err(m) => Err((u.to_string(), m.to_string())),
                 }
-                Err(m) => Err((u.to_string(), m.to_string())),
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            match r {
+                Ok(Ok((u, g, page))) => {
+                    next.extend(page.links.iter().filter(|l| follows(l) && !seen.contains(l.as_str())).cloned());
+                    pages.push(to_fetched(&u, &g, page, depth));
+                }
+                Ok(Err((u, m))) => problems.push(json!({"url": u, "message": m})),
+                Err(_) => {}
             }
-        });
-    }
-    while let Some(r) = set.join_next().await {
-        match r {
-            Ok(Ok((u, g, page))) => pages.push(to_fetched(&u, &g, page, 1)),
-            Ok(Err((u, m))) => problems.push(json!({"url": u, "message": m})),
-            Err(_) => {}
         }
     }
     // One of each page (`/` and `/index.html` are often one), and only
@@ -1135,4 +1204,31 @@ pub async fn preview(spec: &Spec, n: usize) -> Result<Value, String> {
         "sql": plan.create_sql(),
         "rows": rows,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(max_pages: u64) -> Arc<Job> {
+        let spec: Spec = serde_json::from_value(json!({"seeds": ["https://shop.example/"], "max_pages": max_pages, "max_depth": 3})).unwrap();
+        Job::new("j1".into(), spec).unwrap()
+    }
+
+    /// A crawl that ran to its end says why: no links left, the depth (with
+    /// the links it left out, less those reached another way), or the page
+    /// limit (DAP-10: a crawl cut by its depth said only "done").
+    #[test]
+    fn a_finished_crawl_says_why_it_ended() {
+        let j = job(100);
+        assert_eq!(j.why_done(), "it followed every link in scope");
+        for p in ["/a", "/b", "/c"] {
+            j.beyond.lock().unwrap().insert(urls::hash(&format!("https://shop.example{p}")));
+        }
+        // one of them was reached by a shorter path after all
+        assert!(j.frontier.push(Item::new(Url::parse("https://shop.example/c").unwrap(), 1)));
+        assert_eq!(j.beyond_depth(), 2);
+        assert_eq!(j.why_done(), "it reached max depth (3): 2 links on the deepest pages were not followed; raise max depth to reach them");
+        assert_eq!(j.status()["beyond_depth"], 2);
+    }
 }

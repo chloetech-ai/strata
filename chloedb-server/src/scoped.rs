@@ -88,6 +88,18 @@ pub fn route_ok(method: &Method, route: &str) -> bool {
     }
 }
 
+/// Whether a connector's push key ([`Principal::push_only`]) may call
+/// `route` with `method`: its push, the write the push makes with it, and
+/// whether the server is up. Nothing that reads a table.
+pub fn push_route_ok(method: &Method, route: &str) -> bool {
+    let get = method == Method::GET || method == Method::HEAD;
+    match route {
+        "/v1/connectors/:name/push" | "/v1/write" => method == Method::POST,
+        "/v1/health" | "/v1/whoami" => get,
+        _ => false,
+    }
+}
+
 /// Refuses (403) statement `text`, bound as `command`, if `who` (a key
 /// limited to tables) may not run it: its kind's scope on the table it
 /// changes, and read on every table it names. `tables` are the catalog's

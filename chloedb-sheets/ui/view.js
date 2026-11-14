@@ -88,8 +88,8 @@ const CSS = `
 .sx-values label { display: flex; gap: 8px; align-items: center; padding: 2px 0; font-size: 13px; }
 .sx-home-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .sx-home-grid > * { min-width: 0; }
-.sx-scroll { overflow-x: auto; max-width: 100%; }
-.sx-scroll table { min-width: 100%; }
+.sx-hscroll { overflow-x: auto; max-width: 100%; }
+.sx-hscroll table { min-width: 100%; }
 .sx-whose { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .sx-whose button { border: 0; background: transparent; padding: 3px 10px; font-size: 12.5px; color: inherit; cursor: pointer; }
 .sx-whose button[aria-pressed="true"] { background: var(--line); font-weight: 600; }
@@ -99,6 +99,8 @@ const CSS = `
 .sx-hits mark { background: var(--warn-soft); color: inherit; border-radius: 2px; padding: 0 1px; }
 .sx-book-ic { width: 30px; height: 30px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--s3) 16%, transparent); color: var(--s3); flex: none; }
 .sx-book-ic.t { background: color-mix(in srgb, var(--s1) 16%, transparent); color: var(--s1); }
+.sx-note { padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 12.5px; background: rgba(237, 161, 0, .12); }
+.sx-note[hidden] { display: none; }
 .sx-tbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .sx-tbar .input { min-width: 120px; }
 .sx-sql { font: 12.5px var(--mono); width: 100%; min-height: 110px; resize: vertical; }
@@ -106,6 +108,13 @@ const CSS = `
   .sx-home-grid { grid-template-columns: minmax(0, 1fr); }
   .sx-fbar { grid-template-columns: 80px auto minmax(0, 1fr); }
   .sx-stats .opt { display: none; }
+}
+/* A phone: the formatting tools in one row that scrolls sideways, not four
+   rows over the grid; a card's tools under its title, not past its edge. */
+@media (max-width: 600px) {
+  .sx-tools { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; }
+  .sx-tools > * { flex: none; }
+  .sx-home-grid .card > .hd { flex-wrap: wrap; row-gap: 8px; }
 }`;
 
 // ---------------------------------------------------------------- small things
@@ -2844,13 +2853,15 @@ function tablePage(root, ctx, table) {
   const sapi = (p, o) => core.api(p, o);
   let gone = false;
   const stops = [];
-  const t = { name: table, fields: [], pk: -1, count: null, pages: new Map(), pending: new Set(), where: "", search: "", searchField: "", sort: null, epoch: 0, edited: new Map(), schema: null };
+  const t = { name: table, fields: [], pk: -1, count: null, pages: new Map(), pending: new Set(), where: "", search: "", searchField: "", sort: null, epoch: 0, edited: new Map(), schema: null, window: 10000, anchors: new Map(), pastNote: false };
   const src = new TableSource(t);
   const grid = new Grid(core, src, {});
   const count = h("span", { class: "sx-saved" }, "Reading…");
+  // The workbench opened on this table, as filtered and sorted here.
+  const sqlLink = h("a", { class: "btn sm", title: "Query the table in the SQL workbench", href: "#/sql", onclick: () => { sqlLink.href = "#/sql?q=" + encodeURIComponent(`${sqlOf()} LIMIT 100;`); } }, icon("sql"), "SQL");
   const whereIn = h("input", { class: "input", placeholder: "WHERE: price > 10 AND brand = 'Acme'", "aria-label": "Rows where (SQL)", spellcheck: "false", style: { flex: "2 1 260px", fontFamily: "var(--mono)", fontSize: "12.5px" } });
   const searchIn = h("input", { class: "input", type: "search", placeholder: "Search the text", "aria-label": "Search the text", style: { flex: "1 1 160px" } });
-  const fieldSel = h("select", { "aria-label": "The text field searched" });
+  const fieldSel = h("select", { class: "select", "aria-label": "The text field searched" });
   const top = h("div", { class: "sx-top" },
     h("a", { class: "btn ghost sm", href: ctx.href(), title: "All workbooks and tables" }, icon("left"), "Sheets"),
     h("span", { class: "sx-book-ic t", "aria-hidden": "true" }, icon("db")),
@@ -2860,13 +2871,14 @@ function tablePage(root, ctx, table) {
     h("button", { class: "btn sm", title: "Delete the selected rows", onclick: () => deleteRows() }, icon("trash"), "Delete rows"),
     h("button", { class: "btn sm", title: "Copy these rows into a new workbook (formulas, charts, pivots)", onclick: () => toBook() }, icon("copy"), "Open as a workbook"),
     h("button", { class: "btn sm", title: "Read the rows again", "aria-label": "Refresh", onclick: () => reload() }, icon("refresh")),
-    h("a", { class: "btn sm", title: "Query the table in the SQL workbench", href: "#/sql" }, icon("sql"), "SQL"));
+    sqlLink);
+  const note = h("div", { class: "sx-note", role: "status", hidden: true });
   const bar = h("div", { class: "sx-tbar" }, svgIcon(core, G.filter), whereIn, searchIn, fieldSel,
     h("button", { class: "btn sm", onclick: () => { whereIn.value = ""; searchIn.value = ""; apply(); } }, "Clear"));
   const foot = h("div", { class: "sx-foot" }, h("div", { class: "sx-stats", style: { flex: 1 } }, h("span", { class: "muted" }, "A table of the cluster: edits are written to ChloeDB as you make them, and the rows are read again every 5 seconds")));
   const stats = h("div", { class: "sx-stats" });
   foot.append(stats);
-  root.append(h("div", { class: "sx-book" }, top, bar, grid.el, foot));
+  root.append(h("div", { class: "sx-book" }, top, bar, note, grid.el, foot));
   stops.push(() => grid.destroy());
 
   const sel = () => norm(grid.sel);
@@ -2880,6 +2892,67 @@ function tablePage(root, ctx, table) {
     return { cols, from: qid(t.name), where: conds.length ? ` WHERE ${conds.join(" AND ")}` : "", order: order ? ` ORDER BY ${order}` : "", extra };
   }
   const sqlOf = () => { const q = query(); return `SELECT ${q.cols} FROM ${q.from}${q.where}${q.order}`; };
+  // Past the server's result window (--max-result-window, 10,000 rows by
+  // default) OFFSET is refused, so rows further on are read by key: the
+  // sort's values of the row before each block of `window` rows (an anchor)
+  // are read once, each from the one before, and a page is the rows after
+  // its block's anchor, at an offset inside the window.
+  const RANGED = new Set(["int", "float", "timestamp", "bool"]);
+  const sortCols = () => {
+    if (t.pk < 0) return null;
+    const by = t.sort ? t.sort.col : t.pk;
+    if (!RANGED.has(t.fields[by]?.type) || !RANGED.has(t.fields[t.pk].type)) return null;
+    return by === t.pk ? [{ col: t.pk, desc: !!t.sort?.desc }] : [{ col: by, desc: !!t.sort.desc }, { col: t.pk, desc: false }];
+  };
+  const sqlv = (v) => typeof v === "number" || typeof v === "boolean" ? String(v) : lit(v);
+  // The rows after `a` (the sort's values of a row) in the sort's order;
+  // rows without a value come last, either way.
+  function after(keys, a) {
+    const [k0, k1] = keys, c0 = qid(t.fields[k0.col].name), op0 = k0.desc ? "<" : ">";
+    if (!k1) return `${c0} ${op0} ${sqlv(a[0])}`;
+    const c1 = qid(t.fields[k1.col].name);
+    if (a[0] == null) return `(${c0} IS NULL AND ${c1} > ${sqlv(a[1])})`;
+    return `(${c0} ${op0} ${sqlv(a[0])} OR (${c0} = ${sqlv(a[0])} AND ${c1} > ${sqlv(a[1])}) OR ${c0} IS NULL)`;
+  }
+  const block = () => Math.max(TPAGE, Math.floor(t.window / TPAGE) * TPAGE);
+  // The anchor of block b (b >= 1): the sort's values of row b * block().
+  function anchor(b, keys, epoch) {
+    if (t.anchors.has(b)) return t.anchors.get(b);
+    const B = block();
+    const last = t.pages.get(b * B / TPAGE - 1)?.[TPAGE - 1];
+    const got = last ? Promise.resolve(keys.map((k) => last[k.col])) : (async () => {
+      const prev = b > 1 ? await anchor(b - 1, keys, epoch) : null;
+      const q = query();
+      const conds = [q.where.replace(/^ WHERE /, ""), prev ? after(keys, prev) : ""].filter(Boolean);
+      const j = await sapi("/v1/query", { body: { sql: `SELECT ${keys.map((k) => qid(t.fields[k.col].name)).join(", ")} FROM ${q.from}${conds.length ? ` WHERE ${conds.join(" AND ")}` : ""}${q.order} LIMIT 1 OFFSET ${B - 1}` }, timeout: 30000 });
+      if (!j.rows?.length) throw new Error("the table has fewer rows than counted: refresh");
+      return j.rows[0];
+    })();
+    if (epoch === t.epoch) t.anchors.set(b, got);
+    got.catch(() => { if (t.anchors.get(b) === got) t.anchors.delete(b); });
+    return got;
+  }
+  function pageSql(p, epoch) {
+    const B = block(), at = p * TPAGE;
+    if (at + TPAGE <= B) return Promise.resolve(`${sqlOf()} LIMIT ${TPAGE} OFFSET ${at}`);
+    const keys = sortCols();
+    // no key to read by: OFFSET, which a server answers past its window for
+    // some orders (a KEYWORD key's), until it refuses once
+    if (!keys) return Promise.resolve(t.pastNote ? null : `${sqlOf()} LIMIT ${TPAGE} OFFSET ${at}`);
+    const b = Math.floor(at / B);
+    return anchor(b, keys, epoch).then((a) => {
+      const q = query(), conds = [q.where.replace(/^ WHERE /, ""), after(keys, a)].filter(Boolean);
+      return `SELECT ${q.cols} FROM ${q.from} WHERE ${conds.join(" AND ")}${q.order} LIMIT ${TPAGE} OFFSET ${at - b * B}`;
+    });
+  }
+  // Said once, in place of the rows the server will not page to.
+  function pastWindow() {
+    if (t.pastNote) return;
+    t.pastNote = true;
+    const why = t.pk < 0 ? "the table has no primary key to read by" : "the sort is by a column of text";
+    note.textContent = `The rows past ${block().toLocaleString()} are not shown: the server reads at most ${t.window.toLocaleString()} rows a query, and ${why}. Narrow them with a WHERE${t.pk >= 0 ? ", or sort by the key or a number" : ""}.`;
+    note.hidden = false;
+  }
   t.need = (r0, r1) => {
     if (!t.fields.length) return;
     const p0 = Math.floor((r0 - 1) / TPAGE), p1 = Math.floor((r1 - 1) / TPAGE);
@@ -2889,7 +2962,17 @@ function tablePage(root, ctx, table) {
     t.pending.add(p);
     const epoch = t.epoch;
     try {
-      const j = await sapi("/v1/query", { body: { sql: `${sqlOf()} LIMIT ${TPAGE} OFFSET ${p * TPAGE}` }, timeout: 30000 });
+      const sql = await pageSql(p, epoch);
+      if (gone || epoch !== t.epoch) return;
+      if (!sql) { pastWindow(); return; }
+      let j;
+      try { j = await sapi("/v1/query", { body: { sql }, timeout: 30000 }); } catch (e) {
+        // A server with a smaller window than thought says how big it is.
+        const m = /returns at most (\d+) rows/.exec(e.message || "");
+        if (m && +m[1] < t.window && !gone && epoch === t.epoch) { t.window = Math.max(TPAGE, +m[1]); t.anchors.clear(); t.pending.delete(p); return readPage(p, quiet); }
+        if (m && !sortCols()) { pastWindow(); return; }
+        throw e;
+      }
       if (gone || epoch !== t.epoch) return;
       const before = JSON.stringify(t.pages.get(p) || null);
       t.pages.set(p, j.rows);
@@ -2902,13 +2985,15 @@ function tablePage(root, ctx, table) {
     const j = await sapi("/v1/query", { body: { sql: `SELECT COUNT(*) AS n FROM ${q.from}${q.where}` }, timeout: 30000 });
     const n = j.rows?.[0]?.[0] ?? 0;
     const changed = n !== t.count;
+    // rows came or went: the anchors past them have moved
+    if (changed && t.count != null) t.anchors.clear();
     t.count = n;
     count.classList.remove("bad");
     count.textContent = `${n.toLocaleString()} ${n === 1 ? "row" : "rows"}${t.where || t.search ? " match" : ""}`;
     if (changed) { grid.sizeSpacer(); grid.draw(); }
   }
   async function reload() {
-    t.epoch++; t.pages.clear(); t.pending.clear();
+    t.epoch++; t.pages.clear(); t.pending.clear(); t.anchors.clear(); t.pastNote = false; note.hidden = true;
     try { await readCount(); } catch (e) { count.textContent = e.message; count.classList.add("bad"); return; }
     grid.draw();
   }
@@ -3095,6 +3180,10 @@ function tablePage(root, ctx, table) {
     t.fields.forEach((f, i) => widths.set(i + 1, f.type === "text" ? 240 : f.type === "keyword" ? 150 : f.type === "bool" ? 90 : f.type.startsWith("vector") ? 200 : 120));
     src.colAxis.sizes = widths; src.colAxis.set(widths);
     fieldSel.replaceChildren(...t.fields.filter(isText).map((f) => h("option", { value: f.name }, f.name)));
+    // The WHERE box's example, of this table's own fields.
+    const num = t.fields.find((f) => (f.type === "int" || f.type === "float") && t.fields.indexOf(f) !== t.pk), kw = t.fields.find((f) => f.type === "keyword" && t.fields.indexOf(f) !== t.pk);
+    const ex = [num && `${qid(num.name)} > 10`, kw && `${qid(kw.name)} = 'x'`].filter(Boolean).join(" AND ");
+    whereIn.placeholder = ex ? `WHERE: ${ex}` : "WHERE: a SQL condition on the columns";
     fieldSel.style.display = searchIn.style.display = t.fields.some(isText) ? "" : "none";
     if (!t.searchField) t.searchField = fieldSel.value;
   }
@@ -3155,7 +3244,7 @@ function homePage(root, ctx) {
         core.card({ title: "Workbooks", tools: [whoseBar, newBtn], body: books, flush: true })),
       h("div", { class: "stack", style: { gap: "16px" } },
         core.card({ title: "Import", body: drop }),
-        core.card({ title: "Tables of the cluster", sub: "open one live, or copy it into a workbook", body: h("div", { class: "sx-scroll" }, tables), flush: true }))));
+        core.card({ title: "Tables of the cluster", sub: "open one live, or copy it into a workbook", body: h("div", { class: "sx-hscroll" }, tables), flush: true }))));
 
   async function newBook() {
     const name = await ask(core, { title: "A new workbook", label: "Its name", value: "Untitled" });
@@ -3250,7 +3339,8 @@ function homePage(root, ctx) {
     const sqlite = String.fromCharCode(...head).startsWith("SQLite format 3");
     if (sqlite) return importSqlite(file);
     const fmt = /\.xlsx?m?$/i.test(name) ? "xlsx" : /\.tsv$/i.test(name) ? "tsv" : "csv";
-    const busy = toastBusy(`Importing ${name}…`);
+    const about = fmt === "xlsx" ? null : await csvSeconds(file).catch(() => null);
+    const busy = toastBusy(`Importing ${name}…`, about);
     try {
       const b = await ctx.api(`/v1/import?name=${encodeURIComponent(name)}&format=${fmt}`, { body: file, type: "application/octet-stream", timeout: 300000 });
       busy();
@@ -3293,10 +3383,26 @@ function homePage(root, ctx) {
       } catch (e) { out.textContent = e.message; out.style.color = "var(--crit-ink)"; go.disabled = false; }
     };
   }
-  function toastBusy(msg) {
-    const el = h("div", { class: "toast info", style: { position: "fixed", right: "16px", bottom: "16px", zIndex: 95 } }, icon("clock"), h("div", { class: "grow" }, msg));
+  // A toast while a long request runs, with the seconds it has taken (an
+  // import of a large file takes a while: every cell is a row written).
+  function toastBusy(msg, about) {
+    const t0 = Date.now(), took = h("span", { class: "muted" });
+    const el = h("div", { class: "toast info", role: "status", style: { position: "fixed", right: "16px", bottom: "16px", zIndex: 95 } }, icon("clock"), h("div", { class: "grow" }, msg, " ", took));
+    const tick = () => { const s = Math.round((Date.now() - t0) / 1000); took.textContent = s >= 2 ? `${s} s${about ? ` of about ${about} s` : ""}` : ""; };
+    const timer = setInterval(tick, 1000);
     document.body.append(el);
-    return () => el.remove();
+    return () => { clearInterval(timer); el.remove(); };
+  }
+  // About how long an import of a CSV file takes: its cells, counted on its
+  // first 64 KB, at the 25,000 rows a second a server writes.
+  async function csvSeconds(file) {
+    const head = await file.slice(0, 65536).text();
+    const lines = head.split("\n").length - 1;
+    if (lines < 2) return null;
+    const first = head.split("\n")[0], d = [",", ";", "\t", "|"].reduce((a, x) => first.split(x).length > first.split(a).length ? x : a, ",");
+    const cells = (file.size / Math.max(1, head.length)) * lines * first.split(d).length;
+    const secs = Math.round(cells / 25000);
+    return secs >= 5 ? secs : null;
   }
 
   ctx.api("/v1/info", { timeout: 8000 }).then((j) => {

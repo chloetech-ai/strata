@@ -151,6 +151,11 @@ pub enum Slot {
     Health,
 }
 
+/// Connections closed at once, before their handshake, because their
+/// client held its share of them (`--max-connections-per-client`), since
+/// the process started (`chloedb_connections_closed_past_share_total`).
+pub static CLOSED_PAST_SHARE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The routes a connection taken past the cap may call, once: the probes
 /// of a supervisor, so that a server at its cap is not taken for dead.
 pub const HEALTH_ROUTES: [&str; 3] = ["/livez", "/readyz", "/v1/health"];
@@ -174,7 +179,9 @@ pub struct Conn {
 pub async fn track(req: Request, next: Next) -> Response {
     let Some(conn) = req.extensions().get::<Conn>().cloned() else { return next.run(req).await };
     if conn.slot == Slot::Health && !HEALTH_ROUTES.contains(&req.uri().path()) {
-        let mut r = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "the server holds as many connections as it takes (--max-connections): try again shortly\n").into_response();
+        // The API's error shape ([`crate::errors`]), as every other answer.
+        let e = crate::ApiError::coded(503, "overloaded", "the server holds as many connections as it takes (--max-connections): try again shortly");
+        let mut r = (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(crate::errors::answer(&e))).into_response();
         r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
         r.headers_mut().insert(axum::http::header::CONNECTION, axum::http::HeaderValue::from_static("close"));
         return r;

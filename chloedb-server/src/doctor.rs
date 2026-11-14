@@ -19,7 +19,6 @@ use std::time::Duration;
 
 const REPO: &str = "chloetech-ai/chloedb";
 const RELEASES: &str = "https://github.com/chloetech-ai/chloedb/releases";
-const WHEELS: &str = "https://github.com/chloetech-ai/chloedb/releases/expanded_assets/chloedb-py-v";
 
 /// How a check came out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +130,10 @@ async fn version(online: bool) -> Check {
 /// what it printed and what it wrote to stderr.
 pub fn python_result(status: Option<i32>, stdout: &str, stderr: &str) -> Check {
     let name = "python package";
-    let wheels = format!("pip install --upgrade chloedb -f {WHEELS}{}", env!("CARGO_PKG_VERSION"));
+    // PyPI has the wheels from 0.3.0: the newest that fits this machine,
+    // whatever this build's version (a build from main is ahead of every
+    // release, so naming its version named a release that did not exist).
+    let wheels = "pip install --upgrade chloedb   (from PyPI; where pip keeps the placeholder, this machine has no wheel: build from source, docs/chloedb/python.md#from-source)".to_string();
     match status {
         None => Check::new(Level::Ok, name, "no Python 3 here (the package is optional)", None),
         Some(0) => {
@@ -235,7 +237,11 @@ mod tests {
     fn the_placeholder_package_fails() {
         let c = python_result(Some(1), "", "ImportError: This is chloedb 0.0.2, a placeholder that holds the name");
         assert_eq!(c.level, Level::Fail);
-        assert!(c.fix.unwrap().contains("pip install --upgrade chloedb -f"));
+        let fix = c.fix.unwrap();
+        assert!(fix.starts_with("pip install --upgrade chloedb "), "{fix}");
+        // Not a release named after this build's version, which a build
+        // from main is ahead of.
+        assert!(!fix.contains(env!("CARGO_PKG_VERSION")), "{fix}");
         assert_eq!(python_result(Some(0), "0.2.1\n", "").detail, "chloedb 0.2.1");
         assert_eq!(python_result(Some(1), "", "ModuleNotFoundError: No module named 'chloedb'").level, Level::Ok);
         assert_eq!(python_result(None, "", "").level, Level::Ok);

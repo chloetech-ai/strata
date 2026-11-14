@@ -41,6 +41,10 @@ pub const TOKEN: &str = "token";
 /// of the tables it was made for.
 pub const KEY_ID: &str = "strata.chloetech.ai/key-id";
 pub const TABLES: &str = "strata.chloetech.ai/tables";
+/// Annotation of a Secret whose app has no key yet because making it
+/// failed (audit X-E2): the app is given no key, rather than the admin
+/// token, until a reconcile makes one.
+pub const PENDING: &str = "strata.chloetech.ai/key-pending";
 /// Where the coordinators find the apps' tokens, a file per app.
 pub const TOKEN_DIR: &str = "/etc/strata/app-tokens";
 
@@ -144,13 +148,32 @@ pub fn spec_tables(spec: &super::Spec, app: &str) -> Vec<String> {
     tables_of(app, given)
 }
 
+/// Why [`make_key`] made no key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyError {
+    /// The coordinators are from before keys limited to tables: the app
+    /// runs with the admin token, as it did before such keys.
+    BeforeLimits(String),
+    /// Anything else (a timeout, a 5xx, coordinators rolling): the app
+    /// keeps the key it has, and the next reconcile tries again.
+    Failed(String),
+}
+
+impl std::fmt::Display for KeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyError::BeforeLimits(e) | KeyError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Makes app `app`'s key through the coordinators (`admin`), limited to
 /// `tables`, in place of any key of its name (and of `old`, by id): its id
 /// and secret. Refuses (and revokes what it made) when the answer does not
 /// show the key limited, as a server from before limits would answer.
-pub async fn make_key(admin: &super::Admin, app: &str, tables: &[String], old: Option<&str>) -> Result<(String, String), String> {
+pub async fn make_key(admin: &super::Admin, app: &str, tables: &[String], old: Option<&str>) -> Result<(String, String), KeyError> {
     let name = key_name(app);
-    let listed = admin.call(reqwest::Method::GET, "/v1/admin/keys", None).await?;
+    let listed = admin.call(reqwest::Method::GET, "/v1/admin/keys", None).await.map_err(KeyError::Failed)?;
     let mut stale: Vec<String> = listed["keys"].as_array().into_iter().flatten().filter(|k| k["name"] == name.as_str() && k["revoked_ms"].is_null()).filter_map(|k| k["id"].as_str().map(String::from)).collect();
     if let Some(o) = old {
         if !stale.iter().any(|s| s == o) && listed["keys"].as_array().into_iter().flatten().any(|k| k["id"] == o && k["revoked_ms"].is_null()) {
@@ -163,13 +186,14 @@ pub async fn make_key(admin: &super::Admin, app: &str, tables: &[String], old: O
     // (`kube::rolled`, audit N-D4).
     let made = admin
         .post("/v1/admin/keys", json!({"name": name, "tables": tables, "owner": "operator", "note": format!("the key of the app {app} beside this cluster, made by the operator")}))
-        .await?;
-    let id = made["key"]["id"].as_str().ok_or_else(|| format!("the coordinators made a key with no id: {made}"))?.to_string();
+        .await
+        .map_err(KeyError::Failed)?;
+    let id = made["key"]["id"].as_str().ok_or_else(|| KeyError::Failed(format!("the coordinators made a key with no id: {made}")))?.to_string();
     if made["key"]["tables"].as_object().is_none_or(|t| t.is_empty()) {
         let _ = admin.call(reqwest::Method::DELETE, &format!("/v1/admin/keys/{id}"), None).await;
-        return Err("the coordinators made a key of every table for an app: they are from before keys limited to tables, so the app keeps the admin token".into());
+        return Err(KeyError::BeforeLimits("the coordinators made a key of every table for an app: they are from before keys limited to tables, so the app keeps the admin token".into()));
     }
-    let secret = made["secret"].as_str().ok_or("the coordinators' answer has no secret")?.to_string();
+    let secret = made["secret"].as_str().ok_or_else(|| KeyError::Failed("the coordinators' answer has no secret".into()))?.to_string();
     for old in stale.iter().filter(|s| **s != id) {
         // A key left over is named the app's and listed: the next new key
         // revokes it.

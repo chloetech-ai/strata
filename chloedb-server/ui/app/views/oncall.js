@@ -27,7 +27,7 @@ export function badge() {
   return pendingN ? { n: pendingN, tone: "warn", title: `${fmt.plural(pendingN, "proposal")} (the on-call agent's, and change requests) wait for an admin` } : null;
 }
 async function pollPending() {
-  if (!can("admin") || document.hidden) return;
+  if (!can("admin", "GET /v1/admin/oncall/proposals") || document.hidden) return;
   try { pendingN = (await api("/v1/admin/oncall/proposals?state=pending")).proposals?.length || 0; } catch { /* an older server, or no key */ }
 }
 setInterval(pollPending, 20000);
@@ -216,7 +216,7 @@ function render(page, route) {
   // ---------------------------------------------------------- actions
   function keep() { const { question, model, effort, max_steps, note } = draft; store.set("oncall.draft", { question, model, effort, max_steps, note }); }
   async function start(body) {
-    if (!can("admin")) { toast(needs("admin"), "bad"); return false; }
+    if (!can("admin", "POST /v1/admin/oncall")) { toast(needs("admin", "POST /v1/admin/oncall"), "bad"); return false; }
     if (ov && !ov.configured && !nextKey) { toast("This server has no Claude key: paste one under Options, or start the server with ANTHROPIC_API_KEY", "bad"); return false; }
     let ok = false;
     busy = true; draw();
@@ -414,7 +414,7 @@ function render(page, route) {
           h("a", { href: "#/alert/" + encodeURIComponent(a.id), class: "oc-aname" }, a.name || a.id),
           h("div", { class: "small muted" }, [a.severity, a.since_ms ? `firing for ${fmt.dur((Date.now() - a.since_ms) / 1000)}` : "firing", a.silenced ? "silenced" : null, a.ack ? `acknowledged by ${a.ack.by || "someone"}` : null].filter(Boolean).join(" · "),
             last ? [" · ", h("a", { href: "#/oncall?run=" + encodeURIComponent(last.id) }, `looked into ${fmt.ago(last.started_ms)}`)] : null)),
-        h("button", { class: "btn sm primary", disabled: busy || !can("admin"), title: can("admin") ? "" : needs("admin"), onclick: () => start({ alert: a.id }) }, icon("agent"), "Investigate"));
+        h("button", { class: "btn sm primary", disabled: busy || !can("admin", "POST /v1/admin/oncall"), title: can("admin", "POST /v1/admin/oncall") ? "" : needs("admin", "POST /v1/admin/oncall"), onclick: () => start({ alert: a.id }) }, icon("agent"), "Investigate"));
     })) : h("div", { class: "small muted", style: { padding: "12px 14px" } }, state.alerts ? "Nothing is firing." : "Loading the alerts…"));
   }
   function howItWorks() {
@@ -449,8 +449,8 @@ function render(page, route) {
     clear(threadBox, runs.map((r) => turn(r, runs)));
     followBox.hidden = false;
     const busyNow = runs.some((r) => r.state === "running") || busy;
-    followBtn.disabled = busyNow || !can("admin");
-    followBtn.title = !can("admin") ? needs("admin") : busyNow ? "Once it has reported" : "Ask (Ctrl+Enter)";
+    followBtn.disabled = busyNow || !can("admin", "POST /v1/admin/oncall");
+    followBtn.title = !can("admin", "POST /v1/admin/oncall") ? needs("admin", "POST /v1/admin/oncall") : busyNow ? "Once it has reported" : "Ask (Ctrl+Enter)";
   }
   function follow() {
     const runs = thread();
@@ -469,13 +469,13 @@ function render(page, route) {
     const took = r.state === "running" ? (Date.now() - r.started_ms) : r.took_ms;
     const meta = [r.model, r.effort ? `effort ${r.effort}` : null, `${fmt.n(r.turns || 0)} of ${fmt.n(r.max_steps)} model calls`, tokens(r.usage) ? `${fmt.si(tokens(r.usage))} tokens` : null, took ? fmt.ms(took) : null].filter(Boolean).join(" · ");
     const tools = [];
-    if (r.state === "running") tools.push(h("button", { class: "btn sm", disabled: !can("admin") || !!r.stopped_by, onclick: () => stopRun(r) }, icon("stop"), r.stopped_by ? "Stopping…" : "Stop"));
+    if (r.state === "running") tools.push(h("button", { class: "btn sm", disabled: !can("admin", "POST /v1/admin/oncall/runs/:id/stop") || !!r.stopped_by, onclick: () => stopRun(r) }, icon("stop"), r.stopped_by ? "Stopping…" : "Stop"));
     if (r.state === "done" && r === runs[runs.length - 1]) {
       tools.push(h("button", { class: "btn sm ghost", title: "Copy the conversation as Markdown", onclick: () => copy(asMarkdown(runs), "Copied as Markdown") }, icon("copy"), h("span", { class: "oc-wide" }, "Copy")));
-      tools.push(h("button", { class: "btn sm ghost", disabled: !can("write") || !!r.note, title: r.note ? "It is on the timeline" : can("write") ? "Post the report as a note on the events timeline" : needs("write"), onclick: () => postNote(r) }, icon("note"), h("span", { class: "oc-wide" }, r.note ? "On the timeline" : "Post on timeline")));
+      tools.push(h("button", { class: "btn sm ghost", disabled: !can("admin", "POST /v1/events/notes") || !!r.note, title: r.note ? "It is on the timeline" : can("admin", "POST /v1/events/notes") ? "Post the report as a note on the events timeline" : needs("admin", "POST /v1/events/notes"), onclick: () => postNote(r) }, icon("note"), h("span", { class: "oc-wide" }, r.note ? "On the timeline" : "Post on timeline")));
       tools.push(h("button", { class: "btn sm ghost", title: "Download the conversation as JSON", onclick: () => download(runs) }, icon("download")));
     }
-    if (r.state === "failed" || r.state === "stopped") tools.push(h("button", { class: "btn sm", disabled: busy || !can("admin"), onclick: () => start(r.follows ? { question: r.question, follows: r.follows } : r.alert && /^Alert \S+ is firing\./.test(r.question) ? { alert: r.alert } : { question: r.question, alert: r.alert || undefined }) }, icon("refresh"), "Run it again"));
+    if (r.state === "failed" || r.state === "stopped") tools.push(h("button", { class: "btn sm", disabled: busy || !can("admin", "POST /v1/admin/oncall"), onclick: () => start(r.follows ? { question: r.question, follows: r.follows } : r.alert && /^Alert \S+ is firing\./.test(r.question) ? { alert: r.alert } : { question: r.question, alert: r.alert || undefined }) }, icon("refresh"), "Run it again"));
     return h("section", { class: "card oc-turn", dataset: { run: r.id } },
       h("div", { class: "hd" },
         h("div", { class: "oc-q grow" },

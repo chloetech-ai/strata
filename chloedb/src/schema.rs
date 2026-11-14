@@ -1141,7 +1141,11 @@ impl Schema {
         if let Some(pk) = primary_key {
             let i = s.field_index(pk).ok_or_else(|| Error::Schema(format!("no primary key field {pk}")))?;
             if !matches!(s.fields[i].ty, FieldType::Keyword | FieldType::Int) {
-                return Err(Error::Schema("primary key must be KEYWORD or INT".into()));
+                let hint = match s.fields[i].ty {
+                    FieldType::Text { .. } => format!(": TEXT holds words to search, and KEYWORD exact values such as ids, so write {pk} KEYWORD PRIMARY KEY"),
+                    _ => format!(" (a KEYWORD holds an exact value such as an id: {pk} KEYWORD PRIMARY KEY)"),
+                };
+                return Err(Error::Schema(format!("primary key must be KEYWORD or INT{hint}")));
             }
             s.primary_key = Some(i);
         }

@@ -17,6 +17,8 @@
 // Parts: LIST, BOARD, DETAIL, SUMMARY (the patterns), HEADING, TEXT, DATA,
 // STATE, LET and BLOCKS (screen JSON, for what the rest cannot say).
 
+import { parseLayout, LAYOUT_SHORT, LAYOUT_NAMES } from './quality.mjs';
+
 // The newer patterns: a part names its table, then each clause sets one of
 // the pattern's parameters: [parameter, kind of value].
 const MORE = {
@@ -34,10 +36,14 @@ const MORE = {
     clauses: { TEXT: ['text', 'name'], MEANING: ['meaning', 'name'], NAME: ['name', 'name'], SUB: ['sub', 'names'], SHOW: ['show', 'cols'], LIMIT: ['limit', 'num'], PLACEHOLDER: ['placeholder', 'str'], WHERE: ['where', 'sql'], PARAM: ['params', 'param'], TITLE: ['title', 'str'] } },
   DASHBOARD: { use: 'dashboard',
     clauses: { DATE: ['date', 'name'], DAY: ['date', 'day'], VALUE: ['value', 'sql'], LABEL: ['label', 'str'], FORMAT: ['format', 'word'], DAYS: ['days', 'num'], BY: ['group', 'name'], 'GROUP BY': ['group', 'name'], WHERE: ['where', 'sql'], RECENT: ['recent', 'cols'], TITLE: ['title', 'str'] } },
+  OFFERS: { use: 'offers', need: { left: 'LEFT <column of how many are left>' },
+    clauses: { NAME: ['name', 'name'], TEXT: ['text', 'name'], PRICE: ['price', 'name'], IMAGE: ['image', 'name'], LEFT: ['left', 'name'], DATE: ['date', 'name'], WHERE: ['where', 'sql'], 'ORDER BY': ['order', 'sql'], SOON: ['soon', 'num'], OUT: ['out', 'str'], ACTION: ['action', 'str'], OPEN: ['open', 'slug'], CALL: ['call', 'slug'], DONE: ['done', 'str'], LOOK: ['look', 'word'], TITLE: ['title', 'str'], EYEBROW: ['eyebrow', 'str'], ID: ['id', 'slug'] } },
+  LESSONS: { use: 'lessons', need: { progress: 'PROGRESS <table of lessons done>' },
+    clauses: { PROGRESS: ['progress', 'name'], LESSON: ['lesson', 'name'], NAME: ['name', 'name'], TEXT: ['text', 'name'], MINUTES: ['minutes', 'name'], 'ORDER BY': ['order', 'sql'], WHERE: ['where', 'sql'], PARAM: ['params', 'param'], OPEN: ['open', 'slug'], CERTIFICATE: ['certificate', 'slug'], NOUN: ['noun', 'str'], TITLE: ['title', 'str'], ID: ['id', 'slug'] } },
   TREND: { use: 'trend',
     clauses: { DATE: ['date', 'name'], DAY: ['date', 'name'], VALUE: ['value', 'sql'], LABEL: ['label', 'str'], PER: ['per', 'word'], LAST: ['last', 'num'], FORMAT: ['format', 'word'], WHERE: ['where', 'sql'], LINE: ['line', 'flag'], TITLE: ['title', 'str'] } },
 };
-const PARTS = ['LIST', 'BOARD', 'DETAIL', 'SUMMARY', ...Object.keys(MORE), 'HEADING', 'TEXT', 'DATA', 'STATE', 'LET', 'BLOCKS', 'PAGE', 'PHOTOS'];
+const PARTS = ['LIST', 'BOARD', 'DETAIL', 'SUMMARY', ...Object.keys(MORE), 'HEADING', 'TEXT', 'DATA', 'STATE', 'LET', 'BLOCKS', 'PAGE', 'LAYOUT', 'PHOTOS', 'FOR'];
 const FIELD_TYPES = ['TEXT', 'TEXTAREA', 'NUMBER', 'DATE', 'TIME', 'DATETIME', 'SELECT', 'CHECKBOX', 'TAGS', 'EMAIL', 'URL', 'COLOR', 'FILE', 'RATING'];
 const COLUMN_FORMATS = ['DATE', 'DATETIME', 'AGO', 'DAYS', 'WEEKDAY', 'MONTH', 'MONEY', 'NUMBER', 'PERCENT', 'PCT', 'HOURS', 'DURATION', 'CLOCK', 'STARS', 'BOOL'];
 // How a big number reads (KPI ... MONEY): the column formats that fit a number.
@@ -226,6 +232,7 @@ export function compileStatement(text) {
   const title = head[2] ? literal(head[2]) : null;
   let part = null;
   let photos = null;
+  let audience = null;
   let kpiN = 0;
   let kpiRow = null;
   const finish = () => {
@@ -244,7 +251,7 @@ export function compileStatement(text) {
     }
   };
   const SIMPLE = /^(TITLE|NOUN|EMPTY|LABEL|NAME|BACK|LIMIT|MONEY|DONUT)\b/i;
-  const CLAUSE = '(?:TITLE|NOUN|EMPTY|LABEL|NAME|BACK|LIMIT|MONEY|DONUT|WHERE|ORDER BY|GROUP BY|VALUE|SEARCH|FILTER|TOGGLE|FORM|COLUMNS|CARDS|KPI|META|BY|ON ROW|ACTION|SHOW|PICK|RELATED|QUERY|ITEMS|ITEM|DAYS|DAY|SUB|DATE|TIME|PLACE|COLOR|FRONT|DUE|INTERVAL|MASTERED|QUESTION|CHOICES|ANSWER|EXPLANATION|COUNT|RESULTS|TEXT|MEANING|PLACEHOLDER|FORMAT|RECENT|EXTRA|PARAM|PER|LAST|LINE|EXPORT|ADD|SKIP)\\b';
+  const CLAUSE = '(?:TITLE|NOUN|EMPTY|LABEL|NAME|BACK|LIMIT|MONEY|DONUT|WHERE|ORDER BY|GROUP BY|VALUE|SEARCH|FILTER|TOGGLE|FORM|COLUMNS|CARDS|KPI|META|BY|ON ROW|ACTION|SHOW|PICK|RELATED|QUERY|ITEMS|ITEM|DAYS|DAY|SUB|DATE|TIME|PLACE|COLOR|FRONT|DUE|INTERVAL|MASTERED|QUESTION|CHOICES|ANSWER|EXPLANATION|COUNT|RESULTS|TEXT|MEANING|PLACEHOLDER|FORMAT|RECENT|EXTRA|PARAM|PER|LAST|LINE|EXPORT|ADD|SKIP|PRICE|IMAGE|LEFT|SOON|OUT|OPEN|CALL|DONE|LOOK|EYEBROW|PROGRESS|LESSON|MINUTES|CERTIFICATE|ID)\\b';
   // Several clauses may share a line: split after a simple clause (TITLE
   // 'x' NOUN 'y'), and at two or more spaces before a clause word, except in
   // the clauses that hold their own WHERE or JSON.
@@ -280,7 +287,25 @@ export function compileStatement(text) {
     if (PARTS.includes(kw) && !(part && part.more && part.more.clauses[kw])) {
       finish();
       if (kw === 'HEADING') { screen.body.push({ h: literal(rest) }); continue; }
-      if (kw === 'PAGE') { if (!/^[a-z]+$/i.test(rest)) fail(n, 'PAGE <kind>, such as PAGE front'); screen.page = rest.toLowerCase(); continue; }
+      if (kw === 'PAGE') {
+        // PAGE front [LAYOUT editorial]: a front page, and its structure.
+        const pm = rest.match(/^([a-z]+)(?:\s+LAYOUT\s+(.+))?$/i);
+        if (!pm) fail(n, 'PAGE <kind>, such as PAGE front');
+        screen.page = pm[1].toLowerCase();
+        if (pm[2] && parseLayout(pm[2])) screen.layout = parseLayout(pm[2]);
+        continue;
+      }
+      // LAYOUT <hero | split | editorial | dashboard | gallery | tool>: the
+      // screen's page structure (quality.mjs LAYOUTS). A word the kit does
+      // not know is left out rather than failing the build.
+      if (kw === 'LAYOUT') { const l = parseLayout(rest.replace(/^'|'$/g, '')); if (l) screen.layout = l; continue; }
+      // FOR owner | members | everyone: who the screen is for (engine/audience.mjs).
+      if (kw === 'FOR') {
+        const a = rest.toLowerCase().replace(/^'|'$/g, '');
+        if (!['owner', 'admins', 'members', 'everyone'].includes(a)) fail(n, 'FOR owner | members | everyone');
+        audience = a === 'admins' ? 'owner' : a;
+        continue;
+      }
       if (kw === 'TEXT') { screen.body.push({ text: literal(rest), muted: true }); continue; }
       if (kw === 'DATA') {
         // DATA name AS (SELECT ...) [PARAMS (name = expression, ...)]
@@ -446,7 +471,7 @@ export function compileStatement(text) {
   };
   picks(screen.body);
   for (const k of ['state', 'data', 'let']) if (!Object.keys(screen[k]).length) delete screen[k];
-  return { slug: head[1], title, screen, ...(photos?.length ? { photos } : {}) };
+  return { slug: head[1], title, screen, ...(photos?.length ? { photos } : {}), ...(audience ? { for: audience } : {}) };
 }
 
 // A clause of one of the newer parts: sets one parameter of its pattern.
@@ -457,6 +482,7 @@ function moreClause(part, kw, rest, l, n) {
   const u = part.use;
   switch (kind) {
     case 'name': if (!NAME.test(rest)) fail(n, `${kw} <column>`); u[param] = rest; break;
+    case 'slug': if (!/^[a-z][a-z0-9-]*$/.test(rest)) fail(n, `${kw} <a view's or function's slug>`); u[param] = rest; break;
     case 'day': if (!NAME.test(rest)) fail(n, `${kw} <column holding 'YYYY-MM-DD'>`); u[param] = rest; u.day = true; break;
     case 'names': u[param] = names(rest, n, kw); break;
     case 'str': u[param] = literal(rest); break;
@@ -499,10 +525,11 @@ const sqlText = (s) => `'${String(s).replace(/'/g, "''")}'`;
 // Returns null when no statement compiles back into it.
 export function screenStatement(slug, title, screen, { plain = false } = {}) {
   if (!screen || typeof screen !== 'object' || Array.isArray(screen)) return null;
-  if (Object.keys(screen).some((k) => !['state', 'data', 'let', 'body', 'page'].includes(k))) return null;
+  if (Object.keys(screen).some((k) => !['state', 'data', 'let', 'body', 'page', 'layout'].includes(k))) return null;
   const NAME_OK = /^[A-Za-z_][A-Za-z0-9_]*$/;
   const L = [`CREATE SCREEN ${slug}${title ? ` TITLE ${sqlText(title)}` : ''}`];
   if (screen.page !== undefined) { if (typeof screen.page !== 'string' || !/^[a-z]+$/.test(screen.page)) return null; L.push(`PAGE ${screen.page}`); }
+  if (screen.layout !== undefined) { if (parseLayout(screen.layout) !== screen.layout) return null; L.push(`LAYOUT ${screen.layout}`); }
   for (const [k, v] of Object.entries(screen.state || {})) { if (!NAME_OK.test(k)) return null; L.push(`STATE ${k} = ${JSON.stringify(v)}`); }
   for (const [k, v] of Object.entries(screen.data || {})) {
     if (!NAME_OK.test(k)) return null;
@@ -543,6 +570,7 @@ export function compileStatements(plan, code) {
       v.screen = out.screen;
       v.statement = code[v.slug].trim(); // the screen's source, kept with it
       if (!v.title && out.title) v.title = out.title;
+      if (out.for && v.for === undefined) v.for = out.for;
       delete code[v.slug];
     } catch (e) {
       if (!(e instanceof StatementError)) throw e;
@@ -594,7 +622,14 @@ DASHBOARD <table> [AS key]     -- a value over the last N days against the N bef
   DATE <timestamp col> | DAY <'YYYY-MM-DD' col>  VALUE SUM(col)  LABEL 'Hours'  FORMAT number | money | hours  DAYS 30  BY <group col>  RECENT (columns)  WHERE  TITLE
 TREND <table> [AS key]         -- a value per day, week or month over the last periods, as bars (LINE for a line), with the total and the average
   DATE <timestamp or 'YYYY-MM-DD' col>  VALUE SUM(col)  PER day | week | month  LAST 12  LABEL 'Distance (km)'  FORMAT number | money | hours  WHERE  LINE  TITLE
+OFFERS <table> [AS key]        -- what people order or book while some are left (products with stock, workshops with seats, races with places): a card per row with its photo, date and price, 'Only 2 left' when few remain, the OUT word and no action when none; the action opens the view that finishes the order or booking, or calls a rule that checks and lowers the count in one step (its REQUIRE refuses the last one twice). A shop's shelf, a menu with prices, the upcoming races or classes are this part, never a LIST with a form a visitor could edit, and on a front page it comes right after the hero, where visitors see it first
+  LEFT <count col>  NAME <col>  TEXT <col>  PRICE <col>  IMAGE <col>  DATE <col>  WHERE day >= :today  ORDER BY day  SOON 3  OUT 'Full'  ACTION 'Book a seat'  OPEN <view slug, gets {id}> | CALL <function slug, gets {id}>  DONE 'Booked'  LOOK cards | slides  TITLE  EYEBROW  ID <anchor for a nav link>
+  An app asked to sell or take bookings always takes them: never tell visitors that checkout is off or that they can only browse. With no payment service connected, the order is a row (its rule REQUIREs the count and lowers it), confirmed on screen, and the confirmation says how payment happens (on pickup, at the door, or a payment link column the owner fills)
+LESSONS <lessons table> [AS key] -- a course's lessons with each learner's progress: a bar of how many are done, the next lesson as the main action ('Start lesson 3'), Done on each one done, the certificate once all are; a lesson done is a row of PROGRESS (declare ALLOW ALL ON <progress> TO members WHERE <person col> = :user_id)
+  PROGRESS <table of lessons done>  LESSON <its column holding the lesson's id>  NAME <col>  TEXT <col>  MINUTES <col>  ORDER BY position  WHERE  PARAM  OPEN <lesson view slug, gets {id}>  CERTIFICATE <view slug>  NOUN 'lesson'  TITLE
 KPI 'Label' = SUM(col) | COUNT(*) | AVG(col) FROM <table> [WHERE condition] [${KPI_FORMATS.join(' | ')}]   -- a big number over any table, outside a part (KPIs one after the other share a row); :today works in WHERE: this month is WHERE date_trunc('month', day) = date_trunc('month', :today), the last 30 days WHERE days_between(day, :today) <= 30
+FOR owner | members           -- who the screen is for, a line of its own: owner for managing what a public page shows (visitors of the published app never get it in the menu), members for signed-in people; leave it out for everyone
+LAYOUT <${LAYOUT_NAMES.join(' | ')}>   -- the screen's page structure, its second line (PAGE front, a site's front page, takes one too): ${Object.entries(LAYOUT_SHORT).map(([k, v]) => `${k}: ${v}`).join('; ')}. Give one in EVERY statement, not only the first: the first screen's from the art direction's layout, each other screen's by what it is for (numbers and charts: dashboard; one thing to do, a check-in, a quiz: tool; one row, lessons, a menu: editorial; products or photos: gallery; a list beside its form: split); screens of one app need not share one. A screen that gives none gets the one that fits its parts
 HEADING 'text'   TEXT 'text'
 DATA <name> AS SELECT ...      -- more data for BLOCKS and LET, by name
 STATE <name> = <JSON>          LET <name> = <JavaScript expression>

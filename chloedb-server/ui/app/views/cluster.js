@@ -595,6 +595,9 @@ function measuredRate(mi) {
 const ask = (o) => confirm({ reason: isProduction() ? "Why: kept in the audit log with the change" : false, ...o });
 const canAdmin = () => can("admin");
 const needsAdmin = needs("admin");
+// Bounded operations on copies (a scrub, a verify, a checkpoint, a stop): an ops key may run them too.
+const mayRun = (route) => can("admin", route);
+const whyNot = (route) => needs("admin", route);
 
 // ---------------------------------------------------------------- the view
 function render(page, r) {
@@ -1336,8 +1339,8 @@ function render(page, r) {
     const changes = M.changes?.ok === false ? M.changes.why : null;
     const promote = c.primary ? why("it is the primary") : c.down ? why("it does not answer") : c.copying ? why("it is being copied") : c.lag ? why(`it is ${fmt.n(c.lag)} transactions behind: wait until it catches up`) : sh.n < 2 ? why("the shard has one copy") : ro ? why(`${ro}: the operator hands primaries over`) : changes ? changes : !canAdmin() ? needsAdmin : null;
     const remove = managed() ? "the operator keeps every shard's copies: change copies per shard in Draft" : sh.n < 2 ? "the shard's last copy: remove the shard instead" : changes ? changes : !canAdmin() ? needsAdmin : null;
-    const verifyNo = !c.primary ? null : unsupported.verify ? "this server cannot run it from the coordinator (a newer server can)" : sh.n < 2 ? "the shard has no replica" : !canAdmin() ? needsAdmin : null;
-    const ckNo = c.down ? "it does not answer" : c.backupDir === false ? "its server has no --backup-dir" : unsupported.checkpoint ? "this server cannot run it from the coordinator (a newer server can)" : !canAdmin() ? needsAdmin : null;
+    const verifyNo = !c.primary ? null : unsupported.verify ? "this server cannot run it from the coordinator (a newer server can)" : sh.n < 2 ? "the shard has no replica" : !mayRun("POST /v1/admin/copies/verify") ? whyNot("POST /v1/admin/copies/verify") : null;
+    const ckNo = c.down ? "it does not answer" : c.backupDir === false ? "its server has no --backup-dir" : unsupported.checkpoint ? "this server cannot run it from the coordinator (a newer server can)" : !mayRun("POST /v1/admin/copies/checkpoint") ? whyNot("POST /v1/admin/copies/checkpoint") : null;
     const items = [];
     // A shard with no primary that answers and no majority cannot vote one
     // in: the way out is to force a copy that answers (NEW-cluster-admin-3).
@@ -1347,7 +1350,7 @@ function render(page, r) {
     if (c.primary) items.push({ label: "Verify its replicas", icon: "okc", no: verifyNo, run: () => verifyCopy(sh, c) });
     // Bytes against checksums, which Verify (rows against rows) does not
     // see (finding chaos-6).
-    items.push({ label: "Check its data", icon: "okc", no: c.down ? "it does not answer" : unsupported.scrub ? "this server cannot run it from the coordinator (a newer server can)" : !canAdmin() ? needsAdmin : null, run: () => scrubCopy(sh, c) });
+    items.push({ label: "Check its data", icon: "okc", no: c.down ? "it does not answer" : unsupported.scrub ? "this server cannot run it from the coordinator (a newer server can)" : !mayRun("POST /v1/admin/copies/scrub") ? whyNot("POST /v1/admin/copies/scrub") : null, run: () => scrubCopy(sh, c) });
     items.push({ label: "Write a checkpoint", icon: "download", no: ckNo, run: () => checkpointCopy(sh, c) });
     // No Remove on a primary (finding CL-3): hand it over first.
     // A dead primary is still the primary to the server, which refuses to
@@ -2259,7 +2262,7 @@ function render(page, r) {
         h("div", { class: "hd" }, h("h3", {}, mi.running ? (there ? `Slots moving on ${there.name}` : "Slots moving") : "A move left in the cluster map"), h("span", { class: "sub" }, [mi.job && mi.running ? jobWords(mi.job) : null, mi.by ? "started by " + mi.by : null, mi.started ? "at " + clock(mi.started) : null].filter(Boolean).join(" · ")),
           h("div", { class: "tools" },
             there ? (there.url ? h("a", { class: "btn sm", href: there.url.replace(/\/$/, "") + "/#/cluster", target: "_blank", rel: "noopener", title: "Stop it there" }, `Open ${there.name}`, icon("ext")) : null)
-              : mi.running && mi.job ? h("button", { class: "btn sm", disabled: !canAdmin(), title: canAdmin() ? "Stop after the move under way" : needsAdmin, onclick: stopMoves }, icon("stop"), "Stop") : null,
+              : mi.running && mi.job ? h("button", { class: "btn sm", disabled: !mayRun("POST /v1/admin/moves/stop"), title: mayRun("POST /v1/admin/moves/stop") ? "Stop after the move under way" : whyNot("POST /v1/admin/moves/stop"), onclick: stopMoves }, icon("stop"), "Stop") : null,
             !there && (!mi.running || !mi.job) ? h("button", { class: "btn sm", disabled: !canAdmin(), title: "Ends the move a stopped coordinator left: completed if it had flipped, given up if not", onclick: finishMove }, "Finish it") : null)),
         h("div", { class: "bd stack", style: { gap: "6px" } }, mi.job ? movesLine(mi) : h("div", { class: "small" }, `From shard ${mi.moving.from} to shard ${mi.moving.to}, ${mi.moving.state || "under way"}: no coordinator runs it now.`)));
     }
@@ -2281,7 +2284,7 @@ function render(page, r) {
     const tools = [];
     // A plan another coordinator applies: shown here, changed there.
     if (R.elsewhere) tools.push(R.elsewhere.url ? h("a", { class: "btn sm", href: R.elsewhere.url.replace(/\/$/, "") + "/#/cluster", target: "_blank", rel: "noopener" }, `Open ${R.elsewhere.name || "its coordinator"}`, icon("ext")) : null);
-    else if (running) tools.push(h("button", { class: "btn sm", disabled: R.stopping || !canAdmin(), title: canAdmin() ? "Stop after the step under way" : needsAdmin, onclick: stopRun }, icon("stop"), R.stopping ? "Stopping…" : "Stop"));
+    else if (running) tools.push(h("button", { class: "btn sm", disabled: R.stopping || !mayRun("POST /v1/admin/plan/run/stop"), title: mayRun("POST /v1/admin/plan/run/stop") ? "Stop after the step under way" : whyNot("POST /v1/admin/plan/run/stop"), onclick: stopRun }, icon("stop"), R.stopping ? "Stopping…" : "Stop"));
     else if (R.state === "done") tools.push(h("button", { class: "btn sm ghost", onclick: () => { store.set("cluster.planClosed", R.id); runChanged(); } }, "Close"));
     else {
       tools.push(h("button", { class: "btn sm primary", disabled: !canAdmin(), title: canAdmin() ? `Run step ${R.at + 1} again, then the rest: each step first looks at what is done already` : needsAdmin, onclick: () => resumeRun(R) }, icon("play"), "Resume"));

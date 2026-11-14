@@ -50,7 +50,18 @@ fn seeded_runs_keep_the_protocols_promises() {
 /// with the bug put back s0 sends s1 a third copy, ending at 94, 6 ms
 /// before the network cuts s0 off, and nothing is lost: it passed by that
 /// timing. The tests of late copies below find the bug again.
-const FOUND: &[u64] = &[624036738];
+///
+/// 624144435 (found on 14 November 2026, main at 7984b237, and
+/// 0.3.2) was the checker's mistake, not the protocol's: s1, promoted by
+/// hand at 67 ms, waited the call's timeout (10 s) for the answer of s0,
+/// cut off, and won term 2 at 10,084 ms with votes given at 80 ms, after
+/// terms 3 and 4 had begun; s2, the primary of term 4, had acknowledged a
+/// client's retry of write 12 at 9,921 ms as transaction 10 of term 1,
+/// which s1 lacked. The checker asked a primary of term 2 to hold every
+/// write acknowledged as a transaction of an older term, rather than by a
+/// primary of an older term: s1 served nothing, as Raft's stale leader
+/// cannot, and stepped down 20 ms later, on its first call to s2.
+const FOUND: &[u64] = &[624036738, 624144435];
 
 #[test]
 fn seeds_the_nightly_run_found_keep_the_protocols_promises() {

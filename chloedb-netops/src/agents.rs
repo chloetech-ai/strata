@@ -25,6 +25,7 @@ pub const AGENTS: &[(&str, &str, &str, &str)] = &[
     ("change-risk", "Change risk", "Scores a planned change: its blast radius, other changes on the same or neighbouring devices in its window, open incidents nearby, and whether the other plane can carry the load", "On demand, from a change"),
     ("capacity", "Capacity", "Finds the links whose 95th percentile runs hot, and the pairs that cannot carry each other's traffic if one fails", "On demand"),
     ("compliance", "Advisories and drift", "Joins vendor advisories with the inventory's software versions, and searches every configuration for what should not be there", "On demand"),
+    ("estate", "Estate outage", "Reads what a broken object of the estate reports, walks what depends on it and which customers are behind it, and looks for a change on it or on what it hangs from", "When an incident in the estate opens"),
     ("topology", "Topology from logs", "Reads LLDP and routing-adjacency lines out of syslog, builds the links they imply, and compares them with the inventory", "Every five minutes"),
 ];
 
@@ -103,7 +104,7 @@ impl<'a> Run<'a> {
         self.step("reason", title, "", &json!({}), 0, 0.0, &detail.into());
     }
 
-    async fn graph(&mut self, title: &str, sql: String, fallback: impl FnOnce() -> Vec<Row>) -> Vec<Row> {
+    pub(crate) async fn graph(&mut self, title: &str, sql: String, fallback: impl FnOnce() -> Vec<Row>) -> Vec<Row> {
         if self.e.st().graph_sql != Some(false) {
             let t0 = Instant::now();
             let r = self.e.db.query(&sql, json!({})).await;
@@ -125,7 +126,7 @@ impl<'a> Run<'a> {
         let rows = fallback();
         self.graph = "app";
         self.rows += rows.len() as i64;
-        let text = format!("{sql}\n-- This server is a coordinator, which does not walk graphs yet: the app walked its own copy of netops_links.");
+        let text = format!("{sql}\n-- This server is a coordinator, which does not walk graphs yet: the app walked its own copy of the graph.");
         self.step("graph", title, &text, &json!({}), rows.len(), t0.elapsed().as_secs_f64() * 1000.0, "");
         rows
     }

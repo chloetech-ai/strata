@@ -77,14 +77,9 @@ export function when(ms, o) {
   return d.toDateString() === today.toDateString() ? fmt.time(ms) : d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-/** Whether the viewer's key may: "read" | "write" | "admin". */
-export function can(scope) {
-  if (core.can) return core.can(scope);
-  const have = state.whoami?.scope;
-  if (!have) return true;
-  const rank = { read: 1, write: 2, admin: 3 };
-  return (rank[have] || 0) >= (rank[scope] || 0);
-}
+/** Whether the viewer's key may: "read" | "write" | "admin", and an action's route (core.js `can`). */
+export const can = (scope, route) => core.can(scope, route);
+const needs = (scope, route) => core.needs(scope, route);
 
 /** The global time range: {from, to, live, label}. */
 export function timeRange() {
@@ -609,7 +604,7 @@ export function liveDrawer(q, { onCancel } = {}) {
       ].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])),
       card({ title: "Trace so far", sub: "the calls that answered; one still out is not drawn", body: traceSummary({ ...q, ms: q.elapsed_ms }, { onNav: close }) }),
     ],
-    foot: onCancel && can("admin") ? [h("button", { class: "btn", onclick: close }, "Close"), h("button", { class: "btn danger", onclick: () => { close(); onCancel(q); } }, icon("stop"), "Cancel this query…")] : null,
+    foot: onCancel && can("admin", "DELETE /v1/queries/:id") ? [h("button", { class: "btn", onclick: close }, "Close"), h("button", { class: "btn danger", onclick: () => { close(); onCancel(q); } }, icon("stop"), "Cancel this query…")] : null,
   });
   return d;
 }
@@ -703,7 +698,7 @@ export async function cancelQueries({ fingerprint, key, queries, reason }) {
 
 /** Cancels after asking; then refuses the shape for a while when asked. */
 export async function askCancel({ sql, fingerprint, key, queries, onDone }) {
-  if (!can("admin")) { toast("Cancelling needs an admin key", "bad"); return; }
+  if (!can("admin", "DELETE /v1/queries/:id")) { toast(`Cancelling ${needs("admin", "DELETE /v1/queries/:id")}`, "bad"); return; }
   const a = await cancelDialog({ sql, queries, key, fingerprint, refusable: !!fingerprint && await canContain() });
   if (!a) return;
   // The rule first, so a client that retries at once is refused rather than started again.
@@ -732,7 +727,7 @@ export async function containRules() {
   catch (e) { if (e.status === 404 || e.status === 405) { containable = false; return null; } throw e; }
 }
 /** Whether to offer Contain: an admin key, on a server not known to lack it. */
-export const canContainNow = () => can("admin") && containable !== false;
+export const canContainNow = () => can("admin", "POST /v1/admin/contain") && containable !== false;
 /** Whether this server can contain: asks once. */
 export async function canContain() { if (containable == null) { try { await containRules(); } catch { /* unknown: offer it */ } } return containable !== false; }
 
@@ -741,7 +736,7 @@ export async function canContain() { if (containable == null) { try { await cont
  * what it does to whom, how long, and a reason; audited and an event.
  */
 export function containDialog({ fingerprint, sql, key, keys, onDone, action: act = "limit" } = {}) {
-  if (!can("admin")) { toast("Containing needs an admin key", "bad"); return; }
+  if (!can("admin", "POST /v1/admin/contain")) { toast(`Containing ${needs("admin", "POST /v1/admin/contain")}`, "bad"); return; }
   if (containable === false) { toast("This server cannot contain a statement or key yet: contain rules are newer than it", "bad", 6000); return; }
   // R2-workload-2: from a statement and a key, the statement from that key (not everything the key sends),
   // with the action the button named.
@@ -810,7 +805,7 @@ export function containList(rules, { onChange } = {}) {
     h("div", { class: "grow", style: { minWidth: 0 } },
       h("div", { class: "row nw", style: { gap: "6px" } }, r.match?.fingerprint ? h("a", { class: "mono small ellipsis wl-link", href: statementLink(r.match.fingerprint), title: r.match.fingerprint }, r.match.fingerprint) : h("span", { class: "small" }, "every statement"), r.match?.key ? [h("span", { class: "small muted" }, "from"), h("b", { class: "mono small" }, r.match.key)] : null),
       h("div", { class: "small muted" }, `${r.by ? "by " + r.by + " · " : ""}${r.reason ? "“" + r.reason + "” · " : ""}ends ${r.expires_ms ? fmt.ago(r.expires_ms).replace(/^in /, "in ") : "–"}${r.hits != null ? ` · ${fmt.n(r.hits)} matched` : ""}${r.refused != null ? `, ${fmt.n(r.refused)} refused` : ""}`)),
-    can("admin") ? h("button", { class: "btn sm", onclick: async () => {
+    can("admin", "DELETE /v1/admin/contain/:id") ? h("button", { class: "btn sm", onclick: async () => {
       // Lifting a rule lets its clients back in at once: ask, and keep why in the audit log.
       const ok = await core.confirm({ title: "Remove this rule?", body: `${r.match?.key ? `Key ${r.match.key}` : "Every client"} can run ${r.match?.fingerprint ? "this statement" : "everything"} again at once${r.action === "limit" ? ", with no limit" : ""}. The audit log keeps who removed it and why.`, ok: "Remove the rule", reason: true });
       if (!ok) return;

@@ -7,7 +7,7 @@
 // waits here, to apply or dismiss), or is off. The replay reads the load
 // every server keeps a row a minute of (its log store's `load` table).
 
-import { h, s, icon, clear, fmt, card, api, toast, confirm, seg, pill, empty, tipOn, showTip, hideTip, debounce, failure, store, link, can, needs } from "../core.js";
+import { h, s, icon, clear, fmt, card, api, signInNeeded, toast, confirm, seg, pill, empty, tipOn, showTip, hideTip, debounce, failure, store, link, can, needs } from "../core.js";
 import { state, isCoordinator, isProduction } from "../data.js";
 import { live, scaleWords, keptRate } from "../spec.js";
 
@@ -469,6 +469,6 @@ function render(page) {
   const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1) + (/[.)]$/.test(t) ? "" : ".");
 
   load();
-  const t = setInterval(() => { if (alive) load(); }, 15000);
+  const t = setInterval(() => { if (alive && !signInNeeded()) load(); }, 15000);
   return () => { alive = false; clearInterval(t); hideTip(); };
 }

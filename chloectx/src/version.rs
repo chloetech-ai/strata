@@ -20,6 +20,9 @@ pub const BUILD_COMMIT: Option<&str> = option_env!("CHLOECTX_BUILD_COMMIT");
 /// is built on.
 const PATHS: [&str; 2] = ["chloectx", "chloedb"];
 
+/// How a prebuilt binary is installed and upgraded (docs/chloectx/setup.md).
+pub const RELEASE_INSTALL: &str = "curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with ctx";
+
 /// How long a check of the checkout (without fetching) is reused.
 pub const CHECK_EVERY: i64 = 6 * 3600;
 
@@ -75,8 +78,13 @@ pub struct Standing {
     /// Commits on the upstream branch since the build that change ChloeCtx
     /// or ChloeDB.
     pub behind: u64,
-    /// When the upstream branch was last fetched, by this check or anyone.
+    /// The upstream branch was fetched by this check.
     pub fetched: bool,
+    /// The fetch this check asked for failed (offline, an unreachable or
+    /// silent remote): `behind` counts the commits of the last fetch.
+    pub fetch_error: Option<String>,
+    /// When ChloeCtx last fetched the upstream branch, if known.
+    pub fetched_at: Option<i64>,
 }
 
 impl Standing {
@@ -85,36 +93,111 @@ impl Standing {
     }
 
     fn of(v: &Json) -> Option<Standing> {
-        Some(Standing { build: v["build"].as_str()?.into(), upstream: v["upstream"].as_str()?.into(), behind: v["behind"].as_u64()?, fetched: false })
+        Some(Standing {
+            build: v["build"].as_str()?.into(),
+            upstream: v["upstream"].as_str()?.into(),
+            behind: v["behind"].as_u64()?,
+            fetched: false,
+            fetch_error: None,
+            fetched_at: v["fetched_at"].as_i64(),
+        })
     }
 
-    /// One line for a person: where this build stands.
+    /// One line for a person: where this build stands. When the fetch
+    /// failed it says so, and that the count is as of the last fetch
+    /// (CTX-4: it said "up to date" offline).
     pub fn line(&self) -> String {
         let short = &self.build[..self.build.len().min(10)];
-        match self.behind {
+        let standing = match self.behind {
             0 => format!("built from {short}, up to date with {}", self.upstream),
-            1 => format!("built from {short}; 1 commit on {} changes ChloeCtx since; `chloectx upgrade` installs it", self.upstream),
-            n => format!("built from {short}; {n} commits on {} change ChloeCtx since; `chloectx upgrade` installs them", self.upstream),
+            1 => format!("built from {short}; 1 commit on {} changes ChloeCtx since", self.upstream),
+            n => format!("built from {short}; {n} commits on {} change ChloeCtx since", self.upstream),
+        };
+        match &self.fetch_error {
+            Some(e) => {
+                let last = match self.fetched_at {
+                    Some(t) => format!("as of its last fetch, {}", crate::recall::fmt_ago(t, crate::now())),
+                    None => "as of its last fetch".to_string(),
+                };
+                format!("could not fetch {} ({e}), so not checked: {standing} {last}", self.upstream)
+            }
+            None if self.behind > 0 => format!("{standing}; `chloectx upgrade` installs {}", if self.behind == 1 { "it" } else { "them" }),
+            None => standing,
+        }
+    }
+}
+
+/// How long `upgrade --check` waits for the fetch.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `doctor` waits for it: a check should not hang on a remote
+/// that accepts and never answers (CTX-4: doctor took 21 s).
+pub const DOCTOR_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `git fetch` of `branch` from `remote` in `dir` within `timeout`; why not
+/// when it failed.
+pub fn fetch(dir: &Path, remote: &str, branch: &str, timeout: Duration) -> std::result::Result<(), String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["fetch", "--quiet", remote, branch])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh -o BatchMode=yes -o ConnectTimeout=5".into()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
+        s
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => return Ok(()),
+            Ok(Some(_)) => {
+                // The remote's helper may still hold stderr; do not wait on it.
+                let t = Instant::now() + Duration::from_millis(500);
+                while !reader.is_finished() && Instant::now() < t {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let said = if reader.is_finished() { reader.join().unwrap_or_default() } else { String::new() };
+                let line = said.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("git fetch failed").to_string();
+                return Err(crate::llm::clip(&line, 200));
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer from {remote} in {} s", timeout.as_secs()));
+            }
         }
     }
 }
 
 /// Where `build` stands in the checkout `src`, fetching the upstream branch
-/// first when `fetch` (which may fail offline: the last fetch's view is
-/// used then).
-pub fn standing(src: &Path, build: &str, fetch: bool) -> Option<Standing> {
+/// first when `fetch` is a timeout (which may fail offline: the last
+/// fetch's view is used then, and the standing says the fetch failed).
+pub fn standing(src: &Path, build: &str, fetch: Option<Duration>) -> Option<Standing> {
     let up = upstream(src);
     let mut fetched = false;
-    if fetch {
-        if let Some((remote, branch)) = up.split_once('/') {
-            fetched = git(src, &["fetch", "--quiet", remote, branch], Duration::from_secs(20)).is_some();
+    let mut fetch_error = None;
+    if let Some(timeout) = fetch {
+        match up.split_once('/') {
+            Some((remote, branch)) => match self::fetch(src, remote, branch, timeout) {
+                Ok(()) => fetched = true,
+                Err(e) => fetch_error = Some(e),
+            },
+            None => fetch_error = Some(format!("{up} names no remote")),
         }
     }
     let range = format!("{build}..{up}");
     let mut args = vec!["rev-list", "--count", range.as_str(), "--"];
     args.extend(PATHS);
     let behind = git(src, &args, Duration::from_secs(10))?.parse().ok()?;
-    Some(Standing { build: build.to_string(), upstream: up, behind, fetched })
+    Some(Standing { build: build.to_string(), upstream: up, behind, fetched, fetch_error, fetched_at: None })
 }
 
 fn cache_path(home: &Path) -> PathBuf {
@@ -140,21 +223,32 @@ pub fn cached(home: &Path, max_age: i64) -> Option<Standing> {
     (fresh && BUILD_COMMIT == v["build"].as_str()).then(|| Standing::of(&v)).flatten()
 }
 
-/// Checks the checkout again (fetching when `fetch`) and keeps the result
-/// for [`cached`]; `None` when there is no commit or checkout to check.
-pub fn check(home: &Path, fetch: bool) -> Option<Standing> {
+/// Checks the checkout again (fetching within `fetch` when it is a
+/// timeout) and keeps the result for [`cached`]; `None` when there is no
+/// commit or checkout to check.
+pub fn check(home: &Path, fetch: Option<Duration>) -> Option<Standing> {
     let build = BUILD_COMMIT?;
     let s = standing(&source_dir()?, build, fetch)?;
+    Some(remember(home, s))
+}
+
+/// Keeps a standing for [`cached`], with when the upstream was last fetched.
+fn remember(home: &Path, mut s: Standing) -> Standing {
     let mut v = read_cache(home);
-    if v["build"].as_str() != Some(build) {
-        v = json!({});
+    if v["build"].as_str() != Some(s.build.as_str()) {
+        let fetched_at = v["fetched_at"].clone();
+        v = json!({"fetched_at": fetched_at});
     }
     for (k, x) in s.json().as_object().unwrap() {
         v[k] = x.clone();
     }
     v["checked_at"] = json!(crate::now());
+    if s.fetched {
+        v["fetched_at"] = json!(crate::now());
+    }
+    s.fetched_at = v["fetched_at"].as_i64();
     write_cache(home, &v);
-    Some(s)
+    s
 }
 
 /// How often `chloectx ui` fetches the upstream branch on its own: the page
@@ -173,20 +267,15 @@ pub fn summary(home: &Path, check: bool, force: bool) -> Json {
     let fetched_at = read_cache(home)["fetched_at"].as_i64().unwrap_or(0);
     let s = if check {
         let fetch = force || crate::now() - fetched_at > UI_FETCH_EVERY;
-        let s = self::check(home, fetch);
-        if s.as_ref().is_some_and(|s| s.fetched) {
-            let mut v = read_cache(home);
-            v["fetched_at"] = json!(crate::now());
-            write_cache(home, &v);
-        }
-        s
+        self::check(home, fetch.then_some(FETCH_TIMEOUT))
     } else {
-        cached(home, CHECK_EVERY).or_else(|| self::check(home, false))
+        cached(home, CHECK_EVERY).or_else(|| self::check(home, None))
     };
     let v = read_cache(home);
     json!({
         "version": env!("CARGO_PKG_VERSION"), "build": BUILD_COMMIT, "source": source_dir(),
         "standing": s.as_ref().map(Standing::json), "line": s.as_ref().map(Standing::line),
+        "fetch_error": s.as_ref().and_then(|s| s.fetch_error.clone()),
         "checked_at": v["checked_at"], "fetched_at": v["fetched_at"],
     })
 }
@@ -224,24 +313,28 @@ pub struct UpgradeOptions {
 /// runs `doctor` with the new binary.
 pub fn upgrade(project: &Path, o: &UpgradeOptions) -> i32 {
     let Some(src) = source_dir() else {
+        // A prebuilt binary (the release installer's) has no checkout:
+        // the same installer upgrades it, with no Rust (CTX-5).
         eprintln!(
-            "chloectx upgrade: this binary does not know the checkout it was built from (or it is gone).\n\
-             Upgrade from a checkout: git clone https://github.com/chloetech-ai/chloedb && cd chloedb && ./install.sh\n\
-             (or set CHLOECTX_SOURCE to the checkout and run chloectx upgrade again)"
+            "chloectx upgrade: this binary was not built from a checkout on this machine (a prebuilt release, or its checkout is gone).\n\
+             To upgrade a prebuilt one, run the installer again; it replaces {} and keeps your stores and settings:\n\
+             \x20 {RELEASE_INSTALL}\n\
+             then `chloectx install --user` (or --project DIR) again if a release adds hooks, and `chloectx doctor`.\n\
+             Built from a checkout: set CHLOECTX_SOURCE to it and run chloectx upgrade again.",
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "chloectx".into())
         );
         return 1;
     };
     let build = BUILD_COMMIT.unwrap_or("");
     println!("ChloeCtx {}, built from {} in {}", env!("CARGO_PKG_VERSION"), if build.is_empty() { "an unknown commit" } else { &build[..build.len().min(10)] }, src.display());
     if !build.is_empty() {
-        match standing(&src, build, true) {
+        match standing(&src, build, Some(FETCH_TIMEOUT)) {
             Some(s) => {
+                let s = remember(&crate::paths::home(), s);
                 println!("{}", s.line());
-                let mut v = s.json();
-                v["checked_at"] = json!(crate::now());
-                write_cache(&crate::paths::home(), &v);
                 if o.check {
-                    return 0;
+                    // A check that could not fetch did not check.
+                    return if s.fetch_error.is_some() { 1 } else { 0 };
                 }
             }
             None if o.check => {
@@ -378,17 +471,49 @@ mod tests {
         let built = commit(&up, "chloectx/Cargo.toml");
         sh(t.path(), &["clone", "-q", up.to_str().unwrap(), "co"]);
         let co = t.path().join("co");
-        let s = standing(&co, &built, false).unwrap();
+        let s = standing(&co, &built, None).unwrap();
         assert_eq!((s.behind, s.upstream.as_str()), (0, "origin/main"));
         assert!(s.line().contains("up to date"), "{}", s.line());
 
         commit(&up, "chloectx/src/a.rs");
         commit(&up, "docs/a.md");
         commit(&up, "chloedb/src/b.rs");
-        assert_eq!(standing(&co, &built, false).unwrap().behind, 0, "not fetched yet");
-        let s = standing(&co, &built, true).unwrap();
+        assert_eq!(standing(&co, &built, None).unwrap().behind, 0, "not fetched yet");
+        let s = standing(&co, &built, Some(FETCH_TIMEOUT)).unwrap();
         assert_eq!(s.behind, 2, "the docs commit does not count");
         assert!(s.line().contains("2 commits on origin/main") && s.line().contains("chloectx upgrade"), "{}", s.line());
+    }
+
+    /// CTX-4: a fetch that fails, or a remote that never answers, is said
+    /// to have failed (not "up to date"), within the timeout.
+    #[test]
+    fn a_failed_fetch_is_not_up_to_date() {
+        if git(Path::new("."), &["--version"], Duration::from_secs(5)).is_none() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let up = t.path().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "main"]);
+        let built = commit(&up, "chloectx/Cargo.toml");
+        sh(t.path(), &["clone", "-q", up.to_str().unwrap(), "co"]);
+        let co = t.path().join("co");
+        // The remote is gone.
+        sh(&co, &["remote", "set-url", "origin", t.path().join("nowhere").to_str().unwrap()]);
+        let s = standing(&co, &built, Some(FETCH_TIMEOUT)).unwrap();
+        assert!(!s.fetched && s.fetch_error.is_some(), "{s:?}");
+        assert!(s.line().starts_with("could not fetch origin/main") && !s.line().starts_with("built from"), "{}", s.line());
+        assert!(s.line().contains("as of its last fetch"), "{}", s.line());
+
+        // A remote that accepts and never answers: given up at the timeout.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        sh(&co, &["remote", "set-url", "origin", &format!("http://127.0.0.1:{port}/x.git")]);
+        let t0 = Instant::now();
+        let s = standing(&co, &built, Some(Duration::from_secs(2))).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(6), "{:?}", t0.elapsed());
+        assert!(s.fetch_error.as_deref().is_some_and(|e| e.contains("no answer")), "{s:?}");
+        drop(l);
     }
 
     /// The old store folder moves to the new name, once, and the old name

@@ -181,3 +181,50 @@ mod tests {
         assert!(sql_value(&Value::Str("x".repeat(100))).ends_with("..."));
     }
 }
+
+/// What an answer's reader may want to know about it, from its statement:
+/// why a `MATCH` of several words found no row (it needs every word in a
+/// row), or why `score()` is 0 (a `MATCH` filters and does not rank).
+/// `rows` is how many rows the answer has, and `zero_scores` whether it
+/// has scores and each is 0.
+pub fn of_answer(sql: &str, rows: usize, zero_scores: bool) -> Option<String> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    if !(rows == 0 || zero_scores) || !sql.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"match")) {
+        return None;
+    }
+    let tokens: Vec<Token> = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    let ranked = tokens.iter().any(|t| ["bm25", "similarity", "rrf", "decay", "maxsim", "distance"].iter().any(|w| word(t, w)));
+    if rows == 0 {
+        // MATCH ( field , 'words' ) with plain words alone.
+        for i in 0..tokens.len().saturating_sub(5) {
+            if !(word(&tokens[i], "MATCH") && tokens[i + 1] == Token::LParen && tokens[i + 3] == Token::Comma) {
+                continue;
+            }
+            let (Token::Word(field), Token::SingleQuotedString(q)) = (&tokens[i + 2], &tokens[i + 4]) else { continue };
+            let words: Vec<&str> = q.split_whitespace().collect();
+            let plain = words.len() >= 2
+                && words.iter().all(|w| w.chars().all(|c| c.is_alphanumeric() || c == '\'') && !["AND", "OR", "NOT", "NEAR"].contains(w));
+            if !plain || !matches!(tokens.get(i + 5), Some(Token::RParen | Token::Comma)) {
+                continue;
+            }
+            // The call's options, to its closing parenthesis.
+            let end = tokens[i + 5..].iter().position(|t| *t == Token::RParen).map_or(tokens.len(), |n| i + 5 + n);
+            let fuzzy = tokens[i + 5..end].iter().any(|t| word(t, "fuzzy"));
+            let typos = if fuzzy {
+                String::from(" (fuzzy => 'auto' corrects a word only when the index has no such word and a near one is in more rows)")
+            } else {
+                format!(", and MATCH({field}, '{q}', fuzzy => 'auto') forgives typos")
+            };
+            return Some(format!(
+                "MATCH({field}, '{q}') holds for a row that has every one of its {} words, and no row has them all: MATCH({field}, '{}') finds rows with any of them, MATCH({field}, '{q}', min => 2) rows with two, ORDER BY bm25({field}, '{q}') DESC ranks rows by them{typos}",
+                words.len(),
+                words.join(" OR "),
+            ));
+        }
+        return None;
+    }
+    let scored = tokens.windows(3).any(|w| word(&w[0], "score") && w[1] == Token::LParen && w[2] == Token::RParen);
+    (zero_scores && scored && !ranked).then(|| "score() is 0: MATCH filters rows and does not rank them. Rank with ORDER BY bm25(field, 'words') DESC (and SELECT bm25(field, 'words') or score() for each row's score)".to_string())
+}

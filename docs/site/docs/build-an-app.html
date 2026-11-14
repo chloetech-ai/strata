@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Build an app on chloedb-server · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="A shop in one page: search, stock that never oversells, holds that expire, and click events counted exactly once. Each part is a few lines of SQL or JSON over HTTP, with links to the reference for the rest.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/build-an-app.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Start</span>
       <h1>Build an app on chloedb-server</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/build-an-app.md">docs/chloedb/build-an-app.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-a-server">Run a server</a></li><li><a href="#make-the-tables">Make the tables</a></li><li><a href="#write-rows">Write rows</a></li><li><a href="#search">Search</a></li><li><a href="#read-one-row-by-its-key">Read one row by its key</a></li><li><a href="#sell-stock-without-overselling">Sell stock without overselling</a></li><li><a href="#hold-an-item-for-ten-minutes">Hold an item for ten minutes</a></li><li><a href="#count-events-exactly-once">Count events exactly once</a></li><li><a href="#when-a-write-fails">When a write fails</a></li><li><a href="#grow-to-a-cluster">Grow to a cluster</a></li></ol></details>
     <div class="doc-body">
@@ -89,7 +92,7 @@
 <p>A shop in one page: search, stock that never oversells, holds that expire, and click events counted exactly once. Each part is a few lines of SQL or JSON over HTTP, with links to the reference for the rest.</p>
 <h2 id="run-a-server">Run a server<a class="anchor" href="#run-a-server" aria-label="Link to this section">#</a></h2>
 <p>Download the server for your machine (no Rust or build needed), and start it on a new database:</p>
-<pre data-lang="sh">v=0.3.2 p=linux-x86_64   # or linux-aarch64, macos-arm64, macos-x86_64
+<pre data-lang="sh">v=0.3.3 p=linux-x86_64   # or linux-aarch64, macos-arm64, macos-x86_64
 curl -LO https://github.com/chloetech-ai/chloedb/releases/download/chloedb-server-v$v/chloedb-server-$p.tar.gz
 tar xzf chloedb-server-$p.tar.gz &amp;&amp; cp chloedb-server-$p/chloedb-server ./chloedb-server
 ./chloedb-server --db shop.chloedb --seq-no</pre>
@@ -218,7 +221,7 @@ curl -s localhost:7700/v1/admin/rebalance -X POST</pre>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

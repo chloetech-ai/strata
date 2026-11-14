@@ -343,6 +343,7 @@ const CSS = `
 .no-map-hist > div.fault { border-left-color: var(--crit); }
 .no-map-hist .when { color: var(--muted); font-variant-numeric: tabular-nums; }
 .no-map-read { display: grid; gap: 5px; font-size: 12.5px; }
+.no-map-partial { margin: 10px 14px 0; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line)); border-left-width: 3px; background: color-mix(in srgb, var(--warn) 9%, var(--surface)); border-radius: 6px; font-size: 12.5px; line-height: 1.45; }
 .no-map-read > div { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; }
 .no-map-read .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); font-weight: 700; padding-top: 2px; }
 .no-map-side > .btn.ghost { margin: 8px 8px 0; }
@@ -360,7 +361,7 @@ const CSS = `
 const T = (x) => (x ? Date.parse(x) : null);
 const SEV = { critical: "bad", major: "serious", minor: "warn", sev1: "bad", sev2: "serious", sev3: "warn" };
 const STATUS = { investigating: ["warn", "Investigating"], identified: ["info", "Cause identified"], mitigated: ["ok", "Mitigated"], resolved: ["good", "Resolved"] };
-const KIND = { fiber_cut: "Fibre cut", bad_change: "Bad change", optic_degrade: "Failing optic", ddos: "DDoS", cpu_bug: "Software defect", power: "Power", "": "Unknown", capacity: "Capacity" };
+const KIND = { fiber_cut: "Fibre cut", bad_change: "Bad change", optic_degrade: "Failing optic", ddos: "DDoS", cpu_bug: "Software defect", power: "Power", "": "Unknown", capacity: "Capacity", estate: "Estate outage" };
 const PAGES = [["", "My shift"], ["map", "Map"], ["dash", "Dashboards"], ["diagnose", "Diagnose"], ["network", "Network"], ["incidents", "Incidents"], ["alerts", "Alerts"], ["changes", "Changes"], ["customers", "Customers"], ["carriers", "Carriers"], ["topology", "Topology"], ["services", "Services"], ["explore", "Explore"], ["devices", "Devices"], ["agents", "Agents"], ["data", "Data"]];
 const gbps = (bps) => (bps == null ? "–" : bps >= 1e12 ? (bps / 1e12).toFixed(2) + " Tb/s" : bps >= 1e9 ? (bps / 1e9).toFixed(1) + " Gb/s" : (bps / 1e6).toFixed(0) + " Mb/s");
 const pct = (v, d = 0) => (v == null || Number.isNaN(v) ? "–" : (v * 100).toFixed(d) + "%");
@@ -421,6 +422,7 @@ function render(el, ctx) {
     drawAlt(page);
     if (!ready) return;
     if (page !== "map") app.map = null;
+    app.wherePage?.(page);
     const f = { "": shiftPage, map: mapPage, dash: dashPage, diagnose: diagnosePage, network: overviewPage, customers: customersPage, carriers: carriersPage, leadership: leadershipPage, incidents: path[1] ? incidentRoom : incidentsPage, topology: topologyPage, alerts: alertsPage, changes: changesPage, services: servicesPage, explore: explorePage, devices: devicesPage, agents: agentsPage, data: dataPage }[page] || shiftPage;
     stop = f(body, app, path);
   };
@@ -751,7 +753,7 @@ function actionCard(app, a, after) {
   const decide = async (yes, btn) => {
     btn.disabled = true;
     try {
-      const r = await app.ctx.api(`/v1/actions/${encodeURIComponent(a.id)}/${yes ? "approve" : "reject"}`, { body: { who: "You" }, timeout: 60000 });
+      const r = await app.ctx.api(`/v1/actions/${encodeURIComponent(a.id)}/${yes ? "approve" : "reject"}`, { body: {}, timeout: 60000 });
       C.toast(yes ? (r.result || "Approved and carried out") : "Rejected", yes ? "ok" : "info", 6000);
       await app.poll();
       after?.();
@@ -922,7 +924,8 @@ function incidentRoom(body, app, path) {
   const mapCard = C.card({ title: "Where it is", sub: "the devices the incident touches, their neighbours dimmed", body: [replayEl, map, mapLegend(app, "live")] });
   const stepsSub = h("span", { class: "sub" });
   const board = boardCard(app, id);
-  left.append(C.card({ title: "Likely cause", sub: "from the root-cause agent", body: [causeEl, keyEl] }), C.card({ title: "Proposed actions", sub: "nothing runs without an approval, unless autopilot is on", body: actionsEl }), board.el, mapCard,
+  const causeCard = C.card({ title: "Likely cause", sub: "from the root-cause agent", body: [causeEl, keyEl] });
+  left.append(causeCard, C.card({ title: "Proposed actions", sub: "nothing runs without an approval, unless autopilot is on", body: actionsEl }), board.el, mapCard,
     C.card({ title: "Around the incident", sub: "half an hour before it, to now", body: chartsEl }),
     C.card({ title: "How the agent got there", sub: stepsSub, body: stepsEl }),
     C.card({ title: "What the agent was shown", sub: "its brief, packed to a token budget; a click on a row shows the text", body: rcptEl }),
@@ -992,7 +995,7 @@ function incidentRoom(body, app, path) {
       body: h("div", { class: "stack" }, h("label", { class: "stack", style: { gap: "4px" } }, h("span", { class: "small dim" }, "Runbook"), sel), h("label", { class: "stack", style: { gap: "4px" } }, h("span", { class: "small dim" }, "How well it worked"), grade)), foot: ok });
     ok.onclick = async () => {
       ok.disabled = true;
-      try { await app.ctx.api(`/v1/incidents/${id}/close`, { body: { who: "You", runbook: sel.value, grade: +grade.value }, timeout: 60000 }); d.close(); C.toast(i.resolved ? "Recorded" : "Closed. A postmortem draft was written.", "ok"); await app.poll(); stop.run(); }
+      try { await app.ctx.api(`/v1/incidents/${id}/close`, { body: { runbook: sel.value, grade: +grade.value }, timeout: 60000 }); d.close(); C.toast(i.resolved ? "Recorded" : "Closed. A postmortem draft was written.", "ok"); await app.poll(); stop.run(); }
       catch (e) { C.toast(e.message, "bad"); ok.disabled = false; }
     };
   }
@@ -1000,7 +1003,7 @@ function incidentRoom(body, app, path) {
   const stop = live(app, body, `/v1/incidents/${id}`, (j) => {
     inc = j;
     const i = j.incident, open = !i.resolved;
-    const act = async (what, okText) => { try { await app.ctx.api(`/v1/incidents/${id}/${what}`, { body: { who: "You" }, timeout: 120000 }); C.toast(okText, "ok"); stop.run(); } catch (e) { C.toast(e.message, "bad", 6000); } };
+    const act = async (what, okText) => { try { await app.ctx.api(`/v1/incidents/${id}/${what}`, { body: {}, timeout: 120000 }); C.toast(okText, "ok"); stop.run(); } catch (e) { C.toast(e.message, "bad", 6000); } };
     put(head, h("div", { class: "no-hero" + (open ? "" : " calm") },
       h("div", {}, h("div", { class: "row", style: { gap: "8px", marginBottom: "6px" } }, app.link("Incidents", "incidents"), h("span", { class: "muted" }, "/"), h("span", { class: "mono small" }, i.id), sevPill(app, i.severity), statusPill(app, i.status), h("span", { class: "chip" }, KIND[i.category] || i.category)),
         h("h2", {}, i.title), h("p", {}, i.summary),
@@ -1020,7 +1023,9 @@ function incidentRoom(body, app, path) {
       because.length ? h("ul", { class: "no-why" }, because.map((b) => h("li", {}, b))) : null,
       rc ? runFacts(app, rc) : null)
       : C.empty("agent", "No cause named yet", "The agent runs when the incident opens and again as alerts arrive."));
-    if (!keyEl.firstChild) put(keyEl, h("button", { class: "btn xs", style: { marginTop: "10px" }, title: "The simulator knows what it broke. The agent is never shown this.", onclick: () => checkKey(i) }, C.icon("eye"), "Check against the simulator's answer key"));
+    // The estate's outages are worked by its own agent, and the simulator keeps no answer key for them.
+    if (i.root_kind === "estate") { const sub = causeCard.querySelector(".sub"); if (sub) sub.textContent = "from the estate's agent"; put(keyEl); }
+    else if (!keyEl.firstChild) put(keyEl, h("button", { class: "btn xs", style: { marginTop: "10px" }, title: "The simulator knows what it broke. The agent is never shown this.", onclick: () => checkKey(i) }, C.icon("eye"), "Check against the simulator's answer key"));
     stepsSub.textContent = rc ? `${rc.queries ?? j.steps.length - 1} queries, ${C.fmt.ms(rc.ms)} in the database. Click a step for its SQL.` : "";
     // Actions.
     put(actionsEl, j.actions.length ? j.actions.map((a) => actionCard(app, a, () => stop.run())) : C.empty("bolt", "No actions proposed"));
@@ -1187,7 +1192,7 @@ function alertsPage(body, app) {
       { key: "incident", label: "Incident", render: (r) => r.incident ? app.link(r.incident, "incidents", r.incident) : h("span", { class: "muted" }, "–") },
       ...(tab === "firing" ? [{ key: "acked_by", label: "Owner", render: (r) => r.silenced ? h("span", { class: "chip", title: "Silenced by " + r.silenced }, "silenced") : r.acked_by ? h("span", { class: "small" }, r.acked_by) : h("span", { class: "muted small" }, "nobody") },
         { key: "id", label: "", sortable: false, render: (r) => h("span", { class: "row nw", style: { gap: "4px", justifyContent: "flex-end" } },
-          r.silenced ? null : r.acked_by ? h("button", { class: "btn xs ghost", onclick: (e) => { e.stopPropagation(); act(`/v1/alerts/${encodeURIComponent(r.id)}/unack`, { who: WHO }, "Handed back"); } }, "Hand back") : h("button", { class: "btn xs", onclick: (e) => { e.stopPropagation(); act(`/v1/alerts/${encodeURIComponent(r.id)}/ack`, { who: WHO }, "Acknowledged: it is yours now"); } }, "Acknowledge"),
+          r.silenced ? null : r.acked_by ? h("button", { class: "btn xs ghost", onclick: (e) => { e.stopPropagation(); act(`/v1/alerts/${encodeURIComponent(r.id)}/unack`, {}, "Handed back"); } }, "Hand back") : h("button", { class: "btn xs", onclick: (e) => { e.stopPropagation(); act(`/v1/alerts/${encodeURIComponent(r.id)}/ack`, {}, "Acknowledged: it is yours now"); } }, "Acknowledge"),
           r.silenced || !["device", "link"].includes(r.entity_kind) ? null : h("button", { class: "btn xs ghost", onclick: (e) => { e.stopPropagation(); silenceDrawer(app, r.entity_kind, r.entity, () => stop.run()); } }, "Silence")) }] : []),
     ], { rows: j.alerts, compact: true, sortKey: "started", desc: true }) : C.empty("okc", tab === "firing" ? "Nothing is firing" : "Nothing resolved yet", tab === "firing" ? "Every rule came back empty a minute ago." : null) }));
     const ph = charts.timeChart({ height: 130, fmt: C.fmt.n, series: [{ name: "Alerts opened", color: "var(--s7)", area: true, get: (p) => p.n, fmt: C.fmt.n }] });
@@ -1210,7 +1215,7 @@ function ruleDrawer(app, rule, after) {
   const inp = (v, attrs = {}) => h("input", { class: "input", value: v ?? "", disabled: ro || null, ...attrs });
   const sel = (v, options) => { const s = h("select", { class: "select", disabled: ro || null }, options.map((o) => h("option", { value: o }, o))); s.value = v; return s; };
   const name = inp(rule?.name, { placeholder: "Chassis running hot" }), desc = inp(rule?.description, { placeholder: "What it means when this fires" });
-  const sev = sel(rule?.severity || "minor", ["critical", "major", "minor"]), kind = sel(rule?.entity_kind || "device", ["device", "link", "service", "site"]), cmp = sel(rule?.cmp || ">", [">", "<", ">=", "<="]);
+  const sev = sel(rule?.severity || "minor", ["critical", "major", "minor"]), kind = sel(rule?.entity_kind || "device", ["device", "link", "service", "site"]), cmp = sel(rule?.cmp || ">", [">", ">=", "<", "<=", "=", "!="]);
   const thr = inp(rule?.threshold ?? 60, { type: "number", step: "any" }), unit = inp(rule?.unit ?? "°C"), win = inp(rule?.window_s ?? 180, { type: "number", min: 60, step: 60 });
   const sql = h("textarea", { class: "input mono", rows: 9, spellcheck: "false", style: { width: "100%", fontSize: "12.5px", resize: "vertical" }, readOnly: ro || null }, rule?.sql_text || RULE_EXAMPLE);
   const out = h("div");
@@ -1218,9 +1223,11 @@ function ruleDrawer(app, rule, after) {
   test.onclick = async () => {
     test.disabled = true;
     try {
-      const r = await app.ctx.api("/v1/rules/test", { body: { sql: sql.value, window_s: +win.value }, timeout: 60000 });
+      const r = await app.ctx.api("/v1/rules/test", { body: { sql: sql.value, window_s: +win.value, cmp: cmp.value, threshold: +thr.value }, timeout: 60000 });
       const q = (r.queries || [])[0];
-      put(out, r.error ? h("div", { class: "error" }, r.error) : h("div", {}, h("div", { class: "small", style: { margin: "8px 0" } }, h("b", {}, r.count === 0 ? "Nothing would fire right now." : `${r.count} ${r.count === 1 ? "alert" : "alerts"} would fire right now.`), q ? h("span", { class: "muted" }, ` ${C.fmt.ms(q.ms)}`) : null, r.note ? h("div", { style: { color: "var(--crit-ink)" } }, r.note) : null),
+      const n = r.firing ?? r.count;
+      const kept = r.count > n ? ` (${r.count} ${r.count === 1 ? "row" : "rows"} returned; ${r.count - n} with v not ${cmp.value} ${C.fmt.n(+thr.value)})` : "";
+      put(out, r.error ? h("div", { class: "error" }, r.error) : h("div", {}, h("div", { class: "small", style: { margin: "8px 0" } }, h("b", {}, n === 0 ? "Nothing would fire right now." : `${n} ${n === 1 ? "alert" : "alerts"} would fire right now.`), kept, q ? h("span", { class: "muted" }, ` ${C.fmt.ms(q.ms)}`) : null, r.note ? h("div", { style: { color: "var(--crit-ink)" } }, r.note) : null),
         r.rows.length ? C.table(Object.keys(r.rows[0]).map((k) => ({ key: k, label: k, num: typeof r.rows[0][k] === "number", render: (x) => (typeof x[k] === "number" ? C.fmt.n(Math.round(x[k] * 100) / 100) : String(x[k])) })), { rows: r.rows, compact: true, maxHeight: "220px" }) : null));
     } catch (e) { put(out, h("div", { class: "error" }, e.message)); }
     test.disabled = false;
@@ -1228,7 +1235,7 @@ function ruleDrawer(app, rule, after) {
   const save = h("button", { class: "btn primary" }, "Save the rule");
   const del = !isNew && !ro ? h("button", { class: "btn danger", onclick: async () => { try { await app.ctx.api(`/v1/rules/${rule.id}/delete`, { body: {} }); d.close(); after(); } catch (e) { C.toast(e.message, "bad"); } } }, C.icon("trash"), "Delete") : null;
   const d = C.drawer({ title: isNew ? "New alert rule" : rule.name, sub: ro ? "A built-in rule: it can be switched off, and copied into a rule of your own." : "A SELECT that returns entity and v. :since is the start of the window.", wide: true,
-    body: h("div", { class: "stack" }, h("div", { class: "grid g2" }, f("Name", name), f("What it means", desc)), h("div", { class: "grid g3" }, f("Severity", sev), f("About a", kind), f("Window, seconds", win)), h("div", { class: "grid g3" }, f("Fires when v is", cmp), f("Threshold (shown on the alert)", thr), f("Unit", unit)), f("SQL", sql),
+    body: h("div", { class: "stack" }, h("div", { class: "grid g2" }, f("Name", name), f("What it means", desc)), h("div", { class: "grid g3" }, f("Severity", sev), f("About a", kind), f("Window, seconds", win)), h("div", { class: "grid g3" }, f("Fires when v is", cmp), f("Threshold: each row fires when its v passes it", thr), f("Unit", unit)), f("SQL", sql),
       rule ? facts(app, [["last run", C.fmt.ms(rule.last_ms)], ["rows", String(rule.last_rows)], ["firing", String(rule.firing)], rule.runbook ? ["runbook", rule.runbook] : null]) : null, out),
     foot: [test, ro ? null : save, del] });
   save.onclick = async () => {
@@ -1283,7 +1290,7 @@ async function changeDrawer(app, id, clashes) {
   const btn = h("button", { class: "btn primary" }, C.icon("agent"), "Assess the risk");
   const acts = h("span", { class: "row", style: { gap: "8px" } });
   C.drawer({ title: id, sub: "A change request", wide: true, body: [body, riskEl], foot: h("div", { class: "row between", style: { width: "100%" } }, btn, acts) });
-  const doit = async (action, ok) => { try { await app.ctx.api(`/v1/changes/${id}/${action}`, { body: { who: WHO }, timeout: 60000 }); C.toast(ok, "ok"); load(); app.poll?.(); } catch (e) { C.toast(e.message, "bad", 7000); } };
+  const doit = async (action, ok) => { try { await app.ctx.api(`/v1/changes/${id}/${action}`, { body: {}, timeout: 60000 }); C.toast(ok, "ok"); load(); app.poll?.(); } catch (e) { C.toast(e.message, "bad", 7000); } };
   const showRisk = (run) => {
     const r = run.result || {};
     const color = r.score >= 70 ? "var(--crit)" : r.score >= 40 ? "var(--warn)" : "var(--good)";
@@ -1629,10 +1636,9 @@ function dataPage(body, app) {
 
 // ---------------------------------------------------------------- the shift
 
-const WHO = "You";
 const utc = (iso) => (iso ? iso.slice(11, 16) : "");
 const dayUtc = (iso) => (iso ? new Date(Date.parse(iso)).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }) : "");
-const windowText = (a, b) => `${dayUtc(a)} ${utc(a)} to ${utc(b)} UTC`;
+const windowText = (a, b) => `${dayUtc(a)} ${utc(a)} to ${dayUtc(b) !== dayUtc(a) ? dayUtc(b) + " " : ""}${utc(b)} UTC`;
 const WORK = { approval: ["Approve", "bolt"], incident: ["Incident", "alerts"], change: ["Change", "clock"], maintenance: ["Carrier", "route"], alert: ["Alert", "alerts"], ticket: ["Ticket", "logs"], silence: ["Silence", "clock"], note: ["Note", "copy"] };
 
 /** Opens what a worklist row or a lookup hit points at. */
@@ -1646,6 +1652,8 @@ function openThing(app, kind, id) {
   if (kind === "maintenance") return app.go("carriers");
   if (kind === "site") return app.go("topology");
   if (kind === "logs") return app.go("explore", "logs");
+  if (kind === "object") { if (app.map) app.map.open(id); else { app.pending = { open: id }; app.go("map", id); } return null; }
+  if (kind === "estate-customer") { const asked = `${id} customer routers`; if (app.map) app.map.ask(asked); else { app.pending = { ask: asked }; app.go("map"); } return null; }
   return null;
 }
 
@@ -1655,10 +1663,10 @@ function shiftPage(body, app) {
   const note = h("textarea", { class: "input", rows: 2, placeholder: "Leave a note for the next shift: what to watch, what not to touch, who to call", "aria-label": "A note for the next shift" });
   const addNote = async () => {
     if (!note.value.trim()) return;
-    try { await app.ctx.api("/v1/shift/notes", { body: { who: WHO, body: note.value.trim() } }); note.value = ""; C.toast("Left for the next shift", "ok"); stop.run(); } catch (e) { C.toast(e.message, "bad"); }
+    try { await app.ctx.api("/v1/shift/notes", { body: { body: note.value.trim() } }); note.value = ""; C.toast("Left for the next shift", "ok"); stop.run(); } catch (e) { C.toast(e.message, "bad"); }
   };
   body.append(h("div", { class: "no-cols wide" }, h("div", { class: "no-col" }, brief, C.card({ title: "What waits for you", sub: "most urgent first; each row is a row of a table, and a click away from where it is handled", body: work, flush: true })), side));
-  const act = async (path, okText) => { try { await app.ctx.api(path, { body: { who: WHO }, timeout: 60000 }); C.toast(okText, "ok"); stop.run(); app.poll(); } catch (e) { C.toast(e.message, "bad", 6000); } };
+  const act = async (path, okText) => { try { await app.ctx.api(path, { body: {}, timeout: 60000 }); C.toast(okText, "ok"); stop.run(); app.poll(); } catch (e) { C.toast(e.message, "bad", 6000); } };
   const stop = live(app, body, "/v1/shift", (j) => {
     const lead = j.oncall.filter((o) => o.role === "primary");
     const urgent = j.work.filter((w) => w.urgency === 1).length;
@@ -1698,6 +1706,9 @@ async function lookupDrawer(app, q) {
   const d = C.drawer({ title: q, sub: "Looked up in the inventory, the customers, the sessions and the logs", body });
   try {
     const j = await app.call("/v1/lookup?q=" + encodeURIComponent(q));
+    // An id pasted from a ticket names one object of the estate: open it where it is.
+    const exact = j.hits.filter((x) => x.exact);
+    if (exact.length === 1 && j.hits.length === 1) { d.close?.(); openThing(app, "object", exact[0].id); return; }
     const state = (x) => !x ? null : C.pill(x.state === "bad" ? "bad" : x.state === "warn" ? "warn" : "ok", x.state === "bad" ? (x.incident || "incident") : x.state === "warn" ? `${x.alerts} alert${x.alerts === 1 ? "" : "s"}` : "healthy");
     put(body, j.hits.length ? j.hits.map((x) => h("div", { class: "no-hit", style: { cursor: "pointer" }, onclick: () => { d.close?.(); openThing(app, x.kind, x.id); } },
       h("div", { class: "row between nw" }, h("span", {}, h("span", { class: "chip", style: { marginRight: "8px" } }, x.kind), h("b", {}, x.title)), state(x.health)), h("div", { class: "x" }, x.sub)))
@@ -1712,7 +1723,7 @@ const STATE_COLOR = { ok: "var(--good)", warn: "var(--warn)", bad: "var(--crit)"
 
 function diagnosePage(body, app, path) {
   const { h, C, charts } = app;
-  const hero = h("div"), grid = h("div"), listEl = h("div"), inv = h("div"), side = h("div", { class: "no-col" });
+  const hero = h("div"), grid = h("div"), listEl = h("div"), inv = h("div"), estateEl = h("div"), side = h("div", { class: "no-col" });
   body.append(hero, h("div", { class: "no-cols wide" }, h("div", { class: "no-col" }, C.card({ title: "The stack, by place", sub: "customers at the top, power at the bottom: a fault shows on its own layer and on every layer above it", body: [grid, listEl] }), inv), side));
   let sel = null, picked = null, last = null, auto = true;
   const openIt = (o) => o.kind === "link" ? linkDrawer(app, o.id) : o.kind === "device" ? deviceDrawer(app, o.id) : o.kind === "service" ? serviceDrawer(app, o.id) : app.go("customers", o.id);
@@ -1792,7 +1803,11 @@ function diagnosePage(body, app, path) {
         { key: "change", label: "Changed", sortable: false, render: (r) => r.change ? h("a", { class: "no-link small", onclick: (e) => { e.stopPropagation(); changeDrawer(app, r.change.id); } }, `${r.change.id}, ${C.fmt.ago(T(r.change.executed))}`) : h("span", { class: "muted small" }, "no") },
         { key: "incident", label: "Incident", sortable: false, render: (r) => r.incident ? app.link(r.incident, "incidents", r.incident) : h("span", { class: "muted small" }, r.alert ? "alerting" : "no alert") },
       ], { rows: shown.slice(0, 14), compact: true, onRow: (r) => { auto = false; investigate(r); } })] : null);
-    if (!side.childElementCount) put(side, traceCard(app, s ? s.first : null), C.card({ title: "Changes, last six hours", sub: "the first thing to rule out", body: j.changes.length ? h("ul", { class: "no-list" }, j.changes.slice(0, 6).map((c) => h("li", { style: { cursor: "pointer" }, onclick: () => changeDrawer(app, c.id) }, h("div", { class: "row between nw" }, h("b", { class: "ellipsis" }, c.title), h("span", { class: "small muted", style: { whiteSpace: "nowrap" } }, C.fmt.ago(T(c.executed)))), h("div", { class: "small muted" }, `${c.id} · ${c.devices.slice(0, 3).join(", ")}`)))) : h("div", { class: "dim" }, "None carried out.") }),
+    // The estate behind the backbone: its outages are the shift's too, and the map shows where.
+    const est = j.estate || [];
+    put(estateEl, est.length ? C.card({ title: "Behind the backbone", sub: `${est.length} object${est.length === 1 ? "" : "s"} of the estate alerting`, tools: app.link("Map", "map"), body: h("ul", { class: "no-list" }, est.slice(0, 6).map((a) => h("li", { style: { cursor: "pointer" }, onclick: () => openThing(app, "object", a.entity) },
+      h("div", { class: "row between nw" }, h("b", { class: "mono small ellipsis" }, a.entity), a.incident ? app.link(a.incident, "incidents", a.incident) : C.pill(a.severity === "minor" ? "warn" : "bad", a.severity)), h("div", { class: "small muted ellipsis", title: a.summary }, a.summary.replace(/^[^:]*: [^:]*: /, ""))))) }) : null);
+    if (!side.childElementCount) put(side, estateEl, traceCard(app, s ? s.first : null), C.card({ title: "Changes, last six hours", sub: "the first thing to rule out", body: j.changes.length ? h("ul", { class: "no-list" }, j.changes.slice(0, 6).map((c) => h("li", { style: { cursor: "pointer" }, onclick: () => changeDrawer(app, c.id) }, h("div", { class: "row between nw" }, h("b", { class: "ellipsis" }, c.title), h("span", { class: "small muted", style: { whiteSpace: "nowrap" } }, C.fmt.ago(T(c.executed)))), h("div", { class: "small muted" }, `${c.id} · ${c.devices.slice(0, 3).join(", ")}`)))) : h("div", { class: "dim" }, "None carried out.") }),
       C.card({ title: "How to read this page", body: h("div", { class: "small dim stack" }, h("div", {}, h("b", {}, "Start at the bottom. "), "A dark optic is a down link, a lost adjacency, a failing service and a customer on the phone. The lowest layer that is broken is the cause; the rest are its symptoms."),
         h("div", {}, h("b", {}, "Then ask one thing five ways. "), "Investigate walks the topology graph, finds its log lines by substring on every device, checks what changed, searches past incidents by meaning, and shows its last hour. All of it is SQL against one database."),
         h("div", {}, h("b", {}, "Or follow a path. "), "Trace walks from a customer or a device to another, hop by hop, and marks the hop where it goes wrong.")) }));
@@ -1847,9 +1862,9 @@ function boardCard(app, id) {
   const add = async (text) => {
     const q = (text ?? ask.value).trim();
     if (!q) return;
-    try { const j = await app.ctx.api(`/v1/incidents/${id}/panels`, { body: { ask: q, who: WHO } }); ask.value = ""; C.toast(`Added for everyone in the room: ${j.understood}`, "ok"); run(); } catch (e) { C.toast(e.message, "bad", 9000); }
+    try { const j = await app.ctx.api(`/v1/incidents/${id}/panels`, { body: { ask: q } }); ask.value = ""; C.toast(`Added for everyone in the room: ${j.understood}`, "ok"); run(); } catch (e) { C.toast(e.message, "bad", 9000); }
   };
-  const act = async (p, action, ok) => { try { await app.ctx.api(`/v1/incidents/${id}/panels/${encodeURIComponent(p.id)}/${action}`, { body: { who: WHO } }); if (ok) C.toast(ok, "ok"); run(); } catch (e) { C.toast(e.message, "bad"); } };
+  const act = async (p, action, ok) => { try { await app.ctx.api(`/v1/incidents/${id}/panels/${encodeURIComponent(p.id)}/${action}`, { body: {} }); if (ok) C.toast(ok, "ok"); run(); } catch (e) { C.toast(e.message, "bad"); } };
   ask.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
   const cell = (v) => v == null ? "–" : typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString("en-US") : v.toFixed(Math.abs(v) < 10 ? 2 : 1)) : /^\d{4}-\d\d-\d\dT/.test(v) ? `${v.slice(5, 10)} ${v.slice(11, 16)}` : Array.isArray(v) ? v.join(", ") : String(v);
   const lines = (p) => {
@@ -1981,14 +1996,32 @@ function carriersPage(body, app) {
     const ta = h("textarea", { class: "input mono", rows: 12, placeholder: "Paste the carrier's email here. It needs one of our circuit ids and a start and an end such as 2026-11-14 01:00 UTC." });
     const out = h("div", { style: { marginTop: "10px" } });
     const btn = h("button", { class: "btn primary" }, "Read it");
-    const d = C.drawer({ title: "A carrier's notice", sub: "Read into a row of netops_maintenance, then checked against the other plane, the change calendar and the capacity left", body: [ta, out], foot: btn });
+    const save = h("button", { class: "btn primary", style: { display: "none" } }, "Save it");
+    const d = C.drawer({ title: "A carrier's notice", sub: "Read into a row of netops_maintenance, then checked against the other plane, the change calendar and the capacity left", body: [ta, out], foot: [btn, save] });
+    // Read first and show what was read: the window is what collisions and
+    // "in progress" are computed from, so a person confirms it before it is kept.
+    let read = "";
+    ta.oninput = () => { if (ta.value !== read) { save.style.display = "none"; btn.className = "btn primary"; } };
     btn.onclick = async () => {
-      try { const n = await app.ctx.api("/v1/maintenance/parse", { body: { text: ta.value } }); C.toast(`${n.id}: ${n.provider} on ${n.circuit}, ${windowText(n.window_start, n.window_end)}`, "ok", 6000); d.close?.(); stop.run(); }
+      try {
+        const n = await app.ctx.api("/v1/maintenance/parse", { body: { text: ta.value, save: false } });
+        read = ta.value;
+        put(out, h("div", { class: "no-act" }, h("div", { class: "small dim" }, "Read as:"),
+          facts(app, [["carrier", n.provider], ["circuit", n.circuit], ["link", n.link], ["starts", `${n.window_start.replace("T", " ").replace(":00Z", "")} UTC`], ["ends", `${n.window_end.replace("T", " ").replace(":00Z", "")} UTC`], ["impact", n.impact], ["their reference", n.reference || "none found"]]),
+          (n.notes || []).map((x) => h("div", { class: "small", style: { color: "var(--warn)" } }, C.icon("warn"), " ", x)),
+          h("div", { class: "small muted", style: { marginTop: "6px" } }, "If this is right, save it; if not, correct the Start and End lines of the text and read it again.")));
+        save.style.display = ""; btn.className = "btn";
+      } catch (e) { save.style.display = "none"; put(out, h("div", { class: "banner", style: { borderColor: "var(--crit)" } }, e.message)); }
+    };
+    save.onclick = async () => {
+      save.disabled = true;
+      try { const n = await app.ctx.api("/v1/maintenance/parse", { body: { text: read } }); C.toast(`${n.id}: ${n.provider} on ${n.circuit}, ${windowText(n.window_start, n.window_end)}`, "ok", 6000); d.close?.(); stop.run(); }
       catch (e) { put(out, h("div", { class: "banner", style: { borderColor: "var(--crit)" } }, e.message)); }
+      save.disabled = false;
     };
   };
   body.append(h("div", { class: "row between", style: { marginBottom: "12px" } }, h("div", { class: "dim" }, "Carriers' maintenance notices, each matched to the circuit it names and checked for what it collides with."), h("button", { class: "btn sm primary", onclick: paste }, C.icon("plus"), "Paste a notice")), h("div", { class: "no-cols wide" }, list, side));
-  const act = async (id, what, okText) => { try { await app.ctx.api(`/v1/maintenance/${id}/${what}`, { body: { who: WHO }, timeout: 60000 }); C.toast(okText, "ok", 6000); stop.run(); } catch (e) { C.toast(e.message, "bad", 6000); } };
+  const act = async (id, what, okText) => { try { await app.ctx.api(`/v1/maintenance/${id}/${what}`, { body: {}, timeout: 60000 }); C.toast(okText, "ok", 6000); stop.run(); } catch (e) { C.toast(e.message, "bad", 6000); } };
   const stop = live(app, body, "/v1/maintenance", (j) => {
     const now = T(j.at);
     const ahead = j.notices.filter((n) => n.status !== "completed" && T(n.window_end) > now).sort((a, b) => T(a.window_start) - T(b.window_start));
@@ -2030,7 +2063,7 @@ function silenceDrawer(app, kind, matcher, after) {
   const hrs = h("select", { class: "input" }, [[0.5, "30 minutes"], [1, "1 hour"], [2, "2 hours"], [4, "4 hours"], [12, "12 hours"], [24, "A day"]].map(([v, t]) => h("option", { value: v, selected: v === 2 }, t)));
   const btn = h("button", { class: "btn primary" }, "Silence");
   const d = C.drawer({ title: `Silence ${matcher}`, sub: `Alerts on this ${kind} are still recorded, but page nobody and open no incident until it ends`, body: h("div", { class: "stack" }, h("label", {}, h("div", { class: "small muted" }, "Reason"), reason), h("label", {}, h("div", { class: "small muted" }, "For"), hrs)), foot: btn });
-  btn.onclick = async () => { try { await app.ctx.api("/v1/silences", { body: { kind, matcher, reason: reason.value, hours: +hrs.value, who: WHO } }); C.toast(`${matcher} is silenced`, "ok"); d.close?.(); after?.(); } catch (e) { C.toast(e.message, "bad", 6000); } };
+  btn.onclick = async () => { try { await app.ctx.api("/v1/silences", { body: { kind, matcher, reason: reason.value, hours: +hrs.value } }); C.toast(`${matcher} is silenced`, "ok"); d.close?.(); after?.(); } catch (e) { C.toast(e.message, "bad", 6000); } };
 }
 
 function silencesCard(app, j, after) {
@@ -2231,6 +2264,20 @@ function mapPage(body, app, path) {
     loadTimer = setTimeout(load, 140);
     drawCrumbs();
   };
+  const inBox = (x0, y0, x1, y1) => !shown.box || (x1 >= shown.box[0] && x0 <= shown.box[2] && y1 >= shown.box[1] && y0 <= shown.box[3]);
+  const changedIn = (was, now) => {
+    if (!was || !shown.box) return true;
+    const key = (f) => `${f.id}|${f.state}|${f.since}`;
+    const before = new Set((was.faults || []).map(key)), after = new Set((now.faults || []).map(key));
+    for (const f of [...(was.faults || []).filter((f) => !after.has(key(f))), ...(now.faults || []).filter((f) => !before.has(key(f)))]) if (inBox(f.x, f.y, f.x, f.y)) return true;
+    for (const id of new Set([...Object.keys(was.places || {}), ...Object.keys(now.places || {})])) {
+      const c = cont.get(id);
+      if (!c || c.kind !== "hub" || JSON.stringify(was.places?.[id]) === JSON.stringify(now.places?.[id])) continue;
+      if (inBox(c.x - c.w / 2, c.y - c.h / 2, c.x + c.w / 2, c.y + c.h / 2)) return true;
+    }
+    return false;
+  };
+  let loadedAt = 0;
   const load = async (force) => {
     if (dead || !base) return;
     const t = tier();
@@ -2243,6 +2290,7 @@ function mapPage(body, app, path) {
       const j = await app.call(`/v1/map/view?x0=${box[0].toFixed(3)}&y0=${box[1].toFixed(3)}&x1=${box[2].toFixed(3)}&y1=${box[3].toFixed(3)}&t=${t}`);
       if (dead || seq !== loadSeq) return;
       shown = { nodes: j.nodes, edges: j.edges, t, box, ms: j.queries.reduce((a, q) => a + q.ms, 0), cut: j.cut };
+      loadedAt = Date.now();
       draw();
     } catch (e) { console.warn(e); }
   };
@@ -2632,7 +2680,7 @@ function mapPage(body, app, path) {
     askBtn.disabled = true;
     put(side, h("div", { class: "no-map-head" }, h("h3", {}, "Searching"), h("div", { class: "muted small" }, text)));
     let j;
-    try { j = await app.call(`/v1/map/ask?q=${encodeURIComponent(text)}`); } catch (e) { put(side, C.failure(e, "The search")); askBtn.disabled = false; return; }
+    try { j = await app.call("/v1/map/ask", { body: { q: text } }); } catch (e) { put(side, C.failure(e, "The search")); askBtn.disabled = false; return; }
     askBtn.disabled = false;
     if (dead) return;
     found = { ...j, ids: new Set(j.rows.map((r) => r.id)) };
@@ -2650,9 +2698,10 @@ function mapPage(body, app, path) {
     const kinds = { column: "column", substring: "substring index", reading: "reading", events: "events", graph: "graph" };
     put(side,
       h("div", { class: "no-map-head" },
-        h("div", { class: "row nw between" }, h("h3", {}, j.understood ? `${C.fmt.n(j.total)} ${j.total === 1 ? "match" : "matches"}` : "Not understood"), h("button", { class: "btn xs", onclick: () => { found = null; input.value = ""; draw(); drawTrouble(); } }, "Clear")),
+        h("div", { class: "row nw between" }, h("h3", {}, j.understood ? `${C.fmt.n(j.total)} ${j.total === 1 ? "match" : "matches"}${j.partial ? ", for part of it" : ""}` : j.refused ? "Not answered" : "Not understood"), h("button", { class: "btn xs", onclick: () => { found = null; input.value = ""; draw(); drawTrouble(); } }, "Clear")),
         h("div", { class: "small", style: { marginTop: "2px" } }, `“${j.asked}”`),
         h("div", { class: "muted small", style: { marginTop: "4px" }, title: j.note || "" }, j.reader === "model" ? "Read by the server's model, through llm()" : `Read by the fixed reader${j.note ? ": " + j.note.replace(/ \(.*$/, "") : ""}`)),
+      askCaveat(h, j),
       j.understood ? sec("How it was read", null, h("div", { class: "no-map-read" }, j.read.map((r) => h("div", {}, h("span", { class: "k" }, kinds[r.kind] || r.kind), h("span", {}, h("b", {}, r.text), h("span", { class: "muted" }, " · " + r.how)))))) : h("div", { class: "small", style: { padding: "0 14px" } }, j.hint),
       j.sql ? sec("One statement", `${C.fmt.ms(j.queries.find((q) => q.what.startsWith("The search"))?.ms || 0)}`, C.sqlBlock(j.sql + `\n-- ${JSON.stringify(j.params)}`)) : null,
       j.rows.length ? sec(j.total > j.rows.length ? `The first ${j.rows.length}` : "The matches", "click one to go to it",
@@ -2676,7 +2725,10 @@ function mapPage(body, app, path) {
     for (const c of base.containers) cont.set(c.id, c);
     resize();
     fit(false);
-    stopHot = live(app, side, "/v1/map/hot", (j) => { hot = j; draw(); drawTrouble(); if (tier() >= 3) load(true); }, 10000);
+    // What is broken comes every 10 s; the window is asked again only when
+    // something in it changed (a fault in it, or a hub it covers counting
+    // differently), and at the latest every five minutes.
+    stopHot = live(app, side, "/v1/map/hot", (j) => { const was = hot; hot = j; draw(); drawTrouble(); if (tier() >= 3 && (changedIn(was, j) || Date.now() - loadedAt > 300000)) load(true); }, 10000);
     const pend = app.pending; app.pending = null;
     if (pend?.ask) ask((input.value = pend.ask));
     else if (pend?.open || path[1]) open(pend?.open || path[1]);
@@ -2804,7 +2856,10 @@ function whereState(app) {
     if (patch.sel || patch.place) app.where.off = false;
     if (JSON.stringify([app.where.place?.id, app.where.sel?.id]) !== before) for (const f of subs) f(app.where);
   };
-  app.scope = () => (app.where.off ? null : app.where.place);
+  app.wherePage = (page) => { app.page = page; for (const f of subs) f(app.where); };
+  // The place in view is the map's: it narrows the map and the dashboards
+  // that follow it, and no other page's search.
+  app.scope = () => (app.where.off || !["map", "dash"].includes(app.page) ? null : app.where.place);
   app.target = () => (app.where.off ? null : app.where.sel);
 }
 
@@ -2817,7 +2872,7 @@ function whereState(app) {
  */
 function cmdBar(app, opts = {}) {
   const { h, C } = app;
-  let mode = opts.mode || "search", items = [], at = -1, seq = 0, timer = 0, lastQ = null, open = false;
+  let mode = opts.mode || "search", items = [], itemsFor = null, at = -1, seq = 0, timer = 0, lastQ = null, open = false;
   const scopeEl = h("button", { class: "no-scope", type: "button", title: "Where the search looks: the place in view, or the object picked. Click to search everywhere." });
   const input = h("input", { class: "no-cmd-in", type: "search", autocomplete: "off", spellcheck: "false", role: "combobox", "aria-autocomplete": "list", "aria-expanded": "false", "aria-label": "Search the network, or ask" });
   const modeSeg = h("div", { class: "no-cmd-mode", role: "tablist" });
@@ -2876,6 +2931,7 @@ function cmdBar(app, opts = {}) {
     try { j = await app.ctx.api(`/v1/suggest?${params}`); } catch (e) { console.warn(e); return; }
     if (my !== seq || document.activeElement !== input) return;
     items = j.items || [];
+    itemsFor = q;
     at = items.length && q.trim() ? 0 : -1;
     drawList(j);
     show(true);
@@ -2914,7 +2970,10 @@ function cmdBar(app, opts = {}) {
     }
     if (e.key === "Enter") {
       e.preventDefault();
-      const it = open && at >= 0 ? items[at] : null;
+      // Completions of something else than what is in the box now (it was
+      // pasted, or typed faster than they came) are not what Enter means.
+      const it = open && at >= 0 && itemsFor === input.value ? items[at] : null;
+      if (itemsFor !== input.value) { clearTimeout(timer); seq++; }
       if (it && it.partial) { pick(at, false); return; }
       if (it) { pick(at, true); return; }
       submit(null);
@@ -2937,7 +2996,8 @@ function run(app, text, it) {
   }
   const page = (app.ctx.path() || [])[0] || "";
   const sentence = text.split(/\s+/).length >= 2 || /:/.test(text) || (it && it.kind !== "history");
-  if (!sentence && page !== "map") { lookupDrawer(app, text); return; }
+  // One word is looked up (an id from a ticket opens what it names); on the map, a word that is not an id is searched for.
+  if (!sentence && (page !== "map" || /[a-z].*-.*\d|\d.*-.*[a-z]/i.test(text))) { lookupDrawer(app, text); return; }
   // A kind: or state: filter reads as words the map's reader knows; the place in view narrows it.
   const s = app.scope();
   let asked = text.replace(/\bkind:([\w-]+)/g, (_, k) => KIND_NAME[k] ? KIND_NAME[k].toLowerCase() + "s" : k).replace(/\bstate:not-?ok\b/g, "that are not ok").replace(/\bstate:(\w+)/g, "that are $1").replace(/\bvendor:(\S+)/g, "$1").replace(/\bin:(\S+)/g, (_, m) => "in " + m.replace(/-/g, " "));
@@ -3077,7 +3137,7 @@ const ID_RE = /\b((?:[a-z]+\d*-)+[a-z0-9]+(?:--[a-z0-9-]+)?)\b/g;
 async function answer(app, text, hooks) {
   const { h, C } = app;
   const queries = [];
-  const call = async (path) => { const j = await app.ctx.api(path); if (j?.queries) queries.push(...j.queries); return j; };
+  const call = async (path, opts) => { const j = await app.ctx.api(path, opts); if (j?.queries) queries.push(...j.queries); return j; };
   const lower = text.toLowerCase();
   // The object asked about: one named in the question, or the one picked.
   let id = null;
@@ -3191,14 +3251,26 @@ async function answer(app, text, hooks) {
   if (/customers?/.test(lower) && /affected|hurt/.test(lower)) asked = `customer routers${where} that are not ok`;
   else if (/\bchanged?\b/.test(lower) && /\b(last|today|hour|day|week)\b/.test(lower) && !/\b(olt|cell|switch|router|ont|cpe|radio)/i.test(lower)) asked = `everything changed in the last ${/week/.test(lower) ? "week" : "day"}${where}`;
   else if (where && !/\bin [A-Z]/.test(asked)) asked += where;
-  const j = await call(`/v1/map/ask?q=${encodeURIComponent(asked)}`);
+  const j = await call("/v1/map/ask", { body: { q: asked } });
+  if (j.refused) return { body: [p(j.hint)], queries };
   if (!j.understood) return { body: [p(`I did not understand that. ${j.hint || ""}`), p("I can answer, about the object picked: what is wrong and why, what changed before it started, who is affected, what to do, how it went before, what depends on it; or search the network in a sentence.")], queries };
   const body = [p(h("b", {}, `${C.fmt.n(j.total)} ${j.total === 1 ? "match" : "matches"}`), ` for “${j.asked}”, read as: ${j.read.map((r) => r.text).join(", ")}.`)];
+  const caveat = askCaveat(h, j);
+  if (caveat) body.push(caveat);
   if (j.rows.length) body.push(h("ul", { class: "no-ag-ul" }, j.rows.slice(0, 6).map((r) => h("li", {}, h("a", { class: "no-link", onclick: () => app.map ? app.map.open(r.id) : app.go("map", r.id) }, r.id), ` · ${KIND_NAME[r.kind] || r.kind} · ${r.state}${r.latency_ms ? " · " + fms(r.latency_ms) : ""}`))));
   return { body, acts: [h("button", { class: "btn xs", onclick: () => { if (app.map) app.map.ask(asked); else { app.pending = { ask: asked }; app.go("map"); } } }, C.icon("search"), "Show them on the map")], queries, how: "the sentence became one statement" };
 }
 
 // ---------------------------------------------------------------- dashboards
+
+/** What a search did not read, or read from a near spelling: the count is then not the answer to the whole question. */
+function askCaveat(h, j) {
+  const ignored = j.ignored || [], corrected = j.corrected || [];
+  if (!j.understood || (!ignored.length && !corrected.length)) return null;
+  return h("div", { class: "no-map-partial" },
+    ignored.length ? h("div", {}, h("b", {}, "Not read: "), ignored.map((w) => `“${w}”`).join(", "), ". The count leaves out what they ask for; say it another way, or name a kind, place, state, reading or event.") : null,
+    corrected.map((c) => h("div", {}, `Read “${c.from}” as ${c.to}.`)));
+}
 
 /** Panels over the backbone's telemetry and the estate, for the place in view or everywhere. */
 function dashPage(body, app) {

@@ -8,7 +8,7 @@
 // #/table lists the tables, the user's own first.
 
 import { h, icon, clear, api, card, empty, failure, fmt, toast, copy, seg, gate, can, sqlBlock, store, debounce, table } from "../core.js";
-import { tables, cached, table as tableOf, typeBadge, invalidate } from "../catalog.js";
+import { tables, cached, table as tableOf, isStored, isTestModel, typeBadge, invalidate } from "../catalog.js";
 import { ownerOf, isMine, folded } from "../owners.js";
 import { quoteName } from "../sqledit.js";
 import { grid, answerStats, exportMenu } from "../results.js";
@@ -34,12 +34,28 @@ export function proseFields(t) {
 }
 /** The vector fields a table embeds from its text (searchable by words). */
 const meaningFields = (t) => (t?.short?.fields || []).filter((f) => f.type === "vector" && f.embed && !f.multi && !/_(next|prev)$/.test(f.name));
-/** The fields an answer shows: the key, a title, the text searched, a few more; never vectors. */
-function shownFields(t, text) {
-  const fs = (t?.short?.fields || []).filter((f) => !["vector", "sparse", "edges"].includes(f.type));
-  const key = t.short?.key;
-  const want = [key, ...text.map((f) => f.name), ...fs.filter((f) => f.type !== "text" && f.type !== "json").map((f) => f.name)];
-  return [...new Set(want.filter((n) => n && fs.some((f) => f.name === n)))].slice(0, 7);
+const TITLE = /^(title|name|subject|headline)$/i;
+const LONG = /(body|content|text|description|desc|summary|abstract|details|article|message|review|notes?)/i;
+/**
+ * The fields an answer shows: {cols, title, text}. The key, a title, the
+ * text searched, a few more; never vectors. A searched field that is not
+ * kept (a TEXT made from others, `from`) reads NULL, so the stored fields
+ * it is made from are shown in its place, as are those a vector is
+ * embedded from.
+ */
+export function shownFields(t, text, vec = null) {
+  const fs = (t?.short?.fields || []).filter((f) => !["vector", "sparse", "edges"].includes(f.type) && isStored(f));
+  const has = (n) => fs.some((f) => f.name === n);
+  const key = t?.short?.key;
+  const sourcesOf = (f) => [].concat(f?.from || f?.embed?.from || []).flatMap((x) => String(x).split(/\s*,\s*/));
+  const searched = [...new Set([...text.flatMap((f) => (isStored(f) ? [f.name] : sourcesOf(f))), ...(vec ? sourcesOf(vec) : [])].filter((n) => has(n) && n !== key))];
+  const prose = fs.filter((f) => f.type === "text" && f.name !== key).map((f) => f.name);
+  const title = [...searched, ...prose].find((n) => TITLE.test(n)) || null;
+  const rest = (n) => n !== title;
+  const body = searched.filter(rest).find((n) => LONG.test(n)) || searched.find(rest) || prose.filter(rest).find((n) => LONG.test(n)) || (title ? null : prose[0]) || null;
+  const others = fs.filter((f) => f.type !== "text" && f.type !== "json").map((f) => f.name);
+  const cols = [...new Set([key, title, body, ...others].filter((n) => n && has(n)))].slice(0, 7);
+  return { cols, title, text: body };
 }
 
 /**
@@ -52,7 +68,8 @@ function shownFields(t, text) {
  * function's (the words :q, the vector :v, the count :k).
  */
 export function searchSql(t, { q, fields, vec, mode, limit = 20 }) {
-  const cols = shownFields(t, fields).map(quoteName);
+  const shown = shownFields(t, fields, mode !== "words" ? vec : null);
+  const cols = shown.cols.map(quoteName);
   const from = quoteName(t.table);
   const W = fields.map((f) => quoteName(f.name));
   let where = "", order;
@@ -71,7 +88,90 @@ export function searchSql(t, { q, fields, vec, mode, limit = 20 }) {
   if (words) fnParams.push({ name: "q", ty: "TEXT" });
   if (meaning) fnParams.push({ name: "v", ty: `VECTOR(${vec.dim || ""})`.replace("()", "") });
   fnParams.push({ name: "k", ty: "INT", default: 10 });
-  return { sql: `${head}\nLIMIT ${limit}`, params, body: `${head}\nLIMIT :k`, fnParams };
+  return { sql: `${head}\nLIMIT ${limit}`, params, body: `${head}\nLIMIT :k`, fnParams, shown };
+}
+
+// ------------------------------------------------------------ a table's profile
+/**
+ * What each field holds, for the Quality tab: [{filled, more}] in the
+ * order of `fs`. The counts and ranges of many fields go in one statement
+ * (aggregates side by side, a batch of fields at a time), and the top
+ * values of each keyword field in one of their own, a few statements at a
+ * time: a table of 90 fields asks about 30 statements, not 250 at once.
+ * The key is known to be different in every row, so it is not counted.
+ */
+export function profileSql(t, fs, { batch = 24 } = {}) {
+  const tq = quoteName(t.table), key = t.short?.key;
+  const parts = [], tops = [];
+  fs.forEach((f, i) => {
+    const c = quoteName(f.name);
+    const add = (kind, expr) => parts.push({ i, kind, expr });
+    if (f.name !== key) add("filled", f.multi || f.type === "json" ? `COUNT(*) FILTER (WHERE ${c} IS NOT NULL)` : `COUNT(${c})`);
+    if (f.multi) { if (f.type === "keyword") tops.push({ i, sql: `SELECT ${c}, COUNT(*) AS n FROM ${tq} GROUP BY ${c} ORDER BY n DESC LIMIT 3` }); return; }
+    if (/^(date|time)/.test(f.type)) { add("min", `MIN(${c})`); add("max", `MAX(${c})`); }
+    else if (/^(int|float)/.test(f.type)) { add("min", `MIN(${c})`); add("max", `MAX(${c})`); add("avg", `AVG(${c})`); }
+    else if (f.type === "keyword") {
+      if (f.name !== key) { add("distinct", `COUNT(DISTINCT ${c})`); tops.push({ i, sql: `SELECT ${c}, COUNT(*) AS n FROM ${tq} GROUP BY ${c} ORDER BY n DESC LIMIT 3` }); }
+    } else if (f.type === "text") { add("len", `AVG(LENGTH(${c}))`); add("maxlen", `MAX(LENGTH(${c}))`); add("blank", `COUNT(*) FILTER (WHERE ${c} = '')`); }
+  });
+  // Whole fields to a statement, at most `batch` aggregates in each.
+  const batches = [];
+  let cur = [];
+  for (const p of parts) {
+    if (cur.length >= batch && cur[cur.length - 1].i !== p.i) { batches.push(cur); cur = []; }
+    cur.push(p);
+  }
+  if (cur.length) batches.push(cur);
+  return { batches: batches.map((b) => ({ parts: b, sql: `SELECT ${b.map((p) => p.expr).join(", ")} FROM ${tq}` })), tops };
+}
+
+/** Runs `jobs` (functions that return a promise), `limit` at a time. */
+export async function bounded(jobs, limit = 4) {
+  const out = new Array(jobs.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, async () => {
+    while (next < jobs.length) { const k = next++; out[k] = await jobs[k](); }
+  }));
+  return out;
+}
+
+const profiles = new Map();
+/** The profile of a table's fields, kept a few minutes per table and row count. */
+async function profile(t, fs, n) {
+  const id = `${t.table}:${n}:${fs.map((f) => f.name).join(",")}`;
+  const kept = profiles.get(id);
+  if (kept && Date.now() - kept.at < 5 * 60e3) return kept.stats;
+  const q = (sql) => api("/v1/query", { body: { sql }, timeout: 15000 }).then((j) => j.rows || []).catch(() => null);
+  const { batches, tops } = profileSql(t, fs);
+  const stats = fs.map(() => ({ filled: null, more: null, agg: {} }));
+  const put = (p, v) => { if (v !== undefined) stats[p.i].agg[p.kind] = v; };
+  const jobs = [
+    ...batches.map((b) => async () => {
+      const rows = await q(b.sql);
+      if (rows) { b.parts.forEach((p, k) => put(p, rows[0]?.[k])); return; }
+      // A batch the server refused: field by field, so one field does not hide the rest.
+      const one = [...new Set(b.parts.map((p) => p.i))];
+      await bounded(one.map((i) => async () => {
+        const ps = b.parts.filter((p) => p.i === i);
+        const r = await q(`SELECT ${ps.map((p) => p.expr).join(", ")} FROM ${quoteName(t.table)}`);
+        if (r) ps.forEach((p, k) => put(p, r[0]?.[k]));
+      }), 2);
+    }),
+    ...tops.map((x) => async () => { stats[x.i].top = await q(x.sql); }),
+  ];
+  await bounded(jobs, 4);
+  // The shapes the tab reads: filled, and `more` as each type's answer was.
+  fs.forEach((f, i) => {
+    const s = stats[i], a = s.agg;
+    s.filled = f.name === t.short?.key ? n : a.filled ?? null;
+    if (f.multi) s.more = s.top || null;
+    else if (/^(date|time)/.test(f.type)) s.more = "min" in a ? [[a.min, a.max]] : null;
+    else if (/^(int|float)/.test(f.type)) s.more = "min" in a ? [[a.min, a.max, a.avg]] : null;
+    else if (f.type === "keyword") s.more = f.name === t.short?.key ? [[[n]], null] : [a.distinct != null ? [[a.distinct]] : null, s.top || null];
+    else if (f.type === "text") s.more = "len" in a ? [[[a.len, a.maxlen]], [[a.blank]]] : null;
+  });
+  profiles.set(id, { at: Date.now(), stats });
+  return stats;
 }
 
 // ------------------------------------------------------------ the page
@@ -116,7 +216,7 @@ function render(page, r) {
         h("div", { class: "small dim ellipsis" }, `${fmt.plural(fs.length, "field")}${text.length ? " · search " + text.map((f) => f.name).join(", ") : " · no text to search"}`),
         idx[t.table] ? h("div", { class: "small muted ellipsis", title: "on disk, and the use of the last 5 minutes" }, use(idx[t.table])) : null,
         h("div", { class: "row nw small", style: { gap: "6px", marginTop: "4px" } },
-          text.length ? h("span", { class: "badge" }, "words") : null, vecs.length ? h("span", { class: "badge accent" }, "meaning") : text.length ? h("span", { class: "badge muted", title: "Add vectors to search by meaning" }, "no meaning yet") : null,
+          text.length ? h("span", { class: "badge" }, "words") : null, vecs.length ? (vecs.every((v) => isTestModel(v.embed?.model)) ? h("span", { class: "badge muted", title: `A test model (${vecs[0].embed.model}): hashed words, no meaning` }, "test vectors") : h("span", { class: "badge accent" }, "meaning")) : text.length ? h("span", { class: "badge muted", title: "Add vectors to search by meaning" }, "no meaning yet") : null,
           o ? h("span", { class: "badge", title: o.about }, o.owner) : null));
     };
     // The list: every table a row, sortable by size and use, apps' tables
@@ -130,7 +230,7 @@ function render(page, r) {
       { key: "writes", label: "Writes/min", num: true, sort: (t) => idx[t.table]?.writes_per_min, render: (t) => idx[t.table] ? fmt.si(idx[t.table].writes_per_min || 0) : "–" },
       { key: "last", label: "Last write", num: true, sort: (t) => idx[t.table]?.last_write_ms, render: (t) => idx[t.table]?.last_write_ms ? fmt.ago(idx[t.table].last_write_ms) : "–" },
       { key: "fields", label: "Fields", num: true, sort: (t) => (t.short?.fields || []).length, render: (t) => String((t.short?.fields || []).length) },
-      { key: "search", label: "Search", sortable: false, render: (t) => h("span", { class: "row nw", style: { gap: "4px" } }, proseFields(t).length ? h("span", { class: "badge" }, "words") : h("span", { class: "muted small" }, "none"), meaningFields(t).length ? h("span", { class: "badge accent" }, "meaning") : null) },
+      { key: "search", label: "Search", sortable: false, render: (t) => h("span", { class: "row nw", style: { gap: "4px" } }, proseFields(t).length ? h("span", { class: "badge" }, "words") : h("span", { class: "muted small" }, "none"), meaningFields(t).some((v) => !isTestModel(v.embed?.model)) ? h("span", { class: "badge accent" }, "meaning") : meaningFields(t).length ? h("span", { class: "badge muted" }, "test vectors") : null) },
     ], { rows: ts, sortKey: "docs", desc: true, onRow: (t) => { location.hash = `#/table/${encodeURIComponent(t.table)}`; } });
     let how = store.get("tables.how", "tiles");
     const host = h("div");
@@ -168,7 +268,8 @@ function render(page, r) {
     const saved = store.get(key, {});
     let picked = new Set((saved.fields || text.map((f) => f.name)).filter((n) => text.some((f) => f.name === n)));
     if (!picked.size && text[0]) picked.add(text[0].name);
-    let mode = saved.mode || (vecs.length && text.length ? "both" : vecs.length ? "meaning" : "words");
+    // A test model's vectors rank by hashed words, not meaning: words first.
+    let mode = saved.mode || (vecs.length && text.length ? (isTestModel(vecs[0].embed?.model) ? "words" : "both") : vecs.length ? "meaning" : "words");
     const inp = h("input", { class: "input search-big", placeholder: text.length || vecs.length ? `Search ${t.table}: a question or some words` : "This table has no text to search", value: saved.q || "", "aria-label": `Search ${t.table}` });
     const modeBox = h("div");
     const fieldsBox = h("div", { class: "row nw small", style: { gap: "6px", flexWrap: "wrap" } });
@@ -180,7 +281,7 @@ function render(page, r) {
       vecs = meaningFields(tableOf(t.table) || t);
       if (!vecs.length && mode !== "words") mode = "words";
       if (!text.length && mode !== "meaning") mode = vecs.length ? "meaning" : "words";
-      clear(modeBox, seg([["words", "Words", "Rows with your words, the more and rarer the higher"], ["meaning", "Meaning", vecs.length ? `Rows close in meaning (${vecs[0].embed.model})` : "Add meaning first"], ["both", "Both", "Words and meaning fused: the best of the two rankings"]].filter(([k]) => (k === "words" ? text.length : vecs.length) && (k !== "both" || text.length)), mode, (v) => { mode = v; keep(); go(); }, { "aria-label": "Search by" }));
+      clear(modeBox, seg([["words", "Words", "Rows with your words, the more and rarer the higher"], ["meaning", "Meaning", vecs.length ? (isTestModel(vecs[0].embed.model) ? `${vecs[0].embed.model} is a test model: it hashes words and knows no meaning (change it in Models)` : `Rows close in meaning (${vecs[0].embed.model})`) : "Add meaning first"], ["both", "Both", "Words and meaning fused: the best of the two rankings"]].filter(([k]) => (k === "words" ? text.length : vecs.length) && (k !== "both" || text.length)), mode, (v) => { mode = v; keep(); go(); }, { "aria-label": "Search by" }));
       clear(fieldsBox, mode === "meaning" ? h("span", { class: "muted" }, `by meaning, with ${vecs[0]?.name} (${vecs[0]?.embed?.model})`) : [h("span", { class: "muted" }, "in"), text.map((f) => h("button", { class: "chip", "aria-pressed": String(picked.has(f.name)), title: picked.has(f.name) ? `Stop searching ${f.name}` : `Search ${f.name} too`, onclick: () => { if (picked.has(f.name) && picked.size > 1) picked.delete(f.name); else picked.add(f.name); keep(); drawControls(); go(); } }, typeBadge(f), f.name))]);
       clear(meaningBox, vecs.length || !text.length ? null : meaningOffer(t, () => { invalidate(); tables(true).then(() => { mode = "both"; drawControls(); go(); }); }));
     }
@@ -198,7 +299,7 @@ function render(page, r) {
         const j = await api("/v1/query", { body: { sql: s.sql, params: s.params }, signal: mine.signal });
         if (mine !== running) return;
         last = { s, j, q };
-        clear(out, results(t, j, q, text));
+        clear(out, results(t, j, q, s.shown));
         drawTail();
       } catch (e) { if (e.name !== "AbortError") clear(out, h("div", { class: "error" }, e.message)); }
       finally { if (mine === running) { out.classList.remove("loading"); running = null; } }
@@ -225,18 +326,19 @@ function render(page, r) {
   }
 
   /** The answer of a search as a list: a title, the text with the words marked, the other fields. */
-  function results(t, j, q, text) {
+  function results(t, j, q, shown) {
     const rows = j.rows || [], cols = j.columns || [];
     if (!rows.length) return empty("search", "No rows", "Other words, fewer of them, or search by meaning.");
-    const words = q.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-    const ti = cols.findIndex((c) => /^(title|name|subject|headline)$/i.test(c));
-    const bi = cols.findIndex((c) => text.some((f) => f.name === c) && c !== cols[ti]);
+    const words = q.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const start = words.length ? `(?<![\\p{L}\\p{N}])(${words.join("|")})` : null;
+    const ti = shown.title ? cols.indexOf(shown.title) : -1;
+    const bi = shown.text ? cols.indexOf(shown.text) : -1;
     const si = cols.indexOf("score()");
     const ki = cols.indexOf(t.short?.key);
     const marked = (s) => {
       s = String(s ?? "");
       if (!words.length) return s;
-      const re = new RegExp(`\\b(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi");
+      const re = new RegExp(start, "giu");
       const out = []; let i = 0;
       for (const m of s.matchAll(re)) { out.push(s.slice(i, m.index), h("mark", {}, m[0])); i = m.index + m[0].length; }
       out.push(s.slice(i));
@@ -244,15 +346,15 @@ function render(page, r) {
     };
     const snip = (s) => {
       s = String(s ?? "").replace(/\s+/g, " ");
-      const at = words.length ? s.toLowerCase().search(new RegExp(`\\b(${words.join("|")})`)) : -1;
+      const at = words.length ? s.toLowerCase().search(new RegExp(start, "u")) : -1;
       const from = at > 80 ? at - 60 : 0;
       return (from ? "…" : "") + s.slice(from, from + 260) + (s.length > from + 260 ? "…" : "");
     };
-    return h("section", { class: "card hits-card" }, h("div", { class: "hd" }, h("h3", {}, fmt.plural(rows.length, "row")), h("span", { class: "sub" }, answerStats(j)), h("div", { class: "tools" }, exportMenu(j, `chloedb-${t.table}`))),
+    return h("section", { class: "card hits-card" }, h("div", { class: "hd" }, h("h3", {}, "Results"), h("span", { class: "sub" }, answerStats(j)), h("div", { class: "tools" }, exportMenu(j, `chloedb-${t.table}`))),
       h("div", { class: "bd flush" }, h("ol", { class: "hits" }, rows.map((r) => h("li", {},
         h("div", { class: "row nw" }, h("b", { class: "grow" }, ti >= 0 ? marked(r[ti]) : ki >= 0 ? String(r[ki]) : "row"), si >= 0 ? h("span", { class: "small muted mono", title: "score" }, Number(r[si]).toFixed(3)) : null),
         bi >= 0 ? h("div", { class: "small dim" }, marked(snip(r[bi]))) : null,
-        h("div", { class: "small muted hit-f" }, cols.map((c, i) => i === ti || i === bi || i === si || r[i] == null || String(r[i]).length > 80 ? null : h("span", {}, h("span", { class: "k" }, c), " ", String(r[i])))))))));
+        h("div", { class: "small muted hit-f" }, cols.map((c, i) => i === ti || i === bi || i === si || r[i] == null || String(r[i]).length > 80 ? null : h("span", {}, h("span", { class: "k" }, c), " ", typeof r[i] === "number" ? fmt.num(r[i]) : String(r[i])))))))));
   }
 
   /** The offer of meaning for a table without vectors: one click, the defaults told. */
@@ -374,24 +476,11 @@ function render(page, r) {
     const made = all.filter((f) => f.from && !["vector", "sparse"].includes(f.type));
     const out = h("div", { class: "small muted", style: { padding: "12px" } }, "Counting…");
     pane.append(h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Each field"), h("span", { class: "sub" }, "how filled it is, and what is in it")), h("div", { class: "bd" }, out)));
-    const q = (sql) => api("/v1/query", { body: { sql }, timeout: 8000 }).then((j) => j.rows || []).catch(() => null);
     (async () => {
       const tq = quoteName(t.table);
       const n = (await api("/v1/query", { body: { sql: `SELECT COUNT(*) FROM ${tq}` } })).rows?.[0]?.[0] || 0;
       if (!n) { clear(out, empty("table", "No rows to judge", "Quality shows once rows are in.")); return; }
-      const stats = await Promise.all(fs.map(async (f) => {
-        const c = quoteName(f.name);
-        const [filled, more] = await Promise.all([
-          q(`SELECT COUNT(*) FROM ${tq} WHERE ${c} IS NOT NULL`).then((r) => r?.[0]?.[0] ?? null),
-          /^(date|time)/.test(f.type) && !f.multi ? q(`SELECT MIN(${c}), MAX(${c}) FROM ${tq}`)
-            : /^(int|float)/.test(f.type) && !f.multi ? q(`SELECT MIN(${c}), MAX(${c}), AVG(${c}) FROM ${tq}`)
-            : f.type === "keyword" && !f.multi ? Promise.all([q(`SELECT COUNT(DISTINCT ${c}) FROM ${tq}`), q(`SELECT ${c}, COUNT(*) AS n FROM ${tq} GROUP BY ${c} ORDER BY n DESC LIMIT 3`)])
-            : f.type === "keyword" ? q(`SELECT ${c}, COUNT(*) AS n FROM ${tq} GROUP BY ${c} ORDER BY n DESC LIMIT 3`)
-            : f.type === "text" ? Promise.all([q(`SELECT AVG(LENGTH(${c})), MAX(LENGTH(${c})) FROM ${tq}`), q(`SELECT COUNT(*) FROM ${tq} WHERE ${c} = ''`)])
-            : Promise.resolve(null),
-        ]);
-        return { filled, more };
-      }));
+      const stats = await profile(t, fs, n);
       const notes = [];
       const num = (v, f) => v == null ? "–" : /date|time/.test(f.type) && typeof v === "number" && v > 1e11 ? new Date(v).toISOString().slice(0, 10) : typeof v === "string" && /^\d{4}-\d\d-\d\dT/.test(v) ? v.replace(/T00:00:00(\.0+)?Z$/, "").replace("T", " ").replace(/(\.\d+)?Z$/, "") : typeof v === "number" ? (Number.isInteger(v) ? fmt.n(v) : fmt.n(Math.round(v * 100) / 100)) : String(v);
       const rowsEl = fs.map((f, i) => {
@@ -417,7 +506,8 @@ function render(page, r) {
           h("span", { class: "small muted ellipsis", title: what }, what));
       });
       const vecs = (t.embeddings || []).map((e) => {
-        const b = e.backfill, miss = b?.missing || 0;
+        // A backfill that is done has embedded what it found missing (CCB-4).
+        const b = e.backfill, miss = b?.state === "done" ? Math.max(0, (b.missing || 0) - (b.embedded || 0)) : b?.missing || 0;
         if (miss) notes.push(`${e.field} has no vector yet for ${fmt.n(miss)} rows (being filled in)`);
         if (e.error) notes.push(`${e.field}: the model did not open (${e.error})`);
         const share = miss ? Math.max(0, 1 - miss / n) : 1;

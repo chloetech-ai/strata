@@ -6,7 +6,7 @@ the file through ChloeDB's native library over JNI, with no server. It is a
 JDBC driver too, for code and tools that speak JDBC (`jdbc:chloedb:books.chloedb`).
 
 ```sh
-mvn install          # Rust (stable), a C compiler, a JDK 11+ and Maven; installs ai.chloetech:chloedb:0.3.2 into ~/.m2
+mvn install          # Rust (stable), a C compiler, a JDK 11+ and Maven; installs ai.chloetech:chloedb:0.3.3 into ~/.m2
 ```
 
 ```java
@@ -37,7 +37,7 @@ try (Connection c = DriverManager.getConnection("jdbc:chloedb:books.chloedb");
 ```
 
 The guide is [docs/chloedb/java.md](../docs/chloedb/java.md). The jar
-(`target/java/chloedb-0.3.2.jar`) carries the native library for the
+(`target/java/chloedb-0.3.3.jar`) carries the native library for the
 platform it was built on. `mvn -Dcargo.profile=ci package` builds faster,
 without link-time optimisation, when only the tests matter.
 

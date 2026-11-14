@@ -67,6 +67,10 @@ pub fn from_xlsx(bytes: &[u8], name: &str) -> Result<Engine, String> {
     }
     let mut e = engine_of(wb)?;
     e.set_name(name);
+    // Excel keeps each formula's last value in the file, but most other
+    // writers (openpyxl, pandas, exporters) keep none: computed here, or the
+    // formulas show 0 or #VALUE! until the next edit.
+    e.evaluate();
     Ok(e)
 }
 
@@ -133,7 +137,8 @@ fn fill(m: &mut Model, s: u32, header: Option<&[String]>, rows: impl Iterator<It
             match v {
                 Val::Empty => continue,
                 Val::Num(x) if x.is_finite() => m.update_cell_with_number(s, r, c, *x)?,
-                Val::Num(_) => continue,
+                // a cell holds no infinity or NaN: kept as the text it reads as
+                Val::Num(x) => m.update_cell_with_text(s, r, c, if x.is_nan() { "NaN" } else if *x > 0.0 { "inf" } else { "-inf" })?,
                 Val::Text(t) if t.is_empty() => continue,
                 Val::Text(t) => m.update_cell_with_text(s, r, c, t)?,
                 Val::Bool(b) => m.update_cell_with_bool(s, r, c, *b)?,
@@ -156,11 +161,15 @@ fn csv_val(s: &str) -> Val {
     if t.is_empty() {
         return Val::Empty;
     }
-    // Numbers as a spreadsheet would read them, but not codes with leading zeros.
+    // Numbers as a spreadsheet would read them, but not codes with leading
+    // zeros, nor what a number would lose: "NaN", "inf" and "Infinity"
+    // (which Rust's parser takes), or an id of more than 15 digits (a card
+    // or account number), which a double cannot hold.
     let leading_zero = t.len() > 1 && t.starts_with('0') && !t.starts_with("0.");
-    if !leading_zero {
+    let numeric = t.bytes().any(|b| b.is_ascii_digit()) && t.bytes().all(|b| b.is_ascii_digit() || b"+-.,eE".contains(&b));
+    if numeric && !leading_zero && !long_integer(t) {
         if let Ok(x) = t.replace(',', "").parse::<f64>() {
-            if !t.contains(',') || t.split('.').next().is_some_and(|i| i.split(',').skip(1).all(|g| g.len() == 3)) {
+            if x.is_finite() && (!t.contains(',') || t.split('.').next().is_some_and(|i| i.split(',').skip(1).all(|g| g.len() == 3))) {
                 return Val::Num(x);
             }
         }
@@ -170,6 +179,13 @@ fn csv_val(s: &str) -> Val {
         "false" => Val::Bool(false),
         _ => Val::Text(s.to_string()),
     }
+}
+
+/// A whole number written with more than 15 significant digits, which a
+/// double does not hold exactly (Excel too keeps such ids as text only).
+fn long_integer(t: &str) -> bool {
+    let d = t.trim_start_matches(['+', '-']).replace(',', "");
+    d.bytes().all(|b| b.is_ascii_digit()) && d.trim_start_matches('0').len() > 15
 }
 
 /// The delimiter of a CSV file: the one of `,;\t|` its first lines split by most evenly.
@@ -391,6 +407,88 @@ mod tests {
         assert_eq!(e.get_worksheets_properties()[0].name, "fruit");
         let csv = to_csv(e.get_model(), 0).unwrap();
         assert!(csv.starts_with("name,qty,price\npear,3,1.5\n\"fig, dried\""), "{csv}");
+    }
+
+    /// Text that a float would read but lose: "NaN", "inf", "Infinity"
+    /// (which `f64::from_str` takes, and which the sheet then dropped) and
+    /// ids of more than 15 digits stay as they were written (DAP-7).
+    #[test]
+    fn csv_keeps_what_a_number_would_lose() {
+        for t in ["NaN", "nan", "inf", "-inf", "Infinity", "+infinity", "1e400", "12345678901234567890", "4111111111111111", "-4111111111111111", "0x1F"] {
+            assert!(matches!(csv_val(t), Val::Text(ref s) if s == t), "{t} should stay text");
+        }
+        assert!(matches!(csv_val("123456789012345"), Val::Num(x) if x == 123456789012345.0));
+        assert!(matches!(csv_val("1e5"), Val::Num(x) if x == 100000.0));
+        assert!(matches!(csv_val("-2.5"), Val::Num(x) if x == -2.5));
+        assert!(matches!(csv_val(".5"), Val::Num(x) if x == 0.5));
+        let (e, r) = from_csv(b"label,value\nn,7\nnan,NaN\ninf,inf\nInfinity,Infinity\nbig id,12345678901234567890\ncard,4111111111111111\n", "edge.csv", None).unwrap();
+        assert_eq!(r["header"], true);
+        assert_eq!(r["cells"], 12, "a cell was dropped: {r}");
+        for (row, want) in [(2, "7"), (3, "NaN"), (4, "inf"), (5, "Infinity"), (6, "12345678901234567890"), (7, "4111111111111111")] {
+            assert_eq!(e.shown(0, row, 2).unwrap(), want, "row {row}");
+        }
+        let csv = to_csv(e.get_model(), 0).unwrap();
+        assert!(csv.contains("card,4111111111111111\n"), "{csv}");
+    }
+
+    /// A number a file holds that a cell cannot (an infinite REAL of a
+    /// SQLite table) is kept as text, not dropped.
+    #[test]
+    fn a_number_a_cell_cannot_hold_is_kept_as_text() {
+        let mut m = empty_model();
+        let mut budget = 100;
+        let (n, cut) = fill(&mut m, 0, None, vec![vec![Val::Num(f64::INFINITY), Val::Num(f64::NAN), Val::Num(1.0)]].into_iter(), &mut budget).unwrap();
+        assert_eq!((n, cut), (3, false));
+        assert_eq!(m.shown(0, 1, 1).unwrap(), "inf");
+        assert_eq!(m.shown(0, 1, 2).unwrap(), "NaN");
+    }
+
+    /// The xlsx file with its formulas' values taken out, as openpyxl
+    /// writes one: `<f>A1*B1</f>` and no `<v>`.
+    fn without_values(x: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zin = zip::ZipArchive::new(Cursor::new(x)).unwrap();
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..zin.len() {
+            let mut part = zin.by_index(i).unwrap();
+            let name = part.name().unwrap().to_string();
+            let mut text = Vec::new();
+            part.read_to_end(&mut text).unwrap();
+            if name.starts_with("xl/worksheets/") {
+                let mut s = String::from_utf8(text).unwrap();
+                let mut n = 0;
+                while let Some(at) = s.find("</f><v>") {
+                    let end = at + s[at..].find("</v>").unwrap() + 4;
+                    s.replace_range(at + 4..end, "");
+                    n += 1;
+                }
+                assert!(n > 0 || !name.ends_with(".xml"), "{name}: no formula values to take out");
+                text = s.into_bytes();
+            }
+            w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(&text).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    /// An xlsx file written by a program that leaves no computed values
+    /// (openpyxl, pandas and most exporters) shows its formulas computed,
+    /// not 0 until the next edit (DAP-6).
+    #[test]
+    fn xlsx_formulas_are_computed_on_import() {
+        let mut m = empty_model();
+        m.set_user_input(0, 1, 1, "4".into()).unwrap();
+        m.set_user_input(0, 1, 2, "5".into()).unwrap();
+        m.set_user_input(0, 1, 3, "=A1*B1".into()).unwrap();
+        m.set_user_input(0, 2, 3, "=SUM(A1:C1)".into()).unwrap();
+        m.add_sheet("Feuille2").unwrap();
+        m.set_user_input(1, 1, 1, "=Sheet1!C1*2".into()).unwrap();
+        m.evaluate();
+        let x = without_values(&to_xlsx(&m).unwrap());
+        let e = from_xlsx(&x, "calc").unwrap();
+        assert_eq!(e.shown(0, 1, 3).unwrap(), "20");
+        assert_eq!(e.shown(0, 2, 3).unwrap(), "29");
+        assert_eq!(e.shown(1, 1, 1).unwrap(), "40");
     }
 
     #[test]

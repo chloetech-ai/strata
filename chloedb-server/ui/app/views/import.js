@@ -29,6 +29,11 @@ export async function sniff(file) {
   if (head.startsWith("PAR1")) return "parquet";
   const ext = (file.name.split(".").pop() || "").toLowerCase();
   if (ext === "parquet") return "parquet";
+  // A .json file of one object a line (as many tools write) is JSON Lines.
+  if (ext === "json" && /^\s*\{/.test(head)) {
+    const lines = head.trim().split("\n");
+    try { if (lines.length > 1 && typeof JSON.parse(lines[0]) === "object" && /^\s*\{/.test(lines[1])) return "jsonl"; } catch { /* one object over many lines: JSON */ }
+  }
   if (ext === "csv" || ext === "tsv" || ext === "json") return ext;
   if (ext === "jsonl" || ext === "ndjson") return "jsonl";
   if (ext === "sqlite" || ext === "db" || ext === "sqlite3") return "sqlite";
@@ -55,14 +60,43 @@ export function parseDelimited(text, sep = ",", max = Infinity) {
   return rows;
 }
 
+/**
+ * The separator of a CSV whose header holds more ';' (or '|') than ',',
+ * as spreadsheets in much of Europe write it; null for commas.
+ */
+export function otherSeparator(firstLine) {
+  const n = (c) => firstLine.split(c).length - 1;
+  const comma = n(",");
+  if (n(";") > comma) return ";";
+  if (n("|") > comma && n("|") > n(";")) return "|";
+  return null;
+}
+/**
+ * Delimited text as comma-separated CSV, which the server reads: fields
+ * quoted where they need it, and a column whose every value is a number
+ * written with a decimal comma (3,5) written with a point.
+ */
+export function toCommaCsv(text, sep) {
+  const rows = parseDelimited(text, sep).filter((r) => r.length > 1 || r[0] !== "");
+  const width = Math.max(...rows.map((r) => r.length));
+  const decimal = Array.from({ length: width }, (_, i) => {
+    const vs = rows.slice(1).map((r) => r[i]).filter((v) => v != null && v !== "");
+    return vs.length > 0 && vs.every((v) => /^-?\d+(,\d+)?$/.test(v)) && vs.some((v) => v.includes(","));
+  });
+  const cell = (v, i, head) => { let x = v ?? ""; if (!head && decimal[i]) x = x.replace(",", "."); return /[",\r\n]/.test(x) ? `"${x.replace(/"/g, '""')}"` : x; };
+  return rows.map((r, k) => r.map((v, i) => cell(v, i, k === 0)).join(",")).join("\n") + "\n";
+}
+
 /** The first rows of a file as objects, and its columns. */
 async function sample(file, format, max = 200) {
   const text = await file.slice(0, 2 << 20).text();
-  let objs = [];
+  let objs = [], ragged = 0;
   if (format === "csv" || format === "tsv") {
     const rows = parseDelimited(text, format === "tsv" ? "\t" : ",", max + 2);
     const head = rows.shift() || [];
     if (file.size > 2 << 20) rows.pop();
+    // Rows with more cells than the header lose the rest: said, not hidden.
+    ragged = rows.filter((r) => r.length > head.length && r.slice(head.length).some((x) => x !== "")).length;
     objs = rows.filter((r) => r.length > 1 || r[0] !== "").slice(0, max).map((r) => Object.fromEntries(head.map((c, i) => [c, r[i] === "" || r[i] == null ? null : r[i]])));
   } else if (format === "jsonl") {
     for (const line of text.split("\n").slice(0, max)) { const l = line.trim(); if (!l) continue; try { objs.push(JSON.parse(l)); } catch { break; } }
@@ -70,7 +104,7 @@ async function sample(file, format, max = 200) {
     try { const all = JSON.parse(file.size <= 2 << 20 ? text : await file.text()); objs = (Array.isArray(all) ? all : [all]).slice(0, max); } catch (e) { throw new Error(`not JSON: ${e.message}`); }
   }
   const cols = [...new Set(objs.flatMap((o) => Object.keys(o || {})))];
-  return { objs, cols, partial: file.size > 2 << 20 };
+  return { objs, cols, partial: file.size > 2 << 20, ragged };
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
@@ -143,13 +177,28 @@ function render(page) {
   }
   async function open(file) {
     const format = await sniff(file);
+    if (format === "csv") {
+      const sep = otherSeparator((await file.slice(0, 4096).text()).split(/\r?\n/)[0]);
+      if (sep && file.size > 64 << 20) { toast(`${file.name} is separated by '${sep}': save it with commas first (this page reads such a file up to 64 MB)`, "bad", 9000); return; }
+      if (sep) {
+        file = new File([toCommaCsv(await file.text(), sep)], file.name, { type: "text/csv" });
+        toast(`${file.name} is separated by '${sep}': read as such${sep === ";" ? ", and numbers with a decimal comma as numbers" : ""}`, "info", 6000);
+      }
+    }
     if (format === "sqlite") return sqlitePlan(file);
     if (format === "parquet") return parquetPlan(file);
     let s;
     try { s = await sample(file, format); } catch (e) { toast(`${file.name}: ${e.message}`, "bad", 8000); return; }
     if (!s.objs.length) { toast(`${file.name} has no rows`, "bad"); return; }
     const fromCsv = format === "csv" || format === "tsv";
-    const cols = s.cols.map((c) => ({ name: c, ...inferType(s.objs.map((o) => o[c]), fromCsv), use: true }));
+    // A column named as prose (a title, a name, notes) is searched by its
+    // words, short as it is: TEXT, not KEYWORD.
+    const PROSE = /^(title|name|subject|headline|summary|notes?|description|comment|body|text|caption)$/i;
+    const cols = s.cols.map((c) => {
+      const t = inferType(s.objs.map((o) => o[c]), fromCsv);
+      if (t.type === "keyword" && !t.multi && PROSE.test(c) && s.objs.some((o) => typeof o[c] === "string" && /\s/.test(o[c].trim()))) t.type = "text";
+      return { name: c, ...t, use: true };
+    });
     const keyGuess = cols.find((c) => /^(id|key|_id|pk)$/i.test(c.name) && (c.type === "keyword" || c.type === "int")) || cols.find((c) => (c.type === "keyword" || c.type === "int") && new Set(s.objs.map((o) => o[c.name])).size === s.objs.length);
     const overlap = (t) => (t.short?.fields || []).filter((f) => s.cols.includes(f.name)).length;
     const best = [...ts].sort((a, b) => overlap(b) - overlap(a))[0];
@@ -164,6 +213,7 @@ function render(page) {
     const box = h("div", { class: "stack" });
     const fileRow = h("div", { class: "imp-file" }, icon("import", "lg"), h("div", { class: "grow" }, h("b", {}, file.name), h("div", { class: "small muted" }, `${fmt.bytes(file.size)} · ${format.toUpperCase()} · ${fmt.plural(s.objs.length, "row")} read${s.partial ? " from the start of it" : ""} · ${fmt.plural(s.cols.length, "column")}`)),
       h("button", { class: "btn ghost", onclick: start }, icon("x"), "Another file"));
+    const raggedNote = s.ragged ? h("div", { class: "notice small" }, icon("warn"), ` ${fmt.plural(s.ragged, "row")} of the first ${fmt.n(s.objs.length)} ${s.ragged === 1 ? "has" : "have"} more values than the header names: the extra values are not loaded. Is the file separated by another character, or a header missing?`) : null;
     const modeSeg = seg([["existing", "Into a table that exists"], ["new", "Into a new table"]], st.mode, (v) => { st.mode = v; if (v === "existing" && st.suggest) st.table = st.suggest; drawLoad(file, format, s, st); });
     const tableSel = h("select", { class: "select", onchange: (e) => { st.table = e.target.value; drawLoad(file, format, s, st); } }, ts.map((t) => h("option", { value: t.table, selected: t.table === st.table }, t.table)));
     const nameIn = h("input", { class: "input mono", value: st.name, oninput: (e) => { st.name = e.target.value.trim(); check(); } });
@@ -248,16 +298,32 @@ function render(page) {
         reason = ok.reason;
       }
       go.disabled = true;
+      let made = null;
       try {
         let name = st.table;
-        if (st.mode === "new") { await api("/v1/sql", { body: { sql: ddl } }); invalidate(); ts = await tables(true); name = st.name; }
+        if (st.mode === "new") { await api("/v1/sql", { body: { sql: ddl } }); made = st.name; invalidate(); ts = await tables(true); name = st.name; }
         const sent = Date.now();
         const j = await upload(`/v1/import?format=${format}&table=${encodeURIComponent(name)}`, file, CT[format], progress, reason);
         done(name, j, file, { sent, reason, route: "/v1/import" });
-      } catch (e) { failed(e.message, "bad", 9000); go.disabled = false; progress.classList.add("hidden"); }
+      } catch (e) {
+        // A table this load made, which a bad row left empty (an import into
+        // an empty table writes nothing when a row is bad), goes again: the
+        // retry, with the column's type changed, makes it anew.
+        let gone = false;
+        if (made) {
+          try {
+            const left = (await api("/v1/query", { body: { sql: `SELECT COUNT(*) FROM ${quoteName(made)}` } })).rows?.[0]?.[0];
+            if (left === 0) { await api("/v1/sql", { body: { sql: `DROP TABLE ${quoteName(made)}` }, reason: "an import into a new table failed: the empty table it made goes" }); gone = true; }
+          } catch { /* left as it is: the message says so */ }
+          invalidate(); ts = await tables(true).catch(() => ts);
+        }
+        failed(made ? `${e.message}. ${gone ? `Nothing was loaded, and the empty table ${made} was dropped: change the column's type and load again.` : `Table ${made} was made and holds what was loaded.`}` : e.message, "bad", 12000);
+        go.disabled = false; progress.classList.add("hidden");
+        if (gone) check();
+      }
     };
     clear(left, h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Load a file")), h("div", { class: "bd" }, box)));
-    clear(box, fileRow,
+    clear(box, fileRow, raggedNote,
       h("div", { class: "row" }, modeSeg, st.mode === "existing" ? tableSel : st.mode === "new" ? h("label", { class: "row nw small dim" }, "named", nameIn) : null),
       !st.mode ? h("div", { class: "small" }, h("b", {}, "Where do the rows go? "), h("span", { class: "muted" }, st.suggest ? `${st.suggest} has ${st.fit} of the file's ${s.cols.length} columns: pick “Into a table that exists” to load into it, or make a new table.` : "No table has most of the file's columns: a new table fits it best.")) : null,
       st.mode === "existing" && target ? h("div", { class: "small dim" }, `${fmt.plural(st.cols.filter((c) => fieldOf(c)).length, "column")} of ${st.cols.length} go to fields of ${target.table}.`,
@@ -296,7 +362,8 @@ function render(page) {
       h("div", { class: "banner ok" }, icon("okc", "lg"), h("div", { class: "grow" }, h("div", { class: "big" }, `${fmt.plural(j.written ?? 0, "row")} written to ${name}`), h("div", { class: "small muted" }, `from ${file.name} in ${fmt.ms(j.took_ms)}${skipped?.length ? ` · columns skipped: ${skipped.join(", ")}` : ""}`))),
       sentWith ? audited(sentWith) : null,
       h("div", { class: "row" },
-        h("a", { class: "btn primary", href: "#/sql?q=" + encodeURIComponent(`SELECT * FROM ${quoteName(name)} LIMIT 20;`) }, icon("sql"), "Query it"),
+        h("a", { class: "btn primary", href: `#/table/${encodeURIComponent(name)}?tab=search` }, icon("search"), "Search it"),
+        h("a", { class: "btn", href: "#/sql?q=" + encodeURIComponent(`SELECT * FROM ${quoteName(name)} LIMIT 20;`) }, icon("sql"), "Query it"),
         h("a", { class: "btn", href: "#/builder?table=" + encodeURIComponent(name) }, icon("builder"), "Build a query"),
         h("a", { class: "btn", href: "#/schema?table=" + encodeURIComponent(name) }, icon("schema"), "See it in the schema"),
         h("span", { class: "sep" }), h("button", { class: "btn ghost", onclick: start }, icon("import"), "Load another file")))));
@@ -312,6 +379,8 @@ function render(page) {
     const pick = new Set(plan.tables.map((t) => t.source));
     const progress = h("div", { class: "imp-prog hidden" }, h("div", { class: "bar" }, h("span")), h("span", { class: "small dim txt" }));
     const go = h("button", { class: "btn primary" }, icon("import"), "Import the tables");
+    // A plan of this server says whether each table exists, and may not count its rows.
+    const hasRows = plan.tables.some((t) => t.rows != null);
     go.onclick = async () => {
       go.disabled = true;
       try { const j = await upload(`/v1/import?format=sqlite&tables=${encodeURIComponent([...pick].join(","))}`, file, CT.sqlite, progress); invalidate(); ts = await tables(true); done(j.tables.map((t) => t.table).join(", "), { written: j.written, took_ms: j.took_ms }, file); }
@@ -319,11 +388,11 @@ function render(page) {
     };
     clear(left, h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Import a SQLite database")), h("div", { class: "bd stack" },
       h("div", { class: "imp-file" }, icon("db", "lg"), h("div", { class: "grow" }, h("b", {}, file.name), h("div", { class: "small muted" }, `${fmt.bytes(file.size)} · SQLite · ${fmt.plural(plan.tables.length, "table")}`)), h("button", { class: "btn ghost", onclick: start }, icon("x"), "Another file")),
-      h("div", { class: "tbl-wrap" }, h("table", { class: "t" }, h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "SQLite table"), h("th", {}, "becomes"), h("th", { class: "num" }, "rows"), h("th", {}, "notes"))),
+      h("div", { class: "tbl-wrap" }, h("table", { class: "t" }, h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "SQLite table"), h("th", {}, "becomes"), hasRows ? h("th", { class: "num" }, "rows") : null, h("th", {}, "notes"))),
         h("tbody", {}, plan.tables.map((t) => h("tr", {},
           h("td", {}, h("input", { type: "checkbox", checked: true, onchange: (e) => { if (e.target.checked) pick.add(t.source); else pick.delete(t.source); go.disabled = !pick.size; } })),
-          h("td", { class: "mono" }, t.source), h("td", {}, h("span", { class: "row nw", style: { gap: "6px" } }, h("b", {}, t.table), t.created ? h("span", { class: "badge accent" }, "new table") : h("span", { class: "badge" }, "exists"))),
-          h("td", { class: "num" }, fmt.n(t.rows)), h("td", { class: "small dim" }, (t.notes || []).join(" · "))))))),
+          h("td", { class: "mono" }, t.source), h("td", {}, h("span", { class: "row nw", style: { gap: "6px" } }, h("b", {}, t.table), (t.created ?? !t.exists) ? h("span", { class: "badge accent" }, "new table") : h("span", { class: "badge" }, "exists"))),
+          hasRows ? h("td", { class: "num" }, t.rows == null ? "–" : fmt.n(t.rows)) : null, h("td", { class: "small dim" }, (t.notes || []).join(" · "))))))),
       plan.skipped?.length ? h("div", { class: "small muted" }, `Skipped: ${plan.skipped.map((x) => typeof x === "string" ? x : x.source || JSON.stringify(x)).join(", ")}`) : null,
       h("div", { class: "row" }, go, progress))));
   }
@@ -374,6 +443,8 @@ function render(page) {
     // How big the tables are now, where the server lists their sizes.
     const sizeNote = h("div", { class: "small muted" });
     async function estimate() {
+      // The sizes are an admin's to read: another key's estimate is left out.
+      if (!can("admin")) { clear(sizeNote); return; }
       try {
         const j = await api("/v1/index/tables");
         const list = (Array.isArray(j) ? j : j.tables || []).filter((t) => pick.has(t.table));
@@ -428,22 +499,20 @@ function render(page) {
       sub.textContent = v === "parquet" ? "a Parquet file a table, for Spark, DuckDB, polars and pandas" : "the database as a SQLite file";
       hint.textContent = v === "parquet" ? "Vectors go as lists of float32, timestamps in UTC; each file keeps its ChloeDB schema." : "Vectors go as float32 blobs, lists as JSON arrays.";
     });
-    // A coordinator holds no rows: say so before anything is asked for.
-    if (isCoordinator()) {
-      const card = h("section", { class: "card", id: "imp-export" }, h("div", { class: "hd" }, h("h3", {}, "Export"), h("span", { class: "sub" }, "SQLite or Parquet")),
-        h("div", { class: "bd stack", style: { gap: "10px" } },
-          h("div", { class: "banner dt-done" }, icon("info", "lg"), h("div", { class: "grow" }, h("b", {}, "Export runs on a shard's server, not on this coordinator"),
-            h("div", { class: "small muted" }, "A coordinator holds no rows. Open the command center of each shard's primary and export there, or run chloedb-server export --db on its database; each shard's file holds that shard's rows."))),
-          sizeNote));
-      const old = right.querySelector("#imp-export");
-      if (old) old.replaceWith(card); else right.prepend(card);
-      estimate();
-      return;
+    // A coordinator exports a table a file (Parquet, from every shard);
+    // the whole database as one SQLite file runs on a shard's server.
+    const coord = isCoordinator();
+    if (coord) {
+      format = "parquet";
+      sqliteOpts.classList.add("hidden");
+      go.lastChild.textContent = "Download as Parquet";
+      sub.textContent = "a Parquet file a table, of every shard's rows";
+      hint.textContent = "Vectors go as lists of float32, timestamps in UTC. The whole database as SQLite: export on each shard's server (chloedb-server export --db).";
     }
     gate(go, "admin");
     const card = h("section", { class: "card", id: "imp-export" }, h("div", { class: "hd" }, h("h3", {}, "Export"), sub),
       h("div", { class: "bd stack", style: { gap: "10px" } },
-        formatSeg,
+        coord ? null : formatSeg,
         h("div", { class: "row", style: { gap: "6px" } }, cached().map((t) => h("button", { class: "chip", "aria-pressed": "true", onclick: (e) => { if (pick.has(t.table)) pick.delete(t.table); else pick.add(t.table); e.currentTarget.setAttribute("aria-pressed", String(pick.has(t.table))); go.disabled = !pick.size || !can("admin"); estimate(); } }, icon("table"), t.table))),
         sqliteOpts,
         sizeNote,

@@ -3,7 +3,7 @@
 You may have found this page through a user agent in your logs:
 
 ```text
-chloedb-crawl/0.3.2 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)
+chloedb-crawl/0.3.3 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)
 ```
 
 The number after the slash is the crawler's version. Before ChloeDB was renamed, the crawler was called strata-crawl, and its user agent began `strata-crawl/0.1.0`. It is the same crawler, and the robots.txt rules you wrote for `strata-crawl` still apply to it.
@@ -17,10 +17,10 @@ chloedb-crawl is open-source software (Apache-2.0, part of [ChloeDB](https://git
 A crawl can say whom to reach about it. That goes in the user agent after this page's address:
 
 ```text
-chloedb-crawl/0.3.2 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html; ops@example.com)
+chloedb-crawl/0.3.3 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html; ops@example.com)
 ```
 
-A crawl that sets a user agent of its own keeps the crawler's name after it (`AcmeBot/2.0 chloedb-crawl/0.3.2 (+...)`), so this page and your robots.txt rules for `chloedb-crawl` still apply.
+A crawl that sets a user agent of its own keeps the crawler's name after it (`AcmeBot/2.0 chloedb-crawl/0.3.3 (+...)`), so this page and your robots.txt rules for `chloedb-crawl` still apply.
 
 ## How it behaves
 

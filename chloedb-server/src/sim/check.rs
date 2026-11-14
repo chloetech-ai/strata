@@ -8,12 +8,18 @@ use super::copy::{Copy, Role};
 use super::db::{ModelDb, Txn};
 use super::Time;
 
-/// A write a primary answered as acknowledged.
+/// A write a primary answered as acknowledged: the transaction that holds
+/// it (`seq`), and the copy that answered (`by`), the primary of `term`
+/// then. A retry of a write held from an older term is answered by a
+/// primary of a newer one, once a majority holds the first transaction of
+/// its own term ([`crate::cores::shard::Primary::term_start`]): `term` can
+/// be newer than `seq.term`.
 #[derive(Clone, Copy, Debug)]
 pub struct Acked {
     pub write: u64,
     pub seq: SeqNo,
     pub by: usize,
+    pub term: u64,
     pub at: Time,
 }
 
@@ -73,9 +79,9 @@ impl History {
         }
     }
 
-    pub fn acknowledged(&mut self, write: u64, seq: SeqNo, by: usize, at: Time) {
+    pub fn acknowledged(&mut self, write: u64, seq: SeqNo, by: usize, term: u64, at: Time) {
         self.stats.acknowledged += 1;
-        self.acked.push(Acked { write, seq, by, at });
+        self.acked.push(Acked { write, seq, by, term, at });
     }
 
     /// Copy `i`'s history changed other than by growing.
@@ -84,11 +90,11 @@ impl History {
     }
 
     /// Whether copy `i` (its database `db`) holds every write acknowledged
-    /// before `before` as a transaction of a term older than `older_than`,
-    /// up to the first that is not; reports those it lacks as `what` does.
+    /// before `before` by a primary of a term older than `older_than`, up
+    /// to the first that is not; reports those it lacks as `what` does.
     fn holds_all(&mut self, i: usize, db: &ModelDb, before: Time, older_than: u64, what: &dyn Fn(&Acked) -> String) {
         while let Some(a) = self.acked.get(self.held[i]).copied() {
-            if a.at >= before || a.seq.term >= older_than {
+            if a.at >= before || a.term >= older_than {
                 break;
             }
             self.held[i] += 1;
@@ -100,10 +106,15 @@ impl History {
     }
 
     /// Copy `i` began term `term`, holding `db`, at `now`: no other copy
-    /// began it, and it holds every write acknowledged so far in an older
-    /// term. A copy can win a term after a newer one acknowledged writes,
-    /// when the votes it asked for come late: it serves none of them, as
-    /// its first call to a replica that knows the newer term ends it.
+    /// began it, and it holds every write acknowledged so far by a primary
+    /// of an older term, as Raft's leader holds every entry committed in
+    /// an older term. A copy can win a term after a newer one acknowledged
+    /// writes, when the votes it asked for come late: it serves none of
+    /// them, as its first call to a replica that knows the newer term ends
+    /// it. That holds of a write the newer primary acknowledged as a
+    /// transaction of a term older than the one won, a retry it held from
+    /// then (seed 624144435): what counts is the term of the primary that
+    /// answered, not the transaction's.
     pub fn began(&mut self, i: usize, term: u64, db: &ModelDb, now: Time) {
         self.stats.elections += 1;
         self.stats.began_at.push(now);
@@ -115,9 +126,10 @@ impl History {
         self.terms.insert(term, i);
         self.holds_all(i, db, now, term, &|a| {
             format!(
-                "write {} acknowledged by s{} as transaction {} of term {} at {} ms is not held by s{i}, elected the primary of term {term} at {} ms",
+                "write {} acknowledged by s{} (term {}) as transaction {} of term {} at {} ms is not held by s{i}, elected the primary of term {term} at {} ms",
                 a.write,
                 a.by,
+                a.term,
                 a.seq.seq,
                 a.seq.term,
                 a.at / 1000,

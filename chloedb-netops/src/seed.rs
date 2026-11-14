@@ -42,6 +42,13 @@ pub const RULES: &[(&str, &str, &str, &str, &str, f64, &str, &str, &str, i64, &s
      "SELECT m.service AS entity, AVG(m.latency_p95) / MAX(s.latency_slo_ms) * 100 AS v\nFROM netops_service_metrics m JOIN netops_services s ON m.service = s.id\nWHERE m.ts >= :since\nGROUP BY m.service\nHAVING AVG(m.latency_p95) / MAX(s.latency_slo_ms) > 1.0", ">", 100.0, "% of objective", "major", "service", 180, "rb-packet-loss"),
     ("udp-flood", "UDP amplification flood", "More than 3 Gb/s of UDP from amplification ports into one site",
      "SELECT dst_site AS entity, SUM(bytes) * 8 / 120.0 / 1000000000 AS v\nFROM netops_flows\nWHERE ts >= :since AND proto = 'udp' AND dst_site != 'scrubbing' AND dst_port IN (53, 123, 389, 1900, 11211)\nGROUP BY dst_site\nHAVING SUM(bytes) * 8 / 120.0 / 1000000000 > 3", ">", 3.0, "Gb/s", "critical", "site", 120, "rb-ddos"),
+    // The estate behind the backbone: what an outage there leaves without
+    // service is counted as the objects that hang from it (its edges), and
+    // a big one (20 or more behind it) is serious enough to open an incident.
+    ("estate-outage", "Outage in the estate", "An access node, a hub router or a hub's power plant is down and other objects depend on it; major from 20 objects behind it",
+     "SELECT n.id AS entity, COUNT(*) AS v, MAX(n.reason) AS detail,\n  CASE WHEN COUNT(*) >= 20 THEN 'major' ELSE 'minor' END AS severity\nFROM netops_estate_nodes n JOIN netops_estate_edges e ON e.src = n.id\nWHERE n.state = 'down' AND n.layer IN ('access', 'aggregation', 'power')\nGROUP BY n.id", ">=", 1.0, "behind it", "major", "estate", 0, "rb-estate-outage"),
+    ("estate-degraded", "Degraded in the estate", "An access node, a hub router or a hub's power plant is degraded and other objects depend on it",
+     "SELECT n.id AS entity, COUNT(*) AS v, MAX(n.reason) AS detail\nFROM netops_estate_nodes n JOIN netops_estate_edges e ON e.src = n.id\nWHERE n.state = 'degraded' AND n.layer IN ('access', 'aggregation', 'power')\nGROUP BY n.id", ">=", 1.0, "behind it", "minor", "estate", 0, "rb-estate-outage"),
     ("error-log-burst", "Burst of error logs", "Four or more log lines at error severity or worse from one device in three minutes",
      "SELECT device AS entity, COUNT(*) AS v\nFROM netops_syslog\nWHERE ts >= :since AND sev <= 3\nGROUP BY device\nHAVING COUNT(*) >= 4", ">=", 4.0, "lines", "minor", "device", 180, "rb-packet-loss"),
 ];
@@ -76,6 +83,8 @@ pub const RUNBOOKS: &[(&str, &str, &str, &[&str], &str)] = &[
      "Symptoms: a service's error rate or p95 latency breaches its objective with no device down.\n1. List the links on the service's path with loss above 0.1% or errors.\n2. Compare with changes executed in the last hour on those devices.\n3. Check the firewalls' session tables if the service is hosted.\n4. If one link stands out, drain it and follow the optic or congestion runbook."),
     ("rb-fw-sessions", "Firewall session table filling", "ddos", &["security", "firewall"],
      "Symptoms: session table above 80%, new connections dropped.\n1. Find the top destination by sessions; one address means an attack or a misbehaving client.\n2. Enable flood protection on the untrust zone for that destination.\n3. If volumetric, follow the DDoS runbook and divert upstream."),
+    ("rb-estate-outage", "An access node or a hub is down: who is behind it, and who goes", "estate", &["estate", "access", "field"],
+     "Symptoms: an OLT, a cell site, a business-park switch, a hub router or a hub's power plant reports down or degraded, and what hangs from it (ONTs, radios, customer routers, access nodes) is impacted.\n1. Open the object on the map: its reason says what it reported (loss of signal on a PON port, mains lost, an uplink optic, a change before it).\n2. Count what is behind it and which customers; a business park's customers are named on their routers.\n3. Look for a change on it or on what it hangs from in the hour before; roll it back if there is one.\n4. Power or fibre: dispatch field services to the site; tell the facilities desk for a hub's power.\n5. When it is back, check that what was behind it came back too before closing."),
     ("rb-customer-port", "Customer access port flapping", "generic", &["access", "customer"],
      "Symptoms: one access port on an aggregation router goes up and down.\n1. Check the customer's ticket history; CPE reboots are the usual cause.\n2. Look at light levels on the access optic.\n3. If flapping exceeds 10 times an hour, dampen the port and call the customer."),
 ];

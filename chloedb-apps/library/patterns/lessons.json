@@ -1,0 +1,200 @@
+{
+ "title": "A course's lessons with each learner's progress: how far they are, the next lesson to take, and the certificate at the end",
+ "about": "An online course, a training plan, an onboarding path: the lessons in order, each with its number, length and whether this person has done it; a bar of how many are done; the next lesson as the one main action ('Start lesson 3'); and, once all are done, the certificate. A lesson done is a row of the progress table (one per person and lesson; declare its access ALLOW ALL ON <progress> TO members WHERE <person column> = :user_id so each learner sees their own). Someone not signed in sees the lessons and is asked to sign in to keep their progress.",
+ "params": {
+  "table": {
+   "about": "the table of lessons",
+   "need": true
+  },
+  "progress": {
+   "about": "the table of lessons done: one row per person and lesson",
+   "need": true
+  },
+  "lesson": {
+   "about": "the progress column holding the lesson's id",
+   "default": "lesson"
+  },
+  "key": {
+   "about": "names the pattern's data",
+   "default": "{{table}}"
+  },
+  "title": {
+   "about": "a heading",
+   "default": "Your course"
+  },
+  "name": {
+   "about": "the lessons' title column",
+   "default": "title"
+  },
+  "text": {
+   "about": "a column with a line about each lesson"
+  },
+  "minutes": {
+   "about": "a column with each lesson's length in minutes"
+  },
+  "order": {
+   "about": "SQL ORDER BY for the lessons",
+   "default": "position"
+  },
+  "where": {
+   "about": "an SQL condition on the lessons (one course: course = :course)"
+  },
+  "params": {
+   "about": "values for :names in where, may be expressions such as \"=params.course\""
+  },
+  "open": {
+   "about": "the view that shows one lesson, opened with {id}"
+  },
+  "certificate": {
+   "about": "the view that shows the certificate, opened once every lesson is done"
+  },
+  "noun": {
+   "about": "what one lesson is called",
+   "default": "lesson"
+  }
+ },
+ "example": {
+  "use": "lessons",
+  "table": "lessons",
+  "progress": "completions",
+  "lesson": "lesson_id",
+  "name": "title",
+  "minutes": "minutes",
+  "order": "position",
+  "open": "lesson",
+  "certificate": "certificate"
+ },
+ "screen": {
+  "data": {
+   "{{key}}": {
+    "sql": "SELECT * FROM {{table}}{{where|pre: WHERE }} ORDER BY {{order}} LIMIT 200",
+    "params": "{{params}}"
+   },
+   "{{key}}_done": "=app.me() ? app.sql('SELECT {{lesson}} AS lesson FROM {{progress}} LIMIT 2000') : []"
+  },
+  "let": {
+   "{{key}}_ids": "=new Set(({{key}}_done || []).map(d => String(d.lesson)))",
+   "{{key}}_is": "=l => {{key}}_ids.has(String(l.id))",
+   "{{key}}_n": "={{key}}.filter(l => {{key}}_is(l)).length",
+   "{{key}}_next": "={{key}}.find(l => !{{key}}_is(l)) || null",
+   "{{key}}_num": "=l => {{key}}.indexOf(l) + 1",
+   "{{key}}_word": "={{noun|json}}.charAt(0).toUpperCase() + {{noun|json}}.slice(1)",
+   "{{key}}_go": "=l => {{open|json}} ? app.open({{open|json}}, {id: l.id}) : app.insert({{progress|json}}, {{{lesson}}: l.id})"
+  },
+  "body": [
+   {
+    "h": "{{title}}"
+   },
+   {
+    "if": "={{key}}.length > 0",
+    "then": [
+     {
+      "ui": "progressBar",
+      "props": {
+       "value": "={{key}}_n",
+       "max": "={{key}}.length",
+       "label": "=app.me() ? 'Your progress' : 'Sign in to keep your progress'",
+       "format": "=(v, m) => v + ' of ' + m + ' done'"
+      }
+     },
+     {
+      "if": "={{key}}_next",
+      "then": [
+       {
+        "card": [
+         {
+          "text": "=`Up next: ${{{key}}_word} ${{{key}}_num({{key}}_next)}`",
+          "muted": true,
+          "small": true
+         },
+         {
+          "h": "={{key}}_next.{{name}}",
+          "level": 3
+         },
+         {
+          "$when": "text",
+          "text": "={{key}}_next.{{text}} || ''",
+          "muted": true
+         },
+         {
+          "button": "=`Start {{noun}} ${{{key}}_num({{key}}_next)}`",
+          "class": "primary",
+          "do": "=() => {{key}}_go({{key}}_next)"
+         }
+        ]
+       }
+      ],
+      "else": [
+       {
+        "card": [
+         {
+          "h": "You finished every {{noun}}.",
+          "level": 3
+         },
+         {
+          "$when": "certificate",
+          "button": "See your certificate",
+          "class": "primary",
+          "do": "=() => app.open({{certificate|json}})"
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "each": "={{key}}",
+      "as": "l",
+      "class": "list",
+      "body": [
+       {
+        "row": [
+         {
+          "text": "={{key}}_num(l)",
+          "muted": true
+         },
+         {
+          "col": [
+           {
+            "text": "=l.{{name}}"
+           },
+           {
+            "$when": "minutes",
+            "text": "=l.{{minutes}} ? l.{{minutes}} + ' min' : ''",
+            "muted": true,
+            "small": true
+           }
+          ],
+          "class": "grow"
+         },
+         {
+          "if": "={{key}}_is(l)",
+          "then": [
+           {
+            "text": "Done",
+            "small": true,
+            "class": "badge"
+           }
+          ],
+          "else": [
+           {
+            "button": "={{key}}_is(l) ? 'Review' : 'Start'",
+            "class": "small",
+            "do": "=() => {{key}}_go(l)"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ],
+    "else": [
+     {
+      "text": "No {{noun}}s yet.",
+      "muted": true
+     }
+    ]
+   }
+  ]
+ }
+}

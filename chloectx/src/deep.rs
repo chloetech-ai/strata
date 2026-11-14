@@ -33,6 +33,10 @@ use crate::record::{entity_id, file_entity_id, Kind, Record, COLUMNS};
 use crate::store::{row_record, Filter, Reach, Store};
 use crate::Result;
 
+/// The longest the end of a turn waits for a search still running, whatever
+/// `stop_wait_secs` says.
+pub const STOP_WAIT_MAX_SECS: u64 = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeepConfig {
@@ -61,9 +65,13 @@ pub struct DeepConfig {
     pub min_records: u64,
     /// Not for prompts shorter than this many words.
     pub min_words: usize,
-    /// In `async` mode: how long the end of a turn waits for a search still
-    /// running, and whether it then asks the model to reconsider once when
-    /// it found something the turn did not see.
+    /// In `async` mode, opt-in (`stop_recheck`, off by default): at the end
+    /// of a turn whose search found records the turn did not see, ask the
+    /// model once to check its answer against them (Claude Code runs the
+    /// model again for that), waiting up to `stop_wait_secs` (at most
+    /// [`STOP_WAIT_MAX_SECS`]) for a search still running. Off, the end of
+    /// a turn never waits: what the search finds after the turn is offered
+    /// at the next prompt.
     pub stop_wait_secs: u64,
     pub stop_recheck: bool,
     /// `model`: a model writes the searches; `none`: only the request's own
@@ -88,8 +96,8 @@ impl Default for DeepConfig {
             max_picks: 8,
             min_records: 20,
             min_words: 4,
-            stop_wait_secs: 25,
-            stop_recheck: true,
+            stop_wait_secs: 2,
+            stop_recheck: false,
             planner: "model".into(),
             ranker: "model".into(),
         }
@@ -124,6 +132,17 @@ impl DeepConfig {
             c.ranker = m;
         }
         c
+    }
+
+    /// How long the end of a turn may wait for a running search: none
+    /// unless `stop_recheck` is on, and never more than
+    /// [`STOP_WAIT_MAX_SECS`] (CTX-1: a turn held 10 s for a search).
+    pub fn stop_wait(&self) -> std::time::Duration {
+        if self.mode == "async" && self.stop_recheck {
+            std::time::Duration::from_secs(self.stop_wait_secs.min(STOP_WAIT_MAX_SECS))
+        } else {
+            std::time::Duration::ZERO
+        }
     }
 
     pub fn automatic(&self) -> bool {
@@ -477,7 +496,7 @@ fn describe(r: &Record, terms: &HashSet<String>, now: i64, label: &str, max: usi
         }
     }
     let t = recall::snippet(&r.text, terms, max);
-    s += &format!("\n  {}", t.split_whitespace().collect::<Vec<_>>().join(" "));
+    s += &format!("\n  {}", crate::envelope::defuse(&t.split_whitespace().collect::<Vec<_>>().join(" ")));
     s
 }
 

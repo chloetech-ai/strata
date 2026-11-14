@@ -10,14 +10,24 @@
 //!
 //! - **Configured as rows.** Each connector is a row of
 //!   `chloedb_connectors` (name, kind, target, schedule, its config as
-//!   JSON), which the API writes and SQL reads and changes too; what each
-//!   run did is a row of `chloedb_connector_runs` (kept 30 days), and
-//!   each connector's cursor, counts and last error a row of
-//!   `chloedb_connector_state`. The tables are made with the first
-//!   connector. Secrets (passwords, tokens) are never in them: they are
-//!   kept in `<db>.connectors.json` beside the database, readable by the
-//!   server's user only (`--connector-secrets FILE`; a coordinator without
-//!   one keeps them in memory), or named as `env:VARIABLE`.
+//!   JSON), which the API writes and SQL reads; what each run did is a row
+//!   of `chloedb_connector_runs` (kept 30 days), and each connector's
+//!   cursor, counts and last error a row of `chloedb_connector_state`.
+//!   The tables are made with the first connector, and they are the
+//!   server's own: no key writes them but the connectors' own
+//!   ([`Connectors::may_write`]), so a config is changed by an admin
+//!   through `/v1/admin/connectors`, checked there, and checked again each
+//!   time the schedule reads it ([`Connector::check`]). Secrets
+//!   (passwords, tokens) are never in them: they are kept in
+//!   `<db>.connectors.json` beside the database, readable by the server's
+//!   user only (`--connector-secrets FILE`; a coordinator without one
+//!   keeps them in memory), or named as `env:VARIABLE`, a variable whose
+//!   name starts with the prefix the operator chose
+//!   (`CHLOEDB_CONNECTOR_SECRET_` by default, `--connector-env-prefix`).
+//! - **What it reaches.** The public internet only, unless its config
+//!   says `"allow_internal": true`, and never a link-local address (cloud
+//!   metadata); its credentials go to its configured origin only, and an
+//!   answer is read up to a cap ([`reach`], [`kinds`]).
 //! - **A key each.** A run writes through the server's own API (in the
 //!   process, as `/v1/mcp`'s tools do: [`Connectors::call`]) with a key
 //!   made for it, limited to writing its target table; the connectors'
@@ -38,6 +48,7 @@
 pub mod kinds;
 pub mod mail;
 pub mod map;
+pub mod reach;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -64,7 +75,7 @@ pub const RUNS: &str = "chloedb_connector_runs";
 pub const STATE: &str = "chloedb_connector_state";
 
 const SCHEMAS: &[(&str, &str)] = &[
-    (CONFIGS, "CREATE TABLE IF NOT EXISTS chloedb_connectors (id KEYWORD PRIMARY KEY, kind KEYWORD, target KEYWORD, enabled BOOL, every_s INT, config TEXT OPTIONS(indexed = false), push_key KEYWORD, note TEXT, created TIMESTAMP, updated TIMESTAMP)"),
+    (CONFIGS, "CREATE TABLE IF NOT EXISTS chloedb_connectors (id KEYWORD PRIMARY KEY, kind KEYWORD, target KEYWORD, enabled BOOL, every_s INT, config TEXT OPTIONS(indexed = false), push_key KEYWORD, note TEXT, created TIMESTAMP, updated TIMESTAMP, updated_by KEYWORD)"),
     (RUNS, "CREATE TABLE IF NOT EXISTS chloedb_connector_runs (id KEYWORD PRIMARY KEY, connector KEYWORD, kind KEYWORD, target KEYWORD, trigger KEYWORD, started TIMESTAMP, ended TIMESTAMP, took_ms INT, ok BOOL, records INT, rows_ INT, skipped INT, dropped KEYWORD[], error TEXT, cursor TEXT OPTIONS(indexed = false), more BOOL) OPTIONS(retain = '30 days', retain_by = 'started')"),
     (STATE, "CREATE TABLE IF NOT EXISTS chloedb_connector_state (id KEYWORD PRIMARY KEY, cursor TEXT OPTIONS(indexed = false), last_run TIMESTAMP, last_ok TIMESTAMP, last_error TEXT, failures INT, runs INT, records_total INT, rows_total INT, last_rows INT, more BOOL)"),
 ];
@@ -93,6 +104,71 @@ fn batches(rows: &[Map<String, Json>]) -> Vec<&[Map<String, Json>]> {
 
 /// The most records one run reads.
 const RUN_LIMIT: usize = 20_000;
+/// The most bytes of a push's body ([`push`]): smaller than an import's.
+pub const PUSH_BODY_MAX: usize = 32 << 20;
+/// The words a push of too many records is refused with (413).
+const TOO_MANY: &str = "a push takes";
+/// The prefix an `env:` secret's variable has unless the operator chose
+/// another (`--connector-env-prefix`).
+pub const ENV_PREFIX: &str = "CHLOEDB_CONNECTOR_SECRET_";
+
+tokio::task_local! {
+    /// Whether the request being served is the connectors' own, made in
+    /// this process ([`Connectors::own_sql`], [`Connectors::own_write`]):
+    /// the routes run in the task that makes it, so no request from
+    /// outside is in it.
+    static OWN_WRITE: bool;
+}
+
+/// Refuses (403) a change of `table` past the connectors' API, unless it
+/// is not one of the connectors' own tables (`chloedb_connector*`), or the
+/// request is the connectors' own ([`OWN_WRITE`]) or the server's root
+/// credential's ([`crate::service::own`]: a coordinator's call to its
+/// shards, the operator's token). Every key is refused, an admin's too: a
+/// config is changed through `/v1/admin/connectors`, which checks it
+/// ([`spec`]), keeps its secrets out of it and writes down who changed it,
+/// where a row a key could write would pick the URL a connector sends its
+/// credentials to and the table its run's key writes (audit 4, X-N1).
+/// Checked on every write ([`crate::service::Service::write_ops`]) and
+/// every statement ([`crate::service::Service::sql_in`]).
+pub fn may_change(table: &str, what: &str) -> Result<(), ApiError> {
+    if !own_table(table) || crate::service::own() || OWN_WRITE.try_with(|o| *o).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(ApiError {
+        code: Some("server_owned"),
+        status: 403,
+        message: format!("{what} of {table} is refused: it is one of the connectors' own tables, which only the server writes; change a connector with POST /v1/admin/connectors/NAME and delete one with DELETE /v1/admin/connectors/NAME (an admin's)"),
+    })
+}
+
+/// [`may_change`] for each of write operations `ops`, `default` naming
+/// the table of one that names none.
+pub fn may_write_ops(ops: &[Json], default: impl Fn() -> Option<String>) -> Result<(), ApiError> {
+    if crate::service::own() || OWN_WRITE.try_with(|o| *o).unwrap_or(false) {
+        return Ok(());
+    }
+    let mut default_checked = false;
+    for op in ops {
+        match op["table"].as_str() {
+            Some(t) => may_change(t, "a write")?,
+            None if !default_checked => {
+                default_checked = true;
+                if let Some(t) = default() {
+                    may_change(&t, "a write")?;
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether `table` is one of the connectors' own tables
+/// (`chloedb_connector*`), which only the server writes.
+pub fn own_table(table: &str) -> bool {
+    table.len() >= 17 && table[..17].eq_ignore_ascii_case("chloedb_connector")
+}
 /// Operations in one write.
 const BATCH: usize = 500;
 
@@ -111,6 +187,13 @@ pub struct Connector {
     pub note: String,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// Who changed it last (a key's name, or "token").
+    pub updated_by: String,
+    /// Why the row cannot run, when it fails [`Connector::check`] (a row
+    /// written past the API): it is shown, and neither pulled nor pushed
+    /// to, until an admin changes or deletes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid: Option<String>,
 }
 
 impl Connector {
@@ -128,7 +211,43 @@ impl Connector {
             note: r["note"].as_str().unwrap_or_default().to_string(),
             created_ms: ms("created"),
             updated_ms: ms("updated"),
+            updated_by: r["updated_by"].as_str().unwrap_or_default().to_string(),
+            invalid: None,
         })
+        .map(|mut c| {
+            c.invalid = c.check().err();
+            c
+        })
+    }
+
+    /// What a connector must be to run, checked when the API is given one
+    /// ([`spec`]) and again on every row the schedule, a run or a push
+    /// reads: a name, a kind, a target that is a table's name (no grant
+    /// pattern, not the connectors' own), a schedule of 10 s or more, a
+    /// config of 64 KiB at most whose map compiles.
+    pub fn check(&self) -> Result<(), String> {
+        if !name_ok(&self.name) {
+            return Err(format!("{:?} is not a connector's name: 1 to 48 lowercase letters, digits, - and _", self.name));
+        }
+        let k = kinds::kind(&self.kind).ok_or_else(|| format!("{:?} is not a kind of connector: {}", self.kind, kinds::KINDS.iter().map(|k| k.name).collect::<Vec<_>>().join(", ")))?;
+        if !table_ok(&self.target) || own_table(&self.target) {
+            return Err(format!("{:?} is not a table a connector may write: letters, digits and _, and not the connectors' own", self.target));
+        }
+        if k.pull && self.every_s > 0 && self.every_s < 10 {
+            return Err("every_s is 10 seconds at least (or 0, run by hand only)".into());
+        }
+        if !self.config.is_object() {
+            return Err("config is an object".into());
+        }
+        if self.config.to_string().len() > 64 << 10 {
+            return Err("a connector's config is 64 KiB at most".into());
+        }
+        if let Some(Json::Object(m)) = self.config.get("map") {
+            for (col, spec) in m {
+                map::eval(&json!({}), spec, 0).map_err(|e| format!("map column {col}: {e}"))?;
+            }
+        }
+        kinds::check_config(self)
     }
 
     fn row(&self) -> Json {
@@ -136,6 +255,7 @@ impl Connector {
             "id": self.name, "kind": self.kind, "target": self.target, "enabled": self.enabled, "every_s": self.every_s,
             "config": self.config.to_string(), "push_key": self.push_key.clone().unwrap_or_default(), "note": self.note,
             "created": chloedb::timestamp::format(self.created_ms as i64 * 1000), "updated": chloedb::timestamp::format(self.updated_ms as i64 * 1000),
+            "updated_by": self.updated_by,
         })
     }
 
@@ -240,8 +360,14 @@ pub struct Connectors {
     secrets: Mutex<Secrets>,
     /// The key the connectors' own tables are written with.
     own_key: Mutex<Option<String>>,
+    /// The prefix of the variables `env:` secrets may name (none set:
+    /// [`ENV_PREFIX`]).
+    env_prefix: OnceLock<String>,
     wake: tokio::sync::Notify,
+    /// The clients of connectors that reach the public internet only, and
+    /// of those that may reach this network too ([`reach`]).
     http: OnceLock<reqwest::Client>,
+    http_internal: OnceLock<reqwest::Client>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -288,16 +414,48 @@ impl Connectors {
         p.into()
     }
 
-    fn http(&self) -> &reqwest::Client {
-        self.http.get_or_init(|| crate::http_client().connect_timeout(Duration::from_secs(10)).user_agent(concat!("chloedb-connectors/", env!("CARGO_PKG_VERSION"))).build().unwrap_or_default())
+    /// The client of connector `c`, by what it may reach ([`reach`]).
+    fn http(&self, c: &Connector) -> &reqwest::Client {
+        match kinds::internal(c) {
+            false => self.http.get_or_init(|| reach::Reach::new(false).client()),
+            true => self.http_internal.get_or_init(|| reach::Reach::new(true).client()),
+        }
     }
+
+    /// Sets the prefix of the variables `env:` secrets may name
+    /// (`--connector-env-prefix`): not empty, since an empty one would let
+    /// a connector read the server's every variable, its tokens included.
+    pub fn set_env_prefix(&self, prefix: &str) -> Result<(), String> {
+        if prefix.len() < 4 || !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("--connector-env-prefix {prefix:?}: four or more letters, digits and _ (default {ENV_PREFIX})"));
+        }
+        self.env_prefix.set(prefix.to_string()).map_err(|_| "the connectors' env prefix is set once".to_string())
+    }
+
+    /// The prefix of the variables `env:` secrets may name.
+    pub fn env_prefix(&self) -> &str {
+        self.env_prefix.get().map_or(ENV_PREFIX, String::as_str)
+    }
+
+    /// The value of the secret `env:VAR`, when `VAR` has the prefix; why
+    /// not, else.
+    fn env_secret(&self, var: &str) -> Result<Option<String>, String> {
+        let prefix = self.env_prefix();
+        if !var.starts_with(prefix) || var.len() == prefix.len() {
+            return Err(format!("env:{var} is not a variable a connector may read: its name starts with {prefix} (the server's --connector-env-prefix), so that a connector reads no token, key or credential of the server's own"));
+        }
+        Ok(std::env::var(var).ok())
+    }
+
 
     /// The names of `connector`'s secrets (never their values).
     fn secret_names(&self, connector: &str) -> Vec<String> {
         lock(&self.secrets).map.get(connector).map(|m| m.keys().cloned().collect()).unwrap_or_default()
     }
 
-    /// `connector`'s secrets, `env:NAME` ones read from the environment.
+    /// `connector`'s secrets, `env:NAME` ones read from the environment
+    /// (only those whose variable has the prefix: one kept from before the
+    /// prefix is left out, and the log says why).
     fn secrets_of(&self, connector: &str) -> HashMap<String, String> {
         let s = lock(&self.secrets);
         s.map
@@ -305,7 +463,13 @@ impl Connectors {
             .map(|m| {
                 m.iter()
                     .filter_map(|(k, v)| match v.strip_prefix("env:") {
-                        Some(var) => std::env::var(var).ok().map(|x| (k.clone(), x)),
+                        Some(var) => match self.env_secret(var) {
+                            Ok(x) => x.map(|x| (k.clone(), x)),
+                            Err(why) => {
+                                tracing::warn!(connector, secret = %k, "{why}");
+                                None
+                            }
+                        },
                         None => Some((k.clone(), v.clone())),
                     })
                     .collect()
@@ -327,6 +491,9 @@ impl Connectors {
                     entry.remove(k);
                 }
                 Json::String(x) if !x.is_empty() => {
+                    if let Some(var) = x.strip_prefix("env:") {
+                        self.env_secret(var).map_err(bad)?;
+                    }
                     entry.insert(k.clone(), x.clone());
                 }
                 _ => return Err(bad(format!("secret {k} is text (or null to take it out)"))),
@@ -399,12 +566,12 @@ impl Connectors {
 
     async fn own_sql(&self, svc: &Service, sql: &str, params: Json) -> Result<Json, String> {
         let k = self.own(svc)?;
-        self.call(Some(&k), Method::POST, "/v1/sql", Some(json!({"sql": sql, "params": params, "objects": true}))).await
+        OWN_WRITE.scope(true, self.call(Some(&k), Method::POST, "/v1/sql", Some(json!({"sql": sql, "params": params, "objects": true})))).await
     }
 
     async fn own_write(&self, svc: &Service, ops: Vec<Json>) -> Result<Json, String> {
         let k = self.own(svc)?;
-        self.call(Some(&k), Method::POST, "/v1/write", Some(json!({ "ops": ops }))).await
+        OWN_WRITE.scope(true, self.call(Some(&k), Method::POST, "/v1/write", Some(json!({ "ops": ops })))).await
     }
 
     /// Makes the connectors' tables, once.
@@ -416,6 +583,13 @@ impl Connectors {
         for (t, ddl) in SCHEMAS {
             if !have.iter().any(|h| h.eq_ignore_ascii_case(t)) {
                 self.own_sql(svc, ddl, json!({})).await.map_err(|e| format!("making {t}: {e}"))?;
+            }
+        }
+        // Who changed a config last: a column the tables of 0.3.3 and
+        // before lack.
+        if let Ok(s) = svc.table(CONFIGS).await {
+            if !s.fields.iter().any(|f| f.name == "updated_by") {
+                self.own_sql(svc, &format!("ALTER TABLE {CONFIGS} ADD COLUMN updated_by KEYWORD"), json!({})).await.map_err(|e| format!("adding updated_by to {CONFIGS}: {e}"))?;
             }
         }
         self.tables_made.store(true, Ordering::SeqCst);
@@ -505,7 +679,8 @@ impl Connectors {
         }
         let Ok(list) = self.list(svc, false).await else { return };
         let now = now_ms();
-        for c in list.into_iter().filter(|c| c.enabled && c.pulls()) {
+        // A row that fails the API's checks (written past it) never runs.
+        for c in list.into_iter().filter(|c| c.enabled && c.pulls() && c.invalid.is_none()) {
             let st = self.state_of(&c.name);
             let wait_s = if st.more {
                 0
@@ -537,10 +712,16 @@ impl Connectors {
         let st = self.state_of(&c.name);
         let secrets = self.secrets_of(&c.name);
         let now_us = started_ms as i64 * 1000;
-        let ctx = kinds::Ctx { c, cursor: st.cursor.clone(), secrets: &secrets, http: self.http(), now_us, limit: RUN_LIMIT };
-        let fetched = match push {
-            Some((body, ty, _)) => kinds::push(&ctx, body, ty).await.map(|records| kinds::Fetched { records, ..Default::default() }),
-            None => kinds::pull(&ctx).await,
+        let reach = kinds::reach_of(c);
+        let ctx = kinds::Ctx { c, cursor: st.cursor.clone(), secrets: &secrets, http: self.http(c), reach: &reach, now_us, limit: RUN_LIMIT, max_bytes: kinds::max_bytes(c) };
+        // Checked again here: the row may have been written past the API.
+        let fetched = match (c.check(), push) {
+            (Err(why), _) => Err(format!("connector {} does not run: {why} (change it with POST /v1/admin/connectors/{}, or delete it)", c.name, c.name)),
+            (Ok(()), Some((body, ty, _))) => kinds::push(&ctx, body, ty).await.and_then(|records| match records.len() > RUN_LIMIT {
+                true => Err(format!("{TOO_MANY} {RUN_LIMIT} records at most, and this one has {}: send it in parts", records.len())),
+                false => Ok(kinds::Fetched { records, ..Default::default() }),
+            }),
+            (Ok(()), None) => kinds::pull(&ctx).await,
         };
         let mut report = json!({"connector": c.name, "kind": c.kind, "target": c.target, "trigger": trigger.name(), "started_ms": started_ms});
         let outcome: Result<(usize, usize, usize, Vec<String>, Option<String>, bool), String> = async {
@@ -552,6 +733,10 @@ impl Connectors {
                 Some((_, _, k)) => k,
                 None => {
                     let name = format!("connector-run:{}", c.name);
+                    // One table by its name: never a pattern (`*`, `x*`).
+                    if !table_ok(&c.target) || own_table(&c.target) {
+                        return Err(format!("{:?} is not a table a connector may write", c.target));
+                    }
                     let grants = vec![Grant::new(&c.target, Scope::Write).map_err(|e| e.message)?];
                     key_owned = Self::bearer(&svc.keys.ephemeral_key(&name, format!("made by this server for a run of connector {}", c.name), grants).map_err(|e| e.message)?);
                     Some(&key_owned)
@@ -575,11 +760,12 @@ impl Connectors {
                 svc.keys.end_ephemeral(&format!("connector-run:{}", c.name));
             }
             if let Some(e) = &first_err {
-                report["first_skip"] = json!(e);
+                report["first_skip"] = json!(kinds::redact(e, &secrets));
             }
             Ok((records, n, skipped, dropped, f.cursor, f.more))
         }
-        .await;
+        .await
+        .map_err(|e| kinds::redact(&e, &secrets));
         let took_ms = t0.elapsed().as_millis() as u64;
         let mut st = self.state_of(&c.name);
         st.runs += 1;
@@ -598,8 +784,9 @@ impl Connectors {
                 st.rows_total += *rows as u64;
                 st.last_rows = *rows as u64;
                 st.more = *more;
+                // None keeps the last; an empty one clears it.
                 if let Some(cur) = cursor {
-                    st.cursor = Some(cur.clone());
+                    st.cursor = Some(cur.clone()).filter(|c| !c.is_empty());
                 }
                 (true, None)
             }
@@ -659,6 +846,9 @@ impl Connectors {
 
     /// A connector's health ([`self`]).
     fn health(&self, c: &Connector, st: &State) -> &'static str {
+        if c.invalid.is_some() {
+            return "invalid";
+        }
         if !c.enabled {
             return "disabled";
         }
@@ -686,7 +876,7 @@ impl Connectors {
         let next_ms = (c.enabled && c.pulls()).then(|| if st.last_run_ms == 0 { now_ms() } else { st.last_run_ms + c.every_s * 1000 });
         json!({
             "name": c.name, "kind": c.kind, "target": c.target, "enabled": c.enabled, "every_s": c.every_s, "config": c.config,
-            "note": c.note, "created_ms": c.created_ms, "updated_ms": c.updated_ms, "pulls": c.pulls(), "pushed": c.pushed(),
+            "note": c.note, "created_ms": c.created_ms, "updated_ms": c.updated_ms, "updated_by": c.updated_by, "invalid": c.invalid, "pulls": c.pulls(), "pushed": c.pushed(),
             "push": c.pushed().then(|| json!({"url": format!("/v1/connectors/{}/push", c.name), "key_id": c.push_key})),
             "secrets": self.secret_names(&c.name), "health": health, "state": st, "next_ms": next_ms,
         })
@@ -707,7 +897,7 @@ fn kinds_json() -> Json {
         kinds::KINDS
             .iter()
             .map(|k| {
-                let c = Connector { name: String::new(), kind: k.name.into(), target: String::new(), enabled: true, every_s: 0, config: json!({}), push_key: None, note: String::new(), created_ms: 0, updated_ms: 0 };
+                let c = Connector { name: String::new(), kind: k.name.into(), target: String::new(), enabled: true, every_s: 0, config: json!({}), push_key: None, note: String::new(), created_ms: 0, updated_ms: 0, updated_by: String::new(), invalid: None };
                 json!({"kind": k.name, "title": k.title, "about": k.about, "pull": k.pull, "push": k.push, "target": kinds::default_target(&c), "every_s": default_every(k.name), "settings": k.settings.iter().map(|(n, w)| json!({"name": n, "about": w})).collect::<Vec<_>>(), "secrets": k.secrets})
             })
             .collect(),
@@ -797,14 +987,6 @@ fn spec(b: &Json, old: Option<&Connector>) -> Result<Connector, ApiError> {
         (Json::Null, None) => json!({}),
         _ => return Err(bad("config is an object")),
     };
-    if config.to_string().len() > 64 << 10 {
-        return Err(bad("a connector's config is 64 KiB at most"));
-    }
-    if let Some(Json::Object(m)) = config.get("map") {
-        for (col, spec) in m {
-            map::eval(&json!({}), spec, 0).map_err(|e| bad(format!("map column {col}: {e}")))?;
-        }
-    }
     let mut c = Connector {
         name,
         kind: kind.clone(),
@@ -816,26 +998,24 @@ fn spec(b: &Json, old: Option<&Connector>) -> Result<Connector, ApiError> {
         note: b["note"].as_str().map(str::to_string).or(old.map(|o| o.note.clone())).unwrap_or_default(),
         created_ms: old.map_or(now_ms(), |o| o.created_ms),
         updated_ms: now_ms(),
+        updated_by: old.map(|o| o.updated_by.clone()).unwrap_or_default(),
+        invalid: None,
     };
     c.target = match (b["target"].as_str().map(str::trim).filter(|t| !t.is_empty()), old) {
         (Some(t), _) => t.to_ascii_lowercase(),
         (None, Some(o)) => o.target.clone(),
         (None, None) => kinds::default_target(&c),
     };
-    if !table_ok(&c.target) || c.target.starts_with("chloedb_connector") {
-        return Err(bad(format!("{:?} is not a table a connector may write: letters, digits and _, and not the connectors' own", c.target)));
-    }
-    if k.pull && c.every_s > 0 && c.every_s < 10 {
-        return Err(bad("every_s is 10 seconds at least (or 0, run by hand only)"));
-    }
     if !k.pull {
         c.every_s = 0;
     }
+    c.check().map_err(bad)?;
     Ok(c)
 }
 
-/// Makes `c`'s target with its kind's default table when it has none,
-/// with the caller's credential.
+/// Makes `c`'s target when it has none, with the caller's credential: with
+/// the columns of its own map ([`kinds::map_schema`]) when it has one and
+/// writes a table of its choosing, else with its kind's default table.
 async fn make_target(svc: &Arc<Service>, c: &Connector, caller: &Caller) -> Result<bool, ApiError> {
     if svc.table(&c.target).await.is_ok() {
         return Ok(false);
@@ -843,7 +1023,11 @@ async fn make_target(svc: &Arc<Service>, c: &Connector, caller: &Caller) -> Resu
     if c.target != kinds::default_target(c) && c.config["create_target"] != true {
         return Err(ApiError { code: None, status: 404, message: format!("there is no table {}: make it first, or write the kind's own table ({}), or pass \"create_target\": true in config to make {} with that table's columns", c.target, kinds::default_target(c), c.target) });
     }
-    let ddl = kinds::default_schema(&c.kind, &c.target);
+    // Its own map's columns, else its kind's table.
+    let ddl = match &c.config["map"] {
+        Json::Object(m) if !m.is_empty() => kinds::map_schema(m, &c.target).map_err(bad)?,
+        _ => kinds::default_schema(&c.kind, &c.target),
+    };
     svc.connectors.call(caller.auth.as_ref(), Method::POST, "/v1/sql", Some(json!({ "sql": ddl }))).await.map_err(|e| ApiError { code: None, status: 400, message: format!("making {}: {e}", c.target) })?;
     Ok(true)
 }
@@ -858,7 +1042,7 @@ fn push_key(svc: &Service, c: &mut Connector, caller: &Caller) -> Result<String,
         return Err("the server is open (no token and no key): a push needs no key".into());
     }
     let grants = vec![Grant::new(&c.target, Scope::Write).map_err(|e| e.message)?];
-    let name = format!("connector:{}", c.name);
+    let name = format!("{}{}", crate::keys::PUSH_KEY_PREFIX, c.name);
     // A key of that name left by a connector of that name deleted by SQL.
     for k in svc.keys.set().keys {
         if k.name == name {
@@ -875,6 +1059,7 @@ fn push_key(svc: &Service, c: &mut Connector, caller: &Caller) -> Result<String,
 pub async fn create(svc: &Arc<Service>, caller: &Caller, b: &Json) -> Result<Json, ApiError> {
     let me = &svc.connectors;
     let mut c = spec(b, None)?;
+    c.updated_by = caller.who.clone();
     me.make_tables(svc).await.map_err(ApiError::internal)?;
     if me.list(svc, true).await.map_err(ApiError::internal)?.iter().any(|x| x.name == c.name) {
         return Err(ApiError { code: None, status: 409, message: format!("a connector named {} exists: POST /v1/admin/connectors/{} changes it", c.name, c.name) });
@@ -905,6 +1090,8 @@ pub async fn update(svc: &Arc<Service>, caller: &Caller, name: &str, b: &Json) -
     let me = &svc.connectors;
     let old = me.find(svc, name).await?;
     let mut c = spec(b, Some(&old))?;
+    c.updated_by = caller.who.clone();
+    me.make_tables(svc).await.map_err(ApiError::internal)?;
     make_target(svc, &c, caller).await?;
     if let Some(s) = b.get("secrets").filter(|s| !s.is_null()) {
         me.set_secrets(&c.name, s)?;
@@ -946,6 +1133,7 @@ pub async fn rotate(svc: &Arc<Service>, caller: &Caller, name: &str) -> Result<J
     if !c.pushed() {
         return Err(bad(format!("a {} connector is not pushed to, so it has no push key", c.kind)));
     }
+    me.make_tables(svc).await.map_err(ApiError::internal)?;
     let secret = push_key(svc, &mut c, caller).map_err(|e| ApiError { code: None, status: 409, message: e })?;
     me.own_write(svc, vec![json!({"op": "upsert", "table": CONFIGS, "doc": c.row()})]).await.map_err(ApiError::internal)?;
     me.forget_cache();
@@ -956,6 +1144,9 @@ pub async fn rotate(svc: &Arc<Service>, caller: &Caller, name: &str) -> Result<J
 pub async fn run_now(svc: &Arc<Service>, name: &str) -> Result<Json, ApiError> {
     let me = &svc.connectors;
     let c = me.find(svc, name).await?;
+    if let Some(why) = &c.invalid {
+        return Err(ApiError { code: None, status: 409, message: format!("connector {name} does not run: {why} (change it with POST /v1/admin/connectors/{name}, or delete it)") });
+    }
     if !kinds::kind(&c.kind).is_some_and(|k| k.pull) {
         return Err(bad(format!("a {} connector is not pulled: systems push to it (POST /v1/connectors/{}/push)", c.kind, c.name)));
     }
@@ -987,13 +1178,19 @@ pub async fn test(svc: &Arc<Service>, b: &Json) -> Result<Json, ApiError> {
     if let Some(Json::Object(given)) = b.get("secrets") {
         for (k, v) in given {
             if let Some(v) = v.as_str() {
-                secrets.insert(k.clone(), v.strip_prefix("env:").and_then(|e| std::env::var(e).ok()).unwrap_or_else(|| v.to_string()));
+                // A dry run keeps nothing and is not audited as a change:
+                // it is given values, and reads none of the server's.
+                if v.starts_with("env:") {
+                    return Err(bad(format!("secret {k}: a dry run takes a secret's value, not env:VARIABLE (a saved connector reads its env: secrets)")));
+                }
+                secrets.insert(k.clone(), v.to_string());
             }
         }
     }
     let now_us = now_ms() as i64 * 1000;
     let cursor = saved.as_ref().and_then(|s| me.state_of(&s.name).cursor);
-    let ctx = kinds::Ctx { c: &c, cursor, secrets: &secrets, http: me.http(), now_us, limit: 200 };
+    let reach = kinds::reach_of(&c);
+    let ctx = kinds::Ctx { c: &c, cursor, secrets: &secrets, http: me.http(&c), reach: &reach, now_us, limit: 200, max_bytes: kinds::max_bytes(&c) };
     let t0 = std::time::Instant::now();
     let fetched = match b.get("sample").filter(|s| !s.is_null()) {
         Some(Json::String(raw)) => kinds::push(&ctx, raw.as_bytes(), if c.kind == "mail" { "message/rfc822" } else { "application/json" }).await.map(|records| kinds::Fetched { records, ..Default::default() }),
@@ -1040,6 +1237,9 @@ pub async fn push(svc: &Arc<Service>, name: &str, auth: Option<&HeaderValue>, co
     if !c.pushed() {
         return Err(bad(format!("a {} connector is not pushed to: it pulls on its schedule", c.kind)));
     }
+    if let Some(why) = &c.invalid {
+        return Err(ApiError { code: None, status: 409, message: format!("connector {name} takes no push: {why}") });
+    }
     if !c.enabled {
         return Err(ApiError { code: None, status: 409, message: format!("connector {name} is disabled") });
     }
@@ -1047,7 +1247,9 @@ pub async fn push(svc: &Arc<Service>, name: &str, auth: Option<&HeaderValue>, co
     match r["error"].as_str() {
         None => Ok(r),
         Some(e) => {
-            let status = if e.contains("403:") {
+            let status = if e.starts_with(TOO_MANY) {
+                413
+            } else if e.contains("403:") {
                 403
             } else if e.contains("401:") {
                 401

@@ -358,6 +358,54 @@ fn beside(db: &Path, what: &str) -> PathBuf {
     db.with_file_name(format!(".{name}.{what}-{}", new_id()))
 }
 
+/// Removes the copies of the database at `db` that a transfer left beside
+/// it ([`beside`]: a primary's `.<name>.copy-<id>`, the checkpoint it
+/// writes first, `..<name>.copy-<id>.checkpoint-<id>`, and a replica's
+/// `.<name>.restore-<id>`, each with its log and readers' folder) when its
+/// server was killed during it: [`Removed`] runs only when the transfer
+/// ends. A copy is the whole database, so a server that was stopped during
+/// a few of them kept several times its data on its volume, which nothing
+/// showed or removed (LIV-7). Called once the database is open (its
+/// writer's lock taken), when no transfer runs. Answers the files removed
+/// and their bytes.
+pub fn sweep_copies(db: &Path) -> (usize, u64) {
+    let Some(name) = db.file_name().map(|n| n.to_string_lossy().into_owned()) else { return (0, 0) };
+    let dir = db.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+    let ours = |f: &str| [format!(".{name}.copy-"), format!(".{name}.restore-"), format!("..{name}.copy-")].iter().any(|p| f.starts_with(p.as_str()));
+    let (mut n, mut bytes) = (0, 0u64);
+    for e in entries.flatten() {
+        let f = e.file_name().to_string_lossy().into_owned();
+        if !ours(&f) {
+            continue;
+        }
+        let p = e.path();
+        let size = |p: &Path| -> u64 {
+            fn walk(p: &Path) -> u64 {
+                match std::fs::symlink_metadata(p) {
+                    Ok(m) if m.is_dir() => std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| walk(&e.path())).sum(),
+                    Ok(m) => m.len(),
+                    Err(_) => 0,
+                }
+            }
+            walk(p)
+        };
+        let len = size(&p);
+        let r = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        match r {
+            Ok(()) => {
+                n += 1;
+                bytes += len;
+            }
+            Err(e) => tracing::warn!(path = %p.display(), error = %e, "could not remove a copy of the database a transfer left"),
+        }
+    }
+    if n > 0 {
+        tracing::warn!(db = %db.display(), files = n, bytes, "removed copies of the database that transfers left when the server was stopped during them");
+    }
+    (n, bytes)
+}
+
 /// Removes the copy at its path, and its log, when dropped.
 struct Removed(PathBuf);
 
@@ -826,7 +874,7 @@ impl Primary {
                 let count = |a: Option<&AtomicU64>| a.map_or(0, |a| a.load(Ordering::Relaxed));
                 let mut j = json!({
                     "url": p.url, "seq_no": p.acked, "behind": last.saturating_sub(p.acked), "in_sync": p.in_sync,
-                    "copying": p.copying, "copies": p.copies,
+                    "copying": p.copying, "copies": p.copies, "answered": p.answered.is_some(),
                     "verifications": count(f.map(|f| &f.verifications)), "divergences": count(f.map(|f| &f.divergences)),
                     "verify_failures": count(f.map(|f| &f.verify_failures)), "member": p.member, "txn_mismatches": p.mismatches,
                 });
@@ -1756,5 +1804,34 @@ impl Follow {
             Family::one("chloedb_replica_digests_total", "counter", "Digests of its rows this replica computed for its primary to compare (Verify).", self.digests.load(Ordering::Relaxed) as f64),
             Family::one("chloedb_replica_txn_mismatches_total", "counter", "Calls of its primary this replica refused for holding another transaction under the term and number they follow (it is then sent a copy of the primary).", mismatches as f64),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LIV-7: a server stopped during a transfer left its copy of the
+    /// database beside it, and the next start kept it: a replica held five
+    /// times its data. The next start removes those, and nothing else.
+    #[test]
+    fn a_start_removes_the_copies_transfers_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.strata");
+        let write = |name: &str, n: usize| std::fs::write(dir.path().join(name), vec![7u8; n]).unwrap();
+        write("db.strata", 10);
+        write("db.strata-wal", 10);
+        write(".db.strata.restore-00ab", 1000);
+        write(".db.strata.restore-00ab-wal", 10);
+        write(".db.strata.copy-00cd", 500);
+        write("..db.strata.copy-00cd.checkpoint-0001", 300);
+        write(".other.strata.copy-00ef", 50);
+        std::fs::create_dir(dir.path().join(".db.strata.restore-00ab-readers")).unwrap();
+        write(".db.strata.restore-00ab-readers/WRITER", 5);
+        assert_eq!(sweep_copies(&db), (5, 1815));
+        let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [".other.strata.copy-00ef", "db.strata", "db.strata-wal"]);
+        assert_eq!(sweep_copies(&db), (0, 0));
     }
 }

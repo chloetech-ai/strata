@@ -1,6 +1,6 @@
 {
   "name": "chloedb",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "ChloeDB from JavaScript: a search database with SQL, opened in-process from its file (Node, Bun, Deno) or over HTTP from any runtime with fetch",
   "license": "Apache-2.0",
   "private": true,

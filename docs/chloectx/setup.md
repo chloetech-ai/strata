@@ -16,6 +16,10 @@ Python 3 is only needed for the scripted demo and the evaluation harnesses, not 
 
 The CLI login matters more than it looks. The distiller runs `claude -p` in the background, so an expired CLI login breaks it even while interactive sessions (or the desktop app) keep working. Recording and recall still work in that state, but nothing new is written down. `chloectx doctor` checks for it.
 
+ChloeCtx makes model calls of its own, through `claude -p` with a small model (`haiku` by default), billed to the CLI's login: one after each turn to write down decisions and rules (about $0.001), and, once a project's store holds 20 records, two more after each prompt of four words or more, in the background, to search memory for it ([query understanding](index.md#query-understanding), about $0.001 a prompt). Neither holds up a turn: what the search finds comes with the turn's next tool result, or at the next prompt. `CHLOECTX_DISTILL=0` turns the first off, `CHLOECTX_DEEP=off` (or `tool`, only when the model asks) the second.
+
+The daemon that makes these calls finds the `claude` CLI where Claude Code's hooks found it, on its own `PATH`, or in the usual install places (`~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin`, `/usr/local/bin`); `CHLOECTX_CLAUDE` names it outright. `chloectx doctor` shows which one the running daemon uses.
+
 ## Prebuilt
 
 <!-- since 0.3.2 --> From release 0.3.2, the ChloeDB installer fetches `chloectx` prebuilt (macOS 11 or later, Linux with glibc 2.35 or later), with no Rust and no clone; then fetch the model, wire it into Claude Code and check:
@@ -77,7 +81,7 @@ chloectx doctor
 
 ```console
 $ chloectx doctor
-ChloeCtx 0.3.2 for /home/you/code/app
+ChloeCtx 0.3.3 for /home/you/code/app
   ok    binary: /home/you/.local/bin/chloectx
   ok    Claude Code CLI: 2.1.299 (Claude Code)
   ok    user hooks: /home/you/.claude/settings.json (9 events, /home/you/.local/bin/chloectx)
@@ -165,7 +169,9 @@ To back a store up, run `chloectx backup DEST` in the project directory. It copi
 | `CHLOECTX_HOME` | where stores (and, by default, models) live; default `$XDG_DATA_HOME/chloectx` or `~/.local/share/chloectx` (`engram` in place of `chloectx` when only that folder exists) |
 | `CHLOECTX_MODELS` | where the embedding models live |
 | `CHLOECTX_DISTILL_MODEL` | the distiller's model (`install --distill-model` sets it in the settings' `env`) |
-| `CHLOECTX_DISTILL=0` | no distillation |
+| `CHLOECTX_DISTILL=0` | no distillation (read from Claude Code's environment too, whichever process started the daemon) |
+| `CHLOECTX_DEEP` | query understanding: `async` (default), `sync`, `tool` or `off` |
+| `CHLOECTX_CLAUDE` | the `claude` CLI the model calls run, when it is in none of the places the daemon looks |
 | `CHLOECTX_EMBEDDER` | `static` (default), `bert`, or `hash:<dim>` for a model-free hash embedder |
 
 Each of them is still read under its name from before the rename, `ENGRAM_*` (`ENGRAM_DISABLE=1`), when the new one is not set.
@@ -233,13 +239,13 @@ chloectx stop --all          # restart daemons by hand (they start again on dema
 chloectx uninstall --user    # or `chloectx uninstall` in a project; stores are kept
 ```
 
-The binary knows the commit and the checkout it was built from (`chloectx --version` names the commit). `chloectx doctor` fetches that checkout's upstream branch and says how many commits on it change ChloeCtx or ChloeDB since the build, and a session that starts while the binary is behind says so once a day, from what the checkout last fetched. `chloectx upgrade` pulls the checkout (fast forward only: it stops when local commits or changes are in the way, and `--no-pull` builds the checkout as it is), stops the daemons of the old build, runs `install.sh --no-wire` into the binary's own prefix, writes the user-level install again (a version may add hook events; the distillation model you chose is kept), and ends with `doctor`. A binary built outside a checkout (no `.git`) cannot upgrade itself: run `git pull && ./install.sh` in a checkout instead, or point `CHLOECTX_SOURCE` at one.
+The binary knows the commit and the checkout it was built from (`chloectx --version` names the commit). `chloectx doctor` fetches that checkout's upstream branch (waiting at most 3 s; `upgrade --check` waits 20 s) and says how many commits on it change ChloeCtx or ChloeDB since the build, or, when the fetch failed, that it could not check and what the last fetch said (`upgrade --check` then exits 1), and a session that starts while the binary is behind says so once a day, from what the checkout last fetched. `chloectx upgrade` pulls the checkout (fast forward only: it stops when local commits or changes are in the way, and `--no-pull` builds the checkout as it is), stops the daemons of the old build, runs `install.sh --no-wire` into the binary's own prefix, writes the user-level install again (a version may add hook events; the distillation model you chose is kept), and ends with `doctor`. A prebuilt binary, or one built outside a checkout (no `.git`), cannot upgrade itself: `chloectx upgrade` and `doctor` say to run the installer again (`curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with ctx`, which replaces the binary and keeps the stores), or run `git pull && ./install.sh` in a checkout, or point `CHLOECTX_SOURCE` at one.
 
 ## Keep the stores tidy: `chloectx stores` and `chloectx prune`
 
 Every directory a session runs in gets its own store, including the throwaway folders tools make under the system's temporary directory, so stores pile up over months. `chloectx stores` lists them all, most recently used first, with the project each records, its size on disk and when it was last used, and marks the ones `prune` would remove:
 
-- the project folder no longer exists;
+- the project folder no longer exists, and the store was not used for a week (a folder missing for less, or on a drive that is not mounted, such as `/Volumes/…` or `/media/…`, may have moved and is only marked; `chloectx move OLD NEW` attaches the store to the folder's new place);
 - the project is in a temporary folder (`/tmp`, `/var/folders` on macOS) and the store was not used for a day;
 - the store names no project (one from before the daemon wrote `project.txt`, whose `daemon.log` does not name it either) and was not used for a month.
 
@@ -268,4 +274,7 @@ Sessions that were already running keep the old tool names until they restart.
 | the model has no `memory_*` tools | the MCP server is not registered or the session predates it: `claude mcp get chloectx`, then restart the session |
 | `daemon did not answer in time` | read the store's `daemon.log`; a missing embedding model is the usual cause (`chloectx fetch-model`) |
 | distillation costs | about $0.001 and 8 s per turn with a small model; `CHLOECTX_DISTILL=0` turns it off |
+| `doctor`: **last distillation** failed with something other than the login | the line shows what the CLI wrote on stderr and its exit status (an old CLI that does not know a flag, a crash, a proxy), and doctor makes one small model call to say whether it still fails |
+| `doctor`: **daemon's Claude Code CLI** fails | the running daemon was started by a process that has no `claude` on its `PATH`, and it is not in the usual places either: set `CHLOECTX_CLAUDE` to its path, or `chloectx stop` so that the next Claude Code hook starts the daemon |
+| a project folder was moved or renamed, and its sessions start with an empty memory | stores are kept by the folder's path: `chloectx move OLD NEW` attaches the old store to the new folder. `stores` marks a store whose folder went missing in the last week, or is on a drive that is not mounted, and `prune` leaves it alone. A `git worktree` is a folder of its own, with a store of its own |
 | a project should not be recorded | add `"env": {"CHLOECTX_DISABLE": "1"}` to that project's `.claude/settings.local.json`, or set `CHLOECTX_DISABLE=1` in the shell you start `claude` from |

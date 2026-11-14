@@ -11,7 +11,7 @@
 
 import { createRequire } from 'node:module';
 
-const MAX_SNAPSHOT = 14000;
+const MAX_SNAPSHOT = 16000;
 
 // Playwright is installed with the browser it drives, so it is loaded from
 // wherever the machine has it (NODE_PATH included) rather than pinned here.
@@ -45,7 +45,7 @@ const tool = (name, description, props = {}, required = []) => ({
 const ref = { ref: { type: 'string', description: 'The element\'s reference from the page, such as e12.' } };
 
 export const TOOLS = [
-  tool('look', 'Read the page as it is now.'),
+  tool('look', 'Read the page as it is now, or one part of it whole: a long page is cut, and scrolling does not change what you read.', { part: { type: 'string', description: 'Optional: the reference of a part to read whole, such as a table, a list or a dialog (e40).' } }),
   tool('click', 'Click an element.', ref, ['ref']),
   tool('type', 'Type into a text field, replacing what is in it.', { ...ref, text: { type: 'string' }, submit: { type: 'boolean', description: 'Press Enter afterwards.' } }, ['ref', 'text']),
   tool('choose', 'Choose an option of a select element.', { ...ref, option: { type: 'string', description: 'The option\'s label or value.' } }, ['ref', 'option']),
@@ -75,6 +75,31 @@ export function why(message) {
   if (/waiting for locator\('aria-ref=/.test(m) && /Timeout/.test(first)) return 'no element has that reference on the page now; look again';
   if (/Element is not an? (<input>|<select>|input|textarea|select)/i.test(m)) return 'that element does not take typing or a choice';
   return first;
+}
+
+/** The lines of an accessibility tree that are the element `ref` and what it holds. */
+export function subtree(tree, ref) {
+  const r = String(ref || '').replace(/^\[?ref=/, '').replace(/\]$/, '');
+  const lines = tree.split('\n');
+  const i = lines.findIndex((l) => l.includes(`[ref=${r}]`));
+  if (i < 0) return null;
+  const depth = lines[i].search(/\S/);
+  let j = i + 1;
+  while (j < lines.length && (lines[j].trim() === '' || lines[j].search(/\S/) > depth)) j++;
+  return lines.slice(i, j).join('\n');
+}
+
+/**
+ * A page as the agent reads it, at most `max` characters. An open dialog
+ * comes first, whole: it is what a person looks at, and it is the last
+ * thing in the page's tree, where a cut would drop it.
+ */
+export function fit(tree, max = MAX_SNAPSHOT) {
+  const cut = (t, n) => (t.length > n ? `${t.slice(0, Math.max(0, n))}\n… (the rest is cut: look with a part, the reference of a table, a list or a section, to read it whole)` : t);
+  const open = [...tree.matchAll(/^\s*- (?:dialog|alertdialog)\b[^\n]*\[ref=(e\d+)\]/gm)].at(-1);
+  if (!open || tree.length <= max) return cut(tree, max);
+  const dialog = subtree(tree, open[1]);
+  return `A dialog is open:\n${cut(dialog, max)}\n\nThe page behind it:\n${cut(tree, max - dialog.length)}`;
 }
 
 export class BrowserSurface {
@@ -125,10 +150,13 @@ export class BrowserSurface {
     await this.page.waitForTimeout(250);
   }
 
-  async snapshot() {
+  async snapshot(part) {
     let tree;
     try { tree = await this.page.ariaSnapshot({ mode: 'ai' }); } catch (e) { tree = `(the page could not be read: ${e.message.split('\n')[0]})`; }
-    if (tree.length > MAX_SNAPSHOT) tree = `${tree.slice(0, MAX_SNAPSHOT)}\n… (the rest of the page is cut; scroll or look at a part)`;
+    if (part) {
+      const sub = subtree(tree, part);
+      tree = sub ? fit(sub) : `(no element has the reference ${part} now; the whole page follows)\n${fit(tree)}`;
+    } else tree = fit(tree);
     const u = this.page.url().replace(/([?&])token=[^&#]*/, '$1token=…');
     return `Page: ${await this.page.title().catch(() => '')} (${u})\n${tree}`;
   }
@@ -161,7 +189,7 @@ export class BrowserSurface {
       error = why(e.message);
     }
     if (name !== 'wait') await this.settle();
-    const page = await this.snapshot();
+    const page = await this.snapshot(name === 'look' ? input.part : undefined);
     const seen = this.recent.length ? `\n\nThe browser also showed: ${this.recent.map((r) => `${r.kind}: ${r.text}`).join(' | ')}` : '';
     return { text: `${error ? `That did not work: ${error}\n\n` : ''}${page}`, ok: !error, error, url: this.page.url().replace(/([?&])token=[^&#]*/, '$1token=…'), events: this.recent.slice(), note: seen };
   }

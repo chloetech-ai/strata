@@ -93,7 +93,7 @@ pub fn session_notice(dir: &Path, home: &Path) -> Notice {
     }
     if let Some(v) = crate::version::cached(home, i64::MAX).filter(|v| v.behind > 0) {
         if crate::version::notify_due(home) {
-            n.user.push(format!("ChloeCtx: a newer version is in the checkout this one was built from ({}). Run `chloectx upgrade`.", v.line()));
+            n.user.push(format!("ChloeCtx: a newer version is in the checkout this one was built from: {}.", v.line()));
         }
     }
     n

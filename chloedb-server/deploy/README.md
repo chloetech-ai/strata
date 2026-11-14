@@ -41,7 +41,7 @@ kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
 | spec | default | |
 |---|---|---|
 | `shards` | 1 | shards, each holding a part of the 4,096 slots |
-| `replicas` | 3 | copies of each shard: a primary and its replicas, on different nodes when there are |
+| `replicas` | 3 | copies of each shard: a primary and its replicas, on different nodes when there are (preferred, not required: a node without room for a copy, or a cluster of fewer nodes, runs copies of a shard side by side, and Home says so) |
 | `coordinators` | 1 | coordinators behind the cluster's Service |
 | `schema` or `demo` | | the first table's schema (as `--schema` takes it), or this many demo products split over the shards the cluster starts with |
 | `storage` | `{size: 10Gi}` | each copy's volume (`size`, `storageClassName`) |
@@ -50,6 +50,7 @@ kubectl -n strata port-forward svc/demo 7700  # http://127.0.0.1:7700
 | `tokenSecret` | | a Secret whose key `token` every server and coordinator requires; without it they run with `--no-token`, open to whatever reaches them |
 | `clusterTokenSecret` | | a Secret whose key `token` is the cluster's own token (`--cluster-token`), which the servers and coordinators send each other and clients never hold; with it, the `tokenSecret` token goes to the coordinators alone, as the admin token (the operator's too), and may not make the calls between servers. Needs `tokenSecret` |
 | `secretEnv` | | environment variables of every server and coordinator taken from Secrets, `[{name, secret, key}]` (`key` defaults to `key`): the keys of models behind an API, `ANTHROPIC_API_KEY` for the agents, LLM fields and reranking, `OPENAI_API_KEY` and the like for hosted embeddings ([model keys](#model-keys)). Changing it restarts the copies one at a time |
+| `coordinatorStorage` | | a volume for each coordinator (`size`, default `2Gi`; `storageClassName`), which keeps its history across restarts and rollouts: its log store (`--log-store /data/logs`: events, alert history, query statistics, table growth, which Timeline, Logs, Queries and Tables read), its audit log (`--audit-log /data/audit.jsonl`) and its alert rules and their states (`--alerts /data/alerts.json`); a flag `coordinatorArgs` gives itself is not given again. With it the coordinators run as a StatefulSet `<cluster>-coordinator`, each with a volume of its own, kept when the cluster or a coordinator goes; without it (the default) as a Deployment that keeps all of that in memory only, so that a rollout forgets it. Giving it or taking it away restarts the coordinators: the new ones start beside the old ones, which stop once the new ones serve. A StatefulSet restarts one coordinator before it starts the next, so run 2 `coordinators` or more with it: with one, the cluster's Service has none for the seconds it restarts |
 | `image`, `imagePullPolicy`, `resources`, `coordinatorResources`, `args`, `coordinatorArgs` | `chloedb-server:dev` | the servers' image, containers and further arguments (`args` for every server, `coordinatorArgs` for every coordinator: `--hedge-ms 50`, `--partial`) |
 | `rollout` | `{holdAfterSeconds: 30, soakSeconds: 0, onFailure: rollback, progressDeadlineSeconds: 600, verifySeconds: 60, extraCopies: true}` | how a change is made: `paused`, `gates` (limits on `p99Ms`, `errorRatio`, `replicaBehind`, `diskUsedRatio`: one over its limit for `holdAfterSeconds` holds the change), `soakSeconds`, how long a restarted copy serves before the next restarts, `progressDeadlineSeconds`, how long a step of a restart may take, `verifySeconds`, how long the new version must be healthy in a row before it is ready, and `onFailure`, what a version that fails becomes: `rollback` (to the last version that ran everywhere) or `hold`, and `extraCopies`, whether a shard of fewer than three copies takes extra ones while its copies restart. Not part of a version: changing it restarts nothing |
 | `upgrade` | `{mode: off, checkMinutes: 10}` | the upgrader: every `checkMinutes` it asks the registry which image the tag `track` names (by default the tag of `image`), and with `mode` `suggest` shows it, with `on` rolls it out, pinned by its digest, once the cluster is ready. Not part of a version ([upgrading](#upgrading-chloedb)) |
@@ -91,6 +92,8 @@ What a change does:
   `coordinatorResources`, the image): their Deployment rolls them, one
   coordinator at a time, a new one ready before an old one stops
   (`maxSurge: 1`, `maxUnavailable: 0`) and each old one draining first.
+  With `coordinatorStorage` their StatefulSet restarts them one at a time,
+  each old one stopping before its new one starts on its volume.
 - **A larger `storage.size`**: each copy's volume claim grows in place,
   which its storage class must allow (`allowVolumeExpansion: true`); the
   status says so when it does not. A volume never shrinks (a smaller size

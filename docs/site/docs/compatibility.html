@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Compatibility · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="What this code promises about the files it reads and writes, the protocol its servers speak to each other, and the names it was known by before; and what it does not promise yet. It describes the code as it is on…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/compatibility.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Server and cluster</span>
       <h1>Compatibility</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/compatibility.md">docs/compatibility.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-database-file">The database file</a></li><li><a href="#the-packages-and-the-engine">The packages and the engine</a></li><li><a href="#a-cluster-of-mixed-versions">A cluster of mixed versions</a></li><li><a href="#old-names">Old names</a></li><li><a href="#not-promised-yet">Not promised yet</a></li></ol></details>
     <div class="doc-body">
@@ -148,6 +151,13 @@ TIMESTAMP field, a NOT NULL field or a DEFAULT, sequence numbers with
 build exactly as long as it uses only features that build knows, and an
 older build that meets a newer feature refuses the file by name rather than
 misreading it. Starting to use a feature cannot be undone.</p>
+<p><strong>Rollups.</strong> A rollup made by 0.3.3 or later keys its rows by number,
+where one made by 0.3.1 or 0.3.2 keys them by text. 0.3.3 reads and
+refreshes both. 0.3.2 reads the new kind but cannot refresh it, so its
+definition carries the option <code>needs_chloedb_0_3_3</code>, which 0.3.2 refuses
+by name ("no option needs_chloedb_0_3_3"): a refresh by 0.3.2 fails with
+that message rather than leaving the rollup's newest buckets stale. Open a
+database whose rollups 0.3.3 made with 0.3.3 or later.</p>
 <p><strong>Databases from before field ids.</strong> A database written before field ids
 (format 1, 2, or 3 without <code>field_ids</code>) no longer opens for use. <code>upgrade()</code>
 (<code>chloedb.upgrade(path)</code> in Python, <code>upgrade(path)</code> in JavaScript;
@@ -349,7 +359,7 @@ keeps using it, as a machine that already has ChloeCtx's old folder,
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

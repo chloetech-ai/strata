@@ -12,6 +12,9 @@
 //   key): /login?code=... sets the session's cookie and opens the studio;
 // - the engine's own headless browser, which opens the apps it builds to
 //   check and draw them, with a cookie made at each start (selfCookie);
+// - an agent's MCP server (mcp.mjs), with the engine's agent token
+//   (DATA/agent.token, or STRATA_APPS_AGENT_TOKEN) as its bearer token: the
+//   studio's rights, on a laptop and beside a cluster alike (audit 4, X-G7);
 // - anyone, for what sandboxed frames load without cookies (map tiles, and
 //   files named by ids nobody can guess), the login itself and /healthz.
 //
@@ -32,14 +35,17 @@ const COOKIE = 'sa_studio';
 const OPEN = [/^\/api\/tiles\/\d{1,2}\/\d{1,7}\/\d{1,7}\.png$/, /^\/api\/apps\/[a-z0-9]+\/files\/[a-z0-9]{6,20}$/, /^\/healthz$/, /^\/api\/tls\/ask$/];
 
 const digest = (s) => createHash('sha256').update(String(s)).digest();
+const bearerOf = (req) => { const m = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i); return m ? m[1].trim() : null; };
 const hex = (s) => digest(s).toString('hex');
 
 export class Login {
   // appToken: the STRATA_APP_TOKEN chloedb-server sends; publicUrl: where
   // browsers reach the studio (STRATA_APPS_PUBLIC_URL), for the links.
-  constructor({ store, appToken, publicUrl, log = () => {} }) {
+  // agentToken: what an agent's MCP server sends (mcp.mjs).
+  constructor({ store, appToken, agentToken, publicUrl, log = () => {} }) {
     this.store = store;
     this.want = appToken ? digest(appToken) : null;
+    this.agent = agentToken ? digest(agentToken) : null;
     this.publicUrl = publicUrl ? publicUrl.replace(/\/$/, '') : null;
     this.secure = !!this.publicUrl?.startsWith('https://');
     this.log = log;
@@ -60,8 +66,14 @@ export class Login {
 
   // The request came through chloedb-server: it carries its app token.
   fromServer(req) {
-    const m = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
-    return !!(this.want && m && timingSafeEqual(digest(m[1].trim()), this.want));
+    const b = bearerOf(req);
+    return !!(this.want && b && timingSafeEqual(digest(b), this.want));
+  }
+
+  // The request is an agent's, with the agent token (mcp.mjs).
+  fromAgent(req) {
+    const b = bearerOf(req);
+    return !!(this.agent && b && timingSafeEqual(digest(b), this.agent));
   }
 
   cookieOf(req) {
@@ -85,9 +97,15 @@ export class Login {
 
   // null when the request may go on; else what to answer.
   async check(req, url) {
-    if (!this.on) return null;
     if (OPEN.some((re) => re.test(url.pathname)) || url.pathname === '/login') return null;
-    if (this.fromServer(req) || await this.signedIn(req)) return null;
+    // A bearer token is checked with a login or without: one that is neither
+    // chloedb-server's nor the agent token is refused, so an agent with a
+    // wrong or stale token learns it rather than passing as nobody.
+    if (bearerOf(req) && !this.fromServer(req) && !this.fromAgent(req)) {
+      return { status: 401, json: { error: 'that bearer token is not this engine\'s: an agent uses the engine\'s agent token (DATA/agent.token, or STRATA_APPS_AGENT_TOKEN)' } };
+    }
+    if (!this.on) return null;
+    if (this.fromServer(req) || this.fromAgent(req) || await this.signedIn(req)) return null;
     return url.pathname.startsWith('/api/')
       ? { status: 401, json: { error: 'sign in to the studio from the cluster\'s command center: Apps, then App creator, then Studio on an app' } }
       : { status: 401, html: PAGE };

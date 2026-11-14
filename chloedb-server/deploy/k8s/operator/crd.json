@@ -334,6 +334,19 @@
                     "type": "object",
                     "x-kubernetes-preserve-unknown-fields": true
                   },
+                  "coordinatorStorage": {
+                    "description": "A volume for each coordinator, which keeps its history across restarts and rollouts: its log store (events, alerts, query statistics, table growth), its audit log and its alert rules. With it the coordinators run as a StatefulSet, each with a volume; without it (the default) as a Deployment that keeps all of that in memory only. Run 2 coordinators or more with it: a StatefulSet restarts one before it starts its next.",
+                    "properties": {
+                      "size": {
+                        "description": "Each coordinator's volume (default 2Gi; its log store takes up to 1 GiB, --log-store-mb).",
+                        "type": "string"
+                      },
+                      "storageClassName": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "coordinators": {
                     "description": "Coordinators behind the cluster's Service (default 1).",
                     "minimum": 1,

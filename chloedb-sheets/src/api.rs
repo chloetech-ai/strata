@@ -508,4 +508,17 @@ mod tests {
         assert_eq!(parse_range("AA10:AB11"), Some((10, 27, 11, 28)));
         assert_eq!(parse_range("nope"), None);
     }
+
+    /// The grid's scroller (`.sx-scroll`) is absolutely positioned over its
+    /// pane; any other element given that class covers whatever is under it,
+    /// as the home page's tables card did (DAP-1: nothing on the home page
+    /// could be clicked). Only the grid may carry it.
+    #[test]
+    fn grid_scroller_class_is_the_grids_only() {
+        let uses = VIEW.matches("class: \"sx-scroll\"").count() + VIEW.matches("class: \"sx-scroll ").count();
+        assert_eq!(uses, 1, "the absolutely positioned .sx-scroll is used by something other than the grid");
+        // and no second rule for the class, which would apply to the grid too
+        let rules = VIEW.lines().filter(|l| l.trim_start().starts_with(".sx-scroll {")).count();
+        assert_eq!(rules, 1, "a second .sx-scroll rule applies to the grid as well");
+    }
 }

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "chloedb"
-version = "0.3.2"
+version = "0.3.3"
 description = "ChloeDB from Python: an embedded search database (full text, vectors, graphs, SQL), or a chloedb-server over HTTP"
 readme = "README.md"
 license = "Apache-2.0"

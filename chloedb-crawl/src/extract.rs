@@ -111,6 +111,11 @@ pub struct Page {
     /// The links to follow (normalised, once each, `nofollow` left out).
     #[serde(skip)]
     pub links: Vec<Url>,
+    /// Of `links`, those to the next page of a list (`rel="next"`, or
+    /// named "next"): a list's pages are one step from its first, not one
+    /// more each, so `max_depth` does not cut a long list short.
+    #[serde(skip)]
+    pub next: Vec<Url>,
     /// Links on the page, followed or not.
     pub links_out: usize,
     pub noindex: bool,
@@ -272,6 +277,17 @@ fn own_text(el: ElementRef) -> String {
     collapse(&s)
 }
 
+/// Whether a link's text names the next page of a list: "Next", "Next
+/// page", "Older posts", or an arrow alone.
+fn names_next(text: &str) -> bool {
+    let t = text.trim();
+    if matches!(t, "›" | "»" | "→" | ">" | ">>" | "»»") {
+        return true;
+    }
+    let words: String = t.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect::<String>().to_lowercase();
+    matches!(words.split_whitespace().collect::<Vec<_>>().join(" ").as_str(), "next" | "next page" | "next results" | "older posts" | "older entries")
+}
+
 fn all_text(el: ElementRef) -> String {
     collapse(&el.text().collect::<Vec<_>>().join(" "))
 }
@@ -409,6 +425,10 @@ pub fn extract(html: &str, url: &Url, opts: &Options) -> Page {
             continue;
         }
         if let Some(u) = urls::join(url, href) {
+            let next = rel.split_whitespace().any(|r| r == "next") || names_next(&all_text(a)) || a.value().attr("aria-label").is_some_and(names_next);
+            if next && !p.next.contains(&u) {
+                p.next.push(u.clone());
+            }
             if seen.insert(u.as_str().to_string()) {
                 p.links.push(u);
             }
@@ -416,6 +436,7 @@ pub fn extract(html: &str, url: &Url, opts: &Options) -> Page {
     }
     if p.nofollow {
         p.links.clear();
+        p.next.clear();
     }
 
     // The crawl's selectors.
@@ -758,6 +779,20 @@ pub fn learn_template(pages: &[(&[(String, String, u32)], Option<&str>)], min_sh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list's next page, by `rel="next"`, its name or its label, is told
+    /// apart from the list's other links (DAP-10).
+    #[test]
+    fn next_pages_of_a_list() {
+        let html = r#"<html><head><link rel="next" href="/l/2"></head><body>
+<a href="/item/1">Item one</a> <a href="/l/3">Next &rsaquo;</a> <a href="/l/4" aria-label="Next page">&gt;</a>
+<a href="/l/5">»</a> <a href="/l/6">Next steps for your garden</a> <a href="/next-day">delivery</a></body></html>"#;
+        let base = Url::parse("https://shop.example/l/1").unwrap();
+        let p = extract(html, &base, &Options { rules: &[], template: &[], learn: false, max_text: 10_000 });
+        let next: Vec<&str> = p.next.iter().map(|u| u.path()).collect();
+        assert_eq!(next, ["/l/3", "/l/4", "/l/5", "/l/2"]);
+        assert!(p.links.iter().any(|u| u.path() == "/l/6") && p.links.iter().any(|u| u.path() == "/item/1"));
+    }
 
     const PRODUCT: &str = r#"<!doctype html><html lang="en-GB"><head>
 <title>A Light in the Attic | Books</title>

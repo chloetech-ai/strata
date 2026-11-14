@@ -38,6 +38,13 @@ impl RefreshStats {
 /// newest: every this many refreshes.
 const SWEEP_EVERY: u64 = 60;
 
+/// Buckets one query counts or folds at most.
+const SPAN: i64 = 288;
+
+/// Buckets apart that two stale buckets may be and still be folded by one
+/// query (the rows between them are read for nothing).
+const GAP: i64 = 12;
+
 fn all_rows(opts: &ExecOptions) -> ExecOptions {
     ExecOptions { max_rows: None, max_groups: None, ..opts.clone() }
 }
@@ -74,7 +81,12 @@ fn fit(v: Value, ty: &str) -> Value {
     }
 }
 
-/// The rollup key of the row of bucket `bucket` and group `group`.
+/// Groups a bucket may hold: a row's key is its bucket's number times
+/// this, plus its place among the bucket's groups.
+const GROUPS: i64 = 1 << 24;
+
+/// The rollup key of the row of bucket `bucket` and group `group`, in a
+/// rollup made before 0.3.3, whose key is text.
 fn key_of(bucket: i64, group: &[Value]) -> String {
     let mut k = bucket.to_string();
     for v in group {
@@ -139,7 +151,9 @@ impl Db {
             return Err(Error::Query(format!("{} is a system table", base.table)));
         }
         self.sql_with(&r.create_table_sql(&base)?, &Params::new(), opts)?;
-        if let Err(e) = self.sql_with(&rollup::function_sql(r), &Params::new(), opts) {
+        // Kept with the mark of its layout, which 0.3.2 refuses by name.
+        let kept = Rollup { statement: rollup::marked(&r.statement), ..r.clone() };
+        if let Err(e) = self.sql_with(&rollup::function_sql(&kept), &Params::new(), opts) {
             let _ = self.drop_tables(&[&r.name], Default::default());
             return Err(e);
         }
@@ -221,48 +235,104 @@ impl Db {
             let sql = format!("SELECT {bucket}, SUM({}) FROM {} WHERE {bucket} >= :rollup_from AND {bucket} < :rollup_to GROUP BY {bucket}", qsql::ident(r.count_column()), qsql::ident(&r.name));
             self.query_with(&sql, &window(first, last + r.width), &opts)?.rows.into_iter().filter_map(|row| Some((time_of(row.first())?, int_of(row.get(1))))).collect()
         };
-        let count_sql = r.count_sql();
-        let mut b = first;
-        while b <= last {
-            stats.checked += 1;
-            let have = int_of(one(&count_sql, &window(b, b + r.width))?.as_ref());
-            if have != counts.get(&b).copied().unwrap_or(0) {
-                stats.rows_written += self.fold(r, &roll, &types, b, &opts)?;
-                stats.folded += 1;
+        // The table's count of each bucket, in one query of the time
+        // column, a day of buckets at a time at most.
+        let mut stale: Vec<i64> = Vec::new();
+        let mut from = first;
+        while from <= last {
+            let to = (from + SPAN * r.width).min(last + r.width);
+            let have: HashMap<i64, i64> = self.query_with(&r.bucket_counts_sql(), &window(from, to), &opts)?.rows.into_iter().filter_map(|row| Some((time_of(row.first())?, int_of(row.get(1))))).collect();
+            let mut b = from;
+            while b < to {
+                stats.checked += 1;
+                if have.get(&b).copied().unwrap_or(0) != counts.get(&b).copied().unwrap_or(0) {
+                    stale.push(b);
+                }
+                b += r.width;
             }
-            b += r.width;
+            from = to;
+        }
+        // Folded in runs of nearby buckets, a query a run.
+        let mut i = 0;
+        while i < stale.len() {
+            let mut j = i + 1;
+            while j < stale.len() && stale[j] - stale[i] < SPAN * r.width && stale[j] - stale[j - 1] <= GAP * r.width {
+                j += 1;
+            }
+            let run = &stale[i..j];
+            stats.rows_written += self.fold(r, &roll, &types, run, &counts, &opts)?;
+            stats.folded += run.len() as u64;
+            i = j;
         }
         stats.seconds = t0.elapsed().as_secs_f64();
         Ok(stats)
     }
 
-    /// Folds bucket `b` of rollup `r` again, in one transaction: a row for
-    /// each group the bucket holds now, and none for the groups it no
-    /// longer holds.
-    fn fold(&self, r: &Rollup, roll: &Schema, types: &[(String, &'static str)], b: i64, opts: &ExecOptions) -> Result<u64> {
-        let rows = self.query_with(&r.fold_sql(), &window(b, b + r.width), opts)?.rows;
+    /// Folds buckets `run` of rollup `r` again, sorted and within a day of
+    /// each other, by one query of the table: for each bucket, in one
+    /// transaction, a row for each group it holds now and none for the
+    /// groups it no longer holds. `counts` is the rollup's count of each
+    /// bucket: one it holds no rows of has none to delete.
+    fn fold(&self, r: &Rollup, roll: &Schema, types: &[(String, &'static str)], run: &[i64], counts: &HashMap<i64, i64>, opts: &ExecOptions) -> Result<u64> {
+        let (from, to) = (run[0], run[run.len() - 1] + r.width);
+        let wanted: HashSet<i64> = run.iter().copied().collect();
         let keys = r.keys.len();
-        let mut ops = Vec::with_capacity(rows.len());
-        let mut wrote = HashSet::new();
-        for row in rows {
-            let key = key_of(b, &row[..keys]);
-            let mut doc = Vec::with_capacity(roll.fields.len());
-            doc.push(Value::Str(key.clone()));
-            doc.push(Value::Timestamp(b));
-            // types[0] is the bucket's; the groups and aggregates follow.
-            doc.extend(row.into_iter().zip(&types[1..]).map(|(v, (_, ty))| fit(v, ty)));
-            wrote.insert(key);
-            ops.push(WriteOp::Upsert { table: r.name.clone(), doc });
+        // A rollup made before 0.3.3 keys its rows by text; one made since,
+        // by number: each fold writes a bucket's rows whole, so a row's key
+        // need only be unique, not the same from one fold to the next.
+        let text_keys = roll.field(KEY).is_some_and(|f| matches!(f.ty, crate::schema::FieldType::Keyword));
+        let mut rows_of: HashMap<i64, Vec<Vec<Value>>> = HashMap::new();
+        for mut row in self.query_with(&r.fold_range_sql(), &window(from, to), opts)?.rows {
+            let Some(b) = time_of(row.first()) else { continue };
+            if wanted.contains(&b) {
+                row.remove(0);
+                rows_of.entry(b).or_default().push(row);
+            }
         }
-        let had = format!("SELECT {KEY} FROM {} WHERE {} = :rollup_from", qsql::ident(&r.name), qsql::ident(&r.bucket));
-        for row in self.query_with(&had, &window(b, b), opts)?.rows {
-            if let Some(Value::Str(k)) = row.into_iter().next() {
-                if !wrote.contains(&k) {
-                    ops.push(WriteOp::Delete { table: r.name.clone(), key: Value::Str(k) });
+        let mut by_bucket: HashMap<i64, Vec<WriteOp>> = HashMap::new();
+        let mut wrote: HashSet<String> = HashSet::new();
+        for (b, mut rows) in rows_of {
+            if rows.len() as i64 > GROUPS {
+                return Err(Error::Query(format!("rollup {}: a bucket holds {} groups, more than {GROUPS}", r.name, rows.len())));
+            }
+            // In the groups' order, so that a fold of the same rows writes
+            // the same keys.
+            rows.sort_by_cached_key(|row| key_of(b, &row[..keys]));
+            for (i, row) in rows.into_iter().enumerate() {
+                let key = match text_keys {
+                    true => Value::Str(key_of(b, &row[..keys])),
+                    false => Value::Int(b.div_euclid(r.width) * GROUPS + i as i64),
+                };
+                let mut doc = Vec::with_capacity(roll.fields.len());
+                doc.push(key.clone());
+                doc.push(Value::Timestamp(b));
+                // types[0] is the bucket's; the groups and aggregates follow.
+                doc.extend(row.into_iter().zip(&types[1..]).map(|(v, (_, ty))| fit(v, ty)));
+                wrote.insert(format!("{key:?}"));
+                by_bucket.entry(b).or_default().push(WriteOp::Upsert { table: r.name.clone(), doc });
+            }
+        }
+        if run.iter().any(|b| counts.get(b).copied().unwrap_or(0) != 0) {
+            let had = format!("SELECT {KEY}, {} FROM {} WHERE {} >= :rollup_from AND {} < :rollup_to", qsql::ident(&r.bucket), qsql::ident(&r.name), qsql::ident(&r.bucket), qsql::ident(&r.bucket));
+            for row in self.query_with(&had, &window(from, to), opts)?.rows {
+                let (Some(k), Some(b)) = (row.first(), time_of(row.get(1))) else { continue };
+                if wanted.contains(&b) && !wrote.contains(&format!("{k:?}")) {
+                    by_bucket.entry(b).or_default().push(WriteOp::Delete { table: r.name.clone(), key: k.clone() });
                 }
             }
         }
-        self.write_ops(ops)
+        // Whole buckets to a transaction, a few thousand rows each.
+        let mut written = 0;
+        let mut ops: Vec<WriteOp> = Vec::new();
+        for b in run {
+            let Some(mut more) = by_bucket.remove(b) else { continue };
+            if !ops.is_empty() && ops.len() + more.len() > super::GROUP_OPS {
+                written += self.write_ops(std::mem::take(&mut ops))?;
+            }
+            ops.append(&mut more);
+        }
+        written += self.write_ops(ops)?;
+        Ok(written)
     }
 
     /// Refreshes every rollup in the background from now on, every

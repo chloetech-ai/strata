@@ -1,0 +1,500 @@
+{
+ "name": "new-features",
+ "description": "The same five personas on four tasks for what landed after the first runs: context that fits a token budget, time buckets, a key for one table, and rollups.",
+ "seeds": 3,
+ "models": [
+  "haiku",
+  "haiku",
+  "sonnet"
+ ],
+ "budget_usd": 12,
+ "concurrency": 4,
+ "personas": [
+  {
+   "id": "dev-postgres",
+   "name": "Maya Chen",
+   "role": "a backend developer who has used PostgreSQL every day for eight years",
+   "device": "desktop",
+   "background": "Maya is trying ChloeDB for a new service and judges it against Postgres.",
+   "traits": [
+    "Writes SQL fluently and reaches for Postgres habits first (SERIAL, ILIKE, NOW() - INTERVAL '7 days', \\d to describe a table).",
+    "Reads error messages carefully and expects them to say what to change.",
+    "Opens the documentation after two failed attempts, not before.",
+    "Patient for about fifteen minutes, then decides the product is not ready."
+   ]
+  },
+  {
+   "id": "analyst",
+   "name": "Tomás Rivera",
+   "role": "a data analyst who writes reporting SQL",
+   "device": "desktop",
+   "background": "Tomás builds weekly reports. He has never used a search engine's query language.",
+   "traits": [
+    "Comfortable with SELECT, WHERE, GROUP BY and dates; has never heard of BM25 or full-text ranking.",
+    "Likes to look at a table's columns and a few rows before writing a query.",
+    "Copies examples from documentation when he finds one.",
+    "Gives up after about five failed attempts and says what blocked him."
+   ]
+  },
+  {
+   "id": "ml-engineer",
+   "name": "Priya Nair",
+   "role": "a machine learning engineer building retrieval for a chatbot",
+   "device": "desktop",
+   "background": "Priya wants to know quickly whether ChloeDB can be her retrieval layer.",
+   "traits": [
+    "Thinks in embeddings, vector search and hybrid ranking; knows BM25 by name.",
+    "Skims text and jumps to whatever looks like an API or a query box.",
+    "Impatient with forms and wizards; prefers typing a query.",
+    "Will judge the whole product on the first thing that confuses her."
+   ]
+  },
+  {
+   "id": "sre",
+   "name": "Jordan Okafor",
+   "role": "the on-call site reliability engineer for the team's databases",
+   "device": "desktop",
+   "background": "Jordan looks after production access and incidents.",
+   "traits": [
+    "Looks for admin, access and settings pages first.",
+    "Cares about least privilege: read-only means read-only, keys should expire.",
+    "Reads labels literally and distrusts anything ambiguous about permissions.",
+    "Efficient: does not explore beyond what the task needs."
+   ]
+  },
+  {
+   "id": "pm",
+   "name": "Sam Lee",
+   "role": "a product manager who does not write SQL",
+   "device": "phone",
+   "background": "Sam checks things on a phone between meetings and wants answers, not queries.",
+   "traits": [
+    "Does not write SQL; will copy and edit an example if one is in front of them.",
+    "Relies on labels, menus and search boxes; jargon (shards, segments, BM25) confuses Sam.",
+    "Uses a phone, so wide tables and small buttons are a problem.",
+    "Gives up after three or four dead ends and says why."
+   ]
+  }
+ ],
+ "tasks": [
+  {
+   "id": "context-for-a-bot",
+   "title": "Context for a support bot",
+   "surface": "mcp",
+   "scope": "read",
+   "max_steps": 20,
+   "prompt": "We're building a support bot. From the tickets table, pull the tickets about people who can't get into their account, with as much of their text as fits in about 250 tokens, so I can paste it into the bot's prompt. Give me that text, and tell me which ticket ids are in it.",
+   "fixture": {
+    "tables": [
+     {
+      "name": "tickets",
+      "create": "CREATE TABLE tickets (id KEYWORD PRIMARY KEY, subject TEXT, body TEXT, product KEYWORD, created TIMESTAMP)",
+      "rows": [
+       {
+        "id": "t-01",
+        "subject": "Invoice shows wrong VAT",
+        "body": "The March invoice charged 21% VAT but we are registered in Ireland, should be 23%.",
+        "product": "billing",
+        "created": "2026-10-02T09:14:00Z"
+       },
+       {
+        "id": "t-02",
+        "subject": "Export to CSV times out",
+        "body": "Exporting the contacts list with 40k rows times out after a minute in the web dashboard.",
+        "product": "web",
+        "created": "2026-10-02T11:40:00Z"
+       },
+       {
+        "id": "t-03",
+        "subject": "Can't sign in on the iPhone app",
+        "body": "Since the update the iOS app says 'session expired' right after I enter my password. Web login works fine.",
+        "product": "mobile",
+        "created": "2026-10-03T08:02:00Z"
+       },
+       {
+        "id": "t-04",
+        "subject": "Dark mode colors unreadable",
+        "body": "Grey text on the dark background in the reports page is almost invisible.",
+        "product": "web",
+        "created": "2026-10-03T15:21:00Z"
+       },
+       {
+        "id": "t-05",
+        "subject": "Webhook retries flood our endpoint",
+        "body": "When our server returns 500 your webhooks retry every second for an hour.",
+        "product": "api",
+        "created": "2026-10-04T10:00:00Z"
+       },
+       {
+        "id": "t-06",
+        "subject": "Add SSO with Okta",
+        "body": "We need SAML SSO with Okta before we can roll this out to 300 people.",
+        "product": "web",
+        "created": "2026-10-05T13:45:00Z"
+       },
+       {
+        "id": "t-07",
+        "subject": "Duplicate charges this month",
+        "body": "We were billed twice for the Team plan on October 1st. Please refund one.",
+        "product": "billing",
+        "created": "2026-10-05T16:30:00Z"
+       },
+       {
+        "id": "t-08",
+        "subject": "Android app stuck in a login loop",
+        "body": "After entering my email and code the Android app sends me back to the sign-in screen, again and again.",
+        "product": "mobile",
+        "created": "2026-10-06T07:55:00Z"
+       },
+       {
+        "id": "t-09",
+        "subject": "API rate limit too low",
+        "body": "429 errors at 50 requests per second; our plan says 100.",
+        "product": "api",
+        "created": "2026-10-06T12:12:00Z"
+       },
+       {
+        "id": "t-10",
+        "subject": "Push notifications arrive late",
+        "body": "Notifications on my phone show up 20 minutes after the event.",
+        "product": "mobile",
+        "created": "2026-10-07T09:09:00Z"
+       },
+       {
+        "id": "t-11",
+        "subject": "Refund never arrived",
+        "body": "You confirmed a refund of $49 on September 20th but nothing reached my card after three weeks.",
+        "product": "billing",
+        "created": "2026-10-08T14:03:00Z"
+       },
+       {
+        "id": "t-12",
+        "subject": "Search ignores accents",
+        "body": "Searching for 'jose' does not find 'José' in contacts.",
+        "product": "web",
+        "created": "2026-10-08T17:47:00Z"
+       },
+       {
+        "id": "t-13",
+        "subject": "Calendar sync drops events",
+        "body": "Recurring events from Google Calendar disappear after the first week.",
+        "product": "web",
+        "created": "2026-10-09T10:31:00Z"
+       },
+       {
+        "id": "t-14",
+        "subject": "Two-factor code never comes on mobile",
+        "body": "On the phone app the 2FA text message never arrives, so I cannot get into my account from my phone. On desktop it works.",
+        "product": "mobile",
+        "created": "2026-10-10T06:40:00Z"
+       },
+       {
+        "id": "t-15",
+        "subject": "Price increase not announced",
+        "body": "Our renewal went from $12 to $15 per seat without any email.",
+        "product": "billing",
+        "created": "2026-10-10T11:11:00Z"
+       },
+       {
+        "id": "t-16",
+        "subject": "SDK throws on null fields",
+        "body": "The Python SDK raises KeyError when a contact has no phone number.",
+        "product": "api",
+        "created": "2026-10-11T15:00:00Z"
+       },
+       {
+        "id": "t-17",
+        "subject": "Offline mode loses edits",
+        "body": "Edits made on the tablet while offline vanish when it reconnects.",
+        "product": "mobile",
+        "created": "2026-10-12T08:20:00Z"
+       },
+       {
+        "id": "t-18",
+        "subject": "Cannot delete my account",
+        "body": "The delete account button in settings does nothing.",
+        "product": "web",
+        "created": "2026-10-13T19:05:00Z"
+       },
+       {
+        "id": "t-19",
+        "subject": "Locked out of the mobile app after password change",
+        "body": "I changed my password on the website and now the mobile app won't accept the new one or the old one.",
+        "product": "mobile",
+        "created": "2026-10-14T07:31:00Z"
+       },
+       {
+        "id": "t-20",
+        "subject": "Bulk import skips rows",
+        "body": "Importing 2,000 contacts from Excel only created 1,640, no error shown.",
+        "product": "web",
+        "created": "2026-10-15T13:13:00Z"
+       },
+       {
+        "id": "t-21",
+        "subject": "Receipt PDF is blank",
+        "body": "The receipt for my last payment opens as an empty PDF.",
+        "product": "billing",
+        "created": "2026-10-16T10:44:00Z"
+       },
+       {
+        "id": "t-22",
+        "subject": "Slow dashboard on Mondays",
+        "body": "The main dashboard takes 15 seconds to load every Monday morning.",
+        "product": "web",
+        "created": "2026-10-17T09:30:00Z"
+       },
+       {
+        "id": "t-23",
+        "subject": "Tablet layout cuts off buttons",
+        "body": "On the iPad the save button is hidden behind the keyboard.",
+        "product": "mobile",
+        "created": "2026-10-18T16:16:00Z"
+       },
+       {
+        "id": "t-24",
+        "subject": "Webhook signature mismatch",
+        "body": "The HMAC signature header doesn't match when the payload has emoji.",
+        "product": "api",
+        "created": "2026-10-19T12:00:00Z"
+       }
+      ]
+     }
+    ]
+   },
+   "checks": [
+    {
+     "name": "names the account-access tickets",
+     "kind": "answer_includes",
+     "any": [
+      "t-03",
+      "t-08",
+      "t-14",
+      "t-19"
+     ],
+     "at_least": 2
+    }
+   ]
+  },
+  {
+   "id": "busiest-day",
+   "title": "The busiest day",
+   "surface": "mcp",
+   "scope": "read",
+   "max_steps": 20,
+   "prompt": "Our orders are in the table orders. Which single day had the most orders, and how many orders did it have? Days in UTC.",
+   "fixture": {
+    "tables": [
+     {
+      "name": "orders",
+      "create": "CREATE TABLE orders (id KEYWORD PRIMARY KEY, status KEYWORD, total FLOAT, created_at TIMESTAMP)",
+      "generate": {
+       "count": 300,
+       "fields": {
+        "id": {
+         "seq": "o-"
+        },
+        "status": {
+         "pick": [
+          "placed",
+          "paid",
+          "shipped",
+          "delivered",
+          "refunded"
+         ],
+         "weights": [
+          2,
+          3,
+          3,
+          5,
+          1
+         ]
+        },
+        "total": {
+         "float": [
+          5,
+          500
+         ]
+        },
+        "created_at": {
+         "daysAgo": [
+          0,
+          30
+         ]
+        }
+       }
+      }
+     }
+    ]
+   },
+   "checks": [
+    {
+     "name": "the busiest day's count",
+     "kind": "answer_matches_sql",
+     "sql": "SELECT date_trunc('day', created_at) AS d, COUNT(*) AS n FROM orders GROUP BY d ORDER BY n DESC LIMIT 1",
+     "columns": [
+      "n"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "key-for-one-table",
+   "title": "A key for one table",
+   "surface": "browser",
+   "scope": "admin",
+   "max_steps": 25,
+   "prompt": "Our BI tool, Metabase, needs a key that can read the orders table and nothing else: it must not see the customers table. Make that key in the command center, name it metabase, and tell me what to paste into Metabase.",
+   "fixture": {
+    "tables": [
+     {
+      "name": "orders",
+      "create": "CREATE TABLE orders (id KEYWORD PRIMARY KEY, status KEYWORD, total FLOAT, created_at TIMESTAMP)",
+      "generate": {
+       "count": 300,
+       "fields": {
+        "id": {
+         "seq": "o-"
+        },
+        "status": {
+         "pick": [
+          "placed",
+          "paid",
+          "shipped",
+          "delivered",
+          "refunded"
+         ],
+         "weights": [
+          2,
+          3,
+          3,
+          5,
+          1
+         ]
+        },
+        "total": {
+         "float": [
+          5,
+          500
+         ]
+        },
+        "created_at": {
+         "daysAgo": [
+          0,
+          30
+         ]
+        }
+       }
+      }
+     },
+     {
+      "name": "customers",
+      "create": "CREATE TABLE customers (id KEYWORD PRIMARY KEY, name TEXT, email KEYWORD, city KEYWORD)",
+      "generate": {
+       "count": 40,
+       "fields": {
+        "id": {
+         "seq": "c-"
+        },
+        "name": {
+         "pick": [
+          "Ana Silva",
+          "Ben Okoro",
+          "Chen Wei",
+          "Dara Novak",
+          "Eli Haddad",
+          "Fatima Khan"
+         ]
+        },
+        "email": {
+         "pick": [
+          "ana@example.com",
+          "ben@example.com",
+          "chen@example.com",
+          "dara@example.com"
+         ]
+        },
+        "city": {
+         "pick": [
+          "Lisbon",
+          "Lagos",
+          "Taipei",
+          "Prague"
+         ]
+        }
+       }
+      }
+     }
+    ]
+   },
+   "checks": [
+    {
+     "name": "a metabase key that reads orders only",
+     "kind": "http",
+     "path": "/v1/admin/keys",
+     "test": "(body.keys || []).some(k => /metabase/i.test(k.name) && !k.revoked_ms && k.tables && Object.keys(k.tables).length > 0 && Object.entries(k.tables).every(([t, s]) => /^orders$/i.test(t) && s === 'read'))"
+    }
+   ]
+  },
+  {
+   "id": "daily-counts-kept",
+   "title": "Daily counts kept up to date",
+   "surface": "mcp",
+   "scope": "admin",
+   "max_steps": 20,
+   "prompt": "Our dashboard counts orders by status for each day, straight from the orders table, every time it loads, and it is getting slow. Set ChloeDB up so those daily counts are kept up to date ahead of time, then show me yesterday's counts by status from what you set up.",
+   "fixture": {
+    "tables": [
+     {
+      "name": "orders",
+      "create": "CREATE TABLE orders (id KEYWORD PRIMARY KEY, status KEYWORD, total FLOAT, created_at TIMESTAMP)",
+      "generate": {
+       "count": 300,
+       "fields": {
+        "id": {
+         "seq": "o-"
+        },
+        "status": {
+         "pick": [
+          "placed",
+          "paid",
+          "shipped",
+          "delivered",
+          "refunded"
+         ],
+         "weights": [
+          2,
+          3,
+          3,
+          5,
+          1
+         ]
+        },
+        "total": {
+         "float": [
+          5,
+          500
+         ]
+        },
+        "created_at": {
+         "daysAgo": [
+          0,
+          30
+         ]
+        }
+       }
+      }
+     }
+    ]
+   },
+   "checks": [
+    {
+     "name": "a rollup of orders",
+     "kind": "http",
+     "path": "/v1/functions",
+     "test": "(body.functions || []).some(f => /^rollup__/.test(f.name) && /ON\\s+orders/i.test(JSON.stringify(f.versions || [])) && !(f.versions || []).at(-1)?.dropped)"
+    }
+   ]
+  }
+ ]
+}

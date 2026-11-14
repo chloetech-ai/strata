@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Quickstart: a first search in five minutes · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="This page takes you from nothing to a full-text search with SQL in about five minutes, with nothing to compile. You install ChloeDB&#x27;s server, make a table, put a few rows in it, search them, and open the command…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/quickstart.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Start</span>
       <h1>Quickstart: a first search in five minutes</h1>
       <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/guide/run.py">docs/guide/run.py</a>).</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#1-install-the-server">Install the server</a></li><li><a href="#2-start-it">Start it</a></li><li><a href="#3-make-a-table-and-fill-it">Make a table and fill it</a></li><li><a href="#4-search">Search</a></li><li><a href="#5-open-the-command-center">Open the command center</a></li><li><a href="#chloedb-from-python-with-no-server">ChloeDB from Python, with no server</a></li><li><a href="#chloedb-in-docker">ChloeDB in Docker</a></li><li><a href="#next">Next</a></li></ol></details>
     <div class="doc-body">
@@ -92,17 +95,16 @@
 <p>Pick one. Each gives you a <code>chloedb-server</code> program, prebuilt (a download of about 50 MB), in under a minute.</p>
 <p><strong>The install script</strong> puts it in <code>~/.local/bin</code> (it says what to add to your <code>PATH</code> if that folder is not on it yet). It checks the download against the release's SHA-256 and changes nothing else. <a href="../../install.sh">Read it</a> first if you like.</p>
 <pre data-lang="sh">curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh</pre>
-<p><strong>Homebrew</strong>, on macOS or Linux:</p>
-<pre data-lang="sh">brew install chloetech-ai/tap/chloedb</pre>
+<p><strong>Homebrew</strong> is not available yet: there is no tap to install from. Use the install script above, which works on the same Macs and Linux machines.</p>
 <p><strong>Docker</strong>: skip to <a href="#chloedb-in-docker">ChloeDB in Docker</a> below, which runs the same steps against the image.</p>
 <p><strong>By hand</strong>: each <code>chloedb-server-v&lt;version&gt;</code> <a href="https://github.com/chloetech-ai/chloedb/releases">release</a> has an archive per platform (<code>linux-x86_64</code>, <code>linux-aarch64</code>, <code>macos-arm64</code>, <code>macos-x86_64</code>) with a <code>.sha256</code> beside it:</p>
-<pre data-lang="sh">v=0.3.2 p=macos-arm64
+<pre data-lang="sh">v=0.3.3 p=macos-arm64
 curl -fLO https://github.com/chloetech-ai/chloedb/releases/download/chloedb-server-v$v/chloedb-server-$p.tar.gz
 tar xzf chloedb-server-$p.tar.gz &amp;&amp; mkdir -p ~/.local/bin &amp;&amp; mv chloedb-server-$p/chloedb-server ~/.local/bin/</pre>
 <p>Check that it runs:</p>
 <pre data-lang="sh">chloedb-server --version</pre>
 <h2 id="2-start-it">2. Start it<a class="anchor" href="#2-start-it" aria-label="Link to this section">#</a></h2>
-<p>A database is one file. Give the server a path that does not exist yet and it creates an empty database there; it listens on <code>127.0.0.1:7700</code>, which only this machine can reach.</p>
+<p>A database is a file, with its write-ahead log and the server's own logs beside it (<code>quickstart.chloedb-wal</code>, <code>quickstart.chloedb.logs</code>). Give the server a path that does not exist yet and it creates an empty database there; it listens on <code>127.0.0.1:7700</code>, which only this machine can reach.</p>
 <pre data-lang="sh">mkdir -p chloedb-quickstart &amp;&amp; cd chloedb-quickstart
 chloedb-server --db quickstart.chloedb &gt; server.log 2&gt;&amp;1 &amp;
 server=$!
@@ -183,7 +185,7 @@ EOF</pre>
 <h2 id="chloedb-in-docker">ChloeDB in Docker<a class="anchor" href="#chloedb-in-docker" aria-label="Link to this section">#</a></h2>
 <p>The image <code>ghcr.io/chloetech-ai/chloedb-server</code> (Linux, x86-64 and arm64) keeps its database in <code>/data</code>: mount a volume there to keep it. Inside a container the server listens on all of the container's interfaces, which it allows only with a token, so pick one. Publishing the port on <code>127.0.0.1</code> keeps it to this machine.</p>
 <pre data-lang="sh">docker run -d --name chloedb --user 10001:10001 -p 127.0.0.1:7700:7700 -e CHLOEDB_TOKEN=pick-a-secret -v chloedb:/data \
-  ghcr.io/chloetech-ai/chloedb-server:0.3.2</pre>
+  ghcr.io/chloetech-ai/chloedb-server:0.3.3</pre>
 <p>Then every request sends the token, and the console asks for it once:</p>
 <pre data-lang="sh">sql() { curl -sS http://127.0.0.1:7700/v1/sql -H &#x27;content-type: application/json&#x27; -H &#x27;authorization: Bearer pick-a-secret&#x27; --data-binary @-; echo; }</pre>
 <p>and steps 3 to 5 run as written (the <code>/v1/write</code> call needs the same <code>authorization</code> header). Arguments after the image replace its default ones (<code>--db /data/chloedb.chloedb --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701</code>): add <code>--demo 20000</code> by passing <code>--db /data/demo.chloedb --listen 0.0.0.0:7700 --demo 20000</code>. <code>docker rm -f chloedb</code> stops it; the volume keeps the database.</p>
@@ -203,7 +205,7 @@ EOF</pre>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

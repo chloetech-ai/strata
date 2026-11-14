@@ -544,3 +544,42 @@ td.acts .rc-more > summary { width: 30px; height: 30px; }
 @media (pointer: coarse) { td.acts .rc-pill { min-height: 44px; } td.acts .rc-more > summary { width: 44px; height: 44px; } }
 @media (pointer: coarse) { .rc-end .rc-more > summary { width: 44px; height: 44px; } }
 .rc-end .chev { width: 8px; height: 8px; border-right: 2px solid color-mix(in srgb, var(--fg) 30%, transparent); border-top: 2px solid color-mix(in srgb, var(--fg) 30%, transparent); transform: rotate(45deg); margin: 0 4px 0 2px; }
+
+/* ---- page structures (a screen's "layout", LAYOUT in a statement; engine/quality.mjs).
+   screen.js gathers a working screen's title and numbers as its head
+   (.lay-head) and its parts into groups (.lay-group), each starting at a
+   heading or a row of numbers; these rules place them. */
+.lay-group { display: flex; flex-direction: column; gap: calc(var(--space) * .6); min-width: 0; }
+.lay-head { display: flex; flex-direction: column; gap: calc(var(--space) * .5); }
+/* hero: the head is a band in the deep accent, its words white at 8:1 */
+.lay-hero { background: var(--deep, var(--accent)); color: var(--deep-fg, var(--accent-fg)); border-radius: var(--radius); padding: clamp(22px, 4vw, 44px) clamp(18px, 4vw, 44px); gap: 12px;
+  --fg: var(--deep-fg, var(--accent-fg)); --muted: color-mix(in srgb, var(--deep-fg, var(--accent-fg)) 86%, var(--deep, var(--accent))); }
+.lay-hero :is(h1, h2) { color: inherit; font-size: clamp(28px, 5vw, 46px); line-height: 1.06; letter-spacing: -.03em; }
+.lay-hero button.primary, :root[data-look] .lay-hero button.primary { background: var(--deep-fg, var(--accent-fg)); border-color: transparent; color: var(--deep, var(--accent)); }
+.lay-hero button:not(.primary) { background: transparent; color: inherit; border-color: color-mix(in srgb, var(--deep-fg, #fff) 40%, transparent); }
+.lay-hero :is(.say, .hero-band) { background: transparent; color: inherit; padding: 0; box-shadow: none; }
+/* split: the main part wide, a column beside it */
+.lay-split { display: grid; grid-template-columns: minmax(0, 1.75fr) minmax(0, 1fr); gap: calc(var(--space) * 1.5); align-items: start; }
+.lay-aside { display: flex; flex-direction: column; gap: calc(var(--space) * 1.25); position: sticky; top: var(--space); }
+@media (max-width: 860px) { .lay-split { grid-template-columns: minmax(0, 1fr); } .lay-aside { position: static; } }
+/* editorial: a reading column, large titles, rows as a ruled list */
+body.layout-editorial #root { max-width: min(var(--page), 760px); }
+.layout-editorial > .lay-head :is(h1, h2) { font-family: var(--font-title); font-size: clamp(30px, 5.4vw, 52px); line-height: 1.05; letter-spacing: -.03em; }
+.layout-editorial > .lay-head p { font-size: calc(var(--text) * 1.15); max-width: 60ch; }
+.layout-editorial :is(.list > .item, .list > li, tbody tr) { padding-block: calc(var(--row) * 1.6); }
+.layout-editorial .lay-group + .lay-group { border-top: 1px solid var(--line); padding-top: calc(var(--space) * 1.5); }
+/* dashboard: numbers on top, then a grid of cards */
+.lay-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: var(--space); align-items: start; }
+.layout-dashboard .lay-grid > .lay-group { background: var(--card); border: 1px solid var(--card-border); box-shadow: var(--card-shadow); border-radius: var(--radius); padding: var(--pad); }
+.layout-dashboard .lay-grid > .lay-group:has(table) { grid-column: 1 / -1; }
+.layout-dashboard > .lay-head .kpis { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+/* gallery: photos and cards first, in tiles */
+.layout-gallery :is(.rcards, .list:has(> .card)) { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 230px), 1fr)); gap: 14px; }
+.layout-gallery img { border-radius: var(--radius-small); }
+/* tool: one centered panel with the main input first */
+body.layout-tool #root { max-width: min(var(--page), 680px); }
+.layout-tool > .lay-head { align-items: center; text-align: center; }
+.lay-panel { background: var(--card); border: 1px solid var(--card-border); box-shadow: var(--card-shadow); border-radius: calc(var(--radius) * 1.4); padding: clamp(16px, 3vw, 28px); }
+.layout-tool .lay-panel :is(input, select, textarea) { font-size: max(16px, 1.05em); }
+.layout-tool .lay-panel button.primary { min-height: 44px; padding-inline: 20px; }
+@media (max-width: 560px) { .lay-hero { border-radius: 0; margin-inline: -14px; } }

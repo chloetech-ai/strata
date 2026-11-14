@@ -430,10 +430,11 @@ impl HostedReranker {
         loop {
             let passage = cut_to.map_or(text, |n| cut(text, n));
             let messages = json!([{"role": "user", "content": super::grading_prompt(query, passage)}]);
-            // A chat server takes its own defaults: newer OpenAI models
-            // refuse `max_tokens` and a temperature other than 1.
+            // A server takes its own sampling defaults: current Claude
+            // models refuse `temperature` (400), and newer OpenAI models
+            // `max_tokens` and a temperature other than 1.
             let body = match ep.api {
-                RerankApi::Anthropic => json!({"model": ep.model, "max_tokens": 16, "temperature": 0, "messages": messages}),
+                RerankApi::Anthropic => json!({"model": ep.model, "max_tokens": 16, "messages": messages}),
                 _ => json!({"model": ep.model, "messages": messages}),
             };
             let wire = Wire { url: &ep.url, key: ep.key.as_deref(), key_header: &ep.key_header, key_from: &ep.key_from, headers: &ep.headers };
@@ -594,7 +595,8 @@ impl Generator {
         let ep = &self.ep;
         let text = cut(text, ep.max_chars);
         let body = match ep.api {
-            RerankApi::Anthropic => json!({"model": ep.model, "max_tokens": max_tokens, "temperature": 0, "system": system, "messages": [{"role": "user", "content": text}]}),
+            // No `temperature`: current Claude models refuse it (400).
+            RerankApi::Anthropic => json!({"model": ep.model, "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": text}]}),
             // A chat server takes its own defaults: newer OpenAI models
             // refuse `max_tokens` and a temperature other than 1.
             _ => json!({"model": ep.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}]}),

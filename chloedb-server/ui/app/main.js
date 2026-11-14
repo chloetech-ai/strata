@@ -4,7 +4,7 @@
 // palette (Ctrl+K), which finds views, actions and the fleet's shards,
 // copies, nodes, tables, statements, alerts and keys, and the shortcuts.
 
-import { h, icon, clear, store, bus, api, at, connectionName, setToken, hasToken, modal, toast, menu, seg, fmt, copy, connection, can, needs, link, when, whenTitle, span, copyName, copyTitle, isNarrow, logsLink, keyLabel } from "./core.js";
+import { h, icon, clear, store, bus, api, at, connectionName, setToken, hasToken, signInNeeded, modal, toast, menu, seg, fmt, copy, connection, can, needs, link, when, whenTitle, span, copyName, copyTitle, isNarrow, logsLink, keyLabel } from "./core.js";
 import { state, start, setRange, setWindow, setZoom, setPaused, refreshWho, RANGES, rangeFromUrl, rangeParams, timeRange, firingAlerts, firingNow, fresh, clusterName, environment, isCoordinator, setPolls, overnight, isSandbox } from "./data.js";
 import { VIEWS, NAV, REDIRECTS } from "./views/index.js";
 import { loadApps, listApps, appIcon } from "./views/apps.js";
@@ -28,11 +28,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => bus.
 const brandName = h("b", {}, location.host);
 const brandSub = h("small", {}, "connecting…");
 const brand = h("button", { class: "brand", title: "Which cluster this is, and the others you used", "aria-haspopup": "menu" },
-  document.createElementNS("http://www.w3.org/2000/svg", "svg"),
+  h("span", { class: "mark" },
+    h("img", { class: "on-light", src: new URL("brand/chloedb-mark-on-light.svg", import.meta.url).href, alt: "" }),
+    h("img", { class: "on-dark", src: new URL("brand/chloedb-mark.svg", import.meta.url).href, alt: "" })),
   h("div", { class: "clu" }, h("span", { class: "row nw", style: { gap: "4px" } }, brandName, icon("down", "chev")), brandSub));
-const markSvg = brand.querySelector("svg");
-for (const [k, v] of Object.entries({ class: "mark", viewBox: "0 0 32 32", "aria-hidden": "true" })) markSvg.setAttribute(k, v);
-markSvg.innerHTML = '<defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="var(--s1)"/><stop offset="1" stop-color="var(--s7)"/></linearGradient></defs><rect x="2" y="2" width="28" height="28" rx="8" fill="url(#lg)"/><path d="M8 11.5 16 8l8 3.5-8 3.5z" fill="#fff" opacity=".95"/><path d="m8 16 8 3.5 8-3.5" stroke="#fff" stroke-width="2" fill="none" stroke-linejoin="round" opacity=".8"/><path d="m8 20.5 8 3.5 8-3.5" stroke="#fff" stroke-width="2" fill="none" stroke-linejoin="round" opacity=".6"/>';
 
 // Coordinators used from this browser, newest first. Each address keeps its
 // own list (storage is per address), so switching records both ends.
@@ -122,7 +121,7 @@ function navLink(e) {
   const v = viewOf(e);
   const a = h("a", { href: "#/" + e.id, dataset: { view: e.id }, title: e.title + (e.key ? ` (g then ${e.key})` : "") }, icon(e.icon || v.icon), h("span", { class: "t" }, e.title));
   if (e.key) a.append(h("span", { class: "kb", "aria-hidden": "true" }, "g " + e.key));
-  if (e.scope && state.whoami && !can(e.scope)) { a.classList.add("gated"); a.title = `${e.title}: you can look; changing anything here ${needs(e.scope)}`; a.append(h("span", { class: "lockic" }, icon("lock"))); }
+  if (e.scope && state.whoami && !can(e.scope, e.route)) { a.classList.add("gated"); a.title = `${e.title}: you can look; changing anything here ${needs(e.scope, e.route)}`; a.append(h("span", { class: "lockic" }, icon("lock"))); }
   // The range goes along, so a view opens on the window in use.
   a.addEventListener("click", (ev) => { if (ev.button === 0 && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey) { ev.preventDefault(); location.hash = link(e.id); } });
   return a;
@@ -199,6 +198,8 @@ function drawBadges() {
   if (state.paused && drawBadges.done) return;
   drawBadges.done = true;
   for (const a of nav.querySelectorAll("a[data-view]")) {
+    // An app's "!" (not answering) is its link's own, drawn with the list of apps.
+    if (a.dataset.view.startsWith("app/")) continue;
     const e = ENTRIES.find((x) => x.id === a.dataset.view);
     const v = e && viewOf(e);
     let b = null;
@@ -235,7 +236,7 @@ const rangeSeg = seg(RANGES.map(([k, m]) => [m, k, `The last ${k.replace(/(\d)([
 const absBtn = h("button", { class: "abs" });
 absBtn.onclick = () => pickWindow();
 const zoomChip = h("button", { class: "chip hidden", "aria-pressed": "true", title: "Drag across a chart to zoom; this resets it", onclick: () => setZoom(null) }, icon("zout"), "zoomed", h("span", { class: "x" }, "×"));
-const liveBtn = h("button", { class: "btn sm live", onclick: () => setPaused(!state.paused) });
+const liveBtn = h("button", { class: "btn sm live", onclick: () => (signInNeeded() ? bus.emit("unauthorized") : setPaused(!state.paused)) });
 const shareBtn = h("button", { class: "btn sm", title: "Copy a link to exactly this: the view, its selection and this window as fixed times (it opens paused) (s)", onclick: () => share() }, icon("share"), h("span", { class: "lbl" }, "Share"));
 const bell = h("a", { class: "btn ghost icon", href: "#/alerts", title: "Alerts", style: { position: "relative" } }, icon("alerts"));
 const bellCount = h("span", { class: "count hidden bellc" });
@@ -330,6 +331,7 @@ function drawLive() {
   const f = fresh("series"), fh = fresh("health");
   let cls, ic, text, title;
   if (!c.ok) { cls = "down"; ic = "bad"; text = "Not answering"; title = `The server has not answered since ${when(c.since_ms)}: ${c.message}. Click to pause`; }
+  else if (signInNeeded()) { cls = "stale"; ic = "lock"; text = "Signed out"; title = hasToken() ? "The server refused this key: nothing is asked of it until you enter another (click to sign in)" : "This server needs a key: nothing is asked of it until you enter one (click to sign in)"; }
   else if (state.paused) { cls = "paused"; ic = "play"; text = state.from != null ? "Fixed window" : `Paused at ${when(state.pausedAt)}`; title = "Nothing redraws while paused. Click to go live (p)"; }
   else if ((!f.ok && !f.loading) || (!fh.ok && !fh.loading)) { cls = "stale"; ic = "clock"; text = "Stale"; title = `No fresh data: ${(!f.ok ? f.error : fh.error) || "the last answers are old"}`; }
   else { cls = "ok"; ic = null; text = "Live"; title = "Live: the data follows now. Click to pause (p)"; }
@@ -521,12 +523,37 @@ function askToken() {
       h("p", { class: "dim", style: { margin: 0 } }, "Paste an API key (feed, read, write or admin) or the server's token. It is kept for this tab only, and sent as a bearer token."), inp],
     foot: [h("button", { class: "btn", onclick: () => m.close() }, "Cancel"), save],
   });
-  const ok = () => { setToken(inp.value.trim()); m.close(); refreshWho(); toast("Key saved for this tab", "ok"); };
+  const said = h("div", { class: "small", role: "status", "aria-live": "polite" });
+  // The key is asked about before it is kept: a key the server refuses is
+  // said so here, and the dialog stays open.
+  const ok = async () => {
+    const t = inp.value.trim();
+    if (!t || save.disabled) return;
+    save.disabled = true; said.className = "small muted"; said.textContent = "Checking the key…";
+    let w = null;
+    try {
+      const r = await fetch(at("/v1/whoami"), { headers: { authorization: "Bearer " + t, "x-strata-client": "command-center" } });
+      if (r.status === 401 || r.status === 403) { save.disabled = false; said.className = "small bad"; said.textContent = "The server refused this key: check that it is whole, and that it was not revoked or expired."; inp.select(); return; }
+      if (r.ok) w = await r.json().catch(() => null);
+    } catch { /* not answering: kept, and the page says so */ }
+    setToken(t); m.close(); refreshWho();
+    toast(w?.name ? `Signed in as ${w.name} (${w.tables ? keyLabel(w) : w.scope})` : "Key kept for this tab", "ok");
+  };
   save.onclick = ok;
   inp.onkeydown = (e) => { if (e.key === "Enter") ok(); };
+  inp.oninput = () => { said.textContent = ""; };
+  m.el.querySelector(".bd").append(said);
 }
+// Asked once for a key the server refuses (or no key), until another key
+// is given: Cancel is an answer. A page's own "Enter a key" button always asks.
 let asked = false;
-bus.on("unauthorized", () => { if (!document.querySelector(".modal")) { if (!asked || !hasToken()) askToken(); asked = true; } });
+bus.on("token", () => { asked = false; });
+bus.on("unauthorized", (path) => {
+  if (document.querySelector(".modal")) return;
+  if (typeof path === "string" && asked) return;
+  asked = true;
+  askToken();
+});
 
 // ---------------------------------------------------------------- palette
 const go = (hash) => () => { location.hash = hash; };
@@ -538,7 +565,7 @@ const ACTIONS = [
   ...RANGES.map(([k, m], i) => ({ name: `Show the last ${k.replace(/(\d)([a-z])/, "$1 $2")}`, icon: "clock", run: () => setRange(m), hint: String(i + 1) })),
   { name: "Show a fixed window (dates and times)", icon: "clock", run: () => pickWindow() },
   { name: "What happened overnight (Timeline, 18:00 to 08:00)", icon: "timeline", run: () => { const [a, b] = overnight(); setWindow(a, b); location.hash = link("timeline"); } },
-  { name: "Add a note to the timeline", icon: "note", run: go("#/timeline?note=1"), scope: "admin" },
+  { name: "Add a note to the timeline", icon: "note", run: go("#/timeline?note=1"), scope: "admin", route: "POST /v1/events/notes" },
   { name: "Toggle light or dark", icon: "moon", run: () => toggleTheme(), hint: "t" },
   { name: "Collapse or expand the sidebar", icon: "menu", run: () => toggleSide(), hint: "[" },
   { name: "Open another coordinator", icon: "node", run: () => askCoordinator() },
@@ -572,14 +599,16 @@ function mark(text, q) {
 }
 
 // What the palette finds besides the cluster: read when it opens, kept a minute.
-const found = { at: 0, tables: [], statements: [], keys: [] };
+const found = { at: 0, tables: [], statements: [], keys: [], functions: [] };
 async function loadFinds() {
   if (Date.now() - found.at < 60e3) return;
   found.at = Date.now();
-  const [t, st, k] = await Promise.allSettled([
+  const [t, st, k, fn] = await Promise.allSettled([
     api("/v1/tables", { timeout: 5000 }),
     api("/v1/queries/stats?limit=200", { timeout: 5000 }),
-    can("admin") ? api("/v1/admin/keys", { timeout: 5000 }) : Promise.reject(new Error("not admin"))]);
+    can("admin") ? api("/v1/admin/keys", { timeout: 5000 }) : Promise.reject(new Error("not admin")),
+    api("/v1/functions", { timeout: 5000 })]);
+  if (fn.status === "fulfilled") found.functions = (fn.value.functions || []).filter((f) => f.current != null);
   if (t.status === "fulfilled") found.tables = (Array.isArray(t.value) ? t.value : t.value.tables || []).map((x) => typeof x === "string" ? { name: x } : { name: x.name || x.table, docs: x.docs ?? x.rows });
   if (st.status === "fulfilled") found.statements = Array.isArray(st.value) ? st.value : st.value.statements || [];
   found.keys = k.status === "fulfilled" ? (k.value.keys || []).filter((x) => !x.revoked_ms) : [];
@@ -661,6 +690,12 @@ function entities(q) {
     out.push({ grp: "Keys", sc: sc - 5, icon: "key", name: k.name, sub: [k.scope, k.owner ? "owner " + k.owner : null, k.last_used_ms ? "used " + fmt.ago(k.last_used_ms) : "never used"].filter(Boolean).join(" · "), hint: "Access", run: go(link("access", { tab: "keys", key: k.id })),
       acts: [{ name: `Queries from key ${k.name}`, icon: "queries", hint: "Queries", run: go(link("queries", { key: k.name })) }, { name: `The key in Access and audit`, icon: "access", hint: "Access", run: go(link("access", { tab: "keys", key: k.id })) }] });
   }
+  // Saved searches (stored functions): by name and what they are for.
+  for (const f of found.functions) {
+    const cur = (f.versions || []).find((v) => v.version === f.current) || {};
+    const sc = score(ql, `${f.name} ${cur.description || f.description || ""}`); if (sc <= 0) continue;
+    out.push({ grp: "Saved searches", sc, icon: "bookmark", name: f.name, sub: cur.description || f.description || (cur.kind === "table" ? "a saved search" : "a stored function"), hint: "Saved", run: go(link("saved/" + encodeURIComponent(f.name))) });
+  }
   // A request id.
   if (/^[0-9a-f]{12,32}$/i.test(ql)) out.push({ grp: "Requests", sc: 260, icon: "logs", name: `Request ${ql}`, sub: "its log lines and its query", hint: "Logs", run: go(logsLink({ request: ql })) });
   return out;
@@ -689,12 +724,12 @@ function copyActs(nm, r, shard) {
 
 function openPalette(initial = "") {
   if (document.querySelector(".palette")) return;
-  const inp = h("input", { placeholder: "Shard 117, s9-2, a node, a table, an alert, a key, a view…", "aria-label": "Search", autocomplete: "off", spellcheck: "false", value: initial });
+  const inp = h("input", { placeholder: isCoordinator() ? "Shard 117, s9-2, a node, a table, an alert, a key, a view…" : "A table, a saved search, a view, an alert, a key…", "aria-label": "Search", autocomplete: "off", spellcheck: "false", value: initial });
   const list = h("div", { class: "list", role: "listbox" });
   const closeBtn = h("button", { class: "btn ghost pal-close", type: "button" }, "Cancel");
   const pal = h("div", { class: "palette", role: "dialog", "aria-label": "Command palette" }, h("div", { class: "pal-in" }, icon("search"), inp, closeBtn), list,
     h("div", { class: "foot" }, h("span", {}, h("kbd", {}, "↑"), " ", h("kbd", {}, "↓"), " to move"), h("span", {}, h("kbd", {}, "Enter"), " to open"), h("span", {}, h("kbd", {}, "Tab"), " for its actions"), h("span", {}, h("kbd", {}, "Esc"), " to close"),
-      h("span", { class: "sep" }), h("span", {}, "finds shards, copies, nodes, tables, statements, alerts, keys, request ids")));
+      h("span", { class: "sep" }), h("span", {}, isCoordinator() ? "finds shards, copies, nodes, tables, saved searches, statements, alerts, keys, request ids" : "finds tables, saved searches, statements, alerts, keys, request ids")));
   const scrim = h("div", { class: "scrim" });
   document.body.append(scrim, pal);
   loadFinds().then(() => { if (pal.isConnected) draw(); }).catch(() => {});
@@ -706,7 +741,7 @@ function openPalette(initial = "") {
     if (focus) items = focus.acts.map((a) => ({ ...a, grp: focus.name }));
     else {
       const views = ENTRIES.map((e) => { const v = viewOf(e); return { name: e.title, icon: e.icon || v.icon, grp: "Views", hint: e.group + (e.key ? ` · g ${e.key}` : ""), run: go(link(e.id)), sc: Math.max(score(q, e.title), score(q, (v.keywords || "") + " " + e.id, false) * 0.8) * (q ? 0.9 : 1) }; });
-      const acts = ACTIONS.filter((a) => !a.scope || can(a.scope)).map((a) => ({ ...a, grp: "Actions", sc: score(q, a.name, false) * 0.8 }));
+      const acts = ACTIONS.filter((a) => !a.scope || can(a.scope, a.route)).map((a) => ({ ...a, grp: "Actions", sc: score(q, a.name, false) * 0.8 }));
       const ents = entities(q).sort((a, b) => b.sc - a.sc);
       // The best match's actions come right after it ("about shard 117").
       const best = ents[0];
@@ -738,7 +773,7 @@ function openPalette(initial = "") {
       row.onmousemove = () => { if (sel === i) return; sel = i; list.querySelectorAll(".it").forEach((el, k) => { el.classList.toggle("on", k === i); el.setAttribute("aria-selected", String(k === i)); }); };
       list.append(row);
     });
-    if (!items.length) list.append(h("div", { class: "empty" }, q ? `Nothing matches "${q}". Shards by number (117), copies by name (s9-2) or port, nodes, zones, tables, statements, alerts and keys are found here.` : "Nothing here"));
+    if (!items.length) list.append(h("div", { class: "empty" }, q ? `Nothing matches "${q}". ${isCoordinator() ? "Shards by number (117), copies by name (s9-2) or port, nodes, zones, " : ""}tables, saved searches, statements, alerts and keys are found here.` : "Nothing here"));
     list.querySelector(".on")?.scrollIntoView({ block: "nearest" });
   }
   inp.oninput = () => { sel = 0; focus = null; draw(); };
@@ -772,7 +807,9 @@ document.addEventListener("keydown", (e) => {
   if ((e.key === "k" || e.key === "K") && (e.ctrlKey || e.metaKey) && !document.querySelector(".fb-ed")) { e.preventDefault(); openPalette(); return; }
   if ((e.key === "j" || e.key === "J") && (e.ctrlKey || e.metaKey) && !document.querySelector(".fb-ed,.palette")) { e.preventDefault(); openAsk(); return; }
   // Feedback takes a drawer or a dialog too, so f works over them.
-  if (e.key === "f" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && !document.querySelector(".palette,.fb-ed,.menu")) { e.preventDefault(); openFeedback(); return; }
+  // (g then f goes to the Feedback view: the g comes first.)
+  const afterG = gPending && Date.now() - gPending < 1200;
+  if (e.key === "f" && !afterG && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && !document.querySelector(".palette,.fb-ed,.menu")) { e.preventDefault(); openFeedback(); return; }
   if (typing || e.ctrlKey || e.metaKey || e.altKey || document.querySelector(".modal,.palette,.drawer,.fb-ed")) return;
   if (gPending && Date.now() - gPending < 1200 && GKEYS[e.key]) { gPending = 0; location.hash = link(GKEYS[e.key].id); e.preventDefault(); return; }
   gPending = 0;

@@ -55,7 +55,7 @@ pub const CODES: &[Code] = &[
     c("table_not_found", false, "list the tables the key may read (GET /v1/tables, or the list_tables tool)", "schemas"),
     c("column_not_found", false, "describe the table (GET /v1/schema?table=..., or the describe_table tool) for its fields", "schemas"),
     c("query_invalid", false, "the statement does not parse or bind: check it with check_sql, and look up the syntax with search_docs", "http-api"),
-    c("schema_invalid", false, "the schema is refused as the error says (POST /v1/schema/check checks one)", "schemas"),
+    c("schema_invalid", false, "the schema is refused as the error says (check_sql, or POST /v1/schema/check, checks one without making it)", "schemas"),
     c("idempotency_conflict", false, "this idempotency key was used for another request: send a new key", "writes-from-many-clients"),
     c("contained", true, "a contain rule limits or refuses these queries for a while (GET /v1/admin/contain); wait, or ask an operator", "who-sends-the-queries-and-containing-them"),
     c("overloaded", true, "the server is busy: send it again after Retry-After seconds", "limits"),

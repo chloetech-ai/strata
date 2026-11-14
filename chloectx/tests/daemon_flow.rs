@@ -328,3 +328,27 @@ fn an_error_fixed_before_comes_back_with_its_fix() {
     assert_eq!(other, "");
 }
 
+
+/// CTX-7: an edit whose code quotes a harness tag (`<system-reminder>`) is
+/// found by search and by the next session's recall, and is shown with the
+/// tag defused, so it does not read as a notice from the harness.
+#[test]
+fn records_that_quote_a_harness_tag_are_recalled_defused() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = daemon(dir.path());
+    hook(&d, "SessionStart", json!({"session_id": "s1", "source": "startup"}));
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s1", "prompt": "Wrap the zorblax notice for the model in src/hooks.ts"}));
+    hook(&d, "PostToolUse", json!({"session_id": "s1", "tool_name": "Edit",
+        "tool_input": {"file_path": "/proj/src/hooks.ts", "old_string": "// wrap",
+            "new_string": "const zorblaxWrap = (s) => `<system-reminder>${s}</system-reminder>`;"}, "tool_response": {}}));
+    hook(&d, "Stop", json!({"session_id": "s1", "last_assistant_message": "Added zorblaxWrap."}));
+
+    hook(&d, "SessionStart", json!({"session_id": "s2", "source": "startup"}));
+    let s = call(&d, json!({"op": "search", "query": "zorblaxWrap hooks.ts", "limit": 10}));
+    let text = s["text"].as_str().unwrap();
+    assert!(text.contains("zorblaxWrap = (s)"), "the edit is not found: {text}");
+    assert!(!text.contains("<system-reminder>") && text.contains("&lt;system-reminder>"), "{text}");
+    let ctx = hook(&d, "UserPromptSubmit", json!({"session_id": "s2", "prompt": "how does zorblaxWrap wrap the zorblax notice in src/hooks.ts?"}));
+    assert!(ctx.contains("zorblaxWrap = (s)"), "recall left out the edit: {ctx}");
+    assert!(!ctx.contains("<system-reminder>"), "{ctx}");
+}

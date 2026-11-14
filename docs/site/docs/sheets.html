@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>chloedb-sheets: spreadsheets in ChloeDB · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="chloedb-sheets is a spreadsheet app that keeps its workbooks in ChloeDB. A workbook has the things you expect of one: sheets, formulas (IronCalc&#x27;s engine, over 300 of Excel&#x27;s functions, array formulas and spills),…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/sheets.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>chloedb-sheets: spreadsheets in ChloeDB</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/sheets.md">docs/chloedb/sheets.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#the-app">The app</a></li><li><a href="#how-workbooks-are-kept">How workbooks are kept</a></li><li><a href="#its-api">Its API</a></li></ol></details>
     <div class="doc-body">
@@ -89,7 +92,7 @@
 <p><code>chloedb-sheets</code> is a spreadsheet app that keeps its workbooks in ChloeDB. A workbook has the things you expect of one: sheets, formulas (IronCalc's engine, over 300 of Excel's functions, array formulas and spills), number formats, fonts, colors, borders, merged cells, frozen panes, conditional formats, named ranges, sorting, filters, find and replace, charts and pivot tables. It also has what a spreadsheet kept in a database can have:</p>
 <ul>
 <li><strong>Every cell is a row of a ChloeDB table</strong>, so every workbook can be searched at once (BM25 over the cells' text), and a workbook opened in two windows shows what the other changed.</li>
-<li><strong>The cluster's tables open as sheets</strong>, live: rows paged in as you scroll, sorted by any column, filtered with a SQL <code>WHERE</code> and searched with <code>MATCH</code>, and edited in place (each change is a write to the table).</li>
+<li><strong>The cluster's tables open as sheets</strong>, live: rows paged in as you scroll (past the server's result window, by the sort's key: the key's column or a number, time or boolean column, so a table of any size is read to its end), sorted by any column, filtered with a SQL <code>WHERE</code> and searched with <code>MATCH</code>, and edited in place (each change is a write to the table).</li>
 <li><strong>Cells can be filled by SQL</strong>: a query of the cluster's tables writes its answer into a sheet from a cell on, is kept with the workbook, and runs again when you refresh it, so the cells (and the formulas and charts over them) follow the table.</li>
 <li><strong>A sheet becomes a table</strong>: its first row names the columns, each column gets the type its cells hold, and its rows are written to ChloeDB by a key you choose.</li>
 <li><strong>Files come in and go out</strong>: Excel workbooks (.xlsx, formulas and formats kept), CSV and TSV, and SQLite databases, whose tables become sheets of a workbook or tables of the cluster; a workbook goes out as .xlsx, a sheet as CSV.</li>
@@ -101,7 +104,7 @@
 cd chloedb-sheets &amp;&amp; cargo build --release
 target/release/chloedb-sheets serve --local ./sheets-cluster --server-bin ../chloedb-server/target/release/chloedb-server</pre>
 <p>Open <code>http://127.0.0.1:7700</code> and go to <strong>Apps → Sheets</strong>.</p>
-<p><img alt="Sheets in the command center: search over every workbook, the workbooks, an import area, and the cluster's tables" src="../../assets/img/strata-sheets-home.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Sheets in the command center: search over every workbook, the workbooks, an import area, and the cluster's tables" src="../../assets/img/strata-sheets-home.png" /></p>
 <p><code>--local DIR</code> starts a chloedb-server on <code>127.0.0.1:7700</code> (<code>--local-listen</code>) with its database in <code>DIR</code>, lists chloedb-sheets on it as the app <code>sheets</code>, and stops it when chloedb-sheets stops; the same <code>DIR</code> again serves the same workbooks.</p>
 <p>Against a cluster that runs elsewhere, give chloedb-sheets the server (a coordinator or one server) and a key, and give the server the app. Its first start creates the two tables it keeps workbooks in, which takes an admin key; after that a key that can write is enough:</p>
 <pre data-lang="sh">chloedb-sheets serve --server http://coordinator:7700 --key &quot;$CHLOEDB_KEY&quot; --token &quot;$SHEETS_TOKEN&quot; --listen 0.0.0.0:7820
@@ -141,7 +144,7 @@ target/release/chloedb-sheets import shop.sqlite --tables orders,customers --nam
 target/release/chloedb-sheets export &lt;workbook id&gt; -o budget.xlsx --server http://127.0.0.1:7700</pre>
 <h2 id="the-app">The app<a class="anchor" href="#the-app" aria-label="Link to this section">#</a></h2>
 <p><strong>Sheets</strong> lists the workbooks, newest first (<strong>Mine</strong>, <strong>Shared</strong> or <strong>All</strong>, with each one's owner), the cluster's tables, a search over every workbook, and an import area that takes a file dropped on it. A SQLite file asks which of its tables to bring and where: as sheets of a new workbook, or as tables of the cluster (through chloedb-server's own SQLite import, with the signed-in key, keeping the columns' types, keys and indexes). A file is not trusted: a SQLite file's views come in only when named (a view runs its query as it is read, and that query may not end), and reading one stops after 60 s for the list of tables and 180 s for the import; an xlsx file may expand to at most 512 MB and hold at most 2 million cells.</p>
-<p><img alt="A workbook: a color scale, data bars, number formats, a frozen header row and a stacked column chart over the sheet" src="../../assets/img/strata-sheets-workbook.png" /></p>
+<p><img loading="lazy" decoding="async" alt="A workbook: a color scale, data bars, number formats, a frozen header row and a stacked column chart over the sheet" src="../../assets/img/strata-sheets-workbook.png" /></p>
 <p><strong>A workbook</strong> is a grid drawn on a canvas, so a sheet of a million rows scrolls as one of ten; its cells are read a tile at a time as they come into view. Above it:</p>
 <ul>
 <li>the <strong>toolbar</strong>: undo and redo, the format painter, number formats (and decimals, currency, percent), font size, bold, italic, underline and strikethrough, text and fill colors, borders, merging, alignment and wrapping, frozen rows and columns, sorting and filters, Σ (sum, average, count, max, min, median of the cells above or of each column), charts, pivot tables, conditional formats, named ranges, SQL queries, and clearing formats;</li>
@@ -149,7 +152,7 @@ target/release/chloedb-sheets export &lt;workbook id&gt; -o budget.xlsx --server
 </ul>
 <p>The grid does what a spreadsheet's does: arrows, Tab, Enter (back to the column a run of Tabs started from) and Ctrl+arrows to move, Shift to extend, typing to replace a cell and F2 or a double click to edit it, Ctrl+Enter into every selected cell, the fill handle (drag it, or double click it to fill down the data), column and row resizing (double click a column's edge to fit its contents), cut, copy and paste (within the app formulas move and formats come along; from other programs, tab-separated text), right-click menus to insert, delete, hide and show rows and columns, and the usual shortcuts (<strong>More → Keyboard shortcuts</strong> lists them). The sheet tabs below rename, recolor, duplicate, hide, move (drag them) and delete sheets, and the status bar shows the sum, average, count, minimum and maximum of the selection.</p>
 <p>A <strong>filter</strong> puts buttons on the header row of a range: each lists the column's values with their counts, to choose the ones shown, and sorts. It is kept with the workbook. A <strong>chart</strong> (column, bar, line, area, pie or scatter, stacked or not) is drawn over the sheet from a range whose first row names the series and first column holds the categories; drag it by its title, resize it from its corner, double click it to edit it. <strong>Summarize</strong> makes a pivot table of a range on a new sheet: its rows grouped by the values of the columns chosen, with sums, counts, averages, minimums, maximums or distinct counts of others, and a total row. <strong>Conditional formatting</strong> colors cells by their value (greater than, between, text that contains, duplicates, the top 10, above average, a formula), and draws color scales, data bars and icons. <strong>Queries</strong> lists the workbook's SQL blocks, to go to, edit, run again or drop.</p>
-<p><img alt="The cluster's products table opened as a sheet: typed columns, the key in bold, a WHERE box and a text search" src="../../assets/img/strata-sheets-table.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The cluster's products table opened as a sheet: typed columns, the key in bold, a WHERE box and a text search" src="../../assets/img/strata-sheets-table.png" /></p>
 <p><strong>A table of the cluster</strong> opens at <code>#/app/sheets/t/&lt;table&gt;</code> as a sheet whose columns are the table's, named and typed in the header. Rows are read a page of 100 at a time as they come into view, ordered by the key (or by the column whose header you click, then by the key), and read again every five seconds. Typing into a cell sets that field of that row (<code>{"op": "set"}</code> by key); pasting sets many; Delete clears them. <strong>Row</strong> adds one, <strong>Column</strong> runs <code>ALTER TABLE ... ADD COLUMN</code>, <strong>Delete rows</strong> deletes the rows selected (after asking), and <strong>Open as a workbook</strong> copies the rows shown (the filter and order included) into a new workbook, for formulas, charts and pivots over them. A row's key does not change in place.</p>
 <p><strong>Numbers</strong> are shown as Excel's General format shows them, to 15 significant digits and no more (<code>226159459.83</code>, <code>4.1271186440678</code>, <code>1.5E+20</code>), in the grid, a CSV and an xlsx file alike; a number format of the cell's own still applies. <strong>Charts do not go into an .xlsx file</strong>: the file keeps the cells, formulas and formats, and the download says how many charts it left out (the <code>x-app-left-out</code> header of <code>GET /v1/books/:id/xlsx</code>).</p>
 <h2 id="how-workbooks-are-kept">How workbooks are kept<a class="anchor" href="#how-workbooks-are-kept" aria-label="Link to this section">#</a></h2>
@@ -175,7 +178,7 @@ target/release/chloedb-sheets export &lt;workbook id&gt; -o budget.xlsx --server
 </tr>
 </tbody>
 </table></div>
-<p><code>sheets_cells</code> is sharded by the workbook (<code>shard_by</code>), so a workbook's cells sit on one shard and are read in one pass, and clustered by it, so they are read in order. After each change chloedb-sheets compares every cell it touched with what it wrote last, and writes only the cells that changed, in one transaction with the workbook's row; the 350,000 cells of a 50,000-row SQLite import took 8.7 s to write, a change to one cell of it 0.1 to 0.15 s, on the container this was built in. A workbook is held in memory while it is used and let go after 30 minutes unused; a write ChloeDB refuses is retried every 30 seconds, and the workbook says it is not saved yet until one succeeds.</p>
+<p><code>sheets_cells</code> is sharded by the workbook (<code>shard_by</code>), so a workbook's cells sit on one shard and are read in one pass, and clustered by it, so they are read in order. After each change chloedb-sheets compares every cell it touched with what it wrote last, and writes only the cells that changed, in one transaction with the workbook's row; the 350,000 cells of a 50,000-row SQLite import took 8.7 s to write, a change to one cell of it 0.1 to 0.15 s, on the container this was built in. A workbook is held in memory while it is used and let go after 30 minutes unused, or sooner, the least recently used first, when the open workbooks hold more than 1.5 million cells together (<code>CHLOEDB_SHEETS_OPEN_CELLS</code>); a write ChloeDB refuses is retried every 30 seconds, and the workbook says it is not saved yet until one succeeds.</p>
 <p>Changing an open workbook from two places is safe: chloedb-sheets applies changes to a workbook one at a time, and each viewer reads what changed since the version it holds (<code>GET /v1/books/&lt;id&gt;/changes?since=</code>) every three seconds, or redraws the sheet when rows or columns moved.</p>
 <h2 id="its-api">Its API<a class="anchor" href="#its-api" aria-label="Link to this section">#</a></h2>
 <p>Each route is under the app's address (through chloedb-server: <code>/v1/apps/sheets/...</code>), and takes the token.</p>
@@ -255,7 +258,7 @@ target/release/chloedb-sheets export &lt;workbook id&gt; -o budget.xlsx --server
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

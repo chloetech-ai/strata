@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Apps on a cluster · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="Some programs built on ChloeDB run beside chloedb-server and show in its command center under Apps: the crawler, which turns a site into a table, Sheets, spreadsheets whose cells are rows of ChloeDB, and ChloeCtx,…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/guide/apps.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>Apps on a cluster</h1>
       <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/guide/run.py">docs/guide/run.py</a>).</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#how-an-app-attaches">How an app attaches</a></li><li><a href="#start-a-server-and-two-apps">Start a server and two apps</a></li><li><a href="#sheets-a-workbook-with-a-formula-and-a-query">Sheets: a workbook with a formula and a query</a></li><li><a href="#chloectx-a-memory-space-and-its-context">ChloeCtx: a memory space and its context</a></li><li><a href="#the-crawler">The crawler</a></li><li><a href="#on-kubernetes">On Kubernetes</a></li></ol></details>
     <div class="doc-body">
@@ -105,13 +108,13 @@
 <p>One token for the apps, a server that lists both, and the two apps pointed at the server:</p>
 <pre data-lang="sh">export CHLOEDB_APP_TOKEN=$(python3 -c &#x27;import secrets; print(secrets.token_hex(16))&#x27;)
 
-chloedb-server --db ./apps.chloedb --listen 127.0.0.1:7700 --grpc off \
+chloedb-server --db ./apps.chloedb --listen 127.0.0.1:7700 --grpc off --start-apps off \
   --app sheets=http://127.0.0.1:7820 --app chloectx=http://127.0.0.1:7760 &gt; server.log 2&gt;&amp;1 &amp;
 until curl -sf http://127.0.0.1:7700/v1/health &gt; /dev/null; do sleep 0.2; done
 
 chloedb-sheets serve --server http://127.0.0.1:7700 --token &quot;$CHLOEDB_APP_TOKEN&quot; &gt; sheets.log 2&gt;&amp;1 &amp;
 chloectx app --server http://127.0.0.1:7700 --token &quot;$CHLOEDB_APP_TOKEN&quot; --embedder hash:64 &gt; chloectx.log 2&gt;&amp;1 &amp;</pre>
-<p><code>--embedder hash:64</code> makes ChloeCtx's vectors from hashed words, which needs no download; leave it out to use its embedding model (<code>chloectx fetch-model</code> fetches it once). Without <code>--token</code> the server listens on loopback only and anything on this machine that reaches <code>127.0.0.1:7700</code> can change it; give it a token, and its clients keys, before it serves anyone else (<a href="server.html#security">security</a>).</p>
+<p><code>--start-apps off</code> keeps the server from starting the apps installed beside it on its own (it does by default, which is all a first run needs; this page starts them by hand to show how they attach). <code>--embedder hash:64</code> makes ChloeCtx's vectors from hashed words, which needs no download; leave it out to use its embedding model (<code>chloectx fetch-model</code> fetches it once). Without <code>--token</code> the server listens on loopback only and anything on this machine that reaches <code>127.0.0.1:7700</code> can change it; give it a token, and its clients keys, before it serves anyone else (<a href="server.html#security">security</a>).</p>
 <p>The server lists the apps once they answer, which is what the command center's <strong>Apps</strong> menu shows:</p>
 <pre data-lang="sh">until curl -sf http://127.0.0.1:7700/v1/apps | python3 -c &#x27;import json, sys; sys.exit(0 if all(a.get(&quot;up&quot;) for a in json.load(sys.stdin)[&quot;apps&quot;]) else 1)&#x27;; do sleep 0.3; done
 curl -s http://127.0.0.1:7700/v1/apps | python3 -c &#x27;
@@ -205,7 +208,7 @@ Notes from earlier conversations with the user, in their current versions, oldes
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

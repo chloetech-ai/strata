@@ -213,6 +213,10 @@ class Runner:
         self.prev = {}        # name -> {entity: tuple(values)}, to write history only on change
         self.ready = set()    # output tables made
         self.runs = {}        # name -> list of recent runs
+        # Readers of workflows' tables other than workflows (the deployed
+        # model): each a function of a workflow's name to the names of
+        # what reads it, which a delete refuses while there are any.
+        self.readers = []
 
     def setup(self):
         for t in TABLES:
@@ -248,6 +252,7 @@ class Runner:
     def delete(self, name):
         with self.lock:
             users = [n for n, s in self.specs.items() if name in deps(s)]
+            users += [u for f in self.readers for u in f(name)]
             if users:
                 raise SpecError(f"{', '.join(users)} read {name}: delete them first")
             self.db.write([{"op": "delete", "table": "fs_workflows", "key": name}])

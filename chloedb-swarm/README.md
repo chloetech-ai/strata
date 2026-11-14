@@ -22,9 +22,11 @@ person answers a short exit interview.
 Then a stronger model reviews each session, naming the problems it shows
 (bug, error message, confusing UI, missing feature, docs, performance), each
 with the step it happened at and a severity, and telling them apart from the
-simulated person's own mistakes (`agent_mistake`). One more call groups the
-problems of the whole run into findings: one problem that many sessions hit is
-one finding, with how many sessions and which personas hit it.
+simulated person's own mistakes (`agent_mistake`). It names the strengths
+too: what in the product helped the person (an error that said what to do, a
+page where they looked for it). Two more calls group the problems of the whole
+run into findings, and its strengths likewise: one problem that many sessions
+hit is one finding, with how many sessions and which personas hit it.
 
 ## Run it
 
@@ -42,7 +44,13 @@ The browser surface needs Playwright and Chromium
 A run writes `swarm-runs/runs/<id>/` (`run.json`, `sessions.json`,
 `steps.jsonl`, `findings.json`, `report.md`) and a screenshot of each browser
 session's last page. `node bin/swarm.mjs report swarm-runs <id>` writes the
-report again.
+report again, and `node bin/swarm.mjs regroup <id>` (with `--out DIR` or
+`--server URL --token T`) groups a finished run's findings again from the
+reviews it kept, without playing or reviewing a session.
+
+In the browser, the person reads the page as its accessibility tree, cut at
+16,000 characters; an open dialog comes first, whole, and `look` with a
+`part` (an element's reference) reads one table, list or section whole.
 
 | flag | what |
 |---|---|
@@ -76,7 +84,9 @@ SELECT persona, task, AVG(CAST(success AS INT)) FROM swarm_sessions GROUP BY per
 ## A scenario set
 
 `scenarios/starter.json` is the example: five personas, four tasks, three
-seeds, 60 sessions. A set is:
+seeds, 60 sessions. `scenarios/new-features.json` has the same personas on
+features that came later: context that fits a token budget (`PACK`), the
+busiest day (`date_trunc`), a key that reads one table, and a rollup. A set is:
 
 ```jsonc
 {

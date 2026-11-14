@@ -40,7 +40,7 @@ function render(page, r0) {
     if (v === "overnight") { const [a, b] = overnight(); setWindow(a, b); } else setRange(v);
   }, { "aria-label": "Window" });
   const noteBtn = h("button", { class: "btn sm", onclick: () => addNote() }, icon("note"), "Add a note");
-  if (!can("admin")) { noteBtn.disabled = true; noteBtn.title = "Adding a note " + needs("admin"); }
+  if (!can("admin", "POST /v1/events/notes")) { noteBtn.disabled = true; noteBtn.title = "Adding a note " + needs("admin", "POST /v1/events/notes"); }
   const shareBtn = h("button", { class: "btn sm primary", title: "Copy a link to this window, fixed: it opens paused, with the same events", onclick: () => copy(location.origin + location.pathname + link("timeline", { shard: shardFilter, ...rangeParams({ absolute: true }) }), "Link to this window of the timeline copied") }, icon("share"), "Share this window");
   const head = h("div", { class: "page-head" },
     h("div", {}, h("h1", {}, "Timeline"), h("p", {}, "What changed in the fleet, on one time axis: alerts, copies and primaries, rollouts and config, people's changes and notes.")),
@@ -87,7 +87,8 @@ function render(page, r0) {
       events = await fallbackEvents(from, to);
       source = "fallback";
     }
-    try {
+    // The statements' statistics are an admin's: another key's timeline has the events alone.
+    if (can("admin")) try {
       const j = await api(`/v1/queries/stats?from=${from}&to=${to}&limit=500`, { timeout: 10000 });
       stats = (Array.isArray(j) ? j : j.statements || []);
       statsSince = Array.isArray(j) ? null : j.since_ms ?? null;

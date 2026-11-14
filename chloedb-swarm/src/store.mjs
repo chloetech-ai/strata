@@ -97,6 +97,9 @@ export class ServerStore {
 
   async saveFindings(runId, findings) {
     await this.init();
+    // A run's findings are replaced as a whole, so a regroup leaves none behind.
+    await this.server.sql('DELETE FROM swarm_findings WHERE run = :id', { id: runId });
+    if (!findings.length) return null;
     return this.server.import('swarm_findings', findings.map((f) => ({ id: f.id, run: runId, rank: f.rank, category: f.category, severity: f.severity, share: f.share, title: f.title, summary: f.summary, doc: docOf(f) })));
   }
 

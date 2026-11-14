@@ -230,7 +230,8 @@ impl Sim {
                 Some(t) if t.write == write => *t,
                 _ => *txns.iter().find(|t| t.write == write).expect("the primary holds the write it answers"),
             };
-            self.history.acknowledged(write, at.seq, i, self.now);
+            let term = self.copies[i].db.numbering.term;
+            self.history.acknowledged(write, at.seq, i, term, self.now);
         }
         self.answer(i, caller, call, Resp::Write(a.map(|_| seq)));
     }

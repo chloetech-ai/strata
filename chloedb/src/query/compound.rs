@@ -35,6 +35,9 @@
 
 use super::function::FunctionSet;
 use std::cell::RefCell;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Instant;
 use std::collections::HashSet;
 
 use sqlparser::ast::{self as sql, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, TableFactor, UnaryOperator};
@@ -1121,6 +1124,44 @@ pub fn plan_read(sql_text: &str, catalog: &[&Schema], params: &Params, profiles:
     plan_read_calling(sql_text, catalog, params, profiles, &FunctionSet::default())
 }
 
+thread_local! {
+    /// The deadline and cancel flag of the plans made on this thread
+    /// ([`planning_under`]).
+    static PLANNING: RefCell<(Option<Instant>, Option<Arc<AtomicBool>>)> = const { RefCell::new((None, None)) };
+}
+
+/// `f`, whose plans ([`plan_read_calling`] and the rest) stop with
+/// [`Error::Timeout`] once `opts`' deadline passes or its cancel flag is
+/// set: a statement whose planning takes long (thousands of `WITH`
+/// results, say) gives up when its query would, rather than holding a
+/// thread past the caller's wait.
+pub fn planning_under<T>(opts: &ExecOptions, f: impl FnOnce() -> T) -> T {
+    struct Restore((Option<Instant>, Option<Arc<AtomicBool>>));
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = std::mem::take(&mut self.0);
+            PLANNING.with(|p| *p.borrow_mut() = before);
+        }
+    }
+    let _restore = Restore(PLANNING.with(|p| p.replace((opts.deadline, opts.cancel.clone()))));
+    f()
+}
+
+/// [`Error::Timeout`] once the plan being made ran past the deadline or
+/// was cancelled ([`planning_under`]).
+fn check_planning() -> Result<()> {
+    PLANNING.with(|p| {
+        let p = p.borrow();
+        if p.1.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(Error::Timeout("the query was cancelled while it was planned".into()));
+        }
+        match p.0 {
+            Some(d) if Instant::now() >= d => Err(Error::Timeout("the query ran past its deadline while it was planned".into())),
+            _ => Ok(()),
+        }
+    })
+}
+
 /// [`plan_read`] of a query that may call the stored functions of
 /// `functions`, which plan as written out ([`super::function::expand`]).
 pub fn plan_read_calling(sql_text: &str, catalog: &[&Schema], params: &Params, profiles: Profiles, functions: &FunctionSet) -> Result<ir::Plan> {
@@ -1208,6 +1249,23 @@ pub fn run(sql_text: &str, schema: &Schema, params: &Params, runner: &mut ops::R
 /// them.
 pub fn run_checked(sql_text: &str, schema: &Schema, params: &Params, runner: &mut ops::Runner, opts: &ExecOptions) -> Result<ResultSet> {
     ops::run(&plan(sql_text, schema, params)?, schema, runner, opts)
+}
+
+/// `q` without its `WITH`, copied without copying the `WITH`'s queries.
+fn without_with(q: &sql::Query) -> sql::Query {
+    let sql::Query { with: _, body, order_by, limit_clause, fetch, locks, for_clause, settings, format_clause, pipe_operators } = q;
+    sql::Query {
+        with: None,
+        body: body.clone(),
+        order_by: order_by.clone(),
+        limit_clause: limit_clause.clone(),
+        fetch: fetch.clone(),
+        locks: locks.clone(),
+        for_clause: for_clause.clone(),
+        settings: settings.clone(),
+        format_clause: format_clause.clone(),
+        pipe_operators: pipe_operators.clone(),
+    }
 }
 
 /// A query's plan, its columns, and the table whose rows its rows are
@@ -1367,6 +1425,7 @@ impl<'a> Planner<'a> {
     }
 
     fn query(&self, q: &sql::Query) -> Result<Planned> {
+        check_planning()?;
         let mark = self.ctes.borrow().len();
         let r = self.scoped(q);
         self.ctes.borrow_mut().truncate(mark);
@@ -1379,6 +1438,8 @@ impl<'a> Planner<'a> {
             return Ok(p);
         }
         let mut defs = Vec::new();
+        // The query without its `WITH`, copied once (not once per `WITH`).
+        let rest = without_with(q);
         if let Some(w) = &q.with {
             if w.recursive {
                 return Err(err("WITH RECURSIVE is not supported: REACHABLE and PATH traverse links"));
@@ -1387,9 +1448,7 @@ impl<'a> Planner<'a> {
                 // Rerank phases over the `WITH` results from this one on,
                 // which may read those before (a user's history).
                 if i > 0 {
-                    let mut rest = q.clone();
-                    rest.with.as_mut().expect("WITH").cte_tables.drain(..i);
-                    if let Some(p) = self.phased(&rest)? {
+                    if let Some(p) = self.phased_in(&w.cte_tables[i..], &rest)? {
                         return Ok(Planned { node: ir::Node::With { ctes: defs, input: Box::new(p.node) }, ..p });
                     }
                 }
@@ -1408,9 +1467,7 @@ impl<'a> Planner<'a> {
                 defs.push(ir::Cte { name, input: p.node });
             }
         }
-        let mut q = q.clone();
-        q.with = None;
-        let body = self.body(&q)?;
+        let body = self.body(&rest)?;
         Ok(match defs.is_empty() {
             true => body,
             false => Planned { node: ir::Node::With { ctes: defs, input: Box::new(body.node) }, ..body },
@@ -1437,11 +1494,20 @@ impl<'a> Planner<'a> {
     /// bind so, which plans as the table restricted to the `WITH` result's
     /// keys ([`Planner::over_rows`]).
     fn phased(&self, q: &sql::Query) -> Result<Option<Planned>> {
-        let Some(w) = q.with.as_ref().filter(|w| !w.recursive && w.cte_tables.iter().all(|c| c.alias.columns.is_empty())) else { return Ok(None) };
-        let mut body = q.clone();
-        body.with = None;
+        match q.with.as_ref().filter(|w| !w.recursive) {
+            Some(w) => self.phased_in(&w.cte_tables, &without_with(q)),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Planner::phased`] of the query `body` (with no `WITH` of its own)
+    /// after the `WITH` results `ctes`.
+    fn phased_in(&self, ctes: &[sql::Cte], body: &sql::Query) -> Result<Option<Planned>> {
+        if ctes.is_empty() || ctes.iter().any(|c| !c.alias.columns.is_empty()) {
+            return Ok(None);
+        }
         // The first `WITH`, its table and alias.
-        let first = &w.cte_tables[0].query;
+        let first = &ctes[0].query;
         let Some((s0, name)) = one_table(first) else { return Ok(None) };
         let Some(schema) = self.table(&name).filter(|_| self.cte(&name).is_none()) else { return Ok(None) };
         let simple = |s: &sql::Select| s.distinct.is_none() && s.having.is_none() && matches!(&s.group_by, sql::GroupByExpr::Expressions(es, _) if es.is_empty());
@@ -1451,9 +1517,9 @@ impl<'a> Planner<'a> {
         // Each later step: what it projects, ranks by and cuts, its
         // columns named without the `WITH` it reads.
         let mut steps: Vec<(Vec<SelectItem>, sql::OrderByExpr, Option<sql::LimitClause>)> = Vec::new();
-        let reads: Vec<&sql::Query> = w.cte_tables[1..].iter().map(|c| c.query.as_ref()).chain(std::iter::once(&body)).collect();
+        let reads: Vec<&sql::Query> = ctes[1..].iter().map(|c| c.query.as_ref()).chain(std::iter::once(body)).collect();
         for (i, r) in reads.iter().enumerate() {
-            let read = &w.cte_tables[i].alias.name.value;
+            let read = &ctes[i].alias.name.value;
             let Some((s, from)) = one_table(r) else { return Ok(None) };
             let alias = match &s.from[0].relation {
                 TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
@@ -1523,7 +1589,7 @@ impl<'a> Planner<'a> {
         // alias, or a `WITH` result's.
         let mut names = from_names(first);
         for (i, r) in reads.iter().enumerate() {
-            names.push(w.cte_tables[i].alias.name.value.to_ascii_lowercase());
+            names.push(ctes[i].alias.name.value.to_ascii_lowercase());
             names.extend(from_names(r));
         }
         let fields = schema.fields.iter().map(|f| f.name.clone()).collect();
@@ -1715,31 +1781,44 @@ impl<'a> Planner<'a> {
         }
         match body.as_ref() {
             sql::SetExpr::Query(_) => self.side(body),
-            sql::SetExpr::SetOperation { op, set_quantifier, left, right } => {
-                let all = match set_quantifier {
-                    sql::SetQuantifier::All => true,
-                    sql::SetQuantifier::Distinct | sql::SetQuantifier::None => false,
-                    by_name => return Err(err(format!("{op} {by_name} is not supported: select the columns in the same order on both sides"))),
-                };
-                let kind = match op {
-                    sql::SetOperator::Union => ir::SetOp::Union,
-                    sql::SetOperator::Intersect => ir::SetOp::Intersect,
-                    sql::SetOperator::Except | sql::SetOperator::Minus => ir::SetOp::Except,
-                };
-                let l = self.side(left)?;
-                let r = self.side(right)?;
-                if l.columns.len() != r.columns.len() {
-                    return Err(err(format!(
-                        "{}: the query before it selects {} column{} and the one after {}; both sides of a {} select as many",
-                        kind.name(),
-                        l.columns.len(),
-                        if l.columns.len() == 1 { "" } else { "s" },
-                        r.columns.len(),
-                        kind.name()
-                    )));
+            sql::SetExpr::SetOperation { .. } => {
+                // `a UNION b UNION c ...` parses left-deep: its queries are
+                // planned from the first on, along the chain rather than
+                // down it, so that a long chain neither recurses once per
+                // query nor copies the queries before each.
+                let mut chain = Vec::new();
+                let mut first = body.as_ref();
+                while let sql::SetExpr::SetOperation { op, set_quantifier, left, right } = first {
+                    chain.push((op, set_quantifier, right.as_ref()));
+                    first = left;
                 }
-                let multi = l.multi.iter().zip(&r.multi).map(|(a, b)| *a || *b).collect();
-                Ok(Planned { node: ir::Node::SetOp { op: kind, all, left: Box::new(l.node), right: Box::new(r.node) }, columns: l.columns, keyed: None, multi })
+                let mut l = self.side(first)?;
+                for (op, set_quantifier, right) in chain.into_iter().rev() {
+                    let all = match set_quantifier {
+                        sql::SetQuantifier::All => true,
+                        sql::SetQuantifier::Distinct | sql::SetQuantifier::None => false,
+                        by_name => return Err(err(format!("{op} {by_name} is not supported: select the columns in the same order on both sides"))),
+                    };
+                    let kind = match op {
+                        sql::SetOperator::Union => ir::SetOp::Union,
+                        sql::SetOperator::Intersect => ir::SetOp::Intersect,
+                        sql::SetOperator::Except | sql::SetOperator::Minus => ir::SetOp::Except,
+                    };
+                    let r = self.side(right)?;
+                    if l.columns.len() != r.columns.len() {
+                        return Err(err(format!(
+                            "{}: the query before it selects {} column{} and the one after {}; both sides of a {} select as many",
+                            kind.name(),
+                            l.columns.len(),
+                            if l.columns.len() == 1 { "" } else { "s" },
+                            r.columns.len(),
+                            kind.name()
+                        )));
+                    }
+                    let multi = l.multi.iter().zip(&r.multi).map(|(a, b)| *a || *b).collect();
+                    l = Planned { node: ir::Node::SetOp { op: kind, all, left: Box::new(l.node), right: Box::new(r.node) }, columns: l.columns, keyed: None, multi };
+                }
+                Ok(l)
             }
             _ => unreachable!("a set operation or a query"),
         }
@@ -3392,6 +3471,13 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         },
         Expr::Function(_) if outer_field(e).is_some() => ir::Expr::Outer(outer_field(e).expect("a field")),
         e if super::sql::is_now(e) => ir::Expr::Lit(Value::Timestamp(crate::timestamp::now())),
+        e if super::sql::is_today(e) => ir::Expr::Lit(super::sql::day_of(Value::Timestamp(crate::timestamp::now()), &|| e.to_string())?),
+        // DATE(t): the start of t's day, as date_trunc('day', t) and
+        // CAST(t AS DATE) are.
+        Expr::Function(f) if fname(f) == "date" && f.over.is_none() && func_args(f).len() == 1 => match go(func_args(f)[0])? {
+            ir::Expr::Lit(v) => ir::Expr::Lit(super::sql::day_of(super::sql::cast_value(v, CastTo::Timestamp)?, &|| e.to_string())?),
+            x => ir::Expr::Call { func: Func::DateTrunc, args: vec![ir::Expr::Lit(Value::Str("day".into())), x] },
+        },
         Expr::Function(f) if fname(f) == "prefix" => {
             let [x, p] = func_args(f)[..] else { return Err(err("PREFIX(text, prefix) takes two arguments")) };
             ir::Expr::Prefix { expr: typed(x, Some(crate::json::Kind::Str))?, prefix: bx(p)?, edits: 0 }
@@ -3471,8 +3557,12 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
         // rows by the arithmetic and functions that make the type.
         Expr::Cast { expr, data_type, format: None, .. } => {
             let to = CastTo::of(data_type)?;
+            let day = super::sql::is_date(data_type);
             match go(expr)? {
+                ir::Expr::Lit(v) if day => ir::Expr::Lit(super::sql::day_of(super::sql::cast_value(v, to)?, &|| e.to_string())?),
                 ir::Expr::Lit(v) => ir::Expr::Lit(super::sql::cast_value(v, to)?),
+                // A column's day: date_trunc('day', at).
+                x if day => ir::Expr::Call { func: Func::DateTrunc, args: vec![ir::Expr::Lit(Value::Str("day".into())), x] },
                 x => match to {
                     CastTo::Float => ir::Expr::Arith { op: ArithOp::Mul, left: Box::new(x), right: Box::new(ir::Expr::Lit(Value::Float(1.0))) },
                     CastTo::Int => ir::Expr::Call { func: Func::Round, args: vec![x] },
@@ -3483,7 +3573,7 @@ fn compile_with(e: &Expr, params: &Params, slot: &dyn Fn(&Expr) -> Option<Result
                     },
                     CastTo::Bool | CastTo::Timestamp => {
                         return Err(err(format!(
-                            "{e}: a column of the rows casts to INT, FLOAT or TEXT; BOOL and TIMESTAMP take a value, such as CAST('2026-11-02' AS TIMESTAMP)"
+                            "{e}: a column of the rows casts to INT, FLOAT, TEXT or DATE (its day, as date_trunc('day', at)); BOOL and TIMESTAMP take a value, such as CAST('2026-11-02' AS TIMESTAMP)"
                         )))
                     }
                 },

@@ -259,3 +259,50 @@ fn fused_ties_follow_a_descending_key() {
         assert_eq!(ids(&r), vec![1, 2, 3], "{score}");
     }
 }
+
+// Found by the Swarm (round 3): under English stemming the query word is
+// stemmed before its neighbours are looked up, so 'wireles' became
+// 'wirel', three edits from the indexed 'wireless', and a typo that one
+// edit forgives found nothing. A word not in the index now looks for
+// neighbours of the word as written too.
+#[test]
+fn typos_are_forgiven_before_the_stemmer_cuts_them() {
+    use chloedb::schema::Analyzer;
+    let schema = Schema::new(
+        "p",
+        vec![
+            Field::new("id", FieldType::Int),
+            Field::new("title", FieldType::Text { positions: false }).analyzer(Analyzer::English),
+        ],
+        Some("id"),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("p.strata"), schema, DbOptions::default()).unwrap();
+    db.load(vec![
+        vec![Value::Int(1), "Wireless Headphones".into()],
+        vec![Value::Int(2), "Wired Earbuds".into()],
+        vec![Value::Int(3), "Bluetooth Speaker".into()],
+        vec![Value::Int(4), "Wireless Mouse".into()],
+    ])
+    .unwrap();
+    let got = |sql: &str| {
+        let mut v = ids(&query(&db, sql));
+        v.sort();
+        v
+    };
+    assert_eq!(got("SELECT id FROM p WHERE MATCH(title, 'wireles hedphones', fuzzy => 'auto')"), vec![1]);
+    // One edit of the stem 'wirel' reaches 'wire' (wired) too, as before.
+    let one = got("SELECT id FROM p WHERE MATCH(title, 'wireles', fuzzy => 1)");
+    assert!(one.contains(&1) && one.contains(&4), "{one:?}");
+    let tilde = got("SELECT id FROM p WHERE MATCH(title, 'wireles~1 OR hedphones~1')");
+    assert!(tilde.contains(&1) && tilde.contains(&4), "{tilde:?}");
+    let r = query(&db, "SELECT id FROM p ORDER BY bm25(title, 'wireles hedphones', fuzzy => 'auto') DESC LIMIT 5");
+    assert_eq!(ids(&r)[0], 1, "{:?}", ids(&r));
+    // A bm25 of the text a forgiving MATCH filters by forgives as it does:
+    // it scored the words as written and dropped every row the filter found.
+    let r = query(&db, "SELECT id FROM p WHERE MATCH(title, 'wireles hedphones', fuzzy => 'auto') ORDER BY bm25(title, 'wireles hedphones') DESC LIMIT 5");
+    assert_eq!(ids(&r), vec![1], "{:?}", r.stats.plan);
+    // A word the index has is not a typo: 'wired' does not reach 'wireless'.
+    assert_eq!(got("SELECT id FROM p WHERE MATCH(title, 'wired', fuzzy => 'auto')"), vec![2]);
+}

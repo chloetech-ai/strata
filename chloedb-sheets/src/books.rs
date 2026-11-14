@@ -28,6 +28,24 @@ pub const MAX_QUERY_ROWS: usize = 100_000;
 const MAX_CELLS_BACK: usize = 20_000;
 /// A book unused for this long is let go.
 const IDLE: Duration = Duration::from_secs(30 * 60);
+/// Cells the open books hold together at most: past it the least recently
+/// used are let go (they are in Strata), as well as the idle ones. A cell
+/// open takes about a kilobyte (IronCalc's model, and what was saved), so
+/// a few large imports kept the process at gigabytes for half an hour
+/// (DAP-9). `CHLOEDB_SHEETS_OPEN_CELLS` sets it.
+const OPEN_CELLS: usize = 1_500_000;
+
+fn open_cells_budget() -> usize {
+    std::env::var("CHLOEDB_SHEETS_OPEN_CELLS").ok().and_then(|v| v.parse().ok()).unwrap_or(OPEN_CELLS)
+}
+
+/// Gives the memory freed back to the system (glibc keeps it otherwise).
+pub fn trim() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
 
 pub struct Books {
     pub strata: Strata,
@@ -117,6 +135,8 @@ impl Books {
         let summary = b.summary();
         let slot: Slot = Arc::new(tokio::sync::Mutex::new(Some(b)));
         self.slots().insert(summary["id"].as_str().unwrap_or_default().to_string(), slot);
+        self.let_go_over(open_cells_budget());
+        trim();
         Ok(summary)
     }
 
@@ -216,6 +236,44 @@ impl Books {
         Ok(self.answer(b, (!layout).then_some(keys), Vec::new(), None))
     }
 
+    /// Lets go of the least recently used books, saved and not in use,
+    /// until the open ones hold at most `budget` cells. The books let go.
+    pub fn let_go_over(&self, budget: usize) -> usize {
+        let mut open: Vec<(String, Slot, usize, Instant)> = Vec::new();
+        let mut total = 0;
+        for (id, slot) in self.slots().iter() {
+            let Ok(g) = slot.try_lock() else { continue };
+            if let Some(b) = g.as_ref() {
+                let n = b.saved.len();
+                total += n;
+                if b.unsaved.is_none() {
+                    open.push((id.clone(), slot.clone(), n, b.last_used));
+                }
+            }
+        }
+        if total <= budget {
+            return 0;
+        }
+        open.sort_by_key(|o| o.3);
+        let mut gone = 0;
+        for (id, slot, n, _) in open {
+            if total <= budget {
+                break;
+            }
+            let mut s = self.slots();
+            // still that book, and still not in use
+            if s.get(&id).is_some_and(|x| Arc::ptr_eq(x, &slot)) && slot.try_lock().is_ok() {
+                s.remove(&id);
+                total -= n;
+                gone += 1;
+            }
+        }
+        if gone > 0 {
+            tracing::info!("let go of {gone} workbooks: the open ones held more than {budget} cells");
+        }
+        gone
+    }
+
     /// Lets go of books unused for a while, and saves again those Strata
     /// could not take. Runs until the process ends.
     pub async fn keeper(self: Arc<Books>) {
@@ -242,6 +300,8 @@ impl Books {
                     }
                 }
             }
+            self.let_go_over(open_cells_budget());
+            trim();
         }
     }
 
@@ -602,4 +662,35 @@ fn sheet_rows(b: &Book, sheet: u32, key: Option<&str>) -> Result<(Vec<(String, &
         })
         .collect();
     Ok((cols, docs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Books open past the budget of cells are let go, the least recently
+    /// used first; a book in use, or not yet saved, is kept (DAP-9).
+    #[tokio::test]
+    async fn the_least_recently_used_books_are_let_go_past_the_budget() {
+        let books = Books::new(Strata::new("http://127.0.0.1:9", None));
+        let t0 = Instant::now();
+        for (i, (cells, unsaved)) in [(400, false), (300, true), (500, false), (200, false)].into_iter().enumerate() {
+            let mut b = Book::new(format!("b{i}"), "new", new_engine("x"), Ext::default(), 0);
+            b.saved = (0..cells).map(|r| (Key { sheet: 1, row: r + 1, col: 1 }, 0)).collect();
+            b.last_used = t0 + Duration::from_secs(i as u64);
+            b.unsaved = unsaved.then(|| "Strata did not answer".to_string());
+            books.slots().insert(b.id.clone(), Arc::new(tokio::sync::Mutex::new(Some(b))));
+        }
+        assert_eq!(books.let_go_over(10_000), 0);
+        // b2 is in use: kept, though it is old enough to go.
+        let b2 = books.slots().get("b2").unwrap().clone();
+        let held = b2.lock_owned().await;
+        // Of the books not in use (900 cells), 300 at most: b0 (400) goes,
+        // b1 is kept (unsaved), and b3 (200) goes.
+        assert_eq!(books.let_go_over(300), 2);
+        let mut left: Vec<String> = books.slots().keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, ["b1", "b2"]);
+        drop(held);
+    }
 }

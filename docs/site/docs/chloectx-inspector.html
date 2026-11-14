@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>The live inspector · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="A local web app for watching ChloeCtx work: what the hooks store, what the distiller writes down and what recall injects, for your own sessions or for a chat in a scratch project. Every panel is a query against the…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/inspector.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>The live inspector</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/inspector.md">docs/chloectx/inspector.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#on-your-own-stores-chloectx-ui">On your own stores: chloectx ui</a></li><li><a href="#the-demo-chat-in-a-scratch-project">The demo: chat in a scratch project</a></li><li><a href="#a-walkthrough">A walkthrough</a></li><li><a href="#the-panels">The panels</a></li></ol></details>
     <div class="doc-body">
@@ -91,7 +94,7 @@
 <p>The inspector runs in two ways: <code>chloectx ui</code> points it at the stores of your own sessions, and <code>demo/run.sh</code> runs it with a chat column against a scratch project.</p>
 <h2 id="on-your-own-stores-chloectx-ui">On your own stores: <code>chloectx ui</code><a class="anchor" href="#on-your-own-stores-chloectx-ui" aria-label="Link to this section">#</a></h2>
 <pre data-lang="sh">chloectx ui                  # http://127.0.0.1:8765/?token=..., opened in your browser</pre>
-<p><img alt="chloectx ui: a session rebuilt from its records, with the briefing, recall decisions and distilled notes; the store's knowledge on the right" src="../../assets/img/inspector-ui-conversation.png" /></p>
+<p><img loading="lazy" decoding="async" alt="chloectx ui: a session rebuilt from its records, with the briefing, recall decisions and distilled notes; the store's knowledge on the right" src="../../assets/img/inspector-ui-conversation.png" /></p>
 <p>Once ChloeCtx is <a href="chloectx-setup.html">installed</a>, <code>chloectx ui</code> serves this page from the binary over every store under <code>~/.local/share/chloectx/projects</code> (or the folder from before the rename, <code>~/.local/share/engram</code>, on a machine that has it; or <code>--home DIR</code>). Pick a store (one per project directory) and a session. The left column then replays the session from its records, in place of the demo's chat:</p>
 <ul>
 <li>the prompts, the answers and the narration between tool calls;</li>
@@ -101,7 +104,7 @@
 </ul>
 <p>A session that is still running grows as it goes, and the panels on the right work as described below, against the chosen store. Nothing is written to the stores: reads go through each project's daemon with the same read-only operations the demo allows, so the inspector can stay open while sessions write. The server listens on 127.0.0.1 and wants the random token in the URL it prints (kept in a cookie after the first load); on a remote machine, forward the port with <code>ssh -L 8765:127.0.0.1:8765</code>. The address keeps the view (<code>?store=…&amp;session=…&amp;tab=knowledge</code>).</p>
 <p>The header shows the version the server runs and the commit it was built from, and whether the checkout it came from has a newer one: when the page opens it fetches the checkout's upstream branch (at most every ten minutes; <strong>check</strong> fetches again) and counts the commits since the build that change ChloeCtx or ChloeDB, as <code>chloectx upgrade --check</code> does. When there are some, <strong>Update</strong> runs <code>chloectx upgrade</code> (pull, build, install, <code>doctor</code>) and shows its output as it goes, kept in <code>upgrade.log</code> beside the stores. The build takes several minutes. The page that started it keeps running the old binary: restart <code>chloectx ui</code> to use the new one. ChloeCtx's daemons restart new on the next hook, and new Claude Code sessions use it on their own. A pull that cannot fast-forward (local commits, a detached checkout) fails as it does on the command line, and nothing is installed.</p>
-<p><img alt="chloectx ui with the live feed: every record and daemon event of the store as it happens" src="../../assets/img/inspector-ui-live.png" /></p>
+<p><img loading="lazy" decoding="async" alt="chloectx ui with the live feed: every record and daemon event of the store as it happens" src="../../assets/img/inspector-ui-live.png" /></p>
 <h2 id="the-demo-chat-in-a-scratch-project">The demo: chat in a scratch project<a class="anchor" href="#the-demo-chat-in-a-scratch-project" aria-label="Link to this section">#</a></h2>
 <pre data-lang="sh">cd chloectx
 demo/run.sh --model &lt;model&gt; --distill-model &lt;small model&gt;     # opens http://127.0.0.1:8765</pre>
@@ -146,35 +149,35 @@ demo/run.sh --model &lt;model&gt; --distill-model &lt;small model&gt;     # open
 <blockquote>
 <p>Add the overdue report now. Before you start, tell me what storage we chose and why, and any constraint on the report's output.</p>
 </blockquote>
-<p><img alt="The new session answers from ChloeCtx's briefing" src="../../assets/img/inspector-new-session.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The new session answers from ChloeCtx's briefing" src="../../assets/img/inspector-new-session.png" /></p>
 <p>The new session answered correctly: JSON in <code>loans.json</code> because nothing can be installed on the librarian's laptop, only the standard library, and at most 40 characters per line for the receipt printer. None of it was in the new session's context when it started. It came from the <strong>briefing</strong> ChloeCtx injected at <code>SessionStart</code> (1,741 characters), built from the knowledge the distiller wrote after the first turn. Recall for the prompt itself was skipped by the gate (G = 3.61 on 30 candidates), because the briefing had already delivered what mattered.</p>
 <p>By the end, the three turns had become 42 records in three segments: prompts, tool calls and results, answers, episode cards, entities, and the distilled decision, rule and planned work.</p>
 <h2 id="the-panels">The panels<a class="anchor" href="#the-panels" aria-label="Link to this section">#</a></h2>
 <h3 id="finding-an-entity-or-a-file">Finding an entity or a file<a class="anchor" href="#finding-an-entity-or-a-file" aria-label="Link to this section">#</a></h3>
 <p>The box at the top right completes the names of entities and the paths of files as you type (<code>count</code> finds <code>count sheet</code>, <code>src/</code> the files under <code>src</code>), most linked first: an entity row counts the records that link to it. It is a prefix query on the <code>id</code> column, <code>PREFIX(id, 'e:count')</code> for names and <code>PREFIX(id, 'f:src/')</code> for paths, ordered by that count. When the exact prefix leaves room in the list of ten, names one typo away (two from six letters) follow, marked as typos, so <code>cuont</code> still finds <code>count sheet</code>. Picking one opens it with the records that link to it. The graph's seed box completes the same way.</p>
 <h3 id="live">Live<a class="anchor" href="#live" aria-label="Link to this section">#</a></h3>
-<p><img alt="Live: every record and daemon event as it happens" src="../../assets/img/inspector-live.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Live: every record and daemon event as it happens" src="../../assets/img/inspector-live.png" /></p>
 <p>Every record the hooks and the distiller write, and every daemon decision as it happens: <code>SESSIONSTART</code> with the briefing size, <code>RECALL</code> with the gate score and its evidence features (<code>max_cos</code>, <code>max_cov</code>, <code>bm_gap</code>, <code>cos_gap</code>, <code>agree</code>, <code>cue</code>), and <code>DISTILL</code> with the items kept and the cost.</p>
 <h3 id="knowledge">Knowledge<a class="anchor" href="#knowledge" aria-label="Link to this section">#</a></h3>
-<p><img alt="Knowledge: decisions, rules and planned work written down by the distiller" src="../../assets/img/inspector-knowledge.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Knowledge: decisions, rules and planned work written down by the distiller" src="../../assets/img/inspector-knowledge.png" /></p>
 <p>The durable knowledge: decisions, preferences (rules), facts and planned work. Each item says where it came from (<code>distilled</code> by the model, or <code>cue</code> when a sentence like "Always use ISO 8601 dates" was picked up directly from the prompt), and links to the turn and entities it is about. Superseded and completed items can be shown too.</p>
 <h3 id="table">Table<a class="anchor" href="#table" aria-label="Link to this section">#</a></h3>
-<p><img alt="Table: the memory table, filterable by kind, session and full text" src="../../assets/img/inspector-table.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Table: the memory table, filterable by kind, session and full text" src="../../assets/img/inspector-table.png" /></p>
 <p>The <code>memory</code> table itself, paged, filterable by kind, session and a <code>MATCH</code> expression.</p>
 <h3 id="graph">Graph<a class="anchor" href="#graph" aria-label="Link to this section">#</a></h3>
-<p><img alt="Graph: records, their links and the entities they mention" src="../../assets/img/inspector-graph.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Graph: records, their links and the entities they mention" src="../../assets/img/inspector-graph.png" /></p>
 <p>Records are linked to the turn they came from, the files they touch (<code>f:loans.json</code>) and the entities they are about (<code>e:receipt printer</code>). These are ChloeDB <code>EDGES</code> fields, so the panel can run <code>REACHABLE</code> traversals from any seed, as in the <a href="graphs.html">graph queries</a>.</p>
 <h3 id="vectors">Vectors<a class="anchor" href="#vectors" aria-label="Link to this section">#</a></h3>
-<p><img alt="Vectors: every record's embedding projected on two principal components, with a query's nearest neighbours" src="../../assets/img/inspector-vectors.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Vectors: every record's embedding projected on two principal components, with a query's nearest neighbours" src="../../assets/img/inspector-vectors.png" /></p>
 <p>Every record's vector, projected on its first two principal components. A text query is embedded with the store's embedder and its top ten neighbours are drawn and listed with their similarity. Here <em>why JSON instead of SQLite</em> finds the distilled decision first (0.415).</p>
 <h3 id="query">Query<a class="anchor" href="#query" aria-label="Link to this section">#</a></h3>
-<p><img alt="Query: an SQL console over the memory table, with plans" src="../../assets/img/inspector-query.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Query: an SQL console over the memory table, with plans" src="../../assets/img/inspector-query.png" /></p>
 <p>An SQL console over the store, read-only, with the executor's plan and timings. A text parameter bound as a vector is embedded by the store's embedder, so hybrid queries work as written. It can also run ChloeCtx's own hybrid search, the one recall uses.</p>
 <pre data-lang="sql">SELECT id, kind, text FROM memory
 WHERE kind IN (&#x27;decision&#x27;, &#x27;preference&#x27;)
 ORDER BY similarity(emb, :q) DESC LIMIT 5</pre>
 <h3 id="storage">Storage<a class="anchor" href="#storage" aria-label="Link to this section">#</a></h3>
-<p><img alt="Storage: the table's schema, segments and file layout" src="../../assets/img/inspector-storage.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Storage: the table's schema, segments and file layout" src="../../assets/img/inspector-storage.png" /></p>
 <p>The table's schema and fields, its segments, the memtable, and the file's size by component.</p>
     </div>
     <footer class="doc-foot">
@@ -185,7 +188,7 @@ ORDER BY similarity(emb, :q) DESC LIMIT 5</pre>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

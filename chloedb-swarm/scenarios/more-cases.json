@@ -1,0 +1,1126 @@
+{
+  "name": "more-cases",
+  "description": "The same five personas on six more jobs people bring to a database: loading a CSV, a search that forgives typos, the best per category, cancelling stale orders, a join for top customers, and a count found in the command center.",
+  "seeds": 3,
+  "models": [
+    "haiku",
+    "haiku",
+    "sonnet"
+  ],
+  "budget_usd": 14,
+  "concurrency": 4,
+  "personas": [
+    {
+      "id": "dev-postgres",
+      "name": "Maya Chen",
+      "role": "a backend developer who has used PostgreSQL every day for eight years",
+      "device": "desktop",
+      "background": "Maya is trying ChloeDB for a new service and judges it against Postgres.",
+      "traits": [
+        "Writes SQL fluently and reaches for Postgres habits first (SERIAL, ILIKE, NOW() - INTERVAL '7 days', \\d to describe a table).",
+        "Reads error messages carefully and expects them to say what to change.",
+        "Opens the documentation after two failed attempts, not before.",
+        "Patient for about fifteen minutes, then decides the product is not ready."
+      ]
+    },
+    {
+      "id": "analyst",
+      "name": "Tom\u00e1s Rivera",
+      "role": "a data analyst who writes reporting SQL",
+      "device": "desktop",
+      "background": "Tom\u00e1s builds weekly reports. He has never used a search engine's query language.",
+      "traits": [
+        "Comfortable with SELECT, WHERE, GROUP BY and dates; has never heard of BM25 or full-text ranking.",
+        "Likes to look at a table's columns and a few rows before writing a query.",
+        "Copies examples from documentation when he finds one.",
+        "Gives up after about five failed attempts and says what blocked him."
+      ]
+    },
+    {
+      "id": "ml-engineer",
+      "name": "Priya Nair",
+      "role": "a machine learning engineer building retrieval for a chatbot",
+      "device": "desktop",
+      "background": "Priya wants to know quickly whether ChloeDB can be her retrieval layer.",
+      "traits": [
+        "Thinks in embeddings, vector search and hybrid ranking; knows BM25 by name.",
+        "Skims text and jumps to whatever looks like an API or a query box.",
+        "Impatient with forms and wizards; prefers typing a query.",
+        "Will judge the whole product on the first thing that confuses her."
+      ]
+    },
+    {
+      "id": "sre",
+      "name": "Jordan Okafor",
+      "role": "the on-call site reliability engineer for the team's databases",
+      "device": "desktop",
+      "background": "Jordan looks after production access and incidents.",
+      "traits": [
+        "Looks for admin, access and settings pages first.",
+        "Cares about least privilege: read-only means read-only, keys should expire.",
+        "Reads labels literally and distrusts anything ambiguous about permissions.",
+        "Efficient: does not explore beyond what the task needs."
+      ]
+    },
+    {
+      "id": "pm",
+      "name": "Sam Lee",
+      "role": "a product manager who does not write SQL",
+      "device": "phone",
+      "background": "Sam checks things on a phone between meetings and wants answers, not queries.",
+      "traits": [
+        "Does not write SQL; will copy and edit an example if one is in front of them.",
+        "Relies on labels, menus and search boxes; jargon (shards, segments, BM25) confuses Sam.",
+        "Uses a phone, so wide tables and small buttons are a problem.",
+        "Gives up after three or four dead ends and says why."
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "load-a-csv",
+      "title": "Load a CSV and ask about it",
+      "surface": "mcp",
+      "scope": "admin",
+      "max_steps": 24,
+      "personas": [
+        "dev-postgres",
+        "analyst",
+        "pm"
+      ],
+      "prompt": "Our store's product list is in this CSV. Put it in ChloeDB as a table called gear, then tell me how many of the products cost more than $50 and are in stock.\n\nsku,name,category,price,in_stock\ns-01,Trail Running Shoes,shoes,120,true\ns-02,Road Running Shoes,shoes,95,true\ns-03,Hiking Boots,shoes,160,false\ns-04,Rain Jacket,outerwear,85,true\ns-05,Down Jacket,outerwear,210,true\ns-06,Fleece Pullover,outerwear,49.5,true\ns-07,Running Socks (3 pack),accessories,18,true\ns-08,Headlamp,accessories,35,false\ns-09,Water Bottle,accessories,22,true\ns-10,Trekking Poles,accessories,64,true\ns-11,Base Layer Top,outerwear,55,true\ns-12,Sandals,shoes,45,true",
+      "fixture": {
+        "tables": []
+      },
+      "checks": [
+        {
+          "name": "all rows loaded",
+          "kind": "sql",
+          "sql": "SELECT COUNT(*) AS n FROM gear",
+          "expect": {
+            "n": 12
+          }
+        },
+        {
+          "name": "the count",
+          "kind": "answer_includes",
+          "all": [
+            "6"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "forgiving-search",
+      "title": "A search that forgives typos",
+      "surface": "mcp",
+      "scope": "read",
+      "max_steps": 20,
+      "personas": [
+        "ml-engineer",
+        "dev-postgres",
+        "pm"
+      ],
+      "prompt": "Customers type things like 'wireles hedphones' into our shop search and get nothing back. Find the products they actually mean, and tell me how to write the search so typos still find them.",
+      "fixture": {
+        "tables": [
+          {
+            "name": "products",
+            "create": "CREATE TABLE products (id KEYWORD PRIMARY KEY, title TEXT, category KEYWORD, price FLOAT, rating FLOAT, description TEXT)",
+            "rows": [
+              {
+                "id": "p-01",
+                "title": "Wireless Headphones Pro",
+                "category": "audio",
+                "price": 129.0,
+                "rating": 4.7,
+                "description": "Over-ear wireless headphones with noise cancelling and 30 hour battery."
+              },
+              {
+                "id": "p-02",
+                "title": "Bluetooth Earbuds Mini",
+                "category": "audio",
+                "price": 59.0,
+                "rating": 4.1,
+                "description": "Small wireless earbuds with a charging case."
+              },
+              {
+                "id": "p-03",
+                "title": "Studio Monitor Headphones",
+                "category": "audio",
+                "price": 89.0,
+                "rating": 4.5,
+                "description": "Wired closed-back headphones for mixing and recording."
+              },
+              {
+                "id": "p-04",
+                "title": "Kids Wireless Headphones",
+                "category": "audio",
+                "price": 35.0,
+                "rating": 3.9,
+                "description": "Volume-limited wireless headphones for children."
+              },
+              {
+                "id": "p-05",
+                "title": "Mechanical Keyboard",
+                "category": "computing",
+                "price": 99.0,
+                "rating": 4.6,
+                "description": "Hot-swappable mechanical keyboard with brown switches."
+              },
+              {
+                "id": "p-06",
+                "title": "Ergonomic Mouse",
+                "category": "computing",
+                "price": 45.0,
+                "rating": 4.3,
+                "description": "Vertical mouse that reduces wrist strain."
+              },
+              {
+                "id": "p-07",
+                "title": "USB-C Hub",
+                "category": "computing",
+                "price": 29.0,
+                "rating": 4.0,
+                "description": "Seven-port hub with HDMI and card reader."
+              },
+              {
+                "id": "p-08",
+                "title": "27 inch Monitor",
+                "category": "computing",
+                "price": 249.0,
+                "rating": 4.4,
+                "description": "QHD monitor with adjustable stand."
+              },
+              {
+                "id": "p-09",
+                "title": "Espresso Machine",
+                "category": "kitchen",
+                "price": 399.0,
+                "rating": 4.8,
+                "description": "Dual boiler espresso machine with a steam wand."
+              },
+              {
+                "id": "p-10",
+                "title": "Burr Coffee Grinder",
+                "category": "kitchen",
+                "price": 79.0,
+                "rating": 4.2,
+                "description": "Conical burr grinder with 40 settings."
+              },
+              {
+                "id": "p-11",
+                "title": "Electric Kettle",
+                "category": "kitchen",
+                "price": 39.0,
+                "rating": 4.55,
+                "description": "Gooseneck kettle with temperature control."
+              },
+              {
+                "id": "p-12",
+                "title": "Milk Frother",
+                "category": "kitchen",
+                "price": 25.0,
+                "rating": 3.8,
+                "description": "Handheld frother for lattes."
+              }
+            ]
+          }
+        ]
+      },
+      "checks": [
+        {
+          "name": "headphones found",
+          "kind": "answer_includes",
+          "any": [
+            "p-01",
+            "p-03",
+            "p-04",
+            "Wireless Headphones Pro",
+            "Kids Wireless Headphones",
+            "Studio Monitor Headphones"
+          ],
+          "at_least": 2
+        }
+      ]
+    },
+    {
+      "id": "best-per-category",
+      "title": "The two best-rated per category",
+      "surface": "mcp",
+      "scope": "read",
+      "max_steps": 20,
+      "personas": [
+        "analyst",
+        "ml-engineer",
+        "pm"
+      ],
+      "prompt": "For each product category, which are the two best-rated products? Give me their ids and ratings.",
+      "fixture": {
+        "tables": [
+          {
+            "name": "products",
+            "create": "CREATE TABLE products (id KEYWORD PRIMARY KEY, title TEXT, category KEYWORD, price FLOAT, rating FLOAT, description TEXT)",
+            "rows": [
+              {
+                "id": "p-01",
+                "title": "Wireless Headphones Pro",
+                "category": "audio",
+                "price": 129.0,
+                "rating": 4.7,
+                "description": "Over-ear wireless headphones with noise cancelling and 30 hour battery."
+              },
+              {
+                "id": "p-02",
+                "title": "Bluetooth Earbuds Mini",
+                "category": "audio",
+                "price": 59.0,
+                "rating": 4.1,
+                "description": "Small wireless earbuds with a charging case."
+              },
+              {
+                "id": "p-03",
+                "title": "Studio Monitor Headphones",
+                "category": "audio",
+                "price": 89.0,
+                "rating": 4.5,
+                "description": "Wired closed-back headphones for mixing and recording."
+              },
+              {
+                "id": "p-04",
+                "title": "Kids Wireless Headphones",
+                "category": "audio",
+                "price": 35.0,
+                "rating": 3.9,
+                "description": "Volume-limited wireless headphones for children."
+              },
+              {
+                "id": "p-05",
+                "title": "Mechanical Keyboard",
+                "category": "computing",
+                "price": 99.0,
+                "rating": 4.6,
+                "description": "Hot-swappable mechanical keyboard with brown switches."
+              },
+              {
+                "id": "p-06",
+                "title": "Ergonomic Mouse",
+                "category": "computing",
+                "price": 45.0,
+                "rating": 4.3,
+                "description": "Vertical mouse that reduces wrist strain."
+              },
+              {
+                "id": "p-07",
+                "title": "USB-C Hub",
+                "category": "computing",
+                "price": 29.0,
+                "rating": 4.0,
+                "description": "Seven-port hub with HDMI and card reader."
+              },
+              {
+                "id": "p-08",
+                "title": "27 inch Monitor",
+                "category": "computing",
+                "price": 249.0,
+                "rating": 4.4,
+                "description": "QHD monitor with adjustable stand."
+              },
+              {
+                "id": "p-09",
+                "title": "Espresso Machine",
+                "category": "kitchen",
+                "price": 399.0,
+                "rating": 4.8,
+                "description": "Dual boiler espresso machine with a steam wand."
+              },
+              {
+                "id": "p-10",
+                "title": "Burr Coffee Grinder",
+                "category": "kitchen",
+                "price": 79.0,
+                "rating": 4.2,
+                "description": "Conical burr grinder with 40 settings."
+              },
+              {
+                "id": "p-11",
+                "title": "Electric Kettle",
+                "category": "kitchen",
+                "price": 39.0,
+                "rating": 4.55,
+                "description": "Gooseneck kettle with temperature control."
+              },
+              {
+                "id": "p-12",
+                "title": "Milk Frother",
+                "category": "kitchen",
+                "price": 25.0,
+                "rating": 3.8,
+                "description": "Handheld frother for lattes."
+              }
+            ]
+          }
+        ]
+      },
+      "checks": [
+        {
+          "name": "top two each",
+          "kind": "answer_includes",
+          "all": [
+            "p-01",
+            "p-03",
+            "p-05",
+            "p-08",
+            "p-09",
+            "p-11"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cancel-stale",
+      "title": "Cancel stale orders",
+      "surface": "mcp",
+      "scope": "write",
+      "max_steps": 20,
+      "personas": [
+        "dev-postgres",
+        "sre",
+        "analyst"
+      ],
+      "prompt": "Any order that's still 'placed' and was created more than 30 days ago is stale. Mark all of those as 'cancelled' and tell me how many you changed. Don't touch anything else.",
+      "fixture": {
+        "tables": [
+          {
+            "name": "orders",
+            "create": "CREATE TABLE orders (id KEYWORD PRIMARY KEY, customer KEYWORD, total FLOAT, status KEYWORD, created TIMESTAMP)",
+            "generate": {
+              "count": 80,
+              "fields": {
+                "id": {
+                  "seq": "o-"
+                },
+                "customer": {
+                  "pick": [
+                    "c-1",
+                    "c-2",
+                    "c-3",
+                    "c-4",
+                    "c-5"
+                  ]
+                },
+                "total": {
+                  "float": [
+                    10,
+                    300
+                  ],
+                  "digits": 2
+                },
+                "status": {
+                  "pick": [
+                    "placed",
+                    "paid",
+                    "shipped"
+                  ],
+                  "weights": [
+                    2,
+                    2,
+                    1
+                  ]
+                },
+                "created": {
+                  "daysAgo": [
+                    0,
+                    60
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "checks": [
+        {
+          "name": "no stale order left",
+          "kind": "sql",
+          "sql": "SELECT COUNT(*) AS n FROM orders WHERE status = 'placed' AND created < '{{days_ago:30}}'",
+          "expect": {
+            "n": 0
+          }
+        },
+        {
+          "name": "recent placed kept",
+          "kind": "sql",
+          "sql": "SELECT id FROM orders WHERE status = 'placed' AND created > '{{days_ago:29}}'",
+          "min_rows": 1
+        },
+        {
+          "name": "others untouched",
+          "kind": "sql",
+          "sql": "SELECT COUNT(*) AS n FROM orders WHERE status = 'cancelled' AND created > '{{days_ago:29}}'",
+          "expect": {
+            "n": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "top-customers",
+      "title": "Top customers by spend",
+      "surface": "mcp",
+      "scope": "read",
+      "max_steps": 20,
+      "personas": [
+        "analyst",
+        "pm",
+        "sre"
+      ],
+      "prompt": "Who are our three biggest customers by total spend, not counting refunded orders? I need their names and how much each spent.",
+      "fixture": {
+        "tables": [
+          {
+            "name": "customers",
+            "create": "CREATE TABLE customers (id KEYWORD PRIMARY KEY, name TEXT, country KEYWORD)",
+            "rows": [
+              {
+                "id": "c-1",
+                "name": "Ana Souza",
+                "country": "BR"
+              },
+              {
+                "id": "c-2",
+                "name": "Ben Carter",
+                "country": "US"
+              },
+              {
+                "id": "c-3",
+                "name": "Chen Wei",
+                "country": "CN"
+              },
+              {
+                "id": "c-4",
+                "name": "Dara Ali",
+                "country": "AE"
+              },
+              {
+                "id": "c-5",
+                "name": "Eve Martin",
+                "country": "FR"
+              }
+            ]
+          },
+          {
+            "name": "orders",
+            "create": "CREATE TABLE orders (id KEYWORD PRIMARY KEY, customer KEYWORD, total FLOAT, status KEYWORD, created TIMESTAMP)",
+            "rows": [
+              {
+                "id": "o-001",
+                "customer": "c-3",
+                "total": 284.88,
+                "status": "refunded",
+                "created": "2026-10-21T12:00:00Z"
+              },
+              {
+                "id": "o-002",
+                "customer": "c-1",
+                "total": 31.01,
+                "status": "placed",
+                "created": "2026-10-12T12:00:00Z"
+              },
+              {
+                "id": "o-003",
+                "customer": "c-5",
+                "total": 26.82,
+                "status": "paid",
+                "created": "2026-10-02T12:00:00Z"
+              },
+              {
+                "id": "o-004",
+                "customer": "c-1",
+                "total": 135.76,
+                "status": "placed",
+                "created": "2026-10-08T12:00:00Z"
+              },
+              {
+                "id": "o-005",
+                "customer": "c-1",
+                "total": 169.8,
+                "status": "placed",
+                "created": "2026-10-27T12:00:00Z"
+              },
+              {
+                "id": "o-006",
+                "customer": "c-5",
+                "total": 45.9,
+                "status": "paid",
+                "created": "2026-10-21T12:00:00Z"
+              },
+              {
+                "id": "o-007",
+                "customer": "c-5",
+                "total": 284.84,
+                "status": "refunded",
+                "created": "2026-10-02T12:00:00Z"
+              },
+              {
+                "id": "o-008",
+                "customer": "c-2",
+                "total": 23.51,
+                "status": "paid",
+                "created": "2026-10-10T12:00:00Z"
+              },
+              {
+                "id": "o-009",
+                "customer": "c-4",
+                "total": 51.83,
+                "status": "placed",
+                "created": "2026-10-19T12:00:00Z"
+              },
+              {
+                "id": "o-010",
+                "customer": "c-3",
+                "total": 172.47,
+                "status": "paid",
+                "created": "2026-10-04T12:00:00Z"
+              },
+              {
+                "id": "o-011",
+                "customer": "c-5",
+                "total": 175.65,
+                "status": "paid",
+                "created": "2026-10-12T12:00:00Z"
+              },
+              {
+                "id": "o-012",
+                "customer": "c-1",
+                "total": 168.85,
+                "status": "placed",
+                "created": "2026-10-19T12:00:00Z"
+              },
+              {
+                "id": "o-013",
+                "customer": "c-1",
+                "total": 189.51,
+                "status": "refunded",
+                "created": "2026-10-22T12:00:00Z"
+              },
+              {
+                "id": "o-014",
+                "customer": "c-5",
+                "total": 134.0,
+                "status": "shipped",
+                "created": "2026-10-15T12:00:00Z"
+              },
+              {
+                "id": "o-015",
+                "customer": "c-5",
+                "total": 277.8,
+                "status": "shipped",
+                "created": "2026-10-10T12:00:00Z"
+              },
+              {
+                "id": "o-016",
+                "customer": "c-2",
+                "total": 240.37,
+                "status": "paid",
+                "created": "2026-10-03T12:00:00Z"
+              },
+              {
+                "id": "o-017",
+                "customer": "c-5",
+                "total": 97.07,
+                "status": "refunded",
+                "created": "2026-10-11T12:00:00Z"
+              },
+              {
+                "id": "o-018",
+                "customer": "c-4",
+                "total": 93.5,
+                "status": "placed",
+                "created": "2026-10-04T12:00:00Z"
+              },
+              {
+                "id": "o-019",
+                "customer": "c-5",
+                "total": 131.26,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-020",
+                "customer": "c-4",
+                "total": 132.29,
+                "status": "placed",
+                "created": "2026-10-25T12:00:00Z"
+              },
+              {
+                "id": "o-021",
+                "customer": "c-5",
+                "total": 176.18,
+                "status": "shipped",
+                "created": "2026-10-11T12:00:00Z"
+              },
+              {
+                "id": "o-022",
+                "customer": "c-3",
+                "total": 182.37,
+                "status": "refunded",
+                "created": "2026-10-03T12:00:00Z"
+              },
+              {
+                "id": "o-023",
+                "customer": "c-1",
+                "total": 283.96,
+                "status": "refunded",
+                "created": "2026-10-23T12:00:00Z"
+              },
+              {
+                "id": "o-024",
+                "customer": "c-1",
+                "total": 27.59,
+                "status": "shipped",
+                "created": "2026-10-21T12:00:00Z"
+              },
+              {
+                "id": "o-025",
+                "customer": "c-5",
+                "total": 298.0,
+                "status": "refunded",
+                "created": "2026-10-10T12:00:00Z"
+              },
+              {
+                "id": "o-026",
+                "customer": "c-4",
+                "total": 267.24,
+                "status": "shipped",
+                "created": "2026-10-01T12:00:00Z"
+              },
+              {
+                "id": "o-027",
+                "customer": "c-4",
+                "total": 113.08,
+                "status": "placed",
+                "created": "2026-10-16T12:00:00Z"
+              },
+              {
+                "id": "o-028",
+                "customer": "c-1",
+                "total": 73.28,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-029",
+                "customer": "c-2",
+                "total": 125.39,
+                "status": "refunded",
+                "created": "2026-10-03T12:00:00Z"
+              },
+              {
+                "id": "o-030",
+                "customer": "c-2",
+                "total": 140.26,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-031",
+                "customer": "c-4",
+                "total": 260.56,
+                "status": "shipped",
+                "created": "2026-10-23T12:00:00Z"
+              },
+              {
+                "id": "o-032",
+                "customer": "c-4",
+                "total": 296.08,
+                "status": "refunded",
+                "created": "2026-10-08T12:00:00Z"
+              },
+              {
+                "id": "o-033",
+                "customer": "c-2",
+                "total": 34.07,
+                "status": "paid",
+                "created": "2026-10-08T12:00:00Z"
+              },
+              {
+                "id": "o-034",
+                "customer": "c-2",
+                "total": 13.5,
+                "status": "paid",
+                "created": "2026-10-09T12:00:00Z"
+              },
+              {
+                "id": "o-035",
+                "customer": "c-3",
+                "total": 11.19,
+                "status": "refunded",
+                "created": "2026-10-18T12:00:00Z"
+              },
+              {
+                "id": "o-036",
+                "customer": "c-3",
+                "total": 186.85,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-037",
+                "customer": "c-5",
+                "total": 285.56,
+                "status": "placed",
+                "created": "2026-10-15T12:00:00Z"
+              },
+              {
+                "id": "o-038",
+                "customer": "c-5",
+                "total": 123.79,
+                "status": "refunded",
+                "created": "2026-10-13T12:00:00Z"
+              },
+              {
+                "id": "o-039",
+                "customer": "c-1",
+                "total": 149.64,
+                "status": "refunded",
+                "created": "2026-10-02T12:00:00Z"
+              },
+              {
+                "id": "o-040",
+                "customer": "c-2",
+                "total": 29.53,
+                "status": "paid",
+                "created": "2026-10-15T12:00:00Z"
+              }
+            ]
+          }
+        ]
+      },
+      "checks": [
+        {
+          "name": "top three",
+          "kind": "answer_matches_sql",
+          "sql": "SELECT c.name AS name, SUM(o.total) AS spent FROM orders o JOIN customers c ON o.customer = c.id WHERE o.status != 'refunded' GROUP BY c.name ORDER BY spent DESC LIMIT 3",
+          "columns": [
+            "name"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "count-in-the-ui",
+      "title": "A count found in the command center",
+      "surface": "browser",
+      "scope": "read",
+      "max_steps": 24,
+      "entry": "#/",
+      "personas": [
+        "pm",
+        "analyst",
+        "sre"
+      ],
+      "prompt": "Using the ChloeDB command center in the browser, find out how many orders were refunded and what they added up to in total.",
+      "fixture": {
+        "tables": [
+          {
+            "name": "orders",
+            "create": "CREATE TABLE orders (id KEYWORD PRIMARY KEY, customer KEYWORD, total FLOAT, status KEYWORD, created TIMESTAMP)",
+            "rows": [
+              {
+                "id": "o-001",
+                "customer": "c-3",
+                "total": 284.88,
+                "status": "refunded",
+                "created": "2026-10-21T12:00:00Z"
+              },
+              {
+                "id": "o-002",
+                "customer": "c-1",
+                "total": 31.01,
+                "status": "placed",
+                "created": "2026-10-12T12:00:00Z"
+              },
+              {
+                "id": "o-003",
+                "customer": "c-5",
+                "total": 26.82,
+                "status": "paid",
+                "created": "2026-10-02T12:00:00Z"
+              },
+              {
+                "id": "o-004",
+                "customer": "c-1",
+                "total": 135.76,
+                "status": "placed",
+                "created": "2026-10-08T12:00:00Z"
+              },
+              {
+                "id": "o-005",
+                "customer": "c-1",
+                "total": 169.8,
+                "status": "placed",
+                "created": "2026-10-27T12:00:00Z"
+              },
+              {
+                "id": "o-006",
+                "customer": "c-5",
+                "total": 45.9,
+                "status": "paid",
+                "created": "2026-10-21T12:00:00Z"
+              },
+              {
+                "id": "o-007",
+                "customer": "c-5",
+                "total": 284.84,
+                "status": "refunded",
+                "created": "2026-10-02T12:00:00Z"
+              },
+              {
+                "id": "o-008",
+                "customer": "c-2",
+                "total": 23.51,
+                "status": "paid",
+                "created": "2026-10-10T12:00:00Z"
+              },
+              {
+                "id": "o-009",
+                "customer": "c-4",
+                "total": 51.83,
+                "status": "placed",
+                "created": "2026-10-19T12:00:00Z"
+              },
+              {
+                "id": "o-010",
+                "customer": "c-3",
+                "total": 172.47,
+                "status": "paid",
+                "created": "2026-10-04T12:00:00Z"
+              },
+              {
+                "id": "o-011",
+                "customer": "c-5",
+                "total": 175.65,
+                "status": "paid",
+                "created": "2026-10-12T12:00:00Z"
+              },
+              {
+                "id": "o-012",
+                "customer": "c-1",
+                "total": 168.85,
+                "status": "placed",
+                "created": "2026-10-19T12:00:00Z"
+              },
+              {
+                "id": "o-013",
+                "customer": "c-1",
+                "total": 189.51,
+                "status": "refunded",
+                "created": "2026-10-22T12:00:00Z"
+              },
+              {
+                "id": "o-014",
+                "customer": "c-5",
+                "total": 134.0,
+                "status": "shipped",
+                "created": "2026-10-15T12:00:00Z"
+              },
+              {
+                "id": "o-015",
+                "customer": "c-5",
+                "total": 277.8,
+                "status": "shipped",
+                "created": "2026-10-10T12:00:00Z"
+              },
+              {
+                "id": "o-016",
+                "customer": "c-2",
+                "total": 240.37,
+                "status": "paid",
+                "created": "2026-10-03T12:00:00Z"
+              },
+              {
+                "id": "o-017",
+                "customer": "c-5",
+                "total": 97.07,
+                "status": "refunded",
+                "created": "2026-10-11T12:00:00Z"
+              },
+              {
+                "id": "o-018",
+                "customer": "c-4",
+                "total": 93.5,
+                "status": "placed",
+                "created": "2026-10-04T12:00:00Z"
+              },
+              {
+                "id": "o-019",
+                "customer": "c-5",
+                "total": 131.26,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-020",
+                "customer": "c-4",
+                "total": 132.29,
+                "status": "placed",
+                "created": "2026-10-25T12:00:00Z"
+              },
+              {
+                "id": "o-021",
+                "customer": "c-5",
+                "total": 176.18,
+                "status": "shipped",
+                "created": "2026-10-11T12:00:00Z"
+              },
+              {
+                "id": "o-022",
+                "customer": "c-3",
+                "total": 182.37,
+                "status": "refunded",
+                "created": "2026-10-03T12:00:00Z"
+              },
+              {
+                "id": "o-023",
+                "customer": "c-1",
+                "total": 283.96,
+                "status": "refunded",
+                "created": "2026-10-23T12:00:00Z"
+              },
+              {
+                "id": "o-024",
+                "customer": "c-1",
+                "total": 27.59,
+                "status": "shipped",
+                "created": "2026-10-21T12:00:00Z"
+              },
+              {
+                "id": "o-025",
+                "customer": "c-5",
+                "total": 298.0,
+                "status": "refunded",
+                "created": "2026-10-10T12:00:00Z"
+              },
+              {
+                "id": "o-026",
+                "customer": "c-4",
+                "total": 267.24,
+                "status": "shipped",
+                "created": "2026-10-01T12:00:00Z"
+              },
+              {
+                "id": "o-027",
+                "customer": "c-4",
+                "total": 113.08,
+                "status": "placed",
+                "created": "2026-10-16T12:00:00Z"
+              },
+              {
+                "id": "o-028",
+                "customer": "c-1",
+                "total": 73.28,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-029",
+                "customer": "c-2",
+                "total": 125.39,
+                "status": "refunded",
+                "created": "2026-10-03T12:00:00Z"
+              },
+              {
+                "id": "o-030",
+                "customer": "c-2",
+                "total": 140.26,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-031",
+                "customer": "c-4",
+                "total": 260.56,
+                "status": "shipped",
+                "created": "2026-10-23T12:00:00Z"
+              },
+              {
+                "id": "o-032",
+                "customer": "c-4",
+                "total": 296.08,
+                "status": "refunded",
+                "created": "2026-10-08T12:00:00Z"
+              },
+              {
+                "id": "o-033",
+                "customer": "c-2",
+                "total": 34.07,
+                "status": "paid",
+                "created": "2026-10-08T12:00:00Z"
+              },
+              {
+                "id": "o-034",
+                "customer": "c-2",
+                "total": 13.5,
+                "status": "paid",
+                "created": "2026-10-09T12:00:00Z"
+              },
+              {
+                "id": "o-035",
+                "customer": "c-3",
+                "total": 11.19,
+                "status": "refunded",
+                "created": "2026-10-18T12:00:00Z"
+              },
+              {
+                "id": "o-036",
+                "customer": "c-3",
+                "total": 186.85,
+                "status": "shipped",
+                "created": "2026-10-05T12:00:00Z"
+              },
+              {
+                "id": "o-037",
+                "customer": "c-5",
+                "total": 285.56,
+                "status": "placed",
+                "created": "2026-10-15T12:00:00Z"
+              },
+              {
+                "id": "o-038",
+                "customer": "c-5",
+                "total": 123.79,
+                "status": "refunded",
+                "created": "2026-10-13T12:00:00Z"
+              },
+              {
+                "id": "o-039",
+                "customer": "c-1",
+                "total": 149.64,
+                "status": "refunded",
+                "created": "2026-10-02T12:00:00Z"
+              },
+              {
+                "id": "o-040",
+                "customer": "c-2",
+                "total": 29.53,
+                "status": "paid",
+                "created": "2026-10-15T12:00:00Z"
+              }
+            ]
+          }
+        ]
+      },
+      "checks": [
+        {
+          "name": "the count",
+          "kind": "answer_matches_sql",
+          "sql": "SELECT COUNT(*) AS n FROM orders WHERE status = 'refunded'",
+          "columns": [
+            "n"
+          ]
+        }
+      ]
+    }
+  ]
+}

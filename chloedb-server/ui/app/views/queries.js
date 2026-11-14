@@ -96,7 +96,7 @@ function live(body, params, setCount) {
     clear(thead, h("tr", {}, nar ? [h("th", {}, "query"), h("th", {}, "running for"), h("th", {})] : [h("th", {}, "query"), h("th", {}, "via"), h("th", {}, "running for"), h("th", {}, "key"), h("th", {}, "params"), h("th", {}, "waiting on"), h("th", {})]));
   }
   const rulesBox = h("div");
-  const containBtn = can("admin") ? h("button", { class: "btn sm", onclick: () => containDialog({ onDone: loadRules }) }, icon("shield"), "Contain a key…") : null;
+  const containBtn = can("admin", "POST /v1/admin/contain") ? h("button", { class: "btn sm", onclick: () => containDialog({ onDone: loadRules }) }, icon("shield"), "Contain a key…") : null;
   body.append(
     h("div", { class: "row", style: { gap: "10px", marginBottom: "10px" } }, info, h("span", { class: "sep" }), h("span", { class: "small dim" }, "Group by"), groupSeg, search, ownChip),
     card({ body: tbl, flush: true }),
@@ -137,7 +137,7 @@ function live(body, params, setCount) {
     const lim = deadline(q), f = lim ? Math.min(1, q.elapsed_ms / lim) : null;
     const ran = h("div", { style: { minWidth: nar ? "0" : "150px" } }, h("div", { class: "row nw between small", title: lim ? `of ${q.deadline_ms != null ? "its" : "the server's"} ${fmt.ms(lim)} deadline` : null }, h("b", { class: "nowrap" }, fmt.ms(q.elapsed_ms)), lim && !nar ? h("span", { class: "muted" }, `of ${q.deadline_ms != null ? "its" : "the server's"} ${fmt.ms(lim)} deadline`) : null),
       f != null ? h("div", { class: "meter", style: { marginTop: "3px" } }, h("i", { class: f > 0.8 ? "bad" : f > 0.5 ? "warn" : "", style: { width: f * 100 + "%" } })) : null);
-    const act = q.cancelled ? h("span", { class: "pill info" }, "cancelling") : can("admin") ? h("button", { class: "btn sm", onclick: () => cancelOne(q) }, nar ? "Cancel…" : "Cancel query…") : null;
+    const act = q.cancelled ? h("span", { class: "pill info" }, "cancelling") : can("admin", "DELETE /v1/queries/:id") ? h("button", { class: "btn sm", onclick: () => cancelOne(q) }, nar ? "Cancel…" : "Cancel query…") : null;
     if (nar) {
       const tr = h("tr", { class: "click", tabindex: 0 },
         h("td", { style: { paddingLeft: "12px" } }, h("div", { class: "mono small" }, q.node ? `${q.node}:${q.local_id ?? q.id}` : q.id), h("div", { class: "small muted ellipsis" }, [q.key, q.app].filter(Boolean).join(" · ") || (groupBy === "none" ? q.sql : ""))),
@@ -184,7 +184,7 @@ function live(body, params, setCount) {
     const acts = [
       fp ? h("a", { class: "btn sm", href: statementLink(fp) }, "Statement ›") : null,
       fp && canContainNow() ? h("button", { class: "btn sm", title: "Limit or refuse this statement for a while", onclick: () => containDialog({ fingerprint: fp, sql: qs[0].sql, key: keys.length === 1 ? keys[0][0] : null, keys: keys.map(([k, c]) => ({ key: k, share: c / n })), onDone: loadRules }) }, "Contain…") : null,
-      can("admin") && n > 1 ? h("button", { class: "btn sm danger", onclick: () => askCancel({ sql: qs[0].sql, fingerprint: fp, key: groupBy === "key" ? g.id : keys.length === 1 ? keys[0][0] : null, queries: qs, onDone: () => { load(); loadRules(); } }) }, `Cancel all ${fmt.n(n)}…`) : null];
+      can("admin", "DELETE /v1/queries/:id") && n > 1 ? h("button", { class: "btn sm danger", onclick: () => askCancel({ sql: qs[0].sql, fingerprint: fp, key: groupBy === "key" ? g.id : keys.length === 1 ? keys[0][0] : null, queries: qs, onDone: () => { load(); loadRules(); } }) }, `Cancel all ${fmt.n(n)}…`) : null];
     const ind = nar ? "0" : "34px";
     return h("tr", { class: "wl-ghead" }, h("td", { colspan: span },
       nar ? [h("div", { class: "row nw", style: { gap: "8px" } }, fold, h("span", { class: "pill info" }, `${fmt.n(n)} running`)), h("div", { style: { marginTop: "6px" } }, what)]

@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { serverBin, Sandbox } from '../src/sandbox.mjs';
 import { useClient } from '../src/model.mjs';
-import { runSet } from '../src/runner.mjs';
+import { runSet, regroup } from '../src/runner.mjs';
 import { DirStore, ServerStore } from '../src/store.mjs';
 import { scripted } from './helpers.mjs';
 
@@ -40,11 +40,15 @@ const set = {
 function pick(params) {
   const tools = params.tools.map((t) => t.name);
   if (tools.includes('review')) {
-    return { tool: 'review', input: { summary: 'Counted the tickets.', verdict: 'mixed', problems: [{ step: 1, category: 'docs', severity: 1, title: 'No row count in list_tables', detail: 'The person had to write SQL to count.' }] } };
+    return { tool: 'review', input: { summary: 'Counted the tickets.', verdict: 'mixed', problems: [{ step: 1, category: 'docs', severity: 1, title: 'No row count in list_tables', detail: 'The person had to write SQL to count.' }], strengths: [{ step: 2, title: 'COUNT answered in one step', detail: 'The query tool gave the count at once.' }] } };
   }
   if (tools.includes('findings')) {
     const ids = [...params.messages[0].content.matchAll(/\[([^\]]+#\d+)\]/g)].map((m) => m[1]);
     return { tool: 'findings', input: { findings: [{ title: 'No row counts', category: 'docs', severity: 1, summary: 'Counting needs SQL.', fix: 'Show counts.', problems: ids }] } };
+  }
+  if (tools.includes('strengths')) {
+    const good = [...params.messages[0].content.matchAll(/\[([^\]]+\+\d+)\]/g)].map((m) => m[1]);
+    return { tool: 'strengths', input: { strengths: [{ title: 'Counts in one step', summary: 'SQL counts work at once.', problems: good }] } };
   }
   if (tools.includes('interview')) return { tool: 'interview', input: { ease: 6, hardest: 'none', expected: 'a count', one_change: 'counts', would_use: 'yes' } };
   const turn = params.messages.filter((m) => m.role === 'assistant').length;
@@ -65,6 +69,7 @@ test('a run plays each session in its own sandbox and lands in both stores', { s
       assert.equal(run.totals.sessions, 2);
       assert.equal(run.totals.ok, 2, JSON.stringify(run.totals));
       assert.equal(run.totals.findings, 1);
+      assert.equal(run.totals.strengths, 1);
       const got = await store.run(run.id);
       assert.equal(got.sessions.length, 2);
       for (const s of got.sessions) {
@@ -78,6 +83,12 @@ test('a run plays each session in its own sandbox and lands in both stores', { s
       }
       assert.equal(got.findings[0].sessions.length, 2);
       assert.equal(got.findings[0].share, 1);
+      assert.deepEqual(got.findings.map((f) => f.category), ['docs', 'strength']);
+      assert.equal(got.findings[1].sessions.length, 2);
+      // Grouped again from the kept reviews, the findings are replaced, not added to.
+      const again = await regroup(store, run.id);
+      assert.equal(again.totals.findings, 1);
+      assert.equal((await store.run(run.id)).findings.length, 2);
       // Every session's requests carried the swarm's tool list and spoke to its own sandbox.
       assert.ok(model.requests.some((p) => p.tools.some((t) => t.name === 'describe_table')));
       // The sandboxes are gone once the run ends.

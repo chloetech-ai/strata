@@ -160,7 +160,9 @@ const fieldsAsColumns = (fields) => (Array.isArray(fields) ? fields : [])
 
 // One "use" block expanded: {blocks, state, data, let} or throws.
 function expandOne(b, patterns) {
-  const { use, ...given } = b;
+  // "id" (the target of an "#id" link) and "tint" go on the first block it
+  // makes, as on any block of a front page.
+  const { use, id, tint, ...given } = b;
   const p = patterns.get(use);
   if (!p) throw new Error(`no screen pattern ${JSON.stringify(use)}; the patterns are ${[...patterns.keys()].join(', ')}`);
   const unknown = Object.keys(given).filter((k) => !p.params[k]);
@@ -176,7 +178,9 @@ function expandOne(b, patterns) {
   for (const [name, d] of Object.entries(p.params)) if (P[name] === undefined && d.from === 'fields') P[name] = fieldsAsColumns(P.fields).filter((c) => c.key !== P.toggle);
   if (P.key !== undefined && !KEY_RE.test(String(P.key))) throw new Error(`the pattern ${use}: "key" ${JSON.stringify(P.key)} must be a name of letters, digits and _ (set "key" when the table name is not one)`);
   const s = fill(p.screen, P);
-  return { blocks: s.body || [], state: s.state || {}, data: s.data || {}, let: s.let || {} };
+  const blocks = s.body || [];
+  if ((id !== undefined || tint !== undefined) && blocks[0] && typeof blocks[0] === 'object' && !Array.isArray(blocks[0])) blocks[0] = { ...blocks[0], ...(id !== undefined ? { id } : {}), ...(tint !== undefined ? { tint } : {}) };
+  return { blocks, state: s.state || {}, data: s.data || {}, let: s.let || {} };
 }
 
 const HOLDERS = ['row', 'col', 'grid', 'split', 'card', 'section', 'then', 'else', 'body'];

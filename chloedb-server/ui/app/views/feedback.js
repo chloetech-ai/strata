@@ -83,9 +83,9 @@ function render(page, r) {
   }
 
   function item(f) {
-    const prio = h("select", { class: "input sm fb-prio", "aria-label": "Priority", title: can("write") ? "Priority: P0 now, P3 some day" : "Setting the priority " + needs("write"), disabled: !can("write"), dataset: { p: f.priority ?? "" }, onclick: (e) => e.stopPropagation(), onchange: (e) => set(f, { priority: e.target.value === "" ? null : +e.target.value }) },
+    const prio = h("select", { class: "input sm fb-prio", "aria-label": "Priority", title: can("write", "PATCH /v1/feedback/:id") ? "Priority: P0 now, P3 some day" : "Setting the priority " + needs("write", "PATCH /v1/feedback/:id"), disabled: !can("write", "PATCH /v1/feedback/:id"), dataset: { p: f.priority ?? "" }, onclick: (e) => e.stopPropagation(), onchange: (e) => set(f, { priority: e.target.value === "" ? null : +e.target.value }) },
       h("option", { value: "", selected: f.priority == null }, "–"), PRIOS.map(([v, l, t]) => h("option", { value: v, selected: f.priority === v, title: t }, `${l} ${t}`)));
-    const st = h("select", { class: "input sm", "aria-label": "Status", disabled: !can("write"), onclick: (e) => e.stopPropagation(), onchange: (e) => set(f, { status: e.target.value }) }, STATUS.map(([v, l]) => h("option", { value: v, selected: f.status === v }, l)));
+    const st = h("select", { class: "input sm", "aria-label": "Status", disabled: !can("write", "PATCH /v1/feedback/:id"), onclick: (e) => e.stopPropagation(), onchange: (e) => set(f, { status: e.target.value }) }, STATUS.map(([v, l]) => h("option", { value: v, selected: f.status === v }, l)));
     const thumb = f.thumb ? h("img", { class: "fb-thumb", src: f.thumb, alt: "", loading: "lazy" }) : h("div", { class: "fb-thumb none" }, icon("feedback"));
     const nMarks = f.marks_text ? f.marks_text.split("\n").length : 0;
     const el = h("article", { class: "fb-item card" + (OPEN.includes(f.status) ? "" : " closed"), tabIndex: 0, onclick: () => detail(f.id), onkeydown: (e) => { if (e.key === "Enter") detail(f.id); } },
@@ -125,12 +125,12 @@ function render(page, r) {
       }).catch((e) => clear(shotBox, h("div", { class: "error" }, "The screenshot: " + e.message)));
     }
     const marks = Array.isArray(f.marks) ? f.marks.filter((m) => m.tool !== "redact") : [];
-    const writer = can("write");
+    const writer = can("write", "PATCH /v1/feedback/:id");
     const prio = seg([["", "–"], ...PRIOS.map(([v, l, t]) => [String(v), l, t])], f.priority == null ? "" : String(f.priority), () => {});
     const st = seg(STATUS.map(([v, l]) => [v, l]), f.status, () => {});
     const assignee = h("input", { class: "input", value: f.assignee || "", placeholder: "Who works on it: a person, or an agent's thread", disabled: !writer });
     const resolution = h("textarea", { class: "input", rows: 2, placeholder: "What was done: a pull request's link, or why not", disabled: !writer }, f.resolution || "");
-    const save = h("button", { class: "btn primary", disabled: !writer, title: writer ? "" : needs("write") }, "Save");
+    const save = h("button", { class: "btn primary", disabled: !writer, title: writer ? "" : needs("write", "PATCH /v1/feedback/:id") }, "Save");
     save.onclick = async () => {
       const pv = prio.querySelector("[aria-pressed=true]")?.dataset.v ?? "";
       const body = { status: st.querySelector("[aria-pressed=true]")?.dataset.v || f.status, priority: pv === "" ? null : +pv, assignee: assignee.value.trim() || null, resolution: resolution.value.trim() || null };

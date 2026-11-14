@@ -1154,7 +1154,7 @@ test('a photo named by what it shows is found in the built-in set by its subject
     { gallery: [{ photo: 'tram' }] },
     { band: [{ media: ['x'], photo: 'farm' }], photo: '=row.image' },
   ] };
-  const placed = await placeScreenPhotos(screen, { find });
+  const placed = await placeScreenPhotos(screen, { find, drawn: false });
   assert.equal(placed.length, 5);
   assert.deepEqual(asked.map(([q, u]) => `${q}:${u}`), ['coffee:hero', 'bread:slide', 'portrait man:avatar', 'tram:gallery', 'farm:media']);
   assert.equal(screen.body[1].carousel[1].src, 'https://kept', 'a photo with a src is left as it is');
@@ -1166,7 +1166,7 @@ test('a photo named by what it shows is found in the built-in set by its subject
   const plan = { views: [], seed: {
     coffees: [{ name: 'Huila', image: 'photo:latte art coffee' }, { name: 'Sumatra', image: 'photo:Sumatra Mandheling dark roast' }],
     sleds: [{ name: 'Polar', image: 'photo:snowmobile trail' }] } };
-  await placePhotos(plan, {});
+  await placePhotos(plan, {}, { open: false, drawn: false });
   assert.match(plan.seed.coffees[0].image, /^https:\/\/images\.unsplash\.com\/photo-/);
   assert.match(plan.seed.coffees[1].image, /^https:\/\/images\.unsplash\.com\/photo-/);
   assert.notEqual(plan.seed.coffees[1].image, plan.seed.coffees[0].image);
@@ -1179,7 +1179,7 @@ test('a photo named by what it shows is found in the built-in set by its subject
     { name: 'Pumpkin pie', category: 'Pies', image: 'photo:pumpkin pie' },
     { name: 'Cable', image: 'photo:usb charging cable' }] } };
   const code = {};
-  await placePhotos(shop, code);
+  await placePhotos(shop, code, { open: false, drawn: false });
   assert.match(code.home, new RegExp(croissant));
   assert.match(shop.seed.products[0].image, /croissant|photo-/);
   assert.match(builtinPhotos().find((p) => shop.seed.products[1].image.includes(p.id)).tags, /\bpie\b/);
@@ -2048,6 +2048,11 @@ test('every version is drawn on a phone and a computer, and the rules find what 
   assert.match(said[1].problem, /8 things to tap are smaller than a finger \(44 px\): Edit/);
   assert.match(said[2].problem, /"No streak yet" at 3.1:1/);
   assert.match(said[3].problem, /raw ids are shown: ai7nozxh2o/);
+  // A hair under its contrast is noted, not a change of its own (APC-16), and says its own need.
+  const near = rules({ ...ok, faint: [{ text: 'Water', ratio: 4.49, need: 4.5 }], faintCount: 1 }, 'phone');
+  assert.deepEqual(near.map((r) => [r.severity, r.problem]), [['low', 'text that is hard to read: "Water" at 4.49:1 (it needs 4.5:1)']]);
+  assert.equal(repairRequest(near.map((r) => ({ ...r, view: 'Plants', device: 'phone', by: 'rule' }))), null);
+  assert.equal(rules({ ...ok, faint: [{ text: 'Big title', ratio: 2.5, need: 3 }], faintCount: 1 }, 'phone')[0].severity, 'high');
   // small targets are a phone's problem; a computer has a pointer
   assert.ok(!rules(bad, 'computer').some((r) => /finger/.test(r.problem)));
   assert.equal(repairRequest([{ view: 'Today', device: 'phone', problem: 'x', severity: 'low' }]), null);
@@ -2420,6 +2425,29 @@ test('beside a cluster the studio lets in chloedb-server, a session from a one-t
   assert.equal((await restarted.check(req({ cookie: `${own.name}=${own.value}` }), at('/a/a1'))).status, 401, 'one process\'s browser cookie is not another\'s');
   assert.equal(login.sameOrigin(req({ origin: 'https://studio.example' })), true);
   assert.equal(login.sameOrigin(req({ origin: 'https://elsewhere.example' })), false);
+});
+
+test('an agent\'s MCP server signs in with the agent token, beside a cluster and on a laptop (audit 4, X-G7)', async () => {
+  const { Login } = await import('../engine/login.mjs');
+  const store = { setting: async () => null, putSetting: async () => {} };
+  const req = (headers = {}) => ({ headers: { host: 'h', ...headers } });
+  const at = (p) => new URL(`http://h${p}`);
+  const agent = { authorization: 'Bearer the-agent-token' };
+  const cluster = new Login({ store, appToken: 'the-app-token', agentToken: 'the-agent-token' });
+  assert.equal(await cluster.check(req(agent), at('/api/apps')), null, 'the agent token is a studio sign-in');
+  assert.equal(cluster.fromAgent(req(agent)), true);
+  assert.equal(cluster.fromServer(req(agent)), false, 'and not chloedb-server\'s');
+  assert.equal((await cluster.check(req({ authorization: 'Bearer stale' }), at('/api/apps'))).status, 401);
+  assert.equal((await cluster.check(req(), at('/api/apps'))).status, 401);
+  const laptop = new Login({ store, agentToken: 'the-agent-token' });
+  assert.equal(laptop.on, false);
+  assert.equal(await laptop.check(req(agent), at('/api/apps')), null);
+  assert.equal(await laptop.check(req(), at('/api/apps')), null, 'the studio\'s own page, as before');
+  const wrong = await laptop.check(req({ authorization: 'Bearer stale' }), at('/api/apps'));
+  assert.equal(wrong.status, 401, 'a wrong token is refused even with no login');
+  assert.match(wrong.json.error, /agent token/);
+  assert.equal(await laptop.check(req({ authorization: 'Bearer stale' }), at('/healthz')), null);
+  assert.equal(new Login({ store }).fromAgent(req(agent)), false, 'no agent token: nobody is the agent');
 });
 
 test('the engine\'s own browser opens the app with its cookie', async (t) => {
@@ -2911,7 +2939,7 @@ test('a source on a schedule fills a table in Strata once per item, through the 
 
 // ---- a published app's visitors (the appmaker persona's findings, 2026-11-13)
 
-test('a published app: who can do what, chosen by its owner; an app published before the choice keeps what it had', async () => {
+test('a published app: who can do what, chosen by its owner; an app that never chose is at the safest, look', async () => {
   const { Publish, strangerOf, forVisitor } = await import('../engine/publish.mjs');
   const rows = new Map([['old1', JSON.stringify({ on: true, name: 'old-app', hosts: [] })]]);
   const store = { db: { query: async () => [...rows].map(([app, value]) => ({ app, value })) }, putSetting: async (app, name, value) => rows.set(app, value) };
@@ -2919,9 +2947,13 @@ test('a published app: who can do what, chosen by its owner; an app published be
   await pub.load(true);
   const req = (method, host) => ({ method, headers: { host }, socket: { remoteAddress: '203.0.113.9' } });
   const at = (p) => new URL(p, 'http://x');
-  // Published before the choice: anyone can still change it, as before.
-  assert.equal(pub.of('old1').access, 'change');
-  assert.ok(!(await pub.allows(req('POST', 'old-app.apps.example.com'), at('/api/apps/old1/remove'))).denied);
+  // Published before the choice existed, and never chosen since: visitors only look,
+  // until the owner chooses more (it used to be "anyone can do anything").
+  assert.equal(pub.of('old1').access, 'look');
+  assert.match((await pub.allows(req('POST', 'old-app.apps.example.com'), at('/api/apps/old1/remove'))).denied, /read-only for visitors/);
+  assert.equal((await pub.allows(req('POST', 'old-app.apps.example.com'), at('/api/apps/old1/sql'))).denied, undefined);
+  await pub.set('old1', 'Old app', { access: 'change' });
+  assert.ok(!(await pub.allows(req('POST', 'old-app.apps.example.com'), at('/api/apps/old1/remove'))).denied, 'its owner may still choose change');
   // Never published: only me (off); a publish naming no access starts at look.
   assert.deepEqual([pub.of('n1').on, pub.of('n1').access], [false, 'look']);
   await pub.set('n1', 'New one', { on: true });
@@ -2929,7 +2961,9 @@ test('a published app: who can do what, chosen by its owner; an app published be
   const host = 'new-one.apps.example.com';
   const call = (m, p) => pub.allows(req(m, host), at(p));
   assert.ok(!(await call('POST', '/api/apps/n1/sql')).denied, 'looking is reading');
-  for (const p of ['/insert', '/update', '/remove', '/call', '/files', '/email']) assert.match((await call('POST', `/api/apps/n1${p}`)).denied, /only look/, p);
+  // Refused in words that say what was asked: adding, or changing what is there.
+  for (const p of ['/insert', '/call', '/files', '/email']) assert.match((await call('POST', `/api/apps/n1${p}`)).denied, /read-only for visitors: its owner has not let the public add/, p);
+  for (const p of ['/update', '/remove']) assert.match((await call('POST', `/api/apps/n1${p}`)).denied, /read-only for visitors: only its owner can change or delete/, p);
   await pub.set('n1', 'New one', { access: 'add' });
   for (const p of ['/insert', '/update', '/remove', '/call']) assert.equal((await call('POST', `/api/apps/n1${p}`)).denied, undefined, p);
   assert.equal((await call('POST', '/api/apps/n1/update')).access, 'add', 'the routes hold edits to the visitor\'s own rows');
@@ -2940,7 +2974,7 @@ test('a published app: who can do what, chosen by its owner; an app published be
   // The studio's "See it as a stranger": an app not published yet, as a visitor with the access weighed.
   assert.equal(strangerOf({ headers: {} }), null);
   const s = strangerOf({ headers: { 'x-sa-as': 'visitor', 'x-sa-access': 'look' } });
-  assert.match((await pub.allows(req('POST', 'engine'), at('/api/apps/zz9/insert'), s)).denied, /only look/);
+  assert.match((await pub.allows(req('POST', 'engine'), at('/api/apps/zz9/insert'), s)).denied, /read-only for visitors/);
   assert.deepEqual(await pub.allows(req('GET', 'engine'), at('/api/apps/zz9'), s), { app: 'zz9', call: '', access: 'look' });
   assert.ok((await pub.allows(req('POST', 'engine'), at('/api/apps/zz9/requests'), s)).denied, 'a stranger never builds');
   // What a visitor is told of a failure: nothing of how it runs.
@@ -3220,4 +3254,166 @@ test('each app reads and writes with a key of its own, held to its tables by the
   } finally {
     child.kill();
   }
+});
+
+test('a call nobody answered is not an error of the app: no record, no repair', async () => {
+  const { Engine, unanswered } = await import('../engine/engine.mjs');
+  const engine = new Engine({}, { log: () => {} });
+  const tracked = [];
+  engine.store = { track: async (...a) => { tracked.push(a); }, resolve: async () => ({ comp: { caps: ['a1/view/list@2'] } }) };
+  const emitted = [];
+  engine.on('error', (e) => emitted.push(e));
+  // What the command center, a browser and a proxy say when nothing answered (audit APC-1).
+  for (const m of ['data.expenses_k0: no answer: the network failed or the server is not running\n    at load', 'data.x: Failed to fetch', 'TypeError: NetworkError when attempting to fetch resource.',
+    'data.rows: the app apps (http://10.0.0.7:7730) does not answer: error sending request', 'Load failed', 'data.x: no answer in 30 s', 'body[2]: Bad Gateway']) {
+    assert.deepEqual(await engine.browserError('a1', 'a1/view/list@2', m), { stale: false, sent: false, transient: true }, m);
+  }
+  assert.equal(emitted.length, 0, 'no repair from a call nobody answered');
+  assert.equal(tracked.length, 0, 'nor is it counted as the app\'s error');
+  // A real error of the code still is.
+  assert.equal(unanswered("TypeError: Cannot read properties of null (reading 'name')"), false);
+  assert.deepEqual(await engine.browserError('a1', 'a1/view/list@2', "TypeError: Cannot read properties of null (reading 'name')"), { stale: false, sent: true });
+  assert.equal(emitted.length, 1);
+});
+
+// A screen in a frame made as the studio makes one, its calls answered by
+// the test as the studio would: rows, a refusal, or no answer at all.
+async function screenInFrame(t, spec, { access = null, answer }) {
+  const { readFileSync } = await import('node:fs');
+  const { loadPlaywright } = await import('../engine/checks.mjs');
+  const pw = loadPlaywright();
+  if (!pw) { t.skip('no playwright'); return null; }
+  const web = (f) => readFileSync(join(import.meta.dirname, '..', 'web', f), 'utf8');
+  const exprs = [];
+  const walk = (v) => (typeof v === 'string' && v.startsWith('=') ? (exprs.push(v.slice(1)), { $e: exprs.length - 1 })
+    : Array.isArray(v) ? v.map(walk) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)])) : v);
+  const compiled = walk(spec);
+  const close = (x) => x.replace(/<\/(script)/gi, '<\\/$1');
+  const doc = `<!doctype html><html><head><meta charset="utf-8"></head><body><div id="root"></div>
+<script>window.__SA = ${JSON.stringify({ slug: 'list', cap: 'a1/view/list@1', app: 'a1', origin: 'https://studio.test', params: {}, access })};</script>
+<script>${close(web('frame.js'))}</script><script>${close(web('screen.js'))}</script>
+<script>window.__SA_EXPR = []; window.__SA_EXPR_SRC = ${JSON.stringify(exprs)};</script>
+${exprs.map((e, i) => `<script>__SA_EXPR[${i}] = function (s) { with (s) { return (${close(e)}\n); } };</script>`).join('\n')}
+<script>(async () => { try { await __sa_screen(document.getElementById('root'), app, ${JSON.stringify(compiled)}); __sa_ready(); } catch (e) { __sa_report(e); } })();</script></body></html>`;
+  const browser = await pw.chromium.launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.route('**/*', (r) => r.fulfill({ contentType: 'text/html', body: '<!doctype html><body></body>' }));
+  await page.goto('https://studio.test/');
+  await page.exposeFunction('__answer', answer);
+  await page.evaluate((srcdoc) => {
+    window.__seen = [];
+    const f = document.createElement('iframe');
+    f.setAttribute('sandbox', 'allow-scripts');
+    window.addEventListener('message', async (e) => {
+      const m = e.data;
+      if (!m || !m.__sa) return;
+      window.__seen.push({ kind: m.kind, method: m.method, message: m.message });
+      if (m.kind !== 'rpc') return;
+      const out = await window.__answer(m.method, m.args);
+      e.source.postMessage({ __sa: 1, kind: 'result', id: m.id, ...out }, '*');
+    });
+    f.srcdoc = srcdoc;
+    document.body.append(f);
+  }, doc);
+  return { page, frame: () => page.frames()[1], seen: () => page.evaluate(() => window.__seen) };
+}
+
+test('a view whose data read is not answered says so, reads again, and reports no error (APC-1)', async (t) => {
+  let sql = 0;
+  const spec = { data: { plants: 'SELECT * FROM plants' }, body: [{ each: '=plants', body: ['=item.name'] }] };
+  const f = await screenInFrame(t, spec, { answer: (method) => (method === 'sql' && ++sql === 1 ? { error: 'no answer: the network failed or the server is not running', transient: true } : { value: [{ id: '1', name: 'Fern' }] }) });
+  if (!f) return;
+  await f.page.waitForTimeout(500);
+  assert.match(await f.frame().evaluate(() => document.body.innerText), /No answer from the app/);
+  await f.page.waitForTimeout(2600);
+  assert.match(await f.frame().evaluate(() => document.body.innerText), /Fern/, 'read again by itself');
+  assert.doesNotMatch(await f.frame().evaluate(() => document.body.innerText), /No answer/, 'and the note goes once it is answered');
+  const seen = await f.seen();
+  assert.deepEqual(seen.filter((x) => x.kind === 'error'), [], 'nothing reported as the view\'s error');
+  assert.ok(sql >= 2);
+});
+
+test('a visitor who may only look is offered no form and no write; a refusal is said quietly, not reported (APC-2)', async (t) => {
+  const spec = { data: { plants: 'SELECT * FROM plants' }, state: { editing: null },
+    body: [{ form: 'plants', fields: ['name'], edit: '=state.editing' },
+      { button: 'Add a fern', do: "=() => app.insert('plants', { name: 'Fern' })" },
+      { button: 'Show all', do: '=() => set({ all: true })' },
+      { table: '=plants', columns: ['name'], actions: [{ label: 'Water', do: "=row => app.update('plants', row.id, { watered: app.today() })" }, { label: 'Edit', do: '=row => set({ editing: row })' }, { label: 'Open', do: "=row => app.open('plant', { id: row.id })" }] }] };
+  const rows = { value: [{ id: '1', name: 'Fern' }] };
+  const look = await screenInFrame(t, spec, { access: 'look', answer: () => rows });
+  if (!look) return;
+  await look.page.waitForTimeout(600);
+  const buttons = await look.frame().$$eval('button, input, form', (xs) => xs.map((x) => x.textContent.trim() || x.tagName));
+  assert.deepEqual(buttons, ['Show all', 'Open'], 'only what reads or moves is drawn');
+  // The owner (no access given) sees all of it.
+  const own = await screenInFrame(t, spec, { answer: (method) => (method === 'update' ? { error: 'This app is read-only for visitors', refused: true } : rows) });
+  await own.page.waitForTimeout(600);
+  const all = await own.frame().$$eval('button', (xs) => xs.map((x) => x.textContent.trim()));
+  for (const b of ['Add a fern', 'Water', 'Edit', 'Open']) assert.ok(all.includes(b), `${b} in ${all}`);
+  await own.frame().click('button:text("Water")');
+  await own.page.waitForTimeout(400);
+  assert.match(await own.frame().evaluate(() => document.body.innerText), /read-only for visitors/, 'the refusal is said');
+  assert.deepEqual((await own.seen()).filter((x) => x.kind === 'error'), [], 'and not reported as an error');
+});
+
+test('an app is named shortly from its description, and one whose first build failed says so (APC-4)', async () => {
+  const { shortName, firstBuildStatus } = await import('../engine/store.mjs');
+  assert.equal(shortName('A tiny reading list: links with a title and a note, and whether I read them.'), 'Tiny reading list');
+  assert.equal(shortName('A weekend trip expense splitter: who paid what, split four ways.'), 'Weekend trip expense splitter');
+  assert.equal(shortName("Kids' reading — books and who read them"), "Kids' reading");
+  assert.equal(shortName('Track my running mileage per week and show a chart of the last three months of runs'), 'Track my running mileage per week');
+  assert.ok(shortName('x'.repeat(80)).length <= 40);
+  const now = Date.parse('2026-11-13T12:00:00Z');
+  const at = (min) => new Date(now - min * 60000).toISOString();
+  assert.equal(firstBuildStatus({ status: 'failed', created: at(1) }, now), 'failed');
+  assert.equal(firstBuildStatus({ status: 'stopped', created: at(1) }, now), 'failed');
+  assert.equal(firstBuildStatus({ status: 'running', created: at(2) }, now), 'building');
+  assert.equal(firstBuildStatus({ status: 'running', created: at(45) }, now), 'failed', 'an engine that stopped in the middle of it');
+  assert.equal(firstBuildStatus(null, now), 'building');
+});
+
+test('a build its owner stops ends at once: the model call running is killed and the next one never starts (APC-6)', async () => {
+  const { buildScope, IDLE_S } = await import('../engine/llm.mjs');
+  assert.ok(IDLE_S <= 90, 'a model that says nothing holds its app 90 s at most');
+  const answer = '<plan>{"views":[]}</plan>';
+  const stop = new AbortController();
+  const t0 = Date.now();
+  const run = buildScope.run({ signal: stop.signal }, () => ask({ system: 's', prompt: 'p', bin: fakeClaude(answer, 20000), idleMs: 60000 }));
+  setTimeout(() => stop.abort(), 200);
+  await assert.rejects(run, (e) => e.stopped === true && /stopped by its owner/.test(e.message));
+  assert.ok(Date.now() - t0 < 5000, 'stopped, not waited out');
+  await assert.rejects(buildScope.run({ signal: stop.signal }, () => ask({ system: 's', prompt: 'p', bin: fakeClaude(answer) })), /stopped by its owner/);
+  // Outside a build, a call is as it was.
+  assert.equal((await ask({ system: 's', prompt: 'p', bin: fakeClaude(answer) })).text, answer);
+});
+
+test('a failed build says what went wrong in a sentence (APC-7)', async () => {
+  const { explainFailure } = await import('../engine/failures.mjs');
+  assert.match(explainFailure('claude exited 1: Invalid API key · Please run /login').title, /not signed in/);
+  assert.match(explainFailure('claude: Claude AI usage limit reached|1794600000').title, /usage limit/);
+  assert.match(explainFailure('the model wrote nothing for 90 s (0 characters written)').title, /stopped answering/);
+  assert.match(explainFailure('the model\'s answer did not pass the checks: view settle: CREATE SCREEN line 2: "FROBNICATE" does not start a part').title, /did not pass the engine's checks/);
+  assert.match(explainFailure("the model's answer did not pass the checks: the answer held no <plan>: I'm sorry").title, /checks/);
+  assert.match(explainFailure('this studio has reached its spending limit for the model ($6.01 of $6)').title, /spent what it may/);
+  assert.equal(explainFailure('anything', { stopped: true }).title, 'Stopped.');
+  const other = explainFailure('TypeError: x is undefined');
+  assert.match(other.title, /did not go through/);
+  for (const m of ['claude exited 1: Invalid API key', 'x']) assert.doesNotMatch(explainFailure(m).title + explainFailure(m).hint, /^[a-z]/, 'a sentence starts with a capital');
+});
+
+test('a screen written as JSON gets :today as a CREATE SCREEN does: in the build\'s check and in the browser (APC-10)', async (t) => {
+  const { dryRunScreens } = await import('../engine/forge.mjs');
+  const seen = [];
+  const db = { explain: async () => ({ ir: {} }), query: async (sql, params) => { seen.push(params); if (/:today/.test(sql) && !params.today) throw new Error('strata /v1/query: query error: unbound parameter :today'); return []; } };
+  const plan = { views: [{ slug: 'plants', screen: { data: { due: 'SELECT name FROM plants WHERE next_due <= :today', mine: { sql: 'SELECT name FROM plants WHERE next_due <= :today', params: { today: '2026-01-01' } } } } }] };
+  assert.deepEqual(await dryRunScreens(db, 'a1', ['plants'], plan), [], 'no paid fix round for :today');
+  assert.match(seen[0].today, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(seen[1].today, '2026-01-01', 'a value the screen gives stays');
+  let params = null;
+  const f = await screenInFrame(t, { data: { due: 'SELECT name FROM plants WHERE next_due <= :today' }, body: [{ each: '=due', body: ['=item.name'] }] },
+    { answer: (method, args) => { if (method === 'sql') params = args[1]; return { value: [{ name: 'Fern' }] }; } });
+  if (!f) return;
+  await f.page.waitForTimeout(500);
+  assert.match(params?.today || '', /^\d{4}-\d{2}-\d{2}$/);
 });

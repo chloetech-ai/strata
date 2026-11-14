@@ -163,6 +163,15 @@ async fn bodies_are_capped_by_route() {
     // Writes take --max-body-mb: here 1 MiB.
     let doc = |i: usize, len: usize| json!({"op": "upsert", "doc": {"id": format!("big{i}"), "title": "y".repeat(len)}});
     refused(post("/v1/write", json!({"ops": [doc(0, 1100 << 10)]}).to_string()).await);
+    // Sent at once, the refusal is read, in the API's error shape, naming
+    // the limits.
+    let r = client.post(format!("{base}/v1/write")).header("content-type", "application/json").body(json!({"ops": [doc(0, 1100 << 10)]}).to_string()).send().await;
+    if let Ok(r) = r {
+        assert_eq!(r.status(), 413);
+        let j: Json = r.json().await.unwrap();
+        assert_eq!((j["error_code"].as_str(), j["retryable"].as_bool()), (Some("too_large"), Some(false)), "{j}");
+        assert!(j["error"].as_str().unwrap().contains("1 MiB for rows") && j["error"].as_str().unwrap().contains("--max-body-mb"), "{j}");
+    }
     let r = post("/v1/write", json!({"ops": [doc(1, 900 << 10)]}).to_string()).await.unwrap();
     assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
 }
@@ -396,4 +405,30 @@ async fn a_capped_coordinator_understands_and_corrects_as_one_server() {
     // Without understand_fields, every keyword field is read.
     let (status, a) = post(&coord, "/v1/understand", json!({"table": "products", "field": "body", "text": "leather boots"})).await;
     assert_eq!(status, 200, "{a}");
+}
+
+/// Errors answered before a handler runs (a body that is not JSON, the
+/// wrong content type, a route or method there is none of) carry the same
+/// shape as the handlers' errors: `error`, `error_code`, `retryable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn errors_outside_the_handlers_have_the_api_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = capped(open(dir.path(), "e.strata", |i| i < 10));
+    let base = http(Arc::new(svc)).await;
+    let client = chloedb_server::http_client().build().unwrap();
+    let cases = [
+        (client.post(format!("{base}/v1/query")).header("content-type", "application/json").body("{x"), 400, "bad_request", "JSON"),
+        (client.post(format!("{base}/v1/query")).header("content-type", "text/plain").body("{}"), 415, "unsupported_media_type", "Content-Type"),
+        (client.post(format!("{base}/v1/query")).body("{}"), 415, "unsupported_media_type", "Content-Type"),
+        (client.get(format!("{base}/v1/nope")), 404, "not_found", "no route matches GET /v1/nope"),
+        (client.delete(format!("{base}/v1/query")), 405, "bad_request", "does not take this method"),
+    ];
+    for (req, status, code, says) in cases {
+        let r = req.send().await.unwrap();
+        assert_eq!(r.status().as_u16(), status);
+        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+        let j: Json = r.json().await.unwrap();
+        assert_eq!((j["error_code"].as_str(), j["retryable"].as_bool()), (Some(code), Some(false)), "{j}");
+        assert!(j["error"].as_str().unwrap().contains(says), "{says}: {j}");
+    }
 }

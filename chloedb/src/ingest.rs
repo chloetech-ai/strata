@@ -290,6 +290,11 @@ pub struct Rows<'a> {
     empty: EmptyCell,
     /// Columns or keys the schema has no field for (skipped).
     pub unknown: BTreeSet<String>,
+    /// CSV or TSV rows with more or fewer values than the header names
+    /// (their missing cells empty, their extra ones left out), unless
+    /// [`Rows::strict`] refuses them.
+    pub ragged: u64,
+    strict: bool,
 }
 
 /// What an empty cell of a CSV or TSV file means (all spaces, or nothing,
@@ -399,7 +404,7 @@ impl<'a> Rows<'a> {
                 let reader: Box<dyn Read + Send> = Box::new(Counting { inner: reader, newlines: newlines.clone() });
                 let mut r = csv::ReaderBuilder::new().delimiter(if format == Format::Tsv { b'\t' } else { b',' }).flexible(true).from_reader(reader);
                 let header = r.headers().map_err(|e| Error::Schema(format!("CSV header: {e}")))?.clone();
-                let columns = header
+                let columns: Vec<Option<usize>> = header
                     .iter()
                     .map(|h| {
                         let h = h.trim().trim_start_matches('\u{feff}');
@@ -410,10 +415,28 @@ impl<'a> Rows<'a> {
                         f
                     })
                     .collect();
+                // A column twice would be filled by its last cell, silently.
+                for (i, f) in columns.iter().enumerate() {
+                    if let Some(j) = f.and_then(|f| columns[..i].iter().position(|g| *g == Some(f))) {
+                        return Err(Error::Schema(format!("CSV header: column {} names field {} again, as column {} does", i + 1, schema.fields[f.unwrap_or_default()].name, j + 1)));
+                    }
+                }
+                if !columns.iter().any(Option::is_some) {
+                    let sep = if format == Format::Tsv { "tab-separated" } else { "comma-separated" };
+                    return Err(Error::Schema(format!("CSV header: it names no field of {} (is the file {sep}, its first line the header?)", schema.table)));
+                }
                 Inner::Csv(r.into_records(), columns, newlines)
             }
         };
-        Ok(Rows { schema, inner, now: crate::timestamp::now(), empty: EmptyCell::Default, unknown })
+        Ok(Rows { schema, inner, now: crate::timestamp::now(), empty: EmptyCell::Default, unknown, ragged: 0, strict: false })
+    }
+
+    /// These rows refusing a CSV or TSV row with more or fewer values than
+    /// the header names, by its line, rather than counting it in
+    /// [`Rows::ragged`].
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// These rows with `empty` the meaning of an empty CSV cell
@@ -460,6 +483,12 @@ impl Iterator for Rows<'_> {
                     Err(e) => return Some(Err(Error::Schema(format!("CSV: {e}")))),
                 };
                 let line = rec.position().map_or(0, |p| newlines.line(p.byte()));
+                if rec.len() != columns.len() {
+                    if self.strict {
+                        return Some(Err(at_row("line", line, Error::Schema(format!("{} values, and the header names {} columns", rec.len(), columns.len())))));
+                    }
+                    self.ragged += 1;
+                }
                 let mut doc = match start(schema, now) {
                     Ok(d) => d,
                     Err(e) => return Some(Err(e)),
@@ -499,6 +528,8 @@ pub struct Imported {
     pub bulk: bool,
     /// Columns or keys the schema has no field for (skipped).
     pub unknown: Vec<String>,
+    /// CSV or TSV rows with more or fewer values than the header names.
+    pub ragged: u64,
 }
 
 /// Rows a transaction of [`import`] upserts.
@@ -552,6 +583,7 @@ pub fn import_into(db: &Db, table: &str, mut rows: Rows<'_>) -> Result<Imported>
         }
     }
     out.unknown = rows.unknown.iter().cloned().collect();
+    out.ragged = rows.ragged;
     Ok(out)
 }
 
@@ -583,5 +615,136 @@ fn short_str(s: &str) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(80).collect::<String>())
+    }
+}
+
+/// A `CREATE TABLE IF NOT EXISTS` statement for rows of a file that no
+/// table holds yet, from the names in its header (or the keys of its
+/// objects) and the values of its first thousand rows: a column of whole
+/// numbers is INT, of numbers FLOAT, of `true`/`false` BOOL, of ISO dates
+/// TIMESTAMP, of objects or arrays JSON, of text of two and a half words or
+/// more on average (or any value longer than 64 bytes) TEXT (searched with MATCH), and of other text KEYWORD. The
+/// primary key is `key` when given (`""` for none), else a column named
+/// `id` whose values are all there and all different.
+pub fn create_for(table: &str, data: &[u8], format: Format, key: Option<&str>) -> Result<String> {
+    const SAMPLE: usize = 1000;
+    // Each column's name and its first values, as JSON.
+    let mut columns: Vec<(String, Vec<Json>)> = Vec::new();
+    let col = |columns: &mut Vec<(String, Vec<Json>)>, name: &str, v: Json| {
+        let i = match columns.iter().position(|(n, _)| n == name) {
+            Some(i) => i,
+            None => {
+                columns.push((name.to_string(), Vec::new()));
+                columns.len() - 1
+            }
+        };
+        columns[i].1.push(v);
+    };
+    let mut rows = 0usize;
+    match format {
+        Format::Csv | Format::Tsv => {
+            let mut r = csv::ReaderBuilder::new().delimiter(if format == Format::Tsv { b'\t' } else { b',' }).flexible(true).from_reader(data);
+            let header: Vec<String> = r.headers().map_err(|e| Error::Schema(format!("CSV header: {e}")))?.iter().map(|h| h.trim().trim_start_matches('\u{feff}').to_string()).collect();
+            for h in &header {
+                if h.is_empty() {
+                    return Err(Error::Schema("the header has an empty column name: name every column in the first line".into()));
+                }
+                col(&mut columns, h, Json::Null);
+                columns.last_mut().unwrap().1.clear();
+            }
+            for rec in r.records().take(SAMPLE) {
+                let rec = rec.map_err(|e| Error::Schema(format!("CSV: {e}")))?;
+                rows += 1;
+                for (h, cell) in header.iter().zip(rec.iter()) {
+                    let cell = cell.trim();
+                    col(&mut columns, h, if cell.is_empty() { Json::Null } else { Json::String(cell.to_string()) });
+                }
+            }
+        }
+        Format::Jsonl | Format::Json => {
+            let objs: Vec<Json> = if format == Format::Json {
+                match serde_json::from_slice::<Json>(data).map_err(|e| Error::Schema(format!("JSON: {e}")))? {
+                    Json::Array(xs) => xs.into_iter().take(SAMPLE).collect(),
+                    o => vec![o],
+                }
+            } else {
+                data.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)).take(SAMPLE).map(|l| serde_json::from_slice(l).map_err(|e| Error::Schema(format!("JSON line: {e}")))).collect::<Result<_>>()?
+            };
+            for o in objs {
+                let Json::Object(o) = o else { return Err(Error::Schema("rows are JSON objects".into())) };
+                rows += 1;
+                for (k, v) in o {
+                    col(&mut columns, &k, v);
+                }
+            }
+        }
+    }
+    if columns.is_empty() {
+        return Err(Error::Schema("the rows name no columns".into()));
+    }
+    let present = |vs: &[Json]| vs.iter().filter(|v| !v.is_null()).cloned().collect::<Vec<_>>();
+    let type_of = |vs: &[Json]| -> &'static str {
+        let vs = present(vs);
+        let text = |v: &Json| v.as_str().map(str::to_string);
+        if vs.is_empty() {
+            return "KEYWORD";
+        }
+        if vs.iter().all(|v| v.is_boolean() || text(v).is_some_and(|s| s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false"))) {
+            return "BOOL";
+        }
+        if vs.iter().all(|v| v.is_i64() || v.is_u64() || text(v).is_some_and(|s| s.parse::<i64>().is_ok())) {
+            return "INT";
+        }
+        if vs.iter().all(|v| v.is_number() || text(v).is_some_and(|s| s.parse::<f64>().is_ok_and(f64::is_finite))) {
+            return "FLOAT";
+        }
+        if vs.iter().all(|v| text(v).is_some_and(|s| crate::timestamp::parse(&s).is_some())) {
+            return "TIMESTAMP";
+        }
+        if vs.iter().any(|v| v.is_object() || v.is_array()) {
+            return "JSON";
+        }
+        let words: usize = vs.iter().map(|v| text(v).unwrap_or_default().split_whitespace().count()).sum();
+        let long = vs.iter().any(|v| text(v).is_some_and(|s| s.len() > 64));
+        if long || words as f64 / vs.len() as f64 >= 2.5 { "TEXT" } else { "KEYWORD" }
+    };
+    let key = match key {
+        Some("") => None,
+        Some(k) => Some(columns.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(n, _)| n.clone()).ok_or_else(|| Error::Schema(format!("the key {k:?} is not a column of the rows")))?),
+        None => columns.iter().find(|(n, vs)| {
+            let p = present(vs);
+            let mut seen = std::collections::HashSet::new();
+            n.eq_ignore_ascii_case("id") && p.len() == rows && p.iter().all(|v| seen.insert(v.to_string()))
+        }).map(|(n, _)| n.clone()),
+    };
+    let name = |n: &str| if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !n.starts_with(|c: char| c.is_ascii_digit()) { n.to_string() } else { crate::query::sql::quoted(n) };
+    let fields: Vec<String> = columns
+        .iter()
+        .map(|(n, vs)| {
+            let mut ty = type_of(vs);
+            if key.as_deref() == Some(n.as_str()) {
+                ty = if ty == "INT" { "INT" } else { "KEYWORD" };
+                return format!("{} {ty} PRIMARY KEY", name(n));
+            }
+            format!("{} {ty}", name(n))
+        })
+        .collect();
+    Ok(format!("CREATE TABLE IF NOT EXISTS {} ({})", name(table), fields.join(", ")))
+}
+
+#[cfg(test)]
+mod create_for_tests {
+    use super::*;
+
+    #[test]
+    fn a_table_for_a_csv_file() {
+        let csv = "id,title,category,price,stock,in_stock,added\ng-1,Trail Running Shoes,shoes,89.5,12,true,2026-01-02\ng-2,Rain Jacket,jackets,120,3,false,2026-02-03\ng-3,Wool Socks,socks,9.99,40,true,2026-03-04\n";
+        let sql = create_for("gear", csv.as_bytes(), Format::Csv, None).unwrap();
+        assert_eq!(sql, "CREATE TABLE IF NOT EXISTS gear (id KEYWORD PRIMARY KEY, title KEYWORD, category KEYWORD, price FLOAT, stock INT, in_stock BOOL, added TIMESTAMP)");
+        let sql = create_for("gear", b"n,note\n1,a long note of words\n2,another note with words\n", Format::Csv, Some("n")).unwrap();
+        assert_eq!(sql, "CREATE TABLE IF NOT EXISTS gear (n INT PRIMARY KEY, note TEXT)");
+        let sql = create_for("t", br#"[{"id": 1, "tags": ["a"], "my col": "x"}, {"id": 1}]"#, Format::Json, None).unwrap();
+        assert_eq!(sql, r#"CREATE TABLE IF NOT EXISTS t (id INT, "my col" KEYWORD, tags JSON)"#);
+        assert!(create_for("t", b"a,,b\n1,2,3\n", Format::Csv, None).is_err());
     }
 }

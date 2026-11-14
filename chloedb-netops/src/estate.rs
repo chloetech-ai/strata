@@ -87,7 +87,7 @@ pub struct Estate {
     pub edges: Vec<(u32, u32, &'static str)>,
     index: HashMap<String, u32>,
     down: Vec<Vec<u32>>,
-    up: Vec<Vec<u32>>,
+    pub up: Vec<Vec<u32>>,
     /// Between metros: how many backbone links.
     pub trunks: Vec<(String, String, usize)>,
     /// The radius of a hub and of a site, for choosing the level of detail.
@@ -522,7 +522,7 @@ impl Estate {
         self.walk(i, 8, cap, true, false)
     }
 
-    fn walk(&self, from: u32, hops: usize, cap: usize, down: bool, up: bool) -> Vec<u32> {
+    pub fn walk(&self, from: u32, hops: usize, cap: usize, down: bool, up: bool) -> Vec<u32> {
         self.walk_hops(from, hops, cap, down, up).into_iter().map(|(i, _)| i).collect()
     }
 
@@ -651,6 +651,164 @@ pub async fn minute(e: &Engine, m: i64) -> Result<()> {
         e.db.upsert(EVENTS, events).await?;
     }
     est.live.lock().unwrap_or_else(|p| p.into_inner()).extend(started);
+    Ok(())
+}
+
+// ---- outages in the estate, as the shift sees them
+
+/// The hub an object of the estate sits in (its own id for a hub), which
+/// is what its alerts are grouped by: from the estate this app made, or
+/// read off the id (`olt-s03-h12-lon` is in `h12-lon`).
+pub fn hub_of(est: Option<&Estate>, id: &str) -> Option<String> {
+    if let Some(est) = est {
+        if let Some(i) = est.find(id) {
+            let n = &est.nodes[i as usize];
+            let a = n.anc[2];
+            if a != NONE {
+                return Some(est.nodes[a as usize].id.clone());
+            }
+            if n.kind == "hub" {
+                return Some(n.id.clone());
+            }
+            return None;
+        }
+    }
+    let parts: Vec<&str> = id.split('-').collect();
+    let k = parts.iter().position(|p| p.len() == 3 && p.starts_with('h') && p[1..].chars().all(|c| c.is_ascii_digit()))?;
+    (k + 1 < parts.len()).then(|| parts[k..].join("-"))
+}
+
+const LAYER_RANK: &[&str] = &["power", "aggregation", "access", "premises"];
+
+/// The estate's agent: an incident whose alerts are on objects behind the
+/// backbone. The object says what is wrong with it (its `reason`); what is
+/// left to find is how far it reaches (a walk along the edges, and the
+/// customers on what it reaches) and whether a change came before it, on it
+/// or on what it hangs from. Every step is a query, kept as the other
+/// agents keep theirs.
+pub async fn diagnose(e: &Engine, incident: &str, m: i64) -> Result<()> {
+    use crate::agents::{quoted, Run};
+    if !e.st().open.contains_key(incident) {
+        return Ok(());
+    }
+    let mut run = Run::new(e, "estate", incident, incident, m);
+    let alerts = run.q("Read the incident's alerts", "SELECT entity, severity, reading, summary, started FROM netops_alerts\nWHERE incident = :id AND status IN ('firing', 'silenced')\nORDER BY reading DESC LIMIT 50", json!({"id": incident})).await;
+    let mut ids: Vec<String> = alerts.iter().map(|a| a.s("entity")).collect();
+    ids.dedup();
+    run.finding(format!("{} alert{} on {}.", alerts.len(), if alerts.len() == 1 { "" } else { "s" }, ids.join(", ")));
+    if ids.is_empty() {
+        run.think("Conclude", "Nothing is firing: the objects came back before the agent looked.");
+        run.finish("done", "Nothing firing", 0.0).await?;
+        return Ok(());
+    }
+    let objs = run.q("What the objects report now", &format!("SELECT id, kind, layer, name, state, reason, since, hub, metro, region, vendor, model, os_version FROM {NODES}\nWHERE id IN ({}) LIMIT 50", quoted(&ids)), json!({})).await;
+    // The root is one that is down before one that is only degraded (a
+    // slow router does not take down what it feeds); among those, the one
+    // highest up: a hub's power before its routers, a router before what it
+    // feeds; then the one with the most behind it.
+    let rank = |r: &Row| LAYER_RANK.iter().position(|l| *l == r.s("layer")).unwrap_or(9);
+    let reading = |r: &Row| alerts.iter().find(|a| a.s("entity") == r.s("id")).map_or(0.0, |a| a.f("reading"));
+    let mut sorted: Vec<&Row> = objs.iter().collect();
+    sorted.sort_by(|a, b| (a.s("state") != "down").cmp(&(b.s("state") != "down")).then(rank(a).cmp(&rank(b))).then(reading(b).total_cmp(&reading(a))));
+    let Some(root) = sorted.first().map(|r| (*r).clone()) else {
+        run.think("Conclude", "None of the alerting objects is in the estate's tables.");
+        run.finish("done", "The objects were not found", 0.0).await?;
+        return Ok(());
+    };
+    let rid = root.s("id");
+    run.finding(format!("{rid} ({}, {}) is {}: {}", root.s("kind"), root.s("layer"), root.s("state"), root.s("reason")));
+
+    // How far it reaches.
+    let seeds = if ids.len() == 1 { quoted(&ids) } else { format!("({})", quoted(&ids)) };
+    let sql = format!("SELECT kind, state, customer, COUNT(*) AS n FROM {NODES}\nWHERE REACHABLE({EDGES}, {seeds}, hops => 3, dir => 'out', through => layer != 'core')\nGROUP BY kind, state, customer LIMIT 2000");
+    let walked = || -> Vec<Row> {
+        let Some(est) = &e.estate else { return Vec::new() };
+        let hit: HashSet<u32> = est.live.lock().unwrap_or_else(|p| p.into_inner()).iter().flat_map(|f| std::iter::once(f.root).chain(f.hit.iter().copied())).collect();
+        let mut by: HashMap<(String, String, String), i64> = HashMap::new();
+        let mut seen = HashSet::new();
+        for id in &ids {
+            let Some(i) = est.find(id) else { continue };
+            for j in est.walk(i, 3, 20_000, true, false) {
+                if seen.insert(j) {
+                    let n = &est.nodes[j as usize];
+                    *by.entry((n.kind.to_string(), if hit.contains(&j) { "impacted".into() } else { "ok".into() }, n.customer.clone())).or_default() += 1;
+                }
+            }
+        }
+        by.into_iter().map(|((kind, state, customer), n)| json!({"kind": kind, "state": state, "customer": customer, "n": n}).as_object().cloned().unwrap_or_default()).collect()
+    };
+    let behind = run.graph("What depends on them: a walk along the edges, by kind, state and customer", sql, walked).await;
+    let total: i64 = behind.iter().map(|r| r.i("n")).sum();
+    let hit: i64 = behind.iter().filter(|r| r.s("state") != "ok").map(|r| r.i("n")).sum();
+    let mut firms: Vec<(String, i64)> = Vec::new();
+    for r in behind.iter().filter(|r| !r.s("customer").is_empty()) {
+        match firms.iter_mut().find(|f| f.0 == r.s("customer")) {
+            Some(f) => f.1 += r.i("n"),
+            None => firms.push((r.s("customer"), r.i("n"))),
+        }
+    }
+    firms.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    run.finding(format!("{total} objects depend on them, {hit} of them not ok now; {} business customer{} behind them{}.", firms.len(), if firms.len() == 1 { "" } else { "s" },
+        if firms.is_empty() { String::new() } else { format!(": {}", firms.iter().take(5).map(|f| f.0.clone()).collect::<Vec<_>>().join(", ")) }));
+
+    // What came before it: a change on it or on what it hangs from.
+    let mut near: Vec<String> = ids.clone();
+    if let Some(est) = &e.estate {
+        if let Some(i) = est.find(&rid) {
+            near.extend(est.up[i as usize].iter().map(|j| est.nodes[*j as usize].id.clone()).filter(|x| !x.contains("--")));
+        }
+    }
+    near.sort();
+    near.dedup();
+    let events = run.q("Changes and faults on them, and on what they hang from, in the last two hours", &format!("SELECT ts, node, event, cause, text, author, ticket FROM {EVENTS}\nWHERE node IN ({}) AND ts >= :since\nORDER BY ts DESC LIMIT 30", quoted(&near)), json!({"since": iso(m - 7200)})).await;
+    let fault = events.iter().find(|ev| ev.s("event") == "fault" && ev.s("node") == rid);
+    let change = events.iter().find(|ev| ev.s("event") == "change" && fault.is_none_or(|f| ev.s("ts") <= f.s("ts")));
+    run.finding(match change {
+        Some(c) => format!("{} on {} at {} by {}: {}.", c.s("ticket"), c.s("node"), &c.s("ts").get(11..16).unwrap_or(""), c.s("author"), c.s("text")),
+        None => "No change on them or on what they hang from in the last two hours.".into(),
+    });
+    let cause = fault.map(|f| f.s("cause")).filter(|c| !c.is_empty()).unwrap_or_else(|| "unknown".into());
+
+    // Who is on call.
+    let oncall = run.q("Who is on call", "SELECT team, person FROM netops_oncall\nWHERE role = 'primary' AND starts <= :now AND ends > :now LIMIT 20", json!({"now": iso(m)})).await;
+    let person = oncall.iter().find(|o| o.s("team") == "Backbone NOC").or(oncall.first()).map(|o| o.s("person")).unwrap_or_else(|| "the NOC".into());
+    run.finding(format!("{person} is primary."));
+
+    let down = root.s("state") == "down";
+    let reason = root.s("reason");
+    let title = format!("{} {rid}: {}", if down { "Outage at" } else { "Degraded:" }, reason.split(':').next().unwrap_or(&reason).trim());
+    let mut text = format!("{rid} reports: {}.", reason.trim_end_matches('.'));
+    if let Some(c) = change {
+        text += &format!(" It follows {} on {} by {} ({}).", c.s("ticket"), c.s("node"), c.s("author"), c.s("text"));
+    }
+    let severity = if hit >= 100 || firms.len() >= 5 { "sev2" } else { "sev3" };
+    let (who, them) = if ids.len() == 1 { (format!("{rid} alerts"), "it") } else { (format!("{} objects of the estate alert", ids.len()), "them") };
+    let summary = format!("{who} in {}: {total} object{} depend on {them}, {hit} not ok now{}.", root.s("hub"), if total == 1 { "" } else { "s" },
+        if firms.is_empty() { String::new() } else { format!(", with {} business customer{} behind {them} ({}{})", firms.len(), if firms.len() == 1 { "" } else { "s" }, firms.iter().take(3).map(|f| f.0.clone()).collect::<Vec<_>>().join(", "), if firms.len() > 3 { " and others" } else { "" }) });
+    run.think("Conclude", format!("{text} {summary}"));
+    {
+        let mut st = e.st();
+        if let Some(o) = st.open.get_mut(incident) {
+            for (k, v) in [("title", json!(title)), ("summary", json!(summary)), ("root_kind", json!("estate")), ("root_entity", json!(rid)), ("root_cause", json!(text)), ("confidence", json!(0.9)),
+                ("category", json!("estate")), ("runbook", json!("rb-estate-outage")), ("severity", json!(severity)), ("commander", json!(person)), ("customers", json!(firms.len()))] {
+                o.row.insert(k.into(), v);
+            }
+            if o.row.s("status") == "investigating" {
+                o.row.insert("status".into(), json!("identified"));
+            }
+        }
+    }
+    e.save_incident(incident).await?;
+    e.timeline(incident, m, "agent", "Estate agent", &format!("{text} {summary} Paged {person}."), &run.id).await?;
+    // What a person can do from here: send someone, with what was found.
+    let action = format!("{incident}:ticket:{}", rid.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', ""));
+    let have = e.db.query("SELECT id FROM netops_actions WHERE id = :id", json!({"id": action})).await?;
+    if have.is_empty() {
+        e.db.upsert("netops_actions", vec![json!({"id": action, "run": run.id, "incident": incident, "kind": "ticket", "title": format!("Dispatch field services to {rid}"),
+            "detail": format!("{text} {total} objects depend on it{}. Our reference: {incident}.", if firms.is_empty() { String::new() } else { format!(", among them {}", firms.iter().take(5).map(|f| f.0.clone()).collect::<Vec<_>>().join(", ")) }),
+            "command": "", "target": rid, "risk": "low", "status": "proposed", "proposed": iso(crate::sim::now()), "decided_by": "", "result": ""})]).await?;
+    }
+    run.finish("done", &format!("{title} ({cause})"), 0.9).await?;
     Ok(())
 }
 

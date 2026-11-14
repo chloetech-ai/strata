@@ -65,9 +65,11 @@ What it is for: ${String(app.description || '').slice(0, 1200)}
 ${views.length ? `Its views: ${views.join(', ')}\n` : ''}${tables.length ? `Its tables: ${tables.join(', ')}\n` : ''}${art ? `Its art direction (design 1 follows it: its accent's hue, its titles' type, its mood; 2 and 3 are alternatives to it):
 - concept: ${art.concept}
 - mood: ${art.mood || '-'}
+- layout: ${art.layout || '-'}
 - photos: ${art.imagery || 'none'}
-- accent: ${art.accent || '-'}
+- accent: ${art.accent || '-'} (the main buttons' color: their words must read on it)
 - titles: ${art.type || 'system'}
+- main action: ${art.action || '-'}
 ` : ''}
 Design three looks for it.`;
 }
@@ -82,6 +84,10 @@ export function shapeDesigns(designs, direction = null) {
   if (designs.length > 1 && designs.every((d) => d.look === designs[0].look)) designs[1].look = 'bold';
   const type = direction?.art?.type;
   if (type && CHOICES.titles[type]) designs[0].titles = type;
+  // The art direction's layout sets the first design's width: a reading
+  // column for an editorial page, the full width for a dashboard.
+  const width = { editorial: 'narrow', tool: 'narrow', dashboard: 'wide', gallery: 'wide' }[direction?.art?.structure];
+  if (width) designs[0].width = width;
   const out = [];
   for (let i = 0; i < designs.length; i++) for (let j = i + 1; j < designs.length; j++) {
     const differ = SHAPE.filter((k) => designs[i][k] !== designs[j][k]);

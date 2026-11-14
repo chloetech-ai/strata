@@ -216,6 +216,8 @@ pub struct Daemon {
     /// they win over the daemon's own, which may have been started from a
     /// shell or the MCP server without them.
     from_hooks: Mutex<(String, Option<crate::deep::DeepConfig>)>,
+    /// `CHLOECTX_DISTILL` as the hooks saw it: 0 unset, 1 on, 2 off.
+    hook_distill: std::sync::atomic::AtomicU8,
     last_activity: AtomicI64,
     /// Receipts of recalls: opened when they are on or the file exists
     /// (a forget or redact scrubs it while they are off), unset when its
@@ -236,7 +238,7 @@ pub struct Daemon {
 }
 
 /// Work to do after the response is sent (so hooks return at once).
-type Deferred = Box<dyn FnOnce() + Send>;
+pub type Deferred = Box<dyn FnOnce() + Send>;
 
 impl Daemon {
     pub fn open(dir: &Path, project: &str) -> Result<Daemon> {
@@ -258,7 +260,7 @@ impl Daemon {
         let receipts_on = std::sync::atomic::AtomicBool::new(cfg.receipts.enabled);
         let snapshots = crate::snapshots::Snapshots::new(dir);
         Ok(Daemon { paths, project: project.to_string(), store, cfg, state: Mutex::new(state), dirty: Default::default(), pending: Default::default(), saving: Mutex::new(()),
-            logging: Mutex::new(()), distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), next_files: Default::default(), from_hooks: Mutex::new((String::new(), None)), last_activity: AtomicI64::new(now()),
+            logging: Mutex::new(()), distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), next_files: Default::default(), from_hooks: Mutex::new((String::new(), None)), hook_distill: Default::default(), last_activity: AtomicI64::new(now()),
             receipts, receipts_on, unsaved: Default::default(), deferred: Default::default(), no_hook_receipts: Default::default(), snapshots, keep_pending: Default::default() })
     }
 
@@ -587,7 +589,7 @@ impl Daemon {
                     me.keep_after_recall();
                     // The checkout is looked at again (no fetch) every few hours.
                     if crate::version::cached(&home, crate::version::CHECK_EVERY).is_none() {
-                        crate::version::check(&home, false);
+                        crate::version::check(&home, None);
                     }
                 }))))
             }
@@ -612,6 +614,13 @@ impl Daemon {
                 // storing it afterwards keeps the write (and the memtable
                 // rebuild it causes) off the prompt's critical path.
                 let mut text = self.recall_for(&sid, &prompt, false, "prompt")?.map(|x| x.0).unwrap_or_default();
+                // The previous turn's search, when it finished after that turn
+                // ended: offered now, once.
+                if let Some(t) = self.take_late_deep(&sid, turn - 1) {
+                    self.log(&json!({"ts": now(), "event": "deep_late", "session": sid, "turn": turn - 1, "chars": t.len()}));
+                    let t = format!("ChloeCtx's search for your previous request finished after that turn ended:\n{t}");
+                    text = if text.is_empty() { t } else { format!("{text}\n\n{t}") };
+                }
                 let deep = deep_cfg.wants(&prompt, self.store.len());
                 let deep_async = deep && mode == "async";
                 if deep && mode == "sync" {
@@ -710,7 +719,7 @@ impl Daemon {
                     let fixed = if fixes_on { s.fixes.observe(&tool, &input, &resp, &project) } else { Vec::new() };
                     (s.turn, format!("Turn {} request: {}", s.turn, s.episode.prompt.chars().take(200).collect::<String>()), fixed, started)
                 });
-                let mut text = self.take_deep(&sid, turn, false).unwrap_or_default();
+                let mut text = self.take_deep(&sid, turn, Duration::ZERO, false).unwrap_or_default();
                 if fixes_on && tool == "Bash" {
                     let fix = self.fix_for(&sid, &resp);
                     if !fix.is_empty() {
@@ -774,14 +783,19 @@ impl Daemon {
                 let answer = p.get("last_assistant_message").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let active = p.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
                 let cur = self.with_session(&sid, |s| s.turn);
-                // A search still running for this turn: wait for it, and if it
-                // found records the turn did not see, ask the model once to
-                // reconsider with them.
+                // By default the end of a turn neither waits for a search
+                // still running nor asks the model to go on: what the search
+                // finds is offered at the next prompt (CTX-1: waiting held
+                // short turns ~10 s, and the block that followed made Claude
+                // answer twice). With `stop_recheck` turned on, it waits a few
+                // seconds at most and, when the search found records the turn
+                // did not see, asks the model once to check its answer
+                // against them, without repeating it.
                 if !active && mode == "async" && deep_cfg.stop_recheck {
-                    if let Some(t) = self.take_deep(&sid, cur, true) {
+                    if let Some(t) = self.take_deep(&sid, cur, deep_cfg.stop_wait(), true) {
                         self.log(&json!({"ts": now(), "event": "deep_recheck", "session": sid, "turn": cur, "chars": t.len()}));
                         let reason = format!(
-                            "{t}\n\nBefore you finish: if these records change your answer or your changes, make the corrections now and then give your complete answer again. If they change nothing, repeat your previous answer unchanged."
+                            "{t}\n\nChloeCtx found these records for this request after the turn's last tool call (`stop_recheck` is on). If one of them changes your answer or your changes, make the correction now and say in a sentence or two what changed. If none does, end your turn with one short line saying so; do not repeat your answer."
                         );
                         return Ok((json!({"output": {"decision": "block", "reason": reason}}), None));
                     }
@@ -887,7 +901,7 @@ impl Daemon {
     /// planned work it completed (marked done).
     #[allow(clippy::too_many_arguments)]
     pub fn distill_turn(&self, sid: &str, turn: i64, ts: i64, prompt: &str, answer: &str, commands: &[String], files: &[String], ex: &crate::distill::Exchange) {
-        if !self.cfg.distill.active() || (prompt.trim().is_empty() && answer.trim().is_empty()) {
+        if !self.distill_cfg().active() || (prompt.trim().is_empty() && answer.trim().is_empty()) {
             return;
         }
         self.pending.fetch_add(1, Ordering::AcqRel);
@@ -1023,6 +1037,12 @@ impl Daemon {
                 self.receipts_on.store(on, Ordering::Release);
             }
         }
+        if let Some(c) = req.get("claude").and_then(|v| v.as_str()) {
+            crate::llm::set_hook_cli(Path::new(c));
+        }
+        if let Some(on) = req.get("distill").and_then(|v| v.as_bool()) {
+            self.hook_distill.store(if on { 1 } else { 2 }, Ordering::Release);
+        }
         let model = req.get("distill_model").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let deep = req.get("deep").cloned().and_then(|d| serde_json::from_value::<crate::deep::DeepConfig>(d).ok());
         let mut h = self.from_hooks.lock().unwrap();
@@ -1037,6 +1057,11 @@ impl Daemon {
     /// The distiller's settings, with the model the hooks asked for.
     fn distill_cfg(&self) -> crate::distill::DistillConfig {
         let mut c = self.cfg.distill.clone();
+        // CHLOECTX_DISTILL=0 in Claude Code's environment turns it off,
+        // whichever process started the daemon.
+        if self.hook_distill.load(Ordering::Acquire) == 2 {
+            c.enabled = false;
+        }
         let h = self.from_hooks.lock().unwrap();
         if !h.0.is_empty() && std::env::var("CHLOECTX_DISTILL_MODEL").map_or(true, |m| m.is_empty()) {
             c.model = h.0.clone();
@@ -1165,9 +1190,6 @@ impl Daemon {
         (text, Some(res))
     }
 
-    /// The finished search of `turn` not delivered yet, once. With `wait`,
-    /// waits for a running one (up to `stop_wait_secs`) and returns it only
-    /// when its confidence is high or medium.
     /// The id of a turn's prompt record, which notes and fixes link to.
     fn prompt_of(&self, sid: &str, turn: i64) -> Option<String> {
         self.store
@@ -1206,15 +1228,37 @@ impl Daemon {
         crate::fixes::render(&found)
     }
 
-    fn take_deep(&self, sid: &str, turn: i64, wait: bool) -> Option<String> {
-        let until = Instant::now() + Duration::from_secs(if wait { self.deep_cfg().stop_wait_secs } else { 0 });
+    /// A search of an earlier `turn` that finished after its turn ended and
+    /// was not delivered: its text, once, when the ranker was confident and
+    /// the session has not been shown all of its picks since.
+    fn take_late_deep(&self, sid: &str, turn: i64) -> Option<String> {
+        let ids = {
+            let jobs = self.deep_jobs.lock().unwrap();
+            let j = jobs.get(sid).filter(|j| j.turn == turn && j.done && !j.delivered && !j.text.is_empty())?;
+            j.ids.clone()
+        };
+        let seen = self.with_session(sid, |s| ids.iter().all(|i| s.injected.contains(i)));
+        if seen {
+            if let Some(j) = self.deep_jobs.lock().unwrap().get_mut(sid) {
+                j.delivered = true;
+            }
+            return None;
+        }
+        self.take_deep(sid, turn, Duration::ZERO, true)
+    }
+
+    /// The finished search of `turn` not delivered yet, once: waits up to
+    /// `wait` for one still running, and with `confident` returns it only
+    /// when the ranker's confidence is high or medium.
+    fn take_deep(&self, sid: &str, turn: i64, wait: Duration, confident: bool) -> Option<String> {
+        let until = Instant::now() + wait;
         loop {
             {
                 let mut jobs = self.deep_jobs.lock().unwrap();
                 let j = jobs.get_mut(sid).filter(|j| j.turn == turn && !j.delivered)?;
                 if j.done {
                     j.delivered = true;
-                    if j.text.is_empty() || (wait && !matches!(j.confidence.as_str(), "high" | "medium")) {
+                    if j.text.is_empty() || (confident && !matches!(j.confidence.as_str(), "high" | "medium")) {
                         return None;
                     }
                     let (text, ids) = (j.text.clone(), j.ids.clone());
@@ -2111,6 +2155,13 @@ impl Daemon {
                 "bytes": self.snapshots.bytes(), "retention": self.cfg.receipts.snapshots,
             },
             "total_bytes": fs.file_bytes + fs.wal_bytes + receipt_file + receipt_wal + self.snapshots.bytes(),
+            // The model CLI as this daemon resolves it (its PATH is the one
+            // of whichever process started it), for doctor (CTX-3).
+            "claude": match crate::llm::resolve_cli(&self.distill_cfg().command) {
+                Ok(p) => json!({"path": p}),
+                Err(e) => json!({"error": e}),
+            },
+            "distill": self.distill_cfg().active(),
         }))
     }
 }
@@ -2332,6 +2383,11 @@ pub fn request(dir: &Path, project: &str, req: &Json, timeout: Duration) -> Resu
     };
     match try_request(&paths.socket, req, deadline) {
         Ok(r) => return Ok(r),
+        // A daemon that died as the request reached it (CTX-16): a new one
+        // is started, as for one that is not there.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Err(e) if !matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => return Err(err(format!("daemon: {e}"))),
         Err(_) => {}
     }
@@ -2343,6 +2399,12 @@ pub fn request(dir: &Path, project: &str, req: &Json, timeout: Duration) -> Resu
             Err(_) => std::thread::sleep(Duration::from_millis(15)),
         }
     }
+}
+
+/// A request to the store's daemon only when one runs: never starts one
+/// (and so never creates a store).
+pub fn request_running(dir: &Path, req: &Json, timeout: Duration) -> Result<Json> {
+    try_request(&StorePaths::new(dir).socket, req, Instant::now() + timeout).map_err(|e| err(format!("daemon: {e}")))
 }
 
 /// Rewrites the store's segments that hold deleted records, without them

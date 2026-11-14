@@ -9,7 +9,7 @@ import { h, icon, clear, fmt, api, store, toast, copy, menu, empty, seg, sqlBloc
 import { isProduction } from "../data.js";
 import { folded, firstMine, isMine } from "../owners.js";
 import { quoteName } from "../sqledit.js";
-import { tables, cached, table as tableOf, typeBadge, typeMeta, operators, lit, paths as listPaths, cachedPaths, pathFields, pathSql, PATH_TYPES } from "../catalog.js";
+import { tables, cached, table as tableOf, isStored, typeBadge, typeMeta, operators, lit, paths as listPaths, cachedPaths, pathFields, pathSql, PATH_TYPES } from "../catalog.js";
 import { grid, answerStats, exportMenu } from "../results.js";
 import { SERIES } from "../charts.js";
 
@@ -24,7 +24,7 @@ const isTime = (f) => f && f.type === "timestamp";
 const searchable = (f) => f && (f.type === "text" || f.type === "json" && f.text) && f.indexed !== false;
 const groupable = (f) => f && (f.type === "keyword" || isNum(f)) && f.indexed !== false;
 const sortableField = (f) => f && (f.type === "keyword" || isNum(f) || isTime(f) || f.type === "bool") && !f.multi;
-const showable = (f) => f && f.type !== "vector" && f.type !== "sparse" && f.stored !== false;
+const showable = (f) => f && f.type !== "vector" && f.type !== "sparse" && isStored(f);
 const filterable = (f) => operators(f).length > 0 && (f.type !== "text" || f.indexed !== false);
 /** How SQL names a field, or a path of a JSON field (attrs.dims.w). */
 const col = (f) => f.sql || quoteName(f.name);

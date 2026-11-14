@@ -1,6 +1,6 @@
 [package]
 name = "chloedb-sheets"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Spreadsheets on Strata: workbooks whose cells are rows of Strata tables, the cluster's tables opened as live sheets, xlsx, SQLite and CSV in and out"

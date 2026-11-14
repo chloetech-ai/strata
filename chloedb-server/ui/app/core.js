@@ -270,17 +270,49 @@ export function refusedRoute(path) {
   return refusedFor.paths.get(routeOf(path)) || null;
 }
 
+// The key a 401 answered (null: no key), until another is given: the
+// polls hold meanwhile (`every`), so a tab without a valid key does not
+// ask the server every few seconds, nor fill its audit log with refusals.
+let refusedKey;
+/** Whether the server refused the key in use (or wants one): the views say "Sign in", the polls wait. */
+export const signInNeeded = () => refusedKey !== undefined && refusedKey === token;
+
+// The server's own views (statements, logs, index sizes, keys) are read by
+// an admin, or an ops or propose key: whoami says so (`may.server_views`).
+// Another key's page does not ask for them, to be refused (and audited) a poll.
+const SERVER_VIEWS = /^\/v1\/(admin\/|queries|logs|profile|index)/;
+function noServerViews(path) {
+  const w = ctx.whoami;
+  if (!w || w.root || w.may?.server_views !== false || !SERVER_VIEWS.test(routeOf(path))) return null;
+  return `${routeOf(path)} is one of the server's views: it needs an admin key (or an ops or propose key), and "${w.name || "this key"}" has ${w.scope}`;
+}
+
 export async function api(path, opts = {}) {
+  try { return await request(path, opts); }
+  catch (e) {
+    // An agent's key says why it changes the server (the audit log keeps
+    // it): asked once, then the request is sent again with it.
+    if (e?.body?.error_code !== "reason_required" || opts.reason || opts.blob) throw e;
+    // Several at once (Acknowledge all) share one question.
+    asking ||= confirm({ title: "Say why", body: `This key is an agent's (${ctx.whoami?.name || "a key"}${roleOf() ? `, ${roleOf()}` : ""}): the server keeps a reason with each change it makes, in the audit log.`, ok: "Send", reason: "Why: a sentence, kept in the audit log" }).finally(() => { asking = null; });
+    const ok = await asking;
+    if (!ok) throw e;
+    return request(path, { ...opts, reason: ok.reason });
+  }
+}
+let asking = null;
+
+async function request(path, opts) {
   const get = !opts.method && opts.body === undefined;
-  const held = get && !opts.hub ? refusedRoute(path) : null;
-  if (held) throw new ApiError(403, held, { error: held, limited: true });
+  const held = get && !opts.hub ? refusedRoute(path) || noServerViews(path) : null;
+  if (held) throw new ApiError(403, held, { error: held, limited: !!ctx.whoami?.tables, local: true });
   const init = { method: opts.method || (opts.body === undefined ? "GET" : "POST"), headers: { "x-strata-client": "command-center" } };
   if (opts.body !== undefined) {
     if (opts.body instanceof Blob || opts.body instanceof ArrayBuffer || typeof opts.body === "string") { init.body = opts.body; if (opts.type) init.headers["content-type"] = opts.type; }
     else { init.headers["content-type"] = "application/json"; init.body = JSON.stringify(opts.body); }
   }
   if (token) init.headers.authorization = "Bearer " + token;
-  if (opts.reason) init.headers["x-strata-reason"] = headerSafe(opts.reason);
+  if (opts.reason) init.headers["x-chloedb-reason"] = headerSafe(opts.reason);
   let timer = null, timedOut = false;
   if (opts.timeout) {
     const ac = new AbortController();
@@ -298,6 +330,7 @@ export async function api(path, opts = {}) {
     throw new ApiError(0, why, null, false);
   }
   clearTimeout(timer);
+  if (r.status === 401 && !opts.hub) refusedKey = token;
   if (opts.blob) {
     if (r.ok) { answered(); return r; }
     const t = await r.text().catch(() => "");
@@ -326,10 +359,11 @@ export async function api(path, opts = {}) {
   }
   answered();
   if (r.status === 401) bus.emit("unauthorized", path);
-  if (r.status === 403 && get && typeof j?.error === "string" && j.error.includes("not for a key limited to tables")) {
+  // A route this key's scope or its tables do not reach is not asked again for it.
+  if (r.status === 403 && get && !opts.hub && typeof j?.error === "string" && (j.error.includes("not for a key limited to tables") || j.error_code === "scope_refused")) {
     if (refusedFor.token !== token) { refusedFor.token = token; refusedFor.paths = new Map(); }
     refusedFor.paths.set(routeOf(path), j.error);
-    j.limited = true;
+    j.limited = !!ctx.whoami?.tables || j.error.includes("not for a key limited to tables");
   }
   if (!r.ok) throw new ApiError(r.status, j?.error || ("HTTP " + r.status), j);
   return j;
@@ -348,22 +382,53 @@ export const isPaused = () => ctx.paused;
 
 // ---------------------------------------------------------------- scope
 const RANK = { feed: 1, read: 2, write: 3, admin: 4 };
+// The routes as the server lists them (GET /v1/catalog: each one's scope,
+// tier, and whether the ops and propose roles may call it), for a key that
+// acts on the server by its role rather than its scope.
+let ROUTES = null;
+/** For data.js: the catalog's routes ([{method, path, scope, tier, roles}]). */
+export function provideRoutes(list) { ROUTES = list ? new Map(list.map((r) => [`${r.method} ${r.path}`, r])) : null; }
+/** A key for operations' role (whoami's scope "ops" or "propose"), or null. */
+export const roleOf = (w = ctx.whoami) => (w && !RANK[w.scope] && w.may?.server_views ? w.scope : null);
+/** What a key may do to the data: its scope, or for a role key what whoami's `may.data` says (read). */
+const dataScope = (w) => (RANK[w.scope] ? w.scope : w.may?.data || "read");
 /**
- * Whether the signed-in key may do this: can("feed" | "read" | "write" | "admin").
- * Unknown (not signed in, or whoami failed) can read only. Views hide or
- * disable what they cannot do, with `needs(scope)` as the tooltip.
+ * Whether the signed-in key may do this: can("feed" | "read" | "write" |
+ * "admin"), and, for an action on the server, its route ("POST
+ * /v1/alerts/:rule/ack"): the server's catalog then says which scope it
+ * needs and whether an ops or propose key may call it (the bounded,
+ * tier 1 actions for ops; the server's views for both). Unknown (not
+ * signed in, or whoami failed) can read only. Views hide or disable what
+ * they cannot do, with `needs(scope, route)` as the tooltip.
  */
-export function can(scope) {
+export function can(scope, route = null) {
   const w = ctx.whoami;
   if (!w) return scope === "read";
   if (w.root) return true;
+  const r = route ? ROUTES?.get(route) : null;
+  const need = r?.scope || scope;
   // A key limited to tables is never the server's admin: its admin is its
   // tables' (CREATE, ALTER, DROP).
-  if (w.tables && (RANK[scope] || RANK.admin) >= RANK.admin) return false;
-  return (RANK[w.scope] || 0) >= (RANK[scope] || RANK.admin);
+  if (w.tables && (RANK[need] || RANK.admin) >= RANK.admin) return false;
+  if ((RANK[dataScope(w)] || 0) >= (RANK[need] || RANK.admin)) return true;
+  const role = roleOf(w);
+  return !!(role && r?.roles?.[role]);
 }
-/** The tooltip of an action the key cannot take: "needs an admin key". */
-export const needs = (scope) => ctx.whoami?.tables && scope === "admin" ? "needs an admin key of the server (this key is limited to tables)" : `needs ${scope === "admin" ? "an admin" : `a ${scope}`} key`;
+/** Whether an action's request needs a reason from this key (an agent's: whoami's `may.reason_required`). */
+export const reasonNeeded = () => !!ctx.whoami?.may?.reason_required;
+/** The tooltip of an action the key cannot take: "needs an admin key", or for a bounded action "needs a write or an ops key". */
+export function needs(scope, route = null) {
+  const r = route ? ROUTES?.get(route) : null;
+  const need = r?.scope || scope;
+  if (ctx.whoami?.tables && need === "admin") return "needs an admin key of the server (this key is limited to tables)";
+  const a = need === "admin" ? "an admin" : `a ${need}`;
+  const ops = route && (r ? r.roles?.ops : false);
+  const role = roleOf();
+  if (role === "propose" && ops) return `needs ${a} or an ops key (this key is propose: it files change requests)`;
+  if (ops) return `needs ${a} or an ops key`;
+  if (role) return `needs ${a} key (this key is ${role}: it files a change request instead)`;
+  return `needs ${a} key`;
+}
 /** Whether the signed-in key is limited to tables (whoami's `tables`). */
 export const limited = () => !!ctx.whoami?.tables;
 /** A key's grants in words: "swarm_* admin, * read" (whoami's or a key's `tables`). */
@@ -380,8 +445,8 @@ export function cannotSee(e, what) {
   return e?.message || String(e);
 }
 /** Disables a button the key cannot use, and says why: gate(btn, "admin"). Returns the button. */
-export function gate(btn, scope) {
-  if (!can(scope)) { btn.disabled = true; btn.title = (btn.title ? btn.title + ": " : "") + needs(scope); btn.classList.add("gated"); }
+export function gate(btn, scope, route = null) {
+  if (!can(scope, route)) { btn.disabled = true; btn.title = (btn.title ? btn.title + ": " : "") + needs(scope, route); btn.classList.add("gated"); }
   return btn;
 }
 
@@ -845,7 +910,8 @@ export function every(ms, f, now = true, opts = {}) {
   let stopped = false, timer = null, running = false, first = true;
   const tick = async () => {
     if (stopped) return;
-    if (!document.hidden && !running && (first || opts.always || !ctx.paused)) { first = false; running = true; try { await f(); } catch (e) { console.warn(e); } running = false; }
+    // Paused, or without a valid key, a poll runs once (a view learns why it is empty) and then waits.
+    if (!document.hidden && !running && (first || opts.always || (!ctx.paused && !signInNeeded()))) { first = false; running = true; try { await f(); } catch (e) { console.warn(e); } running = false; }
     if (!stopped) timer = setTimeout(tick, ms);
   };
   if (now) tick(); else timer = setTimeout(tick, ms);

@@ -206,6 +206,15 @@ pub fn validate(schema: &Schema, doc: &Document) -> Result<()> {
             _ => false,
         };
         if !ok {
+            // Why a vector of the right length does not fit: a number past
+            // f32's range (about 3.4e38) is infinite there.
+            if let (FieldType::Vector { dim, .. }, Value::Vector(x)) = (&f.ty, v) {
+                if x.len() == *dim {
+                    if let Some(i) = x.iter().position(|c| !c.is_finite()) {
+                        return Err(Error::Schema(format!("bad value for field {}: element {} of the vector is not a finite 32-bit float (from -3.4e38 to 3.4e38)", f.name, i + 1)));
+                    }
+                }
+            }
             return Err(Error::Schema(format!("bad value for field {}: {} does not fit a {} field", f.name, short(v), crate::query::hint::type_of(f))));
         }
     }

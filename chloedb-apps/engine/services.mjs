@@ -13,6 +13,7 @@ import tls from 'node:tls';
 import os from 'node:os';
 import path from 'node:path';
 import { newId } from './store.mjs';
+import { personName } from './engine.mjs';
 
 const scrypt = promisify(scryptCb);
 const DAY = 86400000;
@@ -142,14 +143,89 @@ export class Services {
     if (!p) return null;
     const m = join ? await this.join(appId, personId, { pub }) : await this.member(appId, personId);
     if (!m) return null;
-    return { id: p.id, name: p.name, email: p.email, role: m.role };
+    // A person always has a name to show (their email, else "you").
+    return { id: p.id, name: personName(p), email: p.email, role: m.role || 'member' };
   }
 
   async people(appId) {
     const members = await this.db.query('SELECT person, role, created FROM sa_members WHERE app = :a ORDER BY created LIMIT 1000', { a: appId });
     if (!members.length) return [];
     const rows = await this.db.get('sa_people', members.map((m) => m.person));
-    return members.map((m, i) => (rows[i] ? { id: rows[i].id, name: rows[i].name, email: rows[i].email, role: m.role, joined: m.created } : null)).filter(Boolean);
+    return members.map((m, i) => (rows[i] ? { id: rows[i].id, name: personName(rows[i]), email: rows[i].email, role: m.role, joined: m.created } : null)).filter(Boolean);
+  }
+
+  // A member's role in the app (owner, admin, member), set by its owner or
+  // the studio: the owner stays the owner.
+  async setRole(appId, personId, role) {
+    if (!['admin', 'member'].includes(role)) throw err('role is admin or member');
+    const m = await this.member(appId, String(personId || ''));
+    if (!m) throw err('that person is not a member of this app', 404);
+    if (m.role === 'owner') throw err('the owner stays the owner');
+    const doc = { ...m, role };
+    await this.db.write([{ op: 'upsert', table: 'sa_members', doc }]);
+    return { id: m.person, role };
+  }
+
+  // ---- companies: an app's people working in groups (workspaces), each
+  // person in some with a role there (admin or member). Rows scoped by
+  // :company_id (access.mjs) are the company's the person works in now.
+
+  async companies(appId, personId) {
+    if (!personId) return [];
+    const ms = await this.db.query('SELECT company, role, created FROM sa_memberships WHERE app = :a AND person = :p ORDER BY created LIMIT 200', { a: appId, p: personId });
+    if (!ms.length) return [];
+    const rows = await this.db.get('sa_companies', ms.map((m) => m.company));
+    return ms.map((m, i) => (rows[i] ? { id: rows[i].id, name: rows[i].name, role: m.role } : null)).filter(Boolean);
+  }
+
+  // The company a person works in now: the one asked for (x-sa-company)
+  // when they belong to it, else their first; null when they have none.
+  async companyOf(appId, personId, wanted) {
+    if (!personId) return null;
+    const list = await this.companies(appId, personId);
+    return (wanted && list.find((c) => c.id === String(wanted))?.id) || list[0]?.id || null;
+  }
+
+  async createCompany(appId, personId, { name } = {}) {
+    if (!personId) throw err('Sign in first: a company is made by someone signed in', 401);
+    const n = String(name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    if (!n) throw err('Give the company a name');
+    const mine = await this.companies(appId, personId);
+    if (mine.length >= 20) throw err('one person makes at most 20 companies in an app');
+    const id = newId(10);
+    await this.db.write([
+      { op: 'insert', table: 'sa_companies', doc: { id, app: appId, name: n, author: personId } },
+      { op: 'insert', table: 'sa_memberships', doc: { id: `${appId}#${id}#${personId}`, app: appId, company: id, person: personId, role: 'admin' } },
+    ]);
+    return { id, name: n, role: 'admin' };
+  }
+
+  async companyRole(appId, companyId, personId) {
+    if (!personId || !companyId) return null;
+    const [m] = await this.db.get('sa_memberships', [`${appId}#${companyId}#${personId}`]);
+    return m ? m.role : null;
+  }
+
+  // Someone with an account joins a company of the app, added by one of its
+  // admins (or the studio, by = null).
+  async addToCompany(appId, companyId, by, { email, role = 'member' } = {}) {
+    const [c] = await this.db.get('sa_companies', [String(companyId || '')]);
+    if (!c || c.app !== appId) throw err('no such company', 404);
+    if (by && (await this.companyRole(appId, c.id, by)) !== 'admin') throw err("Only the company's admins can add people to it", 403);
+    if (!['admin', 'member'].includes(role)) throw err('role is admin or member');
+    const p = await this.personByEmail(email || '');
+    if (!p) throw err('Nobody has an account with that email: ask them to sign up first', 404);
+    await this.join(appId, p.id, { pub: true });
+    await this.db.write([{ op: 'upsert', table: 'sa_memberships', doc: { id: `${appId}#${c.id}#${p.id}`, app: appId, company: c.id, person: p.id, role } }]);
+    return { company: c.id, person: p.id, name: personName(p), role };
+  }
+
+  async removeFromCompany(appId, companyId, by, personId) {
+    const [c] = await this.db.get('sa_companies', [String(companyId || '')]);
+    if (!c || c.app !== appId) throw err('no such company', 404);
+    if (by && by !== personId && (await this.companyRole(appId, c.id, by)) !== 'admin') throw err("Only the company's admins can take people out of it", 403);
+    await this.db.write([{ op: 'delete', table: 'sa_memberships', key: `${appId}#${c.id}#${personId}` }]);
+    return { removed: personId };
   }
 
   // ---- files

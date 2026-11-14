@@ -6,6 +6,7 @@
 //                 [--persona a,b] [--task x,y] [--seed 1,2] [--keep]
 //   chloedb-swarm serve --local DIR [--listen 127.0.0.1:7900]
 //   chloedb-swarm serve --server URL [--token T] [--listen 127.0.0.1:7900]
+//   chloedb-swarm regroup RUN_ID [--out DIR | --server URL --token T] [--budget USD]
 //   chloedb-swarm report DIR RUN_ID
 //
 // The model key is ANTHROPIC_API_KEY (or CHLOEDB_SWARM_ANTHROPIC_KEY); the
@@ -13,7 +14,7 @@
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
-import { runSet } from '../src/runner.mjs';
+import { runSet, regroup } from '../src/runner.mjs';
 import { DirStore, ServerStore } from '../src/store.mjs';
 import { markdown } from '../src/report.mjs';
 import { serve } from '../src/serve.mjs';
@@ -61,6 +62,14 @@ async function main() {
     await serve({ local: f.local === true ? undefined : f.local, server: f.server, token: f.token === true ? undefined : f.token, listen: f.listen || '127.0.0.1:7900', scenarios: f.scenarios });
     return;
   }
+  if (cmd === 'regroup') {
+    const id = f._[0];
+    if (!id) throw new Error('chloedb-swarm regroup RUN_ID [--out DIR | --server URL --token T]');
+    const store = f.server ? new ServerStore(f.server, f.token === true ? undefined : f.token) : new DirStore(resolve(f.out || 'swarm-runs'));
+    await regroup(store, id, { budget: f.budget ? Number(f.budget) : 5, log: (m) => console.log(m) });
+    if (store instanceof DirStore) await writeFile(join(store.runDir(id), 'report.md'), markdown(await store.run(id)));
+    return;
+  }
   if (cmd === 'report') {
     const [dir, id] = f._;
     const all = await new DirStore(resolve(dir)).run(id);
@@ -68,7 +77,7 @@ async function main() {
     process.stdout.write(markdown(all));
     return;
   }
-  console.log('chloedb-swarm run SET.json | serve | report DIR RUN_ID (see the head of bin/swarm.mjs)');
+  console.log('chloedb-swarm run SET.json | serve | regroup RUN_ID | report DIR RUN_ID (see the head of bin/swarm.mjs)');
   process.exitCode = cmd ? 2 : 0;
 }
 

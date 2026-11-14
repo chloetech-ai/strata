@@ -108,11 +108,13 @@ struct SpecArgs {
     /// Requests at once, over all hosts.
     #[arg(long, default_value_t = 16)]
     concurrency: usize,
-    /// Requests at once to one host.
-    #[arg(long, default_value_t = 2)]
+    /// Requests at once to one host (the crawler's promise to the sites it
+    /// reads, as in the command center: one at a time, a second apart; a
+    /// site you run can take more).
+    #[arg(long, default_value_t = 1)]
     per_host: usize,
     /// Milliseconds between two requests to a host.
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 1000)]
     delay_ms: u64,
     /// Ignore robots.txt (only for sites you own).
     #[arg(long)]

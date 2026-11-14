@@ -11,20 +11,20 @@ The package is in [`chloedb-java/`](https://github.com/chloetech-ai/chloedb/tree
 ```sh
 cd chloedb-java
 mvn package          # cargo builds the library, Maven the classes; tests run against both
-mvn install          # and into ~/.m2, as ai.chloetech:chloedb:0.3.2
+mvn install          # and into ~/.m2, as ai.chloetech:chloedb:0.3.3
 ```
 
-The jar (`target/java/chloedb-0.3.2.jar`) carries the native library for the platform it was built on (Linux or macOS, x86-64 or ARM), and needs nothing else at run time: no dependency, no server. A project uses it from the local repository:
+The jar (`target/java/chloedb-0.3.3.jar`) carries the native library for the platform it was built on (Linux or macOS, x86-64 or ARM), and needs nothing else at run time: no dependency, no server. A project uses it from the local repository:
 
 ```xml
 <dependency>
   <groupId>ai.chloetech</groupId>
   <artifactId>chloedb</artifactId>
-  <version>0.3.2</version>
+  <version>0.3.3</version>
 </dependency>
 ```
 
-or, with Gradle, `implementation("ai.chloetech:chloedb:0.3.2")` with `mavenLocal()` among the repositories.
+or, with Gradle, `implementation("ai.chloetech:chloedb:0.3.3")` with `mavenLocal()` among the repositories.
 
 `-Dcargo.profile=ci` builds the library without link-time optimisation, much faster, for a build that only runs the tests. `-Dcargo.features=bert` (comma-separated) turns on Cargo features as the Python package has them: `bert` for BERT embedding models (`accelerate` on a Mac), `onnx`, `vision`, `audio`. The library already includes DataFusion, Parquet and `s3://` URLs. `-Dcargo.skip=true` packages the library cargo built before.
 

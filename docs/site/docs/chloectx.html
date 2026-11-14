@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ChloeCtx: how it works · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="ChloeCtx, an application built on ChloeDB, gives a coding agent (Claude Code first) a memory that outlives its context window. It records every prompt, answer, tool call and compaction summary of a project into one…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/index.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>ChloeCtx: how it works</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/index.md">docs/chloectx/index.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-problem">The problem</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#the-data-model">The data model</a></li><li><a href="#when-to-store-always">When to store: always</a></li><li><a href="#when-to-load">When to load</a></li><li><a href="#answering-a-question">Answering a question</a></li><li><a href="#query-understanding">Query understanding</a></li><li><a href="#cost-and-latency-targets">Cost and latency targets</a></li><li><a href="#install-and-use">Install and use</a></li></ol></details>
     <div class="doc-body">
@@ -102,7 +105,7 @@
 <li><strong>Let the model ask precisely.</strong> When the model knows it needs history, it gets search, timeline and SQL tools over the same store.</li>
 </ol>
 <h2 id="architecture">Architecture<a class="anchor" href="#architecture" aria-label="Link to this section">#</a></h2>
-<p><img alt="ChloeCtx's architecture: hooks and the MCP server talk to one daemon per project, which owns the ChloeDB file" src="../../assets/img/engram-architecture.png" /></p>
+<p><img loading="lazy" decoding="async" alt="ChloeCtx's architecture: hooks and the MCP server talk to one daemon per project, which owns the ChloeDB file" src="../../assets/img/engram-architecture.png" /></p>
 <p>Only one process at a time may write a ChloeDB file, and hooks are short-lived processes that run concurrently with the MCP server. So one daemon per project owns the database, and hooks and the MCP server are its clients over a Unix socket.</p>
 <ul>
 <li><strong>Lazy start.</strong> The first client to find no socket spawns the daemon under a spawn lock; the daemon exits after 30 idle minutes. Its first hook takes 50–72 ms, because the 129 MB embedding table is memory-mapped rather than read.</li>
@@ -184,7 +187,7 @@
 </tr>
 </tbody>
 </table></div>
-<p><img alt="One record: a captured event is redacted, trimmed and cut into 400-byte records" src="../../assets/img/engram-record.png" /></p>
+<p><img loading="lazy" decoding="async" alt="One record: a captured event is redacted, trimmed and cut into 400-byte records" src="../../assets/img/engram-record.png" /></p>
 <p>Keys are small and precise. A 400-byte window matches a question better than a 1,500-byte chunk in which the answer is one fact among many, and a context budget holds about ten such windows instead of five snippets. The turn's request joins the lexical key, so that a terse tool result ("test result: ok") is found by the words of the task it served; it stays out of the vector, where it would pull every response towards its request. The study behind these choices is in <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/results.md#what-a-record-should-be">the results</a>.</p>
 <p>Records come in three levels:</p>
 <pre class="mermaid">flowchart LR
@@ -244,7 +247,7 @@
 <p><code>chloectx ingest-transcript</code> back-fills old sessions from Claude Code's JSONL transcripts.</p>
 <h3 id="distilled-knowledge">Distilled knowledge<a class="anchor" href="#distilled-knowledge" aria-label="Link to this section">#</a></h3>
 <p>Raw records hold what was <em>said</em>; a later session needs what was <em>agreed</em>: a decision and its reason, a client's rule, the requirements of work announced for later. Much of it never reaches the code, and a request that depends on it rarely sounds like earlier work, so search alone misses it.</p>
-<p><img alt="Knowledge records: a small model writes down what each turn agreed" src="../../assets/img/engram-knowledge-records.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Knowledge records: a small model writes down what each turn agreed" src="../../assets/img/engram-knowledge-records.png" /></p>
 <p>After each <code>Stop</code>, off the prompt's path, the daemon gives the turn (request, commands, reply) to a small model through <code>claude -p</code>, with up to 40 live notes for context: the ones most related to the turn wherever they are in the history, then the newest. Seeing the related ones is what lets the model update a note written weeks ago instead of adding a near-copy next to it. The prompt names the day the turn took place, so a relative date in it ("tomorrow", "next Tuesday") is counted from that day even when the turn is distilled later (<code>chloectx distill</code>, a backlog). The model returns JSON lines:</p>
 <div class="doc-table"><table>
 <thead>
@@ -333,7 +336,7 @@
 {\, r : r.\text{session} = s \;\wedge\; r.\text{seq} \ge w_s \,} \;\cup\; \text{injected}_s
 $$</p>
 <p>where injected<sub>s</sub> is the set of records already injected since w<sub>s</sub>.</p>
-<p><img alt="The live window: what the model can still see is never repeated" src="../../assets/img/engram-live-window.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The live window: what the model can still see is never repeated" src="../../assets/img/engram-live-window.png" /></p>
 <p>There are three push points and one pull path:</p>
 <pre class="mermaid">sequenceDiagram
     autonumber
@@ -373,7 +376,7 @@ $$</p>
 <p>Then the main search and a three-way gate: strong evidence injects the top records up to 4,000 characters; weak evidence injects three records up to 1,200, marked as a weak match; otherwise nothing.
 3. <strong><code>PreToolUse</code> on <code>Edit</code>/<code>Write</code>: file notes.</strong> Up to two older errors, decisions or rules anchored to that path, once per file per window. With <code>CHLOECTX_NEXT_FILES=1</code> (an experiment, off by default) the hook also names the files earlier sessions usually edited next: B follows A when an edit of B came within three edits after one of A (consecutive edits of one file count once), weighted by one over the gap and summed over sessions, and files above 1 are shown, at most two, each with its newest note. The daemon counts these from the edits the store holds as tool calls, reading only what was stored since it last looked, so nothing new is written. On the memory bench it changed neither how many tasks were solved nor which files were edited (<a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/results.md#next-files">results</a>), so it stays off.
 4. <strong><code>PostToolUse</code> and <code>PostToolUseFailure</code> on <code>Bash</code>: error to fix.</strong> A command that fails and then passes, with edits or other commands between, is written down as a fix: an <code>error</code> record tagged <code>fix</code> holding the error's line, the steps (the last eight edits and commands that change something; <code>ls</code>, <code>grep</code>, <code>git status</code> and the like do not count) and what showed it fixed (the same command passed, or failed with another error). The same command means the same after <code>cd</code>, pipes, redirections, <code>timeout</code> and variable assignments are taken off (<code>cd x &amp;&amp; cargo test 2&gt;&amp;1 | tail</code> is <code>cargo test</code>); a failure is followed for 60 tool calls, and one that passes with nothing between is not a fix. When a command later fails with the same error, in any session of the project, its fixes come with the failure, at most two, once a session. Errors are matched by their signature: the telling line (a compiler's <code>error:</code>, a panic, the last line of a Python traceback, <code>fatal:</code>, ...) with numbers, hashes, temporary paths and the project's path masked, or one sharing four in five of its words. The fix links to the prompt of the turn that fixed it.
-5. <strong>Pull: MCP tools.</strong> <code>memory_ask</code> (by search alone, <a href="#answering-a-question">below</a>; with <code>deep</code>, the query engine), <code>memory_search</code>, <code>memory_timeline</code> (the neighbourhood of a hit), <code>memory_sql</code> (one read-only SELECT over <code>memory</code>, with no model calls, a 2-second deadline and a 1,000-row cap), <code>memory_remember</code> and <code>memory_forget</code>.</p>
+5. <strong>Pull: MCP tools.</strong> <code>memory_ask</code> (by search alone, <a href="#answering-a-question">below</a>; with <code>deep</code>, the query engine), <code>memory_search</code>, <code>memory_timeline</code> (the neighbourhood of a hit), <code>memory_sql</code> (one read-only SELECT over <code>memory</code>, with no model calls, a 2-second deadline and a 1,000-row cap), <code>memory_remember</code> and <code>memory_forget</code> (<code>chloectx forget ID</code> from a shell).</p>
 <p>The briefing also ends with a one-line index of the notes it had no room for ("31 older notes are not shown here, about: …"), so the model knows what to ask for.</p>
 <h3 id="ranking">Ranking<a class="anchor" href="#ranking" aria-label="Link to this section">#</a></h3>
 <p>BM25 and vector search each return their top <em>n</em> = 50 under the exclusion filter. Scores are min-max normalised over the union <em>C</em>, a missing score counting as 0:</p>
@@ -391,9 +394,9 @@ $$</p>
 <p>$$
 G = a\,\cos_{\max} + b\,\mathrm{cov}<em>{\max} + c\,\mathbb{1}</em>{\text{cue}} + d\,\mathbb{1}<em>{\text{agree}} + e\,(\cos_1 - \cos</em>{10}) + f\,\Bigl(1 - \frac{\mathrm{bm25}_{10}}{\mathrm{bm25}_1}\Bigr)
 $$</p>
-<p><img alt="Three tiers: no injection, a brief injection of three records, or the full budget" src="../../assets/img/engram-gate-tiers.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Three tiers: no injection, a brief injection of three records, or the full budget" src="../../assets/img/engram-gate-tiers.png" /></p>
 <p>The weights come from a logistic fit on LongMemEval-S (<code>chloectx/scripts/fit_gate.py</code>): positives are questions whose evidence the packed injection contains; negatives are questions asked against another conversation's store, abstentions and misses. θ<sub>hi</sub> holds precision 0.9 on the fit and θ<sub>lo</sub> precision 0.7. The gate is the weakest part of the design; <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/results.md#the-gate">the results</a> say why.</p>
-<p><img alt="The query path: the exclusion predicate runs inside both searches" src="../../assets/img/engram-query-path.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The query path: the exclusion predicate runs inside both searches" src="../../assets/img/engram-query-path.png" /></p>
 <h2 id="answering-a-question">Answering a question<a class="anchor" href="#answering-a-question" aria-label="Link to this section">#</a></h2>
 <p><code>memory_ask</code> (and <code>chloectx ask</code>) answers by search alone: no model call runs between the question and the answer, because the work was done when memory was written (the messages, the notes the distiller wrote, the user's rules). Four searches run side by side on one snapshot of the store (<a href="https://github.com/chloetech-ai/chloedb/blob/main/chloectx/src/context.rs"><code>context.rs</code></a>), each with the live-window exclusion:</p>
 <div class="doc-table"><table>
@@ -508,7 +511,7 @@ $$</p>
 <tr>
 <td><code>async</code> (default)</td>
 <td>after every prompt of four words or more, once the store holds 20 records, in the background</td>
-<td>with the next tool result; if the turn ends first, its end waits up to 25 s and, when the picks are new and the ranker's confidence is high or medium, asks the model once to reconsider and give its whole answer again</td>
+<td>with the next tool result; if the turn ends first, with the next prompt, when the picks are still new and the ranker's confidence is high or medium. The end of a turn does not wait for it. With <code>"stop_recheck": true</code> the end of the turn waits up to <code>stop_wait_secs</code> (at most 3 s) and, when the picks are new, asks the model once to check its answer against them (Claude Code runs the model again for that, and it says only what changed)</td>
 </tr>
 <tr>
 <td><code>sync</code></td>
@@ -690,7 +693,7 @@ chloectx mount ./work.capsule                                             # serv
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

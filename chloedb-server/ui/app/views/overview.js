@@ -72,6 +72,8 @@ function model() {
 }
 const hostOf = (u) => { try { return new URL(u).host; } catch { return String(u || ""); } };
 
+// The server's runbooks, by title (a fleet problem's next.runbook names one).
+const RUNBOOKS = "https://chloetech-ai.github.io/chloedb/site/docs/runbooks.html#";
 /** A copy's tone: crit (down, or hurting queries now), warn (needs a look), or "". */
 function copyTone(x) {
   if (!x.up) return "crit";
@@ -502,7 +504,7 @@ function render(page, r0) {
           h("div", { class: "pt" }, p.title),
           p.where?.length ? h("div", { class: "small dim" }, p.where.join(" · ")) : null,
           h("div", { class: "small dim" }, [p.to_ms ? h("span", { title: whenTitle(p.from_ms) }, `${when(p.from_ms)}–${when(p.to_ms)}, answering again for ${durTxt(p.to_ms)}`) : p.since_ms ? h("span", { title: whenTitle(p.since_ms) }, `since ${when(p.since_ms)} (${durTxt(p.since_ms)})`) : null, p.impact].filter(Boolean).flatMap((x, i) => i ? [" · ", x] : [x])),
-          p.next?.text ? h("div", { class: "small home-next" }, icon("right"), p.next.text) : null,
+          p.next?.text ? h("div", { class: "small home-next" }, icon("right"), p.next.text, p.next.runbook ? [" · runbook: ", h("a", { href: RUNBOOKS + p.next.runbook.toLowerCase().replace(/[^a-z0-9 -]/g, "").trim().replace(/\s+/g, "-"), target: "_blank", rel: "noopener" }, p.next.runbook, " ", icon("ext"))] : null) : null,
           h("div", { class: "row home-pacts" }, actions)));
     }), probs.length > 8 ? h("div", { class: "small muted" }, `and ${probs.length - 8} more`) : null);
   }
@@ -672,15 +674,17 @@ function render(page, r0) {
   page.append(h("section", { class: "card home-ready" }, h("div", { class: "hd" }, readyTitle, readySub), h("div", { class: "bd" }, readyBody)));
   let auditFile, auditKnown = false;
   async function loadAudit() {
-    if (!can("admin")) { auditKnown = false; drawReady(); return; }
+    if (!can("admin", "GET /v1/admin/audit")) { auditKnown = false; drawReady(); return; }
     try { const j = await api("/v1/admin/audit?limit=1", { timeout: 4000 }); auditFile = j.file || null; auditKnown = true; } catch { auditKnown = false; }
     drawReady();
   }
   function drawReady() {
     const w = state.whoami, a = state.alerts, env = environment();
     const rules = (a?.rules || []).filter((r) => r.enabled !== false);
-    const told = rules.filter((r) => r.owner && r.runbook).length;
-    const routes = (a?.routes || []).length + (a?.webhook ? 1 : 0);
+    // CCW-13: a rule shipped with the server has its runbook compiled in
+    // (runbook_docs); `webhook` is true when there are routes, not one more.
+    const told = rules.filter((r) => (r.owner && r.runbook) || r.runbook_docs).length;
+    const routes = (a?.routes || []).length || (a?.webhook ? 1 : 0);
     const shards = state.cluster?.shards || [];
     const single = !isCoordinator();
     const items = [
@@ -688,10 +692,17 @@ function render(page, r0) {
       { ok: w ? !w.auth?.open : null, title: w?.auth?.open ? "Open: anyone who reaches it can read and change everything" : "Closed: every call needs a key", fix: "Start it with --token, then give each person, app and agent its own key, limited to its tables.", href: "#/access?tab=keys" },
       { ok: routes > 0, title: routes ? `Alerts go somewhere: ${fmt.plural(routes, "route")}` : "Alerts go nowhere: no route (Slack, PagerDuty, a webhook)", fix: "Add a route in Alerts, so that a firing alert reaches a person.", href: "#/alerts?routes=1" },
       { ok: rules.length ? told === rules.length : null, title: rules.length ? `${told} of ${rules.length} alert rules say who owns them and what to do` : "No alert rules", fix: "Give each rule an owner and a runbook URL: the person paged knows it is theirs and where to start.", href: "#/alerts" },
-      { ok: auditKnown ? !!auditFile : null, title: !auditKnown ? "Audit log: needs an admin key to tell" : auditFile ? `Audit log kept on disk (${auditFile})` : "Audit log kept in memory only: a restart loses who changed what", fix: "Start the server with --audit-log FILE (the operator: spec.auditLog).", href: "#/access" },
+      { ok: auditKnown ? !!auditFile : null, title: !auditKnown ? "Audit log: needs an admin key to tell" : auditFile ? `Audit log kept on disk (${auditFile})` : "Audit log kept in memory only: a restart loses who changed what", fix: "Start the server with --audit-log FILE (the operator: spec.coordinatorStorage, a volume for each coordinator's audit log, events and alerts).", href: "#/access" },
       single ? { ok: null, title: "One server: its disk holds the only copy of the data", fix: "Run a cluster with two or more copies a shard (or back the file up) before the data matters.", href: "#/cluster" }
-        : { ok: shards.length ? shards.every((sh) => (sh.replicas || []).length >= 2) : null, title: shards.every((sh) => (sh.replicas || []).length >= 2) ? "Every shard has two copies or more" : `${shards.filter((sh) => (sh.replicas || []).length < 2).length} shards have one copy`, fix: "Add a replica to each shard: a lost disk then loses nothing.", href: "#/cluster" },
+        : { ok: shards.length ? shards.every((sh) => (sh.replicas || []).length >= 2) : null, title: shards.every((sh) => (sh.replicas || []).length >= 2) ? "Every shard has two copies or more" : (() => { const n = shards.filter((sh) => (sh.replicas || []).length < 2).length; return `${fmt.plural(n, "shard")} ${n === 1 ? "has" : "have"} one copy`; })(), fix: "Add a replica to each shard: a lost disk then loses nothing.", href: "#/cluster" },
     ];
+    // LIV-6: copies of a shard on one node, while the cluster has others.
+    if (!single) {
+      const nodeOf = (rp) => rp.detail?.place?.node || null;
+      const all = shards.flatMap((sh) => sh.replicas || []), nodes = new Set(all.map(nodeOf).filter(Boolean));
+      const together = shards.filter((sh) => (sh.replicas || []).length >= 2 && (sh.replicas || []).every((rp) => nodeOf(rp) && nodeOf(rp) === nodeOf(sh.replicas[0])));
+      if (nodes.size > 1 || together.length) items.push({ ok: nodes.size > 1 ? !together.length : null, title: !together.length ? "Every shard's copies run on more than one node" : `${fmt.plural(together.length, "shard")} with every copy on one node (${together.slice(0, 3).map((sh) => `shard ${sh.shard ?? ""}: ${nodeOf(sh.replicas[0])}`).join(", ")}): losing that node stops ${together.length === 1 ? "it" : "them"}`, fix: "Restart one of its replicas so the scheduler places it on another node, or add a node.", href: "#/cluster" });
+    }
     const bad = items.filter((x) => x.ok === false).length;
     readyTitle.textContent = env != null && /^prod/i.test(env) ? "Ready for production" : "Before production";
     readySub.textContent = bad ? `${bad} of ${items.length} not set` : "all set that can be told from here";

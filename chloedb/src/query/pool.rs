@@ -82,7 +82,10 @@ impl Pool {
         let handles = (0..threads)
             .map(|i| {
                 let shared = shared.clone();
-                std::thread::Builder::new().name(format!("chloedb-query-{i}")).spawn(move || shared.serve()).expect("start a query thread")
+                std::thread::Builder::new().name(format!("chloedb-query-{i}")).stack_size(super::parse::QUERY_STACK).spawn(move || {
+                    super::parse::mark_deep_stack();
+                    shared.serve()
+                }).expect("start a query thread")
             })
             .collect();
         Pool { shared, handles }

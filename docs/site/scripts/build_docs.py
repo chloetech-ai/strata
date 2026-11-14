@@ -320,6 +320,9 @@ def convert(page, by_source):
     for i, b in enumerate(blocks):
         key = f"CHLOEDBCODEBLOCK{i:05d}X"
         body = body.replace(f"<p>{key}</p>", b).replace(key, b)
+    # Pictures load as they come near the screen: a reference page holds
+    # dozens, most of them far below the fold.
+    body = body.replace("<img ", '<img loading="lazy" decoding="async" ')
     # Wide tables scroll inside the column.
     body = re.sub(r"<table>", '<div class="doc-table"><table>', body).replace("</table>", "</table></div>")
     # Headings get a link to themselves.
@@ -375,6 +378,9 @@ TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>{title} · ChloeDB docs</title>
+<link rel="icon" href="{up}../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="{up}../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="{up}../assets/brand/apple-touch-icon.png">
 <meta name="description" content="{desc}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -385,7 +391,7 @@ TEMPLATE = """<!doctype html>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from {source}: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="{up}index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="{up}index.html"><img class="on-light" src="{up}../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="{up}../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="{up}features.html">Features</a>
     <a href="{up}scale.html">Laptop to cloud</a>
@@ -422,7 +428,7 @@ TEMPLATE = """<!doctype html>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="{up}index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="{up}index.html"><img class="on-light" src="{up}../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="{up}../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="{start}">{start_label}</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="{github}">GitHub</a></li><li><a href="{github}/blob/{branch}/docs/reproduce.md">Reproduce the results</a></li></ul></div>

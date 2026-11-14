@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use axum::extract::{Query, State};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use crate::api::{bad, Answer, Q, Shared};
@@ -33,7 +33,7 @@ use crate::strata::{Row, RowExt};
 use crate::telemetry::iso;
 
 pub fn routes() -> Router<Shared> {
-    Router::new().route("/v1/map/ask", get(ask)).route("/v1/map/asks", get(asks))
+    Router::new().route("/v1/map/ask", get(ask_read).post(ask_keep)).route("/v1/map/asks", get(asks))
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -54,6 +54,9 @@ pub struct Happened {
     pub author: String,
     pub cause: String,
     pub hours: f64,
+    /// The period in words when the question named one ("this month"),
+    /// else empty and the text says "in the last" so many hours.
+    pub period: String,
     /// Objects this did not happen to.
     pub negate: bool,
 }
@@ -74,6 +77,9 @@ pub struct Plan {
     pub vendor: String,
     pub version: String,
     pub customer: String,
+    /// `customer` is a whole customer's name (matched with `=`), not a
+    /// part of one (`ILIKE`).
+    pub customer_whole: bool,
     pub region: String,
     pub metro: String,
     pub hub: String,
@@ -90,6 +96,22 @@ pub struct Vocabulary {
     pub metros: Vec<(String, Vec<String>)>,
     pub regions: Vec<(String, Vec<String>)>,
     pub vendors: Vec<String>,
+    /// The customers the estate's objects are named for, as written.
+    pub customers: Vec<String>,
+    /// Now (epoch seconds), for "this month" and "this year".
+    pub now: i64,
+}
+
+/// What the reader of fixed vocabulary did not take from a sentence.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct Unread {
+    /// Words it took nothing from: the answer is for the rest of the question.
+    pub ignored: Vec<String>,
+    /// Places read from a near spelling: (as written, the place it was read as).
+    pub corrected: Vec<(String, String)>,
+    /// Why the question is refused rather than answered in part: it names
+    /// an id, a place or a name the estate does not have.
+    pub refused: String,
 }
 
 pub const KINDS: &[(&str, &[&str])] = &[
@@ -118,22 +140,71 @@ const CAUSES: &[(&str, &[&str])] = &[
     ("congestion", &["congestion", "congested"]),
 ];
 const STOP: &[&str] = &["and", "with", "where", "by", "in", "within", "whose", "that", "done", "which", "on", "from", "behind", "near", "during", "over", "since", "was", "were", "is", "are", "the", "a", "an", "having", "has", "have"];
+/// Words a question is made of that ask for nothing: leaving them out
+/// changes no answer, so they are not reported as unread.
+const FILLER: &[&str] = &["all", "any", "every", "everything", "anything", "something", "objects", "object", "nodes", "node", "things", "thing", "elements", "element", "sites", "site", "locations", "what", "show", "me", "list", "find", "give", "get", "see", "tell", "how", "many", "much", "count", "number", "there", "of", "to", "for", "it", "its", "they", "them", "their", "those", "these", "right", "now", "currently", "current", "at", "been", "be", "being", "because", "due", "caused", "went", "gone", "going", "still", "ms", "milliseconds", "percent", "please", "i", "we", "our", "my", "us", "can", "you", "do", "does", "did", "than", "then", "or", "time", "times", "ones", "one"];
 
-fn words(s: &str) -> Vec<String> {
+/// A sentence's words as written, split as [`words`] splits them.
+fn words_cased(s: &str) -> Vec<String> {
     s.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '?' | '!' | '"' | '\u{201c}' | '\u{201d}'))
-        .map(|w| w.trim_matches(|c: char| matches!(c, '.' | ':' | '\'')).to_lowercase())
+        .map(|w| w.trim_matches(|c: char| matches!(c, '.' | ':' | '\'')).to_string())
         .filter(|w| !w.is_empty())
         .collect()
+}
+
+fn words(s: &str) -> Vec<String> {
+    words_cased(s).into_iter().map(|w| w.to_lowercase()).collect()
+}
+
+/// A word that is an id (`ag1-fra`, `olt-s03-h12-lon`): a dash and a digit,
+/// and not a date or a range of numbers.
+fn id_like(w: &str) -> bool {
+    w.contains('-') && w.chars().any(|c| c.is_ascii_digit()) && w.chars().any(|c| c.is_ascii_alphabetic()) && w.len() <= 60
+}
+
+/// Edits between two words, a swap of neighbours counting as one.
+fn distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+fn title(s: &str) -> String {
+    s.split(' ').map(|w| { let mut c = w.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }).collect::<Vec<_>>().join(" ")
+}
+
+/// Hours since the start of this week (Monday), month or year, in UTC.
+fn since_start(now: i64, of: &str) -> f64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    let Some(t) = Utc.timestamp_opt(now, 0).single() else { return 168.0 };
+    let start = match of {
+        "week" => t.date_naive() - chrono::Duration::days(t.weekday().num_days_from_monday() as i64),
+        "month" => t.date_naive().with_day(1).unwrap_or(t.date_naive()),
+        _ => t.date_naive().with_ordinal(1).unwrap_or(t.date_naive()),
+    };
+    let s = start.and_hms_opt(0, 0, 0).map(|d| d.and_utc().timestamp()).unwrap_or(now - 168 * 3600);
+    ((now - s) as f64 / 3600.0).max(1.0)
 }
 
 /// Where `phrase` (words) starts in `w`.
 fn at(w: &[String], phrase: &str) -> Option<usize> {
     let p: Vec<&str> = phrase.split(' ').collect();
     (0..w.len().saturating_sub(p.len() - 1)).find(|&i| p.iter().enumerate().all(|(k, x)| w[i + k] == *x))
-}
-
-fn has(w: &[String], phrases: &[&str]) -> bool {
-    phrases.iter().any(|p| at(w, p).is_some())
 }
 
 fn number(s: &str) -> Option<f64> {
@@ -144,14 +215,26 @@ fn number(s: &str) -> Option<f64> {
 /// The reader of fixed vocabulary: what it recognises it takes, and the
 /// rest of the sentence it leaves.
 pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
+    read_all(text, v, known).0
+}
+
+/// As [`read`], with what it left: the words it took nothing from, the
+/// places it read from a near spelling, and why it refuses the question
+/// when the question names something the estate does not have.
+pub fn read_all(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> (Plan, Unread) {
     let w = words(text);
+    let cased = words_cased(text);
     let mut p = Plan::default();
+    let mut un = Unread::default();
     let mut used = vec![false; w.len()];
     let mark = |i: usize, n: usize, used: &mut Vec<bool>| (i..(i + n).min(used.len())).for_each(|k| used[k] = true);
 
     // When: "last 3 days", "past week", "today", "yesterday".
     let mut hours = None;
+    let mut period = String::new();
+    let mut when: Vec<usize> = Vec::new();
     for i in 0..w.len() {
+        let before = used.iter().filter(|u| **u).count();
         if matches!(w[i].as_str(), "last" | "past" | "previous") {
             let unit = |u: &str| match u.trim_end_matches('s') {
                 "minute" | "min" => Some(1.0 / 60.0),
@@ -174,9 +257,15 @@ pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
         } else if w[i] == "yesterday" {
             hours = Some(48.0);
             mark(i, 1, &mut used);
-        } else if w[i] == "this" && matches!(w.get(i + 1).map(String::as_str), Some("week")) {
-            hours = Some(168.0);
+        } else if w[i] == "this" && matches!(w.get(i + 1).map(String::as_str), Some("week" | "month" | "year")) {
+            let of = w[i + 1].as_str();
+            hours = Some(since_start(v.now, of));
+            period = format!("this {of}");
             mark(i, 2, &mut used);
+        }
+        if used.iter().filter(|u| **u).count() > before {
+            let more: Vec<usize> = (0..w.len()).filter(|k| used[*k] && !when.contains(k)).collect();
+            when.extend(more);
         }
     }
 
@@ -218,8 +307,11 @@ pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
             p.order = "loss".into();
         }
     }
-    if has(&w, &["slowest", "slow"]) && p.order.is_empty() {
-        p.order = "latency".into();
+    if let Some(i) = w.iter().position(|x| matches!(x.as_str(), "slowest" | "slow" | "worst")) {
+        if p.order.is_empty() {
+            p.order = "latency".into();
+        }
+        mark(i, 1, &mut used);
     }
 
     // Who: "by operator m.rossi", "done by Rossi".
@@ -252,10 +344,20 @@ pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
     } else if let Some(i) = failed {
         event = "fault".into();
         mark(i, 1, &mut used);
+        if w[i] == "down" {
+            mark(i - 1, 1, &mut used);
+        }
     } else if !author.is_empty() {
         event = "change".into();
     }
-    let negate = has(&w, &["not changed", "not been changed", "unchanged", "never changed", "without a change", "without change", "no change", "no changes", "not failed", "never failed"]);
+    let mut negate = false;
+    for phrase in ["not been changed", "not changed", "unchanged", "never changed", "without a change", "without change", "no change", "no changes", "not failed", "never failed"] {
+        if let Some(i) = at(&w, phrase) {
+            negate = true;
+            mark(i, phrase.split(' ').count(), &mut used);
+            break;
+        }
+    }
     // About what: the words after "about", or between quotes.
     let mut about = String::new();
     if let (Some(a), Some(b)) = (text.find(['"', '\u{201c}']), text.rfind(['"', '\u{201d}'])) {
@@ -277,19 +379,20 @@ pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
             }
         }
     }
-    let mut cause = String::new();
-    if event == "fault" && about.is_empty() {
-        if let Some((c, _)) = CAUSES.iter().find(|(_, names)| has(&w, names)) {
-            cause = c.to_string();
+    let happened = !event.is_empty() || !about.is_empty() || !author.is_empty();
+    if happened {
+        p.happened = Some(Happened { event, about, author, cause: String::new(), hours: hours.unwrap_or(168.0), period, negate });
+    } else {
+        // A period with nothing that happened in it is not a condition:
+        // its words are left, and reported.
+        for k in when {
+            used[k] = false;
         }
-    }
-    if !event.is_empty() || !about.is_empty() || !author.is_empty() {
-        p.happened = Some(Happened { event, about, author, cause, hours: hours.unwrap_or(168.0), negate });
     }
 
     // Where in the graph.
     let seed = |from: usize, used: &mut Vec<bool>| -> Option<String> {
-        (from..(from + 3).min(w.len())).find(|&k| known(&w[k])).map(|k| {
+        (from..(from + 3).min(w.len())).find(|&k| !used[k] && known(&w[k])).map(|k| {
             used[k] = true;
             w[k].clone()
         })
@@ -322,16 +425,41 @@ pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
             }
         }
     }
-    for (i, x) in w.iter().enumerate() {
+    // The cause of a fault, from words no kind took ("power plants" is a kind).
+    if p.happened.as_ref().is_some_and(|h| h.event == "fault" && h.about.is_empty()) {
+        'cause: for (c, names) in CAUSES {
+            for nm in names.iter() {
+                let n = nm.split(' ').count();
+                if let Some(i) = (0..w.len().saturating_sub(n - 1)).find(|&i| (0..n).all(|k| !used[i + k] && w[i + k] == nm.split(' ').nth(k).unwrap_or(""))) {
+                    mark(i, n, &mut used);
+                    if let Some(h) = p.happened.as_mut() {
+                        h.cause = c.to_string();
+                    }
+                    break 'cause;
+                }
+            }
+        }
+    }
+    for i in 0..w.len() {
         if used[i] {
             continue;
         }
+        let x = w[i].clone();
         let before = if i > 0 { w[i - 1].as_str() } else { "" };
+        let not = before == "not" && !used[i - 1];
         match x.as_str() {
+            "down" | "degraded" | "impacted" | "healthy" | "ok" | "broken" | "unhealthy" | "failing" if not => {
+                // "not down" is not "down": it is every other state.
+                match x.as_str() {
+                    "healthy" | "ok" => p.states.push("not ok".into()),
+                    "broken" | "unhealthy" | "failing" => p.states.push("ok".into()),
+                    _ => p.states.extend(["ok", "degraded", "impacted", "down"].into_iter().filter(|s| *s != x).map(String::from)),
+                }
+                used[i - 1] = true;
+            }
             "down" | "degraded" | "impacted" if !matches!(before, "went" | "gone" | "going") => p.states.push(x.clone()),
             "broken" | "unhealthy" | "failing" => p.states.push("not ok".into()),
             "trouble" if before == "in" => p.states.push("not ok".into()),
-            "ok" if before == "not" => p.states.push("not ok".into()),
             "healthy" | "ok" => p.states.push("ok".into()),
             _ => continue,
         }
@@ -354,31 +482,121 @@ pub fn read(text: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) -> Plan {
     };
     p.metro = named(&v.metros, &mut used);
     p.region = named(&v.regions, &mut used);
+    // A customer by its whole name, the longest that fits ("Northwind
+    // Energy", not every Northwind).
+    let mut whole: Option<(usize, usize, &String)> = None;
+    for c in &v.customers {
+        let low = c.to_lowercase();
+        let n = low.split(' ').count();
+        if whole.is_some_and(|(_, m, _)| m >= n) {
+            continue;
+        }
+        if let Some(i) = at(&w, &low).filter(|&i| (0..n).all(|k| !used[i + k])) {
+            whole = Some((i, n, c));
+        }
+    }
+    if let Some((i, n, c)) = whole {
+        mark(i, n, &mut used);
+        if i > 0 && matches!(w[i - 1].as_str(), "customer" | "customers") && !used[i - 1] {
+            used[i - 1] = true;
+        }
+        p.customer = c.clone();
+        p.customer_whole = true;
+    }
     for (i, x) in w.iter().enumerate() {
         if used[i] {
             continue;
         }
-        if x.len() > 4 && x.starts_with('h') && x[1..3].chars().all(|c| c.is_ascii_digit()) && x.as_bytes()[3] == b'-' {
+        if x.len() > 4 && x.starts_with('h') && x.get(1..3).is_some_and(|d| d.chars().all(|c| c.is_ascii_digit())) && x.as_bytes()[3] == b'-' && known(x) {
             p.hub = x.clone();
             used[i] = true;
         } else if let Some(vn) = v.vendors.iter().find(|vn| vn.to_lowercase() == *x || vn.to_lowercase().split(' ').next() == Some(x.as_str())) {
             p.vendor = vn.clone();
             used[i] = true;
+            // The rest of a name of more words ("Palo Alto").
+            for (k, part) in vn.to_lowercase().split(' ').enumerate().skip(1) {
+                if w.get(i + k).is_some_and(|y| *y == part) {
+                    used[i + k] = true;
+                }
+            }
         } else if matches!(x.as_str(), "running" | "version" | "release") {
             if let Some(ver) = w.get(i + 1).filter(|s| s.chars().any(|c| c.is_ascii_digit())) {
                 p.version = ver.clone();
                 used[i] = true;
                 used[i + 1] = true;
             }
-        } else if x == "customer" {
-            if let Some(c) = w.get(i + 1).filter(|s| !STOP.contains(&s.as_str()) && !used[i + 1]) {
-                p.customer = c.clone();
-                used[i] = true;
-                used[i + 1] = true;
+        } else if x == "customer" && p.customer.is_empty() {
+            // Part of a name: the words after "customer", up to the next
+            // that means something else.
+            let mut k = i + 1;
+            while k < w.len() && k - i <= 4 && !used[k] && !STOP.contains(&w[k].as_str()) && !FILLER.contains(&w[k].as_str()) {
+                k += 1;
+            }
+            if k > i + 1 {
+                p.customer = w[i + 1..k].join(" ");
+                mark(i, k - i, &mut used);
             }
         }
     }
-    p
+
+    // What is left. An id the estate does not have, a place after "in" it
+    // does not know, or a name it cannot place refuses the question: an
+    // answer without it would be an answer to another question.
+    let unknown: Vec<&String> = w.iter().enumerate().filter(|(i, x)| !used[*i] && id_like(x) && !known(x)).map(|(_, x)| x).collect();
+    if !unknown.is_empty() {
+        let list = unknown.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", ");
+        un.refused = format!("{list} {} not an object of the estate: nothing has that id. Check the id (the map's search finds an object by the start of its id).", if unknown.len() == 1 { "is" } else { "are" });
+    }
+    let places: Vec<(&String, Vec<String>)> = v.metros.iter().chain(v.regions.iter()).map(|(id, n)| (id, n.clone())).collect();
+    for i in 1..w.len() {
+        let x = &w[i];
+        if used[i] || !un.refused.is_empty() || !matches!(w[i - 1].as_str(), "in" | "at" | "near" | "around") || STOP.contains(&x.as_str()) || FILLER.contains(&x.as_str()) || x.len() < 4 || x.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let best = places.iter().flat_map(|(id, names)| names.iter().filter(|n| !n.contains(' ') && n.len() >= 4).map(move |n| (distance(x, n), *id, n.clone()))).min_by_key(|t| t.0);
+        let Some((d, id, name)) = best else { continue };
+        let near = if x.len() >= 8 { 2 } else if x.len() >= 5 { 1 } else { 0 };
+        let is_metro = id.starts_with("m-");
+        if d <= near && (if is_metro { p.metro.is_empty() } else { p.region.is_empty() }) {
+            if is_metro { p.metro = id.clone() } else { p.region = id.clone() }
+            used[i] = true;
+            un.corrected.push((cased[i].clone(), title(&name)));
+        } else if d <= 3 || name.get(..4) == x.get(..4) {
+            // Close to a place, too far to be sure of it: asked back, not guessed.
+            un.refused = format!("There is no place called \"{}\" in the estate. Did you mean {}? Places are its metros ({}) and regions.", cased[i], title(&name), v.metros.iter().filter_map(|(_, n)| n.first()).map(|n| title(n)).collect::<Vec<_>>().join(", "));
+        }
+    }
+    if un.refused.is_empty() {
+        // Names: capitalised words nothing took, past the first word (which
+        // is capitalised anyway), taken together.
+        let mut i = 1;
+        while i < w.len() {
+            let cap = |k: usize| !used[k] && cased[k].chars().next().is_some_and(char::is_uppercase) && !STOP.contains(&w[k].as_str()) && !FILLER.contains(&w[k].as_str());
+            if !cap(i) {
+                i += 1;
+                continue;
+            }
+            let mut k = i;
+            while k > 0 && cap(k - 1) {
+                k -= 1;
+            }
+            let mut end = i;
+            while end + 1 < w.len() && cap(end + 1) {
+                end += 1;
+            }
+            let name = cased[k..=end].join(" ");
+            let first = w[k].clone();
+            let alike: Vec<&String> = v.customers.iter().filter(|c| c.to_lowercase().split(' ').next() == Some(first.as_str())).take(4).collect();
+            un.refused = if alike.is_empty() {
+                format!("\"{name}\" is not a place, a customer or a vendor of the estate.")
+            } else {
+                format!("No customer is called \"{name}\". Customers named {}: {}.", title(&first), alike.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "))
+            };
+            break;
+        }
+    }
+    un.ignored = w.iter().enumerate().filter(|(i, x)| !used[*i] && !STOP.contains(&x.as_str()) && !FILLER.contains(&x.as_str())).map(|(_, x)| x.clone()).collect();
+    (p, un)
 }
 
 fn clean(s: &str) -> String {
@@ -396,6 +614,10 @@ pub fn from_model(answer: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) ->
     p.vendor = v.vendors.iter().find(|x| x.to_lowercase() == s("vendor")).cloned().unwrap_or_default();
     p.version = s("version");
     p.customer = s("customer");
+    if let Some(c) = v.customers.iter().find(|c| c.to_lowercase() == p.customer) {
+        p.customer = c.clone();
+        p.customer_whole = true;
+    }
     let one_of = |list: &[(String, Vec<String>)], x: String| list.iter().find(|(id, names)| *id == x || names.contains(&x)).map(|(id, _)| id.clone()).unwrap_or_default();
     p.metro = one_of(&v.metros, s("metro"));
     p.region = one_of(&v.regions, s("region"));
@@ -414,7 +636,7 @@ pub fn from_model(answer: &str, v: &Vocabulary, known: &dyn Fn(&str) -> bool) ->
         let author = hs("author");
         let author = OPERATORS.iter().find(|o| **o == author || o.split('.').nth(1) == Some(author.as_str())).map(|o| o.to_string()).unwrap_or(author);
         let cause = Some(hs("cause")).filter(|c| CAUSES.iter().any(|(id, _)| id == c)).unwrap_or_default();
-        p.happened = Some(Happened { event, about: hs("about"), author, cause, hours: h["hours"].as_f64().filter(|x| *x > 0.0).unwrap_or(168.0).min(24.0 * 90.0), negate: h["negate"].as_bool().unwrap_or(false) });
+        p.happened = Some(Happened { event, about: hs("about"), author, cause, hours: h["hours"].as_f64().filter(|x| *x > 0.0).unwrap_or(168.0).min(24.0 * 90.0), period: String::new(), negate: h["negate"].as_bool().unwrap_or(false) });
     }
     let g = &j["graph"];
     if let Some(from) = g["from"].as_str().map(|x| clean(&x.to_lowercase())).filter(|x| known(x)) {
@@ -490,7 +712,11 @@ pub fn compile(p: &Plan, now: i64, walked: Option<&str>) -> Compiled {
             said("column", format!("{label}: {val}"), "a keyword column");
         }
     }
-    if !p.customer.is_empty() {
+    if !p.customer.is_empty() && p.customer_whole {
+        c.push("customer = :customer".into());
+        params.insert("customer".into(), json!(clean(&p.customer)));
+        said("column", format!("customer: {}", p.customer), "a keyword column");
+    } else if !p.customer.is_empty() {
         c.push("customer ILIKE :customer".into());
         params.insert("customer".into(), json!(format!("%{}%", clean(&p.customer))));
         said("substring", format!("customer contains \"{}\"", p.customer), "ILIKE from the substring index");
@@ -523,7 +749,8 @@ pub fn compile(p: &Plan, now: i64, walked: Option<&str>) -> Compiled {
         }
         hc.push("ts >= :since".into());
         params.insert("since".into(), json!(iso(now - (h.hours * 3600.0) as i64)));
-        let mut text = format!("{} in the last {}", match h.event.as_str() { "change" => "changed", "fault" => "failed", _ => "something happened" }, span(h.hours));
+        let when = if h.period.is_empty() { format!("in the last {}", span(h.hours)) } else { h.period.clone() };
+        let mut text = format!("{} {when}", match h.event.as_str() { "change" => "changed", "fault" => "failed", _ => "something happened" });
         if !h.author.is_empty() {
             hc.push("author = :author".into());
             params.insert("author".into(), json!(h.author));
@@ -576,9 +803,9 @@ fn span(hours: f64) -> String {
 }
 
 fn plan_json(p: &Plan) -> Value {
-    json!({"kinds": p.kinds, "states": p.states, "vendor": p.vendor, "version": p.version, "customer": p.customer, "region": p.region, "metro": p.metro, "hub": p.hub,
+    json!({"kinds": p.kinds, "states": p.states, "vendor": p.vendor, "version": p.version, "customer": p.customer, "customer_whole": p.customer_whole, "region": p.region, "metro": p.metro, "hub": p.hub,
         "readings": p.readings.iter().map(|r| json!({"field": r.field, "op": r.op, "value": r.value})).collect::<Vec<_>>(),
-        "event": p.happened.as_ref().map(|h| json!({"type": h.event, "about": h.about, "author": h.author, "cause": h.cause, "hours": h.hours, "negate": h.negate})),
+        "event": p.happened.as_ref().map(|h| json!({"type": h.event, "about": h.about, "author": h.author, "cause": h.cause, "hours": h.hours, "period": h.period, "negate": h.negate})),
         "graph": p.walk.as_ref().map(|g| json!({"dir": g.dir, "from": g.from, "hops": g.hops})), "order": p.order})
 }
 
@@ -598,13 +825,14 @@ pub async fn vocabulary(e: &Engine) -> Vocabulary {
         }).collect()
     };
     let vendors = e.db.query(&format!("SELECT vendor, COUNT(*) AS n FROM {NODES} GROUP BY vendor LIMIT 100"), json!({})).await.unwrap_or_default();
-    Vocabulary { metros: of("metro"), regions: of("region"), vendors: vendors.iter().map(|r| r.s("vendor")).filter(|s| !s.is_empty()).collect() }
+    let customers = e.db.query(&format!("SELECT customer, COUNT(*) AS n FROM {NODES}\nWHERE customer != ''\nGROUP BY customer LIMIT 5000"), json!({})).await.unwrap_or_default();
+    Vocabulary { metros: of("metro"), regions: of("region"), vendors: vendors.iter().map(|r| r.s("vendor")).filter(|s| !s.is_empty()).collect(), customers: customers.iter().map(|r| r.s("customer")).filter(|s| !s.is_empty()).collect(), now: e.st().last_minute.max(crate::sim::now() - 120) }
 }
 
 /// When the model may be asked again after it failed (epoch seconds).
 static MODEL_AFTER: AtomicI64 = AtomicI64::new(0);
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct AskQ {
     q: String,
     /// `rules` to skip the model.
@@ -613,7 +841,19 @@ struct AskQ {
 
 const FOUND: &str = "id, kind, layer, name, state, reason, x, y, latency_ms, base_ms, loss, vendor, os_version, customer, region, metro, hub, asite";
 
-async fn ask(State(svc): State<Shared>, Query(a): Query<AskQ>) -> Answer {
+/// `GET`: a read, as a read key may make. The fixed reader answers and
+/// nothing is written: no search is kept and no model is asked.
+async fn ask_read(State(svc): State<Shared>, Query(a): Query<AskQ>) -> Answer {
+    ask(svc, a, false).await
+}
+
+/// `POST {"q": ...}`: the search is kept in `netops_searches` (the box's
+/// history), and the server's model reads it when there is one.
+async fn ask_keep(State(svc): State<Shared>, Json(a): Json<AskQ>) -> Answer {
+    ask(svc, a, true).await
+}
+
+async fn ask(svc: Shared, a: AskQ, keep: bool) -> Answer {
     let q = Q::new(&svc);
     let e = q.e.clone();
     let asked = a.q.trim().to_string();
@@ -623,7 +863,7 @@ async fn ask(State(svc): State<Shared>, Query(a): Query<AskQ>) -> Answer {
     let t0 = std::time::Instant::now();
     let v = vocabulary(&e).await;
     // Ids the question names are looked up, so a plan walks from a row that exists.
-    let candidates: Vec<String> = words(&asked).into_iter().filter(|w| w.contains('-') && w.chars().any(|c| c.is_ascii_digit()) && w.len() <= 60).map(|w| clean(&w)).collect();
+    let candidates: Vec<String> = words(&asked).into_iter().filter(|w| id_like(w)).map(|w| clean(&w)).collect();
     let mut ids: Vec<String> = Vec::new();
     if !candidates.is_empty() {
         let list = candidates.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", ");
@@ -632,12 +872,15 @@ async fn ask(State(svc): State<Shared>, Query(a): Query<AskQ>) -> Answer {
     let known = |x: &str| ids.iter().any(|i| i == x);
     let id = format!("ask-{}-{}", e.st().last_minute / 60, e.next_id());
     let now = crate::sim::now();
-    e.db.upsert("netops_searches", vec![json!({"id": id, "ts": iso(now), "asked": asked, "reader": "", "plan": "", "sql_text": "", "found": 0, "ms": 0.0})]).await?;
+    let save = |row: Value| { let db = e.db.clone(); async move { if keep { db.upsert("netops_searches", vec![row]).await.map(|_| ()) } else { Ok(()) } } };
+    save(json!({"id": id, "ts": iso(now), "asked": asked, "reader": "", "plan": "", "sql_text": "", "found": 0, "ms": 0.0})).await?;
     let mut reader = "rules";
     let mut note = String::new();
     let mut plan = None;
     let model = e.opts.rewrite_model.clone();
-    if model.is_empty() {
+    if !keep {
+        note = "asked with GET, which writes nothing and asks no model (POST does both)".into();
+    } else if model.is_empty() {
         note = "no model is set (--rewrite-model)".into();
     } else if a.reader.as_deref() == Some("rules") {
         note = "the fixed reader was asked for".into();
@@ -659,10 +902,25 @@ async fn ask(State(svc): State<Shared>, Query(a): Query<AskQ>) -> Answer {
             }
         }
     }
-    let plan = plan.unwrap_or_else(|| read(&asked, &v, &known));
+    let (plan, unread) = match plan {
+        Some(p) => {
+            // A model's plan drops an id it cannot use; the question is refused instead.
+            let missing: Vec<&String> = candidates.iter().filter(|c| !known(c)).collect();
+            let refused = if missing.is_empty() { String::new() } else { format!("{} {} not an object of the estate: nothing has that id.", missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", "), if missing.len() == 1 { "is" } else { "are" }) };
+            (p, Unread { refused, ..Unread::default() })
+        }
+        None => read_all(&asked, &v, &known),
+    };
+    let ignored = unread.ignored.clone();
+    let corrected: Vec<Value> = unread.corrected.iter().map(|(a, b)| json!({"from": a, "to": b})).collect();
+    if !unread.refused.is_empty() {
+        save(json!({"id": id, "ts": iso(now), "asked": asked, "reader": reader, "plan": plan_json(&plan).to_string(), "sql_text": "", "found": 0, "ms": 0.0})).await?;
+        return q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": false, "refused": true, "read": [], "ignored": ignored, "corrected": corrected, "plan": plan_json(&plan), "rows": [], "places": {}, "total": 0,
+            "hint": unread.refused}));
+    }
     if plan == Plan::default() {
-        e.db.upsert("netops_searches", vec![json!({"id": id, "ts": iso(now), "asked": asked, "reader": reader, "plan": "{}", "sql_text": "", "found": 0, "ms": 0.0})]).await?;
-        return q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": false, "read": [], "plan": plan_json(&plan), "rows": [], "places": {}, "total": 0,
+        save(json!({"id": id, "ts": iso(now), "asked": asked, "reader": reader, "plan": "{}", "sql_text": "", "found": 0, "ms": 0.0})).await?;
+        return q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": false, "read": [], "ignored": ignored, "plan": plan_json(&plan), "rows": [], "places": {}, "total": 0,
             "hint": "Nothing in the sentence was recognised. Name a kind (OLTs, cell sites, hub routers), a place (Frankfurt), a state (down, degraded), a reading (latency above 30 ms), something that happened (changed in the last week about firmware, by m.rossi) or a place in the graph (behind hr1-h03-ams)."}));
     }
     let at = e.st().last_minute.max(now - 120);
@@ -709,8 +967,10 @@ async fn ask(State(svc): State<Shared>, Query(a): Query<AskQ>) -> Answer {
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     let shown = display.clone() + &format!("\n-- {}", Value::Object(compile(&plan, at, None).params));
-    e.db.upsert("netops_searches", vec![json!({"id": id, "ts": iso(now), "asked": asked, "reader": reader, "plan": plan_json(&plan).to_string(), "sql_text": shown, "found": total, "ms": ms})]).await?;
-    q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": true, "read": c.read, "plan": plan_json(&plan), "sql": display, "params": compile(&plan, at, None).params, "rows": rows, "why": why, "places": places, "total": total, "ms": ms}))
+    save(json!({"id": id, "ts": iso(now), "asked": asked, "reader": reader, "plan": plan_json(&plan).to_string(), "sql_text": shown, "found": total, "ms": ms})).await?;
+    // Words left unread make the count the answer to part of the question, and it says so.
+    let partial = !ignored.is_empty();
+    q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": true, "partial": partial, "ignored": ignored, "corrected": corrected, "read": c.read, "plan": plan_json(&plan), "sql": display, "params": compile(&plan, at, None).params, "rows": rows, "why": why, "places": places, "total": total, "ms": ms}))
 }
 
 /// The searches asked lately.
@@ -725,7 +985,124 @@ mod tests {
     use super::*;
 
     fn vocab() -> Vocabulary {
-        Vocabulary { metros: vec![("m-fra".into(), vec!["frankfurt".into(), "fra".into()]), ("m-ams".into(), vec!["amsterdam".into(), "ams".into()])], regions: vec![("r-eu-west".into(), vec!["eu-west".into(), "eu west".into()])], vendors: vec!["Nokia".into(), "Cisco".into()] }
+        Vocabulary { metros: vec![("m-fra".into(), vec!["frankfurt".into(), "fra".into()]), ("m-ams".into(), vec!["amsterdam".into(), "ams".into()])], regions: vec![("r-eu-west".into(), vec!["eu-west".into(), "eu west".into()])], vendors: vec!["Nokia".into(), "Cisco".into()], customers: Vec::new(), now: 1_800_000_000 }
+    }
+
+    /// The estate's vocabulary as `vocabulary` reads it from the simulated
+    /// estate, at 2026-11-13 18:15 UTC.
+    fn estate() -> Vocabulary {
+        let place = |id: &str, name: &str| {
+            let low = name.to_lowercase();
+            let mut names = vec![low.clone(), low.replace('-', " ")];
+            if id.starts_with("m-") {
+                names.push(id[2..].to_string());
+            }
+            names.dedup();
+            (id.to_string(), names)
+        };
+        let metros = [("m-nyc", "New York"), ("m-ash", "Ashburn"), ("m-ams", "Amsterdam"), ("m-lon", "London"), ("m-par", "Paris"), ("m-mad", "Madrid"), ("m-mil", "Milan"), ("m-fra", "Frankfurt"), ("m-waw", "Warsaw"), ("m-sto", "Stockholm")];
+        let regions = [("r-us-east", "US-East"), ("r-eu-west", "EU-West"), ("r-eu-south", "EU-South"), ("r-eu-central", "EU-Central"), ("r-eu-north", "EU-North")];
+        Vocabulary {
+            metros: metros.iter().map(|(i, n)| place(i, n)).collect(),
+            regions: regions.iter().map(|(i, n)| place(i, n)).collect(),
+            vendors: ["Nokia", "Calix", "Zyxel", "Juniper", "Cisco", "MikroTik", "Ericsson", "Adtran", "Arista", "Eltek", "Vertiv", "Palo Alto"].iter().map(|s| s.to_string()).collect(),
+            customers: ["Northwind Energy", "Northwind Pharma", "Northwind Foods", "Northwind Bank", "Halcyon Energy", "Bluewater Freight"].iter().map(|s| s.to_string()).collect(),
+            now: 1_794_593_700,
+        }
+    }
+
+    /// The twenty questions of the November audit, each read as it means
+    /// or refused: none answered with a count for part of it unsaid.
+    #[test]
+    fn twenty_questions_are_read_or_refused() {
+        let v = estate();
+        let known = |x: &str| ["ag1-ams", "hr2-h10-ash", "hr1-h01-ams"].contains(&x);
+        let s = |x: &[&str]| x.iter().map(|y| y.to_string()).collect::<Vec<_>>();
+        let whole = |q: &str| {
+            let (p, un) = read_all(q, &v, &known);
+            assert!(un.refused.is_empty() && un.ignored.is_empty() && un.corrected.is_empty(), "{q}: {un:?}");
+            p
+        };
+        let p = whole("OLTs in London that are down");
+        assert_eq!((p.kinds, p.states, p.metro.as_str()), (s(&["olt"]), s(&["down"]), "m-lon"));
+        let p = whole("everything behind ag1-ams that is not ok");
+        assert_eq!((p.states, p.walk), (s(&["not ok"]), Some(Walk { dir: "out".into(), from: "ag1-ams".into(), hops: 6 })));
+        let p = whole("cell sites that went down in the last 3 days because of power");
+        let h = p.happened.clone().unwrap();
+        assert_eq!((p.kinds, p.states.len(), h.event.as_str(), h.cause.as_str(), h.hours), (s(&["cell"]), 0, "fault", "power", 72.0));
+        let p = whole("customer routers in Frankfurt with latency above 40 ms");
+        assert_eq!((p.kinds, p.metro.as_str(), p.readings, p.customer.as_str()), (s(&["cpe"]), "m-fra", vec![Reading { field: "latency_ms", op: ">", value: Some(40.0) }], ""));
+        let p = whole("everything behind hr2-h10-ash");
+        assert_eq!(p.walk.unwrap().from, "hr2-h10-ash");
+        let p = whole("hub routers changed in the last week by m.rossi");
+        let h = p.happened.unwrap();
+        assert_eq!((p.kinds, h.event.as_str(), h.author.as_str(), h.hours), (s(&["hub-router"]), "change", "m.rossi", 168.0));
+        let p = whole("power plants that failed in the last month");
+        let h = p.happened.unwrap();
+        assert_eq!((p.kinds, h.event.as_str(), h.cause.as_str(), h.hours), (s(&["power"]), "fault", "", 720.0), "a power plant is a kind, not a cause");
+        let p = whole("Nokia OLTs in Paris that are degraded");
+        assert_eq!((p.vendor.as_str(), p.kinds, p.states, p.metro.as_str()), ("Nokia", s(&["olt"]), s(&["degraded"]), "m-par"));
+        let p = whole("switches in Madrid with loss over 2%");
+        assert_eq!((p.kinds, p.metro.as_str(), p.readings), (s(&["switch"]), "m-mad", vec![Reading { field: "loss", op: ">", value: Some(2.0) }]));
+        let p = whole("everything changed today in Stockholm");
+        assert_eq!((p.metro.as_str(), p.happened.unwrap().hours), ("m-sto", 24.0));
+        let p = whole("radios that are not ok in Warsaw");
+        assert_eq!((p.kinds, p.states, p.metro.as_str()), (s(&["radio"]), s(&["not ok"]), "m-waw"));
+        let p = whole("cell sites in EU-NORTH that were not changed in the last month");
+        let h = p.happened.unwrap();
+        assert_eq!((p.kinds, p.region.as_str(), h.negate, h.hours), (s(&["cell"]), "r-eu-north", true, 720.0));
+        let p = whole("objects within 2 hops of hr1-h01-ams that are down");
+        assert_eq!((p.states, p.walk), (s(&["down"]), Some(Walk { dir: "both".into(), from: "hr1-h01-ams".into(), hops: 2 })));
+        // A customer by the whole of its name, not every customer sharing a word of it.
+        let p = whole("Northwind Energy sites that are degraded");
+        assert_eq!((p.customer.as_str(), p.customer_whole, p.states.clone()), ("Northwind Energy", true, s(&["degraded"])));
+        assert!(compile(&p, v.now, None).conditions.contains("customer = :customer"));
+        let p = whole("customer Northwind Energy");
+        assert_eq!((p.customer.as_str(), p.customer_whole), ("Northwind Energy", true));
+        // "This month" is since the first of it: 12 days and 18 hours on 13 November.
+        let p = whole("OLTs in London changed this month");
+        let h = p.happened.clone().unwrap();
+        assert_eq!((h.hours, h.period.as_str()), (12.0 * 24.0 + 18.25, "this month"));
+        assert!(compile(&p, v.now, None).read.iter().any(|r| r["text"] == "changed this month"));
+        // A place it does not know is asked back, and a near spelling read and said.
+        let (_, un) = read_all("olts in londres that are down", &v, &known);
+        assert!(un.refused.contains("\"londres\"") && un.refused.contains("Did you mean London?"), "{un:?}");
+        let (p, un) = read_all("OLTs in Frankfrut that are down", &v, &known);
+        assert_eq!((p.metro.as_str(), un.corrected.clone(), un.refused.as_str()), ("m-fra", vec![("Frankfrut".to_string(), "Frankfurt".to_string())], ""));
+        // An id the estate does not have refuses the question.
+        let (p, un) = read_all("everything behind ag9-zzz that is not ok", &v, &known);
+        assert!(p.walk.is_none() && un.refused.starts_with("ag9-zzz is not an object"), "{un:?}");
+        let p = whole("slowest cell sites in New York");
+        assert_eq!((p.kinds, p.metro.as_str(), p.order.as_str()), (s(&["cell"]), "m-nyc", "latency"));
+        let p = whole("what is broken in Ashburn right now");
+        assert_eq!((p.states, p.metro.as_str()), (s(&["not ok"]), "m-ash"));
+        let p = whole("ONTs with high latency in Milan");
+        assert_eq!((p.kinds, p.metro.as_str(), p.readings), (s(&["ont"]), "m-mil", vec![Reading { field: "latency_ms", op: ">", value: None }]));
+    }
+
+    #[test]
+    fn what_is_not_read_is_said() {
+        let v = estate();
+        let known = |_: &str| false;
+        // A name the estate does not have, beside ones it does.
+        let (_, un) = read_all("Northwind Shipping sites that are down", &v, &known);
+        assert!(un.refused.starts_with("No customer is called \"Northwind Shipping\"") && un.refused.contains("Northwind Energy"), "{un:?}");
+        let (_, un) = read_all("OLTs in Gotham", &v, &known);
+        assert!(un.refused.contains("\"Gotham\" is not a place"), "{un:?}");
+        // Part of a name is a substring, and says so.
+        let (p, un) = read_all("customer northwind that are down", &v, &known);
+        assert_eq!((p.customer.as_str(), p.customer_whole, un.ignored.len()), ("northwind", false, 0));
+        assert!(compile(&p, v.now, None).conditions.contains("customer ILIKE :customer"));
+        // A period with nothing that happened in it, and words it has no use for, are left and listed.
+        let (p, un) = read_all("OLTs in London this month", &v, &known);
+        assert_eq!((p.kinds, p.happened.is_none(), un.ignored.clone()), (vec!["olt".to_string()], true, vec!["this".to_string(), "month".to_string()]));
+        let (_, un) = read_all("OLTs with the newest firmware in London", &v, &known);
+        assert_eq!(un.ignored, vec!["newest".to_string(), "firmware".to_string()]);
+        // "Not down" is every other state.
+        let (p, un) = read_all("OLTs in London that are not down", &v, &known);
+        assert_eq!((p.states, un.ignored.len()), (vec!["ok".to_string(), "degraded".to_string(), "impacted".to_string()], 0));
+        let (p, un) = read_all("Palo Alto firewalls", &v, &known);
+        assert_eq!((p.vendor.as_str(), un.refused.as_str(), un.ignored.len()), ("Palo Alto", "", 0));
     }
 
     #[test]

@@ -21,6 +21,7 @@ export default {
 const HEALTH = {
   ok: ["ok", "ok"],
   failing: ["failing", "failing"],
+  invalid: ["failing", "invalid"],
   stale: ["warn", "stale"],
   running: ["info", "running"],
   pending: ["pending", "not run yet"],
@@ -102,7 +103,7 @@ function render(page) {
     const target = h("input", { class: "input mono", autocomplete: "off", spellcheck: "false" });
     const everyIn = h("input", { class: "input mono", type: "number", min: "10", style: { width: "110px" } });
     const conf = h("textarea", { class: "input mono", rows: 9, spellcheck: "false", style: { width: "100%", resize: "vertical" } });
-    const secrets = h("textarea", { class: "input mono", rows: 3, spellcheck: "false", style: { width: "100%", resize: "vertical" } });
+    const secrets = h("textarea", { class: "input mono", rows: 3, spellcheck: "false", "data-secret": "secrets", style: { width: "100%", resize: "vertical" } });
     const about = h("div", { class: "small dim" });
     const note = h("div");
     const fill = () => {
@@ -200,8 +201,8 @@ function render(page) {
       : `curl -sS -X POST ${url} \\\n  -H "Authorization: Bearer ${secret}" \\\n  -H "Content-Type: application/json" -d '{"id": "1", "msg": "hello"}'`;
     modal({ title: `The push key of ${c.name}`, wide: true, body: h("div", { class: "stack", style: { gap: "10px" } },
       h("div", { class: "small" }, "Shown once. It may write ", h("b", { class: "mono" }, c.target), " and nothing else; revoke or rotate it here or in Access and audit."),
-      h("div", { class: "row", style: { gap: "6px" } }, h("span", { class: "mono small", style: { wordBreak: "break-all" } }, secret), h("button", { class: "btn sm", onclick: () => copy(secret, "Key copied") }, icon("copy"), "Copy")),
-      h("pre", { class: "code small" }, curl), h("button", { class: "btn sm", onclick: () => copy(curl, "Copied") }, icon("copy"), "Copy the snippet")) });
+      h("div", { class: "row", style: { gap: "6px" } }, h("span", { class: "mono small", style: { wordBreak: "break-all" }, "data-secret": "key" }, secret), h("button", { class: "btn sm", onclick: () => copy(secret, "Key copied") }, icon("copy"), "Copy")),
+      h("pre", { class: "code small", "data-secret": "key" }, curl), h("button", { class: "btn sm", onclick: () => copy(curl, "Copied") }, icon("copy"), "Copy the snippet")) });
   }
 
   async function open(name) {
@@ -257,10 +258,12 @@ function render(page) {
       ["Runs", fmt.n(st.runs || 0)], ["Rows written", fmt.n(st.rows_total || 0)], ["Last ok", st.last_ok_ms ? fmt.ago(st.last_ok_ms) : "never"],
       ["Cursor", h("span", { class: "mono small", style: { wordBreak: "break-all" } }, (st.cursor || "–").slice(0, 120))],
       ["Secrets", c.secrets?.length ? h("span", { class: "mono" }, c.secrets.join(", ")) : "none"],
+      ["Changed", c.updated_ms ? `${fmt.ago(c.updated_ms)}${c.updated_by ? ` by ${c.updated_by}` : ""}` : "–"],
       c.push ? ["Push to", h("span", { class: "mono small" }, `POST ${c.push.url}`)] : null,
     ].filter(Boolean);
     const d = drawer({ title: name, sub: `${kindTitle(c.kind)} into ${c.target}`, wide: true, body: h("div", { class: "stack", style: { gap: "14px" } },
       h("div", { class: "row", style: { gap: "6px", flexWrap: "wrap" } }, runBtn, dry, toggleBtn, keyBtn, del),
+      c.invalid ? h("div", { class: "banner bad dt-banner" }, icon("bad"), h("div", { class: "small" }, `This config does not run: ${c.invalid}. Change it here, or delete it.`)) : null,
       st.last_error ? h("div", { class: "banner bad dt-banner" }, icon("bad"), h("div", { class: "small" }, st.last_error)) : null,
       out,
       h("table", { class: "t compact" }, h("tbody", {}, facts.map(([k, x]) => h("tr", {}, h("td", { class: "dim small", style: { width: "130px" } }, k), h("td", {}, x))))),

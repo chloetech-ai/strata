@@ -294,6 +294,7 @@ impl Engine {
         match saved {
             Some(s) => {
                 self.restore(s).await?;
+                self.builtins().await?;
                 let mut st = self.st();
                 st.semantic = st.semantic && semantic;
             }
@@ -317,6 +318,23 @@ impl Engine {
             }
         }
         crate::estate::ensure(self).await
+    }
+
+    /// The built-in rules and runbooks a newer version ships, added to
+    /// tables an older one made; those already there are left as they are
+    /// (a rule switched off stays off).
+    async fn builtins(&self) -> Result<()> {
+        let have: HashSet<String> = self.db.query("SELECT id FROM netops_alert_rules LIMIT 1000", json!({})).await?.iter().map(|r| r.s("id")).collect();
+        let rules: Vec<Value> = seed::rule_rows().into_iter().filter(|r| !have.contains(r["id"].as_str().unwrap_or(""))).collect();
+        if !rules.is_empty() {
+            self.db.upsert("netops_alert_rules", rules).await?;
+        }
+        let have: HashSet<String> = self.db.query("SELECT id FROM netops_runbooks LIMIT 1000", json!({})).await?.iter().map(|r| r.s("id")).collect();
+        let books: Vec<Value> = seed::runbook_rows(minute_now()).into_iter().filter(|r| !have.contains(r["id"].as_str().unwrap_or(""))).collect();
+        if !books.is_empty() {
+            self.db.upsert("netops_runbooks", books).await?;
+        }
+        Ok(())
     }
 
     async fn restore(&self, s: Saved) -> Result<()> {
@@ -754,6 +772,9 @@ impl Engine {
             },
             "service" => (Vec::new(), w.services.iter().find(|s| s.id == entity).map(|s| s.sites.iter().map(|x| x.to_string()).collect()).unwrap_or_default()),
             "site" => (w.devices.iter().filter(|d| d.site == entity && d.role == "border").map(|d| d.id.clone()).collect(), vec![entity.to_string()]),
+            // An object of the estate stands for itself, at its hub: what
+            // breaks in one hub is grouped, and kept apart from the backbone.
+            "estate" => (Vec::new(), crate::estate::hub_of(self.estate.as_ref(), entity).into_iter().collect()),
             _ => (Vec::new(), Vec::new()),
         }
     }
@@ -791,9 +812,12 @@ impl Engine {
                 }
             };
             let n = rows.len();
+            let (cmp, threshold) = (r.s("cmp"), r.f("threshold"));
             for row in rows.into_iter().take(300) {
                 let entity = row.s("entity");
-                if entity.is_empty() {
+                // The rule fires on a row only when its reading passes the
+                // rule's comparison with its threshold.
+                if entity.is_empty() || !fires(&cmp, threshold, &row) {
                     continue;
                 }
                 let v = telemetry::round(row.f("v"), 3);
@@ -821,8 +845,13 @@ impl Engine {
                 let (devices, sites) = self.scope(&kind, &entity);
                 let name = r.s("name");
                 let unit = r.s("unit");
-                let summary = if unit == "up" { format!("{name}: {entity}") } else { format!("{name}: {entity} at {} {unit}", fmt_num(v)) };
-                let a = json!({"id": format!("{key}:{}", m / 60), "rule": rid, "rule_name": name, "severity": r.s("severity"), "status": "firing", "entity_kind": kind, "entity": entity,
+                // A row may say more than its reading (`detail`), and how
+                // serious it is (`severity`), where the rule's query knows.
+                let detail = row.s("detail");
+                let summary = if unit == "up" { format!("{name}: {entity}") } else if kind == "estate" { format!("{name}: {entity}, {} {unit}", fmt_num(v)) } else { format!("{name}: {entity} at {} {unit}", fmt_num(v)) };
+                let summary = if detail.is_empty() { summary } else { format!("{summary}: {}", detail.chars().take(200).collect::<String>()) };
+                let severity = Some(row.s("severity")).filter(|s| ["critical", "major", "minor"].contains(&s.as_str())).unwrap_or_else(|| r.s("severity"));
+                let a = json!({"id": format!("{key}:{}", m / 60), "rule": rid, "rule_name": name, "severity": severity, "status": "firing", "entity_kind": kind, "entity": entity,
                     "site": sites.first().cloned().unwrap_or_default(), "devices": devices, "summary": summary, "reading": v, "threshold": r.f("threshold"), "unit": unit,
                     "started": iso(m), "last_seen": iso(m), "incident": "", "acked_by": "", "assignee": "", "silenced": ""});
                 if let Value::Object(mut map) = a {
@@ -986,8 +1015,20 @@ impl Engine {
         self.timeline(&id, m, "alert", "Alert rules", &format!("{} alert{} grouped into this incident; the first was: {}", members.len(), if members.len() == 1 { "" } else { "s" }, first.s("summary")), &first.s("id")).await?;
         tracing::info!("{id} opened with {} alerts", members.len());
         self.link_fault(&id, m);
+        if self.is_estate(&id) {
+            return crate::estate::diagnose(self, &id, m).await;
+        }
         agents::triage(self, &id, m).await?;
         self.investigate(&id, m).await
+    }
+
+    /// Whether an open incident is the estate's: every alert in it is on an
+    /// object behind the backbone, so the backbone's playbooks do not apply.
+    pub fn is_estate(&self, incident: &str) -> bool {
+        let st = self.st();
+        let mut alerts = st.alerts.values().filter(|a| a.s("incident") == incident).peekable();
+        let kind = st.open.get(incident).map(|o| o.row.s("root_kind")).unwrap_or_default();
+        kind == "estate" || (alerts.peek().is_some() && alerts.all(|a| a.s("entity_kind") == "estate"))
     }
 
     /// Ties an incident to the fault the simulator injected, for the answer
@@ -1011,6 +1052,9 @@ impl Engine {
 
     /// Runs the root-cause agent and marks its answer against the key.
     pub async fn investigate(&self, incident: &str, m: i64) -> Result<()> {
+        if self.is_estate(incident) {
+            return crate::estate::diagnose(self, incident, m).await;
+        }
         let run = agents::root_cause(self, incident, m).await?;
         let (truth, alerts) = {
             let mut st = self.st();
@@ -1275,6 +1319,26 @@ impl Engine {
     }
 }
 
+/// The comparisons a rule may make of its reading `v` with its threshold.
+pub const COMPARATORS: &[&str] = &[">", ">=", "<", "<=", "=", "!="];
+
+/// Whether a row a rule's query returned fires: its `v` compared with the
+/// rule's threshold by the rule's comparator. A row without a number in
+/// `v`, or a rule without a comparator, fires as every row did before
+/// rules had one.
+pub fn fires(cmp: &str, threshold: f64, row: &Row) -> bool {
+    let Some(v) = row.get("v").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))) else { return true };
+    match cmp.trim() {
+        ">" => v > threshold,
+        ">=" => v >= threshold,
+        "<" => v < threshold,
+        "<=" => v <= threshold,
+        "=" | "==" => v == threshold,
+        "!=" | "<>" => v != threshold,
+        _ => true,
+    }
+}
+
 fn fmt_num(v: f64) -> String {
     if v.abs() >= 1000.0 {
         format!("{:.0}", v)
@@ -1289,4 +1353,37 @@ fn fmt_num(v: f64) -> String {
 pub fn fault_row(f: &Fault, at: i64) -> Value {
     json!({"id": f.id, "scenario": f.scenario, "started": iso(f.started), "ended": f.ended.map(iso), "phase": f.phase(at), "truth_kind": f.truth_kind, "truth_entity": f.truth_entity,
         "category": f.category, "incident": f.incident.clone().unwrap_or_default(), "origin": f.origin, "detail": serde_json::to_string(f).unwrap_or_default()})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(v: Value) -> Row {
+        json!({"entity": "cr1-lon", "v": v}).as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn a_rule_fires_only_where_its_reading_passes_its_threshold() {
+        // The auditor's rule: v is 1, and "< 0" must not fire.
+        assert!(!fires("<", 0.0, &row(json!(1))));
+        assert!(fires(">", 0.0, &row(json!(1))));
+        assert!(fires(">=", 1.0, &row(json!(1))) && !fires(">", 1.0, &row(json!(1))));
+        assert!(fires("<=", 1.0, &row(json!(1))) && fires("=", 1.0, &row(json!(1.0))) && !fires("!=", 1.0, &row(json!(1))));
+        // The built-in rules' readings pass their own thresholds.
+        assert!(fires("<", 1.0, &row(json!(0))), "link-down: MIN(up) = 0");
+        assert!(fires(">", 92.0, &row(json!(95.5))), "link-saturated");
+        assert!(fires("<", -10.0, &row(json!(-14.2))), "optic-rx-low");
+        // A row without a number in v, or a rule without a comparator, fires as before.
+        assert!(fires("<", 0.0, &json!({"entity": "x"}).as_object().cloned().unwrap()));
+        assert!(fires("", 100.0, &row(json!(1))));
+        assert!(fires(">", 1.0, &row(json!("2.5"))), "a number the server sent as text");
+    }
+
+    #[test]
+    fn every_built_in_rule_has_a_comparator_the_evaluator_knows() {
+        for r in seed::rule_rows() {
+            assert!(COMPARATORS.contains(&r["cmp"].as_str().unwrap()), "{}", r["id"]);
+        }
+    }
 }

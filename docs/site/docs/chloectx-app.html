@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ChloeCtx as an app of a ChloeDB cluster · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="chloectx app runs ChloeCtx beside a ChloeDB cluster, as the crawler and Sheets do, and the command center shows it under Apps. Its memory is not a file on one laptop: it lives in the cluster&#x27;s tables, so any number…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/app.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>ChloeCtx as an app of a ChloeDB cluster</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/app.md">docs/chloectx/app.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#start-it">Start it</a></li><li><a href="#where-the-memory-is">Where the memory is</a></li><li><a href="#the-api">The API</a></li><li><a href="#spaces-and-what-each-shows">Spaces and what each shows</a></li><li><a href="#a-demo-to-show-it">A demo to show it</a></li><li><a href="#seen-before">Seen before</a></li><li><a href="#create-an-app-from-a-space">Create an app from a space</a></li><li><a href="#tests">Tests</a></li></ol></details>
     <div class="doc-body">
@@ -93,7 +96,7 @@
 <li><strong>Claude Code projects.</strong> What Claude Code sessions remembered: a project <code>chloectx sync</code> copied into the cluster (table <code>chloectx_memory</code>), and, with <code>--local-stores</code>, the stores of the machine the app runs on, where Receipts, Blame and capsules are too (<a href="chloectx-receipts.html#in-the-command-center">Receipts and blame</a>). A store and its synced copy show as one project.</li>
 <li><strong>Seen before</strong>, a page of its own: the cluster's firing alerts, each beside the past incidents it looks like and the fix that worked. One button hands the alert to the cluster's on-call agent with those incidents as its context.</li>
 </ul>
-<p><img alt="A team space's Ask tab: the question &quot;Who approves a refund of 1,200 EUR?&quot;, answered first by the current refund decision with the 500 EUR version it replaced struck through, then the notes that also bear on it, the past conversations folded, and the context's size" src="../../assets/img/chloectx-app-context.png" /></p>
+<p><img loading="lazy" decoding="async" alt="A team space's Ask tab: the question &quot;Who approves a refund of 1,200 EUR?&quot;, answered first by the current refund decision with the 500 EUR version it replaced struck through, then the notes that also bear on it, the past conversations folded, and the context's size" src="../../assets/img/chloectx-app-context.png" /></p>
 <p><em>The demo's team space, asked "Who approves a refund of 1,200 EUR?". The answer leads with the current decision (over 1000 EUR or 900 GBP, a second approver from finance) and what it replaced, then what else bears on it; the scores, what was left out and the context as the agent gets it are below. 14.4 ms, no model call.</em></p>
 <h2 id="start-it">Start it<a class="anchor" href="#start-it" aria-label="Link to this section">#</a></h2>
 <p>A chloedb-server with <code>chloectx</code> installed beside it (in the same directory, as an install puts them) starts it by itself, with a token and a key of its own (<a href="server.html#apps-the-server-starts">apps the server starts</a>); its key may make and write <code>ctx_*</code> tables and read <code>chloectx_memory</code>, so the on-call hand-off of Seen before, which needs an admin key, is refused there. Started by hand:</p>
@@ -363,7 +366,7 @@ python3 chloectx/demo/seed.py --dir ~/chloectx-demo --no-local \
   --server http://127.0.0.1:7700 --space harbor --sync               # the same story as a team space, and synced</pre>
 <p><code>--space</code> writes the story into a new team space through the API (<code>--space-reuse</code> adds to one that exists), <code>--sync</code> copies the store into the cluster's <code>chloectx_memory</code> as the project <code>acme/harbor</code>, and <code>--key-env</code> names the variable holding the server's key. All of it is made up: no transcript of anyone's sessions is in it.</p>
 <h2 id="seen-before">Seen before<a class="anchor" href="#seen-before" aria-label="Link to this section">#</a></h2>
-<p><img alt="Seen before in the command center: four firing alerts of a local cluster, each with the past incidents it looks like; the disk alert's closest incident was recorded for the same alert" src="../../assets/img/chloectx-app-seen-before.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Seen before in the command center: four firing alerts of a local cluster, each with the past incidents it looks like; the disk alert's closest incident was recorded for the same alert" src="../../assets/img/chloectx-app-seen-before.png" /></p>
 <p><em>Seen before on a two-shard cluster in the cloud container (the alerts are real: its disk was over 90% full, and a test load raised the p99). "Disk full within 12 hours" finds the incident recorded for the same alert first, and the p99 alert the merge incident, whose first fix (a restart) was replaced by a better one.</em></p>
 <p>An incident is a note in the space <code>incidents</code>, or in a team's own space of kind <code>incidents</code> (<code>POST /v1/spaces {name, kind: "incidents"}</code>): a title, the symptom, the cause, the fix, and the alert rule it fired, if one did. Seen before reads every incidents space the signed-in key may read, so a team that keeps its own sees its incidents beside the shared ones, and log lines pasted from an outage find the incidents that look like them as an alert does. For each firing alert, it searches the incidents with what the alert says (its name, metric, description and the copies it fires on). The incidents recorded for the same rule come first; another must be close in meaning (cosine 0.3, or 0.2 when it shares a word) and at least half as close as the closest. A match shows the fixes it replaced struck through, so an agent does not repeat one that was given up.</p>
 <p><strong>Hand to the on-call agent</strong> starts the cluster's on-call agent (<code>POST /v1/admin/oncall</code>) on the alert with the closest incidents and the incident space's rules in its question; the server needs a Claude key for it. When the run ends, <strong>keep what it found</strong> drafts an incident from its report for a person to check and record. A postmortem pasted into <strong>Record an incident</strong> is drafted the same way.</p>
@@ -384,7 +387,7 @@ cd ../chloectx &amp;&amp; CHLOECTX_NEED_SERVER=1 cargo test --profile ci --test 
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

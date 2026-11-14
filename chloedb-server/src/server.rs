@@ -182,6 +182,9 @@ pub struct Options {
     pub hub_file: Option<PathBuf>,
     /// The connectors' secrets (default: DB.connectors.json beside --db).
     pub connector_secrets: Option<PathBuf>,
+    /// The prefix of the variables connectors' `env:` secrets may name
+    /// (default [`crate::connectors::ENV_PREFIX`]).
+    pub connector_env_prefix: Option<String>,
     /// Pulls of the connectors run here on their schedules.
     pub connectors: bool,
     /// Who this hub's calls to other clusters say they come from.
@@ -394,8 +397,8 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             fill = Some(Fill::Demo(n));
             Db::create_in(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
         } else if let Some(s) = &o.schema {
-            let text = std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))?;
-            let schema = Schema::from_json(&text).map_err(|e| format!("{}: {e}", s.display()))?;
+            let (s, text) = schema_arg(s)?;
+            let schema = Schema::from_json(&text).map_err(|e| format!("{s}: {e}"))?;
             fill = o.copy_from.clone().map(Fill::Copy);
             Db::create_in(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
         } else {
@@ -404,6 +407,10 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             tracing::info!(db = %path.display(), "creating the database with no tables: create one with CREATE TABLE or an import");
             Db::create_empty(&path, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
         };
+        // Copies a transfer left when this server was stopped during it.
+        if replicating || o.seq_no {
+            crate::replication::sweep_copies(&path);
+        }
         for (field, why) in db.open_codebooks(&o.models) {
             tracing::warn!(field = %field, error = %why, "cannot give this field semantic IDs: writes must carry them");
         }
@@ -531,6 +538,9 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let connector_secrets = o.connector_secrets.clone().or_else(|| o.db.as_deref().filter(|_| o.shards.is_empty()).map(crate::connectors::Connectors::file_of));
     if let Some(file) = connector_secrets {
         svc.connectors.keep_secrets(file)?;
+    }
+    if let Some(p) = &o.connector_env_prefix {
+        svc.connectors.set_env_prefix(p)?;
     }
     if o.connectors {
         svc.connectors.enable();
@@ -773,6 +783,14 @@ pub async fn fetch_model(name: &str, dir: &std::path::Path) -> Result<PathBuf, S
     let pin = chloedb::model_pins::pin(&repo);
     let revision = pin.map_or("main", |p| p.revision);
     for (from, file) in files {
+        // A file already here that is the one pinned is kept, so a second
+        // fetch (the guides' "once") downloads nothing.
+        if let Some(want) = pin.and_then(|p| p.sha256(from)) {
+            if std::fs::read(out.join(file)).is_ok_and(|have| chloedb::model_pins::sha256_hex(&have) == want) {
+                tracing::info!(file, "already here, as pinned");
+                continue;
+            }
+        }
         let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{from}");
         let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("{url}: {e}"))?;
         let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
@@ -914,6 +932,19 @@ fn is_parquet(_: &Path) -> bool {
     false
 }
 
+/// `--schema`'s value: a JSON file, or the JSON itself (a value that starts
+/// with `{` or `[` and names no file). The name errors call it by, and its
+/// text.
+pub fn schema_arg(s: &Path) -> Result<(String, String), String> {
+    let given = s.to_string_lossy();
+    let inline = given.trim_start();
+    if (inline.starts_with('{') || inline.starts_with('[')) && !s.exists() {
+        return Ok(("--schema".to_string(), inline.to_string()));
+    }
+    let text = std::fs::read_to_string(s).map_err(|e| format!("--schema {}: {e}", s.display()))?;
+    Ok((s.display().to_string(), text))
+}
+
 /// `chloedb-server import`: loads `files` into the database at `path`, rows
 /// from JSON Lines, JSON, CSV or TSV files (`format`, or each file's
 /// extension) into its table `table` (the first if `None`), the tables of
@@ -942,13 +973,13 @@ pub fn import_files(path: &Path, schema: Option<&Path>, table: Option<&str>, mod
     if any_sqlite && any_parquet && schema.is_some() {
         return Err("--schema with SQLite and Parquet files: import them one kind at a time".into());
     }
-    let text = schema.map(|s| std::fs::read_to_string(s).map_err(|e| format!("read {}: {e}", s.display()))).transpose()?;
-    let given = match (&text, schema, any_sqlite) {
-        (Some(t), Some(s), true) => chloedb::sqlite::schemas_from_json(t).map_err(|e| format!("{}: {e}", s.display()))?,
+    let schema = schema.map(schema_arg).transpose()?;
+    let given = match (&schema, any_sqlite) {
+        (Some((s, t)), true) => chloedb::sqlite::schemas_from_json(t).map_err(|e| format!("{s}: {e}"))?,
         _ => Vec::new(),
     };
-    let given_table = match (&text, schema, any_parquet) {
-        (Some(t), Some(s), true) => Some(Schema::from_json(t).map_err(|e| format!("{}: {e}", s.display()))?),
+    let given_table = match (&schema, any_parquet) {
+        (Some((s, t)), true) => Some(Schema::from_json(t).map_err(|e| format!("{s}: {e}"))?),
         _ => None,
     };
     let sq = chloedb::sqlite::ImportOptions { tables: how.tables.clone(), schemas: given, blobs_base64: how.blobs_base64 };
@@ -982,7 +1013,7 @@ pub fn import_files(path: &Path, schema: Option<&Path>, table: Option<&str>, mod
             }
         }
         let out = if plans.len() == 1 { plans.remove(0) } else { serde_json::Value::Array(plans) };
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        crate::print_out(&serde_json::to_string_pretty(&out).unwrap_or_default());
         return Ok(());
     }
     for (shown, fetched) in &inputs {
@@ -1022,8 +1053,8 @@ pub fn import_files(path: &Path, schema: Option<&Path>, table: Option<&str>, mod
         let d = match db.take() {
             Some(d) => d,
             None => {
-                let (s, text) = schema.zip(text.as_deref()).ok_or_else(|| format!("{} does not exist: pass --schema FILE to create it", path.display()))?;
-                let schema = Schema::from_json(text).map_err(|e| format!("{}: {e}", s.display()))?;
+                let (s, text) = schema.as_ref().ok_or_else(|| format!("{} does not exist: pass --schema (a JSON file, or the JSON) to create it", path.display()))?;
+                let schema = Schema::from_json(text).map_err(|e| format!("{s}: {e}"))?;
                 created(Db::create_in(path, schema, opts(), models).map_err(|e| format!("create {}: {e}", path.display()))?)
             }
         };
@@ -1515,7 +1546,13 @@ async fn serve_conns(router: axum::Router, listener: TcpListener, access: &Acces
             Slot::Health => probers.take(peer.ip(), None),
         };
         let Some(held) = held else {
-            tracing::debug!(client = %peer.ip(), held = clients.of(peer.ip()), "a client past its share of connections (--max-connections-per-client): closed");
+            // Its client sees only a reset: say so here, a line a second
+            // at most, and count it.
+            listener::CLOSED_PAST_SHARE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static LIMIT: crate::obs::RateLimit = crate::obs::RateLimit::new(1);
+            if let Some(more) = LIMIT.admit() {
+                tracing::info!(client = %peer.ip(), held = clients.of(peer.ip()), closed_since = more, "a client past its share of connections (--max-connections-per-client): its new connection closed before any request");
+            }
             continue;
         };
         let _ = tcp.set_nodelay(true);

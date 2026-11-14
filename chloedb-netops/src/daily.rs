@@ -11,13 +11,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::agents::quoted;
 use crate::api::{bad, Answer, ApiError, Shared, Q};
+use crate::estate::NODES;
 use crate::seed;
 use crate::sim::Engine;
 use crate::strata::{Result, Row, RowExt};
@@ -41,8 +42,8 @@ pub fn routes() -> Router<Shared> {
         .route("/v1/maintenance/:id/:action", post(maintenance_act))
 }
 
-fn who(body: &Option<Json<Value>>) -> String {
-    body.as_ref().and_then(|b| b["who"].as_str()).filter(|s| !s.is_empty()).unwrap_or("NOC engineer").to_string()
+fn who(headers: &HeaderMap, body: &Option<Json<Value>>) -> String {
+    crate::api::actor(headers, body.as_ref().and_then(|b| b["who"].as_str()), "NOC engineer")
 }
 
 /// An id that a restart does not hand out again: the minute and a counter.
@@ -167,7 +168,8 @@ impl Engine {
         let unread = self.db.query("SELECT * FROM netops_maintenance WHERE status = 'new' LIMIT 200", json!({})).await?;
         let mut read = Vec::new();
         for n in unread.iter().filter(|n| n.s("link").is_empty() && !n.s("raw").is_empty()) {
-            let Ok(Value::Object(found)) = read_notice(self, &n.s("raw")) else { continue };
+            let Ok(Value::Object(mut found)) = read_notice(self, &n.s("raw")) else { continue };
+            found.remove("notes");
             let mut row = n.clone();
             for (k, v) in found {
                 let kept = row.get(&k).and_then(|x| x.as_str()).is_some_and(|x| !x.is_empty());
@@ -212,7 +214,7 @@ async fn silences(State(svc): State<Shared>) -> Answer {
     q.done(json!({"silences": rows, "quiet": quiet, "at": iso(q.last())}))
 }
 
-async fn silence_add(State(svc): State<Shared>, Json(b): Json<Value>) -> Answer {
+async fn silence_add(State(svc): State<Shared>, headers: HeaderMap, Json(b): Json<Value>) -> Answer {
     let e = &svc.engine;
     let kind = b["kind"].as_str().unwrap_or("device");
     if !["device", "link", "site", "rule", "service"].contains(&kind) {
@@ -225,7 +227,7 @@ async fn silence_add(State(svc): State<Shared>, Json(b): Json<Value>) -> Answer 
     }
     let hours = b["hours"].as_f64().unwrap_or(2.0).clamp(0.25, 72.0);
     let m = e.st().last_minute;
-    let row = e.silence(kind, matcher, reason, b["who"].as_str().unwrap_or("NOC engineer"), m, m + (hours * 3600.0) as i64, "manual").await?;
+    let row = e.silence(kind, matcher, reason, &crate::api::actor(&headers, b["who"].as_str(), "NOC engineer"), m, m + (hours * 3600.0) as i64, "manual").await?;
     Ok(Json(row))
 }
 
@@ -237,9 +239,9 @@ async fn silence_end(State(svc): State<Shared>, Path(id): Path<String>) -> Answe
     Ok(Json(json!({"id": id, "status": "ended"})))
 }
 
-async fn alert_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, body: Option<Json<Value>>) -> Answer {
+async fn alert_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, headers: HeaderMap, body: Option<Json<Value>>) -> Answer {
     let e = &svc.engine;
-    let by = who(&body);
+    let by = who(&headers, &body);
     let m = e.st().last_minute;
     let rows = e.db.query("SELECT * FROM netops_alerts WHERE id = :id", json!({"id": id})).await?;
     let Some(mut a) = rows.into_iter().next() else { return Err(ApiError(StatusCode::NOT_FOUND, format!("no alert {id}"))) };
@@ -352,10 +354,10 @@ pub(crate) async fn checks_for(q: &Q, c: &Row) -> std::result::Result<Value, Api
     Ok(json!({"before_at": iso(t0 - t0.rem_euclid(60)), "after_at": iso(t1 - t1.rem_euclid(60)), "checks": checks, "ok": ok, "live": status == "in_progress"}))
 }
 
-async fn change_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, body: Option<Json<Value>>) -> Answer {
+async fn change_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, headers: HeaderMap, body: Option<Json<Value>>) -> Answer {
     let q = Q::new(&svc);
     let e = &svc.engine;
-    let by = who(&body);
+    let by = who(&headers, &body);
     let m = q.last();
     let rows = q.rows("The change", "SELECT * FROM netops_changes WHERE id = :id", json!({"id": id})).await?;
     let Some(mut c) = rows.into_iter().next() else { return Err(ApiError(StatusCode::NOT_FOUND, format!("no change {id}"))) };
@@ -411,45 +413,265 @@ async fn change_act(State(svc): State<Shared>, Path((id, action)): Path<(String,
 
 // ---- carriers' maintenance
 
-/// A carrier's email, read: the circuit it names (one of ours), its window
-/// and what to expect.
+/// Time zones as carriers write them, by their offset from UTC in minutes.
+/// A notice in a zone that is not here is refused rather than guessed at.
+const ZONES: &[(&str, i64)] = &[
+    ("UTC", 0), ("GMT", 0), ("Z", 0), ("WET", 0), ("BST", 60), ("WEST", 60), ("CET", 60), ("MET", 60), ("CEST", 120), ("MEST", 120), ("EET", 120), ("EEST", 180), ("MSK", 180),
+    ("IST", 330), ("SGT", 480), ("HKT", 480), ("JST", 540), ("AEST", 600), ("AEDT", 660),
+    ("EST", -300), ("EDT", -240), ("CST", -360), ("CDT", -300), ("MST", -420), ("MDT", -360), ("PST", -480), ("PDT", -420),
+];
+
+/// One time in a notice: where it was found and what it says.
+#[derive(Debug, Clone, PartialEq)]
+struct Stamp {
+    at: usize,
+    line: usize,
+    /// Seconds since the epoch of the wall time, before any zone is applied.
+    wall: i64,
+    /// Whether it carried a date (or only a time of day).
+    dated: bool,
+    /// Its offset from UTC in minutes, when it named one.
+    offset: Option<i64>,
+    /// A zone it named that is not known.
+    unknown: Option<String>,
+}
+
+/// The offset a zone written after a time stands for: `Z`, `+01:00`,
+/// `+0100`, `UTC+1`, `(UTC)`, `CET`. `Ok(None)` when nothing follows;
+/// `Err` with the name when it is a zone this reader does not know.
+fn zone_after(rest: &str, iso_like: bool) -> (std::result::Result<Option<i64>, String>, usize) {
+    let t = rest.trim_start_matches([' ', '(']);
+    let skip = rest.len() - t.len();
+    let sign_offset = |s: &str| -> Option<(i64, usize)> {
+        let b = s.as_bytes();
+        let sign = match b.first()? { b'+' => 1, b'-' => -1, _ => return None };
+        let digits: String = s[1..].chars().take_while(|c| c.is_ascii_digit() || *c == ':').collect();
+        let plain = digits.replace(':', "");
+        let (h, m) = match plain.len() {
+            1 | 2 => (plain.parse::<i64>().ok()?, 0),
+            3 | 4 => (plain[..plain.len() - 2].parse::<i64>().ok()?, plain[plain.len() - 2..].parse::<i64>().ok()?),
+            _ => return None,
+        };
+        (h <= 14 && m < 60).then_some((sign * (h * 60 + m), 1 + digits.len()))
+    };
+    if t.starts_with('Z') && !t[1..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return (Ok(Some(0)), skip + 1);
+    }
+    if let Some((off, n)) = sign_offset(t) {
+        // "-05:00" right after an ISO time is an offset; after "01:00" it
+        // is more often the end of a range ("01:00-05:00").
+        if t.starts_with('+') || (iso_like && skip == 0) {
+            return (Ok(Some(off)), skip + n);
+        }
+    }
+    let word: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    const NOT_ZONES: &[&str] = &["TO", "AND", "UNTIL", "TILL", "THRU", "ON", "AT", "FOR", "THE", "OF", "IN", "BY", "OR", "LOCAL", "HRS", "HOURS", "AM", "PM"];
+    if word.len() < 2 || word.len() > 5 || !word.chars().all(|c| c.is_ascii_uppercase()) || NOT_ZONES.contains(&word.as_str()) {
+        return (Ok(None), 0);
+    }
+    let after = &t[word.len()..];
+    let base = ZONES.iter().find(|z| z.0 == word).map(|z| z.1);
+    match base {
+        Some(b) => match sign_offset(after) {
+            // UTC+1, GMT-5
+            Some((off, n)) if b == 0 => (Ok(Some(off)), skip + word.len() + n),
+            _ => (Ok(Some(b)), skip + word.len()),
+        },
+        None => (Err(word), skip),
+    }
+}
+
+/// Every time in the text: `2026-11-14 01:00`, `2026-11-14T01:00:00+01:00`,
+/// and a time of day alone (`05:00 UTC`) for an end on the start's day.
+fn stamps(text: &str) -> Vec<Stamp> {
+    let bytes = text.as_bytes();
+    let line_of = |i: usize| text[..i].matches('\n').count();
+    let dg = |i: usize| bytes.get(i).is_some_and(|b| b.is_ascii_digit());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let dated = boundary && i + 16 <= bytes.len() && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15].iter().all(|&k| dg(i + k)) && bytes[i + 4] == b'-' && bytes[i + 7] == b'-' && (bytes[i + 10] == b' ' || bytes[i + 10] == b'T') && bytes[i + 13] == b':';
+        let timed = !dated && boundary && i + 5 <= bytes.len() && dg(i) && dg(i + 1) && bytes[i + 2] == b':' && dg(i + 3) && dg(i + 4) && !dg(i + 5);
+        if !dated && !timed {
+            i += 1;
+            continue;
+        }
+        let (date, hm, mut end) = if dated { (&text[i..i + 10], &text[i + 11..i + 16], i + 16) } else { ("1970-01-01", &text[i..i + 5], i + 5) };
+        // Seconds, when given.
+        if bytes.get(end) == Some(&b':') && dg(end + 1) && dg(end + 2) {
+            end += 3;
+        }
+        let iso_like = dated && (bytes[i + 10] == b'T' || end > i + 16);
+        let mut wall = parse_iso(&format!("{date}T{hm}:00Z"));
+        // 1:00 PM, 12:30 am.
+        let tail = text[end..].trim_start();
+        let ampm = tail.get(..2).map(|x| x.to_ascii_lowercase()).filter(|x| (x == "am" || x == "pm") && !tail[2..].starts_with(|c: char| c.is_ascii_alphabetic()));
+        if let Some(x) = ampm {
+            let hour = hm[..2].parse::<i64>().unwrap_or(0);
+            if x == "pm" && hour < 12 {
+                wall += 12 * 3600;
+            } else if x == "am" && hour == 12 {
+                wall -= 12 * 3600;
+            }
+            end += text[end..].len() - tail.len() + 2;
+        }
+        let (zone, n) = zone_after(&text[end..], iso_like);
+        let (offset, unknown) = match zone {
+            Ok(o) => (o, None),
+            Err(w) => (None, Some(w)),
+        };
+        if wall > 0 || !dated {
+            out.push(Stamp { at: i, line: line_of(i), wall, dated, offset, unknown });
+        }
+        i = end + n;
+    }
+    out
+}
+
+/// What a line is about, by the label it starts with.
+fn label(line: &str) -> &'static str {
+    let l = line.trim().trim_start_matches(['*', '-', '>', ' ']).to_lowercase();
+    let head: String = l.split([':', '\t']).next().unwrap_or("").trim().to_string();
+    let starts = |w: &[&str]| w.iter().any(|x| head == *x || head.starts_with(&format!("{x} ")));
+    if ["sent", "date", "date sent", "sent on", "received", "issued", "published", "created", "notified", "from", "to", "cc"].contains(&head.as_str()) {
+        return "sent";
+    }
+    if starts(&["start", "starts", "begin", "begins", "start time", "start date", "window start", "maintenance start", "planned start", "work start"]) || head == "start (utc)" {
+        return "start";
+    }
+    if starts(&["end", "ends", "finish", "finishes", "end time", "end date", "window end", "maintenance end", "planned end", "work end", "until", "completion"]) {
+        return "end";
+    }
+    if starts(&["window", "maintenance window", "time", "when", "schedule", "scheduled"]) {
+        return "window";
+    }
+    ""
+}
+
+/// A carrier's email, read: the circuit it names (one of ours, the first
+/// it names), its window and what to expect. The window is the one on the
+/// lines labelled Start and End (or a Window line), each time in the zone
+/// it is written in; the date the email was sent is not part of it. A time
+/// with no zone takes the zone the notice names elsewhere ("All times
+/// UTC"), else UTC, and the answer says so.
 fn read_notice(e: &Engine, text: &str) -> std::result::Result<Value, String> {
     let w = &e.w;
     let upper = text.to_uppercase();
-    let Some(l) = w.links.iter().find(|l| !l.circuit.is_empty() && l.documented && upper.contains(&l.circuit.to_uppercase())) else {
+    let Some((_, l)) = w.links.iter().filter(|l| !l.circuit.is_empty() && l.documented).filter_map(|l| upper.find(&l.circuit.to_uppercase()).map(|at| (at, l))).min_by_key(|x| x.0) else {
         return Err("no circuit of ours is named in this text: it should carry a service or circuit id such as the ones under Carriers".into());
     };
-    // Times as carriers write them: 2026-11-14 01:00 (UTC), or ISO 8601.
-    let bytes = text.as_bytes();
-    let mut times = Vec::new();
-    let mut i = 0;
-    while i + 16 <= bytes.len() {
-        let s = &bytes[i..i + 16];
-        let digit = |k: usize| s[k].is_ascii_digit();
-        if [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15].iter().all(|&k| digit(k)) && s[4] == b'-' && s[7] == b'-' && (s[10] == b' ' || s[10] == b'T') && s[13] == b':' {
-            let stamp = format!("{}T{}:00Z", &text[i..i + 10], &text[i + 11..i + 16]);
-            let t = parse_iso(&stamp);
-            if t > 0 {
-                times.push(t);
-            }
-            i += 16;
-        } else {
-            i += 1;
-        }
-    }
-    if times.len() < 2 || times[1] <= times[0] {
-        return Err("no window found: the text should give a start and an end as 2026-11-14 01:00 (UTC)".into());
-    }
+    let (start, end, notes) = notice_window(text)?;
     let line = |label: &str| text.lines().find_map(|ln| ln.trim().strip_prefix(label).map(|v| v.trim_start_matches([':', ' ']).trim().to_string())).unwrap_or_default();
     let expected = [line("Expected impact"), line("Impact")].into_iter().find(|s| !s.is_empty()).unwrap_or_default();
     let low = text.to_lowercase();
     let impact = if low.contains("at risk") && !low.contains("outage") { "at risk" } else { "outage" };
-    let reference = [line("Reference"), line("Ticket"), line("Maintenance ID")].into_iter().find(|s| !s.is_empty()).unwrap_or_default();
     let subject = line("Subject");
+    let reference = notice_reference(text);
     let m = e.st().last_minute;
     Ok(json!({"id": format!("MNT-{}", uid(e, e.st().last_minute)), "provider": l.provider, "reference": reference, "circuit": l.circuit, "link": l.id, "a_site": w.devices[l.a].site, "z_site": w.devices[l.b].site,
-        "window_start": iso(times[0]), "window_end": iso(times[1]), "impact": impact, "expected": expected, "status": "new", "received": iso(m),
-        "subject": if subject.is_empty() { format!("Maintenance on {}", l.circuit) } else { subject }, "raw": text, "acked_by": "", "change_id": ""}))
+        "window_start": iso(start), "window_end": iso(end), "impact": impact, "expected": expected, "status": "new", "received": iso(m),
+        "subject": if subject.is_empty() { format!("Maintenance on {}", l.circuit) } else { subject }, "raw": text, "acked_by": "", "change_id": "", "notes": notes}))
+}
+
+/// The carrier's own reference: a Reference, Ticket or Maintenance ID line,
+/// or "Ref PW-88213" anywhere (a subject often carries it).
+fn notice_reference(text: &str) -> String {
+    for ln in text.lines() {
+        let t = ln.trim();
+        let low = t.to_lowercase();
+        for label in ["reference", "our reference", "ticket", "maintenance id", "change id", "ref"] {
+            if let Some(rest) = low.strip_prefix(label) {
+                if rest.starts_with([':', ' ', '#', '.']) {
+                    let v = t[label.len()..].trim_start_matches([':', ' ', '#', '.']).split_whitespace().next().unwrap_or("");
+                    if v.chars().any(|c| c.is_ascii_digit()) {
+                        return v.trim_end_matches([',', ';', ')', ']']).to_string();
+                    }
+                }
+            }
+        }
+    }
+    // "… Ref PW-88213 …", "[Ref: X-1]", "Reference #4411" in a sentence or a subject.
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (i, wd) in words.iter().enumerate() {
+        let k = wd.trim_start_matches(['[', '(']).trim_end_matches([':', '#', '.']).to_lowercase();
+        if matches!(k.as_str(), "ref" | "reference" | "ticket") {
+            if let Some(v) = words.get(i + 1).map(|v| v.trim_start_matches([':', '#']).trim_end_matches([',', ';', ')', ']', '.'])) {
+                if v.chars().any(|c| c.is_ascii_digit()) && v.len() >= 3 {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// The window of a notice, in UTC seconds, and what the reader assumed.
+fn notice_window(text: &str) -> std::result::Result<(i64, i64, Vec<String>), String> {
+    let all = stamps(text);
+    if let Some(s) = all.iter().find(|s| s.unknown.is_some()) {
+        return Err(format!("the time zone {} is not one this reader knows: write the times in UTC or with an offset such as +01:00", s.unknown.clone().unwrap_or_default()));
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let kind = |s: &Stamp| label(lines.get(s.line).copied().unwrap_or(""));
+    let mut notes = Vec::new();
+    // Times on the Start and End lines; else a Window line's two; else the
+    // first two that are not when it was sent.
+    let first = |k: &str| all.iter().find(|s| kind(s) == k);
+    let (a, b) = match (first("start"), first("end")) {
+        (Some(a), Some(b)) => (a.clone(), b.clone()),
+        (a, b) => {
+            let window: Vec<&Stamp> = all.iter().filter(|s| kind(s) == "window").collect();
+            let rest: Vec<&Stamp> = all.iter().filter(|s| kind(s) != "sent").collect();
+            match (a.or(window.first().copied()), b.or(window.get(1).copied())) {
+                (Some(a), Some(b)) if a.at != b.at => (a.clone(), b.clone()),
+                _ if rest.len() >= 2 => (rest[0].clone(), rest[1].clone()),
+                _ => return Err("no window found: the text should give a start and an end, such as Start: 2026-11-14 01:00 UTC and End: 2026-11-14 05:00 UTC".into()),
+            }
+        }
+    };
+    if !a.dated {
+        return Err("the start has no date: it should read like 2026-11-14 01:00 UTC".into());
+    }
+    // A time with no zone of its own: the zone the notice names for all its
+    // times (the first known one written as a word), else UTC.
+    let general = text.split(|c: char| !c.is_ascii_alphanumeric()).find_map(|w| ZONES.iter().find(|z| z.0 == w && z.0 != "Z").map(|z| (z.0, z.1)));
+    let zone = |s: &Stamp, notes: &mut Vec<String>| -> i64 {
+        match s.offset {
+            Some(o) => o,
+            None => match general {
+                Some((name, o)) => {
+                    let n = format!("a time without a zone was read as {name}, the zone the notice names");
+                    if !notes.contains(&n) {
+                        notes.push(n);
+                    }
+                    o
+                }
+                None => {
+                    let n = "no time zone given: read as UTC".to_string();
+                    if !notes.contains(&n) {
+                        notes.push(n);
+                    }
+                    0
+                }
+            },
+        }
+    };
+    let oa = zone(&a, &mut notes);
+    let ob = if b.offset.is_none() && !b.dated { a.offset.unwrap_or(oa) } else { zone(&b, &mut notes) };
+    let start = a.wall - oa * 60;
+    let mut end = if b.dated { b.wall } else { a.wall - a.wall.rem_euclid(86400) + b.wall } - ob * 60;
+    if !b.dated && end <= start {
+        end += 86400;
+        notes.push("the end has no date and is earlier than the start: read as the next day".into());
+    }
+    if end <= start {
+        return Err(format!("the end ({} UTC) is not after the start ({} UTC)", iso(end).replace('T', " ").trim_end_matches(":00Z"), iso(start).replace('T', " ").trim_end_matches(":00Z")));
+    }
+    if end - start > 14 * 86400 {
+        return Err("the window is longer than two weeks: check its start and end".into());
+    }
+    Ok((start, end, notes))
 }
 
 /// What each notice that is not over collides with: the other plane's own
@@ -528,16 +750,20 @@ async fn maintenance_parse(State(svc): State<Shared>, Json(b): Json<Value>) -> A
     if text.len() < 20 {
         return Err(bad("text is the carrier's notice, as it arrived"));
     }
-    let row = read_notice(e, text).map_err(bad)?;
-    if b["save"].as_bool() != Some(false) {
+    let mut row = read_notice(e, text).map_err(bad)?;
+    let notes = row.as_object_mut().and_then(|o| o.remove("notes")).unwrap_or(json!([]));
+    let saved = b["save"].as_bool() != Some(false);
+    if saved {
         e.db.upsert("netops_maintenance", vec![row.clone()]).await?;
     }
+    row["notes"] = notes;
+    row["saved"] = json!(saved);
     Ok(Json(row))
 }
 
-async fn maintenance_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, body: Option<Json<Value>>) -> Answer {
+async fn maintenance_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, headers: HeaderMap, body: Option<Json<Value>>) -> Answer {
     let e = &svc.engine;
-    let by = who(&body);
+    let by = who(&headers, &body);
     let m = e.st().last_minute;
     let rows = e.db.query("SELECT * FROM netops_maintenance WHERE id = :id", json!({"id": id})).await?;
     let Some(mut n) = rows.into_iter().next() else { return Err(ApiError(StatusCode::NOT_FOUND, format!("no notice {id}"))) };
@@ -673,6 +899,33 @@ async fn lookup(State(svc): State<Shared>, Query(p): Query<HashMap<String, Strin
     }
     for s in w.services.iter().filter(|s| s.id == low || s.name.to_lowercase() == low) {
         hits.push(json!({"kind": "service", "id": s.id, "title": s.name, "sub": format!("tier {}, owned by {}", s.tier, s.owner)}));
+    }
+    // The estate behind the backbone: an object by its id (exactly, else by
+    // the start of it), and a customer of a business park by name.
+    if low.len() >= 3 && !is_ip && !hits.iter().any(|h| h["kind"] == "device" && h["id"] == low.as_str()) {
+        let cols = "id, kind, layer, name, state, reason, hub, metro";
+        let mut found = q.soft("An object of the estate by its id", &format!("SELECT {cols} FROM {NODES}\nWHERE id = :q LIMIT 1"), json!({"q": low})).await;
+        if found.is_empty() && low.contains('-') {
+            found = q.soft("Objects of the estate by the start of their id (PREFIX)", &format!("SELECT {cols} FROM {NODES}\nWHERE PREFIX(id, :q) AND layer != 'container'\nORDER BY tier, id LIMIT 6"), json!({"q": low})).await;
+        }
+        for r in found.iter().filter(|r| r.s("layer") != "core") {
+            let id = r.s("id");
+            let inc = open.iter().find(|i| i.s("root_entity") == id || firing.iter().any(|a| a.s("entity") == id && a.s("incident") == i.s("id")));
+            let n = firing.iter().filter(|a| a.s("entity") == id).count();
+            let st = r.s("state");
+            let state = if inc.is_some() || st == "down" { "bad" } else if st != "ok" || n > 0 { "warn" } else { "ok" };
+            let what = if r.s("layer") == "container" { format!("{} {}", r.s("kind"), r.s("name")) } else { format!("{} in {}, {}", r.s("kind"), r.s("hub"), r.s("metro").trim_start_matches("m-").to_uppercase()) };
+            hits.push(json!({"kind": "object", "id": id, "title": if r.s("name") == id { id.clone() } else { format!("{id}: {}", r.s("name")) }, "sub": if st == "ok" { what } else { format!("{what} · {st}: {}", r.s("reason")) },
+                "health": {"state": state, "alerts": n, "incident": inc.map(|i| i.s("id"))}, "exact": id == low}));
+        }
+        if found.is_empty() && !low.contains('-') {
+            let names = q.soft("Customers of the estate by name (substring index)", &format!("SELECT customer, COUNT(*) AS n, SUM(CASE WHEN state != 'ok' THEN 1 ELSE 0 END) AS hurt FROM {NODES}\nWHERE customer ILIKE :q\nGROUP BY customer ORDER BY customer LIMIT 6"), json!({"q": format!("%{}%", t.replace(['%', '_', '\\'], ""))})).await;
+            for c in names {
+                let hurt = c.i("hurt");
+                hits.push(json!({"kind": "estate-customer", "id": c.s("customer"), "title": c.s("customer"), "sub": format!("a customer behind the estate's business parks: {} site{}{}", c.i("n"), if c.i("n") == 1 { "" } else { "s" }, if hurt > 0 { format!(", {hurt} not ok now") } else { String::new() }),
+                    "health": {"state": if hurt > 0 { "warn" } else { "ok" }, "alerts": hurt}}));
+            }
+        }
     }
     q.done(json!({"q": t, "hits": hits}))
 }
@@ -881,13 +1134,13 @@ async fn customer(State(svc): State<Shared>, Path(id): Path<String>, Query(p): Q
 
 // ---- the shift: what happened, and what waits
 
-async fn note_add(State(svc): State<Shared>, Json(b): Json<Value>) -> Answer {
+async fn note_add(State(svc): State<Shared>, headers: HeaderMap, Json(b): Json<Value>) -> Answer {
     let e = &svc.engine;
     let body = b["body"].as_str().unwrap_or("").trim();
     if body.is_empty() {
         return Err(bad("body is the note"));
     }
-    let row = json!({"id": format!("note-{}", uid(e, crate::sim::now())), "ts": iso(crate::sim::now()), "kind": "note", "author": b["who"].as_str().unwrap_or("NOC engineer"), "body": body, "done": false});
+    let row = json!({"id": format!("note-{}", uid(e, crate::sim::now())), "ts": iso(crate::sim::now()), "kind": "note", "author": crate::api::actor(&headers, b["who"].as_str(), "NOC engineer"), "body": body, "done": false});
     e.db.upsert("netops_handovers", vec![row.clone()]).await?;
     Ok(Json(row))
 }
@@ -927,7 +1180,7 @@ async fn shift(State(svc): State<Shared>) -> Answer {
         work.push((urgency, at.clone(), json!({"urgency": urgency, "kind": kind, "title": title, "sub": sub, "at": at, "go": go, "act": act})));
     };
     for a in &pending {
-        add(1, a.s("proposed"), "approval", format!("Approve or reject: {}", a.s("title")), format!("{} risk, proposed by the root-cause agent for {}", a.s("risk"), a.s("incident")), json!({"page": "incidents", "id": a.s("incident")}), json!({"action": a.s("id")}));
+        add(1, a.s("proposed"), "approval", format!("Approve or reject: {}", a.s("title")), format!("{} risk, proposed by the {} agent for {}", a.s("risk"), if e.is_estate(&a.s("incident")) { "estate's" } else { "root-cause" }, a.s("incident")), json!({"page": "incidents", "id": a.s("incident")}), json!({"action": a.s("id")}));
     }
     for i in incidents.iter().filter(|i| i.s("status") != "resolved") {
         let waits = pending.iter().any(|a| a.s("incident") == i.s("id"));
@@ -997,4 +1250,70 @@ async fn shift(State(svc): State<Shared>) -> Answer {
     q.done(json!({"at": iso(m), "began": iso(began), "since": iso(since), "oncall": oncall, "before": before, "briefing": lines, "work": work,
         "incidents": incidents, "pending": pending, "flaps": flapping, "done": done, "next": next, "notices": notices, "conflicts": found, "tickets": tickets,
         "notes": notes, "silences": active, "counts": {"firing": firing, "silenced": silenced, "loose": loose.len(), "open": open_now}}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(text: &str) -> (String, String, Vec<String>) {
+        let (a, b, notes) = notice_window(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        (iso(a), iso(b), notes)
+    }
+
+    #[test]
+    fn a_notice_is_read_on_its_start_and_end_lines_not_on_when_it_was_sent() {
+        let text = "From: noc@carrier.example\nSent: 2026-11-13 09:12 UTC\nSubject: Planned work Ref PW-88213 on LON-AMS\n\nDear customer,\n\nService ID: EVX-1001\nStart: 2026-11-20 01:00 UTC\nEnd: 2026-11-20 05:00 UTC\nExpected impact: outage of up to 30 minutes\n";
+        let (a, b, notes) = window(text);
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-20T01:00:00Z", "2026-11-20T05:00:00Z"));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(notice_reference(text), "PW-88213", "the reference in the subject");
+    }
+
+    #[test]
+    fn offsets_and_zones_are_applied() {
+        // An ISO offset, and the same time in a zone's name.
+        let (a, b, _) = window("Planned maintenance\nStart 2026-11-17T23:00:00+01:00\nEnd 2026-11-18T03:00:00+01:00\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-17T22:00:00Z", "2026-11-18T02:00:00Z"));
+        let (a, b, _) = window("Start: 2026-11-17 23:00 CET\nEnd: 2026-11-18 03:00 CET\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-17T22:00:00Z", "2026-11-18T02:00:00Z"));
+        // Summer time, and a zone given once for every time.
+        let (a, _, _) = window("Begin: 2026-07-01 02:00 CEST\nFinish: 2026-07-01 04:00 CEST");
+        assert_eq!(a, "2026-07-01T00:00:00Z");
+        let (a, b, notes) = window("All times are in EST.\nStart: 2026-11-21 22:00\nEnd: 2026-11-22 02:00\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-22T03:00:00Z", "2026-11-22T07:00:00Z"));
+        assert!(notes.iter().any(|n| n.contains("EST")), "{notes:?}");
+        // A negative offset right after an ISO time.
+        let (a, _, _) = window("Start: 2026-11-21T22:00:00-05:00\nEnd: 2026-11-22T02:00:00-05:00");
+        assert_eq!(a, "2026-11-22T03:00:00Z");
+        // UTC+1 and GMT.
+        let (a, _, _) = window("Start: 2026-11-21 10:00 UTC+1\nEnd: 2026-11-21 11:00 UTC+1");
+        assert_eq!(a, "2026-11-21T09:00:00Z");
+    }
+
+    #[test]
+    fn a_window_on_one_line_and_an_end_without_a_date() {
+        let (a, b, notes) = window("Circuit: EVX-1\nWindow: 2031-01-05 01:00 to 2031-01-05 03:00 (UTC)\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2031-01-05T01:00:00Z", "2031-01-05T03:00:00Z"));
+        assert!(notes.len() == 1 && notes[0].contains("UTC"), "the zone at the end of the line holds for its first time too: {notes:?}");
+        let (a, b, _) = window("Date: 2026-11-10 08:00 UTC\nStart: 2026-11-19 23:00 UTC\nEnd: 03:00 UTC\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-19T23:00:00Z", "2026-11-20T03:00:00Z"), "an end with no date after midnight is the next day");
+        let (a, b, _) = window("Maintenance window: 2026-11-19 01:00-05:00 UTC\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-19T01:00:00Z", "2026-11-19T05:00:00Z"), "a range is not an offset");
+        let (a, _, notes) = window("Start: 2026-11-19 01:00\nEnd: 2026-11-19 02:00\n");
+        assert_eq!(a, "2026-11-19T01:00:00Z");
+        assert_eq!(notes, ["no time zone given: read as UTC"]);
+        let (a, b, _) = window("Start: 2026-11-19 11:00 PM UTC\nEnd: 2026-11-20 01:30 AM UTC\n");
+        assert_eq!((a.as_str(), b.as_str()), ("2026-11-19T23:00:00Z", "2026-11-20T01:30:00Z"));
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_refused() {
+        assert!(notice_window("Start: 2026-11-19 01:00 XYZT\nEnd: 2026-11-19 02:00 XYZT").unwrap_err().contains("XYZT"), "an unknown zone");
+        assert!(notice_window("Start: 2026-11-19 05:00 UTC\nEnd: 2026-11-19 01:00 UTC").unwrap_err().contains("not after"));
+        assert!(notice_window("Sent: 2026-11-13 09:12 UTC\nWe will work on your circuit next week.").is_err(), "the date it was sent is no window");
+        assert_eq!(notice_reference("Reference: CHG-4411\n"), "CHG-4411");
+        assert_eq!(notice_reference("Our ticket 99812 refers"), "99812");
+        assert_eq!(notice_reference("No number here"), "");
+    }
 }

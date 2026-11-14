@@ -3181,6 +3181,32 @@ impl<'a> Executor<'a> {
         Ok(v)
     }
 
+    /// [`Self::near_terms`] of `term`, and when the index has no `term` at
+    /// all (a misspelling) and the word was written otherwise before it
+    /// was stemmed (`raw`), the terms near that form too: `wireles` stems
+    /// to `wirel`, three edits from `wireless`, but is one edit from it as
+    /// written. Each term once, at its nearest.
+    fn near_terms_of(&self, field: usize, term: &str, raw: Option<&str>, edits: u8) -> Result<Arc<Vec<(String, u64, u8)>>> {
+        let near = self.near_terms(field, term, edits)?;
+        let Some(raw) = raw.filter(|r| *r != term) else { return Ok(near) };
+        if near.iter().any(|x| x.2 == 0) {
+            return Ok(near);
+        }
+        let more = self.near_terms(field, raw, edits)?;
+        if more.is_empty() {
+            return Ok(near);
+        }
+        let mut all: Vec<(String, u64, u8)> = near.iter().cloned().collect();
+        for m in more.iter() {
+            match all.iter_mut().find(|x| x.0 == m.0) {
+                Some(x) => x.2 = x.2.min(m.2),
+                None => all.push(m.clone()),
+            }
+        }
+        all.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+        Ok(Arc::new(all))
+    }
+
     /// A `MATCH` query with its synonyms and typos expanded to the indexed
     /// terms of every segment (so each segment evaluates the same terms).
     fn match_query(&self, field: usize, query: &str, expand: &Expand) -> Result<Arc<BoolQuery>> {
@@ -3196,7 +3222,8 @@ impl<'a> Executor<'a> {
             q = text::query::expand(q, syn, &edits);
         }
         let mut failed = None;
-        q = text::query::resolve_fuzzy(q, &mut |t, e| match self.near_terms(field, t, e) {
+        let raw = raw_forms(analyzer, query);
+        q = text::query::resolve_fuzzy(q, &mut |t, e| match self.near_terms_of(field, t, raw.get(t).map(String::as_str), e) {
             Ok(v) => v.iter().map(|x| x.0.clone()).collect(),
             Err(e) => {
                 failed = Some(e);
@@ -3286,6 +3313,7 @@ impl<'a> Executor<'a> {
             // terms in a coordinator's statistics round and in its query;
             // the chances by the collection's where they were sent.
             let auto = fz == Fuzzy::Auto;
+            let raw = raw_forms(analyzer, text);
             let names: Vec<String> = out.terms[..n_base].iter().map(|(t, _)| t.clone()).collect();
             let local = if auto { Some(self.local_stats(field, &names)?) } else { None };
             let sent = self.opts.stats.as_ref().and_then(|s| s.fields.get(&self.schema.fields[field].name));
@@ -3302,7 +3330,7 @@ impl<'a> Executor<'a> {
                         continue;
                     }
                 }
-                let near = self.near_terms(field, t, e)?;
+                let near = self.near_terms_of(field, t, raw.get(t).map(String::as_str), e)?;
                 for (n, ndf, d) in near.iter().filter(|x| x.2 > 0 && (!auto || x.1 > df)).take(MAX_FUZZY_TERMS) {
                     let mut x = w * text::fuzzy::weight(*d, len);
                     if auto {
@@ -5343,4 +5371,20 @@ struct PartPick {
     rest: Pred,
     /// The partitions' rows.
     rows: usize,
+}
+
+/// Each stemmed term of `text` whose word was written otherwise, with that
+/// word as the field's terms are folded but not stemmed: the form a typo's
+/// neighbours are also looked for by (`near_terms_of`).
+fn raw_forms(analyzer: crate::schema::Analyzer, text: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    analyzer.for_each_token(text, |w| {
+        if let Some(t) = analyzer.term_of(w) {
+            let raw = analyzer.prefix_of(w);
+            if raw != *t {
+                out.entry(t.into_owned()).or_insert(raw);
+            }
+        }
+    });
+    out
 }

@@ -6,7 +6,7 @@
 // (its runtime settings). A rate above the safe defaults asks first and
 // says what it costs. Queries that already ran are in Queries > History.
 
-import { h, icon, clear, fmt, api, store, toast, card, empty, seg, every, failure, table, pill, toggle, debounce, sqlBlock, copy, bus, shareBar, confirm } from "../core.js";
+import { h, icon, clear, fmt, api, store, toast, card, empty, seg, every, failure, table, pill, toggle, debounce, sqlBlock, copy, bus, shareBar, confirm, needs } from "../core.js";
 import { timeChart, SERIES } from "../charts.js";
 import { visible, last, domain, setZoom } from "../data.js";
 import { editor } from "../sqledit.js";
@@ -155,7 +155,7 @@ function runner(body) {
     if (!fp) return;
     const to = Date.now(), from = to - 3600e3;
     const [st, rules] = await Promise.all([
-      api(`/v1/queries/stats/${encodeURIComponent(fp)}?from=${from}&to=${to}`).catch(() => null),
+      can("admin") ? api(`/v1/queries/stats/${encodeURIComponent(fp)}?from=${from}&to=${to}`).catch(() => null) : null,
       containRules().catch(() => null)]);
     if (!linked || linked.fp !== fp) return;
     linked.stat = st?.statement || null;
@@ -735,8 +735,8 @@ function settingsTab(body) {
       toast(failed.length ? `Set on ${n - failed.length} of ${n} servers. Not on: ${failed.slice(0, 3).join(", ")}${failed.length > 3 ? ` and ${failed.length - 3} more` : ""}` : `Set on all ${n} servers`, failed.length ? "bad" : "ok");
       draw();
     };
-    const admin = can("admin");
-    const btn = (label, b, cls = "btn sm") => { const x = h("button", { class: cls, onclick: () => setAll(b()) }, label); if (!admin) { x.disabled = true; x.title = "Needs an admin key"; } return x; };
+    const admin = can("admin", "PUT /v1/profile/settings");
+    const btn = (label, b, cls = "btn sm") => { const x = h("button", { class: cls, onclick: () => setAll(b()) }, label); if (!admin) { x.disabled = true; x.title = needs("admin", "PUT /v1/profile/settings").replace(/^n/, "N"); } return x; };
     const goneN = (state.fleet?.coordinators || []).filter((c) => c.gone).length;
     clear(fleet, card({ title: "Every server's settings", sub: `${who}${down ? ` · ${down} down, not listed` : ""}${goneN ? ` · ${fmt.plural(goneN, "coordinator")} not answering, not listed` : ""} · each until it restarts`, flush: true, body: h("div", {},
       h("div", { class: "row", style: { gap: "8px", padding: "10px 12px", flexWrap: "wrap", alignItems: "center" } },

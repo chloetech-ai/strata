@@ -1,7 +1,7 @@
 {
   "name": "chloedb",
   "version": "0.0.3",
-  "description": "Placeholder, not ChloeDB: holds the name for ChloeDB, an embedded search database with SQL. Install ChloeDB from https://github.com/chloetech-ai/chloedb/releases (chloedb-js-v0.3.2)",
+  "description": "Placeholder, not ChloeDB: holds the name for ChloeDB, an embedded search database with SQL. Install ChloeDB from https://github.com/chloetech-ai/chloedb/releases (chloedb-js-v0.3.3)",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/chloetech-ai/chloedb.git", "directory": "packaging/chloedb/npm" },
   "homepage": "https://github.com/chloetech-ai/chloedb",

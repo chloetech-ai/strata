@@ -71,7 +71,7 @@ const TYPES: [&str; 8] = ["INT", "FLOAT", "TEXT", "KEYWORD", "BOOL", "TIMESTAMP"
 
 /// Names the binder gives a meaning of its own, which no stored function
 /// takes.
-const RESERVED: &[&str] = &[
+pub(crate) const RESERVED: &[&str] = &[
     "abs", "approx_percentile", "array_agg", "at_least", "avg", "bm25", "ceil", "ceiling", "char_length", "character_length", "clamp", "classify", "coalesce", "concat", "corr", "count", "count_true", "covar_pop", "covar_samp", "cross_encoder", "cume_dist", "date", "date_add",
     "date_bin", "date_format", "date_part", "date_sub", "date_trunc", "datediff", "datepart", "datetrunc", "day", "dayofweek", "decay", "dense_rank", "distance", "dot", "embed", "encode", "exp", "extract", "features", "first_value",
     "floor", "gbdt", "greatest", "group_concat", "hash", "hops", "hour", "ifnull", "instr", "isnull", "json_extract", "lag", "last_value", "lcase", "lead", "least", "left", "len", "length", "llm", "ln", "log", "lower",
@@ -969,16 +969,199 @@ pub fn expand(q: &sql::Query, set: &FunctionSet) -> Result<Option<(sql::Query, V
     if set.is_empty() {
         return Ok(None);
     }
-    let mut used = Vec::new();
+    let mut x = Expansion { set, used: Vec::new(), nodes: 0 };
     // `SELECT * FROM f(..)` alone is f's body.
-    if let Some(body) = whole_call(q, set, &mut used)? {
+    if let Some(body) = whole_call(q, set, &mut x.used)? {
         let mut out = body;
-        expand_query(&mut out, set, 1, &mut used)?;
-        return Ok(Some((out, used)));
+        x.query(&mut out, 1, 0)?;
+        return Ok(Some((out, x.used)));
     }
     let mut out = q.clone();
-    expand_query(&mut out, set, 0, &mut used)?;
-    Ok((!used.is_empty()).then_some((out, used)))
+    x.query(&mut out, 0, 0)?;
+    Ok((!x.used.is_empty()).then_some((out, x.used)))
+}
+
+/// The most expressions a statement's calls may write out in all
+/// ([`expand`]), as many as the elements a statement's text may hold: a
+/// body that uses a parameter twice and calls a function that does too
+/// doubles at each of up to [`MAX_DEPTH`] calls.
+pub const MAX_WRITTEN_OUT: usize = 250_000;
+
+/// The depth of `e` as a tree, counted up to `cap` (past it, `cap + 1`),
+/// and its expressions, added to `nodes`.
+fn depth_of(e: &mut Expr, cap: usize, nodes: &mut usize) -> usize {
+    *nodes += 1;
+    if cap == 0 {
+        return 1;
+    }
+    let (mut first, mut most) = (true, 0);
+    // The first expression visit_expr_mut is called with is `e`; each
+    // one after it is one of its children, measured here.
+    visit_expr_mut(e, &mut |c| {
+        if std::mem::take(&mut first) {
+            return true;
+        }
+        most = most.max(depth_of(c, cap - 1, nodes));
+        false
+    });
+    1 + most
+}
+
+/// One [`expand`]: the functions it calls, the versions it called, and
+/// the expressions it wrote out so far.
+struct Expansion<'s> {
+    set: &'s FunctionSet,
+    used: Vec<String>,
+    nodes: usize,
+}
+
+impl Expansion<'_> {
+    /// A query error when `out`, written out at `pos` levels deep in the
+    /// statement, would nest past [`super::parse::MAX_EXPR_DEPTH`] or take
+    /// the statement past [`MAX_WRITTEN_OUT`] expressions: the bounds the
+    /// parser holds a statement's text to, held to it written out, before
+    /// anything walks it deeper (#501 bounds the text only, so that a
+    /// call of a few bytes could plan 16,000 levels and overflow the
+    /// stack).
+    fn check(&mut self, name: &str, out: &mut Expr, pos: usize) -> Result<()> {
+        let room = super::parse::MAX_EXPR_DEPTH.saturating_sub(pos);
+        if depth_of(out, room, &mut self.nodes) > room {
+            return Err(err(format!(
+                "{name}(...) written out nests more than {} levels deep, the most a statement may (its body, the bodies it calls and its arguments in them): write the function with fewer terms, or call it with simpler arguments",
+                super::parse::MAX_EXPR_DEPTH
+            )));
+        }
+        if self.nodes > MAX_WRITTEN_OUT {
+            return Err(err(format!(
+                "the calls of {name} written out hold more than {MAX_WRITTEN_OUT} expressions, the most a statement may: does a body use a parameter many times and call another function that does too?"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Writes out the calls in `q`, at call nesting `depth`, its
+    /// expressions `pos` levels deep in the statement.
+    fn query(&mut self, q: &mut sql::Query, depth: usize, pos: usize) -> Result<()> {
+        let mut failed: Option<Error> = None;
+        // Table functions in FROM, then calls in expressions.
+        let set = self.set;
+        relations_mut(q, &mut |t| {
+            if failed.is_some() {
+                return;
+            }
+            let TableFactor::Table { name, alias, args, .. } = t else { return };
+            let f = match resolve(set, name) {
+                Ok(Some(f)) => f.clone(),
+                Ok(None) => return,
+                Err(e) => {
+                    failed = Some(e);
+                    return;
+                }
+            };
+            if f.def.kind != Kind::Table {
+                failed = Some(err(format!("{} returns a value, not rows: call it in an expression, not in FROM", f.def.name)));
+                return;
+            }
+            let Some(a) = args else {
+                failed = Some(err(format!("{} is a table function: call it, {}(...)", f.def.name, f.def.name)));
+                return;
+            };
+            if depth >= MAX_DEPTH {
+                failed = Some(err(format!("calls nest more than {MAX_DEPTH} deep at {}: does a function call itself?", f.def.name)));
+                return;
+            }
+            match table_body(&f, &a.args, &mut self.used) {
+                Ok(mut body) => {
+                    // The body is a query of its own, a level deeper.
+                    let mut measured = Ok(());
+                    query_exprs_mut(&mut body, &mut |e| {
+                        if measured.is_ok() {
+                            measured = self.check(&f.def.name, e, pos + 1);
+                        }
+                    });
+                    if let Err(e) = measured.and_then(|()| self.query(&mut body, depth + 1, pos + 1)) {
+                        failed = Some(e);
+                        return;
+                    }
+                    let alias = alias.clone().unwrap_or_else(|| sql::TableAlias { name: sql::Ident::new(f.def.name.clone()), columns: Vec::new() });
+                    *t = TableFactor::Derived { lateral: false, subquery: Box::new(body), alias: Some(alias) };
+                }
+                Err(e) => failed = Some(e),
+            }
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        query_exprs_mut(q, &mut |e| {
+            if failed.is_none() {
+                if let Err(x) = self.expr(e, depth, pos) {
+                    failed = Some(x);
+                }
+            }
+        });
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Writes out the scalar calls in `e`, which sits `pos` levels deep in
+    /// the statement.
+    fn expr(&mut self, e: &mut Expr, depth: usize, pos: usize) -> Result<()> {
+        if let Some(out) = self.call(e, depth, pos)? {
+            *e = out;
+            return Ok(());
+        }
+        let (mut first, mut failed) = (true, None);
+        // `e`'s children, one level deeper ([`depth_of`]).
+        visit_expr_mut(e, &mut |c| {
+            if std::mem::take(&mut first) {
+                return true;
+            }
+            if failed.is_none() {
+                if let Err(x) = self.expr(c, depth, pos + 1) {
+                    failed = Some(x);
+                }
+            }
+            false
+        });
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// `x` written out when it calls a scalar function of the set, at
+    /// `pos` levels deep in the statement.
+    fn call(&mut self, x: &mut Expr, depth: usize, pos: usize) -> Result<Option<Expr>> {
+        let Expr::Function(call) = x else { return Ok(None) };
+        let Some(f) = resolve(self.set, &call.name)?.cloned() else { return Ok(None) };
+        let name = &f.def.name;
+        if f.def.kind == Kind::Table {
+            return Err(err(format!("{name} returns rows: call it in FROM, SELECT * FROM {name}(...)")));
+        }
+        if call.over.is_some() || call.filter.is_some() || !call.within_group.is_empty() {
+            return Err(err(format!("{name} is a stored function: OVER, FILTER and WITHIN GROUP are for aggregates and window functions")));
+        }
+        if depth >= MAX_DEPTH {
+            return Err(err(format!("calls nest more than {MAX_DEPTH} deep at {name}: does a function call itself?")));
+        }
+        let args: Vec<FunctionArg> = match &call.args {
+            FunctionArguments::None => Vec::new(),
+            FunctionArguments::List(l) if l.duplicate_treatment.is_none() && l.clauses.is_empty() => l.args.clone(),
+            other => return Err(err(format!("{name}{other}: the arguments of a stored function are values or expressions"))),
+        };
+        // The arguments first, then the body with them in place.
+        let mut bound = bind_args(&f, &args)?;
+        for a in bound.values_mut() {
+            self.expr(a, depth, pos + 1)?;
+        }
+        let Body::Expr(body) = &f.body else { return Err(Error::Corrupt(format!("{} has no expression", f.id()))) };
+        let mut out = Expr::Nested(Box::new((**body).clone()));
+        substitute(&mut out, &bound);
+        note(&mut self.used, &f);
+        // Measured before the calls it makes are walked into, so that no
+        // walk goes deeper than a statement may.
+        self.check(name, &mut out, pos)?;
+        // Calls the body makes, one level down; the arguments in it are
+        // written out already.
+        self.expr(&mut out, depth + 1, pos)?;
+        Ok(Some(out))
+    }
 }
 
 /// The body of a table function `q` is nothing but a call of: `SELECT *
@@ -1119,121 +1302,6 @@ fn table_body(f: &Function, args: &[FunctionArg], used: &mut Vec<String>) -> Res
     query_exprs_mut(&mut out, &mut |e| substitute(e, &bound));
     note(used, f);
     Ok(out)
-}
-
-/// Writes out the calls in `q`, at nesting `depth`.
-fn expand_query(q: &mut sql::Query, set: &FunctionSet, depth: usize, used: &mut Vec<String>) -> Result<()> {
-    let mut failed: Option<Error> = None;
-    // Table functions in FROM, then calls in expressions.
-    relations_mut(q, &mut |t| {
-        if failed.is_some() {
-            return;
-        }
-        let TableFactor::Table { name, alias, args, .. } = t else { return };
-        let f = match resolve(set, name) {
-            Ok(Some(f)) => f.clone(),
-            Ok(None) => return,
-            Err(e) => {
-                failed = Some(e);
-                return;
-            }
-        };
-        if f.def.kind != Kind::Table {
-            failed = Some(err(format!("{} returns a value, not rows: call it in an expression, not in FROM", f.def.name)));
-            return;
-        }
-        let Some(a) = args else {
-            failed = Some(err(format!("{} is a table function: call it, {}(...)", f.def.name, f.def.name)));
-            return;
-        };
-        if depth >= MAX_DEPTH {
-            failed = Some(err(format!("calls nest more than {MAX_DEPTH} deep at {}: does a function call itself?", f.def.name)));
-            return;
-        }
-        match table_body(&f, &a.args, used) {
-            Ok(mut body) => {
-                if let Err(e) = expand_query(&mut body, set, depth + 1, used) {
-                    failed = Some(e);
-                    return;
-                }
-                let alias = alias.clone().unwrap_or_else(|| sql::TableAlias { name: sql::Ident::new(f.def.name.clone()), columns: Vec::new() });
-                *t = TableFactor::Derived { lateral: false, subquery: Box::new(body), alias: Some(alias) };
-            }
-            Err(e) => failed = Some(e),
-        }
-    });
-    if let Some(e) = failed {
-        return Err(e);
-    }
-    query_exprs_mut(q, &mut |e| {
-        if failed.is_none() {
-            if let Err(x) = expand_expr(e, set, depth, used) {
-                failed = Some(x);
-            }
-        }
-    });
-    failed.map_or(Ok(()), Err)
-}
-
-/// Writes out the scalar calls in `e`.
-fn expand_expr(e: &mut Expr, set: &FunctionSet, depth: usize, used: &mut Vec<String>) -> Result<()> {
-    let mut failed: Option<Error> = None;
-    visit_expr_mut(e, &mut |x| {
-        if failed.is_some() {
-            return false;
-        }
-        let Expr::Function(call) = x else { return true };
-        let f = match resolve(set, &call.name) {
-            Ok(Some(f)) => f.clone(),
-            Ok(None) => return true,
-            Err(e) => {
-                failed = Some(e);
-                return false;
-            }
-        };
-        let name = &f.def.name;
-        if f.def.kind == Kind::Table {
-            failed = Some(err(format!("{name} returns rows: call it in FROM, SELECT * FROM {name}(...)")));
-            return false;
-        }
-        if call.over.is_some() || call.filter.is_some() || !call.within_group.is_empty() {
-            failed = Some(err(format!("{name} is a stored function: OVER, FILTER and WITHIN GROUP are for aggregates and window functions")));
-            return false;
-        }
-        if depth >= MAX_DEPTH {
-            failed = Some(err(format!("calls nest more than {MAX_DEPTH} deep at {name}: does a function call itself?")));
-            return false;
-        }
-        let args: Vec<FunctionArg> = match &call.args {
-            FunctionArguments::None => Vec::new(),
-            FunctionArguments::List(l) if l.duplicate_treatment.is_none() && l.clauses.is_empty() => l.args.clone(),
-            other => {
-                failed = Some(err(format!("{name}{other}: the arguments of a stored function are values or expressions")));
-                return false;
-            }
-        };
-        let r = (|| -> Result<Expr> {
-            // The arguments first, then the body with them in place.
-            let mut bound = bind_args(&f, &args)?;
-            for a in bound.values_mut() {
-                expand_expr(a, set, depth, used)?;
-            }
-            let Body::Expr(body) = &f.body else { return Err(Error::Corrupt(format!("{} has no expression", f.id()))) };
-            let mut out = (**body).clone();
-            substitute(&mut out, &bound);
-            note(used, &f);
-            // Calls the body makes, one level down; the arguments in it
-            // are written out already.
-            expand_expr(&mut out, set, depth + 1, used)?;
-            Ok(Expr::Nested(Box::new(out)))
-        })();
-        match r {
-            Ok(out) => *x = out,
-            Err(e) => failed = Some(e),
-        }
-        false
-    });
-    failed.map_or(Ok(()), Err)
 }
 
 /// The functions a statement's text calls, as [`expand`] would write them

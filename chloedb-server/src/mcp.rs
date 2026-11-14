@@ -52,7 +52,7 @@ const INSTRUCTIONS: &str = "ChloeDB is a search database with SQL: full text (BM
 Start with list_tables: it gives each table's CREATE TABLE statement. \
 ChloeDB SQL is its own dialect, not Postgres: MATCH(field, 'words') filters by text, ORDER BY bm25(field, 'words') DESC ranks by it, \
 similarity(vector_field, :p) ranks by meaning (bind :p in params as {\"embed\": \"some text\", \"field\": \"emb\"}), and search_docs finds the syntax of anything else. \
-query runs SELECT only; execute runs INSERT, UPDATE, DELETE, CREATE, ALTER and DROP; write sends rows as JSON. \
+query runs SELECT only; execute runs INSERT, UPDATE, DELETE, CREATE, ALTER and DROP; write sends rows as JSON; import loads many rows at once (a CSV file's text, JSON lines or objects) into a table. \
 check_sql parses and binds a statement against the tables without running it, and explain shows how a SELECT runs. \
 list_feedback and get_feedback read what people asked of the command center, with screenshots; update_feedback takes an item and marks it done. \
 The key you connect with decides what you may change (whoami): read, write, or admin for tables. \
@@ -76,6 +76,9 @@ enum Act {
     Action { method: Method, path: String, body: Option<Json>, reason: String },
     /// A runbook, found here ([`crate::runbooks`]).
     Runbook { query: String },
+    /// `import`: rows as text, sent to `POST /v1/import` with their
+    /// content type.
+    Import { path: String, content_type: &'static str, data: Vec<u8>, create: Option<String> },
 }
 
 /// What a tool keeps of a route's answer.
@@ -243,6 +246,24 @@ const TOOLS: &[Tool] = &[
             Some(Json::Array(o)) if !o.is_empty() => Ok(route(Method::POST, "/v1/write", Some(json!({"ops": o})), Shape::All)),
             _ => Err(Failed::Arguments("the arguments need an array \"ops\" of one operation or more".into())),
         },
+    },
+    Tool {
+        name: "import",
+        title: "Import rows",
+        description: "Load many rows into a table at once: CSV or TSV text (the first line names the columns), JSON lines, a JSON array of objects as text in data, or the objects themselves in rows. The table must exist (list_tables shows it), or with create: true an admin key makes it first from the rows: types from the values (whole numbers INT, numbers FLOAT, true/false BOOL, ISO dates TIMESTAMP, longer text of several words TEXT, other text KEYWORD), the primary key a column named id (or key); the answer shows the CREATE TABLE it ran. Columns the table has not are skipped and named in the answer; a row with the key of one there replaces it. Answers how many rows it wrote. Needs a write key. For a few rows, write works too.",
+        schema: || json!({"type": "object", "properties": {
+            "table": {"type": "string"},
+            "format": {"type": "string", "enum": ["csv", "tsv", "jsonl", "json"], "description": "the format of data (default csv); rows are JSON"},
+            "data": {"type": "string", "description": "the rows as text, such as a CSV file's contents"},
+            "rows": {"type": "array", "items": {"type": "object"}, "description": "the rows as objects, in place of data"},
+            "empty": {"type": "string", "enum": ["default", "null", "text"], "description": "what an empty CSV cell is: the field's DEFAULT (the default), NULL, or empty text"},
+            "strict": {"type": "boolean", "description": "refuse a column the table does not have, rather than skip it"},
+            "create": {"type": "boolean", "description": "make the table from the rows when there is none (needs an admin key)"},
+            "key": {"type": "string", "description": "with create: the column that is the primary key (default a column named id; \"\" for none)"}
+        }, "required": ["table"]}),
+        read_only: false,
+        destructive: true,
+        act: import_act,
     },
     Tool {
         name: "get_rows",
@@ -599,7 +620,38 @@ fn sections() -> &'static [Section] {
 }
 
 fn words(t: &str) -> Vec<String> {
-    t.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| w.len() > 1).map(|w| w.to_lowercase()).collect()
+    t.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| w.len() > 1).map(|w| stem(&w.to_lowercase())).collect()
+}
+
+/// A word without its plural's ending: `tables` is `table`, `queries`
+/// `query`, `boxes` `box`, so a question finds the heading of either.
+fn stem(w: &str) -> String {
+    if w.len() > 4 && w.ends_with("ies") {
+        return format!("{}y", &w[..w.len() - 3]);
+    }
+    if w.len() > 4 && ["ses", "xes", "ches", "shes"].iter().any(|e| w.ends_with(e)) {
+        return w[..w.len() - 2].to_string();
+    }
+    if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") && !w.ends_with("us") {
+        return w[..w.len() - 1].to_string();
+    }
+    w.to_string()
+}
+
+/// Words of a question that say nothing of what it is about.
+const STOPWORDS: &[&str] = &["the", "an", "of", "to", "in", "into", "for", "on", "and", "or", "with", "is", "are", "how", "do", "doe", "can", "my", "from", "by", "it", "this", "that", "what", "which", "example", "way", "use", "want", "need"];
+
+/// A question's words, without stopwords, and with the names ChloeDB
+/// gives what other databases call otherwise (a materialized view is a
+/// rollup).
+fn query_words(query: &str) -> Vec<String> {
+    let mut q: Vec<String> = words(query).into_iter().filter(|w| !STOPWORDS.contains(&w.as_str())).collect();
+    for (other, ours) in [("materialized", "rollup"), ("materialised", "rollup"), ("precompute", "rollup"), ("precomputed", "rollup"), ("today", "current_date")] {
+        if q.iter().any(|w| w == other) {
+            q.push(ours.to_string());
+        }
+    }
+    q
 }
 
 /// The sections that best match `query`: each query word scores by how
@@ -607,7 +659,10 @@ fn words(t: &str) -> Vec<String> {
 /// section (at most 5), and three times over in the heading.
 pub fn search_docs(query: &str, limit: usize) -> Json {
     let all = sections();
-    let mut q = words(query);
+    let mut q = query_words(query);
+    // Words side by side in the question (`create table`), which a
+    // section that has them side by side matches more than one with each.
+    let pairs: Vec<(String, String)> = q.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
     q.sort();
     q.dedup();
     let texts: Vec<(Vec<String>, Vec<String>)> = all.iter().map(|s| (words(&s.heading), words(s.text))).collect();
@@ -625,7 +680,12 @@ pub fn search_docs(query: &str, limit: usize) -> Json {
                 let hf = h.iter().filter(|x| *x == w).count() as f64;
                 idf * (tf + 3.0 * hf)
             }).sum();
-            (score, i)
+            let side_by_side: f64 = pairs.iter().map(|(a, b)| {
+                let k = t.windows(2).filter(|w| w[0] == *a && w[1] == *b).count().min(5) as f64;
+                let both = q.iter().zip(&idf).filter(|(w, _)| *w == a || *w == b).map(|(_, f)| f).sum::<f64>();
+                k * both
+            }).sum();
+            (score + side_by_side, i)
         })
         .filter(|(s, _)| *s > 0.0)
         .collect();
@@ -655,11 +715,49 @@ fn clip(t: &str, max: usize) -> (&str, bool) {
     (&t[..end], true)
 }
 
+// ----- import
+
+/// The `import` tool's call: the route with its query string, and the rows.
+fn import_act(a: &Json) -> Result<Act, Failed> {
+    let table = s(a, "table")?;
+    let (format, data) = match (a.get("rows"), opt_s(a, "data")) {
+        (Some(Json::Array(rows)), None) if !rows.is_empty() => ("json", serde_json::to_vec(rows).map_err(|e| Failed::Arguments(e.to_string()))?),
+        (None | Some(Json::Null), Some(d)) => (opt_s(a, "format").unwrap_or("csv"), d.as_bytes().to_vec()),
+        (Some(_), Some(_)) => return Err(Failed::Arguments("send the rows in data (text) or in rows (objects), not both".into())),
+        _ => return Err(Failed::Arguments("the arguments need the rows: data, as text (a CSV file's contents), or rows, an array of objects".into())),
+    };
+    let create = match a.get("create").and_then(|v| v.as_bool()) {
+        Some(true) => {
+            let f = chloedb::ingest::Format::parse(format).ok_or_else(|| Failed::Arguments(format!("format is csv, tsv, jsonl or json, not {format:?}")))?;
+            Some(chloedb::ingest::create_for(table, &data, f, opt_s(a, "key")).map_err(|e| Failed::Arguments(format!("no table could be made from the rows: {e}")))?)
+        }
+        _ => None,
+    };
+    let content_type = match format.to_ascii_lowercase().as_str() {
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "jsonl" | "ndjson" => "application/x-ndjson",
+        "json" => "application/json",
+        f => return Err(Failed::Arguments(format!("format is csv, tsv, jsonl or json, not {f:?}"))),
+    };
+    let mut path = format!("/v1/import?table={}", encode(table));
+    if let Some(e) = opt_s(a, "empty") {
+        path.push_str(&format!("&empty={}", encode(e)));
+    }
+    if a.get("strict").and_then(|v| v.as_bool()) == Some(true) {
+        path.push_str("&strict=true");
+    }
+    Ok(Act::Import { path, content_type, data, create })
+}
+
 // ----- check_sql
 
 /// What a statement would do, bound against the tables and not run.
 pub fn check_sql(sql: &str, tables: &[std::sync::Arc<chloedb::Schema>]) -> Result<Json, String> {
     use chloedb::query::sql::{bind_command, Command, Write};
+    if let Some(j) = check_own_statement(sql, tables)? {
+        return Ok(j);
+    }
     let refs: Vec<&chloedb::Schema> = tables.iter().map(|t| &**t).collect();
     let cmd = bind_command(sql, &refs, &chloedb::query::Params::default()).map_err(|e| e.to_string())?;
     Ok(match cmd {
@@ -687,6 +785,57 @@ pub fn check_sql(sql: &str, tables: &[std::sync::Arc<chloedb::Schema>]) -> Resul
         Command::Function(f) => json!({"statement": if matches!(f, chloedb::query::function::Statement::Drop { .. }) { "drop function" } else { "create function" }, "name": f.name(), "needs": "an admin key"}),
         Command::Explain { json } => json!({"statement": "explain", "json": json, "note": "run it with query: it answers the plan without running the statement"}),
     })
+}
+
+/// The statements `execute` takes before SQL's own (as `POST /v1/sql`
+/// does, [`crate::service::Service::sql_in`]): rollups, classifiers,
+/// recommenders and a table's synonyms, checked against the tables.
+fn check_own_statement(sql: &str, tables: &[std::sync::Arc<chloedb::Schema>]) -> Result<Option<Json>, String> {
+    use chloedb::query::{classify, recommend, rollup, table_synonyms};
+    let find = |t: &str| tables.iter().find(|s| s.table.eq_ignore_ascii_case(t)).ok_or_else(|| format!("query error: no table {t}"));
+    if let Some(st) = rollup::parse_statement(sql).map_err(|e| e.to_string())? {
+        return Ok(Some(match st {
+            rollup::Statement::Create { rollup: r, if_not_exists } => {
+                let base = find(&r.base)?;
+                let columns = r.check(base).map_err(|e| e.to_string())?;
+                json!({
+                    "statement": "create rollup", "rollup": r.name, "table": base.table, "if_not_exists": if_not_exists,
+                    "exists": tables.iter().any(|t| t.table.eq_ignore_ascii_case(&r.name)),
+                    "columns": columns.iter().map(|(c, ty)| json!({"name": c, "type": ty})).collect::<Vec<_>>(),
+                    "needs": "an admin key not limited to tables",
+                    "note": "the rollup is a table of its own, filled a few seconds after it is made and kept up to date as rows come",
+                })
+            }
+            rollup::Statement::Drop { name, if_exists } => json!({"statement": "drop rollup", "rollup": name, "if_exists": if_exists, "needs": "an admin key not limited to tables"}),
+            rollup::Statement::Refresh { name, full } => json!({"statement": "refresh rollup", "rollup": name, "full": full, "needs": "an admin key not limited to tables"}),
+        }));
+    }
+    if let Some(st) = classify::parse_statement(sql).map_err(|e| e.to_string())? {
+        return Ok(Some(match st {
+            classify::Statement::Create(c) => {
+                let schema = find(&c.table)?;
+                let model = c.check(schema).map_err(|e| e.to_string())?;
+                json!({"statement": "create classifier", "name": c.name, "table": schema.table, "field": c.field, "labels": c.labels, "embedded_by": model, "needs": "an admin key"})
+            }
+            classify::Statement::Drop { name, if_exists } => json!({"statement": "drop classifier", "name": name, "if_exists": if_exists, "needs": "an admin key"}),
+        }));
+    }
+    if let Some(st) = recommend::parse_statement(sql).map_err(|e| e.to_string())? {
+        return Ok(Some(match st {
+            recommend::Statement::Create { def, replace } => {
+                def.check(tables).map_err(|e| e.to_string())?;
+                json!({"statement": "create recommender", "name": def.name, "events": def.events, "replace": replace, "needs": "an admin key"})
+            }
+            recommend::Statement::Drop { name, if_exists } => json!({"statement": "drop recommender", "name": name, "if_exists": if_exists, "needs": "an admin key"}),
+        }));
+    }
+    if let Some(st) = table_synonyms::parse_statement(sql).map_err(|e| e.to_string())? {
+        let schema = find(st.table())?;
+        st.function_sql().map_err(|e| e.to_string())?;
+        let what = if matches!(st, table_synonyms::Statement::Create { .. }) { "create synonyms" } else { "drop synonyms" };
+        return Ok(Some(json!({"statement": what, "table": schema.table, "needs": "an admin key"})));
+    }
+    Ok(None)
 }
 
 // ----- the protocol
@@ -817,6 +966,19 @@ async fn call(svc: &std::sync::Arc<Service>, router: Option<&Router>, caller: &C
             let router = router.ok_or_else(|| Failed::Call("the server is still starting".into()))?;
             forward_with(router, caller, method, &path, body, &[("x-strata-reason", reason)]).await.map_err(Failed::Call)?
         }
+        Act::Import { path, content_type, data, create } => {
+            let router = router.ok_or_else(|| Failed::Call("the server is still starting".into()))?;
+            let made = match &create {
+                Some(sql) => Some(forward(router, caller, Method::POST, "/v1/sql", Some(json!({"sql": sql}))).await.map_err(|e| Failed::Call(format!("{e} (the import would make the table with {sql})")))?),
+                None => None,
+            };
+            let mut j = forward_body(router, caller, Method::POST, &path, Some((content_type, data)), &[]).await.map_err(Failed::Call)?;
+            if let (Some(sql), Some(_)) = (create, made) {
+                // IF NOT EXISTS: a table that was there already is kept as it was.
+                j["create_table"] = json!(sql);
+            }
+            j
+        }
         Act::Route { method, path, body, shape } => {
             let router = router.ok_or_else(|| Failed::Call("the server is still starting".into()))?;
             let mut j = forward(router, caller, method, &path, body).await.map_err(Failed::Call)?;
@@ -888,6 +1050,12 @@ pub(crate) async fn forward(router: &Router, caller: &Caller<'_>, method: Method
 /// [`forward`], with headers of its own (`extra`, which win over the
 /// caller's).
 pub(crate) async fn forward_with(router: &Router, caller: &Caller<'_>, method: Method, path: &str, body: Option<Json>, extra: &[(&str, String)]) -> Result<Json, String> {
+    let body = body.map(|j| serde_json::to_vec(&j).map(|b| ("application/json", b))).transpose().map_err(|e| e.to_string())?;
+    forward_body(router, caller, method, path, body, extra).await
+}
+
+/// [`forward_with`], with a body of any content type.
+async fn forward_body(router: &Router, caller: &Caller<'_>, method: Method, path: &str, body: Option<(&str, Vec<u8>)>, extra: &[(&str, String)]) -> Result<Json, String> {
     use tower::ServiceExt;
     let mut b = Request::builder().method(method).uri(path);
     let passed = [
@@ -925,9 +1093,9 @@ pub(crate) async fn forward_with(router: &Router, caller: &Caller<'_>, method: M
         b = b.header(crate::obs::HEADER, id.clone());
     }
     let body = match body {
-        Some(j) => {
-            b = b.header(header::CONTENT_TYPE, "application/json");
-            Body::from(serde_json::to_vec(&j).map_err(|e| e.to_string())?)
+        Some((content_type, bytes)) => {
+            b = b.header(header::CONTENT_TYPE, content_type);
+            Body::from(bytes)
         }
         None => Body::empty(),
     };
@@ -1016,6 +1184,24 @@ pub async fn stdio(url: &str, key: Option<&str>, ca: Option<Vec<u8>>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docs_search_finds_what_other_databases_call_otherwise() {
+        let first = |q: &str| search_docs(q, 3)["sections"][0]["section"].as_str().unwrap_or("").to_string();
+        for (q, want) in [
+            ("materialized view", "Rollups"),
+            ("precompute daily counts kept up to date", "Rollups"),
+            ("CREATE TABLE example", "Tables"),
+            ("import a CSV file into a table", "Loading a file"),
+            ("current date today", "Parts of times"),
+        ] {
+            let got = first(q);
+            assert!(got.contains(want), "{q:?} found {got:?}, not {want}");
+        }
+        assert_eq!(stem("queries"), "query");
+        assert_eq!(stem("tables"), "table");
+        assert_eq!(stem("class"), "class");
+    }
 
     #[test]
     fn docs_split_into_sections_and_search_finds_them() {

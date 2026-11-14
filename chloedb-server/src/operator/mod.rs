@@ -118,6 +118,15 @@ pub struct Spec {
     /// More arguments for every coordinator (`--hedge-ms 50`,
     /// `--partial`, ...).
     pub coordinator_args: Vec<String>,
+    /// A volume for each coordinator, which keeps its history across
+    /// restarts: its log store (events, alerts, query statistics, table
+    /// growth: `--log-store`), its audit log (`--audit-log`) and its alert
+    /// rules and their states (`--alerts`). With it the coordinators run as
+    /// a StatefulSet, each with a volume of its own; without it (the
+    /// default, as before) as a Deployment that keeps all of that in memory
+    /// only, so that every rollout forgets it (LIV-2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinator_storage: Option<CoordinatorStorage>,
     /// How changes are made: paused, or held by gates on the cluster's
     /// live numbers.
     pub rollout: RolloutSpec,
@@ -348,6 +357,27 @@ impl Default for Storage {
     }
 }
 
+/// Each coordinator's volume (`spec.coordinatorStorage`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CoordinatorStorage {
+    /// Each coordinator's volume: its log store takes up to
+    /// `--log-store-mb` (1 GiB by default) of it.
+    pub size: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class_name: Option<String>,
+}
+
+impl Default for CoordinatorStorage {
+    fn default() -> CoordinatorStorage {
+        CoordinatorStorage { size: "2Gi".into(), storage_class_name: None }
+    }
+}
+
+/// Where a coordinator with a volume keeps its history, and the flag
+/// that says so: given unless `coordinatorArgs` gives the flag itself.
+pub const COORDINATOR_FILES: [(&str, &str); 3] = [("--log-store", "/data/logs"), ("--audit-log", "/data/audit.jsonl"), ("--alerts", "/data/alerts.json")];
+
 /// An environment variable taken from a Secret (`spec.secretEnv`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -388,6 +418,7 @@ impl Default for Spec {
             coordinator_resources: None,
             args: Vec::new(),
             coordinator_args: Vec::new(),
+            coordinator_storage: None,
             rollout: RolloutSpec::default(),
             autoscale: autoscale::Autoscale::default(),
             upgrade: upgrade::Upgrade::default(),
@@ -420,6 +451,9 @@ impl Spec {
         }));
         // Only when there is one, so that a cluster without one keeps its
         // hash (and its coordinators) across the operator's upgrade.
+        if let Some(st) = &self.coordinator_storage {
+            j["storage"] = json!(st);
+        }
         let apps = self.apps();
         if !apps.is_empty() {
             j["apps"] = json!(apps);
@@ -480,6 +514,11 @@ impl Spec {
         }
         if self.shards > 4096 {
             return Err("a cluster has at most 4,096 shards, one a slot".into());
+        }
+        if let Some(st) = &self.coordinator_storage {
+            if quantity(&st.size).is_none_or(|b| b == 0) {
+                return Err(format!("coordinatorStorage.size is a size Kubernetes reads, such as 2Gi, not {:?}", st.size));
+            }
         }
         if self.rollout.progress_deadline_seconds < 10 {
             return Err(format!("rollout.progressDeadlineSeconds is 10 or more (a copy takes seconds to restart), not {}", self.rollout.progress_deadline_seconds));
@@ -2150,6 +2189,10 @@ pub fn crd() -> Json {
             "coordinatorResources": free("Resources of each coordinator's container."),
             "args": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every server."},
             "coordinatorArgs": {"type": "array", "items": {"type": "string"}, "description": "More arguments for every coordinator."},
+            "coordinatorStorage": {"type": "object", "description": "A volume for each coordinator, which keeps its history across restarts and rollouts: its log store (events, alerts, query statistics, table growth), its audit log and its alert rules. With it the coordinators run as a StatefulSet, each with a volume; without it (the default) as a Deployment that keeps all of that in memory only. Run 2 coordinators or more with it: a StatefulSet restarts one before it starts its next.", "properties": {
+                "size": {"type": "string", "description": "Each coordinator's volume (default 2Gi; its log store takes up to 1 GiB, --log-store-mb)."},
+                "storageClassName": {"type": "string"},
+            }},
             "rollout": {"type": "object", "description": "How changes are made: paused, or held by gates on the cluster's live numbers.", "properties": {
                 "paused": {"type": "boolean", "description": "While true the operator takes no step toward the spec (a copy that lost its data still joins again)."},
                 "gates": {"type": "object", "description": "Limits on live numbers: one over its limit for holdAfterSeconds holds the change until it is resumed.", "properties": {

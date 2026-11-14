@@ -205,7 +205,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
     // Two copies deep: a dry run or change request a tool files makes
     // requests of its own (a plan, a count of rows), through the copy
     // below it, which files none.
-    let copy = |app: &App| api(app).route("/v1/health", get(health)).layer(tower::ServiceBuilder::new().layer(middleware::from_fn_with_state(app.clone(), observe)).layer(DefaultBodyLimit::max(crate::service::SMALL_BODY))).with_state(app.clone());
+    let copy = |app: &App| api(app).route("/v1/health", get(health)).fallback(no_route).layer(tower::ServiceBuilder::new().layer(middleware::from_fn_with_state(app.clone(), observe)).layer(DefaultBodyLimit::max(crate::service::SMALL_BODY))).with_state(app.clone());
     let inner = copy(&app);
     let tools = copy(&App { mcp: Some(inner), ..app.clone() });
     // connectors: their runs write through the same routes and checks.
@@ -223,12 +223,55 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         // page, whose calls go to /c/<name>/v1/...
         .route("/c/:name", get(ui::index))
         .merge(api)
+        .fallback(no_route)
         // One stack, outermost first, put on each route once: each layer
         // put on its own wraps the routes in another boxed service, and
         // each request then clones every box inside the layer it passes
         // (some 40 allocations a request, with five layers).
         .layer(tower::ServiceBuilder::new().layer(middleware::from_fn_with_state(app.clone(), observe)).layer(DefaultBodyLimit::max(crate::service::SMALL_BODY)).layer(compression()))
         .with_state(app)
+}
+
+/// A path no route matches: the API's error, not an empty 404.
+async fn no_route(method: axum::http::Method, uri: axum::http::Uri) -> ApiError {
+    ApiError::coded(404, "not_found", format!("no route matches {method} {} (GET /v1/catalog lists the API's routes)", uri.path()))
+}
+
+/// An error answered before a handler ran, by axum (a body that is not
+/// JSON, no JSON content type, a body over its limit, a method the route
+/// does not take): plain text or nothing, made the API's error shape
+/// ([`crate::errors`]) with its sentence, so a client reads every error
+/// alike. Other answers are left as they are.
+async fn json_error(res: Response, max_body: usize) -> Response {
+    let status = res.status().as_u16();
+    if !matches!(status, 400 | 405 | 411 | 413 | 415 | 422) {
+        return res;
+    }
+    let ct = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !(ct.is_empty() || ct.starts_with("text/plain")) {
+        return res;
+    }
+    let allow = res.headers().get(header::ALLOW).cloned();
+    let (parts, body) = res.into_parts();
+    let text = match axum::body::to_bytes(body, 64 << 10).await {
+        Ok(b) => String::from_utf8_lossy(&b).trim().to_string(),
+        Err(_) => String::new(),
+    };
+    let message = match status {
+        405 => format!("the route does not take this method{}", allow.as_ref().and_then(|a| a.to_str().ok()).map_or(String::new(), |a| format!(": it takes {a}"))),
+        413 => format!(
+            "the request's body is larger than the route takes: {} MiB for rows (/v1/write, /v1/import and the like; --max-body-mb), {} MiB for any other route",
+            max_body >> 20,
+            crate::service::SMALL_BODY >> 20
+        ),
+        _ if text.is_empty() => parts.status.canonical_reason().unwrap_or("refused").to_string(),
+        _ => text,
+    };
+    let mut r = ApiError { code: None, status, message }.into_response();
+    if let Some(a) = allow {
+        r.headers_mut().insert(header::ALLOW, a);
+    }
+    r
 }
 
 /// The API's routes, behind [`auth`].
@@ -421,7 +464,7 @@ fn api(app: &App) -> Router<App> {
         .route("/v1/admin/connectors/:name", get(connectors_one).post(connectors_update).delete(connectors_delete))
         .route("/v1/admin/connectors/:name/run", post(connectors_run))
         .route("/v1/admin/connectors/:name/key", post(connectors_rotate))
-        .route("/v1/connectors/:name/push", post(connectors_push).layer(rows.clone()))
+        .route("/v1/connectors/:name/push", post(connectors_push).layer(DefaultBodyLimit::max(app.svc.max_body.min(crate::connectors::PUSH_BODY_MAX))))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -508,7 +551,7 @@ async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
     let caller = caller_of(req.headers(), peer, &app.svc.trusted_proxies);
     let ui = caller.command_center();
-    let (mut res, deadline) = match browsers(&app, &req) {
+    let (res, deadline) = match browsers(&app, &req) {
         Some(refused) => (refused, None),
         None => {
             let inner = keys::calling(caller, obs::scope(Some(id.clone()), next.run(req)));
@@ -517,6 +560,7 @@ async fn observe(State(app): State<App>, req: Request, next: Next) -> Response {
             telemetry::traced(telemetry::Trace::new(), run).instrument(span.clone()).await
         }
     };
+    let mut res = if res.status().as_u16() >= 400 { json_error(res, app.svc.max_body).await } else { res };
     let secs = t0.elapsed().as_secs_f64();
     let status = res.status().as_u16();
     // The command center's own requests are not the clients' traffic
@@ -902,6 +946,13 @@ async fn auth(State(app): State<App>, mut req: Request, next: Next) -> Response 
     let refused = match &who {
         None => Some(ApiError { code: None, status: 401, message: "missing or wrong token".into() }),
         Some(_) if narrowing.is_some() => narrowing,
+        // A connector's push key writes its table and reads nothing, an
+        // app's included.
+        Some(w) if w.push_only() && !crate::scoped::push_route_ok(&method, route) => Some(ApiError {
+            code: Some("scope_refused"),
+            status: 403,
+            message: format!("{method} {route} is not for {:?}, a connector's push key: it writes its table through the connector's push, and reads nothing", w.name),
+        }),
         // A key limited to tables calls the routes that check them, and no
         // other ([`crate::scoped`]).
         Some(_) if app_grants => None,
@@ -909,6 +960,14 @@ async fn auth(State(app): State<App>, mut req: Request, next: Next) -> Response 
         // A key for operations: the server's views, and for `ops` the
         // bounded actions ([`crate::ops::role_may`]).
         Some(w) if w.scope < need && !crate::ops::role_may(w.role, &method, route) => w.may(need, &format!("{method} {route}")).err(),
+        // A tier 3 action (it loses data or costs money) is never an
+        // agent's alone, whatever its key (audit X-D2): it files a change
+        // request, which a person applies with their own key.
+        Some(w) if agent_tier_refused(w, &method, route) => Some(ApiError::coded(
+            403,
+            "change_request_required",
+            format!("{method} {route} loses data or costs money (tier 3): an agent does not do it alone, even with an admin key. Dry run it (POST /v1/admin/changes/preview) and file a change request (POST /v1/admin/changes) for a person to approve"),
+        )),
         // An agent says why it changes the server: the audit log keeps it.
         Some(w) if agent_needs_reason(w, &method, route) => Some(ApiError::coded(
             400,
@@ -1040,6 +1099,15 @@ fn agent_needs_reason(w: &Principal, method: &axum::http::Method, route: &str) -
         && !route.starts_with("/v1/feedback")
         && crate::ops::is_agent(w, caller.as_ref())
         && caller.as_ref().is_none_or(|c| c.reason.as_deref().is_none_or(|r| r.trim().is_empty()))
+}
+
+/// Whether a request is an agent's tier 3 action ([`crate::ops::tier`]),
+/// which it files as a change request instead. SQL is judged by its
+/// statement, in [`sql`] ([`crate::changes::sql_tier`]). An approved
+/// change is applied with the approver's own key and headers that name no
+/// agent ([`crate::changes::applying`]), so it is not refused here.
+fn agent_tier_refused(w: &Principal, method: &axum::http::Method, route: &str) -> bool {
+    crate::ops::tier(method, route) >= 3 && crate::ops::is_agent(w, keys::caller().as_ref())
 }
 
 /// Why a request failed on the client's side (4xx), for [`auth`] to log.
@@ -1302,8 +1370,32 @@ fn body_str<'a>(b: &'a Json, k: &str) -> Result<&'a str, ApiError> {
     b.get(k).and_then(|v| v.as_str()).ok_or_else(|| ApiError::bad(format!("the body needs a string {k:?}")))
 }
 
-fn body_u64(b: &Json, k: &str) -> u64 {
-    b.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
+/// The whole number `k` of body `b`, 0 when it is missing or null; refused
+/// when it is anything else (`"100"`, `-1`, `1e15`), rather than read as
+/// missing.
+fn body_u64(b: &Json, k: &str) -> Result<u64, ApiError> {
+    match b.get(k) {
+        None | Some(Json::Null) => Ok(0),
+        Some(v) => v.as_u64().ok_or_else(|| ApiError::bad(format!("{k} is a whole number from 0{}, not {}", if k.ends_with("_ms") { " (milliseconds)" } else { "" }, crate::obs::truncate(&v.to_string(), 40)))),
+    }
+}
+
+/// The fields of a query's body (`POST /v1/query`).
+const QUERY_FIELDS: &[&str] = &["sql", "params", "timeout_ms", "shard", "stats", "snapshot", "partial", "min_seq_no", "min_seq_nos", "profile", "trace", "steps", "page_size", "keep_alive_ms", "cursor", "format", "log", "objects", "reason"];
+
+/// A sentence for each field of body `b` that is not one of `known` (a
+/// misspelt `timeout_ms` would otherwise go unnoticed), for an answer's
+/// `warnings`.
+fn unknown_fields(b: &Json, known: &[&str]) -> Vec<String> {
+    b.as_object().map_or_else(Vec::new, |o| o.keys().filter(|k| !known.contains(&k.as_str())).map(|k| format!("{k:?} is not a field of this request: it was left out (the fields are {})", known.join(", "))).collect())
+}
+
+/// `j` with `warnings` for the fields of `b` that are not `known`.
+fn warn_unknown(j: &mut Json, b: &Json, known: &[&str]) {
+    let w = unknown_fields(b, known);
+    if !w.is_empty() {
+        j["warnings"] = json!(w);
+    }
 }
 
 /// The writes a read must see ([`After`]): the body's `min_seq_no`, the
@@ -1372,7 +1464,8 @@ async fn schema(State(app): State<App>, w: Option<axum::Extension<Principal>>, Q
             if who.limited() {
                 who.may_table(Scope::Read, t, "a table's schema")?;
             }
-            app.svc.table(t).await?
+            // A table there is none of is not found, as a row is.
+            app.svc.table(t).await.map_err(|e| if e.status == 400 && crate::errors::code_of(&e) == "table_not_found" { ApiError { status: 404, ..e } } else { e })?
         }
         // A key limited to tables: the first table it may read, rather than
         // a refusal of one it did not name.
@@ -1528,11 +1621,13 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
         if let Some(k) = ["sql", "params", "page_size", "log", "shard", "stats", "snapshot", "min_seq_no", "min_seq_nos", "profile", "partial"].into_iter().find(|k| given(k)) {
             return Err(ApiError::bad(format!("a scroll's next page takes its cursor alone (with format, keep_alive_ms or timeout_ms), not {k}: the query and its version are those it started with")));
         }
-        let a = app.svc.scroll_next(cursor, &crate::service::scroll_owner(&who), keep_alive, body_u64(&b, "timeout_ms"), None).await?;
+        let a = app.svc.scroll_next(cursor, &crate::service::scroll_owner(&who), keep_alive, body_u64(&b, "timeout_ms")?, None).await?;
         if arrow {
             return arrow_answer(a).await;
         }
-        return Ok(AxJson(answer_of(&b, &a)?).into_response());
+        let mut j = answer_of(&b, &a)?;
+        warn_unknown(&mut j, &b, QUERY_FIELDS);
+        return Ok(AxJson(j).into_response());
     }
     if who.limited() {
         // A shard's query is a coordinator's, not for a key limited to
@@ -1560,10 +1655,10 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
     let req = QueryReq {
         sql: body_str(&b, "sql")?.to_string(),
         params: app.svc.params_for(b.get("params"), Some(body_str(&b, "sql")?), &who).await?,
-        timeout_ms: body_u64(&b, "timeout_ms"),
+        timeout_ms: body_u64(&b, "timeout_ms")?,
         shard: b.get("shard").and_then(|v| v.as_bool()).unwrap_or(false),
         stats,
-        snapshot: body_u64(&b, "snapshot"),
+        snapshot: body_u64(&b, "snapshot")?,
         partial: b.get("partial").and_then(|v| v.as_bool()),
         after: after(&b)?,
         profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true),
@@ -1611,6 +1706,7 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
     if b.get("trace").and_then(|v| v.as_bool()) == Some(true) || b.get("profile").and_then(|v| v.as_bool()) == Some(true) {
         j["trace"] = json!(telemetry::trace().map(|t| t.spans()).unwrap_or_default());
     }
+    warn_unknown(&mut j, &b, QUERY_FIELDS);
     Ok(AxJson(j).into_response())
 }
 
@@ -1932,6 +2028,13 @@ async fn close_cursor(State(app): State<App>, w: Option<axum::Extension<Principa
 /// (`"objects": true`; [`as_objects`]).
 fn answer_of(b: &Json, a: &crate::service::Answer) -> Result<Json, ApiError> {
     let mut j = answer(a);
+    // Why a MATCH of several words found nothing, or why score() is 0.
+    if let Some(sql) = b.get("sql").and_then(|s| s.as_str()) {
+        let zero = !a.rs.scores.is_empty() && a.rs.scores.iter().all(|s| *s == 0.0);
+        if let Some(h) = chloedb::query::hint::of_answer(sql, a.rs.rows.len(), zero) {
+            j["hint"] = json!(h);
+        }
+    }
     if !wants_steps(b) && !body_bool(b, "shard")? {
         without_steps(&mut j);
     }
@@ -1986,7 +2089,7 @@ async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, head
     let w = who(w);
     let params = app.svc.params_for(b.get("params"), b.get("sql").and_then(Json::as_str), &w).await?;
     if let Some(log) = b.get("log") {
-        let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params, timeout_ms: body_u64(&b, "timeout_ms"), after: after(&b)?, who: Some(w.clone()), ..Default::default() };
+        let req = QueryReq { sql: body_str(&b, "sql")?.to_string(), params, timeout_ms: body_u64(&b, "timeout_ms")?, after: after(&b)?, who: Some(w.clone()), ..Default::default() };
         return logged(&app, &w, req, log, body_bool(&b, "objects")?).await.map(IntoResponse::into_response);
     }
     let statement = body_str(&b, "sql")?;
@@ -2004,7 +2107,7 @@ async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, head
         audit_ui_write(statement, None, None);
     }
     let key = body_key(&b, &headers)?;
-    let (r, partial) = crate::coord::with_partial(app.svc.sql_in(&w, statement, &params, after(&b)?, body_u64(&b, "timeout_ms"), None, key)).await;
+    let (r, partial) = crate::coord::with_partial(app.svc.sql_in(&w, statement, &params, after(&b)?, body_u64(&b, "timeout_ms")?, None, key)).await;
     match r {
         Ok(SqlAnswer::Rows(mut a)) => {
             hide_hosts(&w, &mut a.rs.stats.steps);
@@ -2029,7 +2132,7 @@ fn body_key(b: &Json, headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let key = match (b.get("idempotency_key"), headers.get("idempotency-key")) {
         (Some(Json::String(k)), _) => Some(k.clone()),
         (Some(_), _) => return Err(ApiError::bad("idempotency_key is a string")),
-        (None, Some(h)) => Some(h.to_str().map_err(|_| ApiError::bad("the Idempotency-Key header is not text"))?.to_string()),
+        (None, Some(h)) => Some(h.to_str().map_err(|_| ApiError::bad("the Idempotency-Key header is visible ASCII alone (letters, digits, - and the like): send non-ASCII text percent-encoded, or a UUID"))?.to_string()),
         (None, None) => None,
     };
     if key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
@@ -2045,7 +2148,11 @@ fn body_key(b: &Json, headers: &HeaderMap) -> Result<Option<String>, ApiError> {
 /// (`idempotency_key`; [`crate::coord::with_partial`]).
 fn write_failed(e: ApiError, partial: Option<Json>) -> Response {
     let Some(partial) = partial else { return e.into_response() };
-    let mut body = json!({"error": e.message, "partial": true, "shards": partial["shards"]});
+    // The error's shape (`error_code`, `retryable`, `hint`), with what was
+    // written: whether to send it again matters most here.
+    let mut body = crate::errors::answer(&e);
+    body["partial"] = json!(true);
+    body["shards"] = partial["shards"].clone();
     if let Some(k) = partial.get("idempotency_key") {
         body["idempotency_key"] = k.clone();
     }
@@ -2177,7 +2284,7 @@ fn strict_ops(ops: &mut [Json]) {
 async fn run_plan(State(app): State<App>, w: Option<axum::Extension<Principal>>, AxJson(b): AxJson<Json>) -> Res {
     let plan = chloedb::query::ir::Plan::from_json(b.get("plan").ok_or_else(|| ApiError::bad("the body needs a \"plan\""))?)?;
     let who = who(w);
-    match app.svc.run_plan(&who, plan, after(&b)?, body_u64(&b, "timeout_ms")).await? {
+    match app.svc.run_plan(&who, plan, after(&b)?, body_u64(&b, "timeout_ms")?).await? {
         SqlAnswer::Rows(mut a) => {
             hide_hosts(&who, &mut a.rs.stats.steps);
             Ok(AxJson(answer_of(&b, &a)?))
@@ -2280,7 +2387,10 @@ async fn kv_one(State(app): State<App>, w: Option<axum::Extension<Principal>>, a
     table_ok(&app, &who(w), Some(&table), Scope::Read, "a read by key").await?;
     let t0 = Instant::now();
     let timeout_ms = q.get("timeout_ms").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let got = app.svc.get_rows(Some(&table), vec![chloedb::value::Value::Str(key.clone())], None, &after_of_query(&q)?, timeout_ms, true).await?;
+    // The key as the table's key is typed: an INT key's text that is not
+    // a number says so, not that a query is invalid.
+    let k = js::param(&path_key(&*app.svc.table(&table).await?, &key)?)?;
+    let got = app.svc.get_rows(Some(&table), vec![k], None, &after_of_query(&q)?, timeout_ms, true).await?;
     let took_ms = t0.elapsed().as_secs_f64() * 1e3;
     Ok(match got.rows.into_iter().next().flatten() {
         Some((row, seq_no)) => AxJson(json!({"table": got.table, "key": key, "found": true, "row": key_row(&got.columns, &row), "seq_no": seq_no, "took_ms": took_ms})).into_response(),
@@ -2306,7 +2416,7 @@ async fn kv_get(State(app): State<App>, w: Option<axum::Extension<Principal>>, A
         Some(_) => return Err(ApiError::bad("columns is an array of the names of columns")),
     };
     table_ok(&app, &who(w), table, Scope::Read, "a read by key").await?;
-    let got = app.svc.get_rows(table, keys, columns, &after(&b)?, body_u64(&b, "timeout_ms"), true).await?;
+    let got = app.svc.get_rows(table, keys, columns, &after(&b)?, body_u64(&b, "timeout_ms")?, true).await?;
     Ok(AxJson(KeyRowsJson { got: &got, took_ms: t0.elapsed().as_secs_f64() * 1e3 }).into_response())
 }
 
@@ -2365,7 +2475,7 @@ impl serde::Serialize for KeyRowsJson<'_> {
 
 /// The idempotency key of a write: the `Idempotency-Key` header.
 fn idempotency(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
-    let key = headers.get("idempotency-key").map(|h| h.to_str().map(str::to_string).map_err(|_| ApiError::bad("the Idempotency-Key header is not text"))).transpose()?;
+    let key = headers.get("idempotency-key").map(|h| h.to_str().map(str::to_string).map_err(|_| ApiError::bad("the Idempotency-Key header is visible ASCII alone (letters, digits, - and the like): send non-ASCII text percent-encoded, or a UUID"))).transpose()?;
     if key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
         return Err(ApiError::bad("an idempotency key has 1 to 256 characters"));
     }
@@ -2511,8 +2621,13 @@ async fn import_rows(app: App, w: Option<axum::Extension<Principal>>, q: std::co
         Some(e) => chloedb::ingest::EmptyCell::parse(e).ok_or_else(|| ApiError::bad(format!("empty is default, null or text, not {e:?}")))?,
     };
     let opts = crate::service::ImportOpts { strict: flag(&q, "strict", false)?, empty };
-    let (w, skipped) = app.svc.import(q.get("table").map(String::as_str), body, format, opts).await?;
+    let (w, skipped, ragged) = app.svc.import(q.get("table").map(String::as_str), body, format, opts).await?;
     let mut j = json!({"written": w.rows, "skipped_fields": skipped, "took_ms": t0.elapsed().as_secs_f64() * 1e3});
+    // Rows of a CSV or TSV file with more or fewer values than its header
+    // (?strict=true refuses them).
+    if ragged > 0 {
+        j["ragged_rows"] = json!(ragged);
+    }
     if let Some(r) = receipt_json(&w) {
         j["receipt"] = r;
     }
@@ -3234,12 +3349,12 @@ async fn explain(State(app): State<App>, w: Option<axum::Extension<Principal>>, 
     // A query the hits cannot be shown for (one that orders groups, or by
     // a column it computes) is explained without them, and says why.
     let mut no_hits = None;
-    let hits = match body_u64(&b, "hits") {
+    let hits = match body_u64(&b, "hits")? {
         0 => None,
         _ if !chloedb::query::sql::ranks(sql) => None,
         n => {
             let asked = match chloedb::query::sql::with_features(sql) {
-                Ok(sql) => app.svc.query(QueryReq { sql, params: params.clone(), timeout_ms: body_u64(&b, "timeout_ms"), ..Default::default() }).await,
+                Ok(sql) => app.svc.query(QueryReq { sql, params: params.clone(), timeout_ms: body_u64(&b, "timeout_ms")?, ..Default::default() }).await,
                 Err(e) => Err(ApiError::from(e)),
             };
             match asked {
@@ -3256,7 +3371,7 @@ async fn explain(State(app): State<App>, w: Option<axum::Extension<Principal>>, 
             }
         }
     };
-    let mut a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms"), profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true),         ..Default::default() }).await?;
+    let mut a = app.svc.query(QueryReq { sql: sql.into(), params, timeout_ms: body_u64(&b, "timeout_ms")?, profile: b.get("profile").and_then(|v| v.as_bool()) == Some(true),         ..Default::default() }).await?;
     hide_hosts(&who, &mut a.rs.stats.steps);
     let mut out = json!({
         "kind": a.kind,
@@ -3354,7 +3469,7 @@ async fn sid_next(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     };
     let sql = format!("SELECT COUNT(*) FROM {}{filter}", chloedb::query::sql::ident(&table));
     let params = app.svc.params(None, b.get("params")).await?;
-    let next = app.svc.sid_next(&sql, None, &params, field, &prefixes, &after(&b)?, body_u64(&b, "timeout_ms")).await?;
+    let next = app.svc.sid_next(&sql, None, &params, field, &prefixes, &after(&b)?, body_u64(&b, "timeout_ms")?).await?;
     let next: Vec<Json> = prefixes
         .iter()
         .zip(next)
@@ -3365,7 +3480,7 @@ async fn sid_next(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 
 async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let params = app.svc.params(None, b.get("params")).await?;
-    let (stats, snapshot, version) = app.svc.term_stats(body_str(&b, "sql")?, None, &params, &after(&b)?, body_u64(&b, "timeout_ms")).await?;
+    let (stats, snapshot, version) = app.svc.term_stats(body_str(&b, "sql")?, None, &params, &after(&b)?, body_u64(&b, "timeout_ms")?).await?;
     Ok(AxJson(json!({"stats": stats, "snapshot": snapshot, "version": version})))
 }
 
@@ -3374,7 +3489,7 @@ async fn term_stats(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
 /// a coordinator's by its shards' counts ([`crate::service::Service::correct`]).
 async fn correct(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let (table, field, text) = (body_str(&b, "table")?.to_string(), body_str(&b, "field")?.to_string(), body_str(&b, "text")?.to_string());
-    let c = app.svc.correct(&table, &field, &text, body_u64(&b, "timeout_ms")).await?;
+    let c = app.svc.correct(&table, &field, &text, body_u64(&b, "timeout_ms")?).await?;
     Ok(AxJson(serde_json::to_value(c).map_err(ApiError::internal)?))
 }
 
@@ -4922,7 +5037,7 @@ async fn log_filter(State(app): State<App>, w: Option<axum::Extension<Principal>
 async fn log_query(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let sql = body_str(&b, "sql")?;
     let params = app.svc.params(None, b.get("params")).await?;
-    let timeout = app.svc.timeout_of(body_u64(&b, "timeout_ms"));
+    let timeout = app.svc.timeout_of(body_u64(&b, "timeout_ms")?);
     let local = match b.get("scope").and_then(|v| v.as_str()) {
         None | Some("cluster") => false,
         Some("local") => true,
@@ -6224,6 +6339,17 @@ async fn rotate_key(State(app): State<App>, w: Option<axum::Extension<Principal>
 /// `{"name": ..., "scope": "feed" | "read" | "write" | "admin",
 /// "expires_days": n}`: a new key; its secret is in this answer only.
 async fn create_key(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    // A misspelt field would otherwise be left out without a word, and a
+    // key without its limits reads every table: refuse what is not a
+    // field of a key.
+    const FIELDS: &[&str] = &["name", "scope", "tables", "routes", "apps", "preset", "prefix", "expires_days", "expires_minutes", "agent", "owner", "note", "on_behalf_of", "reason"];
+    let Json::Object(fields) = &b else { return Err(ApiError::bad("a key is a JSON object: {\"name\": ..., \"scope\": ...}")) };
+    if let Some(k) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+        return Err(ApiError::bad(format!("{k:?} is not a field of a key: {}", FIELDS.join(", "))));
+    }
+    if b.get("prefix").is_some_and(|p| !p.is_null()) && b.get("preset").is_none_or(Json::is_null) {
+        return Err(ApiError::bad("prefix is the tables of a preset: give a \"preset\" (GET /v1/whoami lists them), or limit the key with \"tables\": {\"team_*\": \"write\"}"));
+    }
     let name = body_str(&b, "name")?;
     // `"tables": {"crawl_*": "admin", "*": "read"}`: a key limited to
     // those ([`keys::Grant`]), whose scope is the most they give (and no

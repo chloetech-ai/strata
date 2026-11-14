@@ -116,7 +116,7 @@ The same names are the JSON fields of `POST /v1/crawls` and `POST /v1/preview`, 
 | `include`, `exclude` | | regular expressions on URLs: follow only links that match one of `include`, never those that match `exclude` |
 | `keep` | | regular expressions: write rows only for pages that match (the others are read for their links) |
 | `max_pages` | 1,000 | URLs to fetch at most |
-| `max_depth` | 5 | links from a seed |
+| `max_depth` | 5 | links from a seed; a list's next page (a link with `rel="next"`, or named "Next", "Next page", "Older posts" or an arrow) is as deep as the list, so a long list is read to its end. A crawl that ends says why: its page limit, its depth (with the links it left out, also in the status's `beyond_depth`), or no links left |
 | `concurrency`, `per_host` | 16, 1 | requests at once, and to one host |
 | `delay_ms` | 1,000 | between the starts of two requests to a host (longer when its robots.txt asks, or when it is slow to answer) |
 | `robots`, `sitemaps` | on | obey robots.txt; read sitemaps |
@@ -125,7 +125,7 @@ The same names are the JSON fields of `POST /v1/crawls` and `POST /v1/preview`, 
 | `rules` | | fields from CSS selectors, as above |
 | `learn` | on | learn the site's template |
 | `embed` | | a model to embed the title and body with, into `emb` |
-| `user_agent` | `chloedb-crawl/0.3.2 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)` | a crawl's own is sent with that after it, unless it names `chloedb-crawl` (or `strata-crawl`, its old name) |
+| `user_agent` | `chloedb-crawl/0.3.3 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)` | a crawl's own is sent with that after it, unless it names `chloedb-crawl` (or `strata-crawl`, its old name) |
 | `contact` | `--contact` of `chloedb-crawl serve` (or `CHLOEDB_CRAWL_CONTACT`) | whom a site's owner reaches about the crawl, an email address or a URL, sent in the user agent: `chloedb-crawl/<version> (+https://...; ops@example.com)` |
 | `timeout_ms`, `max_bytes`, `batch` | 20,000, 5 MB, 200 | |
 

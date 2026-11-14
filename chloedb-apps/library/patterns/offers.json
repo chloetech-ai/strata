@@ -1,0 +1,145 @@
+{
+ "title": "Things people order or book while some are left: products with stock, workshops and classes with seats, races with places",
+ "about": "A shop's shelf, a studio's workshops, a club's races: each row a card with its photo, date, price and how many are left. A few left says 'Only 2 left'; none says the out word ('Sold out', 'Full') and offers no action; the rest offer the action, which opens the view that finishes the order or booking with {id} (open), or calls a rule with {id} that checks and lowers the count in one step (call: give the rule a REQUIRE, so two people never get the last one). For dated rows, where 'day >= :today' and order 'day' keep the coming ones, soonest first. Use it on a front page or a booking screen: a visitor sees what is on offer, never a form that edits rows.",
+ "params": {
+  "table": {
+   "about": "the table of things to order or book",
+   "need": true
+  },
+  "key": {
+   "about": "names the pattern's data",
+   "default": "{{table}}"
+  },
+  "title": {
+   "about": "a heading"
+  },
+  "eyebrow": {
+   "about": "a short line above the heading"
+  },
+  "name": {
+   "about": "the column with each one's name",
+   "default": "name"
+  },
+  "text": {
+   "about": "a column with a line about each one"
+  },
+  "price": {
+   "about": "a column with its price"
+  },
+  "image": {
+   "about": "a column with its photo (a URL or a file's id)"
+  },
+  "left": {
+   "about": "the column with how many are left (stock, seats, places)",
+   "need": true
+  },
+  "date": {
+   "about": "a column with its day or time, shown on the card"
+  },
+  "where": {
+   "about": "an SQL condition on the rows (:today is today)"
+  },
+  "order": {
+   "about": "SQL ORDER BY",
+   "default": "{{name}}"
+  },
+  "soon": {
+   "about": "from how many left the card says 'Only N left'",
+   "default": 3
+  },
+  "out": {
+   "about": "the word for none left",
+   "default": "Sold out"
+  },
+  "action": {
+   "about": "the action's words",
+   "default": "Order"
+  },
+  "open": {
+   "about": "the view that finishes the order or booking, opened with {id}"
+  },
+  "call": {
+   "about": "the function or rule called with {id} instead, when one tap is the order (a booking for the signed-in person)"
+  },
+  "done": {
+   "about": "what the toast says after a call",
+   "default": "Done: it is yours"
+  },
+  "look": {
+   "about": "cards (a shelf) or slides",
+   "default": "cards"
+  }
+ },
+ "example": {
+  "use": "offers",
+  "table": "workshops",
+  "title": "Workshops",
+  "name": "title",
+  "text": "summary",
+  "price": "price",
+  "image": "photo",
+  "left": "seats_left",
+  "date": "day",
+  "where": "day >= :today",
+  "order": "day",
+  "out": "Full",
+  "action": "Book a seat",
+  "open": "book"
+ },
+ "screen": {
+  "data": {
+   "{{key}}": {
+    "sql": "SELECT * FROM {{table}}{{where|pre: WHERE }} ORDER BY {{order}} LIMIT 60",
+    "params": {
+     "today": "=today"
+    }
+   }
+  },
+  "let": {
+   "{{key}}_left": "=row => Math.max(0, Number(row.{{left}}) || 0)",
+   "{{key}}_badge": "=row => {{key}}_left(row) === 0 ? {{out|json}} : {{key}}_left(row) <= {{soon}} ? 'Only ' + {{key}}_left(row) + ' left' : null",
+   "{{key}}_act": "=item => ({{open|json}} ? {label: {{action|json}}, open: {{open|json}}, params: {id: item.id}} : {label: {{action|json}}, do: async () => { await app.call({{call|json}}, {id: item.id}); app.toast({{done|json}}); }})"
+  },
+  "body": [
+   {
+    "carousel": "={{key}}",
+    "look": "{{look}}",
+    "title": "{{title}}",
+    "eyebrow": "{{eyebrow}}",
+    "item": {
+     "title": "=item.{{name}}",
+     "text": {
+      "$when": "text",
+      "$value": "=item.{{text}}"
+     },
+     "price": {
+      "$when": "price",
+      "$value": "=item.{{price}} == null ? undefined : app.fmt.money(item.{{price}})"
+     },
+     "src": {
+      "$when": "image",
+      "$value": "=item.{{image}}"
+     },
+     "eyebrow": {
+      "$when": "date",
+      "$value": "=item.{{date}} ? app.fmt.date(item.{{date}}) : null"
+     },
+     "badge": "={{key}}_badge(item)",
+     "action": {
+      "$when": "open|call",
+      "$value": "={{key}}_left(item) === 0 ? null : {{key}}_act(item)"
+     }
+    }
+   },
+   {
+    "if": "={{key}}.length === 0",
+    "then": [
+     {
+      "text": "Nothing on offer right now. Check back soon.",
+      "muted": true
+     }
+    ]
+   }
+  ]
+ }
+}

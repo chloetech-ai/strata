@@ -233,7 +233,12 @@ pub fn blame(store: &Store, book: Option<&Book>, snaps: &Snapshots, project: &st
     };
     let this_turn: Vec<&Receipt> = receipts.iter().filter(|r| r.turn == edit.turn).collect();
     let earlier: Vec<&Receipt> = receipts.iter().filter(|r| r.turn < edit.turn).rev().collect();
-    let shown_ids: Vec<String> = this_turn.iter().chain(earlier.iter()).flat_map(|r| r.shown.iter().cloned()).collect();
+    // Every row a receipt below shows (`Row::shown`: listed rows too, not
+    // only `Receipt::shown`, the ones shown in full), so that a row missing
+    // from the store now is one that was deleted (CTX-6).
+    let mut shown_ids: Vec<String> = this_turn.iter().chain(earlier.iter()).flat_map(|r| r.rows.iter().filter(|x| x.shown()).map(|x| x.id.clone()).chain(r.shown.iter().cloned())).collect();
+    shown_ids.sort();
+    shown_ids.dedup();
     let now_recs = store.get(&shown_ids)?;
     let status = |id: &str| -> Vec<String> {
         let mut flags = Vec::new();

@@ -1411,17 +1411,18 @@ fn refuses_reads(s: &tonic::Status) -> bool {
 /// started with another `--cluster-token`: the coordinator sends every
 /// replica the same one, and the others take it.
 fn try_elsewhere(s: &tonic::Status) -> bool {
-    !matches!(
-        s.code(),
-        Code::InvalidArgument
-            | Code::NotFound
-            | Code::AlreadyExists
-            | Code::PermissionDenied
-            | Code::FailedPrecondition
-            | Code::OutOfRange
-            | Code::Unimplemented
-            | Code::ResourceExhausted
-    )
+    !crate::too_deep_to_decode(s)
+        && !matches!(
+            s.code(),
+            Code::InvalidArgument
+                | Code::NotFound
+                | Code::AlreadyExists
+                | Code::PermissionDenied
+                | Code::FailedPrecondition
+                | Code::OutOfRange
+                | Code::Unimplemented
+                | Code::ResourceExhausted
+        )
 }
 
 /// How a call to a replica ended, for what is kept of the replica

@@ -37,7 +37,7 @@ One token for the apps, a server that lists both, and the two apps pointed at th
 ```sh
 export CHLOEDB_APP_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 
-chloedb-server --db ./apps.chloedb --listen 127.0.0.1:7700 --grpc off \
+chloedb-server --db ./apps.chloedb --listen 127.0.0.1:7700 --grpc off --start-apps off \
   --app sheets=http://127.0.0.1:7820 --app chloectx=http://127.0.0.1:7760 > server.log 2>&1 &
 until curl -sf http://127.0.0.1:7700/v1/health > /dev/null; do sleep 0.2; done
 
@@ -45,7 +45,7 @@ chloedb-sheets serve --server http://127.0.0.1:7700 --token "$CHLOEDB_APP_TOKEN"
 chloectx app --server http://127.0.0.1:7700 --token "$CHLOEDB_APP_TOKEN" --embedder hash:64 > chloectx.log 2>&1 &
 ```
 
-`--embedder hash:64` makes ChloeCtx's vectors from hashed words, which needs no download; leave it out to use its embedding model (`chloectx fetch-model` fetches it once). Without `--token` the server listens on loopback only and anything on this machine that reaches `127.0.0.1:7700` can change it; give it a token, and its clients keys, before it serves anyone else ([security](../chloedb/server.md#security)).
+`--start-apps off` keeps the server from starting the apps installed beside it on its own (it does by default, which is all a first run needs; this page starts them by hand to show how they attach). `--embedder hash:64` makes ChloeCtx's vectors from hashed words, which needs no download; leave it out to use its embedding model (`chloectx fetch-model` fetches it once). Without `--token` the server listens on loopback only and anything on this machine that reaches `127.0.0.1:7700` can change it; give it a token, and its clients keys, before it serves anyone else ([security](../chloedb/server.md#security)).
 
 The server lists the apps once they answer, which is what the command center's **Apps** menu shows:
 

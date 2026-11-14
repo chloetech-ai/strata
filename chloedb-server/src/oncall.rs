@@ -122,6 +122,13 @@ impl Proposal {
     fn json(&self, t: u64) -> Json {
         let mut j = json!(self);
         j["state"] = json!(self.state_now(t));
+        // Every role key reads the list: no credential in what it shows
+        // (audit X-D1).
+        for k in ["body", "result"] {
+            if let Some(v) = j.get(k) {
+                j[k] = crate::changes::scrub(v);
+            }
+        }
         j
     }
 }
@@ -245,9 +252,41 @@ impl Desk {
             p.result = Some(json!({"error": "the server restarted while it was being applied: check whether it took"}));
             p.decided_ms.get_or_insert(t);
         }
+        // A desk kept by a server from before audit X-D1 may hold answers
+        // with secrets in them, and decided bodies: they are scrubbed, and
+        // the file written again (0600) once the desk is loaded.
+        let mut scrubbed = false;
+        for p in ps.iter_mut() {
+            if let Some(r) = &p.result {
+                let c = crate::changes::scrub(r);
+                scrubbed |= c != *r;
+                p.result = Some(c);
+            }
+            // A change request filed before it that carries a credential
+            // is not applied: it is filed again, without it.
+            let carries = p.action == "change" && (crate::catalog::route_of(&p.path).is_some_and(crate::ops::carries_credentials) || p.body.as_ref().is_some_and(|b| crate::changes::secret_in(b).is_some()));
+            if p.state == "pending" && carries {
+                p.state = "failed".into();
+                p.result = Some(json!({"error_code": "scope_refused", "error": "it carries or answers a credential, which a change request no longer does: a person calls the route with their own key"}));
+                p.decided_ms.get_or_insert(t);
+                scrubbed = true;
+            }
+            if p.state != "pending" {
+                if let Some(b) = &p.body {
+                    let c = crate::changes::scrub(b);
+                    scrubbed |= c != *b;
+                    p.body = Some(c);
+                }
+            }
+        }
         let top = ps.iter().filter_map(|p| p.id.strip_prefix(['p', 'c'])?.parse::<u64>().ok()).max().unwrap_or(0);
         let next = j["next"].as_u64().unwrap_or(0).max(top);
         *lock(&self.inner) = (next, ps);
+        if scrubbed {
+            self.save();
+        } else {
+            private(path);
+        }
         let mut g = lock(&self.runs);
         if g.is_empty() {
             *g = runs;
@@ -266,7 +305,7 @@ impl Desk {
             serde_json::to_vec(&j).unwrap_or_default()
         };
         let tmp = path.with_extension("oncall.tmp");
-        if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, path)) {
+        if let Err(e) = write_private(&tmp, &body).and_then(|_| std::fs::rename(&tmp, path)) {
             tracing::warn!(error = %e, path = %path.display(), "could not keep the on-call agent's runs");
         }
     }
@@ -357,7 +396,10 @@ impl Desk {
                     p.state = state.into();
                     p.decided_by = Some(by.to_string());
                     p.decided_ms = Some(t);
-                    p.result = Some(result);
+                    // What it was answered, and the body once it is decided,
+                    // without a credential they may hold (audit X-D1).
+                    p.result = Some(crate::changes::scrub(&result));
+                    p.body = p.body.as_ref().map(crate::changes::scrub);
                     p.json(t)
                 }
                 None => Json::Null,
@@ -1027,9 +1069,52 @@ pub async fn approve(svc: &Arc<Service>, router: Option<Router>, headers: &Heade
     Ok(svc.oncall.decide(&p.id, state, by, result))
 }
 
+/// Writes `body` to `path`, readable by this server's user alone (0600 on
+/// Unix): the desk holds what agents were told and asked (audit X-D1).
+fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(path)?;
+    // A file left by an earlier write keeps its mode: set it.
+    #[cfg(unix)]
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    f.write_all(body)?;
+    f.sync_all()
+}
+
+/// Makes the desk file at `path` readable by this server's user alone, as
+/// a server from before audit X-D1 did not.
+fn private(path: &std::path::Path) {
+    #[cfg(unix)]
+    if let Err(e) = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)) {
+        tracing::warn!(error = %e, path = %path.display(), "could not make the on-call desk readable by this server alone");
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_desk_is_this_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.oncall.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"{\"next\": 0}").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"next\": 0}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        private(&path);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn tools_read_their_routes() {

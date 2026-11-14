@@ -20,6 +20,18 @@ use crate::error::{Error, Result};
 /// SQLite's default limit is 1,000 too.
 pub const MAX_EXPR_DEPTH: usize = 1000;
 
+/// The stack ChloeDB's own query threads (the pool's, DataFusion's) and
+/// chloedb-server's start with: four times the 2 MiB that the statements
+/// [`MAX_EXPR_DEPTH`] lets through are tested to plan and run in
+/// (`tests/deep_statements.rs`), so that a thread with a deeper call
+/// above the query still has room. Untouched, the pages cost no memory.
+pub const QUERY_STACK: usize = 8 << 20;
+
+/// The levels of [`MAX_EXPR_DEPTH`] that each `UNION`, `INTERSECT` or
+/// `EXCEPT` counts for: planning and running a chain of them recurses
+/// once per query joined, with frames larger than an operator's.
+pub const SET_OP_LEVELS: usize = 8;
+
 /// The call `MAX k PER field` parses as, the last item of its query's
 /// ORDER BY: `__max_per(k, field)` ([`crate::query::compound`]).
 pub const PER_CAP: &str = "__max_per";
@@ -103,6 +115,23 @@ fn syntax_error(message: &str, sql_text: &str) -> String {
             return out;
         }
     }
+    // `body MATCH 'words'`, as SQLite's FTS writes it: ChloeDB's MATCH is
+    // a function of the field and the words.
+    if let (Some((line, col)), Some(rest)) = (at, m.strip_prefix("No infix parser for token ")) {
+        if let Some(word) = rest.split("value: \"").nth(1).and_then(|r| r.split('"').next()) {
+            let mut out = format!("SQL syntax error at line {line}, column {col}");
+            if let Some(near) = near(sql_text, line, col) {
+                out.push_str(&format!(" (near \"{near}\")"));
+            }
+            if word.eq_ignore_ascii_case("MATCH") {
+                let (field, words) = infix_match(sql_text, line, col).unwrap_or_else(|| ("field".into(), "'words'".into()));
+                out.push_str(&format!(": MATCH is written as a function of the field and the words, MATCH({field}, {words}), not between them; ORDER BY bm25({field}, {words}) DESC ranks by it"));
+            } else {
+                out.push_str(&format!(": {word} cannot follow what comes before it here; between two values comes an operator (=, <, LIKE, IN, AND, OR)"));
+            }
+            return out;
+        }
+    }
     let mut out = String::from("SQL syntax error");
     if let Some((line, col)) = at {
         out.push_str(&format!(" at line {line}, column {col}"));
@@ -143,6 +172,31 @@ fn alias_typo(sql_text: &str, line: usize, col: usize) -> Option<(String, u64, u
     }
     let kw = *super::hint::nearest(&w.value.to_ascii_uppercase(), CLAUSES.iter().copied()).first()?;
     Some((w.value.clone(), prev.span.start.line, prev.span.start.column, kw))
+}
+
+/// The field before and the text after the `MATCH` at (`line`, `col`) of
+/// `body MATCH 'words'`, as the function call writes them.
+fn infix_match(sql_text: &str, line: usize, col: usize) -> Option<(String, String)> {
+    let tokens = Tokenizer::new(&GenericDialect {}, sql_text).tokenize_with_location().ok()?;
+    let at = tokens.iter().position(|t| t.span.start.line == line as u64 && t.span.start.column == col as u64)?;
+    let solid = |t: &&TokenWithSpan| !matches!(t.token, Token::Whitespace(_));
+    let prev = tokens[..at].iter().rev().find(solid)?;
+    let mut after = tokens[at + 1..].iter().filter(solid);
+    let next = after.next()?;
+    let field = match &prev.token {
+        Token::Word(w) => w.to_string(),
+        _ => return None,
+    };
+    let words = match &next.token {
+        Token::SingleQuotedString(_) | Token::Placeholder(_) => next.token.to_string(),
+        // `:q`, a parameter, as the tokenizer reads it: a colon, then a name.
+        Token::Colon => match &after.next()?.token {
+            Token::Word(w) => format!(":{}", w.value),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((field, words))
 }
 
 /// The parser's names of what it expected, as a sentence says them.
@@ -331,38 +385,177 @@ pub fn unparse_per_caps(sql: &str) -> String {
     out
 }
 
-/// An upper bound of the expression depth `tokens` can parse into: within
-/// each open parenthesis (or bracket), the operators since its last comma,
-/// summed over the open ones, plus how many are open. Commas separate list
-/// items, which sit side by side, so `IN (1, 2, ...)` and `VALUES (...),
-/// (...)` stay shallow however long they are.
+/// An upper bound of the depth `tokens` can parse into: within each open
+/// parenthesis (or bracket), the operators since its last comma, summed
+/// over the open ones, plus how many are open. Commas separate list items,
+/// which sit side by side, so `IN (1, 2, ...)` and `VALUES (...), (...)`
+/// stay shallow however long they are. `UNION`, `INTERSECT` and `EXCEPT`
+/// nest the queries they join as operators nest expressions, and every
+/// step of planning one costs more stack than an operator's, so each
+/// counts [`SET_OP_LEVELS`], and the commas of the queries it joins do not
+/// take them back; the operators of the query before it do not count on.
 fn check_depth(tokens: &[Token]) -> Result<()> {
-    let mut open: Vec<usize> = vec![0];
+    depth(tokens, MAX_EXPR_DEPTH).map(drop).map_err(|()| {
+        Error::Query(format!(
+            "the statement nests more than {MAX_EXPR_DEPTH} levels deep (long chains of AND, OR or arithmetic, deep parentheses, or more than {} queries joined by UNION, INTERSECT or EXCEPT); use IN lists or split it",
+            MAX_EXPR_DEPTH / SET_OP_LEVELS
+        ))
+    })
+}
+
+/// The bound of [`check_depth`] on how deep `tokens` nest, or `Err` once
+/// it passes `limit`.
+fn depth(tokens: &[Token], limit: usize) -> std::result::Result<usize, ()> {
+    // Per open parenthesis: the operators since its last comma, and the
+    // set operators within it.
+    let mut open: Vec<(usize, usize)> = vec![(0, 0)];
     let mut sum = 0usize;
+    let mut most = 0usize;
     for t in tokens {
         match t {
-            Token::LParen | Token::LBracket | Token::LBrace => open.push(0),
+            Token::LParen | Token::LBracket | Token::LBrace => open.push((0, 0)),
             Token::RParen | Token::RBracket | Token::RBrace => {
                 if open.len() > 1 {
-                    sum -= open.pop().unwrap_or(0);
+                    let (ops, sets) = open.pop().unwrap_or_default();
+                    sum -= ops + sets;
                 }
             }
-            Token::Comma | Token::SemiColon => {
-                let last = open.last_mut().expect("the statement level");
+            Token::Comma => {
+                let last = &mut open.last_mut().expect("the statement level").0;
                 sum -= *last;
                 *last = 0;
             }
+            Token::SemiColon => {
+                let (ops, sets) = open.last_mut().expect("the statement level");
+                sum -= *ops + *sets;
+                (*ops, *sets) = (0, 0);
+            }
+            // The query before it is whole: its operators do not nest
+            // with the next one's.
+            Token::Word(w) if matches!(w.keyword, Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT | Keyword::MINUS) => {
+                let (ops, sets) = open.last_mut().expect("the statement level");
+                sum -= *ops;
+                *ops = 0;
+                *sets += SET_OP_LEVELS;
+                sum += SET_OP_LEVELS;
+            }
             t if chains(t) => {
-                *open.last_mut().expect("the statement level") += 1;
+                open.last_mut().expect("the statement level").0 += 1;
                 sum += 1;
             }
             _ => {}
         }
-        if sum + open.len() > MAX_EXPR_DEPTH {
-            return Err(Error::Query(format!("the statement nests expressions more than {MAX_EXPR_DEPTH} levels deep (long chains of AND, OR or arithmetic, or deep parentheses); use IN lists or split it")));
+        most = most.max(sum + open.len());
+        if most > limit {
+            return Err(());
         }
     }
-    Ok(())
+    Ok(most)
+}
+
+/// How deep a statement may nest ([`check_depth`]'s bound) to be planned
+/// and run on the thread that asks for it, which may be a tokio worker's
+/// or a blocking thread's of 2 MiB: [`deep_stack`] gives a deeper one a
+/// thread of [`QUERY_STACK`]. The statements of each shape at this depth
+/// are tested on a 2 MiB thread (`tests/deep_statements.rs`).
+pub const INLINE_DEPTH: usize = 100;
+
+/// The longest statement that cannot nest past [`INLINE_DEPTH`]: each
+/// level takes a byte or more of text.
+const INLINE_BYTES: usize = INLINE_DEPTH - 1;
+
+/// Whether `sql` may nest deeper than [`INLINE_DEPTH`], by [`check_depth`]'s
+/// bound, or may call a stored function: a call is written out after the
+/// text is read ([`crate::query::function::expand`]), and may nest as
+/// deep as a statement may ([`MAX_EXPR_DEPTH`]) however short its text.
+/// A statement with a parenthesis or longer than [`INLINE_BYTES`] is
+/// tokenized once more to tell. One that does not tokenize is not deep
+/// (its parse fails on the thread that asks).
+pub fn nests_deep(sql: &str) -> bool {
+    if sql.len() <= INLINE_BYTES && !sql.contains('(') {
+        return false;
+    }
+    match Tokenizer::new(&GenericDialect {}, sql).tokenize() {
+        Ok(tokens) => may_call_stored(&tokens) || (sql.len() > INLINE_BYTES && depth(&tokens, INLINE_DEPTH).is_err()),
+        Err(_) => false,
+    }
+}
+
+/// Words a parenthesis follows that name no function: a stored
+/// function's name may be any other word but a built-in one's.
+const NOT_CALLS: &[Keyword] = &[
+    Keyword::ALL, Keyword::AND, Keyword::ANY, Keyword::ARRAY, Keyword::AS, Keyword::BETWEEN, Keyword::BY, Keyword::CASE, Keyword::CAST, Keyword::CHAR, Keyword::CHECK, Keyword::CREATE, Keyword::DECIMAL,
+    Keyword::DEFAULT, Keyword::ELSE, Keyword::EXCEPT, Keyword::EXISTS, Keyword::EXTRACT, Keyword::FILTER, Keyword::FROM, Keyword::FUNCTION, Keyword::GROUP, Keyword::HAVING, Keyword::IN, Keyword::INTERSECT,
+    Keyword::INTERVAL, Keyword::INTO, Keyword::IS, Keyword::JOIN, Keyword::KEY, Keyword::LATERAL, Keyword::LIMIT, Keyword::NOT, Keyword::NUMERIC, Keyword::OFFSET, Keyword::ON, Keyword::OPTIONS, Keyword::OR,
+    Keyword::ORDER, Keyword::OVER, Keyword::PARTITION, Keyword::PRIMARY, Keyword::RETURNS, Keyword::ROW, Keyword::SELECT, Keyword::SET, Keyword::TABLE, Keyword::THEN, Keyword::TRY_CAST, Keyword::UNION,
+    Keyword::UNIQUE, Keyword::UNNEST, Keyword::USING, Keyword::VALUES, Keyword::VARCHAR, Keyword::WHEN, Keyword::WHERE, Keyword::WITH, Keyword::WITHIN,
+];
+
+/// Words after which a name followed by a parenthesis is a table's, with
+/// its columns: `INSERT INTO t (a, b)`, `CREATE TABLE t (...)`.
+const NAMES_TABLE: &[Keyword] = &[Keyword::INTO, Keyword::TABLE, Keyword::EXISTS, Keyword::INDEX, Keyword::ON, Keyword::REFERENCES, Keyword::FUNCTION];
+
+/// Whether `tokens` call a function that may be a stored one: a word,
+/// not a built-in function's name nor one of [`NOT_CALLS`], followed by
+/// a parenthesis, and not a table's name before its columns.
+fn may_call_stored(tokens: &[Token]) -> bool {
+    let mut words = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).peekable();
+    let mut before: Option<&Token> = None;
+    while let Some(t) = words.next() {
+        let prev = before.replace(t);
+        let Token::Word(w) = t else { continue };
+        if w.quote_style.is_some() || !matches!(words.peek(), Some(Token::LParen)) || NOT_CALLS.contains(&w.keyword) {
+            continue;
+        }
+        if matches!(prev, Some(Token::Word(p)) if NAMES_TABLE.contains(&p.keyword)) {
+            continue;
+        }
+        let name = w.value.to_ascii_lowercase();
+        if !name.starts_with("__") && !crate::query::function::RESERVED.contains(&name.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+thread_local! {
+    /// Whether this thread has [`QUERY_STACK`] or more (a thread of
+    /// [`deep_stack`], or of the query pool).
+    static DEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread has at least [`QUERY_STACK`] of stack
+/// ([`mark_deep_stack`]).
+pub fn on_deep_stack() -> bool {
+    DEEP.with(std::cell::Cell::get)
+}
+
+/// Marks this thread as one with at least [`QUERY_STACK`] of stack, on
+/// which [`deep_stack`] runs its work itself.
+pub fn mark_deep_stack() {
+    DEEP.with(|d| d.set(true));
+}
+
+/// `f`, on a thread of [`QUERY_STACK`] when `deep` and this thread is not
+/// one (its caller waits), else here. Planning, binding, running and
+/// dropping a statement recurse once per level it nests, so a statement
+/// that nests deeper than [`INLINE_DEPTH`] ([`nests_deep`]) runs so, on
+/// whatever thread it was asked from.
+pub fn deep_stack<T: Send>(deep: bool, f: impl FnOnce() -> T + Send) -> T {
+    if !deep || on_deep_stack() {
+        return f();
+    }
+    std::thread::scope(|s| {
+        let h = std::thread::Builder::new()
+            .name("chloedb-deep".into())
+            .stack_size(QUERY_STACK)
+            .spawn_scoped(s, || {
+                mark_deep_stack();
+                f()
+            })
+            .expect("start a thread for a deep statement");
+        h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
 }
 
 /// Whether a token can join two expressions into a deeper one: every
@@ -423,6 +616,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_infix_match_says_how_chloedb_writes_it() {
+        let e = parse("SELECT id FROM t WHERE body MATCH 'red mug' LIMIT 3").unwrap_err().to_string();
+        assert!(e.contains("MATCH(body, 'red mug')") && e.contains("bm25(body, 'red mug')"), "{e}");
+        let e = parse("SELECT id FROM t WHERE title MATCH :q").unwrap_err().to_string();
+        assert!(e.contains("MATCH(title, :q)"), "{e}");
+        let hint = |sql: &str, rows, zero| crate::query::hint::of_answer(sql, rows, zero);
+        assert!(hint("SELECT id FROM t WHERE MATCH(body, 'red mug cup')", 0, false).is_some_and(|h| h.contains("'red OR mug OR cup'")));
+        assert_eq!(hint("SELECT id FROM t WHERE MATCH(body, 'red OR mug')", 0, false), None);
+        assert_eq!(hint("SELECT id FROM t WHERE MATCH(body, 'red')", 0, false), None);
+        assert_eq!(hint("SELECT id FROM t WHERE MATCH(body, 'red mug')", 3, false), None);
+        assert!(hint("SELECT id, score() FROM t WHERE MATCH(body, 'red')", 3, true).is_some_and(|h| h.contains("ORDER BY bm25")));
+        assert_eq!(hint("SELECT id, score() FROM t WHERE MATCH(body, 'red') ORDER BY bm25(body, 'red') DESC", 3, true), None);
+    }
+
+    #[test]
     fn max_k_per_parses_as_the_last_ordering() {
         let as_sql = |q: &str| parse(q).unwrap()[0].to_string();
         assert_eq!(as_sql("SELECT id FROM t ORDER BY bm25(body, 'x') DESC MAX 2 PER venue LIMIT 20"), "SELECT id FROM t ORDER BY bm25(body, 'x') DESC, __max_per(2, venue) LIMIT 20");
@@ -461,5 +669,22 @@ mod tests {
             let r = parse(&format!("SELECT id FROM t WHERE {bad}"));
             assert!(matches!(&r, Err(Error::Query(m)) if m.contains("nests")), "{r:?}");
         }
+        // Each set operator counts SET_OP_LEVELS, its queries' commas and
+        // operators apart; within parentheses as without.
+        let most = (MAX_EXPR_DEPTH - 1) / SET_OP_LEVELS + 1;
+        for (n, ok) in [(most, true), (most + 1, false)] {
+            for q in ["SELECT a, b FROM t WHERE a = 1 AND b > 2", "SELECT 1"] {
+                let chain = vec![q; n].join(" UNION ALL ");
+                for sql in [chain.clone(), format!("SELECT id FROM t WHERE id IN ({chain})"), vec![q; n].join(" INTERSECT "), vec![q; n].join(" EXCEPT ")] {
+                    let r = parse(&sql);
+                    assert_eq!(r.is_ok(), ok, "{n} of {q}: {:?}", r.err());
+                    if !ok {
+                        assert!(matches!(&r, Err(Error::Query(m)) if m.contains("nests more than") && m.contains("UNION")), "{r:?}");
+                    }
+                }
+            }
+        }
+        // Statements apart count apart.
+        assert!(parse(&format!("{0}; {0}", vec!["SELECT 1"; most].join(" UNION ALL "))).is_ok());
     }
 }

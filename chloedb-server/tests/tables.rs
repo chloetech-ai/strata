@@ -428,8 +428,11 @@ async fn every_table_over_http_and_grpc() {
     assert_eq!((events["table"].as_str(), events["shard_by"].as_str(), events["short"]["shard_by"].as_str()), (Some("events"), Some("usr"), Some("usr")));
     let first: Json = c.get(format!("{h}/v1/schema")).send().await.unwrap().json().await.unwrap();
     assert_eq!((first["table"].as_str(), first["shard_by"].is_null()), (Some("items"), true));
+    // A table there is none of is not found (PRF-9).
     let r = c.get(format!("{h}/v1/schema?table=nope")).send().await.unwrap();
-    assert_eq!(r.status().as_u16(), 400);
+    assert_eq!(r.status().as_u16(), 404);
+    let j: Json = r.json().await.unwrap();
+    assert_eq!(j["error_code"], "table_not_found", "{j}");
 
     // Rows of each table: operations that name it, an import, SQL.
     let (items, _, events) = rows();

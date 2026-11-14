@@ -1,6 +1,6 @@
 [package]
 name = "chloedb-server"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 # Integration tests are the targets below, not one per file in tests/.
 autotests = false

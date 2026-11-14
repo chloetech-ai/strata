@@ -238,11 +238,18 @@ async fn presets_are_grants_and_routes() {
         (json!({"name": "a4", "preset": "analyst", "prefix": "x_*", "tables": {"y": "read"}}), "leave them out"),
         (json!({"name": "a5", "scope": "admin", "routes": ["fleet"]}), "limited to tables"),
         (json!({"name": "a6", "tables": {"x_*": "read"}, "routes": ["everything"]}), "not a group"),
+        // A misspelt field is refused, not left out: without its limits the
+        // key would read every table.
+        (json!({"name": "a7", "presett": "oncall", "prefix": "logs_*"}), "\"presett\" is not a field of a key"),
+        (json!({"name": "a8", "tabels": {"logs_*": "write"}}), "\"tabels\" is not a field of a key"),
+        (json!({"name": "a9", "prefix": "logs_*"}), "prefix is the tables of a preset"),
     ] {
         let (s, j) = call(&base, "POST", "/v1/admin/keys", ROOT, Some(body.clone())).await;
         assert_eq!(s, 400, "{body}: {j}");
         assert!(j["error"].as_str().unwrap().contains(why), "{body}: {j}");
     }
+    let (_, listed) = call(&base, "GET", "/v1/admin/keys", ROOT, None).await;
+    assert!(!listed.to_string().contains("\"a7\"") && !listed.to_string().contains("\"a8\""), "a refused key is not made: {listed}");
     // Given by hand, as a preset gives them.
     let (s, made) = call(&base, "POST", "/v1/admin/keys", ROOT, Some(json!({"name": "ops2", "tables": {"logs_*": "write"}, "routes": ["fleet"]}))).await;
     assert_eq!((s, &made["key"]["allow"]["routes"]), (200, &json!(["fleet"])), "{made}");

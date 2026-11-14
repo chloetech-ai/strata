@@ -85,8 +85,8 @@ export const NAV = [
     { id: "explorer", title: "Log explorer", icon: "search", key: "m" },
     { id: "queries", title: "Queries", icon: "queries", key: "q" },
     { id: "performance", title: "Performance", icon: "perf", key: "p" },
-    { id: "oncall", title: "On-call agent", icon: "agent", key: "n", scope: "admin" },
-    { id: "feedback", title: "Feedback", icon: "feedback", key: "f", scope: "write" },
+    { id: "oncall", title: "On-call agent", icon: "agent", key: "n", scope: "admin", route: "POST /v1/admin/oncall" },
+    { id: "feedback", title: "Feedback", icon: "feedback", key: "f", scope: "write", route: "POST /v1/feedback" },
   ]],
   ["Run the cluster", [
     { id: "cluster", title: "Cluster", icon: "cluster", key: "c" },

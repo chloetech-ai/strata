@@ -21,7 +21,9 @@ What a block's info string means (```lang words...):
                           stopped when the page ends)
     sh, first line "# install"
                           shown, not run: installs a reader does once (the
-                          checkout's own builds are on PATH instead)
+                          checkout's own builds are on PATH instead);
+                          scripts/check-doc-urls.py checks that what they
+                          download exists
     python, js            run as a script (python3, node) in the page's
                           directory
     sql db=FILE           run against the database FILE (in-process, with

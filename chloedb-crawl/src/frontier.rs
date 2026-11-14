@@ -154,6 +154,22 @@ impl Frontier {
         self.lock().seen.insert(crate::urls::hash(url))
     }
 
+    /// Whether a URL was seen (queued, fetched, or marked).
+    pub fn seen(&self, url: &str) -> bool {
+        self.lock().seen.contains(&crate::urls::hash(url))
+    }
+
+    /// How many of these URL hashes were not seen.
+    pub fn unseen(&self, hashes: &HashSet<u64>) -> usize {
+        let g = self.lock();
+        hashes.iter().filter(|h| !g.seen.contains(h)).count()
+    }
+
+    /// The most URLs handed out (`max_pages`).
+    pub fn limit(&self) -> u64 {
+        self.lock().limit
+    }
+
     /// Queues a URL unless it was seen. Whether it was queued.
     pub fn push(&self, item: Item) -> bool {
         let mut g = self.lock();

@@ -158,9 +158,14 @@
       return el;
     };
 
+    // The page's layout (a screen's "layout") chooses how a hero that does
+    // not say its look is drawn: a photo, words beside it, or plain words.
+    let pageLayout = null;
+    const LAYOUT_HERO = { hero: 'photo', split: 'split', editorial: 'plain', gallery: 'split', dashboard: 'split', tool: 'split' };
     F.hero = (b, s, path) => {
-      const look = b.look || (b.src || b.photo ? 'photo' : 'gradient');
-      const align = b.align || (look === 'split' ? 'left' : 'center');
+      const pic0 = b.src || b.photo;
+      const look = b.look || (pageLayout && LAYOUT_HERO[pageLayout] && (pic0 || LAYOUT_HERO[pageLayout] === 'plain') ? LAYOUT_HERO[pageLayout] : pic0 ? 'photo' : 'gradient');
+      const align = b.align || (look === 'split' || pageLayout === 'editorial' ? 'left' : 'center');
       const height = b.height || (look === 'photo' ? 'full' : look === 'split' ? 'tall' : 'tall');
       const text = h('div', { class: `fp-hero-text ${align}` },
         [b.eyebrow ? h('p', { class: 'fp-eyebrow' }, tx(b.eyebrow, s, path)) : null,
@@ -429,7 +434,8 @@
     // section of its own, plain blocks between them gathered in one.
     const kindOf = (b) => (b && typeof b === 'object' ? KINDS.find((k) => b[k] !== undefined) : null);
     const flat = (x) => (Array.isArray(x) ? x.flatMap(flat) : x == null || x === false ? [] : [x]);
-    function page(body, s) {
+    function page(body, s, layout = null) {
+      pageLayout = layout;
       const out = [];
       let loose = null;
       const section = (b, i) => h('section', { class: `fp-sec${b && b.tint ? ' tint' : ''}`, id: (b && b.id) || null }, h('div', { class: 'fp-wrap' }));

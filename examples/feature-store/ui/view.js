@@ -19,7 +19,9 @@ const CSS = `
 .fs-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
 .fs-kpis .kpi { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); }
 .fs-kpis .delta { max-width: none; }
-.fs-pipe { width: 100%; height: auto; display: block; }
+.fs-pipe { width: 100%; min-width: 760px; height: auto; display: block; }
+/* On a phone the diagram keeps a readable size and scrolls sideways. */
+:has(> .fs-pipe) { overflow-x: auto; }
 .fs-pipe .node rect { fill: var(--surface); stroke: var(--line-2); stroke-width: 1.2; }
 .fs-pipe .node.k-stream rect { stroke: var(--s1); }
 .fs-pipe .node.k-batch rect { stroke: var(--s4); }
@@ -392,15 +394,23 @@ function shopPage(root, ctx) {
   const who = h("div", { class: "fs-who" });
   const grid = h("div", { class: "fs-grid" });
   const timing = h("div");
-  const result = h("div");
+  const result = h("div"), failed = h("div");
   root.append(h("div", { class: "fs-note" }, "The sample application: the shop's ranking for one shopper, as the shoppers get it. Each card shows how much each feature pushed the product up or down. Click a product as this shopper: its impressions and the click are written in one transaction, and the shopper's features are read back at once."));
   root.append(h("div", { class: "fs-shop" },
     card({ title: "Shopper", tools: [again], body: [pick, who] }),
-    h("div", {}, card({ title: "Ranked for them", sub: "top 8 of 240", body: [timing, result, grid] }))));
+    h("div", {}, card({ title: "Ranked for them", sub: "top 8 of 240", body: [timing, failed, result, grid] }))));
   pick.onchange = () => { uid = pick.value; load(); };
 
   async function load(flash) {
-    const r = await ctx.api(`/api/shop?user=${encodeURIComponent(uid)}`);
+    let r;
+    try { r = await ctx.api(`/api/shop?user=${encodeURIComponent(uid)}`); } catch (e) {
+      // The shop could not rank (a table the model reads is gone): say so
+      // in place of the products, not a blank page.
+      failed.replaceChildren(h("div", { class: "error" }, `The shop could not rank: ${e.message}`));
+      grid.replaceChildren();
+      return;
+    }
+    failed.replaceChildren();
     last = r;
     drawWho(r, flash);
     const ms = r.ms;

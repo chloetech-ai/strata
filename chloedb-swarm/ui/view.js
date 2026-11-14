@@ -38,6 +38,7 @@ const CSS = `
 .swm-sev3 { background: var(--crit-soft); color: var(--crit-ink); }
 .swm-sev2 { background: var(--warn-soft); color: var(--text); }
 .swm-sev1 { background: var(--surface-3); color: var(--text-2); }
+.swm-sev0 { background: var(--good-soft); color: var(--good-ink); }
 .swm-steps { list-style: none; margin: 0; padding: 0; }
 .swm-steps li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
 .swm-steps li:first-child { border-top: 0; }
@@ -169,7 +170,7 @@ function runPage(root, ctx, id) {
     parts.push(h('div', { class: 'swm-kpis' },
       kpi(h, 'Succeeded', pct(t.rate ?? (done.length ? ok / done.length : null)), `${ok} of ${done.length} sessions`),
       kpi(h, 'Sessions', fmt.n(done.length), `of ${run.planned} planned`),
-      kpi(h, 'Findings', fmt.n(findings.length), t.problems != null ? `from ${t.problems} problems` : 'after the review'),
+      kpi(h, 'Findings', fmt.n(findings.filter((f) => f.category !== 'strength').length), t.problems != null ? `from ${t.problems} problems` : 'after the review'),
       kpi(h, 'Agent mistakes', t.problems ? pct(t.agent_mistakes / t.problems) : '–', 'of the problems found'),
       kpi(h, 'Cost', usd(run.cost?.usd), `users ${usd(run.cost?.users?.usd)}, review ${usd(run.cost?.judge?.usd)}`)));
 
@@ -187,7 +188,14 @@ function runPage(root, ctx, id) {
       h('tbody', {}, personas.map((p) => h('tr', {}, h('td', {}, p), tasks.map((k) => h('td', {}, cell(sessions.filter((s) => s.persona.id === p && s.task.id === k))))))));
     const byModel = t.by_model ? h('div', { class: 'small dim', style: { marginTop: '10px' } }, 'By the model playing the user: ', Object.entries(t.by_model).map(([m, b]) => `${m} ${pct(b.rate)} of ${b.n}, ${b.steps} steps, ease ${b.ease ?? '–'}`).join(' · ')) : null;
 
-    const flist = h('div', {}, findings.length ? findings.map((f) => h('div', { class: 'swm-f' },
+    const bad = findings.filter((f) => f.category !== 'strength');
+    const good = findings.filter((f) => f.category === 'strength');
+    const glist = h('div', {}, good.map((f) => h('div', { class: 'swm-f' },
+      h('div', { class: 't' }, h('span', { class: 'swm-chip swm-sev0' }, 'strength'), h('b', {}, f.title)),
+      h('div', { class: 'meta' }, `${f.sessions.length} sessions (${pct(f.share)}) · `, f.personas.map((p) => h('span', { class: 'swm-chip' }, p)), f.tasks.map((k) => h('span', { class: 'swm-chip' }, k))),
+      h('div', {}, f.summary),
+      h('ul', {}, (f.evidence || []).map((e) => h('li', {}, h('a', { href: ctx.href(id, e.session, String(e.step)) }, `${e.session.replace(`${id}-`, '')} step ${e.step}`), ': ', e.detail))))));
+    const flist = h('div', {}, bad.length ? bad.map((f) => h('div', { class: 'swm-f' },
       h('div', { class: 't' }, h('span', { class: `swm-chip swm-sev${f.severity}` }, ['', 'friction', 'costly', 'blocking'][f.severity] || f.severity), h('b', {}, `${f.rank}. ${f.title}`)),
       h('div', { class: 'meta' }, `${f.category.replace('_', ' ')} · ${f.sessions.length} sessions (${pct(f.share)}) · `, f.personas.map((p) => h('span', { class: 'swm-chip' }, p)), f.tasks.map((k) => h('span', { class: 'swm-chip' }, k))),
       h('div', {}, f.summary),
@@ -209,7 +217,7 @@ function runPage(root, ctx, id) {
     body.replaceChildren(...parts,
       h('div', { class: 'swm-cols' },
         card({ title: 'Findings', sub: 'grouped from every session\'s review, most important first', body: flist }),
-        h('div', { class: 'grid' }, card({ title: 'Success by persona and task', body: h('div', {}, matrix, byModel) }))),
+        h('div', { class: 'grid' }, card({ title: 'Success by persona and task', body: h('div', {}, matrix, byModel) }), good.length ? card({ title: 'Strengths', sub: 'what worked, to keep', body: glist }) : null)),
       h('div', { style: { height: '14px' } }),
       card({ title: 'Sessions', flush: true, body: stable }));
   };
@@ -250,7 +258,7 @@ function sessionPage(root, ctx, runId, sid, target) {
             card({ title: 'Task', body: kv([['Person', `${s.persona.name}, ${s.persona.role}`], ['Device', s.persona.device], ['Surface', s.task.surface], ['Asked', h('div', { style: { whiteSpace: 'pre-wrap' } }, s.task.prompt.length > 600 ? `${s.task.prompt.slice(0, 600)}…` : s.task.prompt)]]) }),
             card({ title: 'Result', body: kv([['Answer', s.answer], ['Checks', h('div', {}, (s.checks || []).map((c) => h('div', {}, `${c.ok ? '✓' : '✗'} ${c.name}: ${c.detail}`)))], ['Error', s.error], ['Errors seen', `${s.errors.failed_steps} failed steps, ${s.errors.http5xx} server errors, ${s.errors.http4xx} refused calls, ${s.errors.console} console errors`]]) }),
             iv ? card({ title: 'Exit interview', body: kv([['Ease (1-7)', String(iv.ease)], ['Hardest', iv.hardest], ['Expected', iv.expected], ['One change', iv.one_change], ['Would use', iv.would_use]]) }) : null,
-            review ? card({ title: 'Review', sub: review.verdict.replace('_', ' '), body: h('div', {}, h('p', { style: { marginTop: 0 } }, review.summary), review.problems.length ? h('ul', { style: { paddingLeft: '18px', margin: 0 } }, review.problems.map((p) => h('li', {}, h('span', { class: `swm-chip swm-sev${p.severity}` }, p.category.replace('_', ' ')), h('a', { href: ctx.href(runId, sid, String(p.step)) }, `step ${p.step}`), `: ${p.title}. `, h('span', { class: 'dim' }, p.detail)))) : h('div', { class: 'dim' }, 'No problems.')) }) : null)));
+            review ? card({ title: 'Review', sub: review.verdict.replace('_', ' '), body: h('div', {}, h('p', { style: { marginTop: 0 } }, review.summary), review.problems.length ? h('ul', { style: { paddingLeft: '18px', margin: 0 } }, review.problems.map((p) => h('li', {}, h('span', { class: `swm-chip swm-sev${p.severity}` }, p.category.replace('_', ' ')), h('a', { href: ctx.href(runId, sid, String(p.step)) }, `step ${p.step}`), `: ${p.title}. `, h('span', { class: 'dim' }, p.detail)))) : h('div', { class: 'dim' }, 'No problems.'), (review.strengths || []).length ? h('ul', { style: { paddingLeft: '18px', margin: '8px 0 0' } }, review.strengths.map((p) => h('li', {}, h('span', { class: 'swm-chip swm-sev0' }, 'strength'), h('a', { href: ctx.href(runId, sid, String(p.step)) }, `step ${p.step}`), `: ${p.title}. `, h('span', { class: 'dim' }, p.detail)))) : null) }) : null)));
       if (target) document.getElementById(`step-${target}`)?.scrollIntoView({ block: 'center' });
     } catch (e) { body.replaceChildren(failure(e, 'This session')); }
   })();

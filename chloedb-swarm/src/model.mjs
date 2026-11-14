@@ -80,13 +80,15 @@ export function useClient(c) { shared = c; }
  * One request; `spend` is charged and the answer carries its `cost`. A
  * spent budget and a refusal are errors, which the caller records.
  */
-export async function ask(spend, params) {
+export async function ask(spend, params, { stream = false } = {}) {
   if (spend?.over) throw Object.assign(new Error(`the run's budget of $${spend.cap} is spent`), { budget: true });
   // Sonnet 5.5 and Opus 5.5 decline some requests by classifier; a server-side
-  // fallback retries those it can on the model Anthropic recommends.
-  const res = FALLBACK.test(params.model)
-    ? await client().beta.messages.create({ ...params, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' })
-    : await client().messages.create(params);
+  // fallback retries those it can on the model Anthropic recommends. A long
+  // answer (`stream`) is streamed, so a large max_tokens does not time out.
+  const fb = FALLBACK.test(params.model);
+  const api = fb ? client().beta.messages : client().messages;
+  const body = fb ? { ...params, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' } : params;
+  const res = stream && api.stream ? await api.stream(body).finalMessage() : await api.create(body);
   const priced = PRICES[res.model] ? res.model : params.model;
   const cost = spend ? spend.charge(priced, res.usage) : costOf(priced, res.usage);
   if (res.stop_reason === 'refusal') throw Object.assign(new Error(`the model declined (${res.stop_details?.category || 'no category'})`), { cost, refusal: true });

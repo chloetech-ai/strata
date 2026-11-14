@@ -11,7 +11,7 @@ The package is in [`chloedb-js/`](https://github.com/chloetech-ai/chloedb/tree/m
 Each `chloedb-js-v<version>` release on [GitHub](https://github.com/chloetech-ai/chloedb/releases) has a tarball per platform with the addon built in, which installs with no Rust and no compiler. Install the tarball for your platform:
 
 ```sh
-npm install https://github.com/chloetech-ai/chloedb/releases/download/chloedb-js-v0.3.2/chloedb-0.3.2-darwin-arm64.tgz
+npm install https://github.com/chloetech-ai/chloedb/releases/download/chloedb-js-v0.3.3/chloedb-0.3.3-darwin-arm64.tgz
 ```
 
 It imports as `"chloedb"`. Windows and Alpine (musl) have no tarball: build from source there (Windows through WSL 2). Release 0.1.0, from before the rename, was published as `strata-db` and imports as `"strata-db"`.
@@ -25,7 +25,7 @@ It imports as `"chloedb"`. Windows and Alpine (musl) have no tarball: build from
 
 The workflow [`js-release.yml`](https://github.com/chloetech-ai/chloedb/blob/main/.github/workflows/js-release.yml) builds the tarballs on a `chloedb-js-v<version>` tag and runs each one in an empty app before attaching it to the release; `node scripts/pack.mjs <platform>` packs one by hand.
 
-`chloedb` on npm is a placeholder (0.0.x) that holds the name until the releases are published there: a bare `npm install chloedb` installs it, and importing it throws an error that says how to install ChloeDB. From 0.3.2 the same workflow can publish to npm the way napi-rs packages are: `chloedb`, the JavaScript, with a package per platform holding its addon (`@chloedb/linux-x64-gnu`, `@chloedb/darwin-arm64`, ...) as optional dependencies, of which npm installs the one of your machine. Once it has (the workflow's header says what that needs), `npm install chloedb` is all it takes. `node scripts/pack.mjs --npm <platform>` and `--npm-main` pack those packages by hand.
+`chloedb` on npm is a placeholder (0.0.x) that holds the name until the releases are published there: a bare `npm install chloedb` installs it, and importing it throws an error that says how to install ChloeDB. From 0.3.3 the same workflow can publish to npm the way napi-rs packages are: `chloedb`, the JavaScript, with a package per platform holding its addon (`@chloedb/linux-x64-gnu`, `@chloedb/darwin-arm64`, ...) as optional dependencies, of which npm installs the one of your machine. Once it has (the workflow's header says what that needs), `npm install chloedb` is all it takes. `node scripts/pack.mjs --npm <platform>` and `--npm-main` pack those packages by hand.
 
 ### From source
 

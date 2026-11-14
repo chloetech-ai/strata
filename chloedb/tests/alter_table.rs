@@ -394,3 +394,48 @@ fn values_set_in_place_keep_their_column() {
     assert_eq!(rows(&db, "SELECT n FROM items WHERE id = 'a'"), [[Value::Null]]);
     db.storage().check().unwrap();
 }
+
+/// INSERTs racing `ALTER TABLE` on their table (finding PRF-3): one bound
+/// before an ALTER committed and run after it is bound again, to the table
+/// as it is then, and writes its rows, rather than failing with "was
+/// altered ... while the statement ran".
+#[test]
+fn inserts_racing_alter_table_write_their_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("t.strata"), items(), opts()).unwrap();
+    let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let written = std::thread::scope(|s| {
+        let writers: Vec<_> = (0..3)
+            .map(|w| {
+                let db = &db;
+                s.spawn(move || {
+                    let mut n = 0i64;
+                    while std::time::Instant::now() < stop {
+                        let values: Vec<String> = (0..10).map(|k| format!("('w{w}-{}', 'row', {k})", n + k)).collect();
+                        db.sql(&format!("INSERT INTO items (id, title, n) VALUES {}", values.join(", ")), &Params::new()).unwrap_or_else(|e| panic!("{e}"));
+                        n += 10;
+                    }
+                    n
+                })
+            })
+            .collect();
+        let mut k = 0;
+        while std::time::Instant::now() < stop {
+            k += 1;
+            for sql in [format!("ALTER TABLE items ADD COLUMN c{k} INT"), format!("ALTER TABLE items RENAME COLUMN c{k} TO d{k}"), format!("ALTER TABLE items DROP COLUMN d{k}")] {
+                // The writer may be busy with an INSERT a moment.
+                while let Err(e) = db.sql(&sql, &Params::new()) {
+                    assert!(matches!(e, chloedb::Error::Busy(_)), "{sql}: {e}");
+                }
+                // As a client sends them, one after the other: back to back,
+                // this thread takes the writer again before the INSERTs
+                // waiting for it wake.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert!(k > 1, "{k} rounds of changes");
+        writers.into_iter().map(|w| w.join().unwrap()).sum::<i64>()
+    });
+    assert!(written > 0);
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM items"), vec![vec![Value::Int(written)]]);
+}

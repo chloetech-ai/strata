@@ -146,7 +146,8 @@ fn a_model_answers_about_the_rows_a_query_returns() {
     {
         let seen = mock.seen.lock().unwrap();
         let b = &seen[0];
-        assert_eq!((b["model"].as_str(), b["system"].as_str(), b["temperature"].as_f64(), b["max_tokens"].as_u64()), (Some("claude-haiku-5-5"), Some("Say what the review is about."), Some(0.0), Some(1024)));
+        assert_eq!((b["model"].as_str(), b["system"].as_str(), b["max_tokens"].as_u64()), (Some("claude-haiku-5-5"), Some("Say what the review is about."), Some(1024)));
+        assert!(b.get("temperature").is_none(), "current Claude models refuse a temperature: {b}");
     }
     assert!(rs.stats.plan.iter().any(|l| l.starts_with(&format!("llm: {MODEL} asked about 2 rows: 2 requests"))), "{:?}", rs.stats.plan);
     // The same query again asks nothing: the answers are kept.

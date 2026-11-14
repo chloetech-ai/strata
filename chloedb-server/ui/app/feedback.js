@@ -39,6 +39,11 @@ export function setViewOf(f) { viewOf = f; }
 // ---------------------------------------------------------------- the screenshot, from the page
 const XHTML = "http://www.w3.org/1999/xhtml";
 const mine = (el) => el.classList?.contains("fb-ui") || el.classList?.contains("tip");
+// What shows a secret (a new key, a push key, a connector's secrets) is
+// marked `data-secret`: the picture has dots in its place, a mark never
+// names it, and a capture of the screen blacks it out.
+const SECRET = "[data-secret]";
+const isSecret = (el) => el.nodeType === 1 && el.matches(SECRET);
 const isDark = () => document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
 
 function styles() {
@@ -74,12 +79,24 @@ function stand(src, what) {
   return d;
 }
 
+/** A secret's place in the picture: its box, with dots and none of its words. */
+function masked(src) {
+  const r = src.getBoundingClientRect();
+  const c = document.createElement(src.localName === "pre" || src.localName === "textarea" ? "div" : src.localName);
+  for (const a of ["class", "style"]) if (src.hasAttribute(a)) c.setAttribute(a, src.getAttribute(a));
+  c.style.width = r.width + "px"; c.style.height = r.height + "px"; c.style.boxSizing = "border-box"; c.style.overflow = "hidden";
+  if (c.localName === "input") c.setAttribute("value", "••••••••");
+  else c.textContent = "•••••••• a secret: not in the picture";
+  return c;
+}
+
 /** A copy of `src` for the picture: values of fields, canvases and images as pictures, scrolled boxes as scrolled. */
 function copyOf(src) {
   if (src.nodeType === 3) return document.createTextNode(src.nodeValue);
   if (src.nodeType !== 1 || mine(src)) return null;
   const tag = src.localName;
   if (["script", "noscript", "template", "link", "style"].includes(tag)) return null;
+  if (isSecret(src)) return masked(src);
   if (tag === "iframe" || tag === "object" || tag === "embed") return stand(src, "An app's frame: use From the screen to take it");
   if (tag === "canvas" || tag === "video") {
     const p = tag === "canvas" ? pictureOf(src) : null;
@@ -162,6 +179,14 @@ async function fromScreen() {
     const scale = c.width / innerWidth;
     // The marks name what is under them only when this tab is what was taken.
     const mapped = Math.abs(c.height / scale - innerHeight) < 4;
+    // A secret on the page is blacked out where it shows; when what was
+    // taken is not this tab as it is, where it shows is not known, and
+    // the picture is not kept.
+    const secrets = [...document.querySelectorAll(SECRET)].map((e) => e.getBoundingClientRect()).filter((r) => r.width && r.height && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth);
+    if (secrets.length && !mapped) throw new Error("a secret (a new key) is on the page: close it, then take the picture");
+    const g = c.getContext("2d");
+    g.fillStyle = "#111";
+    for (const r of secrets) g.fillRect(Math.floor((r.left - 2) * scale), Math.floor((r.top - 2) * scale), Math.ceil((r.width + 4) * scale), Math.ceil((r.height + 4) * scale));
     return { canvas: c, w: innerWidth, h: mapped ? innerHeight : c.height / scale, scale, how: "screen", mapped };
   } finally { stream.getTracks().forEach((t) => t.stop()); }
 }
@@ -192,6 +217,8 @@ const rectOf = (m) => ({ left: Math.min(m.x, m.x + m.w), top: Math.min(m.y, m.y 
 const meets = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
 /** What an element is called, from its own attributes and words, never a field's value. */
 function labelOf(e) {
+  if (e.closest(SECRET)) return "a secret";
+  if (e.querySelector(SECRET)) return tidy(e.getAttribute("aria-label") || e.getAttribute("title"), 80);
   const own = e.getAttribute("aria-label") || e.getAttribute("title");
   if (own) return tidy(own, 80);
   if (e.matches(FIELD)) {
@@ -417,8 +444,8 @@ function editor(shot, view) {
   const errs = ERRORS.slice();
   const withErrors = h("input", { type: "checkbox", checked: errs.length > 0 });
   const sendBtn = h("button", { type: "button", class: "btn primary", onclick: () => send() }, icon("check"), "Send");
-  const writer = can("write");
-  if (!writer) { sendBtn.disabled = true; sendBtn.title = "Sending feedback " + needs("write"); }
+  const writer = can("write", "POST /v1/feedback");
+  if (!writer) { sendBtn.disabled = true; sendBtn.title = "Sending feedback " + needs("write", "POST /v1/feedback"); }
   function redrawList() {
     clear(list, marks.length ? marks.map((m) => h("li", { dataset: { n: String(m.n) }, class: "fb-mark" },
       m.tool === "redact" ? h("span", { class: "fb-n fb-n-redact", title: "Blacked out: not in the picture sent" }, "■") : h("span", { class: "fb-n", style: { background: m.color } }, String(m.n)),

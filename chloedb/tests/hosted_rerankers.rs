@@ -377,7 +377,8 @@ fn a_language_model_grades_each_row() {
         if name.starts_with("anthropic/") {
             let s = &seen[0];
             assert_eq!((s.header("x-api-key"), s.header("anthropic-version"), s.header("authorization")), (Some("ak-1"), Some("2023-06-01"), None));
-            assert_eq!((s.body["model"].as_str(), s.body["max_tokens"].as_u64(), s.body["temperature"].as_f64()), (Some("claude-haiku-5-5"), Some(16), Some(0.0)));
+            assert_eq!((s.body["model"].as_str(), s.body["max_tokens"].as_u64()), (Some("claude-haiku-5-5"), Some(16)));
+            assert!(s.body.get("temperature").is_none(), "current Claude models refuse a temperature: {}", s.body);
         } else {
             assert_eq!(seen[0].body["model"], "qwen3-8b");
             assert!(seen[0].body.get("max_tokens").is_none(), "{}", seen[0].body);

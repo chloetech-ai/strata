@@ -254,6 +254,9 @@ pub fn preset(name: &str, prefix: &str) -> Result<(Vec<Grant>, Allow), ApiError>
     Ok((grants, allow))
 }
 
+/// The start of a connector's push key's name ([`Principal::push_only`]).
+pub const PUSH_KEY_PREFIX: &str = "connector:";
+
 impl Principal {
     pub fn open() -> Principal {
         Principal::admin("open", true)
@@ -343,6 +346,15 @@ impl Principal {
     /// A key limited to some tables ([`Grant`]).
     pub fn limited(&self) -> bool {
         self.tables.is_some()
+    }
+
+    /// A connector's push key (`connector:<name>`, limited to its target,
+    /// made by [`crate::connectors`]): it writes its table and reads
+    /// nothing, not even that table ([`crate::scoped::push_route_ok`]), so
+    /// that the key a sending system holds, if it leaks, reads no alert or
+    /// ticket. Known by its name, which only narrows what a key may do.
+    pub fn push_only(&self) -> bool {
+        self.tables.is_some() && self.name.starts_with(PUSH_KEY_PREFIX)
     }
 
     /// What this credential may do to table `table`: its scope, or for a

@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>chloedb-netops: network operations on ChloeDB · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="chloedb-netops is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/netops.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>chloedb-netops: network operations on ChloeDB</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/netops.md">docs/chloedb/netops.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#the-pages">The pages</a></li><li><a href="#the-map">The map</a></li><li><a href="#where-is-it-broken">Where is it broken</a></li><li><a href="#an-incidents-board">An incident's board</a></li><li><a href="#the-agents">The agents</a></li><li><a href="#the-six-faults">The six faults</a></li><li><a href="#your-own-network">Your own network</a></li><li><a href="#the-tables">The tables</a></li><li><a href="#what-it-is-not">What it is not</a></li><li><a href="#test-it">Test it</a></li></ol></details>
     <div class="doc-body">
@@ -100,7 +103,7 @@
 <li><strong>The past is a table.</strong> Every version of each device's configuration is a row, so the change behind an incident is a diff, and "who put this line here" is a query. Which runbook closed which incident is kept as a grade the ranking can learn from.</li>
 </ul>
 <p>Like <a href="crawler.html">the crawler</a> and <a href="sheets.html">the spreadsheets</a>, it is a program of its own, in Rust, that talks to chloedb-server over HTTP only, and the command center shows it as an app.</p>
-<p><img alt="My shift: the handover written from the tables, what waits most urgent first, the changes and carrier windows coming up, and notes for the next shift" src="../../assets/img/netops-shift.png" /></p>
+<p><img loading="lazy" decoding="async" alt="My shift: the handover written from the tables, what waits most urgent first, the changes and carrier windows coming up, and notes for the next shift" src="../../assets/img/netops-shift.png" /></p>
 <h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
 <p>Build both programs, then start chloedb-netops with a server of its own:</p>
 <pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
@@ -226,17 +229,17 @@ chloedb-server ... --app netops=http://netops-host:7840   # with CHLOEDB_APP_TOK
 </table></div>
 <p>The box above every page searches, and completes as it is typed (<a href="#the-box-above-every-page-and-the-assistant">below</a>). An id, a site or a circuit opens on the map; a sentence becomes the map's query; anything else is looked up: an address (matched to the customer whose prefix holds it), a circuit id, a customer, a device, an interface, an AS number, with what the thing is and whether it is healthy.</p>
 <p>Each page has a <strong>SQL</strong> button that lists the queries behind what it shows, with their times.</p>
-<p><img alt="An incident's room: the cause the agent named with its evidence, the actions it proposed, and the room's board" src="../../assets/img/netops-incident.png" /></p>
+<p><img loading="lazy" decoding="async" alt="An incident's room: the cause the agent named with its evidence, the actions it proposed, and the room's board" src="../../assets/img/netops-incident.png" /></p>
 <h2 id="the-map">The map<a class="anchor" href="#the-map" aria-label="Link to this section">#</a></h2>
-<p><img alt="The whole network: regions and metros, coloured by what is broken inside them" src="../../assets/img/netops-map.png" /></p>
-<p>The backbone of 64 devices is what a carrier's core is. What it carries is far more: metro hubs with their routers and power plants, street cabinets, cell sites and business parks, and the ONTs, radios and customer routers behind them. The simulator makes that estate too (<code>--estate N</code>, about 200,000 objects by default, <code>0</code> for none): 18 kinds of object in <code>netops_estate_nodes</code>, what feeds what in <code>netops_estate_edges</code> (an edge table, upstream to downstream), and two months of faults and changes on every object in <code>netops_estate_events</code>. A few dozen faults are kept going, some of them caused by a change a few minutes before.</p>
+<p><img loading="lazy" decoding="async" alt="The whole network: regions and metros, coloured by what is broken inside them" src="../../assets/img/netops-map.png" /></p>
+<p>The backbone of 64 devices is what a carrier's core is. What it carries is far more: metro hubs with their routers and power plants, street cabinets, cell sites and business parks, and the ONTs, radios and customer routers behind them. The simulator makes that estate too (<code>--estate N</code>, about 200,000 objects by default, <code>0</code> for none): 18 kinds of object in <code>netops_estate_nodes</code>, what feeds what in <code>netops_estate_edges</code> (an edge table, upstream to downstream), and two months of faults and changes on every object in <code>netops_estate_events</code>. A few dozen faults are kept going, some of them caused by a change a few minutes before. Two alert rules watch it (<code>estate-outage</code> and <code>estate-degraded</code>, SQL over the two tables like the others): an access node, a hub router or a hub's power plant that is down or degraded with objects behind it raises an alert, grouped by its hub; a down one with 20 or more behind it is major and opens an incident, which the estate's agent works (what it reported, how far it reaches and which customers, a change before it, who is on call) and proposes sending field services. The degraded ones wait on <strong>My shift</strong>, and <strong>Diagnose</strong> lists them under the backbone's layers. Pasting an object's id into the search opens it.</p>
 <p>The Map page draws all of it without ever asking for all of it. Places are boxes, one inside the other: a region holds its metros, a metro its core devices and its hubs, a hub its routers, its power plant and its sites, and a site its access node and what is behind it. A box shows a name and a count until there is room for what is inside it, and then it is divided by layer: the backbone in a band along a metro's top, aggregation and power along a hub's, the premises under a site's access node. Shapes say what a thing is: a cell site is a circle with its sectors around the tower, a business park a box with its corners cut, a router a diamond, a power plant or a tower a triangle.</p>
 <ul>
 <li><strong>Zoom is a query.</strong> Every object has a place on a plane and a level of detail from which it is worth drawing. Regions, metros and hubs are read once; from there on the page asks for the objects and links in its window at its level of detail, two range queries, and draws what comes back.</li>
 <li><strong>Red is a <code>GROUP BY</code>.</strong> The objects that are down or degraded, and a count by place of what is behind them, are two queries every ten seconds; the page adds them up through site, hub, metro and region, with the backbone's open incidents. A place is coloured by how much the broken things inside it carry: a hub's router weighs more than a cabinet, a cabinet more than one home.</li>
 <li><strong>A click is a walk.</strong> For one object: what it hangs from (<code>REACHABLE</code> against the edges) and the nearest of those that is broken, which is where its trouble comes from; what depends on it, counted by kind and state (<code>REACHABLE</code> along the edges, grouped); what else is in trouble within three hops; the changes and faults of thirty days on it and on everything around it, with the change made just before the trouble began; and how faults that read like this one ended before (BM25 over the events).</li>
 </ul>
-<p><img alt="One object: where its trouble starts, what it hangs from, what depends on it, and the trouble around it" src="../../assets/img/netops-map-object.png" /></p>
+<p><img loading="lazy" decoding="async" alt="One object: where its trouble starts, what it hangs from, what depends on it, and the trouble around it" src="../../assets/img/netops-map-object.png" /></p>
 <p>A click on an object also lights what it hangs from and what depends on it, and fades the rest; the panel beside the map has tabs for the object: <strong>Overview</strong> (the walk above), <strong>Metrics</strong> (a minute's series for the backbone's devices and their links; for the estate, its latest reading and its faults and changes a day over sixty days), <strong>Events</strong>, <strong>Logs</strong> (syslog for the backbone; the estate's events as lines), <strong>Related</strong> (the chain it hangs from, what depends on it by kind, the customers behind it, the trouble around it), <strong>Incidents</strong> and <strong>Config</strong> (its properties, and for the backbone the latest configuration). They are read by <code>/v1/map/detail</code>.</p>
 <h3 id="the-box-above-every-page-and-the-assistant">The box above every page, and the assistant<a class="anchor" href="#the-box-above-every-page-and-the-assistant" aria-label="Link to this section">#</a></h3>
 <p>The box has two modes, <strong>Search</strong> and <strong>Ask</strong> (Tab switches them when the box is empty), and a chip that says where it looks: the object picked, the place the map shows, or everywhere (a click on the chip searches everywhere). As it is typed, <code>/v1/suggest</code> completes it from the tables, from what was typed before the word, and from where the person is:</p>
@@ -330,13 +333,13 @@ ORDER BY latency_ms DESC LIMIT 300</pre>
 </tbody>
 </table></div>
 <p>The same conditions run a second time grouped by place, so the map shows the matches at every zoom: a count on each region, metro, hub and site that holds some, and a ring on each object once it is drawn.</p>
-<p><img alt="A sentence read into conditions, the one statement it became, and the matches by place" src="../../assets/img/netops-map-search.png" /></p>
-<p>A sentence becomes a plan, and only a plan becomes SQL: every value in it is one the estate has or a parameter. Two readers make plans. With <code>--rewrite-model</code> (default <code>anthropic/claude-haiku-5-5</code>, empty for none) the app asks the server's own <a href="sql.html#language-models-llm"><code>llm()</code></a> to rewrite the question, over the row it was saved as in <code>netops_searches</code>; the model is told the plan's shape and what it may name, and its answer is checked field by field. When the server has no model (no key, no network), a reader of fixed vocabulary answers instead, and the page says which of them read the sentence. The model's path is covered by a unit test of the checking, not by a run against a model: this build was only run where the server had none.</p>
+<p><img loading="lazy" decoding="async" alt="A sentence read into conditions, the one statement it became, and the matches by place" src="../../assets/img/netops-map-search.png" /></p>
+<p>A sentence becomes a plan, and only a plan becomes SQL: every value in it is one the estate has or a parameter. Two readers make plans. With <code>--rewrite-model</code> (default <code>anthropic/claude-haiku-5-5</code>, empty for none) the app asks the server's own <a href="sql.html#language-models-llm"><code>llm()</code></a> to rewrite the question, over the row it was saved as in <code>netops_searches</code>; the model is told the plan's shape and what it may name, and its answer is checked field by field. When the server has no model (no key, no network), a reader of fixed vocabulary answers instead, and the page says which of them read the sentence. The fixed reader lists the words it took nothing from beside the count, which is then the answer to the rest of the question; an id, a place or a name the estate does not have refuses the question rather than being dropped from it ("ag9-zzz is not an object of the estate", "Did you mean London?"), and a place one letter off is read and said. A customer is matched by its whole name when the question gives it ("Northwind Energy"), and "this week", "this month" and "this year" start on their first day. The model's path is covered by a unit test of the checking, not by a run against a model: this build was only run where the server had none.</p>
 <p>Measured on one server in a 4-vCPU cloud container, with 170,337 objects, 173,133 links and about 470,000 events: the estate is written in about 25 seconds; a window is read in 10 to 75 ms depending on how much is in it; the eight queries behind one object take about 17 ms together; the statement above takes 5 to 10 ms, a walk of the 20,000 objects behind one aggregation router with a condition 22 to 30 ms, and "not changed in the last month" about 290 ms.</p>
 <p>On a cluster of shards the range queries, the grouping and the subquery run through the coordinator as they are. A coordinator does not walk graphs yet, so the walks are done by the app over the estate it made, and the page says so.</p>
 <h2 id="where-is-it-broken">Where is it broken<a class="anchor" href="#where-is-it-broken" aria-label="Link to this section">#</a></h2>
 <p>A list of alerts says that things are wrong, not where the trouble begins. The Diagnose page answers that, and then asks about the broken thing in the ways that only one database holding the topology, the logs, the history and the readings can.</p>
-<p><img alt="Diagnose: the stack by place with the lowest broken layer outlined, a trace that marks the broken hop, and the start of an investigation" src="../../assets/img/netops-diagnose.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Diagnose: the stack by place with the lowest broken layer outlined, a trace that marks the broken hop, and the start of an investigation" src="../../assets/img/netops-diagnose.png" /></p>
 <ul>
 <li><strong>The stack, by place.</strong> A grid with a row per layer (power and reachability, optics, links, capacity, routing, device health, services, customers) and a column per site, plus one for the backbone between sites. Each cell is read from the last three minutes of the tables. A fault shows on its own layer and on every layer above it, so the lowest layer with something broken is named as where to start, and what shows above it is marked as likely following from it.</li>
 <li><strong>Investigate</strong> takes one link, device or service and asks five things, each card saying which of ChloeDB's abilities answered it, with how many queries and in what time:</li>
@@ -356,8 +359,8 @@ ORDER BY latency_ms DESC LIMIT 300</pre>
 <li><strong>It is shared and kept.</strong> A panel is a row of <code>netops_panels</code> holding one read-only query, so everyone in the room sees the same board, a removed panel stays removed, who added what is on the timeline, and the board is still there for the postmortem.</li>
 <li><strong>It learns in the plainest way.</strong> What people added by hand to other incidents of the same kind is offered, one click each, on the next one.</li>
 </ul>
-<p><img alt="The board of a fibre cut: loss, link state, the other plane's load and latency from its template, and panels people asked for" src="../../assets/img/netops-board.png" /></p>
-<p><img alt="Leadership: services against their objectives, what incidents cost, risk, and the week written as a report" src="../../assets/img/netops-leadership.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The board of a fibre cut: loss, link state, the other plane's load and latency from its template, and panels people asked for" src="../../assets/img/netops-board.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Leadership: services against their objectives, what incidents cost, risk, and the week written as a report" src="../../assets/img/netops-leadership.png" /></p>
 <h2 id="the-agents">The agents<a class="anchor" href="#the-agents" aria-label="Link to this section">#</a></h2>
 <div class="doc-table"><table>
 <thead>
@@ -669,7 +672,7 @@ WHERE ts &gt;= &#x27;2026-11-13T03:00:00Z&#x27; GROUP BY link ORDER BY worst DES
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

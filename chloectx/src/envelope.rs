@@ -112,6 +112,42 @@ pub fn is_envelope(text: &str) -> bool {
     false
 }
 
+/// Whether a stored record is a harness envelope that recall passes over:
+/// a `prompt` stored before [`clean`] existed. Only prompts are wrapped by
+/// a harness; code, tool output and notes that mention one of its tags
+/// (a hook that writes `<system-reminder>`) are the work itself, stay
+/// searchable, and are rendered through [`defuse`] (CTX-7).
+pub fn is_envelope_record(r: &crate::record::Record) -> bool {
+    r.kind == crate::record::Kind::Prompt && is_envelope(&r.text)
+}
+
+/// `text` with the opening `<` of every harness tag escaped (`&lt;`), so
+/// that a recalled record that quotes `<system-reminder>` reads as quoted
+/// text in the context it is injected into, not as a notice from the
+/// harness. Other angle brackets are left as they are.
+pub fn defuse(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('<') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut last = 0;
+    let mut i = 0;
+    while let Some(off) = text[i..].find('<') {
+        let at = i + off;
+        if tag_at(&text[at..]).is_some_and(|(name, _, _, _)| DROP.contains(&name) || UNWRAP.contains(&name)) {
+            out.push_str(&text[last..at]);
+            out.push_str("&lt;");
+            last = at + 1;
+        }
+        i = at + 1;
+    }
+    if last == 0 {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    out.push_str(&text[last..]);
+    std::borrow::Cow::Owned(out)
+}
+
 /// `text` without its envelopes: the dropped tags go with their content,
 /// the unwrapped ones leave their content, and entities that only an
 /// escaped envelope put there are decoded. Text with no envelope comes
@@ -267,5 +303,22 @@ mod tests {
         let t = "<command-message>review is running…</command-message>\n<command-name>/review</command-name>\n<command-args>PR 12</command-args>";
         assert_eq!(clean(t), "/review\nPR 12");
         assert_eq!(clean("<local-command-stdout>Total cost: $0.12</local-command-stdout>"), "");
+    }
+
+    #[test]
+    fn records_that_mention_a_tag_stay_and_are_defused() {
+        use crate::record::{Kind, Record};
+        let code = "const zorblaxWrap = (s) => `<system-reminder>${s}</system-reminder>`;";
+        let rec = |kind: Kind, text: &str| Record {
+            id: "s:1".into(), session: "s".into(), kind, tag: "-".into(), turn: 1, seq: 1, ts: 0, importance: 0.5,
+            files: String::new(), text: text.into(), ctx: String::new(), links: Vec::new(),
+        };
+        assert!(!is_envelope_record(&rec(Kind::ToolCall, code)), "an edit that quotes a tag is the work");
+        assert!(!is_envelope_record(&rec(Kind::Note, "Hooks wrap notices in <system-reminder> tags.")));
+        assert!(is_envelope_record(&rec(Kind::Prompt, "<system-reminder>x</system-reminder>\nRename it.")), "an old prompt's envelope");
+        let d = defuse(code);
+        assert_eq!(d, "const zorblaxWrap = (s) => `&lt;system-reminder>${s}&lt;/system-reminder>`;");
+        assert!(!d.contains("<system-reminder>"), "{d}");
+        assert_eq!(defuse("a < b and <div>"), "a < b and <div>");
     }
 }

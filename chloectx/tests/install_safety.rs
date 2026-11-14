@@ -149,3 +149,46 @@ fn a_model_is_kept_only_with_its_pinned_bytes() {
         assert!(files.iter().all(|f| p.sha256(f).is_some()), "{repo}");
     }
 }
+
+/// CTX-9: a mistyped project path is refused, not created. CTX-12: in a git
+/// repository, the two files that name this machine's binary are kept out
+/// of `git add` (in `.git/info/exclude`), and a tracked `.mcp.json` is
+/// called out.
+#[test]
+fn a_project_install_checks_the_folder_and_keeps_its_files_out_of_git() {
+    let t = tempfile::tempdir().unwrap();
+    let missing = t.path().join("no/such/dir");
+    let e = install::install(&missing, "/bin/chloectx", false, None).unwrap_err().to_string();
+    assert!(e.contains("is not a folder") && e.contains(&t.path().display().to_string()), "{e}");
+    assert!(!t.path().join("no").exists(), "the mistyped path was created");
+
+    let git = |dir: &Path, args: &[&str]| {
+        let st = std::process::Command::new("git").arg("-C").arg(dir).args(args).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output();
+        st.map(|o| (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned())).unwrap_or((false, String::new()))
+    };
+    let repo = t.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    if !git(&repo, &["init", "-q"]).0 {
+        return; // no git here
+    }
+    std::fs::write(repo.join("README"), "x\n").unwrap();
+    let msg = install::install(&repo, "/bin/chloectx", false, None).unwrap();
+    assert!(msg.contains("info/exclude"), "{msg}");
+    let (_, status) = git(&repo, &["status", "--porcelain", "--untracked-files=all"]);
+    assert!(!status.contains(".mcp.json") && !status.contains("settings.local.json"), "{status}");
+    assert!(status.contains("README"), "{status}");
+    // Again: nothing added twice.
+    install::install(&repo, "/bin/chloectx", false, None).unwrap();
+    let ex = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert_eq!(ex.matches("/.mcp.json").count(), 1, "{ex}");
+
+    // A tracked .mcp.json is said to be tracked.
+    let repo2 = t.path().join("repo2");
+    std::fs::create_dir_all(&repo2).unwrap();
+    git(&repo2, &["init", "-q"]);
+    std::fs::write(repo2.join(".mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
+    git(&repo2, &["add", ".mcp.json"]);
+    git(&repo2, &["commit", "-q", "-m", "mcp"]);
+    let msg = install::install(&repo2, "/bin/chloectx", false, None).unwrap();
+    assert!(msg.contains(".mcp.json is tracked by git"), "{msg}");
+}

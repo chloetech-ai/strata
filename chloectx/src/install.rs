@@ -514,7 +514,54 @@ fn model_status() -> Json {
     json!({"ok": ok, "embedder": spec, "path": dir.to_string_lossy(), "fix": if ok { Json::Null } else { json!("chloectx fetch-model") }})
 }
 
+/// The nearest folder above `p` that exists, for a mistyped path.
+fn nearest_existing(p: &Path) -> Option<&Path> {
+    p.ancestors().skip(1).find(|a| a.is_dir() && a.parent().is_some())
+}
+
+/// In a git work tree, keeps this machine's install files out of `git add`:
+/// each of `files` that is neither tracked nor ignored yet goes into the
+/// repository's `info/exclude` (local, never committed). What it did or
+/// what to watch for, for the person (CTX-12).
+fn keep_out_of_git(project: &Path, files: &[&str]) -> Vec<String> {
+    let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(project).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok();
+    let Some(out) = git(&["rev-parse", "--git-path", "info/exclude"]).filter(|o| o.status.success()) else { return Vec::new() };
+    let exclude = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let exclude = if exclude.is_absolute() { exclude } else { project.join(exclude) };
+    let mut notes = Vec::new();
+    let mut add = Vec::new();
+    for f in files {
+        if git(&["ls-files", "--error-unmatch", "--", f]).is_some_and(|o| o.status.success()) {
+            notes.push(format!("{f} is tracked by git and now names this machine's chloectx; do not commit that change"));
+        } else if !git(&["check-ignore", "-q", "--", f]).is_some_and(|o| o.status.success()) {
+            add.push(format!("/{f}"));
+        }
+    }
+    if !add.is_empty() {
+        let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text += "# ChloeCtx's project install: paths of this machine\n";
+        for a in &add {
+            text += &format!("{a}\n");
+        }
+        let ok = exclude.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(&exclude, text).is_ok();
+        if ok {
+            notes.push(format!("{} hold this machine's paths, so they were added to {} (git leaves them out)", add.iter().map(|a| a.trim_start_matches('/')).collect::<Vec<_>>().join(" and "), exclude.display()));
+        } else {
+            notes.push(format!("{} hold this machine's paths: do not commit them", add.iter().map(|a| a.trim_start_matches('/')).collect::<Vec<_>>().join(" and ")));
+        }
+    }
+    notes
+}
+
 pub fn install(project: &Path, exe: &str, shared: bool, distill_model: Option<&str>) -> Result<String> {
+    // A mistyped path is not created (CTX-9).
+    if !project.is_dir() {
+        let hint = nearest_existing(project).map(|a| format!(" (the nearest folder above it that exists is {})", a.display())).unwrap_or_default();
+        return Err(err(format!("{} is not a folder{hint}; give the project's folder, as `chloectx --project DIR install`", project.display())));
+    }
     let settings_path = project.join(".claude").join(if shared { "settings.json" } else { "settings.local.json" });
     let mut settings = read_settings(&settings_path)?;
     let mcp_path = project.join(".mcp.json");
@@ -538,12 +585,15 @@ pub fn install(project: &Path, exe: &str, shared: bool, distill_model: Option<&s
     servers.insert(SERVER.into(), json!({"command": exe, "args": ["mcp"]}));
     saved.extend(backup_if_changed(&mcp_path, &mcp)?);
     write_json(&mcp_path, &mcp)?;
+    // Shared settings are meant to be committed; the local ones are not.
+    let git = if shared { Vec::new() } else { keep_out_of_git(project, &[".claude/settings.local.json", ".mcp.json"]) };
     Ok(format!(
-        "ChloeCtx installed for {}:\n  hooks and MCP approval: {}\n  MCP server: {}\n  store: {}{}",
+        "ChloeCtx installed for {}:\n  hooks and MCP approval: {}\n  MCP server: {}\n  store: {}{}{}",
         project.display(),
         settings_path.display(),
         mcp_path.display(),
         crate::paths::store_dir(project).display(),
+        git.iter().map(|n| format!("\n  git: {n}")).collect::<String>(),
         saved_note(&saved)
     ))
 }

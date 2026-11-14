@@ -16,14 +16,22 @@ name: CI runner
 #   main, builds the snapshot droplets start from (provision.sh on a fresh
 #   Ubuntu droplet) and keeps the newest two.
 #
+# - place: when a CI run that is not main's is requested (a pull request's,
+#   the merge queue's, a tag's), makes the droplet for it if it builds the
+#   engine, and posts where its heavy jobs run as the commit status
+#   `ci-runner`, which that run's job `runner` waits for: a branch's copy
+#   of ci.yml runs without the secrets (audit 4, X-I2).
+#
 # Secrets: DIGITALOCEAN_TOKEN (the DigitalOcean API) and
 # CI_RUNNER_ADMIN_TOKEN (Administration: read and write on this repository,
-# for the runners' state). This workflow runs only code from main: a
-# workflow_run and a schedule take the default branch's files.
+# for the runners' state), in the environment `ci-runner`, whose
+# deployment branches are main alone (.github/ci-runner/README.md). This
+# workflow runs only code from main: a workflow_run and a schedule take the
+# default branch's files.
 on:
   workflow_run:
     workflows: [CI]
-    types: [completed]
+    types: [requested, completed]
   schedule:
     - cron: "*/15 * * * *"
     - cron: "41 4 3 * *"
@@ -41,8 +49,43 @@ permissions:
   actions: read
 
 jobs:
+  place:
+    if: >-
+      github.repository == 'chloetech-ai/chloedb' && github.event_name == 'workflow_run' &&
+      github.event.action == 'requested' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      !(github.event.workflow_run.event != 'pull_request' && github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ci-runner
+    permissions:
+      contents: read
+      actions: read
+      statuses: write
+    concurrency:
+      group: ci-runner-place-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: .github/ci-runner
+      - name: Place the run's heavy jobs
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+          GH_ADMIN_TOKEN: ${{ secrets.CI_RUNNER_ADMIN_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_RUNNER: ${{ vars.CI_RUNNER }}
+          CI_RUNNER_SIZE: ${{ vars.CI_RUNNER_SIZE }}
+          CI_RUNNER_REGION: ${{ vars.CI_RUNNER_REGION }}
+          CI_RUNNER_COUNT: ${{ vars.CI_RUNNER_COUNT }}
+          CI_RUNNER_HOSTED_LIMIT: ${{ vars.CI_RUNNER_HOSTED_LIMIT }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: python3 .github/ci-runner/ci_runner.py place
+
   reap:
-    if: github.repository == 'chloetech-ai/chloedb' && (github.event_name == 'workflow_run' || (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') || (github.event_name == 'workflow_dispatch' && inputs.job == 'reap'))
+    if: github.repository == 'chloetech-ai/chloedb' && ((github.event_name == 'workflow_run' && github.event.action == 'completed') || (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') || (github.event_name == 'workflow_dispatch' && inputs.job == 'reap'))
+    environment: ci-runner
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
@@ -61,6 +104,7 @@ jobs:
 
   image:
     if: github.repository == 'chloetech-ai/chloedb' && (github.event_name == 'push' || (github.event_name == 'schedule' && github.event.schedule == '41 4 3 * *') || (github.event_name == 'workflow_dispatch' && inputs.job == 'image'))
+    environment: ci-runner
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
@@ -79,6 +123,7 @@ jobs:
   # GitHub's own runners are.
   status:
     if: github.event_name == 'workflow_dispatch' && inputs.job == 'status'
+    environment: ci-runner
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -97,6 +142,7 @@ jobs:
   # destroys it once CI has been idle 15 minutes.
   start:
     if: github.event_name == 'workflow_dispatch' && inputs.job == 'start'
+    environment: ci-runner
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

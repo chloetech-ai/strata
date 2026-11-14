@@ -19,6 +19,22 @@ bus.on("token", () => { cache = null; at = 0; });
 
 export const table = (name) => cached().find((t) => t.table.toLowerCase() === String(name).toLowerCase());
 
+/** Whether a model is the test one (hash:N): words hashed, no meaning. */
+export const isTestModel = (m) => /^hash:/.test(String(m || ""));
+
+/**
+ * Whether a SELECT returns a field's values: what the schema says, else
+ * its type's default as the short schema leaves it out. A TEXT made from
+ * others (`from`) and a vector are not kept, so they read NULL.
+ */
+export function isStored(f) {
+  if (!f) return false;
+  if (f.stored != null) return !!f.stored;
+  if (f.type === "vector") return false;
+  if (f.type === "text") return !(f.from && f.from.length);
+  return true;
+}
+
 /** What each type is for, with a glyph and a color slot. */
 export const TYPES = {
   text: { label: "TEXT", glyph: "T", color: "var(--s1)", what: "Words, searched with MATCH and ranked with bm25" },

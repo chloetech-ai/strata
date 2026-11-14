@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -160,6 +160,17 @@ fn nums(e: &Engine, devices: &[String]) -> String {
 /// The board an incident starts with: what every incident needs, then what
 /// its suspected cause needs.
 fn template(e: &Engine, inc: &Row) -> Vec<Spec> {
+    // An outage in the estate has no backbone device or link: its board is
+    // the hub it is in, read from the estate's tables.
+    if inc.s("root_kind") == "estate" || inc.s("category") == "estate" || e.is_estate(&inc.s("id")) {
+        use crate::estate::{EVENTS, NODES};
+        let hubs = quoted(&inc.list("sites"));
+        return vec![
+            table_spec("estate:hub", "What is not ok in the hub, by kind".into(), format!("SELECT kind, state, COUNT(*) AS objects FROM {NODES}\nWHERE hub IN ({hubs}) AND state != 'ok'\nGROUP BY kind, state ORDER BY objects DESC LIMIT 30")),
+            table_spec("estate:events", "Faults, clearings and changes in the hub, last three days".into(), format!("SELECT e.ts AS ts, e.node AS node, e.event AS event, e.cause AS cause, e.author AS author, e.text AS text FROM {EVENTS} e JOIN {NODES} n ON n.id = e.node\nWHERE n.hub IN ({hubs}) AND e.ts >= :since3d\nORDER BY ts DESC LIMIT 20")),
+            table_spec("customers", "Customers behind what is not ok in the hub".into(), format!("SELECT customer, COUNT(*) AS objects FROM {NODES}\nWHERE hub IN ({hubs}) AND state != 'ok' AND customer != ''\nGROUP BY customer ORDER BY objects DESC LIMIT 15")),
+        ];
+    }
     let s = scope_of(e, inc);
     let dn = nums(e, &s.devices);
     let mut out = Vec::new();
@@ -321,24 +332,8 @@ async fn panels(State(svc): State<Shared>, Path(id): Path<String>) -> Answer {
     let e = &svc.engine;
     let inc = load(&q, &id).await?;
     let now = q.last();
-    let mut rows = q.rows("Its panels", "SELECT * FROM netops_panels WHERE incident = :id ORDER BY pos LIMIT 200", json!({"id": id})).await?;
-    // The board is made on first sight, and gains its cause's panels once
-    // the cause is known. A removed panel stays removed.
-    let have: HashSet<String> = rows.iter().map(|r| r.s("tkey")).collect();
-    let mut pos = rows.iter().map(|r| r.i("pos")).max().unwrap_or(0);
-    let mut fresh = Vec::new();
-    for spec in template(e, &inc) {
-        if !have.contains(&spec.key) {
-            pos += 10;
-            let common = ["link:loss", "logs:kinds", "customers"].contains(&spec.key.as_str());
-            fresh.push(panel_row(&inc, &spec, pos, if common { "template" } else { "cause" }, if common { "the room" } else { "root-cause agent" }, "", format!("{id}:{}", spec.key), now));
-        }
-    }
-    if !fresh.is_empty() {
-        e.db.upsert("netops_panels", fresh.clone()).await?;
-        rows.extend(fresh.into_iter().filter_map(|v| v.as_object().cloned()));
-        rows.sort_by_key(|r| r.i("pos"));
-    }
+    // Looking writes nothing: a read key sees the board as it would be.
+    let rows = board(&q, e, &inc, now, false).await?;
     let mut out = Vec::new();
     for p in rows.iter().filter(|p| p.get("removed").and_then(Value::as_bool) != Some(true)) {
         let t = std::time::Instant::now();
@@ -366,7 +361,34 @@ async fn panels(State(svc): State<Shared>, Path(id): Path<String>) -> Answer {
         "examples": ["loss on LON-NYC last 2 hours", "cpu on cr1-fra", "logs \"LINK-3-UPDOWN\"", "who sends the most", "customers on ag1-ams", "optical power", "changes last 3 days"]}))
 }
 
-async fn panel_add(State(svc): State<Shared>, Path(id): Path<String>, Json(b): Json<Value>) -> Answer {
+/// The room's panels: those kept, and the template's for its kind and
+/// cause that are not kept yet (a removed panel stays removed). `keep`
+/// writes those, which a change to the board does first, so that every
+/// panel it names is a row.
+async fn board(q: &Q, e: &Engine, inc: &Row, now: i64, keep: bool) -> std::result::Result<Vec<Row>, ApiError> {
+    let id = inc.s("id");
+    let mut rows = q.rows("Its panels", "SELECT * FROM netops_panels WHERE incident = :id ORDER BY pos LIMIT 200", json!({"id": id})).await?;
+    let have: HashSet<String> = rows.iter().map(|r| r.s("tkey")).collect();
+    let mut pos = rows.iter().map(|r| r.i("pos")).max().unwrap_or(0);
+    let mut fresh = Vec::new();
+    for spec in template(e, inc) {
+        if !have.contains(&spec.key) {
+            pos += 10;
+            let common = ["link:loss", "logs:kinds", "customers"].contains(&spec.key.as_str());
+            fresh.push(panel_row(inc, &spec, pos, if common { "template" } else { "cause" }, if common { "the room" } else { "root-cause agent" }, "", format!("{id}:{}", spec.key), now));
+        }
+    }
+    if !fresh.is_empty() {
+        if keep {
+            e.db.upsert("netops_panels", fresh.clone()).await?;
+        }
+        rows.extend(fresh.into_iter().filter_map(|v| v.as_object().cloned()));
+        rows.sort_by_key(|r| r.i("pos"));
+    }
+    Ok(rows)
+}
+
+async fn panel_add(State(svc): State<Shared>, Path(id): Path<String>, headers: HeaderMap, Json(b): Json<Value>) -> Answer {
     let q = Q::new(&svc);
     let e = &svc.engine;
     let inc = load(&q, &id).await?;
@@ -374,12 +396,13 @@ async fn panel_add(State(svc): State<Shared>, Path(id): Path<String>, Json(b): J
     if ask.is_empty() {
         return Err(bad("ask is what the panel should show: a sentence or a SELECT"));
     }
-    let who = b["who"].as_str().unwrap_or("NOC engineer");
+    let who = &crate::api::actor(&headers, b["who"].as_str(), "NOC engineer");
     let mut spec = read_ask(e, &inc, ask).map_err(|m| bad(&m))?;
     if let Some(t) = b["title"].as_str().filter(|t| !t.trim().is_empty()) {
         spec.title = t.trim().to_string();
     }
     let now = q.last();
+    board(&q, e, &inc, now, true).await?;
     let n = e.next_id();
     let row = panel_row(&inc, &spec, 0, "person", who, ask, format!("{id}:p{now}-{n}"), now);
     // The query has to run before the panel joins the board.
@@ -394,10 +417,12 @@ async fn panel_add(State(svc): State<Shared>, Path(id): Path<String>, Json(b): J
     q.done(json!({"panel": row, "rows": got.len(), "understood": spec.title}))
 }
 
-async fn panel_act(State(svc): State<Shared>, Path((id, panel, action)): Path<(String, String, String)>, body: Option<Json<Value>>) -> Answer {
+async fn panel_act(State(svc): State<Shared>, Path((id, panel, action)): Path<(String, String, String)>, headers: HeaderMap, body: Option<Json<Value>>) -> Answer {
     let e = &svc.engine;
     let q = Q::new(&svc);
-    let who = body.as_ref().and_then(|b| b["who"].as_str()).unwrap_or("NOC engineer").to_string();
+    let who = crate::api::actor(&headers, body.as_ref().and_then(|b| b["who"].as_str()), "NOC engineer");
+    let inc = load(&q, &id).await?;
+    board(&q, e, &inc, q.last(), true).await?;
     let rows = q.rows("The panel", "SELECT * FROM netops_panels WHERE id = :p AND incident = :id", json!({"p": panel, "id": id})).await?;
     let Some(p) = rows.into_iter().next() else { return Err(ApiError(StatusCode::NOT_FOUND, format!("no panel {panel}"))) };
     let mut row = Value::Object(p.clone());

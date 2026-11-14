@@ -95,7 +95,7 @@ async fn agents_list_query_check_and_change_tables_within_their_keys_scope() {
 
     let tools = rpc(&base, &read, "tools/list", json!({})).await;
     let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for n in ["list_tables", "describe_table", "query", "explain", "check_sql", "execute", "write", "get_rows", "json_paths", "list_models", "search_docs", "whoami"] {
+    for n in ["list_tables", "describe_table", "query", "explain", "check_sql", "execute", "write", "import", "get_rows", "json_paths", "list_models", "search_docs", "whoami"] {
         assert!(names.contains(&n), "{n} in {names:?}");
     }
     let execute = tools["tools"].as_array().unwrap().iter().find(|t| t["name"] == "execute").unwrap();
@@ -163,6 +163,47 @@ async fn agents_list_query_check_and_change_tables_within_their_keys_scope() {
     assert!(tool(&base, &read, "write", json!({"ops": [{"op": "delete", "table": "notes", "key": "n1"}]})).await.0, "a read key writes nothing");
     let (failed, found) = tool(&base, &read, "query", json!({"sql": "SELECT id FROM products WHERE MATCH(body, 'desk lamp agent')"})).await;
     assert!(!failed && found.to_string().contains("mcp-1"), "{found}");
+
+    // import: a CSV's text, or objects; a read key loads nothing.
+    let csv = "id,body\nn2,first line of a csv\nn3,\"second, with a comma\"\n";
+    assert!(tool(&base, &read, "import", json!({"table": "notes", "data": csv})).await.0, "a read key imports nothing");
+    let (failed, imported) = tool(&base, &write, "import", json!({"table": "notes", "data": csv})).await;
+    assert!(!failed && imported["written"] == 2, "{imported}");
+    let (failed, imported) = tool(&base, &write, "import", json!({"table": "notes", "rows": [{"id": "n4", "body": "an object", "colour": "red"}]})).await;
+    assert!(!failed && imported["written"] == 1 && imported.to_string().contains("colour"), "{imported}");
+    let (failed, rows) = tool(&base, &read, "get_rows", json!({"table": "notes", "keys": ["n3", "n4"]})).await;
+    assert!(!failed && rows.to_string().contains("second, with a comma") && rows.to_string().contains("an object"), "{rows}");
+    let (_, j) = post(&base, "/v1/mcp", Some(&write), json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "import", "arguments": {"table": "notes"}}})).await;
+    assert_eq!(j["error"]["code"], -32602, "rows are needed: {j}");
+    // create: an admin key makes the table from the rows' header and values.
+    let gear = "id,title,price,stock\ng-1,Trail Running Shoes,89.5,12\ng-2,Rain Jacket,120,3\n";
+    assert!(tool(&base, &write, "import", json!({"table": "gear", "data": gear, "create": true})).await.0, "a write key makes no table");
+    let (failed, imported) = tool(&base, &admin, "import", json!({"table": "gear", "data": gear, "create": true})).await;
+    assert!(!failed && imported["written"] == 2, "{imported}");
+    assert_eq!(imported["create_table"], "CREATE TABLE IF NOT EXISTS gear (id KEYWORD PRIMARY KEY, title TEXT, price FLOAT, stock INT)");
+    let (failed, found) = tool(&base, &read, "query", json!({"sql": "SELECT id FROM gear WHERE stock > 5 AND MATCH(title, 'running')"})).await;
+    assert!(!failed && found.to_string().contains("g-1") && !found.to_string().contains("g-2"), "{found}");
+
+    // check_sql knows the statements execute takes before SQL's own.
+    let (failed, c) = tool(&base, &read, "check_sql", json!({"sql": "CREATE ROLLUP sold_daily ON products AS SELECT date_trunc('day', ts), category, COUNT(*)"})).await;
+    assert!(failed && c.as_str().unwrap().contains("no field ts"), "bound against the table: {c}");
+    let (failed, c) = tool(&base, &read, "check_sql", json!({"sql": "REFRESH ROLLUP sold_daily FULL"})).await;
+    assert!(!failed && c["statement"] == "refresh rollup" && c["full"] == true, "{c}");
+    let (failed, c) = tool(&base, &read, "check_sql", json!({"sql": "DROP ROLLUP IF EXISTS sold_daily"})).await;
+    assert!(!failed && c["statement"] == "drop rollup", "{c}");
+
+    // A MATCH of words no row has together says what finds them.
+    let (failed, none) = tool(&base, &read, "query", json!({"sql": "SELECT id FROM products WHERE MATCH(body, 'desk lamp zeppelin')"})).await;
+    assert!(!failed && none["rows"].as_array().unwrap().is_empty(), "{none}");
+    let hint = none["hint"].as_str().unwrap_or_else(|| panic!("{none}"));
+    assert!(hint.contains("'desk OR lamp OR zeppelin'") && hint.contains("bm25(body, 'desk lamp zeppelin')"), "{hint}");
+    let (_, unranked) = tool(&base, &read, "query", json!({"sql": "SELECT id, score() FROM products WHERE MATCH(body, 'lamp') LIMIT 3"})).await;
+    assert!(unranked["hint"].as_str().is_some_and(|h| h.contains("ORDER BY bm25")), "{unranked}");
+    let (_, ranked) = tool(&base, &read, "query", json!({"sql": "SELECT id FROM products WHERE MATCH(body, 'lamp') ORDER BY bm25(body, 'lamp') DESC LIMIT 3"})).await;
+    assert!(ranked.get("hint").is_none(), "{ranked}");
+    // `body MATCH 'x'` is refused with the form ChloeDB writes.
+    let (failed, why) = tool(&base, &read, "query", json!({"sql": "SELECT id FROM products WHERE body MATCH 'lamp'"})).await;
+    assert!(failed && why.as_str().unwrap().contains("MATCH(body, 'lamp')"), "{why}");
 
     // explain, models, docs.
     let (failed, plan) = tool(&base, &read, "explain", json!({"sql": "SELECT id FROM products WHERE MATCH(body, 'laptop') ORDER BY bm25(body, 'laptop') DESC LIMIT 3"})).await;

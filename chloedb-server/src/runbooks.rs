@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Value as Json};
 
 const SOURCE: &str = include_str!("../../docs/chloedb/runbooks.md");
-const PAGE: &str = "https://chloetech-ai.github.io/chloedb/site/docs/runbooks.html";
+pub const PAGE: &str = "https://chloetech-ai.github.io/chloedb/site/docs/runbooks.html";
 
 /// One runbook.
 pub struct Runbook {

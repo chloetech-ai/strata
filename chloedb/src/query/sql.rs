@@ -993,6 +993,11 @@ struct Binder<'a> {
     guards: RefCell<Vec<(Guard, Option<Pred>, bool)>>,
     /// Whether `ORDER BY` is being bound.
     ordering: Cell<bool>,
+    /// The `fuzzy` option of each `MATCH` bound so far, by field and text:
+    /// a `bm25` of the same field and text without its own takes it, so
+    /// that ranking the rows a forgiving `MATCH` found does not score the
+    /// misspelt words as written and drop every row (found by the Swarm).
+    match_fuzzy: RefCell<Vec<(usize, String, Value)>>,
 }
 
 impl<'a> Binder<'a> {
@@ -1007,6 +1012,7 @@ impl<'a> Binder<'a> {
             tables: &[],
             guards: RefCell::new(Vec::new()),
             ordering: Cell::new(false),
+            match_fuzzy: RefCell::new(Vec::new()),
         }
     }
 
@@ -1901,6 +1907,12 @@ impl<'a> Binder<'a> {
                         let field = self.searched_field(field, "bm25")?;
                         let text = self.literal(text)?.as_str().ok_or_else(|| err("bm25 text must be a string"))?.to_string();
                         let mut opts = opts;
+                        if !opts.contains_key("fuzzy") {
+                            let key = text.trim().to_lowercase();
+                            if let Some((_, _, z)) = self.match_fuzzy.borrow().iter().find(|(f, t, _)| *f == field && *t == key) {
+                                opts.insert("fuzzy".into(), z.clone());
+                            }
+                        }
                         Expand::from_opts(&opts).map_err(err)?;
                         crate::query::exec::plain_syntax(&opts)?;
                         // Expansion is a rewrite before the plan
@@ -2342,6 +2354,9 @@ impl<'a> Binder<'a> {
                     None => text.clone(),
                 };
                 let p = Pred::Match { field, query, expand };
+                if let Some(z) = opts.get("fuzzy") {
+                    self.match_fuzzy.borrow_mut().push((field, text.trim().to_lowercase(), z.clone()));
+                }
                 self.guard(&mut guarded, || GuardSite::Match { field, text, expand }, need, Some(&p), "MATCH")?;
                 p
             }
@@ -2908,6 +2923,7 @@ impl<'a> Binder<'a> {
     fn literal(&self, e: &Expr) -> Result<Value> {
         match e {
             Expr::Nested(x) => self.literal(x),
+            Expr::Cast { expr, data_type, format: None, .. } if is_date(data_type) => day_of(cast_value(self.literal(expr)?, CastTo::Timestamp)?, &|| e.to_string()),
             Expr::Cast { expr, data_type, format: None, .. } => cast_value(self.literal(expr)?, CastTo::of(data_type)?),
             // `TIMESTAMP '2026-10-01'`, `DATE '2026-10-01'`.
             Expr::TypedString(sql::TypedString { data_type, value, .. }) => match &value.value {
@@ -2916,6 +2932,10 @@ impl<'a> Binder<'a> {
             },
             // The statement's time, as text a TIMESTAMP takes.
             e if is_now(e) => Ok(Value::Str(crate::timestamp::format(self.now))),
+            // `CURRENT_DATE`: the start of the statement's day (UTC).
+            e if is_today(e) => day_of(Value::Timestamp(self.now), &|| e.to_string()),
+            // `DATE('2026-11-02 13:00')`: the start of that day.
+            Expr::Function(f) if fname(f) == "date" && func_args(f).len() == 1 => day_of(cast_value(self.literal(func_args(f)[0])?, CastTo::Timestamp)?, &|| e.to_string()),
             // A time moved by an interval (`now() - INTERVAL '2 hours'`), a
             // value the statement computes once: an index's range still
             // serves `at > now() - INTERVAL '15 minutes'`.
@@ -3389,6 +3409,39 @@ pub(crate) fn is_now(e: &Expr) -> bool {
     }
 }
 
+/// Whether `e` is the day of the statement, `CURRENT_DATE`: the start of
+/// today (UTC), as `date_trunc('day', now())` is.
+pub(crate) fn is_today(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => {
+            f.name.to_string().eq_ignore_ascii_case("current_date")
+                && match &f.args {
+                    sql::FunctionArguments::None => true,
+                    sql::FunctionArguments::List(l) => l.args.is_empty(),
+                    _ => false,
+                }
+        }
+        Expr::Identifier(id) => id.quote_style.is_none() && id.value.eq_ignore_ascii_case("current_date"),
+        _ => false,
+    }
+}
+
+/// Whether `ty` is `DATE`: a time cut to the start of its day, as
+/// `date_trunc('day', t)` cuts it (ChloeDB keeps it a TIMESTAMP).
+pub(crate) fn is_date(ty: &sql::DataType) -> bool {
+    matches!(ty, sql::DataType::Date)
+}
+
+/// The start of the day of time `v` (UTC), as a TIMESTAMP; NULL stays NULL.
+pub(crate) fn day_of(v: Value, what: &dyn Fn() -> String) -> Result<Value> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let t = time_of(&v, what)?;
+    let at = crate::timestamp::trunc(t, crate::timestamp::Unit::Day).ok_or_else(|| err(format!("{} is outside the times a TIMESTAMP holds", what())))?;
+    Ok(Value::Timestamp(at))
+}
+
 /// The interval `e` writes (`INTERVAL '15 minutes'`, `INTERVAL '15'
 /// MINUTE`), if it is one.
 pub(crate) fn interval(e: &Expr) -> Option<Result<crate::timestamp::Interval>> {
@@ -3427,7 +3480,8 @@ pub(crate) fn interval_shift(e: &Expr) -> Option<Result<(&Expr, crate::timestamp
 /// interval.
 pub(crate) fn is_time_value(e: &Expr) -> bool {
     match strip_nested(e) {
-        e if is_now(e) => true,
+        e if is_now(e) || is_today(e) => true,
+        Expr::Function(f) if fname(f) == "date" && func_args(f).len() == 1 => true,
         Expr::TypedString(sql::TypedString { data_type, .. }) | Expr::Cast { data_type, .. } => matches!(CastTo::of(data_type), Ok(CastTo::Timestamp)),
         Expr::Function(f) if fname(f) == "date_trunc" => true,
         e => interval_shift(e).is_some(),

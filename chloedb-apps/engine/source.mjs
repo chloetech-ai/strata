@@ -45,7 +45,9 @@ export function tableStatement(spec) {
   if (spec.links) defs.push(`src KEYWORD NOT NULL REFERENCES ${spec.links}`, `dst KEYWORD NOT NULL REFERENCES ${spec.links}`);
   for (const c of spec.columns || []) if (!(spec.links && (c.name === 'src' || c.name === 'dst'))) defs.push(colSql(c));
   defs.push('created TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
-  return `${spec.description ? `-- ${oneLine(spec.description)}\n` : ''}CREATE TABLE ${spec.name} (\n  ${defs.join(',\n  ')}\n)${spec.links ? " OPTIONS(edges = 'src, dst')" : ''}`;
+  // Its declared access (access.mjs) follows it, one ALLOW statement each.
+  const access = Array.isArray(spec.access) && spec.access.length ? `;\n${spec.access.join(';\n')}` : '';
+  return `${spec.description ? `-- ${oneLine(spec.description)}\n` : ''}CREATE TABLE ${spec.name} (\n  ${defs.join(',\n  ')}\n)${spec.links ? " OPTIONS(edges = 'src, dst')" : ''}${access}`;
 }
 
 // The photos a screen shows: placed after its patterns are expanded (a

@@ -123,8 +123,9 @@ pub struct Pick {
 
 const NOTE_KINDS: [Kind; 5] = [Kind::Decision, Kind::Preference, Kind::Fact, Kind::Todo, Kind::Note];
 
+/// A record's text on one line, its harness tags defused ([`crate::envelope::defuse`]).
 fn one_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::envelope::defuse(&s.split_whitespace().collect::<Vec<_>>().join(" ")).into_owned()
 }
 
 fn date(ts: i64) -> String {

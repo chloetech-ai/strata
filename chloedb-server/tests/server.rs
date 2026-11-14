@@ -277,9 +277,14 @@ async fn rollups_over_http() {
     assert_eq!(status, 200, "{r}");
     let (status, r) = post(&c, &format!("{base}/v1/sql"), sql("CREATE ROLLUP logs_5m ON logs AS SELECT date_bin('5 minutes', ts), service, COUNT(*), SUM(latency)")).await;
     assert_eq!(status, 200, "{r}");
-    // Folded by the refresher, not by the statement.
+    // A short table's rollup is filled by the statement, which says so;
+    // the refresher then has nothing to fold.
+    assert_eq!(r["columns"], json!(["rollup", "made", "filled", "buckets_folded", "rows_written", "note"]), "{r}");
+    assert_eq!((r["rows"][0][1].as_bool(), r["rows"][0][2].as_bool(), r["rows"][0][3].as_i64()), (Some(true), Some(true), Some(2)), "{r}");
     let s = svc.clone();
-    assert_eq!(tokio::task::spawn_blocking(move || s.refresh_rollups_due(false)).await.unwrap().unwrap(), 2);
+    assert_eq!(tokio::task::spawn_blocking(move || s.refresh_rollups_due(false)).await.unwrap().unwrap(), 0);
+    let (status, r) = post(&c, &format!("{base}/v1/sql"), sql("CREATE ROLLUP IF NOT EXISTS logs_5m ON logs AS SELECT date_bin('5 minutes', ts), service, COUNT(*), SUM(latency)")).await;
+    assert_eq!((status, r["rows"][0][1].as_bool()), (200, Some(false)), "{r}");
     let read = "SELECT bucket, service, count, sum_latency FROM logs_5m ORDER BY bucket, service";
     let (status, r) = post(&c, &format!("{base}/v1/query"), sql(read)).await;
     assert_eq!((status, r["rows"].as_array().map(Vec::len)), (200, Some(2)), "{r}");

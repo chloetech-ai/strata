@@ -44,8 +44,9 @@
 //! `rollup` makes a rollup of a loaded table by 5 minutes, service and
 //! severity (count, sum, least and greatest latency), and prints how long
 //! its first fold took, a refresh with nothing new, one after 50,000 new
-//! lines and a full one; then queries of the rollup beside the same
-//! queries of the table, with whether their answers are equal.
+//! lines and a full one, and the rollup's bytes on disk as flushed and
+//! once merged; then queries of the rollup beside the same queries of the
+//! table, with whether their answers are equal.
 //!
 //! `OPTIONS` are the table's (`cluster_by = 'ts'`, `compression = 'zstd'`).
 
@@ -154,7 +155,12 @@ fn create(db_path: &Path, options: &str) -> Db {
 
 /// Sum of segment image bytes of table `logs`.
 fn segment_bytes(db: &Db) -> u64 {
-    let snap = db.storage().snapshot().table("logs").unwrap();
+    table_bytes(db, "logs")
+}
+
+/// Sum of segment image bytes of a table, once flushed.
+fn table_bytes(db: &Db, table: &str) -> u64 {
+    let snap = db.storage().snapshot().table(table).unwrap();
     snap.segments().iter().filter(|s| !s.in_memory).map(|s| s.file.image().len() as u64).sum()
 }
 
@@ -549,7 +555,10 @@ fn rollup(db_path: &Path, runs: usize) {
     let _ = db.sql("DROP ROLLUP IF EXISTS logs_5m", &Params::new());
     let lines = count(&db, "SELECT COUNT(*) FROM logs");
     let (secs, r) = refresh("CREATE ROLLUP logs_5m ON logs AS SELECT date_bin('5 minutes', ts), service, severity, COUNT(*), SUM(latency), MIN(latency), MAX(latency)");
-    say("create", secs, serde_json::json!({"lines": lines, "rollup_rows": count(&db, "SELECT COUNT(*) FROM logs_5m")}).as_object().map(|o| { let mut o = o.clone(); o.extend(stats(&r).as_object().unwrap().clone()); serde_json::Value::Object(o) }).unwrap());
+    db.storage().flush().unwrap();
+    let flushed = table_bytes(&db, "logs_5m");
+    db.storage().merge(&MergePolicy::compact()).unwrap();
+    say("create", secs, serde_json::json!({"lines": lines, "rollup_rows": count(&db, "SELECT COUNT(*) FROM logs_5m"), "rollup_bytes": flushed, "rollup_bytes_merged": table_bytes(&db, "logs_5m")}).as_object().map(|o| { let mut o = o.clone(); o.extend(stats(&r).as_object().unwrap().clone()); serde_json::Value::Object(o) }).unwrap());
     let (secs, r) = refresh("REFRESH ROLLUP logs_5m");
     say("refresh_nothing_new", secs, stats(&r));
     // 50,000 new lines over the last minute, as a busy minute brings.

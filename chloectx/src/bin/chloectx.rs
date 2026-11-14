@@ -20,7 +20,7 @@ down decisions and rules. `chloectx doctor` says whether that is happening.
 
 More commands (`chloectx help <command>` explains each):
   look into memory   report, blame, receipts, receipt, snapshot, sql, stats, briefing
-  maintain a store   redact, distill, consolidate, backup, fetch-model, ingest-transcript
+  maintain a store   forget, move, redact, distill, consolidate, backup, fetch-model, ingest-transcript
   share memory       sync, pack, mount, app
   run by Claude Code (not by hand): hook, mcp, serve, rpc, wiring";
 
@@ -127,6 +127,18 @@ enum Cmd {
     /// Store a decision, preference, fact, todo or note.
     #[command(display_order = 8)]
     Remember { kind: String, text: String },
+    /// Delete records from this project's memory for good, by id
+    ///
+    /// The ids are the ones `chloectx search` and the inspector show
+    /// (`session:seq`). Each record is deleted, scrubbed from the receipts
+    /// that showed it, and the automatic snapshots that hold it are dropped;
+    /// the other records of its turn stay. It cannot be undone.
+    #[command(hide = true)]
+    Forget {
+        /// Record ids, such as a1b2c3d4:42.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// The edit behind a line of code (`path:line`) or a file: its session,
     /// prompt and tool calls, the notes written from its turn, the records
     /// memory had recalled into the agent's context before it (with their
@@ -255,6 +267,18 @@ enum Cmd {
         /// Build and install even when nothing changed.
         #[arg(long)]
         force: bool,
+    },
+    /// Attach the memory of a project that moved to its new folder
+    ///
+    /// Stores are kept by the project folder's path, so a project that is
+    /// moved or renamed starts with an empty memory. This makes the store of
+    /// OLD the store of NEW (which must have none of its own yet).
+    #[command(hide = true)]
+    Move {
+        /// Where the project was.
+        old: PathBuf,
+        /// Where it is now.
+        new: PathBuf,
     },
     /// List every store on this machine: its project, size and last use
     #[command(display_order = 9)]
@@ -649,6 +673,31 @@ fn main() {
         }
         Cmd::Doctor => std::process::exit(doctor::run(&project)),
         Cmd::Upgrade { check, no_pull, force } => std::process::exit(chloectx::version::upgrade(&project, &chloectx::version::UpgradeOptions { check, no_pull, force })),
+        Cmd::Move { old, new } => match chloectx::stores::relink(&paths::home(), &old, &new) {
+            Ok(t) => println!("{t}"),
+            Err(e) => {
+                eprintln!("chloectx move: {e}");
+                std::process::exit(1);
+            }
+        },
+        Cmd::Forget { ids } => {
+            // Only a store that exists: forgetting never creates one.
+            let dir = paths::store_dir(&project);
+            if !dir.join("memory.strata").exists() {
+                eprintln!("chloectx forget: {} has no store ({}); run it in the project's folder, or pass --project", project.display(), dir.display());
+                std::process::exit(1);
+            }
+            let mut missing = 0;
+            for id in &ids {
+                let r = send(&project, json!({"op": "forget", "id": id}), 120);
+                let t = r["text"].as_str().unwrap_or("");
+                println!("{t}");
+                missing += usize::from(t.starts_with("No record"));
+            }
+            if missing > 0 {
+                std::process::exit(1);
+            }
+        }
         Cmd::Stores { json: as_json } => std::process::exit(chloectx::stores::list(&paths::home(), as_json)),
         Cmd::Prune { older_than, yes, dry_run } => std::process::exit(chloectx::stores::prune(&paths::home(), &chloectx::stores::PruneOptions { older_than_days: older_than, yes, dry_run })),
         Cmd::Pack { out, kinds, since_days, max_records, title, json: as_json, sessions } => {
@@ -727,7 +776,14 @@ fn main() {
             let mut failed = 0;
             for (dir, proj, name) in stores {
                 let prefix = if all { format!("{name}: ") } else { String::new() };
-                match redact_store(&dir, &proj, dry_run) {
+                // One store at a time, and a daemon started for it here is
+                // stopped after it (CTX-8: `--all` left one per store).
+                let was_running = std::os::unix::net::UnixStream::connect(paths::StorePaths::new(&dir).socket).is_ok();
+                let res = redact_store(&dir, &proj, dry_run);
+                if !was_running {
+                    let _ = daemon::request_running(&dir, &json!({"op": "shutdown"}), Duration::from_secs(10));
+                }
+                match res {
                     Ok(t) => println!("{prefix}{t}"),
                     Err(e) => {
                         failed += 1;
@@ -740,7 +796,13 @@ fn main() {
             }
         }
         Cmd::Stop { all: false } => {
-            send(&project, json!({"op": "shutdown"}), 10);
+            // Only a daemon that runs: stopping never starts one, nor
+            // creates a store (CTX-13).
+            let dir = paths::store_dir(&project);
+            match daemon::request_running(&dir, &json!({"op": "shutdown"}), Duration::from_secs(10)) {
+                Ok(_) => println!("stopped the daemon of {}; it starts again when a hook or tool needs it", project.display()),
+                Err(_) => println!("no daemon runs for {}", project.display()),
+            }
         }
         Cmd::Stop { all: true } => {
             let mut n = 0;

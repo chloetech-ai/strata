@@ -4,15 +4,19 @@
 
 import { sqlFunctionsDoc } from './sqlfns.mjs';
 import vm from 'node:vm';
+import path from 'node:path';
 import { ask, parseAnswer, MODEL } from './llm.mjs';
-import { checkFunction } from './sandbox.mjs';
+import { checkFunction, evalExpression } from './sandbox.mjs';
 import { TYPES, NAME_RE, SLUG_RE, COMPONENT_RE, LIB, SHARED_KINDS, physical, briefOf } from './store.mjs';
 import { SHARED, sharedRefs, appNode } from './graph.mjs';
 import { Trace, planDecisions } from './trace.mjs';
 import { rewriteSql, checkReads } from './sql.mjs';
 import { expandPlan, expandScreen, patternsDoc, PATTERNS, BUILTIN, usePatterns, checkPattern, PATTERN_ADD_DOC } from './patterns.mjs';
-import { placePhotos, placeScreenPhotos, photoIds } from './photos.mjs';
+import { assignLayouts } from './layouts.mjs';
+import { audienceOf } from './audience.mjs';
+import { placePhotos, placeScreenPhotos, photoIds, warmPhotos, photoCache } from './photos.mjs';
 import { withPhotos } from './source.mjs';
+import { checkAccess, parseAccessList, allowText, wantsAccess } from './access.mjs';
 import { compileStatements, compileStatement, STATEMENT_DOC } from './statement.mjs';
 import { compileRuleStatements, isRuleStatement, RULE_SQL_DOC } from './rulesql.mjs';
 import { checkRule, RULES_DOC } from './rules.mjs';
@@ -35,6 +39,7 @@ export function keysIn(code) {
   return out;
 }
 import { madeUp, tidyTitle } from './taste.mjs';
+import { ART_DOC, TASTE_DOC, LAYOUT_NAMES, LAYOUT_SHORT, parseLayout } from './quality.mjs';
 
 // A screen's budget (budgetOf, below): what a change may grow it to.
 export const BUDGET = { parts: 7, kpis: 4, fields: 8, code: 1000, grow: 400 };
@@ -66,6 +71,22 @@ Every table also has id (keyword, the primary key; app.insert makes one when the
 Tables only grow: you may add tables and add columns, never drop or rename them or change a column's type. A column you no longer need stays; leave it alone.
 
 Choose text only for prose people search by words, and keyword for anything you compare with =, group by or sort by exactly. Sorting by a text column works too.
+
+# Access (who may read and write each table)
+
+The engine enforces who may read and write a table, on the server, for every read and write the app's people make (app.sql, app.insert, app.update, app.remove and the functions they call): hiding rows or buttons in a screen protects nothing. Declare it in the plan's "access", one ALLOW statement per string:
+
+    ALLOW READ | ADD | CHANGE | REMOVE | WRITE | ALL [, ...] ON <table> TO everyone | members | admins | owner [WHERE <column> = :user_id | <column> = :company_id [OR ...]]
+
+- WRITE is add, change and remove; ALL is read and write. members are people signed in to the app; admins are the ones its owner made admins (and the owner); each includes the ones after it (TO members lets admins and the owner too). everyone includes visitors who are not signed in.
+- WHERE keeps a person to their own rows (owner_id = :user_id) or their company's (company_id = :company_id): reads see only those rows, an add fills the column with the person's id (or their company's) when the row leaves it out, and changes and removes reach only those rows. The column is a keyword column of the table: add it in "tables" when the table lacks it.
+- A table with no ALLOW statement is open to whoever reaches the app. Once a table has one, only what its statements allow goes through. The app's builder (the studio) always sees every row.
+- Statements for a table replace the ones it had: give all of a table's statements together.
+- Examples. Only signed-in people read or change the data: ALLOW ALL ON invoices TO members. Everyone reads the menu, the owner edits it: ALLOW READ ON dishes TO everyone, ALLOW WRITE ON dishes TO owner. Each person sees their own notes: ALLOW ALL ON notes TO members WHERE owner_id = :user_id. Admins see everything: ALLOW ALL ON notes TO admins.
+- Companies (workspaces): the engine keeps which company each person works in (not a table of the app: never make one). In a view: app.companies() -> [{id, name, role}], app.company() -> the id of the one they work in now or null, app.createCompany(name) (they become its admin), app.useCompany(id), app.addToCompany(company, email, role) (an admin adds someone who has an account; role 'member' or 'admin'). A table each company keeps to itself has a company_id keyword column and ALLOW ALL ON t TO members WHERE company_id = :company_id.
+- In SQL, :user_id, :user_email, :user_name and :company_id are bound by the engine to the signed-in person and their company (never pass them yourself); a query that names one when nobody is signed in is refused with "Sign in first", so a screen that needs a person shows app.signIn first.
+
+Whenever the request says who may see or change data (only signed-in people, the owner, admins, roles, each person's or each company's own data), declare access for every table of the app, including the ones that stay open (ALLOW READ ON t TO everyone): a build that asks for it and declares none is refused.
 
 # SQL (Strata's dialect: read-only SELECT through app.sql)
 
@@ -149,7 +170,7 @@ returning an object of functions. Helpers get no app and no page (no app.*, docu
 # Services: people, files, email, places, a model, the web
 
 Every app gets these from the runtime. In views and components each call returns a Promise; the ones marked (functions too) also work in functions, where they return directly.
-- People. app.me() -> the signed-in person {id, name, email, role} or null. app.signIn(email, password), app.signUp({email, name, password}) and app.signOut(): every view of the app starts again afterwards, seeing the new person. app.people() -> the app's members [{id, name, email, role}] (functions too). One account works in every app here; the first person to sign in to an app is its owner, the others are members. In a function, app.user is the person whose action led to the call, or null. To record who did something, keep the person's id in a keyword column (author, assignee) and show names from app.people(). Use the shared components for this (ui.signIn, ui.userMenu, ui.avatar, ui.peoplePicker) and lib.access for who may do what. An app that only one person uses needs none of it.
+- People. app.me() -> the signed-in person {id, name, email, role} or null. app.signIn(email, password), app.signUp({email, name, password}) and app.signOut(): every view of the app starts again afterwards, seeing the new person. app.people() -> the app's members [{id, name, email, role}] (functions too). One account works in every app here; the first person to sign in to an app is its owner, the others are members. In a function, app.user is the person whose action led to the call, or null. To record who did something, keep the person's id in a keyword column (author, assignee) and show names from app.people(). Use the shared components for this (ui.signIn, ui.userMenu, ui.avatar, ui.peoplePicker). Who may read or write a table is declared in "access" (see Access) and enforced by the engine; lib.access only decides what a screen shows. An app that only one person uses needs none of it.
 - Files. app.upload(file) takes a File from <input type="file"> or a drop (a FileList or an array uploads each) and returns {id, name, type, size, url}; files are at most 15 MB. Keep the id in a keyword column, or a keyword[] for several. app.fileUrl(id) is the URL to show it (an img's src, a link); app.fileUrl(id, {download: true}) downloads it. app.files(ids) -> [{id, name, type, size, url}] (functions too). The shared ui.uploader, ui.image, ui.gallery, ui.imageViewer and ui.fileList do the rest.
 - Email. app.email({to, subject, text}) puts a plain-text email in the app's outbox and returns {id, status} (functions too; from a view only when someone is signed in). At most 10 recipients, and 30 emails an hour per app. Without a mail server the outbox holds it (status "held"): tell the person it is queued, never that it was delivered.
 - Places. app.geocode(address) -> up to 5 matches [{label, lat, lng}] (functions too). app.tiles is the URL template of map tiles; ui.map and ui.locationPicker use it, with lib.geo for distances.
@@ -188,9 +209,10 @@ First <plan>...</plan> holding one JSON object, then one <code slug="...">...</c
 {
   "name": "Habits",
   "ux": {"who": "...", "job": "...", "often": "daily", "device": "phone", "first": "today", "glance": "..."},
-  "art": {"concept": "...", "mood": "...", "imagery": "none", "accent": "...", "type": "system"},
+  "art": {"concept": "...", "mood": "...", "layout": "split, ...", "type": "serif titles over plain text", "accent": "...", "imagery": "none", "action": "Start lesson 1"},
   "summary": "what this version changed, in one or two plain sentences, written to the person",
   "tables": [{"name": "tasks", "description": "what a row is", "columns": [{"name": "title", "type": "text"}, {"name": "status", "type": "keyword"}]}],
+  "access": ["ALLOW ALL ON tasks TO members WHERE owner_id = :user_id"],
   "views": [{"slug": "board", "title": "Board", "description": "what it shows and lets you do", "order": 1}],
   "functions": [{"slug": "weekly-summary", "description": "what it does, its input and output", "on": null, "every": null}],
   "components": [{"name": "calendar", "title": "Month calendar", "description": "what it shows and lets the person do", "props": "month: 'YYYY-MM', default this month; onMonth(month): the person moved to another month; items: [{date: 'YYYY-MM-DD', label, color}], ...", "change": "for a new version of an existing component: what it adds"}],
@@ -204,9 +226,10 @@ First <plan>...</plan> holding one JSON object, then one <code slug="...">...</c
 
 - name: only for a new app, or when asked to rename it: what a person would call it on their home screen, 2 to 4 words ("Habits", "Plant care", "Lunch votes"); never the request cut short.
 - ux: the brief the screens are designed from, decided first, before the tables and screens (for a new app, and for a change that alters who uses it or how): "who" uses it and where; the "job" they come back for, in their words; how "often" ("several times a day", "daily", "several times a week", "weekly", "monthly" or "now and then"); the "device" ("phone", "desktop" or "both"; a thing done daily is done on a phone unless the request says otherwise); "first", the slug of the screen that opens first, where that job is done; and the "glance", what they see on opening without a tap (the count, the list or the number that matters). The screens follow it, in this order: first the one where the job is done (in one or two taps for a job done daily or more: a check per item, a quick add, a toggle; never a form to fill for it), then the ones to look back (history, charts, totals), last the ones to set up (the list of things, settings). On a phone a screen is one column of what fits a phone; a table with more than three columns is drawn as cards.
-- art: the app's art direction, for a new app, decided with the brief and before the screens (it sets the look the app is given, and the screens follow it): the "concept", one sentence on what it should feel like, from the subject's own world ("a quiet ledger for a corner bakery's flour and butter", "a coach's clipboard at the side of the pitch"); the "mood" in three words; the "imagery", what its photos show (the dishes themselves, close up; the rooms to let) or "none" when photos do not help the job; the "accent", the one color of its buttons, named as the subject would ("deep indigo, like the club's kit", "brick red"), green or teal only when the subject itself is green; and "type", the face of its titles: "system", "serif" (editorial, food, books), "rounded" (friendly, for families and kids) or "mono" (technical). Screens keep to it: words in the subject's own terms, photos only where the imagery says, no emoji in titles, labels or buttons (the named icons instead), no em dashes in what they say, and nothing made up that the app's rows do not hold (no ratings, review counts or customer numbers).
+${ART_DOC}
 - tables: tables to add, and existing tables you add columns to (for an existing table, list only its new columns).
-- views and functions: the ones you add or rewrite, each with a code block of the same slug holding its whole code. Leave out the ones that stay as they are. Rewriting a view means writing all of it again. Keep slugs as they are (lowercase letters, digits, dashes). "order" places views (the lowest opens first).
+- access: ALLOW statements (see Access) for the tables whose access is new or changes; leave it out otherwise (a table keeps the access it has).
+- views and functions: the ones you add or rewrite, each with a code block of the same slug holding its whole code. A view only the owner (or admins) uses, such as managing the rows a public page shows, says "for": "owner"; one for signed-in members only, "for": "members"; visitors of a published app never see an owner's view in its menu. Leave out the ones that stay as they are. Rewriting a view means writing all of it again. Keep slugs as they are (lowercase letters, digits, dashes). "order" places views (the lowest opens first).
 - components and helpers: the ones you add, or write a new version of, each with a <code slug="ui:NAME"> or <code slug="lib:NAME"> block holding its whole code. The components and helpers the code calls are found from it: the app keeps the version of each it has, and takes the newest of one it did not use before.
 - upgrade: names of components or helpers this app uses at an older version (see the list) that it should move to the newest.
 - remove: slugs of views or functions to take out.
@@ -244,6 +267,8 @@ Write each view as a screen unless it needs something a screen cannot say. A scr
   ]
 }
 
+A screen may give "layout": one of ${LAYOUT_NAMES.join(', ')} (its page structure: ${Object.entries(LAYOUT_SHORT).map(([k, v]) => `${k}, ${v}`).join('; ')}).
+
 Values: a string that starts with "=" is a JavaScript expression; anything else is taken as it is. An expression sees each "data" entry by name (its rows), each "let" by name (computed in order, after the data), state, set(changes) (merges into state and redraws), app (as in a view: app.insert, app.update, app.remove, app.call, app.open, app.toast, app.fmt, app.today(), app.me()...), lib (the helpers), ui, h, params (app.params), today, and, inside "each", the item by its name. A handler is an expression that gives a function ("=g => app.remove('guests', g.id)"); after it finishes the screen fetches its data again. Callbacks in a component's props are handlers too.
 
 data: name -> a SELECT (as for app.sql), or {"sql": "...", "params": {"name": value}} (values may be expressions, such as "=state.month": the data is fetched again when the state changes), or {"sql": "=expression giving the SELECT", "params": {...}} when the query itself depends on state, or "=expression" for anything else (a Promise is awaited: "=app.call('totals', {month: state.month})", "=app.people()").
@@ -276,7 +301,7 @@ Working screens are drawn like a good phone app: a large title, the screen's num
 
 ## Front pages
 
-An app that people outside it will visit (a shop, café, restaurant, studio, salon, event, wedding, club, portfolio, a product's landing page) opens on a front page: a screen with "page": "front", drawn edge to edge, each part a full-width section, in the design's colors and gradient, with quiet motion (parts rise into view as the page scrolls, photos zoom slowly, numbers count up). Make it the first view ("Home", order 0); the views that do the work (orders, bookings, the guest list) come after it, and its actions open them. Write it like Apple's own pages or a fine magazine: one idea per section, few and confident words, real photos, generous space; 6 to 10 sections. A tool only its owner uses has no front page unless asked.
+An app that people outside it will visit (a shop, café, restaurant, studio, salon, event, wedding, club, portfolio, a product's landing page) opens on a front page: a screen with "page": "front", drawn edge to edge, each part a full-width section, in the design's colors and gradient, with quiet motion (parts rise into view as the page scrolls, photos zoom slowly, numbers count up). Make it the first view ("Home", order 0); the views that do the work (orders, bookings, the guest list) come after it, and its actions open them. Write it like Apple's own pages or a fine magazine: one idea per section, few and confident words, real photos, generous space; 6 to 10 sections. Its structure follows the art direction's layout ("layout" on the screen, LAYOUT in a statement): hero (a photo hero), split (words beside the photo), editorial (a plain left-aligned hero over a ruled list, for menus and lessons), gallery (photos first); its hero stays short enough that the main action shows on a phone's first screen. A tool only its owner uses has no front page unless asked.
 
 Its blocks (they work in any screen; on a front page each is a section of its own):
 - {"nav": "Brand", "links": [action, ...], "action": action}: the site's header, first in the body. Links go to parts of the page ("href": "#id") or to views ("open": "slug").
@@ -296,7 +321,7 @@ Section blocks (carousel, gallery, features, stats, quotes, pricing, faq, steps)
 An action: {"label", "open": "a view's slug", "params", "href": "#id" or "https://...", "do": "=handler", "style": "primary" | "secondary" | "link"}; the first action of a group is primary, the others secondary.
 Photos: "photo": a few plain words, the subject first, as you would search a photo library ("barista pouring latte art", "yoga class in a bright studio", "bride and groom on a beach", "modern living room"). The engine finds each photo when the version is stored and adds "src" (and a "credit" when its license asks for one); never write "src" for such a photo yourself. A photo the app's data holds is "src": "=item.image" (a URL or a stored file's id). Example rows may hold "photo:a query" in a text column (a product's image), which becomes a photo's URL: name the thing itself, plainly, the kind first ("croissant", "pie pumpkin", "bread rye loaf", "coffee beans dark roast"), never a brand or place name.
 
-{"page": "front", "body": [
+{"page": "front", "layout": "hero", "body": [
   {"nav": "Ember & Oak", "links": [{"label": "Coffee", "href": "#coffee"}, {"label": "Visit", "href": "#visit"}], "action": {"label": "Order", "open": "shop"}},
   {"hero": "Coffee, roasted *slowly*.", "eyebrow": "Small-batch roasters since 2014", "sub": "Single-origin beans, roasted on Tuesday, at your door by Friday.", "photo": "latte art coffee cups", "actions": [{"label": "Shop the beans", "open": "shop"}, {"label": "Find the café", "href": "#visit"}]},
   {"carousel": "=beans", "item": {"title": "=item.name", "text": "=item.notes", "price": "=app.fmt.money(item.price)", "src": "=item.image"}, "id": "coffee", "eyebrow": "This week's roast", "title": "Four coffees, *one* Tuesday."},
@@ -304,7 +329,9 @@ Photos: "photo": a few plain words, the subject first, as you would search a pho
   {"media": ["We started with a 5 kg roaster in a garage..."], "photo": "coffee shop interior", "eyebrow": "Our story", "title": "From a garage to your *kitchen*"},
   {"band": ["Cupping every Saturday at 10."], "look": "photo", "photo": "cafe interior", "title": "Visit the roastery", "id": "visit", "actions": [{"label": "Book a seat", "open": "bookings"}]},
   {"footer": "Ember & Oak", "text": "Small-batch coffee from Portland.", "columns": [{"title": "Visit", "links": ["412 Alder St", "Open 7-4 daily"]}]}
-]}`;
+]}
+
+${TASTE_DOC}`;
 
 const SCREEN_PLAN = `
 - views: a screen view carries its whole screen in the plan entry ("screen": {...}) and has no code block. A code view has no "screen" and a code block of its slug.
@@ -366,6 +393,8 @@ export function prepareScreens(plan, code, view) {
   const written = [...(SCREENS ? editCode(plan, code, view) : []), ...compileStatements(plan, code), ...compileRuleStatements(plan, code), ...patchScreens(plan, view)];
   for (const v of plan?.views || []) if (v && v.screen && typeof v.screen === 'object') BUDGETS.set(v, budgetOf(v.screen));
   const problems = [...written, ...expandPlan(plan, withPlanPatterns(plan))];
+  // Every screen gets a page structure, chosen or the one that fits it.
+  assignLayouts(plan, cleanArt(plan?.art) || briefOf(view?.app)?.art || null);
   screensToCode(plan, code);
   rulesToCode(plan, code);
   return problems;
@@ -658,10 +687,11 @@ export function rulesToCode(plan, code) {
 export async function dryRunScreens(db, appId, names, plan) {
   const problems = [];
   const today = new Date().toISOString().slice(0, 10);
-  const nothing = new Proxy(() => null, { get: () => nothing, apply: () => null });
-  const guess = (x, state) => {
+  // Worked out in QuickJS (sandbox.mjs), never in the engine's own process:
+  // the expression is the model's (or an editor's) code (audit 4, X-G1).
+  const guess = async (x, state) => {
     if (typeof x !== 'string' || !x.startsWith('=')) return x;
-    try { return new Function('s', `with (s) { return (${x.slice(1)}\n); }`)({ state, today, params: {}, app: { today: () => today, now: () => new Date().toISOString(), me: () => null }, lib: nothing }) ?? null; } catch { return null; }
+    return (await evalExpression(x.slice(1), { state, today })) ?? null;
   };
   for (const v of plan.views || []) {
     if (!v || !v.screen) continue;
@@ -670,7 +700,9 @@ export async function dryRunScreens(db, appId, names, plan) {
       const sql = typeof q === 'string' ? q : q && q.sql;
       if (typeof sql !== 'string' || sql.startsWith('=')) continue;
       const params = {};
-      for (const [k, x] of Object.entries((q && typeof q === 'object' && q.params) || {})) params[k] = guess(x, state);
+      for (const [k, x] of Object.entries((q && typeof q === 'object' && q.params) || {})) params[k] = await guess(x, state);
+      // :today is the screen's own, as a CREATE SCREEN's query has it (screen.js binds it).
+      if (/:today\b/.test(sql) && params.today == null) params.today = today;
       // A parameter worked out from what only the running screen has (its
       // data, a helper) cannot be known here: such a query is not run, so
       // that a right query is never sent back as wrong.
@@ -787,6 +819,7 @@ const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}\n... (${s.length - n} m
 function describeTable(t, count, sample) {
   const cols = ['id keyword', 'created timestamp', ...(t.spec.columns || []).map((c) => `${c.name} ${c.type}${c.type === 'meaning' ? ` of ${[].concat(c.of || []).join(', ')}` : ''}`)];
   const lines = [`- ${t.spec.name} (${count} rows)${t.spec.links ? `, links between rows of ${t.spec.links} (src -> dst)` : ''}: ${cols.join(', ')}${t.spec.description ? `\n  ${t.spec.description}` : ''}`];
+  lines.push(`  access: ${t.spec.access?.length ? t.spec.access.join('; ') : 'none declared (whoever reaches the app reaches it)'}`);
   if (sample.length) lines.push(`  latest rows: ${clip(JSON.stringify(sample), 1500)}`);
   return lines.join('\n');
 }
@@ -993,7 +1026,7 @@ export async function buildContext(engine, appId, request) {
     return copy.filter(Boolean).join('\n\n');
   };
   const found = new Map(lib.map((c) => [c.id, c.found]));
-  return { prompt: parts.join('\n\n'), forPiece, view, library: libCaps.map((c) => ({ ...c, found: found.get(c.id) })), shared, system: systemWith(shared) };
+  return { prompt: parts.join('\n\n'), forPiece, view, library: libCaps.map((c) => ({ ...c, found: found.get(c.id) })), shared, system: systemWith(shared), request };
 }
 
 // The system prompt with the whole library of shared pieces, by name and
@@ -1081,8 +1114,29 @@ export function checkView(code) {
 }
 
 // Checks a plan against the app as it is. Returns a list of problems.
-export async function validate(plan, code, view, library, shared = new Map()) {
+// The plan's access statements (access.mjs): each parses and names a table
+// and columns the app has; and a request that asks for signed-in people
+// only, roles or companies declares access for every table of the app.
+export function accessProblems(plan, view, requestText = '') {
+  const columns = new Map();
+  for (const t of [...view.tables.map((x) => x.spec), ...(plan.tables || [])]) {
+    const set = columns.get(t.name) || new Set(['id', 'created', ...(t.links ? ['src', 'dst'] : [])]);
+    for (const c of t.columns || []) set.add(c.name);
+    columns.set(t.name, set);
+  }
+  if (plan.access !== undefined && !Array.isArray(plan.access)) return ['access: a list of ALLOW statements, one string each'];
+  const problems = checkAccess(plan.access || [], columns);
+  if (!problems.length && wantsAccess(requestText)) {
+    const declared = new Set([...view.tables.filter((x) => x.spec.access?.length).map((x) => x.spec.name), ...parseAccessList(plan.access || []).keys()]);
+    const open = [...columns.keys()].filter((t) => !declared.has(t));
+    if (open.length) problems.push(`access: the request asks who may reach the data (signed-in people, roles or companies), but ${open.join(', ')} ${open.length === 1 ? 'declares' : 'declare'} no access: give "access" ALLOW statements for ${open.length === 1 ? 'it' : 'each'} (the engine enforces them on the server; hiding data in the screens is not enough). A table anyone may read says so: ALLOW READ ON t TO everyone`);
+  }
+  return problems;
+}
+
+export async function validate(plan, code, view, library, shared = new Map(), requestText = '') {
   const problems = checkBrief(plan, view);
+  problems.push(...accessProblems(plan, view, requestText));
   const tables = new Map(view.tables.map((t) => [t.spec.name, t.spec]));
   for (const t of plan.tables || []) {
     if (!NAME_RE.test(t.name || '')) { problems.push(`table name ${JSON.stringify(t.name)}: lowercase letters, digits and _`); continue; }
@@ -1215,7 +1269,7 @@ export { briefOf };
 // The art direction (plan.art), kept with the brief: what the app should feel
 // like, what its photos show, its accent and the type of its titles. Doable
 // writes one before any interface; the designs and the screens follow it.
-const ART = ['concept', 'mood', 'imagery', 'accent', 'type'];
+const ART = ['concept', 'mood', 'layout', 'type', 'accent', 'imagery', 'action'];
 const TYPES_OF_TITLES = ['system', 'serif', 'rounded', 'mono'];
 export function cleanArt(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a.concept !== 'string' || !a.concept.trim()) return null;
@@ -1223,6 +1277,8 @@ export function cleanArt(a) {
   const t = out.type.toLowerCase();
   out.type = TYPES_OF_TITLES.find((x) => t.includes(x)) || (/editorial|elegant|classic/.test(t) ? 'serif' : /friendly|playful|soft/.test(t) ? 'rounded' : /code|technical|terminal/.test(t) ? 'mono' : 'system');
   if (!out.imagery) out.imagery = 'none';
+  // The first screen's structure, as the kit names it (quality.mjs LAYOUTS).
+  out.structure = parseLayout(out.layout) || '';
   return out;
 }
 // The brief to keep for a version: the plan's (or the app's, when the plan
@@ -1400,7 +1456,7 @@ async function pool(items, n, fn) {
   return out;
 }
 
-async function buildSplit({ prompt, forPiece, view, library, shared, system = SYSTEM }, progress, tr = new Trace()) {
+async function buildSplit({ prompt, forPiece, view, library, shared, system = SYSTEM, request = null }, progress, tr = new Trace()) {
   let cost = 0;
   let plan;
   let problems = [];
@@ -1411,7 +1467,7 @@ async function buildSplit({ prompt, forPiece, view, library, shared, system = SY
   const STEP = parallel ? PLAN_STEP_PARALLEL : PLAN_STEP;
   let planPrompt = `${prompt}\n\n${STEP}`;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    progress(attempt === 1 ? `Asking the model (${SCREEN_MODEL}) to plan the first version` : `Asking the model again to fix the plan: ${problems.slice(0, 3).join('; ')}`, { step: 'plan' });
+    progress(attempt === 1 ? `Asking the model (${SCREEN_MODEL}) to plan the first version` : `Asking the model again to fix the plan: ${problems.slice(0, 3).join('; ')}`, { step: attempt === 1 ? 'plan' : 'fix' });
     const span = tr.start('plan', attempt === 1 ? 'The model plans the first version' : 'The model plans again, to fix the plan');
     const answer = await ask({ system, prompt: planPrompt, model: SCREEN_MODEL, onWrite: tee(writing(progress, 'The model'), previewer(view, progress)) });
     tr.call(span, answer, system.length + planPrompt.length);
@@ -1424,7 +1480,7 @@ async function buildSplit({ prompt, forPiece, view, library, shared, system = SY
         const statements = Object.fromEntries(Object.entries(parsed.code || {}).filter(([, c]) => /^\s*CREATE\s+SCREEN\b/i.test(c) || isRuleStatement(c)));
         const preparing = prepareScreens(plan, statements, view);
         completePlan(plan, view, library);
-        problems = [...preparing, ...(await validate(plan, {}, view, library, shared)).filter((p) => !/has no <code slug=/.test(p))];
+        problems = [...preparing, ...(await validate(plan, {}, view, library, shared, request?.text)).filter((p) => !/has no <code slug=/.test(p))];
       } catch (e) { problems = [e.message]; }
       c.problems = problems.slice(0, 8);
     });
@@ -1471,8 +1527,12 @@ async function buildSplit({ prompt, forPiece, view, library, shared, system = SY
     const t0 = Date.now();
     let last = 0;
     const done = [];
+    // A plan whose pieces are all screens written as JSON has none to write.
+    if (!pieces.length) return;
     for (const pc of pieces) board.set(pc.slug, { label: pc.label.replace(/^(view|function) /, ''), kind: pc.label.split(' ')[0], state: notes.has(pc.slug) ? 'again' : 'writing', chars: 0 });
-    progress(`Writing ${pieces.length === 1 ? pieces[0].label : `${pieces.length} pieces at once: ${pieces.map((p) => p.label).join(', ')}`}`, { step: 'write', pieces: shown() });
+    // Writing again what the checks found is a step of its own (fix), so the
+    // estimate counts it rather than calling the build late.
+    progress(`Writing ${pieces.length === 1 ? pieces[0].label : `${pieces.length} pieces at once: ${pieces.map((p) => p.label).join(', ')}`}`, { step: notes.size ? 'fix' : 'write', pieces: shown() });
     await pool(pieces, 8, async (pc) => {
       const fix = notes.get(pc.slug);
       const span = tr.start(fix ? 'fix' : 'write', fix ? `${pc.label}, again` : pc.label, { piece: pc.slug, ...(fix ? { problems: fix.problems.slice(0, 4) } : {}) });
@@ -1508,7 +1568,7 @@ async function buildSplit({ prompt, forPiece, view, library, shared, system = SY
   };
   await write(pieces);
   takeExamples();
-  problems = await tr.span('check', 'Check the code', async (c) => { const p = [...prepareScreens(plan, code, view), ...await validate(plan, code, view, library, shared)]; c.problems = p.slice(0, 8); return p; });
+  problems = await tr.span('check', 'Check the code', async (c) => { const p = [...prepareScreens(plan, code, view), ...await validate(plan, code, view, library, shared, request?.text)]; c.problems = p.slice(0, 8); return p; });
   if (problems.length) {
     const notes = new Map();
     for (const pc of pieces) {
@@ -1520,7 +1580,7 @@ async function buildSplit({ prompt, forPiece, view, library, shared, system = SY
     if (again.length) {
       await write(again, notes);
       takeExamples();
-      problems = await tr.span('check', 'Check the code again', async (c) => { const p = [...prepareScreens(plan, code, view), ...await validate(plan, code, view, library, shared)]; c.problems = p.slice(0, 8); return p; });
+      problems = await tr.span('check', 'Check the code again', async (c) => { const p = [...prepareScreens(plan, code, view), ...await validate(plan, code, view, library, shared, request?.text)]; c.problems = p.slice(0, 8); return p; });
     }
   }
   // A screen's budget was asked of the plan already; over it, it is kept.
@@ -1538,6 +1598,15 @@ async function buildSplit({ prompt, forPiece, view, library, shared, system = SY
 }
 
 // Runs a request through the model and applies its answer as the next version.
+// Where found photos go: the app's files (when the engine has them), the
+// shared cache beside them, and the art direction's accent for a drawing.
+function photoOptions(engine, appId, plan, view) {
+  const files = engine.services?.filesDir;
+  if (files) photoCache(path.join(files, '..', 'photo-cache'));
+  const save = engine.services?.saveFile ? async (bytes, meta) => (await engine.services.saveFile(appId, bytes, meta)).id : null;
+  return { save, accent: plan?.art?.accent || briefOf(view?.app)?.art?.accent || '' };
+}
+
 export async function forge(engine, appId, request, progress = () => {}) {
   const tr = new Trace();
   try {
@@ -1576,7 +1645,7 @@ async function forgeTraced(engine, appId, request, progress, tr) {
   const small = !split && smallChange(request.text, view);
   for (let attempt = 1; attempt <= (small ? 3 : 2) && !split; attempt++) {
     const model = small && attempt === 1 ? SMALL_MODEL : SCREEN_MODEL;
-    progress(attempt === 1 ? `Asking the model (${model}${small ? ', for a small change' : ''}) to ${view.comp.n ? 'change the app' : 'build the first version'}` : `Asking the model${small && attempt === 2 ? ` (${SCREEN_MODEL})` : ''} again to fix: ${problems.slice(0, 3).join('; ')}`, { step: 'plan' });
+    progress(attempt === 1 ? `Asking the model (${model}${small ? ', for a small change' : ''}) to ${view.comp.n ? 'change the app' : 'build the first version'}` : `Asking the model${small && attempt === 2 ? ` (${SCREEN_MODEL})` : ''} again to fix: ${problems.slice(0, 3).join('; ')}`, { step: attempt === 1 ? 'plan' : 'fix' });
     const span = tr.start('model', attempt === 1 ? (view.comp.n ? 'The model plans and writes the change' : 'The model plans and writes the first version') : 'The model answers again, to fix problems', { model });
     answer = await ask({ system, prompt: attemptPrompt, model, onWrite: tee(writing(progress), previewer(view, progress)) });
     tr.call(span, answer, system.length + attemptPrompt.length);
@@ -1587,7 +1656,7 @@ async function forgeTraced(engine, appId, request, progress, tr) {
         ({ plan, code } = parseAnswer(answer.text));
         const preparing = prepareScreens(plan, code, view);
         completePlan(plan, view, library);
-        problems = [...preparing, ...await validate(plan, code, view, library, shared)];
+        problems = [...preparing, ...await validate(plan, code, view, library, shared, request?.text)];
       } catch (e) {
         problems = [e.message];
       }
@@ -1607,13 +1676,17 @@ async function forgeTraced(engine, appId, request, progress, tr) {
     throw err;
   }
   progress('The code passed the checks; storing it in ChloeDB', { step: 'store' });
+  // The photos the screens and example rows name are searched for while the
+  // tables are made and the queries run (engine/photos.mjs).
+  const photoOpts = photoOptions(engine, appId, plan, view);
+  warmPhotos(plan).catch(() => {});
   // A new app's three designs are made from its art direction, beside the
   // storing (the server's hook; the drawn-page check waits for them).
   const art = !view.comp.n && !request.candidate ? cleanArt(plan.art) : null;
   const designing = art && typeof engine.onDirection === 'function'
     ? Promise.resolve(engine.onDirection(appId, { art, views: (plan.views || []).map((v) => ({ title: v.title })), tables: (plan.tables || []).map((t) => t.name) })).catch(() => null)
     : null;
-  if (art) progress(`Art direction: ${art.concept}${art.accent ? `; accent ${art.accent}` : ''}${art.type !== 'system' ? `; ${art.type} titles` : ''}`);
+  if (art) progress(`Art direction: ${art.concept}${art.structure ? `; ${art.structure} layout` : ''}${art.accent ? `; accent ${art.accent}` : ''}${art.type !== 'system' ? `; ${art.type} titles` : ''}${art.action ? `; main action "${art.action}"` : ''}`);
   let storing = tr.start('strata', 'Store the code and the new version in ChloeDB');
 
   // Tables first: data the new code reads must exist when it goes live.
@@ -1624,21 +1697,39 @@ async function forgeTraced(engine, appId, request, progress, tr) {
   const existingTables = new Set(await store.tableNames());
   const tableSpecs = new Map(view.tables.map((t) => [t.spec.name, t.spec]));
   const written = [];
+  // The plan's ALLOW statements, by table, as the engine keeps them.
+  const accessOf = new Map([...parseAccessList(plan.access || [])].map(([name, rules]) => [name, rules.map(allowText)]));
+  const stored = new Map();
   for (const t of plan.tables || []) {
     const old = tableSpecs.get(t.name);
     const columns = [...(old?.columns || [])];
     for (const c of t.columns || []) if (!columns.find((x) => x.name === c.name)) columns.push({ name: c.name, type: c.type, ...(c.type === 'meaning' ? { of: [].concat(c.of || []) } : {}) });
     const links = old?.links || t.links || null;
     if (links) for (const n of ['src', 'dst']) if (!columns.find((x) => x.name === n)) columns.unshift({ name: n, type: 'keyword' });
-    const spec = { name: t.name, description: t.description || old?.description || '', columns, ...(links ? { links } : {}) };
+    const spec = { name: t.name, description: t.description || old?.description || '', columns, ...(links ? { links } : {}), ...(old?.access?.length ? { access: old.access } : {}) };
+    const access = accessOf.get(t.name);
+    if (access) spec.access = access;
+    stored.set(t.name, spec);
     const res = await store.ensureTable(appId, spec, existingTables);
     if (res.created) progress(`Created table ${res.created}`);
     if (res.added.length) progress(`Added ${res.added.join(', ')} to ${t.name}`);
-    if (!res.created && !res.added.length && old) continue;
+    if (!res.created && !res.added.length && old && !access) continue;
     const id = await store.putCapability({ app: appId, slug: t.name, kind: 'table', title: t.name, description: spec.description, spec, code: '' });
     caps.set(`table/${t.name}`, id);
     written.push(id);
   }
+  // Access declared for a table the plan does not otherwise change: a new
+  // version of the table with it (its statements replace the ones it had).
+  for (const [name, access] of accessOf) {
+    if (stored.has(name)) continue;
+    const old = tableSpecs.get(name);
+    if (!old || JSON.stringify(old.access || []) === JSON.stringify(access)) continue;
+    const spec = { ...old, access };
+    const id = await store.putCapability({ app: appId, slug: name, kind: 'table', title: name, description: spec.description, spec, code: '' });
+    caps.set(`table/${name}`, id);
+    written.push(id);
+  }
+  if (accessOf.size) progress(`Access: ${[...accessOf.values()].flat().join('; ')}`);
   // Screens: their queries run now against the tables as they are, and the
   // model gets one try to fix the screens whose queries fail.
   if ((plan.views || []).some((v) => v.screen)) {
@@ -1672,14 +1763,14 @@ async function forgeTraced(engine, appId, request, progress, tr) {
     }
   }
   // Photos the screens name by what they show become pictures (engine/photos.mjs).
-  const photos = await tr.span('strata', 'Find the photos the screens name', () => placePhotos(plan, code));
+  const photos = await tr.span('strata', 'Find the photos the screens name', () => placePhotos(plan, code, photoOpts));
   if (photos.count) progress(`Found ${photos.count} photo${photos.count === 1 ? '' : 's'}: ${photos.sources}`);
   for (const [kind, list] of [['view', plan.views], ['function', plan.functions]]) {
     for (const item of list || []) {
       // The patterns a screen was expanded from, for the graph: this
       // version's, and a patched screen keeps its earlier ones.
       const patterns = kind === 'view' && item.screen ? [...new Set([...(item.patched !== undefined ? view.views.find((x) => x.slug === item.slug)?.spec?.patterns || [] : []), ...(item.patterns || [])])] : [];
-      const spec = kind === 'view' ? { order: item.order ?? 50, ...(item.screen ? { screen: true, ...(typeof item.statement === 'string' ? { statement: item.statement } : {}), ...(patterns.length ? { patterns } : {}) } : {}) } : { on: item.on || null, ...(item.every ? { every: item.every } : {}), ...(item.source ? { source: true } : {}), ...(item.rule ? { rule: true, ...(typeof item.statement === 'string' ? { statement: item.statement } : {}) } : {}) };
+      const spec = kind === 'view' ? { order: item.order ?? 50, ...audienceOf(item, view), ...(item.screen ? { screen: true, ...(typeof item.statement === 'string' ? { statement: item.statement } : {}), ...(patterns.length ? { patterns } : {}) } : {}) } : { on: item.on || null, ...(item.every ? { every: item.every } : {}), ...(item.source ? { source: true } : {}), ...(item.rule ? { rule: true, ...(typeof item.statement === 'string' ? { statement: item.statement } : {}) } : {}) };
       const id = await store.putCapability({ app: appId, slug: item.slug, kind, title: item.title || item.slug, description: item.description || '',
         code: code[item.slug], spec, forked_from: item.forked_from || null, author: request.source === 'repair' ? 'repair' : 'forge' });
       caps.set(`${kind}/${item.slug}`, id);
@@ -2009,7 +2100,7 @@ export async function editScreen(engine, appId, slug, { patch, screen, statement
   if (photos && !ex.problems.length) withPhotos(ex.screen, photos);
   const problems = [...ex.problems, ...checkScreen(ex.screen, columnsFor(view, {}))];
   // A photo the edit names is found as for a built screen.
-  if (!problems.length) await placeScreenPhotos(ex.screen, { used: new Set([...view.views.filter((v) => v.slug !== slug).flatMap((v) => photoIds(v.code)), ...photoIds(JSON.stringify(ex.screen))]) });
+  if (!problems.length) await placeScreenPhotos(ex.screen, { ...photoOptions(engine, appId, null, view), used: new Set([...view.views.filter((v) => v.slug !== slug).flatMap((v) => photoIds(v.code)), ...photoIds(JSON.stringify(ex.screen))]) });
   if (!problems.length) problems.push(...await dryRunScreens(engine.db, appId, view.tables.map((t) => t.spec.name), { views: [{ slug, screen: ex.screen }] }));
   if (problems.length) throw Object.assign(new Error(problems.slice(0, 4).join('; ')), { status: 400, problems });
   const code = JSON.stringify(ex.screen, null, 1);

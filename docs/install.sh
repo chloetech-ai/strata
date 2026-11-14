@@ -49,12 +49,38 @@ fail() {
   exit 1
 }
 have() { command -v "$1" > /dev/null 2>&1; }
+# The header above, as --help: a heredoc, since with `curl ... | sh` there
+# is no file to read it from.
+usage() {
+  cat << 'USAGE'
+Install ChloeDB's server, prebuilt (no Rust, no C compiler), into ~/.local/bin:
+
+  curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh
+  curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with crawl,sheets,ctx
+
+Options:
+  --with LIST   programs of the same release to install beside the server:
+                crawl (chloedb-crawl), sheets (chloedb-sheets),
+                ctx (chloectx, memory for Claude Code), or all
+  -h, --help    this text
+
+Settings (after the pipe: curl ... | CHLOEDB_VERSION=0.3.3 sh):
+  CHLOEDB_VERSION       the version to install; the newest release by default
+  CHLOEDB_WITH          the programs --with names, when it is not given
+  CHLOEDB_INSTALL_DIR   where to put the programs (default ~/.local/bin)
+  CHLOEDB_RELEASES_URL  where the release archives are (default GitHub's)
+
+It checks each download against the release's SHA-256 and changes nothing
+outside the install folder. Platforms: Linux x86_64 and aarch64 (glibc 2.35
+or later), macOS 11 or later on arm64 and x86_64.
+USAGE
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --with) [ $# -gt 1 ] || fail "--with needs a list: crawl,sheets,ctx or all"; WITH="$2"; shift 2 ;;
     --with=*) WITH="${1#--with=}"; shift ;;
-    -h | --help) sed -n '2,40p' "$0" 2> /dev/null || true; exit 0 ;;
+    -h | --help) usage; exit 0 ;;
     *) fail "unknown option $1 (--with crawl,sheets,ctx is the one there is)" ;;
   esac
 done

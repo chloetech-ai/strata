@@ -28,6 +28,14 @@ use chloedb_server::auth::{self, Access, Secret, Tls};
 use chloedb_server::obs;
 use chloedb_server::server::{self, Options};
 
+/// `println!` for a command's answer, which a closed pipe ends quietly
+/// ([`chloedb_server::print_out`]).
+macro_rules! out {
+    ($($t:tt)*) => {
+        chloedb_server::print_out(&format!($($t)*))
+    };
+}
+
 #[derive(Parser)]
 #[command(version, about = "ChloeDB over HTTP JSON and gRPC, with a query UI and an agent", args_conflicts_with_subcommands = true)]
 struct Args {
@@ -37,7 +45,8 @@ struct Args {
     /// --demo's, else with no tables (CREATE TABLE and imports add them).
     #[arg(long)]
     db: Option<PathBuf>,
-    /// Schema of a new database, as JSON.
+    /// Schema of a new database: a JSON file, or the JSON itself
+    /// (`--schema '{"table": "t", "key": "id", "fields": [...]}'`).
     #[arg(long)]
     schema: Option<PathBuf>,
     /// Create the demo product catalogue with this many products.
@@ -641,7 +650,7 @@ struct Args {
     #[arg(long, env = "CHLOEDB_START_APPS", default_value = "auto")]
     start_apps: String,
     /// Whether this server runs its connectors' pulls on their schedules
-    /// (https://chloetech-ai.github.io/chloedb/docs/connectors.html): auto
+    /// (https://chloetech-ai.github.io/chloedb/site/docs/connectors.html): auto
     /// (on a server of its own or a coordinator; never on a replica or a
     /// shard) or off. Pushes are taken either way.
     #[arg(long, env = "CHLOEDB_CONNECTORS", default_value = "auto")]
@@ -652,6 +661,12 @@ struct Args {
     /// name secrets as env:VARIABLE).
     #[arg(long)]
     connector_secrets: Option<PathBuf>,
+    /// The prefix of the environment variables a connector's secret may
+    /// name as env:VARIABLE (default CHLOEDB_CONNECTOR_SECRET_): the
+    /// others, this server's own tokens and keys among them, are never
+    /// read for a connector.
+    #[arg(long, env = "CHLOEDB_CONNECTOR_ENV_PREFIX")]
+    connector_env_prefix: Option<String>,
     /// A folder that holds each app's own token in a file of the app's
     /// name, read as it is sent (so a token written there later, as a
     /// Kubernetes Secret mounted there is, needs no restart).
@@ -1000,7 +1015,8 @@ enum Command {
         /// The database.
         #[arg(long)]
         db: PathBuf,
-        /// Schema of a new database, as JSON. With SQLite files, schemas
+        /// Schema of a new database: a JSON file, or the JSON itself (a
+        /// value that starts with `{`). With SQLite files, schemas
         /// for the tables it creates, in place of the ones made from
         /// SQLite's: one, an array, or the output of --plan, edited. With
         /// Parquet files, the schema of the table they create (the output
@@ -1083,12 +1099,86 @@ fn main() {
     // clap and the code read the old names, so the new ones are copied over
     // before the runtime starts any thread.
     chloedb::env::adopt_old_names();
-    run();
+    // As #[tokio::main] builds it, with a larger stack for each worker and
+    // blocking thread, where queries are planned and run: the statements
+    // the parser takes fit in 2 MiB, and this leaves room for more.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(chloedb::query::parse::QUERY_STACK)
+        .build()
+        .expect("start the tokio runtime")
+        .block_on(run());
 }
 
-#[tokio::main]
+/// The server's options by topic, for `--help`: every option of [`Args`]
+/// is under one (a test says so), so that the few a first run needs are
+/// not lost among the rest. `-h` lists the first topic's only.
+const HELP_TOPICS: &[(&str, &[&str])] = &[
+    ("Start", &[
+        "db", "schema", "demo", "models", "listen", "grpc", "token", "no_token", "log",
+        "start_apps"
+    ]),
+    ("Database", &[
+        "demo_shard", "copy_from", "no_backfill", "no_fetch_models", "directory",
+        "wal_drop_damaged", "recover", "verify_checksums", "seq_no", "idempotency_ttl_s",
+        "scrub_every_s", "scrub_mib_s", "synonyms", "backup_dir", "slices", "slices_rebuild_s",
+        "no_read_stats"
+    ]),
+    ("Merges and storage tiers", &[
+        "merge_threads", "merge_memory_mb", "merge_write_mb_per_sec", "merge_nice", "cold_store",
+        "cold_cache_gb", "cold_keep_local_gb", "cold_min_segment_mb", "cold_cache_dir"
+    ]),
+    ("Replication", &[
+        "replicas", "replica", "promote", "write_acks", "ship_log_mb", "verify_every_s",
+        "failover_after_ms"
+    ]),
+    ("Cluster: a coordinator and its shards", &[
+        "shards", "hedge_ms", "shard_timeout_ms", "route", "hedge_adaptive", "prefer_caught_up",
+        "partial", "stats_cache_terms", "write_every_copy", "kube_cluster", "coordinator_listen",
+        "local_shard", "cluster_token", "shard_ca", "slot_map", "peer_url", "cluster_name",
+        "node_name", "environment", "public_url", "image_repository"
+    ]),
+    ("Security", &[
+        "allow_host", "tls_cert", "tls_key", "keys", "audit_log", "trust_proxy", "redact_params"
+    ]),
+    ("Limits and timeouts", &[
+        "timeout_ms", "max_timeout_ms", "max_concurrent", "admission_wait_ms", "max_result_window",
+        "max_scroll_rows", "max_groups", "max_rerank", "llm_rows", "llm_per_minute",
+        "model_calls_per_key_day", "query_memory_mb", "filter_cache_mb", "answer_cache_mb",
+        "max_queued_writes", "max_body_mb", "max_connections", "max_connections_per_client",
+        "header_timeout_secs", "idle_timeout_secs", "body_timeout_secs", "write_timeout_secs",
+        "drain_ms", "stop_grace_ms"
+    ]),
+    ("Agent, models and media", &[
+        "model", "api_base", "media_fetch", "media_max_bytes", "media_store", "media_timeout_s"
+    ]),
+    ("Logs, alerts and health", &[
+        "log_format", "log_store", "log_retain", "log_store_mb", "log_queries", "slow_ms",
+        "otlp_retain", "alerts", "alert_webhook", "contain", "slo_error_ratio", "slo_p99_ms"
+    ]),
+    ("Apps, connectors, tenants and clouds", &[
+        "apps", "app_token", "app_token_dir", "connectors", "connector_secrets", "connector_env_prefix", "tenants",
+        "tenant_cache", "tenant_idle_s", "tenant_open_max", "opensearch_listen",
+        "opensearch_version", "aws_file", "digitalocean_file", "cloud_file", "hub_file",
+        "hub_device"
+    ]),
+];
+
+/// [`Args`]' command, its options under [`HELP_TOPICS`]' headings.
+fn args_command() -> clap::Command {
+    use clap::CommandFactory;
+    let mut cmd = Args::command();
+    for (i, (topic, ids)) in HELP_TOPICS.iter().enumerate() {
+        for id in *ids {
+            cmd = cmd.mut_arg(*id, |a| a.help_heading(*topic).hide_short_help(i > 0));
+        }
+    }
+    cmd.after_help("These are the options of a first run: --help lists all of them, by topic. Each command (import, admin, doctor, ...) has its own --help.")
+        .after_long_help("Each command (import, admin, doctor, ...) has its own --help.")
+}
+
 async fn run() {
-    let a = Args::parse();
+    let a = <Args as clap::FromArgMatches>::from_arg_matches(&args_command().get_matches()).unwrap_or_else(|e| e.exit());
     chloedb::query::llm::set_limits(chloedb::query::llm::Limits { rows: a.llm_rows, per_minute: (a.llm_per_minute > 0).then_some(a.llm_per_minute) });
     let format = obs::LogFormat::parse(&a.log_format).unwrap_or_else(|| {
         eprintln!("chloedb-server: --log-format is text or json, not {:?}", a.log_format);
@@ -1110,11 +1200,11 @@ async fn run() {
                 // Whether the store refuses a write whose condition fails:
                 // tenants are not safe in one that does not.
                 TenantsCommand::CheckStore { .. } => match chloedb::tenant::check_store(&*store) {
-                    Ok(()) => println!("{}: creates only what is absent, replaces only the version named, and reads its last write: tenants can be kept here", store.describe()),
+                    Ok(()) => out!("{}: creates only what is absent, replaces only the version named, and reads its last write: tenants can be kept here", store.describe()),
                     Err(e) => fail(&e.to_string()),
                 },
                 TenantsCommand::List { .. } => match chloedb::tenant::list(&*store) {
-                    Ok(ids) => ids.iter().for_each(|id| println!("{id}")),
+                    Ok(ids) => ids.iter().for_each(|id| out!("{id}")),
                     Err(e) => fail(&e.to_string()),
                 },
             }
@@ -1122,8 +1212,8 @@ async fn run() {
         }
         Some(Command::Upgrade { db }) => {
             match chloedb::upgrade::upgrade(db) {
-                Ok(Some(u)) => println!("copied {} rows of {} tables of {} into this version's format; the old database is {}", u.rows, u.tables, db.display(), u.old.display()),
-                Ok(None) => println!("{} needs no upgrade", db.display()),
+                Ok(Some(u)) => out!("copied {} rows of {} tables of {} into this version's format; the old database is {}", u.rows, u.tables, db.display(), u.old.display()),
+                Ok(None) => out!("{} needs no upgrade", db.display()),
                 Err(e) => fail(&format!("upgrade {}: {e}", db.display())),
             }
             return;
@@ -1140,7 +1230,7 @@ async fn run() {
             let dir = models.clone().unwrap_or_else(chloedb::embed::models_dir);
             let checks = chloedb_server::doctor::run(&chloedb_server::doctor::Options { models: &dir, port: *port, online: !offline, python }).await;
             for c in &checks {
-                println!("{}", c.line());
+                out!("{}", c.line());
             }
             if checks.iter().any(|c| c.level == chloedb_server::doctor::Level::Fail) {
                 std::process::exit(1);
@@ -1155,7 +1245,7 @@ async fn run() {
             let suffix = if to_type.eq_ignore_ascii_case("f16") { "f16" } else { "int8" };
             let to = to.clone().unwrap_or_else(|| from.with_file_name(format!("{}-{suffix}", from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())));
             match chloedb::embed::quantize_static(&from, &to, to_type) {
-                Ok(q) => println!("{}: {} rows of {} dimensions, {} MB (was {} MB)", to.display(), q.rows, q.dim, q.bytes_after >> 20, q.bytes_before >> 20),
+                Ok(q) => out!("{}: {} rows of {} dimensions, {} MB (was {} MB)", to.display(), q.rows, q.dim, q.bytes_after >> 20, q.bytes_before >> 20),
                 Err(e) => fail(&e.to_string()),
             }
             return;
@@ -1204,7 +1294,7 @@ async fn run() {
             match cli::send(&target, &call).await {
                 Ok((status, answer)) => {
                     let text = if *json { answer.to_string() } else { serde_json::to_string_pretty(&answer).unwrap_or_default() };
-                    println!("{text}");
+                    out!("{text}");
                     std::process::exit(cli::exit_code(status, &answer));
                 }
                 Err(e) => {
@@ -1215,7 +1305,7 @@ async fn run() {
         }
         Some(Command::Promote { url, replicas, write_acks, force, token }) => {
             match server::promote(url, replicas, write_acks, *force, token.as_deref()).await {
-                Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
+                Ok(j) => out!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
                 Err(e) => fail(&e),
             }
             return;
@@ -1258,7 +1348,7 @@ async fn run() {
             };
             if *drop_slot {
                 match chloedb_server::postgres::drop_slot(o).await {
-                    Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
+                    Ok(j) => out!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
                     Err(e) => fail(&format!("follow-postgres {name}: {e}")),
                 }
                 return;
@@ -1282,14 +1372,14 @@ async fn run() {
                 wait: std::time::Duration::from_secs(*wait_s),
             };
             match chloedb_server::follow::switch_over(o).await {
-                Ok(j) => println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
+                Ok(j) => out!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()),
                 Err(e) => fail(&format!("switch-over to {target}: {e}")),
             }
             return;
         }
         Some(Command::Operator { namespace, every_ms, no_crd, print_crd, kube_api, kube_token, kube_ca }) => {
             if *print_crd {
-                println!("{}", serde_json::to_string_pretty(&chloedb_server::operator::crd()).unwrap_or_default());
+                out!("{}", serde_json::to_string_pretty(&chloedb_server::operator::crd()).unwrap_or_default());
                 return;
             }
             let ca = kube_ca.as_ref().map(|p| std::fs::read(p).unwrap_or_else(|e| fail(&format!("--kube-ca {}: {e}", p.display()))));
@@ -1464,6 +1554,7 @@ async fn run() {
         cloud_file: a.cloud_file,
         hub_file: a.hub_file,
         connector_secrets: a.connector_secrets.clone(),
+        connector_env_prefix: a.connector_env_prefix.clone(),
         connectors: run_connectors,
         hub_device: a.hub_device,
         contain: a.contain.clone().or_else(|| a.alerts.as_ref().map(|p| p.with_file_name("contain.json"))),
@@ -1709,4 +1800,25 @@ enum AdminCmd {
 fn fail(msg: &str) -> ! {
     tracing::error!("{msg}");
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A new option goes under a topic of `--help`, or it would be listed
+    /// apart from the rest, under "Options".
+    #[test]
+    fn every_option_is_under_a_help_topic() {
+        let mut cmd = super::args_command();
+        cmd.build();
+        let loose: Vec<String> = cmd
+            .get_arguments()
+            .filter(|a| !matches!(a.get_id().as_str(), "help" | "version") && a.get_help_heading().is_none())
+            .map(|a| a.get_id().to_string())
+            .collect();
+        assert!(loose.is_empty(), "options under no topic of HELP_TOPICS in main.rs: {loose:?}");
+        let mut seen = std::collections::HashSet::new();
+        for id in super::HELP_TOPICS.iter().flat_map(|(_, ids)| ids.iter()) {
+            assert!(seen.insert(id), "{id} is under two topics");
+        }
+    }
 }

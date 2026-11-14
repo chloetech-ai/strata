@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ChloeDB from Java · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="The ai.chloetech.chloedb package runs a ChloeDB database inside a Java process, the way sqlite-jdbc runs SQLite: the database is a file the JVM opens, read and written by ChloeDB&#x27;s native library over JNI, with no…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/java.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Clients</span>
       <h1>ChloeDB from Java</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/java.md">docs/chloedb/java.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#build-it">Build it</a></li><li><a href="#a-database-in-your-process">A database in your process</a></li><li><a href="#rows-and-values">Rows and values</a></li><li><a href="#queries">Queries</a></li><li><a href="#tables">Tables</a></li><li><a href="#files">Files</a></li><li><a href="#jdbc">JDBC</a></li><li><a href="#errors">Errors</a></li><li><a href="#how-it-works">How it works</a></li></ol></details>
     <div class="doc-body">
@@ -92,14 +95,14 @@
 <p>The package is in <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb-java"><code>chloedb-java/</code></a>: Java classes (<code>src/main/java</code>) and the Rust crate of their native library (<code>src/*.rs</code>). Building it needs Rust (stable), a C compiler, a JDK (11 or later) and Maven.</p>
 <pre data-lang="sh">cd chloedb-java
 mvn package          # cargo builds the library, Maven the classes; tests run against both
-mvn install          # and into ~/.m2, as ai.chloetech:chloedb:0.3.2</pre>
-<p>The jar (<code>target/java/chloedb-0.3.2.jar</code>) carries the native library for the platform it was built on (Linux or macOS, x86-64 or ARM), and needs nothing else at run time: no dependency, no server. A project uses it from the local repository:</p>
+mvn install          # and into ~/.m2, as ai.chloetech:chloedb:0.3.3</pre>
+<p>The jar (<code>target/java/chloedb-0.3.3.jar</code>) carries the native library for the platform it was built on (Linux or macOS, x86-64 or ARM), and needs nothing else at run time: no dependency, no server. A project uses it from the local repository:</p>
 <pre data-lang="xml">&lt;dependency&gt;
   &lt;groupId&gt;ai.chloetech&lt;/groupId&gt;
   &lt;artifactId&gt;chloedb&lt;/artifactId&gt;
-  &lt;version&gt;0.3.2&lt;/version&gt;
+  &lt;version&gt;0.3.3&lt;/version&gt;
 &lt;/dependency&gt;</pre>
-<p>or, with Gradle, <code>implementation("ai.chloetech:chloedb:0.3.2")</code> with <code>mavenLocal()</code> among the repositories.</p>
+<p>or, with Gradle, <code>implementation("ai.chloetech:chloedb:0.3.3")</code> with <code>mavenLocal()</code> among the repositories.</p>
 <p><code>-Dcargo.profile=ci</code> builds the library without link-time optimisation, much faster, for a build that only runs the tests. <code>-Dcargo.features=bert</code> (comma-separated) turns on Cargo features as the Python package has them: <code>bert</code> for BERT embedding models (<code>accelerate</code> on a Mac), <code>onnx</code>, <code>vision</code>, <code>audio</code>. The library already includes DataFusion, Parquet and <code>s3://</code> URLs. <code>-Dcargo.skip=true</code> packages the library cargo built before.</p>
 <h2 id="a-database-in-your-process">A database in your process<a class="anchor" href="#a-database-in-your-process" aria-label="Link to this section">#</a></h2>
 <pre data-lang="java" data-title="Java">import ai.chloetech.chloedb.Database;
@@ -262,7 +265,7 @@ try (Connection c = DriverManager.getConnection(&quot;jdbc:chloedb:books.chloedb
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

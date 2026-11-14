@@ -63,6 +63,53 @@ async function pool(items, n, fn, stopped) {
   await Promise.all(workers);
 }
 
+/** The problems and strengths of the sessions' reviews, each with an id. */
+export function reviewed(sessions) {
+  const problems = [];
+  const strengths = [];
+  for (const s of sessions) {
+    (s.review?.problems || []).forEach((p, i) => problems.push({ id: `${s.id}#${i + 1}`, session: s.id, persona: s.persona.id, task: s.task.id, ...p }));
+    (s.review?.strengths || []).forEach((p, i) => strengths.push({ id: `${s.id}+${i + 1}`, session: s.id, persona: s.persona.id, task: s.task.id, ...p }));
+  }
+  return { problems, strengths };
+}
+
+const findingTotals = (problems, findings) => ({
+  problems: problems.length,
+  findings: findings.filter((f) => f.category !== 'strength').length,
+  strengths: findings.filter((f) => f.category === 'strength').length,
+  agent_mistakes: problems.filter((p) => p.category === 'agent_mistake').length,
+});
+
+async function groupAndSave(store, runId, sessions, judge, log) {
+  const { problems, strengths } = reviewed(sessions);
+  let findings = [];
+  try { findings = (await groupFindings(judge, problems, sessions, { strengths })).findings; } catch (e) { log(`grouping the findings failed: ${e.message}`); }
+  await store.saveFindings(runId, findings.map((f) => ({ id: `${runId}-f${String(f.rank).padStart(2, '0')}`, run: runId, ...f })));
+  return { problems, findings };
+}
+
+/**
+ * Group a finished run's findings again from the reviews it kept, without
+ * playing or reviewing any session: after a grouping that failed, or with
+ * a newer judge. Its findings are replaced; the run's totals and judge cost
+ * follow.
+ */
+export async function regroup(store, runId, { budget = 5, log = () => {} } = {}) {
+  const all = await store.run(runId);
+  if (!all) throw new Error(`no run ${runId}`);
+  const { run, sessions } = all;
+  const judge = new Spend(budget);
+  const { problems, findings } = await groupAndSave(store, runId, sessions, judge, log);
+  run.totals = { ...(run.totals || {}), ...findingTotals(problems, findings) };
+  const j = run.cost?.judge || { usd: 0, calls: 0 };
+  run.cost = { ...run.cost, judge: { ...j, usd: Number(((j.usd || 0) + judge.usd).toFixed(4)), calls: (j.calls || 0) + judge.calls } };
+  run.cost.usd = Number(((run.cost.users?.usd || 0) + run.cost.judge.usd).toFixed(4));
+  await store.saveRun(run);
+  log(`run ${runId}: ${run.totals.findings} findings and ${run.totals.strengths} strengths from ${problems.length} problems, $${judge.usd.toFixed(4)}`);
+  return run;
+}
+
 /**
  * Play a scenario set. `store` gets the run, its sessions, steps and
  * findings; `workdir` holds the sandboxes. Answers the finished run.
@@ -148,19 +195,15 @@ export async function runSet(set, { store, workdir, bin = serverBin(), budget = 
   // Review each session, then group what the reviews found.
   run.status = 'judging';
   await store.saveRun(run);
-  const problems = [];
   await pool(sessions, concurrency, async (s) => {
     if (s.outcome === 'error' && !s.steps) return;
     try {
       const steps = await store.steps(s.id);
       s.review = await reviewSession(judge, s, steps);
-      (s.review.problems || []).forEach((p, i) => problems.push({ id: `${s.id}#${i + 1}`, session: s.id, persona: s.persona.id, task: s.task.id, ...p }));
       await store.saveSession(s);
     } catch (e) { log(`review of ${s.id} failed: ${e.message}`); }
   }, () => judge.over);
-  let findings = [];
-  try { findings = (await groupFindings(judge, problems, sessions)).findings; } catch (e) { log(`grouping the findings failed: ${e.message}`); }
-  await store.saveFindings(run.id, findings.map((f) => ({ id: `${run.id}-f${String(f.rank).padStart(2, '0')}`, run: run.id, ...f })));
+  const { problems, findings } = await groupAndSave(store, run.id, sessions, judge, log);
 
   run.status = control.stop ? 'stopped' : users.over ? 'budget' : 'done';
   run.ended = new Date().toISOString();
@@ -168,8 +211,7 @@ export async function runSet(set, { store, workdir, bin = serverBin(), budget = 
     sessions: sessions.length, ...rates(sessions),
     by_persona: rates(sessions, (s) => s.persona.id), by_task: rates(sessions, (s) => s.task.id), by_model: rates(sessions, (s) => s.model),
     outcomes: sessions.reduce((m, s) => ({ ...m, [s.outcome]: (m[s.outcome] || 0) + 1 }), {}),
-    problems: problems.length, findings: findings.length,
-    agent_mistakes: problems.filter((p) => p.category === 'agent_mistake').length,
+    ...findingTotals(problems, findings),
   };
   run.cost = { users: users.toJSON(), judge: judge.toJSON(), usd: Number((users.usd + judge.usd).toFixed(4)) };
   await store.saveRun(run);

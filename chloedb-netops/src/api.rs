@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -325,7 +325,7 @@ async fn incident(State(svc): State<Shared>, Path(id): Path<String>) -> Answer {
     let timeline = q.rows("Its timeline", "SELECT ts, kind, actor, note, ref_id FROM netops_timeline\nWHERE incident = :id ORDER BY ts LIMIT 300", json!({"id": id})).await?;
     let runs = q.rows("Agent runs on it", "SELECT * FROM netops_agent_runs WHERE incident = :id ORDER BY started DESC LIMIT 20", json!({"id": id})).await?;
     let acts = q.rows("Actions proposed for it", "SELECT * FROM netops_actions WHERE incident = :id ORDER BY proposed LIMIT 50", json!({"id": id})).await?;
-    let rca = runs.iter().find(|r| r.s("agent") == "root-cause").map(|r| r.s("id"));
+    let rca = runs.iter().find(|r| r.s("agent") == "root-cause" || r.s("agent") == "estate").map(|r| r.s("id"));
     let (steps, receipts) = match &rca {
         Some(run) => (
             q.rows("What the root-cause agent did, step by step", "SELECT n, tool, title, detail, sql_text, row_count, ms FROM netops_agent_steps\nWHERE run = :run ORDER BY n LIMIT 100", json!({"run": run})).await?,
@@ -400,10 +400,25 @@ async fn answer_key(State(svc): State<Shared>, Path(id): Path<String>) -> Answer
     q.done(json!({"key": rows.first()}))
 }
 
-async fn incident_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, body: Option<Json<Value>>) -> Answer {
+/// Who did something, as it is recorded: the key the command center
+/// forwarded the request for (`x-chloedb-principal`, which the caller
+/// cannot choose), else, for a call with no key behind it (the server's
+/// own token, an open server, a direct call with this app's token), the
+/// name the body gives, else `default`.
+pub fn actor(h: &HeaderMap, said: Option<&str>, default: &str) -> String {
+    let principal = h.get("x-chloedb-principal").and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty());
+    let said = said.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("you")).map(|s| s.chars().take(80).collect::<String>());
+    match principal {
+        Some(p) if !matches!(p, "token" | "open" | "cluster") => p.to_string(),
+        Some(p) => said.unwrap_or_else(|| if p == "open" { "someone (an open server)".into() } else { "admin (the server's token)".into() }),
+        None => said.unwrap_or_else(|| default.to_string()),
+    }
+}
+
+async fn incident_act(State(svc): State<Shared>, Path((id, action)): Path<(String, String)>, headers: HeaderMap, body: Option<Json<Value>>) -> Answer {
     let e = &svc.engine;
     let b = body.map(|b| b.0).unwrap_or(Value::Null);
-    let who = b["who"].as_str().unwrap_or("Operator").to_string();
+    let who = actor(&headers, b["who"].as_str(), "Operator");
     let _guard = e.lock.lock().await;
     let m = e.st().last_minute;
     let open = e.st().open.contains_key(&id);
@@ -493,7 +508,11 @@ async fn rule_test(State(svc): State<Shared>, Json(b): Json<Value>) -> Answer {
         Ok(rows) => {
             let ok = rows.is_empty() || (rows[0].contains_key("entity") && rows[0].contains_key("v"));
             let n = rows.len();
-            q.done(json!({"rows": rows.into_iter().take(50).collect::<Vec<_>>(), "count": n, "ok": ok, "note": if ok { "" } else { "A rule returns two columns: entity (what is wrong) and v (the reading)." }}))
+            // What would fire: the rows whose reading passes the comparison.
+            let cmp = b["cmp"].as_str().unwrap_or(">");
+            let threshold = b["threshold"].as_f64().unwrap_or(0.0);
+            let firing = rows.iter().filter(|r| !r.s("entity").is_empty() && crate::sim::fires(cmp, threshold, r)).count();
+            q.done(json!({"rows": rows.into_iter().take(50).collect::<Vec<_>>(), "count": n, "firing": firing, "cmp": cmp, "threshold": threshold, "ok": ok, "note": if ok { "" } else { "A rule returns two columns: entity (what is wrong) and v (the reading)." }}))
         }
         Err(e) => q.done(json!({"error": e.message, "ok": false})),
     }
@@ -516,12 +535,17 @@ async fn rule_save(State(svc): State<Shared>, Json(b): Json<Value>) -> Answer {
     if !["link", "device", "service", "site"].contains(&kind) {
         return Err(bad("entity_kind is link, device, service or site"));
     }
+    let cmp = b["cmp"].as_str().unwrap_or(">").trim();
+    if !crate::sim::COMPARATORS.contains(&cmp) {
+        return Err(bad(format!("cmp is how v is compared with the threshold: one of {}", crate::sim::COMPARATORS.join(" "))));
+    }
+    let Some(threshold) = b.get("threshold").map_or(Some(0.0), |t| t.as_f64().or_else(|| t.as_str().and_then(|s| s.trim().parse().ok()))) else { return Err(bad("threshold is a number")) };
     let severity = b["severity"].as_str().unwrap_or("minor");
     if !["critical", "major", "minor"].contains(&severity) {
         return Err(bad("severity is critical, major or minor"));
     }
     let _guard = e.lock.lock().await;
-    e.db.upsert("netops_alert_rules", vec![json!({"id": id, "name": name, "description": b["description"].as_str().unwrap_or(""), "sql_text": sql, "cmp": b["cmp"].as_str().unwrap_or(">"), "threshold": b["threshold"].as_f64().unwrap_or(0.0),
+    e.db.upsert("netops_alert_rules", vec![json!({"id": id, "name": name, "description": b["description"].as_str().unwrap_or(""), "sql_text": sql, "cmp": cmp, "threshold": threshold,
         "unit": b["unit"].as_str().unwrap_or(""), "severity": severity, "entity_kind": kind, "window_s": b["window_s"].as_i64().unwrap_or(180).clamp(60, 86400), "clear_after": 2, "enabled": true,
         "runbook": b["runbook"].as_str().unwrap_or(""), "firing": 0, "builtin": false})]).await?;
     Ok(Json(json!({"id": id})))
@@ -896,8 +920,8 @@ async fn actions(State(svc): State<Shared>, Query(p): Query<HashMap<String, Stri
     q.done(json!({"actions": rows}))
 }
 
-async fn action_decide(State(svc): State<Shared>, Path((id, decision)): Path<(String, String)>, body: Option<Json<Value>>) -> Answer {
-    let who = body.as_ref().and_then(|b| b["who"].as_str()).unwrap_or("Operator").to_string();
+async fn action_decide(State(svc): State<Shared>, Path((id, decision)): Path<(String, String)>, headers: HeaderMap, body: Option<Json<Value>>) -> Answer {
+    let who = actor(&headers, body.as_ref().and_then(|b| b["who"].as_str()), "Operator");
     let approve = match decision.as_str() {
         "approve" => true,
         "reject" => false,
@@ -940,4 +964,23 @@ async fn end_fault(State(svc): State<Shared>) -> Answer {
 async fn settings(State(svc): State<Shared>, Json(b): Json<Value>) -> Answer {
     svc.engine.settings(b["autopilot"].as_bool(), b["fault_every"].as_i64()).await?;
     Ok(Json(sim_state(&svc.engine)))
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    #[test]
+    fn the_actor_is_the_key_the_server_forwarded_for() {
+        let with = |p: &str| { let mut h = HeaderMap::new(); h.insert("x-chloedb-principal", p.parse().unwrap()); h };
+        // A key's name is who it was, whatever the body says.
+        assert_eq!(actor(&with("roberto"), Some("You"), "Operator"), "roberto");
+        assert_eq!(actor(&with("roberto"), Some("someone else"), "Operator"), "roberto");
+        // No key behind it: the body's name, never "You", else what it was.
+        assert_eq!(actor(&with("token"), Some("m.rossi"), "Operator"), "m.rossi");
+        assert_eq!(actor(&with("token"), Some("You"), "Operator"), "admin (the server's token)");
+        assert_eq!(actor(&with("open"), None, "Operator"), "someone (an open server)");
+        assert_eq!(actor(&HeaderMap::new(), Some("test"), "Operator"), "test");
+        assert_eq!(actor(&HeaderMap::new(), None, "Operator"), "Operator");
+    }
 }

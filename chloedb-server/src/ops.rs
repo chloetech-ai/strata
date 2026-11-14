@@ -36,9 +36,7 @@ pub const READ_POSTS: &[&str] = &[
     "/v1/admin/simulator/predict",
     "/v1/logs/query",
     "/v1/admin/autoscale/replay",
-    "/v1/admin/aws/plan",
     "/v1/admin/aws/validate",
-    "/v1/admin/digitalocean/plan",
     "/v1/admin/digitalocean/validate",
     "/v1/alerts/backtest",
     "/v1/query",
@@ -117,6 +115,34 @@ const NOT_FOR_ROLES: &[&str] = &[
     "/v1/admin/digitalocean/token",
     "/v1/admin/hub/copy",
 ];
+
+/// Routes whose body or answer holds a credential: those of
+/// [`NOT_FOR_ROLES`], and those that make or show a key's secret, or take
+/// another cluster's, a connector's or a cloud's. A change request does
+/// not carry them (audit X-D1): it is kept on disk and read by every role
+/// key, and so would be what it carries and what it was answered.
+const CREDENTIAL_ROUTES: &[&str] = &[
+    "/v1/admin/keys",
+    "/v1/admin/keys/:id/rotate",
+    "/v1/keys/own",
+    "/v1/admin/connectors",
+    "/v1/admin/connectors/test",
+    "/v1/admin/connectors/:name",
+    "/v1/admin/connectors/:name/key",
+    "/v1/connectors/:name/push",
+    "/v1/admin/hub/connections",
+    "/v1/admin/hub/connections/:name",
+    "/v1/admin/hub/adopt",
+    "/v1/admin/aws/validate",
+    "/v1/admin/aws/plan",
+    "/v1/admin/digitalocean/validate",
+    "/v1/admin/digitalocean/plan",
+];
+
+/// Whether `route` carries or answers a credential ([`CREDENTIAL_ROUTES`]).
+pub fn carries_credentials(route: &str) -> bool {
+    NOT_FOR_ROLES.contains(&route) || CREDENTIAL_ROUTES.contains(&route)
+}
 
 /// Whether a key with role `role` may call `route` by `method` beyond
 /// what its scope (read) allows: the server's views (tier 0) for both

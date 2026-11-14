@@ -86,6 +86,9 @@
     const fail = (where, e) => {
       const err = new Error(`${where}: ${e && e.message ? e.message : e}`);
       err.__cap = e && e.__cap;
+      // A refusal and a call nobody answered stay what they are (frame.js).
+      if (e && e.refused) err.refused = true;
+      if (e && e.transient) err.transient = true;
       return err;
     };
     // The value of v in scope s: expressions evaluated, objects and arrays walked.
@@ -106,7 +109,10 @@
       try {
         const r = typeof fn === 'function' ? fn(...args) : fn;
         if (r && typeof r.then === 'function') await r;
-      } catch (e) { if (!(e && e.refused)) report(fail(where, e)); app.toast(e && e.message ? e.message : String(e)); }
+      } catch (e) {
+        if (e && e.transient) app.toast('No answer from the app just now. Try again in a moment.');
+        else { if (!(e && e.refused)) report(fail(where, e)); app.toast(e && e.message ? e.message : String(e)); }
+      }
       await refresh();
     };
     const handler = (v, s, where) => {
@@ -119,11 +125,23 @@
       for (const [k, v] of Object.entries(props || {})) out[k] = typeof v === 'function' && /^on[A-Z]/.test(k) ? (...args) => run(v, args, `${where}.${k}`) : v;
       return out;
     };
+    // A visitor who may only look (a published app's choice, app.access) is
+    // not offered what would write: forms, and the buttons and row actions
+    // that add, change or remove (their code writes, or their label says so:
+    // Edit opens a form that is not there). The server refuses such a write
+    // anyway; this keeps it from being offered.
+    const readOnly = app.access === 'look';
+    const WRITES = /\bapp\.(insert|update|remove|call|upload|email)\s*\(/;
+    const WRITE_LABEL = /^(add|new|edit|delete|remove|archive|discard|trash|create)\b/i;
+    const writes = (doV, label) => readOnly && ((isExpr(doV) && WRITES.test(String(SRC[doV.$e] || ''))) || (typeof doV === 'function' && WRITES.test(String(doV))) || WRITE_LABEL.test(String(label || '').trim()));
     // A preview (drawn while the model still writes the app) has no tables
     // or components yet: what fails stays quiet.
     const preview = !!spec.preview;
     function report(e) {
       if (preview) return;
+      // Not the screen's fault: a refusal is said where it happened, and a
+      // call nobody answered is asked again (load).
+      if (e && (e.refused || e.transient)) return;
       const key = String(e && e.message);
       if (reported.has(key)) return;
       reported.add(key);
@@ -142,15 +160,37 @@
           const def = typeof q === 'string' ? { sql: q } : q || {};
           // An expression for sql gives the SELECT to run (one that depends on
           // state), or the rows themselves.
+          // A query that names :today and gives it no value gets the day here.
+          const bind = (sql, p) => (/:today\b/.test(sql) && (p.today === undefined || p.today === null) ? { ...p, today: app.today() } : p);
           if (isExpr(def.sql)) {
             const sql = await val(def.sql, s, where);
             if (typeof sql !== 'string') return sql;
-            return await app.sql(sql, val(def.params || {}, s, `${where}.params`));
+            return await app.sql(sql, bind(sql, val(def.params || {}, s, `${where}.params`)));
           }
-          return await app.sql(def.sql, val(def.params || {}, s, `${where}.params`));
-        } catch (e) { report(fail(where, e)); return []; }
+          return await app.sql(def.sql, bind(String(def.sql || ''), val(def.params || {}, s, `${where}.params`)));
+        } catch (e) {
+          // Nobody answered (the network, the engine restarting): what was
+          // shown stays, and the data is asked for again shortly.
+          if (e && e.transient) { missed = true; return data[name]; }
+          report(fail(where, e));
+          return [];
+        }
       }));
       data = Object.fromEntries(entries.map(([name], i) => [name, out[i] ?? []]));
+      retryLoad(missed);
+    }
+    // After a read nobody answered: again in 2 s, then 4, 8... up to 30 s,
+    // until one is answered; the person is told once (frame.js).
+    let retryIn = 0;
+    let retryTimer = 0;
+    let missed = false;
+    function retryLoad(was) {
+      missed = false;
+      if (!was) { if (retryIn && window.__sa_offline) window.__sa_offline(false); retryIn = 0; return; }
+      if (!retryIn && window.__sa_offline) window.__sa_offline(true);
+      retryIn = Math.min(30000, retryIn ? retryIn * 2 : 2000);
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => { refresh().catch(() => {}); }, retryIn);
     }
     function compute() {
       lets = {};
@@ -205,7 +245,7 @@
         if (b.chips !== undefined) return chips(b, s, path);
         if (b.input !== undefined) return input(b, s, path);
         if (b.button !== undefined) return button(b, s, path);
-        if (b.form !== undefined) return folded(b, s, path);
+        if (b.form !== undefined) return readOnly ? null : folded(b, s, path);
         if (b.checks !== undefined) return checks(b, s, path);
         if (b.table !== undefined) return table(b, s, path);
         if (b.code !== undefined) return code(b, s, path);
@@ -259,6 +299,7 @@
     const asks = (q, fn) => !!q && !/\bapp\.remove\(/.test(String(fn));
 
     function button(b, s, path) {
+      if (writes(b.do, T(b.button, s, path))) return null;
       const fn = val(b.do, s, `${path}.do`);
       const btn = h('button', { class: b.class || null, type: 'button', onclick: async () => {
         if (asks(b.confirm, fn) && !confirm(T(b.confirm, s, path))) return;
@@ -466,10 +507,12 @@
       const given = b.columns !== undefined ? val(b.columns, s, `${path}.columns`) : null;
       const cols = (Array.isArray(given) && given.length ? given : Object.keys(rows[0]).filter((k) => k !== 'id' && k !== 'created').map((key) => ({ key }))).map((c) => (typeof c === 'string' ? { key: c } : c));
       const fns = cols.map((c, i) => (c.value !== undefined ? val(c.value, s, `${path}.columns[${i}].value`) : null));
-      const acts = (b.actions || []).map((a, i) => ({ ...a, fn: val(a.do, s, `${path}.actions[${i}].do`) }));
+      const acts = (b.actions || []).map((a, i) => ({ ...a, fn: val(a.do, s, `${path}.actions[${i}].do`) })).filter((a) => !writes(a.do, T(a.label, s, path)));
       const onRow = b.onRow !== undefined ? val(b.onRow, s, `${path}.onRow`) : null;
       const cell = (c, fn, r) => {
         let v = typeof fn === 'function' ? fn(r) : fn !== null ? fn : r[c.key];
+        // A tick in a row writes when it changes: one a visitor who may only look cannot change.
+        if (readOnly && v instanceof HTMLInputElement && v.type === 'checkbox') v.disabled = true;
         if (v instanceof Node) return v;
         if (c.format && FORMAT[c.format]) v = FORMAT[c.format](v);
         if (Array.isArray(v)) v = v.join(', ');
@@ -755,7 +798,7 @@
         try {
           if (row) { await app.remove(table, row.id, { undo: false }); has.delete(key(it, day)); }
           else { has.set(key(it, day), await app.insert(table, { ...(b.fields || {}), [itemCol]: it.id, [dayCol]: day, ...(skipCol ? { [skipCol]: skip } : {}) })); }
-        } catch (e) { report(fail(path, e)); }
+        } catch (e) { if (e && (e.refused || e.transient)) app.toast(e.transient ? 'No answer from the app just now. Try again in a moment.' : e.message); report(fail(path, e)); }
         btn.disabled = false;
         await refresh();
       };
@@ -763,7 +806,7 @@
         const st = stateOf(it, ymd(d));
         const now = k === n - 1;
         const btn = h('button', { type: 'button', class: `check${now ? ' today' : ' past'}${st === 'done' ? ' on' : st === 'skip' ? ' skip' : ''}`, 'data-age': String(n - 1 - k), 'aria-pressed': String(st === 'done'),
-          'aria-label': `${nameOf(it)}, ${label(d)}${st === 'skip' ? ', skipped' : ''}`, title: `${label(d)}${st === 'skip' ? ' (skipped)' : ''}`, onclick: () => toggle(it, d, btn) },
+          'aria-label': `${nameOf(it)}, ${label(d)}${st === 'skip' ? ', skipped' : ''}`, title: `${label(d)}${st === 'skip' ? ' (skipped)' : ''}`, disabled: readOnly, onclick: () => toggle(it, d, btn) },
           h('span', { class: st === 'skip' ? 'dash' : 'mark', 'aria-hidden': 'true' }));
         return btn;
       };
@@ -808,6 +851,35 @@
     const front = window.__sa_front ? window.__sa_front({ h, val, T, block, run, app, scope }) : null;
     const isFront = spec.page === 'front' && !!front;
     if (isFront) document.body.classList.add('front');
+    // The screen's page structure (engine/quality.mjs LAYOUTS): a class the
+    // kit draws (kit.css, front.css), and for a working screen its parts
+    // arranged: the title and numbers as its head, then the screen's groups
+    // (each starts at a heading or a row of numbers) placed as the layout says.
+    const LAYOUTS = ['hero', 'split', 'editorial', 'dashboard', 'gallery', 'tool'];
+    const layout = LAYOUTS.includes(spec.layout) ? spec.layout : null;
+    if (layout) { document.body.classList.add(`layout-${layout}`); document.documentElement.dataset.layout = layout; }
+    const flatNodes = (x) => (Array.isArray(x) ? x.flatMap(flatNodes) : x instanceof Node ? [x] : []);
+    const headLike = (el) => el.nodeType === 1 && (el.matches('h1, h2, .say, .kpis, .hero-band') || (el.matches('.row') && !!el.querySelector(':scope > h1, :scope > h2')));
+    function arrange(els) {
+      const list = flatNodes(els);
+      if (!layout || list.length < 2) return list;
+      const head = [];
+      let i = 0;
+      while (i < list.length && (headLike(list[i]) || (list[i].nodeType === 1 && list[i].matches('p') && head.length))) head.push(list[i++]);
+      const groups = [];
+      for (; i < list.length; i++) {
+        if (!groups.length || (headLike(list[i]) && groups.at(-1).length)) groups.push([]);
+        groups.at(-1).push(list[i]);
+      }
+      const box = (cls, kids) => h('div', { class: cls }, kids);
+      const top = head.length ? [box(`lay-head${layout === 'hero' ? ' lay-hero' : ''}`, head)] : [];
+      if (!groups.length) return top;
+      const cells = groups.map((g, k) => box(`lay-group lay-g${k}`, g));
+      if (layout === 'split' && cells.length > 1) return [...top, box('lay-split', [box('lay-main', [cells[0]]), box('lay-aside', cells.slice(1))])];
+      if (layout === 'tool') return [...top, box('lay-main lay-panel', [cells[0]]), ...cells.slice(1)];
+      if (layout === 'dashboard') return [...top, box('lay-grid', cells)];
+      return [...top, ...cells];
+    }
 
     // ---- drawing: the whole screen again, keeping focus and what is typed.
     function focusPath() {
@@ -835,8 +907,8 @@
           const f = focusPath();
           heroAt = null;
           if (isFront) {
-            root.replaceChildren(h('div', { class: 'screen front' }, front.page(spec.body, scope())));
-          } else root.replaceChildren(h('div', { class: 'col screen' }, blocks(spec.body, scope(), 'body')));
+            root.replaceChildren(h('div', { class: `screen front${layout ? ` layout-${layout}` : ''}` }, front.page(spec.body, scope(), layout)));
+          } else root.replaceChildren(h('div', { class: `col screen${layout ? ` layout-${layout}` : ''}` }, arrange(blocks(spec.body, scope(), 'body'))));
           if (front) front.after(root);
           restore(f);
         } while (again);

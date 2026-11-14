@@ -22,6 +22,8 @@ const isVector = (ty) => /^vector/i.test(ty || "");
 const readsOf = (sql) => [...new Set([...(sql || "").matchAll(/\b(?:FROM|JOIN)\s+"?([A-Za-z_][\w]*)"?(?!\s*\()/gi)].map((m) => m[1]).filter((t) => !/^(select|unnest)$/i.test(t)))];
 /** Its calls over the last 15 minutes, from the statements that name it: {calls, errors, p99, keys}. */
 async function usage() {
+  // The statements' statistics are an admin's: another key asks nothing.
+  if (!can("admin")) return null;
   try {
     const st = await api("/v1/queries/stats?limit=500");
     const list = Array.isArray(st) ? st : st.statements || [];

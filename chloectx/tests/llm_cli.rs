@@ -92,3 +92,53 @@ fn a_cli_that_hangs_times_out() {
     assert!(e.to_string().contains("timed out"), "{e}");
     assert!(t0.elapsed() < Duration::from_secs(10));
 }
+
+/// CTX-2: a CLI that fails with a message on stderr and nothing on stdout
+/// (an unknown flag, a crash, a proxy error): the error names what it said
+/// and how it exited, not only "EOF while parsing".
+#[test]
+fn a_failed_call_keeps_what_the_cli_said() {
+    home();
+    let t = tempfile::tempdir().unwrap();
+    let exe = t.path().join("claude");
+    std::fs::write(&exe, "#!/bin/sh\ncat > /dev/null\necho 'error: unknown option --tools' >&2\necho '(Did you mean --tool?)' >&2\nexit 2\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = complete(&cli(&exe, Duration::from_secs(20)), "s", "p").unwrap_err().to_string();
+    assert!(e.contains("unknown option --tools") && e.contains("Did you mean"), "{e}");
+    assert!(e.contains("exited with status 2"), "{e}");
+}
+
+/// CTX-3: the CLI is found without this process's PATH: where the hooks
+/// saw it, and `CHLOECTX_CLAUDE`, which wins.
+#[test]
+fn the_cli_is_found_off_the_path() {
+    use chloectx::llm::{resolve_cli, set_hook_cli};
+    let t = tempfile::tempdir().unwrap();
+    let bin = t.path().join("hooks-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = fake_cli(&bin, 2);
+    assert_eq!(resolve_cli("/abs/claude").unwrap(), PathBuf::from("/abs/claude"), "a path is used as it is");
+    set_hook_cli(&exe);
+    // The hooks' one wins over PATH and the usual places.
+    assert_eq!(resolve_cli("claude").unwrap(), exe);
+    let named = fake_cli(&t.path().join("x").tap_mkdir(), 2);
+    std::env::set_var("CHLOECTX_CLAUDE", &named);
+    assert_eq!(resolve_cli("claude").unwrap(), named);
+    std::env::set_var("CHLOECTX_CLAUDE", t.path().join("nope"));
+    assert!(resolve_cli("claude").unwrap_err().contains("CHLOECTX_CLAUDE"));
+    std::env::remove_var("CHLOECTX_CLAUDE");
+    // A name that is nowhere says where it looked.
+    let e = resolve_cli("no-such-cli-chloectx").unwrap_err();
+    assert!(e.contains("PATH") && e.contains(".local/bin"), "{e}");
+}
+
+trait TapMkdir {
+    fn tap_mkdir(self) -> Self;
+}
+
+impl TapMkdir for PathBuf {
+    fn tap_mkdir(self) -> Self {
+        std::fs::create_dir_all(&self).unwrap();
+        self
+    }
+}

@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>chloedb-crawl: a site into a table · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="chloedb-crawl takes a URL, reads the site&#x27;s pages, finds their fields, makes a table from them and fills it, and adds shards to the cluster as the table grows. It is a program of its own, in Rust, that talks to…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/crawler.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Apps</span>
       <h1>chloedb-crawl: a site into a table</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/crawler.md">docs/chloedb/crawler.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#what-it-does-with-a-page">What it does with a page</a></li><li><a href="#the-command-centers-view">The command center's view</a></li><li><a href="#options">Options</a></li><li><a href="#api">API</a></li><li><a href="#limits">Limits</a></li></ol></details>
     <div class="doc-body">
@@ -93,7 +96,7 @@
 cd chloedb-crawl &amp;&amp; cargo build --release
 target/release/chloedb-crawl serve --local ./crawl-cluster --server-bin ../chloedb-server/target/release/chloedb-server</pre>
 <p>Open <code>http://127.0.0.1:7700</code> and go to <strong>Apps → Crawler</strong>. Type the site's address under <strong>New crawl</strong> and press <strong>Crawl</strong>, or <strong>Preview</strong> first to see the table it would make; <strong>Options</strong> holds the rest of the settings below. Each crawl gets its own page, where you watch it fill the table and grow the cluster, and pause or stop it.</p>
-<p><img alt="The Crawler in the command center: the New crawl form, the crawls, and the cluster's shards" src="../../assets/img/strata-crawler-new-crawl.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The Crawler in the command center: the New crawl form, the crawls, and the cluster's shards" src="../../assets/img/strata-crawler-new-crawl.png" /></p>
 <p><code>--local DIR</code> starts one shard server and a coordinator on <code>127.0.0.1:7700</code> with their databases and logs in <code>DIR</code>, and adds a shard each time one holds more than <code>--split-rows</code> rows of a crawl's table (100,000 by default, at most <code>--max-shards</code>, 8). The same <code>DIR</code> again serves the same cluster, with the shards it grew.</p>
 <h3 id="from-the-command-line">From the command line<a class="anchor" href="#from-the-command-line" aria-label="Link to this section">#</a></h3>
 <p>The same crawl runs without the command center too. <code>crawl</code> takes the address, prints its progress every two seconds, then what it did (the table it made and why, the columns it added, the shards it added) and the <code>CREATE TABLE</code> it ran; add <code>--stay</code> to keep the cluster serving after the crawl. <code>preview</code> prints what the form's <strong>Preview</strong> shows, without ChloeDB:</p>
@@ -248,7 +251,7 @@ target/release/chloedb-crawl preview https://books.toscrape.com/ --pages 10</pre
 <tr>
 <td><code>max_depth</code></td>
 <td>5</td>
-<td>links from a seed</td>
+<td>links from a seed; a list's next page (a link with <code>rel="next"</code>, or named "Next", "Next page", "Older posts" or an arrow) is as deep as the list, so a long list is read to its end. A crawl that ends says why: its page limit, its depth (with the links it left out, also in the status's <code>beyond_depth</code>), or no links left</td>
 </tr>
 <tr>
 <td><code>concurrency</code>, <code>per_host</code></td>
@@ -292,7 +295,7 @@ target/release/chloedb-crawl preview https://books.toscrape.com/ --pages 10</pre
 </tr>
 <tr>
 <td><code>user_agent</code></td>
-<td><code>chloedb-crawl/0.3.2 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)</code></td>
+<td><code>chloedb-crawl/0.3.3 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)</code></td>
 <td>a crawl's own is sent with that after it, unless it names <code>chloedb-crawl</code> (or <code>strata-crawl</code>, its old name)</td>
 </tr>
 <tr>
@@ -373,7 +376,7 @@ target/release/chloedb-crawl preview https://books.toscrape.com/ --pages 10</pre
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

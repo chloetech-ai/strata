@@ -201,3 +201,24 @@ fn values_of_rows() {
         assert!(e.contains(says), "{q}: {e}");
     }
 }
+
+/// A day as other databases write it: `CAST(t AS DATE)`, `DATE(t)` and
+/// `CURRENT_DATE`, each `date_trunc('day', ...)`, in SELECT, GROUP BY and
+/// WHERE, on columns and on values.
+#[test]
+fn days_as_cast_date_and_current_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let now = timestamp::now();
+    let today = timestamp::trunc(now, timestamp::Unit::Day).unwrap();
+    let t = |micros: i64| format!("'{}'", timestamp::format(micros));
+    sql(&db, &format!("INSERT INTO snaps VALUES (1, {}, 10, 'fixed'), (2, {}, 20, 'fixed'), (3, {}, 30, 'auction'), (4, NULL, 40, 'fixed')", t(today + 60_000_000), t(today + 120_000_000), t(today - 86_400_000_000 * 3)));
+    let day = |micros: i64| Value::Timestamp(micros);
+    assert_eq!(sql(&db, "SELECT id, CAST(at AS DATE), DATE(at) FROM snaps WHERE id IN (1, 4) ORDER BY id"), vec![vec![Value::Int(1), day(today), day(today)], vec![Value::Int(4), Value::Null, Value::Null]]);
+    assert_eq!(sql(&db, "SELECT CAST('2026-11-05T07:31:52Z' AS DATE), DATE('2026-11-05 23:59'), CURRENT_DATE"), vec![vec![day(1_793_836_800_000_000), day(1_793_836_800_000_000), day(today)]]);
+    let rows = sql(&db, "SELECT CAST(at AS DATE) AS d, COUNT(*) AS n FROM snaps WHERE at IS NOT NULL GROUP BY d ORDER BY n DESC");
+    assert_eq!(rows, vec![vec![day(today), Value::Int(2)], vec![day(today - 86_400_000_000 * 3), Value::Int(1)]]);
+    assert_eq!(sql(&db, "SELECT id FROM snaps WHERE at >= CURRENT_DATE ORDER BY id"), vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    assert_eq!(sql(&db, "SELECT COUNT(*) FROM snaps WHERE at >= CURRENT_DATE - INTERVAL '7 days'"), vec![vec![Value::Int(3)]]);
+    assert_eq!(sql(&db, "SELECT id FROM snaps WHERE CAST(at AS DATE) = CURRENT_DATE - INTERVAL '3 days'"), vec![vec![Value::Int(3)]]);
+}

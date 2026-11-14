@@ -667,7 +667,9 @@ function render(page, r) {
       const rows = OPS().map((op) => {
         const res = results.get(`${id()}:${op.id}`);
         const busy = running.has(op.id);
-        const no = op.no || (!canAdmin() && op.id !== "snapshot" ? needsAdmin : null);
+        // Bounded operations (a checkpoint, a verify, a reset) an ops key may run too: the catalog says.
+        const route = `POST ${op.path || (op.id === "checkpoint" ? "/v1/admin/checkpoint" : "")}`;
+        const no = op.no || (op.id !== "snapshot" && !can("admin", route) ? needs("admin", route) : null);
         return h("div", { class: "cc-op" + (no ? " off" : "") },
           h("div", { class: "cc-op-ic" }, icon(op.ic)),
           h("div", { class: "cc-op-t" },

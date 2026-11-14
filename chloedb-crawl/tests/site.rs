@@ -156,6 +156,19 @@ async fn a_preview_plans_the_table_from_a_few_pages() {
     assert_eq!(site.hits("/private/"), 0);
 }
 
+/// From a shop's home, which links only to its first list, the preview
+/// reads the list's products too, so it shows the fields a crawl will
+/// extract (DAP-14: it read the home and the list, and showed none).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_from_the_home_page_reaches_the_products() {
+    let (_site, base) = serve_site().await;
+    let p = chloedb_crawl::job::preview(&spec(json!({"seeds": [format!("{base}/")], "table": "widgets"})), 8).await.unwrap();
+    let urls: Vec<&str> = p["pages"].as_array().unwrap().iter().map(|x| x["url"].as_str().unwrap()).collect();
+    assert!(urls.iter().filter(|u| u.contains("/p/")).count() >= 4, "{urls:?}");
+    let cols: Vec<&str> = p["plan"]["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(cols.contains(&"offers_price") && cols.contains(&"sku"), "{cols:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_api_takes_no_browsers_and_needs_its_token() {
     let strata = Strata::new("http://127.0.0.1:9", None);

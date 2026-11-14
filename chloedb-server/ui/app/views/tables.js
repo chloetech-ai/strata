@@ -7,7 +7,7 @@
 // bytes and reads are its drill-down, the index inspector
 // (#/inspector?table=).
 
-import { h, s, clear, fmt, api, card, empty, failure, icon, store, bus, tipOn, hideTip, showTip, seg, ApiError, copyName, copyTitle } from "../core.js";
+import { h, s, clear, fmt, api, card, empty, failure, icon, signInNeeded, store, bus, tipOn, hideTip, showTip, seg, ApiError, copyName, copyTitle, can } from "../core.js";
 import { state } from "../data.js";
 import { shardTrouble } from "../sqlguard.js";
 import { tables as catalog, table as tableOf } from "../catalog.js";
@@ -89,13 +89,16 @@ function render(page, r) {
     again.disabled = true; stamp.textContent = "Reading the sizes of every table…";
     const t0 = performance.now();
     try {
+      // The sizes of every table are an admin's: another key lists the
+      // tables it reads, each with its drill-down, and asks nothing it would be refused.
+      if (!can("admin")) throw new ApiError(403, "the sizes need an admin key");
       const j = await api("/v1/index/tables");
       rows = (Array.isArray(j) ? j : j.tables || []).map(derive);
       win = Math.max(-1, ...rows.map((t) => t.rate_window_s ?? -1)); if (win < 0) win = null;
       lookEvery = j.look_every_s ?? 60;
       err = null; legacy = false; took = performance.now() - t0; at = Date.now();
     } catch (e) {
-      if (e instanceof ApiError && (e.status === 404 || e.status === 405)) {
+      if (e instanceof ApiError && (e.status === 404 || e.status === 405 || (e.status === 403 && !can("admin")))) {
         // An older server: no list of sizes; the catalog's tables, each with its drill-down.
         legacy = true; err = null;
         try { rows = (await catalog(true)).map((t) => ({ table: t.table, legacy: true })); } catch (e2) { err = e2; }
@@ -113,7 +116,8 @@ function render(page, r) {
     drawHead();
     if (legacy) {
       stamp.textContent = "";
-      clear(cards, h("div", { class: "banner dt-done", style: { gridColumn: "1 / -1" } }, icon("info", "lg"), h("div", { class: "grow" }, h("b", {}, "This server does not list the sizes of its tables"), h("div", { class: "small muted" }, "It answers GET /v1/index/tables from a newer version on. Open a table below for its fields, bytes, freshness and reads."))));
+      clear(cards, h("div", { class: "banner dt-done", style: { gridColumn: "1 / -1" } }, icon("info", "lg"), h("div", { class: "grow" }, ...(can("admin") ? [h("b", {}, "This server does not list the sizes of its tables"), h("div", { class: "small muted" }, "It answers GET /v1/index/tables from a newer version on. Open a table below for its fields, bytes, freshness and reads.")]
+          : [h("b", {}, "The sizes of the tables are for an admin key"), h("div", { class: "small muted" }, "This key sees the tables below. Open one for its fields and rows.")]))));
       clear(list, h("div", { class: "dt-legacy" }, rows.map((t) => h("a", { class: "btn", href: "#/inspector?table=" + encodeURIComponent(t.table) }, icon("table"), t.table))));
       clear(shardsBox); clear(copiesBox); shardsCard.hidden = copiesCard.hidden = true;
       return;
@@ -346,6 +350,6 @@ function render(page, r) {
   draw();
   load();
   // Again every 30 s (the server keeps an answer 30 s), unless paused or hidden.
-  const again30 = setInterval(() => { if (!state.paused && !document.hidden && page.isConnected && !again.disabled) load(); }, 30e3);
+  const again30 = setInterval(() => { if (!state.paused && !signInNeeded() && !document.hidden && page.isConnected && !again.disabled) load(); }, 30e3);
   return () => { clearInterval(again30); hideTip(); reselect = null; offs.forEach((f) => f()); };
 }

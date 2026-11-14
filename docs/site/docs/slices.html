@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Slices: search on the device, the server as fallback · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="A slice is a copy of the rows of a table near a device&#x27;s user, which the device searches itself: near in space (a geo slice, for &quot;near me&quot; search) or near in meaning (a vector slice, for recommendations and &quot;more…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/slices.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Search and SQL</span>
       <h1>Slices: search on the device, the server as fallback</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/slices.md">docs/chloedb/slices.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#when-an-answer-comes-from-the-device">When an answer comes from the device</a></li><li><a href="#turn-it-on">Turn it on</a></li><li><a href="#fresh-or-stale">Fresh or stale</a></li><li><a href="#from-python">From Python</a></li><li><a href="#from-javascript">From JavaScript</a></li><li><a href="#vector-slices-more-like-this-on-the-device">Vector slices: "more like this" on the device</a></li><li><a href="#what-the-server-sees">What the server sees</a></li></ol></details>
     <div class="doc-body">
@@ -202,9 +205,9 @@ const r = await tracks.similar(taste, { k: 10 });</pre>
 <p>The codes are 30 bytes a track gzipped (19 MB for the catalogue). No proved answer was wrong. More clusters (smaller ones) make each fetch smaller and the manifest larger: 4,096 clusters of this catalogue make a 3.6 MB manifest, the default 793 a 0.7 MB one with fetches about seven times as large.</p>
 <h2 id="what-the-server-sees">What the server sees<a class="anchor" href="#what-the-server-sees" aria-label="Link to this section">#</a></h2>
 <p>Each helper reports its counts every 20 searches (<code>POST /v1/slices/&lt;table&gt;/usage</code>: searches, why, time on the device and on the server), and the server counts the manifests and tiles it serves. The command center's <strong>Slices</strong> view shows them since the server started: the share answered on the device, the devices, a map of the tiles by rows, size or downloads, the reasons searches went to the server, the last hour by minute, the busiest tiles, and the slice's version with Rebuild and Delete.</p>
-<p><img alt="The Slices view: eight devices around New York, 65% of their searches answered on the device, the tiles they downloaded on the map, and why the rest went to the server" src="../../assets/img/slices-view.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The Slices view: eight devices around New York, 65% of their searches answered on the device, the tiles they downloaded on the map, and why the rest went to the server" src="../../assets/img/slices-view.png" /></p>
 <p>For a vector slice the map is a grid of its clusters, busiest first:</p>
-<p><img alt="The Slices view of a vector slice: 629,298 Yambda tracks in 1,024 clusters, eight listeners answering 77% of their searches on the device, and the clusters they downloaded" src="../../assets/img/slices-vector-view.png" /></p>
+<p><img loading="lazy" decoding="async" alt="The Slices view of a vector slice: 629,298 Yambda tracks in 1,024 clusters, eight listeners answering 77% of their searches on the device, and the clusters they downloaded" src="../../assets/img/slices-vector-view.png" /></p>
 <div class="doc-table"><table>
 <thead>
 <tr>
@@ -249,7 +252,7 @@ const r = await tracks.similar(taste, { k: 10 });</pre>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

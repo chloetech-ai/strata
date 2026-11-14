@@ -49,6 +49,23 @@ pub enum SqlResult {
     Written(u64),
 }
 
+/// The end of the error of a write whose table was altered (or dropped and
+/// created again) after the write was bound and before it ran
+/// ([`Db::write_prepared`]): bound again, it runs.
+const ALTERED: &str = "while the statement ran; run it again";
+
+/// How many times a write whose table was altered as it ran is bound again
+/// and run ([`altered_while_running`]) before its error is answered: each
+/// time lost is an `ALTER TABLE` that committed meanwhile.
+pub const ALTERED_TRIES: usize = 10;
+
+/// Whether the error `message` says that the write's table was altered
+/// after the write was bound, so that the same statement bound again may
+/// run: an `ALTER TABLE` raced it.
+pub fn altered_while_running(message: &str) -> bool {
+    message.contains(ALTERED)
+}
+
 /// An INSERT, UPDATE or DELETE bound to its table, with the vectors it
 /// writes computed ([`Db::prepare_write`]), to run with
 /// [`Db::write_prepared`].
@@ -1425,6 +1442,13 @@ impl Db {
     /// [`crate::query::compound::MAX_ROWS`] rows each; its answer is held
     /// to [`ExecOptions::max_rows`].
     pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
+        // A statement that nests deep runs on a thread with the stack for
+        // it, and its planning stops at its deadline as its run does.
+        crate::query::parse::deep_stack(crate::query::parse::nests_deep(sql), || crate::query::compound::planning_under(opts, || self.query_at_here(snap, sql, params, opts)))
+    }
+
+    /// [`Db::query_at`] on this thread.
+    fn query_at_here(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         if let Some(call) = crate::query::paths::Call::of_sql(sql)? {
             return self.json_paths_at(snap, &call, params, opts).map(|p| p.to_result());
         }
@@ -1899,6 +1923,13 @@ impl Db {
     /// [`Db::sql`], a SELECT run with `opts` (its deadline, cancel flag and
     /// memory budget); any other statement runs as [`Db::sql`] runs it.
     pub fn sql_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<SqlResult> {
+        // A statement that nests deep runs on a thread with the stack for
+        // it, and its planning stops at its deadline as its run does.
+        crate::query::parse::deep_stack(crate::query::parse::nests_deep(sql), || crate::query::compound::planning_under(opts, || self.sql_with_here(sql, params, opts)))
+    }
+
+    /// [`Db::sql_with`] on this thread.
+    fn sql_with_here(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<SqlResult> {
         if let Some(st) = crate::query::classify::parse_statement(sql)? {
             return self.classifier_statement(&st, opts);
         }
@@ -2005,7 +2036,17 @@ impl Db {
             Command::Write { table, write } => {
                 let schema = catalog.iter().find(|t| t.table == table).expect("bound to a table of the catalog");
                 let write = Plan::of_write(schema, &write).to_write(schema)?;
-                self.write_queued(writes::Job::Sql(self.prepare(schema.clone(), write)?)).map(|(n, _)| SqlResult::Written(n))
+                let mut r = self.write_queued(writes::Job::Sql(self.prepare(schema.clone(), write)?));
+                // An ALTER TABLE committed between binding the statement and
+                // writing it: it is bound again, to the table as it is now.
+                for _ in 0..ALTERED_TRIES {
+                    if !r.as_ref().is_err_and(|e| altered_while_running(&e.to_string())) {
+                        break;
+                    }
+                    let Some(p) = self.prepare_write(sql, params)? else { break };
+                    r = self.write_queued(writes::Job::Sql(p));
+                }
+                r.map(|(n, _)| SqlResult::Written(n))
             }
         }
     }
@@ -2285,7 +2326,7 @@ impl Db {
         let schema = &*p.schema;
         let mut tt = t.table(&schema.table)?;
         if tt.schema() != schema {
-            return Err(Error::Query(format!("table {} was altered, or dropped and created again, while the statement ran; run it again", schema.table)));
+            return Err(Error::Query(format!("table {} was altered, or dropped and created again, {ALTERED}", schema.table)));
         }
         let models = self.write_models_of(schema);
         let derivers = self.derivers_of(schema);

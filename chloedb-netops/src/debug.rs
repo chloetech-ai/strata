@@ -111,6 +111,16 @@ async fn where_(State(svc): State<Shared>) -> Answer {
     let services = q.rows("Each service, last five minutes", "SELECT service, SUM(errors) AS errors, SUM(requests) AS requests, MAX(latency_p95) AS p95 FROM netops_service_metrics\nWHERE ts >= :since\nGROUP BY service LIMIT 500", json!({"since": iso(m - 300)})).await?;
     let alerts = q.rows("What fires now", "SELECT entity, rule_name, severity, incident, acked_by FROM netops_alerts\nWHERE status = 'firing' LIMIT 2000", json!({})).await?;
     let changes = q.rows("Changes carried out in the last six hours", "SELECT id, title, devices, executed FROM netops_changes\nWHERE executed >= :since AND executed <= :now\nORDER BY executed DESC LIMIT 100", json!({"since": iso(m - 6 * 3600), "now": iso(m)})).await?;
+    // The estate behind the backbone: what its rules fire on now, the worst first.
+    let mut estate: Vec<(u8, i64, Value)> = e.st().alerts.values()
+        .filter(|a| a.s("entity_kind") == "estate" && a.s("status") == "firing")
+        .map(|a| {
+            let rank = match a.s("severity").as_str() { "critical" => 0, "major" => 1, _ => 2 };
+            (rank, -a.f("reading") as i64, json!({"entity": a.s("entity"), "rule": a.s("rule_name"), "severity": a.s("severity"), "summary": a.s("summary"), "incident": a.s("incident")}))
+        })
+        .collect();
+    estate.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let estate: Vec<Value> = estate.into_iter().take(50).map(|x| x.2).collect();
     let alert_of = |entity: &str| alerts.iter().find(|a| a.s("entity") == entity);
     let change_of = |devs: &[&str]| changes.iter().find(|c| c.list("devices").iter().any(|d| devs.contains(&d.as_str()))).map(|c| json!({"id": c.s("id"), "title": c.s("title"), "executed": c.s("executed")}));
 
@@ -229,7 +239,7 @@ async fn where_(State(svc): State<Shared>) -> Answer {
     }
     off.sort_by_key(|o| (LAYERS.iter().position(|l| o["layer"] == l.0).unwrap_or(9), std::cmp::Reverse(rank(o["state"].as_str().unwrap_or("")))));
     q.done(json!({"at": iso(m), "layers": LAYERS.iter().map(|l| json!({"id": l.0, "name": l.1, "what": l.2})).collect::<Vec<_>>(), "cols": cols, "cells": cells, "offenders": off, "start": start,
-        "changes": changes.iter().map(|c| json!({"id": c.s("id"), "title": c.s("title"), "executed": c.s("executed"), "devices": c.list("devices")})).collect::<Vec<_>>(), "firing": alerts.len()}))
+        "changes": changes.iter().map(|c| json!({"id": c.s("id"), "title": c.s("title"), "executed": c.s("executed"), "devices": c.list("devices")})).collect::<Vec<_>>(), "firing": alerts.len(), "estate": estate}))
 }
 
 /// A device for whatever names one end of a trace: a device, a customer

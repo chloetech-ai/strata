@@ -234,7 +234,7 @@ function sendLogsCard({ onMade } = {}) {
   let secret = null;
   const draw = () => clear(blocks,
     step("1", "A table for the lines", "Columns named as OTLP names them, so the Collector and JSON lines both fill it. The substring indexes answer LIKE and ILIKE '%Gi0/1%' anywhere in a line, an IP or a host name; retain drops lines after 30 days.", tableSql(name()), makeBtn()),
-    step("2", "A key that writes them", `An oncall key writes the logs_* tables (OTLP too) and reads them, the fleet's health, events, alerts and metrics, and nothing else. ${secret ? "Here it is, once: keep it in the Collector's environment as CHLOEDB_LOGS_KEY." : "An admin makes it (Access and audit, or this call), and sees its secret once."}`, secret ? `export CHLOEDB_LOGS_KEY=${secret}` : keyCurl(base), keyBtn()),
+    step("2", "A key that writes them", `An oncall key writes the logs_* tables (OTLP too) and reads them, the fleet's health, events, alerts and metrics, and nothing else. ${secret ? "Here it is, once: keep it in the Collector's environment as CHLOEDB_LOGS_KEY." : "An admin makes it (Access and audit, or this call), and sees its secret once."}`, secret ? `export CHLOEDB_LOGS_KEY=${secret}` : keyCurl(base), keyBtn(), secret ? "secret" : null),
     step("3", "Send them: an OpenTelemetry Collector", "Syslog on UDP 5514 and anything that speaks OTLP, batched and sent to this server's /v1/logs (OTLP/HTTP, JSON). Run it with otelcol-contrib --config collector.yaml.", collectorYaml(base, name()), null, "yaml"),
     step("…", "or a JSON lines import", "From a file, a script or a cron job: one object a line, the same columns.", importCurl(base, name())));
   function makeBtn() {
@@ -266,12 +266,13 @@ function sendLogsCard({ onMade } = {}) {
 }
 
 function step(n, title, text, code, action, lang) {
+  const secret = lang === "secret";
   return h("div", { class: "lx-step" },
     h("div", { class: "lx-step-n" }, n),
     h("div", { class: "grow", style: { minWidth: 0 } },
       h("div", { class: "row between" }, h("b", {}, title), h("div", { class: "row nw", style: { gap: "6px" } }, action, h("button", { class: "btn sm ghost", onclick: () => copy(code) }, icon("copy"), "Copy"))),
       h("div", { class: "small dim", style: { margin: "2px 0 6px" } }, text),
-      lang === "yaml" ? h("pre", { class: "code lx-code" }, code) : sqlBlock(code, { class: "code lx-code" })));
+      lang === "yaml" || secret ? h("pre", { class: "code lx-code", "data-secret": secret ? "key" : null }, code) : sqlBlock(code, { class: "code lx-code" })));
 }
 
 // ---------------------------------------------------------------- the page

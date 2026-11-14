@@ -47,7 +47,8 @@
 //!   says more), or `NULL`; `returns => 'number'` gives the first number of
 //!   the answer as a FLOAT, and `returns => 'bool'` yes or no as a BOOL,
 //!   `NULL` without one. `max_tokens => n` bounds the answer (1024 for
-//!   text, 64 otherwise). The model answers at temperature 0.
+//!   text, 64 otherwise). The model answers with its own sampling
+//!   defaults: no temperature is sent, which current Claude models refuse.
 //! * **Cost.** One request per distinct (model, prompt, input), the
 //!   endpoint's `concurrency` at once (8); answers are kept in memory
 //!   ([`CACHE_ENTRIES`]), so the same question costs nothing the second

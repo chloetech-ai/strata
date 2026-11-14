@@ -146,6 +146,39 @@ fn csv_rows(schema: &Schema, text: &str, empty: ingest::EmptyCell) -> Result<Vec
 }
 
 #[test]
+fn a_vector_past_f32s_range_says_so() {
+    let schema = Schema::from_json(r#"{"table": "v", "key": "id", "fields": [{"name": "id", "type": "keyword"}, {"name": "e", "type": "vector", "dim": 3, "index": "flat"}]}"#).unwrap();
+    let doc = vec![Value::Str("a".into()), Value::Vector(vec![1e39_f64 as f32, 0.0, 0.0].into())];
+    let e = chloedb::value::validate(&schema, &doc).unwrap_err().to_string();
+    assert!(e.contains("element 1 of the vector is not a finite 32-bit float"), "{e}");
+}
+
+#[test]
+fn csv_rows_that_do_not_fit_their_header() {
+    let schema = Schema::from_json(r#"{"table": "t1", "key": "id", "fields": [{"name": "id", "type": "int"}, {"name": "n", "type": "int"}, {"name": "name", "type": "keyword"}]}"#).unwrap();
+    let rows = |text: &str, strict: bool| -> Result<(usize, u64), String> {
+        let mut r = Rows::new(&schema, std::io::Cursor::new(text.as_bytes().to_vec()), Format::Csv).map_err(|e| e.to_string())?.strict(strict);
+        let n = r.by_ref().collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?.len();
+        Ok((n, r.ragged))
+    };
+    // A row of more or fewer values than the header: counted, or refused
+    // by its line when strict.
+    assert_eq!(rows("id,n\n400,2,3\n401,5\n", false).unwrap(), (2, 1));
+    assert_eq!(rows("id,n,name\n400,2,a\n401,5\n", false).unwrap(), (2, 1));
+    let e = rows("id,n\n401,5\n400,2,3\n", true).unwrap_err();
+    assert!(e.contains("line 3") && e.contains("3 values, and the header names 2 columns"), "{e}");
+    assert!(rows("id,n,name\n401,5\n", true).unwrap_err().contains("line 2: 2 values"));
+    assert_eq!(rows("id,n\n1,2\n", true).unwrap(), (1, 0));
+    // A column twice, or a header that names no field.
+    for strict in [false, true] {
+        let e = rows("id,id\n403,404\n", strict).unwrap_err();
+        assert!(e.contains("column 2 names field id again, as column 1 does"), "{e}");
+        let e = rows("id;n\n301;2\n", strict).unwrap_err();
+        assert!(e.contains("names no field of t1 (is the file comma-separated"), "{e}");
+    }
+}
+
+#[test]
 fn csv_lines_empty_cells_and_whole_floats() {
     let schema = Schema::from_json(
         r#"{"table": "t", "key": "id", "fields": [

@@ -42,8 +42,8 @@ body.front #root { max-width: none; gap: 0; }
 .fp-btn.secondary { background: var(--fill); color: var(--fg); }
 .fp-btn.secondary:hover { background: color-mix(in srgb, var(--fg) 12%, var(--card)); }
 .fp-btn.link, .fp-btn.navlink { background: transparent; padding: .3em 0; box-shadow: none; color: var(--accent); font-weight: 500; border-radius: 4px; }
-.fp-btn.navlink { color: var(--fg); opacity: .78; font-size: 15px; }
-.fp-btn.navlink:hover { opacity: 1; background: transparent; }
+.fp-btn.navlink { color: var(--fg); font-size: 15px; }
+.fp-btn.navlink:hover { background: transparent; text-decoration: underline !important; text-underline-offset: 3px; }
 .fp-btn.link:hover { background: transparent; text-decoration: underline !important; text-underline-offset: 3px; }
 .fp-chev { font-size: 1.25em; line-height: 0; transition: transform .25s var(--ease); }
 .fp-btn.link:hover .fp-chev { transform: translateX(3px); }
@@ -225,7 +225,8 @@ img.kb { animation: fp-kb calc(30s * var(--slow)) ease-in-out infinite alternate
 .fp-card-pic { margin: 0; aspect-ratio: 4 / 3; overflow: hidden; position: relative; background: var(--fill); }
 .fp-card-pic img, .fp-card-pic .fp-ph { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 1s var(--ease); }
 .fp-card-pic .fp-ph { display: grid; place-items: center; }
-.fp-ph-init { font-size: clamp(2rem, 4vw, 3rem); font-weight: 600; letter-spacing: .02em; color: rgba(255,255,255,.9); text-shadow: 0 2px 18px rgba(0,0,0,.18); }
+/* initials where a photo is missing: on a dark chip, so they read on any part of the gradient */
+.fp-ph-init { font-size: clamp(2rem, 4vw, 3rem); font-weight: 600; letter-spacing: .02em; color: #fff; background: rgba(0,0,0,.58); padding: .12em .45em; border-radius: 14px; }
 .fp-card:hover .fp-card-pic img { transform: scale(1.06); }
 .fp-card-foot { margin-top: auto; padding-top: 8px; display: flex; align-items: center; gap: 12px; justify-content: space-between; }
 .fp-card-foot .fp-btn { padding: .55em 1.1em; font-size: 14.5px; }
@@ -359,7 +360,9 @@ img.kb { animation: fp-kb calc(30s * var(--slow)) ease-in-out infinite alternate
 @media (min-width: 761px) { .fp-step:not(:last-child)::after { content: ""; position: absolute; top: 22px; left: 58px; right: -20px; height: 2px; background: linear-gradient(90deg, var(--line), transparent); } }
 
 /* footer */
-.fp-footer { background: color-mix(in srgb, var(--fg) 3.5%, var(--bg)); border-top: 1px solid var(--line); padding-block: 64px 30px; }
+.fp-footer { background: color-mix(in srgb, var(--fg) 3.5%, var(--bg)); border-top: 1px solid var(--line); padding-block: 64px 30px;
+  /* the footer's tint is darker than the page: its quiet words darker too, so they still read at 4.5:1 */
+  --muted: color-mix(in srgb, var(--fg) 74%, var(--bg)); }
 .fp-foot-top { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 2fr); gap: 48px; }
 .fp-foot-brand { display: flex; flex-direction: column; gap: 14px; max-width: 360px; }
 .fp-foot-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 28px; }
@@ -370,3 +373,26 @@ img.kb { animation: fp-kb calc(30s * var(--slow)) ease-in-out infinite alternate
 @media (max-width: 760px) { .fp-foot-top { grid-template-columns: minmax(0, 1fr); } }
 
 @media (prefers-reduced-motion: reduce) { .rv { opacity: 1; transform: none; } .fp-slide-cap > * { opacity: 1; transform: none; } }
+
+/* ---- page structures on a front page (a screen's "layout"; screen.js adds layout-<name>) */
+/* editorial: a left-aligned page of serif-sized titles, sections as a ruled list */
+.screen.front.layout-editorial .fp-head { align-items: flex-start; text-align: left; }
+.screen.front.layout-editorial .fp-head .fp-sub { margin-inline: 0; }
+.screen.front.layout-editorial .fp-sec + .fp-sec > .fp-wrap { border-top: 1px solid var(--line); padding-top: clamp(40px, 6vw, 72px); }
+.screen.front.layout-editorial .fp-sec { padding-block: clamp(48px, 7vw, 96px); }
+.screen.front.layout-editorial .fp-hero.look-plain > .fp-wrap { padding-block: 104px 56px; }
+.screen.front.layout-editorial .fp-display { font-size: clamp(40px, 6vw, 84px); }
+.screen.front.layout-editorial :is(table, .list) { font-size: 17px; }
+/* gallery: tiles right under a short hero */
+.screen.front.layout-gallery .fp-hero.h-full, .screen.front.layout-gallery .fp-hero.h-tall { min-height: max(440px, 62vh); }
+/* split and tool: a shorter introduction, the work right below it */
+.screen.front:is(.layout-split, .layout-tool, .layout-dashboard) .fp-hero.h-full { min-height: max(520px, 76vh); }
+/* a band in the accent: the deep accent under white words (8:1), so a pale accent or gradient never carries white text */
+.fp-band.look-accent { background: linear-gradient(125deg, var(--deep, var(--accent)), color-mix(in srgb, var(--g2) 30%, var(--deep, var(--accent))) 55%, color-mix(in srgb, var(--g3) 22%, var(--deep, var(--accent)))); }
+
+/* Touch: every link and control on a front page is 44 px (brand, header links, footer links, link buttons). */
+@media (pointer: coarse) {
+  .fp-btn, .fp-brand, .fp-menu, .fp-round { min-height: 44px; }
+  .fp-menu, .fp-round { min-width: 44px; }
+  .fp-btn.link, .fp-btn.navlink, .fp-foot-col .fp-btn { padding-block: 10px; }
+}

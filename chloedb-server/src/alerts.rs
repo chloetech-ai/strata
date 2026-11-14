@@ -270,13 +270,13 @@ pub fn defaults() -> Vec<Rule> {
         (rule("disk-critical", "Disk nearly full", "disk_used_ratio", ">", 0.97, "mean", 120, 0, "critical", c, "Under 3% of the copy's disk is left: writes fail when it is full. Free space or move slots off the copy now."), 0.95),
         (rule("disk-filling", "Disk full within 12 hours", "disk_hours_to_full", "<", 12.0, "mean", 1800, 0, "warning", c, "At the rate the copy's disk filled over the last 30 minutes, it is full in under 12 hours."), 24.0),
         (rule("p99", "", "p99_ms", ">", 0.0, "mean", 300, 0, "warning", s, ""), 0.0),
-        (rule("p99-jump", "Query p99 doubled", "p99_ms", ">", 2.0, "mean", 300, 0, "warning", s, "The p99 of the last 5 minutes is over twice the p99 of the 5 minutes before."), 1.5),
+        (rule("p99-jump", "Query p99 doubled", "p99_ms", ">", 2.0, "mean", 300, 0, "warning", s, "The p99 of the last 5 minutes is over twice the p99 of the 5 minutes before, and over 20 ms: a p99 under 20 ms is not judged."), 1.5),
         (rule("errors", "", "error_ratio", ">", 0.0, "mean", 300, 0, "warning", s, ""), 0.0),
         (rule("key-failing", "A client's calls fail", "key_error_ratio", ">", 0.2, "mean", 300, 0, "warning", s, "Over 20% of one key's calls failed in 5 minutes (its own errors included: bad SQL, its own deadline), for a key with 30 calls or more. Tell the key's owner."), 0.1),
         (rule("key-flood", "A client crowds out the others", "key_busy_ratio", ">", 1.0, "mean", 60, 0, "warning", s, "Over a minute, one key's queries took over half of this server's query time, and ran more at once than the server has cores, while other keys queried too: their queries wait. Queries, Running now, grouped by key, shows its queries; Contain a key limits it. Tell the key's owner."), 0.5),
         (rule("rejected", "Queries refused (429)", "rejected_s", ">", 0.5, "mean", 300, 0, "warning", s, "Queries found no slot (--max-concurrent) or no memory before their deadline, or a Contain rule refused them."), 0.2),
-        (rule("5xx", "Server errors over 1% of requests", "http_5xx_ratio", ">", 0.01, "mean", 300, 0, "warning", s, "Over 1% of the HTTP requests of 5 minutes failed on the server's side (5xx)."), 0.005),
-        (rule("replica-behind", "A replica is behind", "replica_behind_s", ">", 30.0, "mean", 300, 0, "warning", c, "A replica is over 30 seconds of its primary's writes behind (transactions behind over the write rate)."), 10.0),
+        (rule("5xx", "Server errors over 1% of requests", "http_5xx_ratio", ">", 0.01, "mean", 300, 0, "warning", s, "Over 1% of the HTTP requests of 5 minutes failed on the server's side (5xx), judged over 100 requests or more, or 10 failures or more: one failure of a few requests is not a server failing."), 0.005),
+        (rule("replica-behind", "A replica is behind", "replica_behind_s", ">", 30.0, "mean", 300, 0, "warning", c, "A replica has lacked a transaction its primary committed for over 30 seconds, on average over 5 minutes. A replica being sent a whole copy, or not heard from since the primary started, is not counted: A replica does not serve reads and A copy is down say those."), 10.0),
         (rule("out-of-sync", "A replica is out of sync", "replicas_out_of_sync", ">", 0.0, "all", 60, 0, "critical", c, "A replica does not hold what its primary committed: a failover now could lose writes."), 0.0),
         (rule("replica-reads", "A replica does not serve reads", "serves_reads", "<", 1.0, "all", 60, 0, "warning", c, "The replica is catching up with its primary, or lost it."), 1.0),
         (rule("query-memory", "Query memory almost spent", "query_memory_ratio", ">", 0.9, "mean", 60, 0, "warning", s, "The running queries hold over 90% of --query-memory-mb; more are refused with 429."), 0.8),
@@ -339,7 +339,7 @@ fn follow(r: &mut Rule, error_ratio: f64, p99_ms: f64) {
         "errors" => {
             (r.threshold, r.resolve) = (error_ratio, Some(error_ratio / 2.0));
             r.name = format!("Query errors over {}", pct(error_ratio));
-            r.description = format!("Over {} of the queries that ended in 5 minutes failed on the server's side (errors and the server's deadline; not bad SQL nor a client's own deadline). {} is the service level objective (--slo-error-ratio), which Home checks too.", pct(error_ratio), pct(error_ratio));
+            r.description = format!("Over {} of the queries that ended in 5 minutes failed on the server's side (errors and the server's deadline; not bad SQL nor a client's own deadline), judged over 100 queries or more, or 10 failures or more. {} is the service level objective (--slo-error-ratio), which Home checks too.", pct(error_ratio), pct(error_ratio));
         }
         "p99" => {
             (r.threshold, r.resolve) = (p99_ms, Some(p99_ms * 0.8));
@@ -348,7 +348,7 @@ fn follow(r: &mut Rule, error_ratio: f64, p99_ms: f64) {
         }
         "availability" => {
             (r.threshold, r.resolve) = (1.0 - error_ratio, Some(1.0 - error_ratio / 2.0));
-            r.description = format!("Under {} of the searches that ended in 5 minutes succeeded (failures on the server's side): over {} failed, the service level objective (--slo-error-ratio).", pct(1.0 - error_ratio), pct(error_ratio));
+            r.description = format!("Under {} of the searches that ended in 5 minutes succeeded (failures on the server's side): over {} failed, the service level objective (--slo-error-ratio). Judged over 100 searches or more, or 10 failures or more.", pct(1.0 - error_ratio), pct(error_ratio));
         }
         _ => {}
     }
@@ -953,6 +953,10 @@ pub struct Alerts {
     pushed: Mutex<HashMap<String, (u64, Result<(), String>)>>,
     /// The copies' each_copy rules version ([`Kept::rules_ms`]), by URL.
     copy_rules_ms: Mutex<HashMap<String, u64>>,
+    /// What fires on the copies of their own rules (scope self, which a
+    /// coordinator does not gather), as their details last said
+    /// ([`Self::gather`]): the Alerts page shows them (LIV-3).
+    copies_firing: Mutex<Vec<Json>>,
     /// When each critical alert was last sent again ([`Route::repeat_min`]).
     repeated: Mutex<HashMap<String, u64>>,
     /// What each other coordinator last said of its alerts, by its URL:
@@ -1094,6 +1098,7 @@ impl Alerts {
             peering: AtomicBool::new(false),
             pushed: Mutex::new(HashMap::new()),
             copy_rules_ms: Mutex::new(HashMap::new()),
+            copies_firing: Mutex::new(Vec::new()),
             repeated: Mutex::new(HashMap::new()),
             peer_states: Mutex::new(HashMap::new()),
             slo: Mutex::new(None),
@@ -1633,6 +1638,7 @@ impl Alerts {
         let not_pushed: HashSet<String> = lock(&self.pushed).iter().filter(|(_, (_, r))| r.is_err()).map(|(u, _)| u.clone()).collect();
         let mut copies = lock(&self.copies);
         let mut present = HashSet::new();
+        let mut on_copies: Vec<Json> = Vec::new();
         let mut versions = lock(&self.copy_rules_ms);
         for s in snap["shards"].as_array().into_iter().flatten() {
             let i = s["shard"].as_u64().unwrap_or(0) as usize;
@@ -1640,6 +1646,17 @@ impl Alerts {
                 let url = r["url"].as_str().unwrap_or_default().to_string();
                 let short = r["short"].as_str().map(String::from).unwrap_or_else(|| crate::coord::copy_short(i, &url));
                 let reported = &r["detail"]["alerts"]["rules"];
+                if answers(r) {
+                    for f in r["detail"]["alerts"]["firing"].as_array().into_iter().flatten() {
+                        // Each_copy rules are gathered below, as the coordinator's own.
+                        let id = f["id"].as_str().unwrap_or_default();
+                        if !rules.iter().any(|x| x.id == id && x.copies()) {
+                            let mut one = f.clone();
+                            (one["copy"], one["short"], one["shard"]) = (json!(url), json!(short), json!(i));
+                            on_copies.push(one);
+                        }
+                    }
+                }
                 if let Some(v) = r["detail"]["alerts"]["rules_ms"].as_u64() {
                     versions.insert(url.clone(), v);
                 }
@@ -1699,6 +1716,8 @@ impl Alerts {
         copies.retain(|k, _| present.contains(k));
         versions.retain(|u, _| present.iter().any(|(_, x)| x == u));
         drop(versions);
+        on_copies.sort_by(|a, b| (sev_rank(a["severity"].as_str().unwrap_or("")), a["short"].as_str()).cmp(&(sev_rank(b["severity"].as_str().unwrap_or("")), b["short"].as_str())));
+        *lock(&self.copies_firing) = on_copies;
         let mut states = lock(&self.states);
         for rule in rules.iter().filter(|r| r.enabled && r.copies()) {
             let mine: Vec<&CopySt> = copies.iter().filter(|((r, _), _)| r == &rule.id).map(|(_, c)| c).collect();
@@ -2031,6 +2050,13 @@ impl Alerts {
             .iter()
             .map(|r| {
                 let mut j = json!(r);
+                // A rule without a runbook of its own whose id has one compiled
+                // in (every default and built-in rule): where it is (CCW-6, CCW-13).
+                if r.runbook.is_empty() {
+                    if let Some(b) = crate::runbooks::for_id(&r.id) {
+                        j["runbook_docs"] = json!(format!("{}#{}", crate::runbooks::PAGE, b.anchor));
+                    }
+                }
                 let s = out.iter().find(|s| s["rule"] == r.id.as_str()).cloned().unwrap_or(Json::Null);
                 j["status"] = json!({"state": s["state"], "since_ms": s["since_ms"], "value": s["value"]});
                 if let Some(run) = (!r.sql.is_empty()).then(|| lock(&self.sql_runs).get(&r.id).cloned()).flatten() {
@@ -2056,6 +2082,9 @@ impl Alerts {
             "state_file": self.state_file.as_ref().map(|p| p.display().to_string()),
             "coordinator": self.is_coordinator(), "cluster": {"name": id.name, "public_url": id.public_url},
             "rules_ms": rules_ms, "rules_by": rules_by,
+            // The copies' own rules (scope self) that fire there now: not
+            // this server's alerts, so not counted in `firing`, but shown.
+            "copies_firing": *lock(&self.copies_firing),
             // Who sends the messages: with several coordinators, one.
             "pager": {"this": me, "sends": pager, "coordinators": peers},
         })
@@ -2084,7 +2113,7 @@ impl Alerts {
             })
             .collect();
         let mut j = json!({"brief": true, "rules": rules, "states": states});
-        for k in ["firing", "pending", "no_data", "firing_shown", "firing_elsewhere", "coordinator", "cluster"] {
+        for k in ["firing", "pending", "no_data", "firing_shown", "firing_elsewhere", "coordinator", "cluster", "copies_firing"] {
             j[k] = full[k].clone();
         }
         j
@@ -2892,8 +2921,77 @@ pub const DERIVED: [&str; 5] = ["http_5xx_ratio", "replica_behind_s", "disk_hour
 
 /// What `disk_hours_to_full` is when the disk does not fill: ten years.
 pub const NOT_FILLING_H: f64 = 87_600.0;
-/// A replica behind with no write to catch up with is a day behind.
+/// The most seconds `replica_behind_s` says, a day.
 const STUCK_S: f64 = 86_400.0;
+
+/// A latency under this has not risen in a way anyone notices: a rule
+/// `vs: "before"` over a latency (`p99_ms`, `write_p99_ms` ...) judges a
+/// window whose own value is under it as unchanged (1), as Performance's
+/// "p99 rose" asks for over 20 ms too. A copy's p99 that goes from 1 ms to
+/// 2 ms doubled, and nobody waits for it (LIV-3).
+pub const JUMP_MIN_MS: f64 = 20.0;
+/// The fewest requests (or queries) of a window whose share that failed
+/// (`http_5xx_ratio`, `error_ratio`, `availability`) is judged, unless
+/// [`RATIO_MIN_FAILED`] of them failed: below both, the window counts as
+/// none failed. One 5xx of 90 requests on a nearly idle copy is not 1% of
+/// its traffic failing (LIV-3).
+pub const RATIO_MIN_COUNT: f64 = 100.0;
+/// The failures of a window that are judged as a share however few the
+/// requests: ten of twelve failing is a server that fails.
+pub const RATIO_MIN_FAILED: f64 = 10.0;
+
+/// A share of failures `n` of `d`, judged only over [`RATIO_MIN_COUNT`]
+/// requests or [`RATIO_MIN_FAILED`] failures (0 below both); `None` when
+/// there were none.
+fn judged_share(n: f64, d: f64) -> Option<f64> {
+    if d <= 0.0 {
+        return None;
+    }
+    Some(if d < RATIO_MIN_COUNT && n < RATIO_MIN_FAILED { 0.0 } else { n / d })
+}
+
+/// The transactions behind of the replica furthest behind in point `p`:
+/// of those that apply the primary's log (`replica_behind_applying`: not
+/// one being sent a whole copy, nor one that has not answered since the
+/// primary started, whose number the primary does not know yet), else of
+/// every replica (a server before it reported that).
+fn behind_of(p: &Json) -> Option<f64> {
+    p["replica_behind_applying"].as_f64().or_else(|| p["replica_behind_max"].as_f64())
+}
+
+/// `replica_behind_s` at `points[i]`: how long the replica furthest behind
+/// has lacked a transaction the primary committed. It holds `seq_no -
+/// behind`, and the primary committed past that between the last point
+/// whose `seq_no` was at most that and the one after it: the lag is from
+/// the one after (a replica one transaction behind just after the
+/// primary's commit is 0 s behind, not a day). A replica that lacks
+/// what the primary committed before the series starts is at least as far
+/// behind as the series is long. Points without `seq_no` (an older
+/// primary): transactions behind over the write rate, and no value when
+/// nothing is written, as it cannot tell (it said a day: LIV-3).
+fn lag_at(points: &[Arc<Json>], i: usize) -> Option<f64> {
+    let p = &points[i];
+    let behind = behind_of(p)?;
+    if behind <= 0.0 {
+        return Some(0.0);
+    }
+    let at = |p: &Json| p["t"].as_u64().unwrap_or(0);
+    let Some(seq) = p["seq_no"].as_f64() else {
+        let w = p["writes_s"].as_f64().unwrap_or(0.0);
+        return (w > 0.0).then(|| (behind / w).min(STUCK_S));
+    };
+    let held = seq - behind;
+    let mut since = at(p);
+    for q in points[..i].iter().rev() {
+        match q["seq_no"].as_f64() {
+            Some(s) if s > held => since = at(q),
+            Some(_) => break,
+            // A point without the number: the primary's role began after it.
+            None => break,
+        }
+    }
+    Some((at(p).saturating_sub(since) as f64 / 1e3).min(STUCK_S))
+}
 
 /// A point's 5xx answers a second that are the server's: a query whose
 /// client's own deadline passed answers 504 too, and is the client's
@@ -2909,10 +3007,16 @@ pub fn value_of(p: &Json, metric: &str) -> Option<f64> {
             let all = p["http_s"].as_f64().filter(|a| *a > 0.0)?;
             Some(server_5xx_s(p) / all)
         }
+        // One point alone: transactions behind over the write rate, unknown
+        // when nothing is written ([`lag_at`] reads the series).
         "replica_behind_s" => {
-            let behind = p["replica_behind_max"].as_f64()?;
+            let behind = behind_of(p)?;
             let w = p["writes_s"].as_f64().unwrap_or(0.0);
-            Some(if behind <= 0.0 { 0.0 } else if w > 0.0 { (behind / w).min(STUCK_S) } else { STUCK_S })
+            if behind <= 0.0 {
+                Some(0.0)
+            } else {
+                (w > 0.0).then(|| (behind / w).min(STUCK_S))
+            }
         }
         _ => p.get(metric).and_then(Json::as_f64),
     }
@@ -2930,7 +3034,9 @@ fn window_of(r: &Rule, points: &[Arc<Json>], t: u64) -> (Option<f64>, Option<u64
         if partial.is_some() || partial_before.is_some() {
             return (None, partial);
         }
-        return (now.zip(before.filter(|b| *b > 0.0)).map(|(n, b)| n / b), None);
+        // A latency under JUMP_MIN_MS now has not risen that matters.
+        let floor = r.metric.ends_with("_ms") && now.is_some_and(|n| n < JUMP_MIN_MS);
+        return (now.zip(before.filter(|b| *b > 0.0)).map(|(n, b)| if floor { (n / b).min(1.0) } else { n / b }), None);
     }
     window_own(r, points, t)
 }
@@ -2952,34 +3058,30 @@ fn window_own(r: &Rule, points: &[Arc<Json>], t: u64) -> (Option<f64>, Option<u6
     if !any_point && partial.is_some_and(|s| s < PARTIAL_MIN_MS.min(w / 2)) {
         return (None, partial);
     }
-    // Shares weigh each point by what it counts.
-    let share = |num: &dyn Fn(&Json) -> f64, den: &dyn Fn(&Json) -> f64| -> Option<f64> {
+    // Shares of what failed weigh each point by what it counts, and judge
+    // only a window with enough of it (judged_share).
+    let counted = |num: &dyn Fn(&Json) -> f64, den: &dyn Fn(&Json) -> f64| -> Option<f64> {
         let (mut n, mut d) = (0.0, 0.0);
         for p in &window {
             n += num(p);
             d += den(p);
         }
-        (d > 0.0).then(|| n / d)
+        judged_share(n, d)
     };
     let secs = |p: &Json| p["secs"].as_f64().unwrap_or(crate::telemetry::INTERVAL.as_secs_f64());
     if r.eval == "mean" {
         match r.metric.as_str() {
             "error_ratio" | "availability" if window.iter().any(|p| p.get("queries").is_some()) => {
-                let Some(ratio) = share(&|p| p["query_errors"].as_f64().unwrap_or(0.0), &|p| p["queries"].as_f64().unwrap_or(0.0)) else { return (None, partial) };
+                let Some(ratio) = counted(&|p| p["query_errors"].as_f64().unwrap_or(0.0), &|p| p["queries"].as_f64().unwrap_or(0.0)) else { return (None, partial) };
                 return (Some(if r.metric == "availability" { 1.0 - ratio } else { ratio }), partial);
             }
-            "http_5xx_ratio" => return (share(&|p| server_5xx_s(p) * secs(p), &|p| p["http_s"].as_f64().unwrap_or(0.0) * secs(p)), partial),
-            "replica_behind_s" => {
-                let behind: Vec<f64> = window.iter().filter_map(|p| p["replica_behind_max"].as_f64()).collect();
-                if behind.is_empty() {
-                    return (None, partial);
-                }
-                let mean = behind.iter().sum::<f64>() / behind.len() as f64;
-                let writes = share(&|p| p["writes_s"].as_f64().unwrap_or(0.0) * secs(p), &|p| secs(p)).unwrap_or(0.0);
-                return (Some(if mean <= 0.0 { 0.0 } else if writes > 0.0 { (mean / writes).min(STUCK_S) } else { STUCK_S }), partial);
-            }
+            "http_5xx_ratio" => return (counted(&|p| server_5xx_s(p) * secs(p), &|p| p["http_s"].as_f64().unwrap_or(0.0) * secs(p)), partial),
             _ => {}
         }
+    }
+    if r.metric == "replica_behind_s" {
+        let vals: Vec<(u64, f64)> = (start..start + window.len()).filter_map(|i| lag_at(points, i).map(|v| (at(&points[i]), v))).collect();
+        return (aggregate(r, &vals), partial);
     }
     if r.metric == "disk_hours_to_full" {
         // The window's slope (least squares) and its latest value, once the
@@ -4608,5 +4710,74 @@ mod tests {
         st.value = Some(1.0);
         let m = a.message(&Event::of(&r, "firing", &st, 10));
         assert!(m.contains(": failing is on ("), "{m}");
+    }
+
+    /// LIV-3: on a calm cluster the built-in rules fired 289 times in a
+    /// day: a p99 from 1 ms to 2 ms "doubled", one 5xx of 90 requests was
+    /// over 1%, one failed query of three was "errors over 1%", and a
+    /// replica one transaction behind while nothing was written read as a
+    /// day behind. None of those fires now; the real cases still do.
+    #[test]
+    fn a_calm_copy_fires_nothing_and_a_real_trouble_still_does() {
+        let t = 600_000u64;
+        let at = |f: &dyn Fn(u64) -> Json| -> Vec<Arc<Json>> { (0..=300u64).map(|i| { let mut p = f(i); p["t"] = json!(i * 2_000); Arc::new(p) }).collect() };
+        let one = |r: Rule, ps: &[Arc<Json>]| { let a = Alerts::new(None, None).unwrap(); let id = r.id.clone(); a.set_rules(vec![r], "t").unwrap(); a.check(ps, t); a.one(&id).unwrap() };
+        let d = |id: &str| defaults().into_iter().find(|r| r.id == id).unwrap();
+        // The p99 from 1 ms to 2.1 ms: under 20 ms, unchanged.
+        let s = one(d("p99-jump"), &at(&|i| json!({"p99_ms": if i > 150 { 2.1 } else { 1.0 }})));
+        assert_eq!((s["state"].as_str(), s["value"].as_f64()), (Some("ok"), Some(1.0)), "{s}");
+        // From 15 ms to 45 ms: tripled, and over 20 ms.
+        let s = one(d("p99-jump"), &at(&|i| json!({"p99_ms": if i > 150 { 45.0 } else { 15.0 }})));
+        assert_eq!(s["state"], "firing", "{s}");
+        // One 5xx of 45 requests in 5 minutes: not judged.
+        let s = one(d("5xx"), &at(&|i| json!({"http_s": 0.15, "http_5xx_s": if i == 200 { 0.5 } else { 0.0 }, "secs": 2.0})));
+        assert_eq!((s["state"].as_str(), s["value"].as_f64()), (Some("ok"), Some(0.0)), "{s}");
+        // Sixteen of 30 requests fail: ten failures or more are judged.
+        let s = one(d("5xx"), &at(&|i| json!({"http_s": 0.1, "http_5xx_s": if i % 10 == 0 { 0.5 } else { 0.0 }, "secs": 2.0})));
+        assert_eq!(s["state"], "firing", "{s}");
+        // One failed query of three; then 5 of 200.
+        let s = one(d("errors"), &at(&|i| json!({"queries": if i % 100 == 0 { 1.0 } else { 0.0 }, "query_errors": if i == 200 { 1.0 } else { 0.0 }})));
+        assert_eq!((s["state"].as_str(), s["value"].as_f64()), (Some("ok"), Some(0.0)), "{s}");
+        let s = one(d("errors"), &at(&|i| json!({"queries": if i > 150 { 1.0 } else { 0.0 }, "query_errors": if i > 150 && i % 30 == 0 { 1.0 } else { 0.0 }})));
+        assert_eq!(s["state"], "firing", "{s}");
+        // A quiet primary commits one transaction a minute; its replica is
+        // one behind at the point just after each: 0 s, not a day.
+        let quiet = at(&|i| json!({"seq_no": (i / 30) as f64, "replica_behind_max": if i % 30 == 0 { 1.0 } else { 0.0 }, "writes_s": 0.0}));
+        let s = one(d("replica-behind"), &quiet);
+        assert_eq!((s["state"].as_str(), s["value"].as_f64()), (Some("ok"), Some(0.0)), "{s}");
+        // A replica that stopped at transaction 100 while the primary wrote
+        // on for the last 5 minutes is that far behind.
+        let stuck = at(&|i| json!({"seq_no": if i < 150 { 100.0 } else { 100.0 + (i - 150) as f64 }, "replica_behind_max": if i < 150 { 0.0 } else { (i - 150) as f64 }, "writes_s": 0.5}));
+        let s = one(d("replica-behind"), &stuck);
+        assert!(s["state"] == "firing" && (s["value"].as_f64().unwrap() - 149.0).abs() < 2.0, "{s}");
+        // A replica being sent a whole copy is all of it behind: it is not
+        // the lag rule's (a replica that does not serve reads says it).
+        let copying = at(&|i| json!({"seq_no": 1000.0 + i as f64, "replica_behind_max": 1000.0 + i as f64, "replica_behind_applying": 0.0, "writes_s": 0.5}));
+        assert_eq!(one(d("replica-behind"), &copying)["state"], "ok");
+        // An older primary (no seq_no) writing nothing: no value, not a day.
+        assert_eq!(value_of(&json!({"replica_behind_max": 1.0, "writes_s": 0.0}), "replica_behind_s"), None);
+        assert_eq!(value_of(&json!({"replica_behind_max": 400.0, "writes_s": 10.0}), "replica_behind_s"), Some(40.0));
+    }
+
+    /// LIV-3: a copy's own rules (scope self) fire on the copy only; the
+    /// coordinator's Alerts said "Nothing is firing" meanwhile. It lists
+    /// them now, apart from its own alerts.
+    #[test]
+    fn a_coordinator_lists_what_fires_on_its_copies_own_rules() {
+        let a = Alerts::new(None, None).unwrap();
+        a.set_coordinator(true);
+        let disk = defaults().into_iter().find(|r| r.id == "disk-full").unwrap();
+        let copy = |url: &str, firing: Json| json!({"url": url, "status": "ok", "role": "primary", "takes_writes": true, "detail": {"load": {"t": 1_000}, "alerts": {"firing": firing, "rules": {"disk-full": {"state": "ok", "value": 0.5, "since_ms": 500, "sig": disk.sig()}}}}});
+        let snap = json!({"shards": [
+            {"shard": 0, "replicas": [copy("http://a", json!([{"id": "p99-jump", "name": "Query p99 doubled", "severity": "warning", "since_ms": 900, "value": 2.5}]))]},
+            {"shard": 1, "replicas": [copy("http://b", json!([{"id": "disk-full", "name": "Disk almost full", "severity": "warning", "since_ms": 900, "value": 0.95}]))]},
+        ]});
+        a.check_cluster(&snap, 1_000);
+        let j = a.json();
+        let on = j["copies_firing"].as_array().unwrap();
+        assert_eq!(on.len(), 1, "an each_copy rule is the coordinator's own alert: {j}");
+        assert_eq!((on[0]["id"].as_str(), on[0]["short"].as_str(), on[0]["shard"].as_u64()), (Some("p99-jump"), Some("a"), Some(0)), "{j}");
+        assert_eq!(j["firing"], 0, "{j}");
+        assert_eq!(a.brief_json()["copies_firing"], j["copies_firing"]);
     }
 }

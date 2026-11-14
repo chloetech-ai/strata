@@ -184,3 +184,11 @@ def test_workflows_chain_search_train_and_serve(demo):
     r = demo("/api/shop?user=u010")
     assert r["model"] == m["id"] and len(r["items"]) == fs.K
     demo("/api/wf/delete", {"name": "t_chain"})
+    # The deployed model reads item_signals, which no workflow reads: its
+    # delete is refused while the model serves (DAP-11: it dropped the
+    # table, and every ranking failed).
+    with pytest.raises(urllib.error.HTTPError) as e:
+        demo("/api/wf/delete", {"name": "item_signals"})
+    assert e.value.code == 400 and "deployed model" in json.loads(e.value.read())["error"]
+    assert demo("/api/shop?user=u011")["model"] == m["id"]
+    assert "item_signals" in {n["name"] for n in demo("/api/wf/graph")["nodes"] if n["kind"] == "workflow"}

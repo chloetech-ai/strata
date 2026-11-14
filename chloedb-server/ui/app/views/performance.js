@@ -15,7 +15,7 @@ import {
   ask, objects, hasLogStore, queryColumns, causesAndVictims,
 } from "../workload.js";
 
-export default { id: "performance", title: "Performance", icon: "perf", group: "Operate", keywords: "latency throughput heatmap findings advisor tuning cpu memory disk routes kinds percentiles slow copies fleet failures", render };
+export default { id: "performance", title: "Performance", icon: "perf", group: "Operate", keywords: "latency throughput heatmap findings advisor tuning cpu memory disk routes kinds percentiles slow copies fleet failures", render, onParams };
 
 const BOUNDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
 /** The slow bands one can ask about: over 100 ms, 1 s, 10 s. */
@@ -54,7 +54,12 @@ function figures(ps) {
 
 // ---------------------------------------------------------------- the view
 
-function render(page) {
+// A link's ?tab= opens that tab (and the address says the tab shown).
+let onTab = null;
+function onParams(r) { onTab?.(r.params.get("tab")); }
+const tabOf = (k) => (TABS.some(([t]) => t === k) ? k : null);
+
+function render(page, r) {
   let rules = null, stmts = null, stmtsErr = null, prev = null, prevKey = "", load = undefined, routes = null, routesErr = null, showOwnRoutes = false;
   // What runs here now, by statement (the memory finding names the longest).
   let liveGroups = null;
@@ -101,7 +106,16 @@ function render(page) {
   const slowerBox = h("div", { style: { margin: "14px 0" } });
   const tabs = h("div", { class: "tabs wl-tabs-scroll", role: "tablist", style: { marginTop: "6px" } });
   const tabBody = h("div");
-  let tab = store.get("perf.tab2", "queries");
+  let tab = tabOf(r?.params?.get("tab")) || tabOf(store.get("perf.tab2", "queries")) || "queries";
+  const showTab = (k) => {
+    tab = k; store.set("perf.tab2", k);
+    const q = new URLSearchParams(location.hash.split("?")[1] || "");
+    q.set("tab", k);
+    const want = location.hash.split("?")[0] + "?" + q;
+    if (location.hash !== want) history.replaceState(null, "", want);
+    drawTabs(); drawTab(); if (k === "queries") loadRoutes();
+  };
+  onTab = (k) => { if (tabOf(k) && k !== tab) showTab(k); };
   // PERF-6: what the KPIs compare with: the window before, or the same time a day or a week ago.
   const BASES = [["before", "window before", "the window before"], ["day", "yesterday", "the same time yesterday"], ["week", "last week", "the same time last week"]];
   let base = store.get("perf.base", "before"), prevNone = null;
@@ -588,7 +602,7 @@ function render(page) {
 
   // ------------------------------------------------ the tabs below
   function drawTabs() {
-    clear(tabs, TABS.map(([k, v]) => h("button", { role: "tab", "aria-selected": String(k === tab), onclick: () => { tab = k; store.set("perf.tab2", k); drawTabs(); drawTab(); if (k === "queries") loadRoutes(); } }, v)),
+    clear(tabs, TABS.map(([k, v]) => h("button", { role: "tab", "aria-selected": String(k === tab), onclick: () => showTab(k) }, v)),
       narrow() ? null : [h("span", { class: "sep" }), h("span", { class: "small muted", style: { alignSelf: "center" } }, isCoord() ? "Writes and Resources are this coordinator's; Storage and Replication list every copy" : "This server")]);
   }
   const sub = [];

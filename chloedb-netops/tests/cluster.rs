@@ -172,7 +172,9 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     let st = api.get("/v1/status").await;
     assert_eq!(st["network"]["devices"], 64);
     assert_eq!(st["network"]["sites"], 10);
-    assert_eq!(st["open_incidents"], 0, "a calm network opens no incident: {st}");
+    // The estate behind the backbone has outages of its own from the start; the backbone is calm.
+    let calm = api.get("/v1/incidents").await["incidents"].as_array().unwrap().iter().filter(|i| i["status"] != "resolved" && i["category"] != "estate").count();
+    assert_eq!(calm, 0, "a calm network opens no incident: {st}");
     let ov = api.get("/v1/overview").await;
     ran_sql(&ov, "overview");
     assert!(len(&ov["traffic"]) > 60 && len(&ov["services"]) == 12 && len(&ov["recent"]) > 0, "overview: {}", ov["at"]);
@@ -219,7 +221,7 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
 
     // A search in a sentence: every condition it names in one statement.
     let up = node["upstream"].as_array().unwrap().iter().find(|u| u["layer"] == "core").or(node["upstream"].as_array().unwrap().last()).unwrap()["id"].as_str().unwrap().to_string();
-    let ask = |q: String| { let api = &api; async move { let r = api.http.get(format!("{}/v1/map/ask", api.url)).query(&[("q", q.as_str())]).bearer_auth(TOKEN).send().await.unwrap(); assert!(r.status().is_success(), "{q}: {}", r.status()); r.json::<Value>().await.unwrap() } };
+    let ask = |q: String| { let api = &api; async move { let r = api.http.post(format!("{}/v1/map/ask", api.url)).json(&json!({"q": q})).bearer_auth(TOKEN).send().await.unwrap(); assert!(r.status().is_success(), "{q}: {}", r.status()); r.json::<Value>().await.unwrap() } };
     let found = ask(format!("everything behind {up} that is not ok")).await;
     assert!(found["understood"] == true && found["sql"].as_str().unwrap().contains("REACHABLE(") && found["rows"].as_array().unwrap().iter().any(|r| r["id"] == fid), "{fid} is behind {up} and broken: {} matches, {}", found["total"], found["read"]);
     assert!(found["places"][metro].as_i64().unwrap() >= 1, "counted where it is, for the map");
@@ -232,6 +234,11 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     let none = ask("how is the weather today".into()).await;
     assert!(none["understood"] == false && none["total"] == 0);
     assert!(len(&api.get("/v1/map/asks").await["asks"]) >= 2, "the searches are kept");
+    // A GET reads and writes nothing: the history stays as it was, and no model is asked.
+    let kept = api.get("/v1/data").await["tables"].as_array().unwrap().iter().find(|t| t["table"] == "netops_searches").map(|t| t["rows"].clone());
+    let read = api.get(&format!("/v1/map/ask?q={}", "OLTs%20that%20are%20down")).await;
+    assert!(read["understood"] == true && read["reader"] == "rules", "a GET is answered: {}", read["note"]);
+    assert_eq!(api.get("/v1/data").await["tables"].as_array().unwrap().iter().find(|t| t["table"] == "netops_searches").map(|t| t["rows"].clone()), kept, "a GET kept no search");
 
     // The box completes from the tables: an id by PREFIX, the rest of a sentence, a filter's values, and the assistant's questions.
     let q = |s: &str| s.replace(' ', "%20").replace(':', "%3A");
@@ -254,7 +261,7 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     for path in ["/v1/incidents", "/v1/alerts", "/v1/rules", "/v1/changes", "/v1/devices", "/v1/services", "/v1/flows", "/v1/agents", "/v1/devices/cr1-lon", "/v1/links/cr1-lon--cr1-nyc", "/v1/services/ip-transit", "/v1/devices/cr1-lon/blame"] {
         ran_sql(&api.get(path).await, path);
     }
-    assert_eq!(len(&api.get("/v1/rules").await["rules"]), 14);
+    assert_eq!(len(&api.get("/v1/rules").await["rules"]), 16);
 
     // The topology read from the logs: two cables nobody wrote down, and two
     // inventory links that no device has ever named.
@@ -289,8 +296,48 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     assert_eq!(r.status(), 400, "a rule is a SELECT");
     let saved = api.post("/v1/rules", json!({"name": "Chassis on fire", "sql": sql, "severity": "major", "entity_kind": "device", "threshold": 200, "unit": "°C"})).await;
     assert_eq!(saved["id"], "chassis-on-fire");
-    assert_eq!(len(&api.get("/v1/rules").await["rules"]), 15);
+    assert_eq!(len(&api.get("/v1/rules").await["rules"]), 17);
     api.post("/v1/rules/chassis-on-fire/delete", json!({})).await;
+
+    // An outage behind the backbone reaches the shift: an access node with
+    // objects behind it goes down (written straight to the server, as a feed
+    // of the estate would), its rule fires, an incident opens on it and the
+    // estate's agent says what is behind it. Diagnose and the lookup find it.
+    let sql = |q: String| { let (http, url) = (api.http.clone(), app.strata.clone()); async move {
+        let r = http.post(format!("{url}/v1/sql")).json(&json!({"sql": q})).send().await.unwrap();
+        let status = r.status();
+        let j: Value = r.json().await.unwrap();
+        assert!(status.is_success(), "{j}");
+        j
+    } };
+    let busy: Vec<String> = faults.iter().filter_map(|f| f["hub"].as_str().map(str::to_string)).collect();
+    let cand = api.http.post(format!("{}/v1/query", app.strata)).json(&json!({"objects": true, "sql": "SELECT n.id AS id, MAX(n.hub) AS hub, COUNT(*) AS c FROM netops_estate_nodes n JOIN netops_estate_edges e ON e.src = n.id\nWHERE n.state = 'ok' AND n.layer = 'access'\nGROUP BY n.id ORDER BY c DESC LIMIT 50"})).send().await.unwrap().json::<Value>().await.unwrap();
+    let olt = cand["rows"].as_array().unwrap().iter().find(|r| r["c"].as_i64().unwrap() >= 20 && !busy.iter().any(|h| r["hub"] == h.as_str())).unwrap_or_else(|| panic!("an access node with 20 behind it: {cand}"))["id"].as_str().unwrap().to_string();
+    sql(format!("UPDATE netops_estate_nodes SET state = 'down', reason = 'Loss of signal on the PON uplink' WHERE id = '{olt}'")).await;
+    let t0 = Instant::now();
+    let out = loop {
+        let incs = api.get("/v1/incidents").await;
+        if let Some(i) = incs["incidents"].as_array().unwrap().iter().find(|i| i["status"] != "resolved" && i["root_entity"] == olt.as_str()) {
+            break i.clone();
+        }
+        assert!(t0.elapsed() < Duration::from_secs(180), "an outage in the estate opened no incident: {}", api.get("/v1/alerts?status=firing").await["alerts"]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let id = out["id"].as_str().unwrap().to_string();
+    let inc = api.get(&format!("/v1/incidents/{id}")).await;
+    let i = &inc["incident"];
+    assert!(i["root_kind"] == "estate" && i["category"] == "estate" && i["title"].as_str().unwrap().contains(&olt) && i["root_cause"].as_str().unwrap().contains("Loss of signal"), "the estate's incident: {i}");
+    assert!(inc["steps"].as_array().unwrap().iter().any(|s| s["sql_text"].as_str().unwrap_or("").contains("netops_estate")), "the estate's agent kept its queries: {}", inc["steps"]);
+    let board = api.get(&format!("/v1/incidents/{id}/panels")).await;
+    assert!(len(&board["panels"]) == 3 && board["panels"].as_array().unwrap().iter().all(|p| p["error"] == ""), "the estate's board reads the estate: {}", board["panels"]);
+    let alerts = api.get("/v1/alerts?status=firing").await;
+    assert!(alerts["alerts"].as_array().unwrap().iter().any(|a| a["entity"] == olt.as_str() && a["rule"] == "estate-outage" && a["severity"] == "major" && a["incident"] == id.as_str()), "its alert");
+    let wh = api.get("/v1/where").await;
+    assert!(wh["estate"].as_array().unwrap().iter().any(|a| a["entity"] == olt.as_str() && a["incident"] == id.as_str()), "Diagnose names it: {}", wh["estate"]);
+    let found = api.get(&format!("/v1/lookup?q={olt}")).await;
+    assert!(found["hits"][0]["id"] == olt.as_str() && found["hits"][0]["exact"] == true && found["hits"][0]["health"]["incident"] == id.as_str(), "the lookup finds it by its id: {found}");
+    sql(format!("UPDATE netops_estate_nodes SET state = 'ok', reason = '' WHERE id = '{olt}'")).await;
+    api.post(&format!("/v1/incidents/{id}/close"), json!({"who": "test", "runbook": "rb-estate-outage", "grade": 3})).await;
 
     // The agents that run on demand.
     let cap = api.post("/v1/agents/capacity/run", json!({})).await;
@@ -312,7 +359,8 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
         // A seed fixes where each fault lands, so the six do not share a device.
         api.post("/v1/sim/inject", json!({"scenario": sc, "seed": 1})).await;
         let ov = api.get("/v1/overview").await;
-        let open = ov["open"].as_array().unwrap();
+        // The estate's own outages come and go beside it; the fault injected is on the backbone.
+        let open: Vec<&Value> = ov["open"].as_array().unwrap().iter().filter(|i| i["category"] != "estate").collect();
         assert_eq!(open.len(), 1, "{sc}: one incident for one fault, not one per alert: {open:?}");
         let id = open[0]["id"].as_str().unwrap().to_string();
         let inc = api.get(&format!("/v1/incidents/{id}")).await;
@@ -370,7 +418,7 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
         assert_eq!(closed["incident"]["status"], "resolved");
         assert!(!closed["incident"]["postmortem"].as_str().unwrap_or("").is_empty(), "{sc}: a postmortem draft");
         assert!(len(&closed["judgments"]) > 0, "{sc}: the judgment is kept");
-        assert_eq!(len(&api.get("/v1/overview").await["open"]), 0);
+        assert_eq!(api.get("/v1/overview").await["open"].as_array().unwrap().iter().filter(|i| i["category"] != "estate").count(), 0);
     }
     let verdicts = api.get("/v1/agents").await["verdicts"].clone();
     assert_eq!(verdicts, json!([{"n": 6, "verdict": "correct"}]), "six faults, six right answers");
@@ -445,8 +493,11 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
 
     // The incident's board: its cause's panels, one asked for in a sentence,
     // one refused, one removed.
+    let panels = || async { api.get("/v1/data").await["tables"].as_array().unwrap().iter().find(|t| t["table"] == "netops_panels").map(|t| t["rows"].clone()) };
+    let before = panels().await;
     let board = api.get(&format!("/v1/incidents/{fibre}/panels")).await;
     ran_sql(&board, "board");
+    assert_eq!(panels().await, before, "looking at the board writes nothing");
     let titles: Vec<&str> = board["panels"].as_array().unwrap().iter().map(|p| p["title"].as_str().unwrap()).collect();
     assert!(titles.len() >= 5 && titles.iter().any(|t| t.starts_with("Packet loss")) && titles.iter().any(|t| t.starts_with("Link state")), "a fibre cut's board: {titles:?}");
     assert!(board["panels"].as_array().unwrap().iter().all(|p| p["error"] == ""), "every panel's query runs: {}", board["panels"]);
@@ -494,7 +545,8 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     assert!(st["sim"]["simulate"] == false && st["network"]["devices"] == 64 && st["network"]["sites"] == 10, "the network from the tables: {}", st["network"]);
     let r = api.http.post(format!("{}/v1/sim/inject", api.url)).bearer_auth(TOKEN).json(&json!({"scenario": "fiber_cut"})).send().await.unwrap();
     assert!(!r.status().is_success(), "nothing to inject into a real network");
-    let before = api.get("/v1/incidents").await["incidents"].as_array().unwrap().iter().filter(|i| i["status"] != "resolved").count();
+    // An outage the simulator left in the estate's tables may still be open: only the backbone's count here.
+    let before = api.get("/v1/incidents").await["incidents"].as_array().unwrap().iter().filter(|i| i["status"] != "resolved" && i["category"] != "estate").count();
     assert_eq!(before, 0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 / 60 * 60;
     let stamp = |t: i64| chrono::DateTime::from_timestamp(t, 0).unwrap().format("%Y-%m-%dT%H:%M:%SZ").to_string();

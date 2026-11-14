@@ -175,6 +175,15 @@ function homePage(root, ctx) {
     learn: core.toggle(true, (v) => { checks.learn = v; }, "learn the site's template"),
   };
   const field = (label, input, cls = "", title) => h("label", { class: "f " + cls, title }, label, input);
+  // What the pace means for one site: the defaults are the crawler's promise
+  // to the sites it reads (a request at a time, a second apart).
+  const pace = h("p", { class: "small muted wide", "data-pace": "" });
+  const showPace = () => {
+    const pages = num(f.max_pages) || 1000, per = Math.max(1, num(f.per_host) || 1), delay = num(f.delay_ms) ?? 1000;
+    const rate = delay > 0 ? (1000 / delay) * per : null;
+    pace.textContent = rate ? `One site at this pace: about ${rate >= 10 || Number.isInteger(rate) ? Math.round(rate) : rate.toFixed(rate < 1 ? 2 : 1)} ${rate === 1 ? "page" : "pages"} a second, so ${pages.toLocaleString()} pages take about ${fmt.dur(pages / rate)}. Keep it for sites you don't run; a site of yours can take more requests at once and a shorter wait. List pages ("next") do not count toward the depth.` : "No wait between requests: only for a site you run.";
+  };
+  for (const k of ["max_pages", "per_host", "delay_ms"]) f[k].addEventListener("input", showPace);
   const previewBtn = h("button", { class: "btn", type: "button", onclick: () => preview() }, icon("eye"), "Preview");
   const startBtn = h("button", { class: "btn primary", type: "submit" }, icon("play"), "Crawl");
   const form = h("form", { onsubmit: (e) => { e.preventDefault(); start(); } },
@@ -188,6 +197,7 @@ function homePage(root, ctx) {
         field("Requests at once", f.concurrency),
         field("Requests at once per host", f.per_host),
         field("Between requests to a host (ms)", f.delay_ms),
+        pace,
         field("Pages the table is made from", f.sample),
         field("A column once this share of pages has the field", f.promote_at),
         field("Vectors of title and body, by the model", f.embed),
@@ -209,6 +219,7 @@ function homePage(root, ctx) {
   const fill = (d) => {
     for (const k of ["max_pages", "max_depth", "concurrency", "per_host", "delay_ms", "sample", "promote_at"]) if (d[k] != null && !f[k].value) f[k].value = d[k];
     if (d.contact) f.contact.placeholder = d.contact;
+    showPace();
   };
   const lines = (t) => t.value.split("\n").map((x) => x.trim()).filter(Boolean);
   const num = (inp) => (inp.value === "" ? undefined : Number(inp.value));
@@ -381,9 +392,9 @@ function crawlPage(root, ctx, id) {
   root.append(h("div", { class: "page-head" },
     h("div", {}, h("a", { class: "small", href: ctx.href() }, "← Crawls"), h("div", { class: "row", style: { gap: "10px" } }, title, phase), sub),
     h("div", { class: "tools" }, pauseBtn, stopBtn, sqlLink, forgetBtn)));
-  const errorBox = h("div");
+  const errorBox = h("div"), whyBox = h("div");
   const bar = h("i", { style: { width: "0%" } });
-  root.append(errorBox, h("div", { class: "cr-bar", title: "Pages handed out of the most it fetches" }, bar));
+  root.append(errorBox, whyBox, h("div", { class: "cr-bar", title: "Pages handed out of the most it fetches" }, bar));
 
   const k = { pages: kpi(core, "Pages fetched"), rows: kpi(core, "Rows written"), queue: kpi(core, "Queued"), cols: kpi(core, "Columns"), shards: kpi(core, "Shards"), misses: kpi(core, "Not pages") };
   root.append(h("div", { class: "grid g6" }, Object.values(k).map((x) => x.el)));
@@ -494,6 +505,10 @@ function crawlPage(root, ctx, id) {
     showIf(forgetBtn, !active);
     sqlLink.href = "#/sql?q=" + encodeURIComponent(`SELECT * FROM ${quote(s.table)} LIMIT 20;`);
     errorBox.replaceChildren(s.error ? h("div", { class: "error", style: { marginBottom: "12px" } }, s.error) : "");
+    // Why a crawl ended, so that a crawl cut short by its depth or its
+    // page limit says so (and what to raise), not only "done".
+    const why = s.why_done || (s.phase === "done" && s.beyond_depth ? `${fmt.n(s.beyond_depth)} links on the deepest pages were not followed (at most ${s.spec.max_depth} links deep)` : null);
+    whyBox.replaceChildren(why ? h("div", { class: "notice", style: { marginBottom: "12px" }, "data-why": "" }, h("b", {}, "Why it ended: "), why) : "");
     bar.style.width = Math.min(100, (fr.handed / Math.max(1, s.spec.max_pages)) * 100) + "%";
 
     const series = s.series || [];
@@ -501,7 +516,7 @@ function crawlPage(root, ctx, id) {
     k.pages.set(fmt.n(c.fetched), active ? `${fmt.si(s.rate.fetched)}/s` : `of ${fmt.si(s.spec.max_pages)} at most`, pr.slice(-60).map((p) => p[1]));
     const rowsNote = [active ? `${fmt.si(s.rate.written)}/s` : null, c.refused ? `${fmt.n(c.refused)} refused` : null, !active && c.duplicates ? `${fmt.n(c.duplicates)} duplicates` : null].filter(Boolean).join(", ");
     k.rows.set(fmt.n(c.written), rowsNote, wr.slice(-60).map((p) => p[1]));
-    k.queue.set(fmt.n(fr.queued), `${fr.in_flight} out now, ${fmt.si(fr.seen)} links seen`);
+    k.queue.set(fmt.n(fr.queued), `${fr.in_flight} out now, ${fmt.si(fr.seen)} links seen` + (s.beyond_depth ? `, ${fmt.si(s.beyond_depth)} past depth ${s.spec.max_depth}` : ""));
     const cols = s.plan?.columns || [];
     k.cols.set(s.plan ? String(cols.length) : "–", s.plan ? (c.added_columns ? `${c.added_columns} added while crawling` : "all from the sample") : `made after ${s.spec.sample} pages`);
     k.shards.set(g.shards?.length ? String(g.shards.length) : "–", g.policy?.split_rows ? `one more past ${fmt.si(g.policy.split_rows)} rows` : "growth is off");

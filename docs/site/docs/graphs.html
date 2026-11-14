@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Graphs in ChloeDB · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="Rows can link to other rows. A traversal, a shortest path or personalized PageRank runs in the same SQL statement as BM25, filters and vector search, and can start from any of them. On arXiv, the papers cited by a…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/graphs.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Search and SQL</span>
       <h1>Graphs in ChloeDB</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/graphs.md">docs/chloedb/graphs.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#rows-are-nodes">Rows are nodes</a></li><li><a href="#storing-edges">Storing edges</a></li><li><a href="#the-sql">The SQL</a></li><li><a href="#planning-and-traversal">Planning and traversal</a></li><li><a href="#speed">Speed</a></li><li><a href="#does-the-graph-help-search">Does the graph help search?</a></li><li><a href="#edge-tables">Edge tables</a></li><li><a href="#on-a-cluster">On a cluster</a></li><li><a href="#limits-and-next-steps">Limits and next steps</a></li></ol></details>
     <div class="doc-body">
@@ -104,7 +107,7 @@ $$</p>
 <p>A key has at most one live row in a snapshot, so ρ<sub>S</sub> is a function. When it has none (the target was deleted, or never existed), the edge dangles and traversals skip it, as a foreign key without a constraint would.</p>
 <p>Edges belong to their source row and point at keys, not storage positions. They are written, logged, updated, deleted, merged and snapshotted with the row, and nothing else in the engine had to change. A merge rewrites every docID and an update moves a row to a newer segment, but neither changes a key, so no edge is ever rewritten. The price is a lookup per hop, and most of the engineering below goes into making it cheap.</p>
 <h2 id="storing-edges">Storing edges<a class="anchor" href="#storing-edges" aria-label="Link to this section">#</a></h2>
-<p><img alt="One segment's graph section: out-edges as a CSR over local docIDs, a reverse index grouped by target key, and same-segment hints" src="../../assets/img/strata-graph-section.png" /></p>
+<p><img loading="lazy" decoding="async" alt="One segment's graph section: out-edges as a CSR over local docIDs, a reverse index grouped by target key, and same-segment hints" src="../../assets/img/strata-graph-section.png" /></p>
 <p>Every segment, on disk or built from the memtable, gets one section per indexed <code>EDGES</code> field, read in place through <code>mmap</code>:</p>
 <ul>
 <li><strong>Out-edges.</strong> A CSR over local docIDs: offsets, then per edge its source, its target key (an <code>i64</code>, or offsets and bytes for string keys), a label code and a weight. Labels and weights are stored only when some edge has one.</li>
@@ -120,7 +123,7 @@ $$</p>
 b \approx \underbrace{8}<em>{\text{target}} + \underbrace{4}</em>{\text{source}} + \underbrace{4 + 4}<em>{\text{reverse}} + \underbrace{4}</em>{\text{hint}} + \frac{8\,\lvert V \rvert + 16\,\lvert K_E \rvert}{\lvert E \rvert}\ \text{bytes per edge}
 $$</p>
 <p>with <em>K</em><sub>E</sub> the distinct targets. That comes to 27 bytes per edge on arXiv, where the graph is under 5% of the file:</p>
-<p><img alt="Sizes of the arXiv table: vectors 453.3 MB, doc store 129.4 MB, graph section 31.1 MB at 27.0 bytes per edge, full-text index 20.1 MB, file 639.0 MB" src="../../assets/img/table-graph-size.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Sizes of the arXiv table: vectors 453.3 MB, doc store 129.4 MB, graph section 31.1 MB at 27.0 bytes per edge, full-text index 20.1 MB, file 639.0 MB" src="../../assets/img/table-graph-size.png" /></p>
 <h2 id="the-sql">The SQL<a class="anchor" href="#the-sql" aria-label="Link to this section">#</a></h2>
 <p>Two predicates, a column and a score join the existing functions. Each takes seeds: a key, a parameter, a tuple of keys, or any subquery over the same table, so a vector search, a BM25 query or a facet filter can be the way into the graph.</p>
 <pre data-lang="sql">-- papers within two citations of p1, either way, nearest first
@@ -141,7 +144,7 @@ SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
   ppr(cites, (SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 2), weighted =&gt; 1)) DESC LIMIT 20;</pre>
 <p>The functions and their options are listed in the <a href="sql.html#graphs">query language reference</a>.</p>
 <h2 id="planning-and-traversal">Planning and traversal<a class="anchor" href="#planning-and-traversal" aria-label="Link to this section">#</a></h2>
-<p><img alt="Graph first, then the usual plan: seeds and options feed a traversal over the whole snapshot, whose result becomes an exact document set per segment" src="../../assets/img/strata-graph-plan.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Graph first, then the usual plan: seeds and options feed a traversal over the whole snapshot, whose result becomes an exact document set per segment" src="../../assets/img/strata-graph-plan.png" /></p>
 <p>A traversal does not respect segment boundaries, so graph computations run first, over the whole snapshot. Seeds are resolved (a seed subquery runs as a query of its own on the same snapshot), and the traversal runs. Its result becomes, per segment, a materialised document set with exact cardinality, plus each row's distance and PageRank score. The planner then sees a graph predicate as a filter whose size it knows exactly: a vector search over a neighbourhood of a few hundred rows becomes an exact scan of those rows.</p>
 <pre class="mermaid">flowchart LR
     SD[&quot;seeds&lt;br/&gt;keys, a tuple or a subquery&quot;] --&gt; TR[&quot;traversal over the snapshot&lt;br/&gt;BFS · bidirectional path · PageRank push&quot;]
@@ -173,7 +176,7 @@ $$</p>
 <li><strong>SQLite:</strong> an edge table <code>(src, dst)</code> as a <code>WITHOUT ROWID</code> primary key, an index on <code>(dst, src)</code>, and recursive CTEs.</li>
 <li><strong>CSR:</strong> the same traversal code on two in-memory arrays. This is the lower bound: no keys, no segments, no SQL.</li>
 </ul>
-<p><img alt="Graph query latency on arXiv: ChloeDB, SQLite and an in-memory CSR, p50 and p95, for REACHABLE, PATH, ppr and vector-seeded queries" src="../../assets/img/table-graph-speed.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Graph query latency on arXiv: ChloeDB, SQLite and an in-memory CSR, p50 and p95, for REACHABLE, PATH, ppr and vector-seeded queries" src="../../assets/img/table-graph-speed.png" /></p>
 <p><em>arXiv, 200 seeds per query. Source: <code>chloedb/results/graph/latency_arxiv.json</code>.</em></p>
 <p>On the million-row graph (<code>chloedb/results/graph/synthetic_1000000.json</code>; loaded in 2.7 s into a 307 MB file, 27 bytes per edge):</p>
 <div class="doc-table"><table>
@@ -267,11 +270,11 @@ $$</p>
 \qquad
 \mathrm{nDCG@}k = \frac{\sum_{i \le k} \mathbb{1}[r_i \in T] / \log_2(i + 1)}{\sum_{i \le \min(k, \lvert T \rvert)} 1 / \log_2(i + 1)}
 $$</p>
-<p><img alt="Finding a paper's references on the 484 report papers: following the citations of the two nearest papers reaches nDCG@20 0.253, against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search" src="../../assets/img/table-graph-quality.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Finding a paper's references on the 484 report papers: following the citations of the two nearest papers reaches nDCG@20 0.253, against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search" src="../../assets/img/table-graph-quality.png" /></p>
 <p><em>Source: <code>chloedb/results/graph/quality_stats.json</code>. Times are from the quality runs on the M2, after one untimed pass per method.</em></p>
 <p><strong>The graph doubles what vector search finds.</strong> The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search (+0.130, 95% interval 0.111–0.149, p &lt; 0.0001), 0.161 for BM25 and 0.160 for hybrid search, in 0.2 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.</p>
 <p>PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.179, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (48 ms).</p>
-<p><img alt="nDCG@20 by number of vector seeds: the citation expansion peaks at two or three seeds and falls below vector search beyond 20" src="../../assets/img/chart-graph-seeds.png" /></p>
+<p><img loading="lazy" decoding="async" alt="nDCG@20 by number of vector seeds: the citation expansion peaks at two or three seeds and falls below vector search beyond 20" src="../../assets/img/chart-graph-seeds.png" /></p>
 <p><strong>Fewer seeds are better.</strong> With more seeds, the citations of papers less similar to the query crowd out those of the nearest ones. In a first version of the experiment the seeds themselves stayed in the candidate set; ranked by similarity they took the top places, and from 20 seeds on the "graph" method returned exactly the vector search's results. Every graph method above removes the seeds with <code>NOT REACHABLE(cites, seeds, hops =&gt; 0, min_hops =&gt; 0)</code>.</p>
 <p><strong>A graph made of vectors adds nothing.</strong> A <code>VECTOR</code> field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task it returns what vector search already found when the seeds are kept (recall@20 0.112 against 0.111 at 10 seeds, on all queries), and is worse when they are removed (nDCG@20 0.079). A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows with vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in ChloeDB for exploratory queries, at 0.12 ms per hop of 10 neighbours.</p>
 <h2 id="edge-tables">Edge tables<a class="anchor" href="#edge-tables" aria-label="Link to this section">#</a></h2>
@@ -349,7 +352,7 @@ $$</p>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

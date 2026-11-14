@@ -27,12 +27,22 @@ export function markdown({ run, sessions, findings }) {
     for (const [m, b] of Object.entries(t.by_model)) out.push(`| ${m} | ${b.n} | ${pct(b.rate)} | ${b.steps} | ${b.ease ?? '–'} |`);
     out.push('');
   }
+  const good = findings.filter((f) => f.category === 'strength');
+  const bad = findings.filter((f) => f.category !== 'strength');
   out.push('## Findings', '');
-  if (!findings.length) out.push('None.', '');
-  for (const f of findings) {
+  if (!bad.length) out.push('None.', '');
+  for (const f of bad) {
     out.push(`### ${f.rank}. ${f.title}`, '', `${f.category}, severity ${f.severity}; ${f.sessions.length} sessions (${pct(f.share)}); personas: ${f.personas.join(', ')}; tasks: ${f.tasks.join(', ')}.`, '', f.summary, '', `Fix: ${f.fix}`, '');
     for (const e of f.evidence || []) out.push(`- ${e.session} step ${e.step}: ${e.detail}`);
     out.push('');
+  }
+  if (good.length) {
+    out.push('## Strengths', '');
+    for (const f of good) {
+      out.push(`### ${f.title}`, '', `${f.sessions.length} sessions (${pct(f.share)}); personas: ${f.personas.join(', ')}; tasks: ${f.tasks.join(', ')}.`, '', f.summary, '');
+      for (const e of f.evidence || []) out.push(`- ${e.session} step ${e.step}: ${e.detail}`);
+      out.push('');
+    }
   }
   out.push('## Sessions', '', '| session | persona | task | seed | model | outcome | steps | checks | ease |', '| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   for (const s of sessions) out.push(`| ${s.id} | ${s.persona.id} | ${s.task.id} | ${s.seed} | ${s.model} | ${s.outcome}${s.success ? ' ✓' : ''} | ${s.steps} | ${(s.checks || []).map((c) => (c.ok ? 'pass' : 'fail')).join(', ')} | ${s.interview?.ease ?? '–'} |`);

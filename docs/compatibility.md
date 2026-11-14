@@ -55,6 +55,14 @@ build exactly as long as it uses only features that build knows, and an
 older build that meets a newer feature refuses the file by name rather than
 misreading it. Starting to use a feature cannot be undone.
 
+**Rollups.** A rollup made by 0.3.3 or later keys its rows by number,
+where one made by 0.3.1 or 0.3.2 keys them by text. 0.3.3 reads and
+refreshes both. 0.3.2 reads the new kind but cannot refresh it, so its
+definition carries the option `needs_chloedb_0_3_3`, which 0.3.2 refuses
+by name ("no option needs_chloedb_0_3_3"): a refresh by 0.3.2 fails with
+that message rather than leaving the rollup's newest buckets stale. Open a
+database whose rollups 0.3.3 made with 0.3.3 or later.
+
 **Databases from before field ids.** A database written before field ids
 (format 1, 2, or 3 without `field_ids`) no longer opens for use. `upgrade()`
 (`chloedb.upgrade(path)` in Python, `upgrade(path)` in JavaScript;

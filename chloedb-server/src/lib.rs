@@ -104,6 +104,22 @@ pub fn http_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder().tls_built_in_native_certs(false)
 }
 
+/// Writes a line of a command's answer to stdout. A reader that stops early
+/// (`chloedb-server admin catalog | head -1`) closes the pipe, and that ends
+/// the command quietly, with exit code 0, as it ends other tools, where
+/// `println!` panics (exit code 101).
+pub fn print_out(line: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("chloedb-server: writing to stdout: {e}");
+        std::process::exit(1);
+    }
+}
+
 pub mod pb {
     tonic::include_proto!("strata.v1");
 }
@@ -162,9 +178,24 @@ impl From<chloedb::Error> for ApiError {
     }
 }
 
+/// Whether a server refused a request whose message it could not decode
+/// for nesting deeper than Protobuf's limit: a plan whose expression
+/// nests too deep (`a + b + ...` of a hundred terms), the request's fault
+/// and not the copy's.
+pub fn too_deep_to_decode(s: &tonic::Status) -> bool {
+    s.code() == tonic::Code::Internal && s.message().contains("failed to decode Protobuf message") && s.message().contains("recursion limit reached")
+}
+
 impl From<tonic::Status> for ApiError {
     fn from(s: tonic::Status) -> ApiError {
         use tonic::Code;
+        if too_deep_to_decode(&s) {
+            return ApiError {
+                code: Some("query_invalid"),
+                status: 400,
+                message: "query error: the statement nests too deep to be sent to the shards (its plan passes Protobuf's limit of 100 nested messages): write its expressions with fewer levels, or split it".into(),
+            };
+        }
         let status = match s.code() {
             Code::InvalidArgument => 400,
             Code::NotFound => 404,

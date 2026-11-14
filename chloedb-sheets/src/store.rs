@@ -221,54 +221,93 @@ fn book_doc(b: &Book, frame: Option<&[u8]>, cells: usize) -> Value {
     doc
 }
 
+/// A cell's row as `sheets_cells` holds it, as an upsert.
+fn cell_op(book_id: &str, k: &Key, sheet_name: &str, c: &crate::book::Stored) -> Value {
+    let mut doc = json!({
+        "id": cell_id(book_id, k), "book": book_id, "sheet": k.sheet, "sheet_name": sheet_name,
+        "row": k.row, "col": k.col, "ref": book::cell_ref(k.row, k.col),
+        "kind": c.kind, "input": c.input, "text": c.text, "style": c.style,
+    });
+    if let Some(n) = c.num.filter(|n| n.is_finite()) {
+        doc["num"] = json!(n);
+    }
+    if let Some(f) = c.f {
+        doc["f"] = json!(f);
+    }
+    if let Some(x) = &c.extra {
+        doc["extra"] = json!(x);
+    }
+    json!({"op": "upsert", "table": CELLS, "doc": doc})
+}
+
+/// Writes of one save sent at once: the server applies them in turn, but
+/// the next one's body is on its way (and parsed) while one is applied.
+const IN_FLIGHT: usize = 2;
+
 /// Writes a save: the cells that changed, the ones gone, and the book's row.
 /// Returns the rows written.
+///
+/// The rows are made a write at a time ([`WRITE_OPS`]), not all at once: an
+/// import of 450,000 cells held them all as JSON, about a gigabyte, which
+/// the process kept (DAP-9).
 pub async fn write(strata: &Strata, b: &Book, s: &Save) -> Result<usize, String> {
-    let mut ops: Vec<Value> = Vec::with_capacity(s.cells.len() + s.deleted.len() + 1);
-    for (k, sheet_name, c, _) in &s.cells {
-        let mut doc = json!({
-            "id": cell_id(&b.id, k), "book": b.id, "sheet": k.sheet, "sheet_name": sheet_name,
-            "row": k.row, "col": k.col, "ref": book::cell_ref(k.row, k.col),
-            "kind": c.kind, "input": c.input, "text": c.text, "style": c.style,
-        });
-        if let Some(n) = c.num.filter(|n| n.is_finite()) {
-            doc["num"] = json!(n);
-        }
-        if let Some(f) = c.f {
-            doc["f"] = json!(f);
-        }
-        if let Some(x) = &c.extra {
-            doc["extra"] = json!(x);
-        }
-        ops.push(json!({"op": "upsert", "table": CELLS, "doc": doc}));
-    }
-    for k in &s.deleted {
-        ops.push(json!({"op": "delete", "table": CELLS, "key": cell_id(&b.id, k), "routing": b.id}));
-    }
-    let head = s.head.is_some() || s.frame.is_some() || !ops.is_empty();
-    if head {
-        // The frame goes with every row of the book: a row upserted whole.
-        let frame = match &s.frame {
-            Some((f, _)) => f.clone(),
-            None => book::frame(b.model()),
-        };
-        ops.push(json!({"op": "upsert", "table": BOOKS, "doc": book_doc(b, Some(&frame), s.cell_count)}));
-    }
-    if ops.is_empty() {
+    let head = s.head.is_some() || s.frame.is_some() || !s.cells.is_empty() || !s.deleted.is_empty();
+    if !head {
         return Ok(0);
     }
-    let mut written = 0;
-    let n = ops.len();
     let base = new_id("w");
-    let mut i = 0;
+    let mut written = 0;
     let mut part = 0;
-    while i < n {
-        let end = (i + WRITE_OPS).min(n);
-        let chunk: Vec<Value> = ops[i..end].to_vec();
-        written += strata.write(chunk, &format!("{base}-{part}"), PATIENCE).await.map_err(|e| e.to_string())?;
+    let mut out: tokio::task::JoinSet<Result<usize, String>> = tokio::task::JoinSet::new();
+    let mut first_err: Option<String> = None;
+    // The cells, then the deleted ones; the last write (with room for the
+    // book's row) goes once the others are in, so that a small save is one
+    // transaction, as before.
+    let n = s.cells.len() + s.deleted.len();
+    let op = |j: usize| match s.cells.get(j) {
+        Some((k, sheet_name, c, _)) => cell_op(&b.id, k, sheet_name, c),
+        None => json!({"op": "delete", "table": CELLS, "key": cell_id(&b.id, &s.deleted[j - s.cells.len()]), "routing": b.id}),
+    };
+    let last = n.saturating_sub(1) / WRITE_OPS * WRITE_OPS;
+    let mut i = 0;
+    while i < last {
+        let end = (i + WRITE_OPS).min(last);
+        let ops: Vec<Value> = (i..end).map(op).collect();
         i = end;
+        while out.len() >= IN_FLIGHT {
+            match out.join_next().await {
+                Some(Ok(Ok(w))) => written += w,
+                Some(Ok(Err(e))) => first_err = first_err.or(Some(e)),
+                Some(Err(e)) => first_err = first_err.or(Some(e.to_string())),
+                None => break,
+            }
+        }
+        if first_err.is_some() {
+            break;
+        }
+        let (st, key) = (strata.clone(), format!("{base}-{part}"));
+        out.spawn(async move { st.write(ops, &key, PATIENCE).await.map_err(|e| e.to_string()) });
         part += 1;
     }
+    while let Some(r) = out.join_next().await {
+        match r {
+            Ok(Ok(w)) => written += w,
+            Ok(Err(e)) => first_err = first_err.or(Some(e)),
+            Err(e) => first_err = first_err.or(Some(e.to_string())),
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    // The book's row last, once its cells are all in: the frame goes with
+    // every row of the book, a row upserted whole.
+    let frame = match &s.frame {
+        Some((f, _)) => f.clone(),
+        None => book::frame(b.model()),
+    };
+    let mut ops: Vec<Value> = (last..n).map(op).collect();
+    ops.push(json!({"op": "upsert", "table": BOOKS, "doc": book_doc(b, Some(&frame), s.cell_count)}));
+    written += strata.write(ops, &format!("{base}-{part}"), PATIENCE).await.map_err(|e| e.to_string())?;
     Ok(written)
 }
 

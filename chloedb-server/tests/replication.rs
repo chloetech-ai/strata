@@ -214,7 +214,7 @@ async fn replicas_hold_what_their_primary_wrote() {
     let seq3 = pdb.storage().seq_of(None, &Value::Str("p0000003".into())).unwrap().unwrap();
     let w = p.write_ops(vec![json!({"op": "add", "key": "p0000003", "field": "sold", "value": 1, "if_seq_no": seq3})], None).await.unwrap();
     holds(w.seq_no.unwrap());
-    let (n, _) = p.import(None, axum::body::Bytes::from("id,title,price\nc1,Copper kettle,12.5\nc2,Iron pan,30\n"), chloedb::ingest::Format::Csv, Default::default()).await.unwrap();
+    let (n, _, _) = p.import(None, axum::body::Bytes::from("id,title,price\nc1,Copper kettle,12.5\nc2,Iron pan,30\n"), chloedb::ingest::Format::Csv, Default::default()).await.unwrap();
     assert_eq!(n.rows, 2);
     holds(last(&pdb));
     // Writers at once, which the writer groups into shared transactions. Each

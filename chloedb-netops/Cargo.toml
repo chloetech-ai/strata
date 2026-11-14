@@ -1,6 +1,6 @@
 [package]
 name = "chloedb-netops"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Network operations on ChloeDB: topology, telemetry rollups, alerts written as SQL, incidents correlated over the topology graph, changes with their blast radius, and agents that show what they read"

@@ -137,7 +137,13 @@ export function tokenize(sql) {
 const tableFunctions = new Set();
 export const useTableFunctions = (names) => { tableFunctions.clear(); for (const n of names) tableFunctions.add(String(n).toLowerCase()); };
 
-export function rewriteSql(sql, tables, physical) {
+// scope(name), when given, is asked for each of the app's tables the query
+// reads: null (every row), or {sql(alias, {left})} giving the condition its
+// rows must meet (access.mjs, a table declared for each person's or
+// company's own rows); it may throw to refuse the table. The condition joins
+// the WHERE of each SELECT that reads the table, so search, ranking and
+// graph walks keep working on the table's own scan.
+export function rewriteSql(sql, tables, physical, { scope = null } = {}) {
   const text = String(sql || '').trim();
   if (!text) throw new Error('empty SQL');
   const all = tokenize(text);
@@ -156,7 +162,7 @@ export function rewriteSql(sql, tables, physical) {
   const edits = []; // {s, e, text}
   // A frame per open parenthesis: the function it calls (if any), whether
   // its query has a FROM list open, the CTEs its WITH defined.
-  const frames = [{ fn: null, from: false, select: false, ctes: new Set(), with: false, factor: false }];
+  const frames = [{ fn: null, from: false, select: false, ctes: new Set(), with: false, factor: false, block: null }];
   const top = () => frames[frames.length - 1];
   const isCte = (name) => frames.some((f) => f.ctes.has(name));
   const skip = new Set(); // token indexes that are names, not keywords
@@ -166,12 +172,32 @@ export function rewriteSql(sql, tables, physical) {
   };
 
   // A table's alias: AS and any word, or a word sqlparser takes as one.
+  // Answers the alias as written, or null.
   const alias = (j) => {
     const t = toks[j];
-    if (up(t) === 'AS') { if (toks[j + 1]) skip.add(j + 1); return true; }
-    if (t && (t.k === 'qident' || (t.k === 'word' && !RESERVED_ALIAS.has(up(t))))) { skip.add(j); return true; }
-    return false;
+    if (up(t) === 'AS') { if (toks[j + 1]) skip.add(j + 1); return toks[j + 1] ? toks[j + 1].v : null; }
+    if (t && (t.k === 'qident' || (t.k === 'word' && !RESERVED_ALIAS.has(up(t))))) { skip.add(j); return t.v; }
+    return null;
   };
+  // The SELECT a table factor belongs to: the innermost frame's query (a
+  // parenthesised join has none of its own).
+  const blockOf = () => { for (let k = frames.length - 1; k >= 0; k--) if (frames[k].block) return frames[k].block; return null; };
+  // Once a SELECT's clauses are read: its scoped tables' conditions join its
+  // WHERE (or make one).
+  const finish = (b, last) => {
+    if (!b || !b.scoped.length) return;
+    if (b.outer) refuse('a RIGHT or FULL JOIN cannot read a table kept to each person\'s own rows; use JOIN or LEFT JOIN');
+    const cond = b.scoped.join(' AND ');
+    if (b.where !== null) {
+      edits.push({ s: toks[b.where].e, e: toks[b.where].e, text: ` ${cond} AND (` });
+      const at = toks[b.whereEnd ?? last].e;
+      edits.push({ s: at, e: at, text: ')' });
+    } else {
+      const at = toks[b.fromEnd ?? last].e;
+      edits.push({ s: at, e: at, text: ` WHERE ${cond}` });
+    }
+  };
+  const CLAUSE_END = new Set(['GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH', 'QUALIFY', 'WINDOW', 'SORT', 'SETTINGS', 'FORMAT']);
 
   // The table factor at toks[j]: a plain app table (rewritten), a CTE, one
   // of the library's table functions, or a parenthesis (a subquery or a
@@ -196,6 +222,13 @@ export function rewriteSql(sql, tables, physical) {
     used.add(name);
     const had = alias(j + 1);
     edits.push({ s: t.s, e: t.e, text: `${physical(name)}${had ? '' : ` AS ${name}`}` });
+    const sc = scope ? scope(name) : null;
+    if (sc) {
+      const b = blockOf();
+      if (!b) refuse(`${t.v} is read outside a SELECT`);
+      const left = up(toks[j - 1]) === 'JOIN' && (up(toks[j - 2]) === 'LEFT' || (up(toks[j - 2]) === 'OUTER' && up(toks[j - 3]) === 'LEFT'));
+      b.scoped.push(sc.sql(had || name, { left }));
+    }
   };
 
   // One CTE's head at toks[j]: name [(cols)] AS [[NOT] MATERIALIZED] (
@@ -211,7 +244,7 @@ export function rewriteSql(sql, tables, physical) {
     const prev = toks[i - 1];
     const f = top();
     if (t.v === '(') {
-      frames.push({ fn: prev && prev.k === 'word' && !skip.has(i - 1) ? up(prev) : null, from: !!t.factor, select: false, ctes: new Set(), with: false, factor: !!t.factor });
+      frames.push({ fn: prev && prev.k === 'word' && !skip.has(i - 1) ? up(prev) : null, from: !!t.factor, select: false, ctes: new Set(), with: false, factor: !!t.factor, block: null });
       const nx = toks[i + 1];
       if (t.factor && nx && !['SELECT', 'WITH', 'VALUES'].includes(up(nx)) && nx.v !== '(') factor(i + 1);
       if (t.factor && up(nx) === 'VALUES') top().from = false;
@@ -220,6 +253,7 @@ export function rewriteSql(sql, tables, physical) {
     if (t.v === ')') {
       if (frames.length === 1) refuse('a ) closes nothing');
       const closed = frames.pop();
+      finish(closed.block, i - 1);
       if (closed.factor) alias(i + 1);
       continue;
     }
@@ -235,6 +269,8 @@ export function rewriteSql(sql, tables, physical) {
     if (w === 'SELECT') {
       if (prev && prev.v !== '(' && prev.v !== ')' && !BEFORE_SELECT.has(up(prev))) refuse('SELECT can start a query only');
       f.select = true; f.from = false; f.with = false;
+      finish(f.block, i - 1);
+      f.block = { scoped: [], where: null, whereEnd: null, fromEnd: null, outer: false };
       continue;
     }
     if (w === 'WITH') {
@@ -254,12 +290,22 @@ export function rewriteSql(sql, tables, physical) {
       continue;
     }
     if (w === 'JOIN' || w === 'APPLY') { f.from = true; factor(i + 1); continue; }
+    if ((w === 'RIGHT' || w === 'FULL') && blockOf()) blockOf().outer = true;
+    if (f.block) {
+      const b = f.block;
+      if (w === 'WHERE' && b.where === null) b.where = i;
+      else if (CLAUSE_END.has(w)) {
+        if (b.where !== null && b.whereEnd === null) b.whereEnd = i - 1;
+        if (b.where === null && b.fromEnd === null) b.fromEnd = i - 1;
+      } else if (['UNION', 'INTERSECT', 'EXCEPT', 'MINUS'].includes(w)) { finish(b, i - 1); f.block = null; }
+    }
     if (ENDS_FROM.has(w)) { f.from = false; continue; }
     // Graph walks may name a links table as their first argument.
     if ((w === 'REACHABLE' || w === 'PATH' || w === 'PPR') && toks[i + 1]?.v === '(') {
       const a = toks[i + 2];
       if (a && a.k === 'word' && names.has(a.v.toLowerCase()) && toks[i + 3]?.v !== '.') {
         const name = a.v.toLowerCase();
+        if (scope && scope(name)) refuse(`${a.v} is kept to each person's own rows: it cannot be walked as a graph`);
         used.add(name);
         skip.add(i + 2);
         edits.push({ s: a.s, e: a.e, text: physical(name) });
@@ -267,6 +313,7 @@ export function rewriteSql(sql, tables, physical) {
     }
   }
   if (frames.length !== 1) refuse('a ( is not closed');
+  finish(frames[0].block, toks.length - 1);
 
   // The text as written, with the table names replaced; a trailing ; goes.
   let end = toks[toks.length - 1].e;

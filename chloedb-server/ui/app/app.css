@@ -83,7 +83,12 @@ svg.i.lg { width: 20px; height: 20px; }
 .side { grid-row: 1 / 4; background: var(--surface); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; transition: width .18s; }
 .brand { height: 52px; display: flex; align-items: center; gap: 10px; padding: 0 14px; border: 0; border-bottom: 1px solid var(--line); background: none; font-weight: 700; letter-spacing: .01em; white-space: nowrap; overflow: hidden; width: 100%; text-align: left; cursor: pointer; flex: none; }
 .brand:hover { background: var(--surface-2); }
-.brand .mark { width: 28px; height: 28px; flex: none; }
+.brand .mark { width: 28px; height: 32px; flex: none; display: grid; place-items: center; }
+.brand .mark img { height: 32px; width: auto; }
+.brand .mark .on-dark { display: none; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .brand .mark .on-light { display: none; } :root:not([data-theme="light"]) .brand .mark .on-dark { display: block; } }
+:root[data-theme="dark"] .brand .mark .on-light { display: none; }
+:root[data-theme="dark"] .brand .mark .on-dark { display: block; }
 .brand .clu { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
 .brand .clu b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
 .brand .clu .chev { width: 13px; height: 13px; color: var(--muted); }
@@ -3724,3 +3729,15 @@ pre.code.diff > .del { background: color-mix(in srgb, var(--crit) 14%, transpare
 .ex-sticky { position: sticky; top: 12px; }
 @media (max-width: 900px) { .ex-sticky { position: static; } }
 @media (max-width: 560px) { .qu-top .seg { max-width: 100%; overflow-x: auto; flex-wrap: nowrap; } .qu-top .seg button { flex: none; } }
+
+/* A phone: the title gives up its room before anything is pushed off the
+   top bar (a flex-shrink under 1 would take only part of the overflow),
+   the environment badge keeps its first letters, and a card's tools wrap
+   below its title: nothing pans the page sideways. */
+@media (max-width: 560px) {
+  .top .crumbs { flex: 1 1 0; min-width: 0; }
+  .top .env { flex: 0 1 auto; min-width: 30px; max-width: 76px; overflow: hidden; text-overflow: ellipsis; }
+  .top { overflow-x: clip; }
+  .card > .hd { flex-wrap: wrap; row-gap: 6px; }
+  .card > .hd .tools { flex-wrap: wrap; max-width: 100%; margin-left: 0; }
+}

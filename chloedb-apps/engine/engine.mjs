@@ -5,12 +5,16 @@
 import { EventEmitter } from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Store, physical, newId } from './store.mjs';
-import { rewriteSql, checkReads } from './sql.mjs';
+import { rewriteSql, checkReads, tokenize } from './sql.mjs';
+import { decide, rulesOf, scopeSql, scopeParams, inScope, fillScope, SCOPE_PARAM } from './access.mjs';
 import { runFunction } from './sandbox.mjs';
 import { runRule } from './rules.mjs';
 import { rowLabel, tablesOf } from './activity.mjs';
 
 const MAX_ROWS = 1000;
+// What a person is called where an app shows them: their name, else their
+// email, else "you" (never "undefined").
+export const personName = (p) => (p && String(p.name || '').trim()) || (p && String(p.email || '').trim()) || 'you';
 const MAX_DEPTH = 3;
 // What a visitor of a published app may write (checkVisitorWrite): a field
 // of at most 10 KB, a row of at most 64 KB, a list of at most 100 items.
@@ -87,6 +91,33 @@ export function checkVisitorWrite(view, spec, fields, limits = VISITOR_LIMITS) {
   }
 }
 
+// The person a request is for, as SQL parameters: :user_id, :user_email,
+// :user_name and :company_id are the engine's to bind. For an app's people
+// (ctx.as) they are always the signed-in person's and the company they work
+// in now, whatever the call sent, so a page cannot ask as someone else; for
+// the studio, a value the call gives stays. A query that names one with no
+// value is refused as a 401 (sign in first), not sent to ChloeDB unbound.
+const PEOPLE_PARAMS = ['user_id', 'user_email', 'user_name', 'company_id'];
+function bindPeople(sql, params, ctx = {}) {
+  const p = { ...(params || {}) };
+  delete p[SCOPE_PARAM.user];
+  delete p[SCOPE_PARAM.company];
+  let named;
+  try { named = new Set(tokenize(String(sql || '')).filter((t) => t.k === 'param').map((t) => t.v.slice(1))); } catch { return p; }
+  if (!PEOPLE_PARAMS.some((k) => named.has(k))) return p;
+  const me = ctx.as ? ctx.as.user : ctx.user || null;
+  const company = ctx.as ? ctx.as.company : ctx.company || null;
+  const ours = { user_id: me?.id, user_email: me?.email, user_name: me?.name, company_id: company };
+  for (const k of PEOPLE_PARAMS) {
+    if (!named.has(k)) continue;
+    if (ctx.as || p[k] === undefined || p[k] === null) { if (ours[k] != null) p[k] = ours[k]; else delete p[k]; }
+    if (p[k] === undefined || p[k] === null) {
+      throw Object.assign(new Error(k === 'company_id' ? 'Join or choose a company first: this needs the company you work in' : 'Sign in first: this needs someone signed in'), { status: 401, refused: 'sign-in' });
+    }
+  }
+  return p;
+}
+
 function coerce(type, v, col) {
   if (v === null || v === undefined || v === '') return null;
   switch (type) {
@@ -119,6 +150,15 @@ function coerce(type, v, col) {
     default:
       return typeof v === 'string' ? v : (typeof v === 'object' ? JSON.stringify(v) : String(v));
   }
+}
+
+// Whether an error a browser reported says only that a call was not
+// answered: the browser's own words for a failed fetch, the command center's
+// ("no answer: the network failed..."), a proxy's 502 to 504, an engine or a
+// server not answering. Not a fault of the app's code, so never a repair.
+const UNANSWERED = /\b(no answer\b|failed to fetch|networkerror|network error|load failed|the network failed|does not answer|is not answering|not answering|bad gateway|service unavailable|gateway time-?out|econnreset|econnrefused|socket hang up|the answer was cut off|too many requests)/i;
+export function unanswered(message) {
+  return UNANSWERED.test(String(message || '').split('\n')[0]);
 }
 
 export class Engine extends EventEmitter {
@@ -217,10 +257,21 @@ export class Engine extends EventEmitter {
 
   // ---- what views and functions call
 
-  async sql(appId, sql, params) {
+  // ctx.as is the person a read is for, when it is one of the app's people
+  // (a visitor or a member, through the public path): the tables' declared
+  // access (access.mjs) holds them to what they may see. Without it (the
+  // studio, the engine's own checks, triggers) every row is read.
+  async sql(appId, sql, params, ctx = {}) {
     const view = await this.view(appId);
     const names = view.tables.map((t) => t.spec.name);
-    const { sql: phys } = rewriteSql(sql, names, (t) => physical(appId, t));
+    const who = ctx.as || null;
+    const specs = new Map(view.tables.map((t) => [t.spec.name, t.spec]));
+    const scope = who ? (name) => {
+      const d = decide(specs.get(name), 'read', who);
+      return d.all ? null : { sql: (alias, o) => scopeSql(d.scope, alias, o) };
+    } : null;
+    const { sql: phys } = rewriteSql(sql, names, (t) => physical(appId, t), { scope });
+    params = { ...bindPeople(sql, params, ctx), ...(who ? scopeParams(who) : {}) };
     const db = await this.dbOf(appId);
     // With the app's own key the server refuses any other table itself;
     // with the engine's, its plan is checked first.
@@ -247,6 +298,7 @@ export class Engine extends EventEmitter {
 
   async insert(appId, table, fields, ctx = {}) {
     const spec = await this.tableSpec(appId, table);
+    fields = this.mayWrite(spec, 'add', fields, ctx);
     if (ctx.visitor) checkVisitorWrite(await this.view(appId), spec, fields);
     const doc = this.makeDoc(spec, fields);
     for (const k of Object.keys(doc)) if (doc[k] === null) delete doc[k];
@@ -266,9 +318,11 @@ export class Engine extends EventEmitter {
     const [old] = await db.get(physical(appId, table), [String(id)]);
     if (!old) throw new Error(`no row ${id} in ${table}`);
     if (ctx.visitor) checkVisitorWrite(await this.view(appId), spec, fields);
-    if (ctx.ownRows) await this.ownedBy(appId, table, old.id, ctx.who);
+    this.mayChange(spec, 'change', old, ctx);
+    if (ctx.ownRows && !rulesOf(spec)) await this.ownedBy(appId, table, old.id, ctx.who);
     const changes = this.makeDoc(spec, fields, { partial: true });
     const doc = { ...old, ...changes, id: old.id };
+    this.mayChange(spec, 'change', doc, ctx, { moved: true });
     for (const k of Object.keys(doc)) if (doc[k] === null) delete doc[k];
     await db.write([{ op: 'upsert', table: physical(appId, table), doc }]);
     this.announce('data', { app: appId, tables: [table] });
@@ -280,13 +334,35 @@ export class Engine extends EventEmitter {
     const spec = await this.tableSpec(appId, table);
     const db = await this.dbOf(appId);
     const [old] = await db.get(physical(appId, table), [String(id)]);
-    if (ctx.ownRows) await this.ownedBy(appId, table, String(id), ctx.who);
+    this.mayChange(spec, 'remove', old, ctx);
+    if (ctx.ownRows && !rulesOf(spec)) await this.ownedBy(appId, table, String(id), ctx.who);
     await db.write([{ op: 'delete', table: physical(appId, table), key: String(id) }]);
     this.announce('data', { app: appId, tables: [table] });
     if (old) await this.after(appId, table, 'delete', old, ctx);
     // The row as it was, in a form app.insert takes back: the frame's Undo.
     const row = old ? Object.fromEntries(Object.entries(old).filter(([k]) => k === 'id' || k === 'created' || (spec.columns || []).some((c) => c.name === k))) : null;
     return { removed: old ? 1 : 0, row };
+  }
+
+  // A write by one of the app's people (ctx.as), against the table's
+  // declared access: an add under a scope gets the scope's columns filled
+  // (and is refused when it names someone else). Answers the fields to write.
+  mayWrite(spec, action, fields, ctx) {
+    if (!ctx.as) return fields;
+    const d = decide(spec, action, ctx.as);
+    return d.all ? fields : fillScope(fields, d.scope, ctx.as, spec.name);
+  }
+
+  // A change or remove of row `row` by one of the app's people: allowed on
+  // the table, and the row in their scope (with moved, the row as it would
+  // be stored: a change cannot move a row out of the scope).
+  mayChange(spec, action, row, ctx, { moved = false } = {}) {
+    if (!ctx.as) return;
+    const d = decide(spec, action, ctx.as);
+    if (d.all || !row) return;
+    if (!inScope(row, d.scope, ctx.as)) {
+      throw Object.assign(new Error(moved ? `You cannot give ${spec.name} rows to someone else (${d.scope.map((t) => t.col).join(' or ')})` : `You can ${action} only your own rows of ${spec.name}`), { status: 403, refused: 'access' });
+    }
   }
 
   async call(appId, slug, input, ctx = {}) {
@@ -305,7 +381,9 @@ export class Engine extends EventEmitter {
     // app.fetch answer empty there.
     // A visitor's call (a published app's public) stays one all the way
     // down: its writes are checked as theirs, its errors only recorded.
-    const inner = { depth, by: fn.id, user, test: !!ctx.test, visitor: !!ctx.visitor, pub: !!(ctx.pub || ctx.visitor) };
+    // A person's call (ctx.as) runs as them: its reads and writes are held
+    // to the tables' declared access, all the way down.
+    const inner = { depth, by: fn.id, user, test: !!ctx.test, visitor: !!ctx.visitor, pub: !!(ctx.pub || ctx.visitor), ...(ctx.as ? { as: ctx.as } : {}) };
     const services = () => {
       if (!this.services) throw new Error('this engine runs without services (people, files, email, places)');
       return this.services;
@@ -323,7 +401,7 @@ export class Engine extends EventEmitter {
     if (batch || ctx.batch) inner.batch = batch || ctx.batch;
     const host = async (method, args) => {
       switch (method) {
-        case 'sql': return this.sql(appId, args[0], args[1]);
+        case 'sql': return this.sql(appId, args[0], args[1], inner);
         case 'insert': return batch ? batch.insert(args[0], args[1]) : this.insert(appId, args[0], args[1], inner);
         case 'update': return batch ? batch.update(args[0], args[1], args[2]) : this.update(appId, args[0], args[1], args[2], inner);
         case 'remove': return batch ? batch.remove(args[0], args[1]) : this.remove(appId, args[0], args[1], inner);
@@ -342,7 +420,7 @@ export class Engine extends EventEmitter {
       // A rule runs here, in the engine; JavaScript runs in the sandbox.
       // A call answers {result, logs, ms}, from a rule as from JavaScript.
       const started = Date.now();
-      const rule = async () => ({ result: await runRule(JSON.parse(fn.code), { user: user ? { id: user.id, name: user.name, email: user.email } : null, ...(input || {}) }, host), logs: [], ms: Date.now() - started });
+      const rule = async () => ({ result: await runRule(JSON.parse(fn.code), { user: user ? { id: user.id, name: personName(user), email: user.email } : null, ...(input || {}) }, host), logs: [], ms: Date.now() - started });
       let out;
       if (batch && !ctx.batch) out = await this.exclusive(appId, async () => { const r = await rule(); await batch.commit(); return r; });
       else if (fn.spec.rule) out = await rule();
@@ -388,6 +466,7 @@ export class Engine extends EventEmitter {
     return {
       insert: async (table, fields) => {
         const spec = await this.tableSpec(appId, table);
+        fields = this.mayWrite(spec, 'add', fields, ctx);
         const doc = this.makeDoc(spec, fields);
         for (const k of Object.keys(doc)) if (doc[k] === null) delete doc[k];
         doc.id = fields?.id ? String(fields.id) : newId(10);
@@ -400,8 +479,10 @@ export class Engine extends EventEmitter {
         const spec = await this.tableSpec(appId, table);
         const old = await current(table, String(id));
         if (!old) throw new Error(`no row ${id} in ${table}`);
+        this.mayChange(spec, 'change', old, ctx);
         const changes = this.makeDoc(spec, fields, { partial: true });
         const doc = { ...old, ...changes, id: old.id };
+        this.mayChange(spec, 'change', doc, ctx, { moved: true });
         for (const k of Object.keys(doc)) if (doc[k] === null) delete doc[k];
         ops.push({ op: 'upsert', table: physical(appId, table), doc });
         rows.set(key(table, doc.id), doc);
@@ -409,8 +490,9 @@ export class Engine extends EventEmitter {
         return doc;
       },
       remove: async (table, id) => {
-        await this.tableSpec(appId, table);
+        const spec = await this.tableSpec(appId, table);
         const old = await current(table, String(id));
+        this.mayChange(spec, 'remove', old, ctx);
         ops.push({ op: 'delete', table: physical(appId, table), key: String(id) });
         rows.set(key(table, String(id)), null);
         if (old) events.push([table, 'delete', old]);
@@ -482,7 +564,12 @@ export class Engine extends EventEmitter {
 
   // An error a view's frame reports (POST /api/apps/<id>/error). From code
   // the app no longer runs it is stale; from a visitor it is only recorded.
+  // One that says a call was not answered (the network, the engine or
+  // the server restarting: unanswered()) is no fault of the code: it is
+  // neither recorded nor repaired. A browser of an older runtime still
+  // sends them.
   async browserError(appId, capId, message, { visitor = false } = {}) {
+    if (unanswered(message)) return { stale: false, sent: false, transient: true };
     const live = await this.store.resolve(appId).catch(() => null);
     if (!live?.comp.caps.includes(capId)) return { stale: true };
     this.reportError(appId, capId, String(message || '').slice(0, 1500), 'in the browser', { visitor });

@@ -148,3 +148,39 @@ fn receipts_can_be_turned_off() {
     assert!(!store.path().join("receipts.strata").exists());
     assert!(call(&d, json!({"op": "receipts"})).get("error").is_some());
 }
+
+/// CTX-6: a record a search listed before an edit (a `listed` row, not one
+/// shown in full) and still in the store is not called "deleted since".
+#[test]
+fn blame_does_not_call_listed_records_deleted() {
+    let store = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let project = proj.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    std::fs::create_dir_all(proj.path().join("src")).unwrap();
+    std::fs::write(proj.path().join("src/tax.rs"), "fn tax() {\n    round_half_even(x)\n}\n").unwrap();
+    std::fs::write(store.path().join("config.json"), r#"{"embedder": "hash:64", "sync": false, "distill": {"enabled": false}}"#).unwrap();
+    let d = Arc::new(Daemon::open(store.path(), &project).unwrap());
+    hook(&d, "SessionStart", json!({"session_id": "s1", "source": "startup"}));
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s1", "prompt": "How do we round tax amounts?"}));
+    for t in ["Tax amounts round half to even at the last step.", "The tax test suite runs with cargo test tax.", "Tax rounding is checked against the VAT tables."] {
+        ok(call(&d, json!({"op": "remember", "kind": "note", "text": t})));
+    }
+    hook(&d, "Stop", json!({"session_id": "s1", "last_assistant_message": "Tax rounds half to even."}));
+
+    hook(&d, "SessionStart", json!({"session_id": "s2", "source": "startup"}));
+    hook(&d, "UserPromptSubmit", json!({"session_id": "s2", "prompt": "Change the tax rounding"}));
+    // A search lists records (the `listed` rows of its receipt).
+    let s = ok(call(&d, json!({"op": "search", "query": "tax rounding", "include_current": true})));
+    let listed: Vec<String> = s["ids"].as_array().unwrap().iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    assert!(!listed.is_empty(), "{s}");
+    hook(&d, "PostToolUse", json!({"session_id": "s2", "tool_name": "Edit",
+        "tool_input": {"file_path": format!("{project}/src/tax.rs"), "old_string": "round_half_even(x)", "new_string": "round_half_up(x)"}, "tool_response": {}}));
+    std::fs::write(proj.path().join("src/tax.rs"), "fn tax() {\n    round_half_up(x)\n}\n").unwrap();
+    hook(&d, "Stop", json!({"session_id": "s2", "last_assistant_message": "Changed."}));
+
+    let b = ok(call(&d, json!({"op": "blame", "target": "src/tax.rs:2"})));
+    let text = b["text"].as_str().unwrap();
+    assert_eq!(b["edit"]["session"], json!("s2"), "{text}");
+    assert!(listed.iter().any(|id| text.contains(id.as_str())), "the search's rows are not in the blame: {text}");
+    assert!(!text.contains("deleted since"), "records that exist are called deleted: {text}");
+}

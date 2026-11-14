@@ -40,7 +40,7 @@ const APP_ID = /^[a-z0-9]{1,32}$/;
 // their descriptions: only the engine's own tables are taken.)
 export function appGrants(id, reads = functionReadTables()) {
   const out = { [`app_${id}_*`]: 'write' };
-  for (const t of reads) if (/^sa_[a-z0-9_]+$/.test(t) && !['sa_people', 'sa_sessions', 'sa_settings', 'sa_members'].includes(t)) out[t] = 'read';
+  for (const t of reads) if (/^sa_[a-z0-9_]+$/.test(t) && !['sa_people', 'sa_sessions', 'sa_settings', 'sa_members', 'sa_companies', 'sa_memberships'].includes(t)) out[t] = 'read';
   return out;
 }
 

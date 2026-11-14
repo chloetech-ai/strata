@@ -75,7 +75,8 @@ export function grid(j, { max = 1000, onRow } = {}) {
   const thead = h("thead"), tbody = h("tbody");
   const tbl = h("table", { class: "t rgrid" }, thead, tbody);
   const more = h("div", { class: "row", style: { padding: "8px 10px" } });
-  const wrap = h("div", { class: "grid-wrap" }, tbl, more);
+  // What the server says of a ranked answer's scores (score() is 0 without a ranking).
+  const wrap = h("div", { class: "grid-wrap" }, j.hint && (j.rows || []).length ? h("div", { class: "notice small", style: { margin: "8px 10px" } }, j.hint) : null, tbl, more);
   const maxScore = Math.max(1e-12, ...(j.scores || []).filter(isNum).map(Math.abs));
 
   function head() {
@@ -114,7 +115,7 @@ export function grid(j, { max = 1000, onRow } = {}) {
       return tr;
     }));
     clear(more, shown < order.length ? [h("span", { class: "small muted" }, `${fmt.n(shown)} of ${fmt.n(order.length)} rows shown`), h("button", { class: "btn sm", onclick: () => { shown = Math.min(order.length, shown + 500, max); body(); } }, "Show more")] : null);
-    if (!order.length) clear(tbody, h("tr", {}, h("td", { colspan: cols.length + 2 }, empty("table", "No rows", "The query ran and matched nothing."))));
+    if (!order.length) clear(tbody, h("tr", {}, h("td", { colspan: cols.length + 2 }, empty("table", "No rows", j.hint || "The query ran and matched nothing."))));
   }
   head(); body();
   return wrap;
@@ -295,7 +296,8 @@ export function answerStats(j) {
   return h("div", { class: "row small", style: { gap: "14px" } },
     j.written != null ? h("span", {}, h("b", {}, fmt.n(j.written)), " written") : h("span", {}, h("b", {}, fmt.plural(j.rows?.length ?? j.rows ?? 0, "row"))),
     h("span", {}, h("b", {}, fmt.ms(j.took_ms)), " on the server"),
-    st.filter_docs != null ? h("span", { title: "rows the WHERE clause kept, before ranking" }, h("b", {}, fmt.n(st.filter_docs)), " passed the filter") : null,
+    // A ranking with no WHERE (meaning, fused) reports 0 kept: not said.
+    st.filter_docs != null && !(st.filter_docs === 0 && (j.rows?.length ?? j.rows)) ? h("span", { title: "rows the WHERE clause kept, before ranking" }, h("b", {}, fmt.n(st.filter_docs)), " passed the filter") : null,
     st.scored ? h("span", { title: "rows the ranking scored" }, h("b", {}, fmt.n(st.scored)), " scored") : null,
     st.reranked ? h("span", {}, h("b", {}, fmt.n(st.reranked)), " reranked") : null,
     j.partial ? h("span", { class: "pill warn" }, icon("warn"), `missing shards ${j.partial.missing_shards.join(", ")}`) : null);

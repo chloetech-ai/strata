@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ChloeDB: design · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="ChloeDB is to search what SQLite is to relational data: a library that keeps a whole database in one file, needs no server or configuration, gives ACID transactions, and is queried with SQL. Every table is indexed…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/index.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -81,7 +84,7 @@
       <span class="eyebrow">Search and SQL</span>
       <h1>ChloeDB: design</h1>
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloedb/index.md">docs/chloedb/index.md</a>.</p>
-      <p class="doc-version">These docs describe release 0.3.2.</p>
+      <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#goals">Goals</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#storage-engine">Storage engine</a></li><li><a href="#segments">Segments</a></li><li><a href="#index-families">Index families</a></li><li><a href="#planning-and-execution">Planning and execution</a></li><li><a href="#where-it-fits">Where it fits</a></li><li><a href="#code-layout">Code layout</a></li></ol></details>
     <div class="doc-body">
@@ -99,7 +102,7 @@
 </ul>
 <p>One process writes a database at a time; other processes can <a href="#readers-in-other-processes">read it while it is written</a>. Joins across tables, and sharding and replication in <a href="server.html">chloedb-server</a>, came later; <a href="#where-it-fits">current limits</a> has where they stand.</p>
 <h2 id="architecture">Architecture<a class="anchor" href="#architecture" aria-label="Link to this section">#</a></h2>
-<p><img alt="ChloeDB's layers: SQL is parsed and bound, a per-segment planner chooses operators, and operators read immutable segments in one file plus a WAL" src="../../assets/img/strata-layers.png" /></p>
+<p><img loading="lazy" decoding="async" alt="ChloeDB's layers: SQL is parsed and bound, a per-segment planner chooses operators, and operators read immutable segments in one file plus a WAL" src="../../assets/img/strata-layers.png" /></p>
 <p>A statement goes through four stages. The binder turns SQL into a predicate tree and a scorer; the planner picks, per segment and from exact statistics, how to evaluate each part; operators run against zero-copy views of the segment's sections; per-segment results are merged.</p>
 <pre class="mermaid">flowchart LR
     SQL[&quot;SQL text&quot;] --&gt; B[&quot;parser + binder&lt;br/&gt;(sqlparser, MATCH grammar)&quot;]
@@ -118,7 +121,7 @@
 <h3 id="immutable-segments-not-a-b-tree">Immutable segments, not a B-tree<a class="anchor" href="#immutable-segments-not-a-b-tree" aria-label="Link to this section">#</a></h3>
 <p>SQLite updates B-trees in place. Compressed posting lists, bit-packed columns and vector graphs do not survive that: inserting one docID into a compressed partition means re-encoding it, and the best encodings are chosen per whole list. SQLite's own FTS5 already stores its index as immutable segments merged in the background, as do Lucene, Tantivy and PISA. ChloeDB uses that log-structured design for the whole table: every index lives in immutable segments, writes go to a WAL and an in-memory memtable, and segments are merged in the background.</p>
 <h3 id="one-file">One file<a class="anchor" href="#one-file" aria-label="Link to this section">#</a></h3>
-<p><img alt="One file plus a WAL: two meta slots name the current manifest; a commit writes new extents, syncs, then flips to the other slot" src="../../assets/img/strata-file.png" /></p>
+<p><img loading="lazy" decoding="async" alt="One file plus a WAL: two meta slots name the current manifest; a commit writes new extents, syncs, then flips to the other slot" src="../../assets/img/strata-file.png" /></p>
 <p>Pages are 4 KiB. Pages 0 and 1 are two meta slots (magic, format version, transaction id, manifest and freelist locations, page count, CRC32); the rest are extents, runs of pages holding segment data, manifests, delete sets and freelists. Segments are written once, never modified, and freed only when no snapshot references them.</p>
 <p><strong>Backups.</strong> While a database is open, its rows since the last flush are in the <code>-wal</code> sidecar only, so a copy of the file alone misses them, and copying both while it is written is not consistent either. The safe ways: <code>Database::checkpoint(dest)</code> (Python <code>db.checkpoint(dest)</code>, chloedb-server <code>POST /v1/admin/checkpoint</code>) writes a consistent copy while the database is in use, checking every segment against its checksum first, so that damage is never copied into a backup under a fresh checksum, and checking the copy before naming it; and a clean close (<code>Db::close</code>, <code>close()</code> in the bindings) flushes the rows in memory into the file and leaves the log empty, so the file alone is then a complete copy, as <code>Database::flush</code> makes it at any moment until the next write.</p>
 <p>The file is read through one <code>mmap</code>. Sections read at random positions (the HNSW graph and its codes, float32 vectors for re-ranking, dictionaries, the doc store, the key index) are advised <code>MADV_RANDOM</code>, so a cold page fault reads one page instead of the kernel's read-around of up to 32. Sections read a run at a time (postings, document lengths, columns, IVF clusters) keep read-ahead. Readers open lazily per field, so a query touches only the headers of the fields it uses.</p>
@@ -166,7 +169,7 @@
 <h2 id="segments">Segments<a class="anchor" href="#segments" aria-label="Link to this section">#</a></h2>
 <p>A segment is <em>n</em> documents with local docIDs <code>0..n</code>, stored as a header and a directory of named sections (<code>text.body.terms</code>, <code>text.body.post</code>, <code>col.year</code>, <code>vec.emb.ivf</code>, …), each with its offset, length and CRC32. Sections are 64-byte aligned, and those over a page are page-aligned, so any <code>&amp;[u64]</code> view of a section is aligned and an index can be used straight from the mapped file. Each index component has a builder (documents in docID order to section bytes) and a reader (sections to a zero-copy view). A build of 1,024 documents or more runs on several threads (build option <code>build.threads</code>, by default the cores, at most 8): the fields build at once, longest first; a TEXT field's documents are analysed in runs, one per thread, and its posting lists are then encoded in ranges of terms, one per thread. The image is the same bytes as a build on one thread, and as a build that takes the documents in batches (<code>SegmentBuild</code>, which merges use). On TREC-COVID (171,332 documents, 192 MB of text), a text segment builds in 2.9 to 3.2 s on four threads and 9.0 to 9.7 s on one (two runs each on the cloud container's 4-core Xeon). An HNSW graph uses threads of its own (<code>vector.threads</code>, default 1; chloedb-server sets the cores), whose inserts race, so its links vary slightly from build to build. Operators run per segment and their results are merged; collection-wide statistics keep BM25 scores comparable across segments. A ranked text query (<code>bm25</code>, and the rank-safe boosts of it) searches the largest segments first, and each segment it searches after others starts at the <code>k</code>-th best score they found, skipping from the start what cannot reach it, as Lucene shares its minimum competitive score between segments; the rows and scores are those of one segment holding them all. On the first 5,000,000 MS MARCO passages in three segments, one query per thread as a loaded server runs them, that took <code>bm25</code> from 496 to 727 queries a second at one client and from 1,904 to 2,789 at four, a filtered <code>bm25</code> from 230 to 294 and a boost by year from 101 to 134 (medians of two rounds of three passes, the benchmark harness's queries in shard mode, on the cloud container's 4-core Xeon).</p>
 <h2 id="index-families">Index families<a class="anchor" href="#index-families" aria-label="Link to this section">#</a></h2>
-<p><img alt="One row, three index families, all built once per segment from documents in docID order and read in place" src="../../assets/img/strata-row-indexes.png" /></p>
+<p><img loading="lazy" decoding="async" alt="One row, three index families, all built once per segment from documents in docID order and read in place" src="../../assets/img/strata-row-indexes.png" /></p>
 <h3 id="full-text">Full text<a class="anchor" href="#full-text" aria-label="Link to this section">#</a></h3>
 <ul>
 <li><strong>Analyzer.</strong> Unicode word split, lowercase, ASCII folding, an English stopword list and a light English stemmer (words longer than 64 bytes are kept whole: the stemmer takes time in the square of a word's length): <code>english</code>, every TEXT field's unless its schema names another: <code>simple</code> keeps every word as written (for names and codes). A field's queries use its analyzer, and the schema records it by name and version, so a version of ChloeDB whose analysis differs refuses the field instead of misreading it.</li>
@@ -236,7 +239,7 @@ $$</p>
 </tr>
 </tbody>
 </table></div>
-<p><img alt="A filtered hybrid query: each input retrieves its top 100 under the same filter, and the union is re-scored exactly and fused" src="../../assets/img/strata-hybrid-plan.png" /></p>
+<p><img loading="lazy" decoding="async" alt="A filtered hybrid query: each input retrieves its top 100 under the same filter, and the union is re-scored exactly and fused" src="../../assets/img/strata-hybrid-plan.png" /></p>
 <h3 id="filtered-vector-search">Filtered vector search<a class="anchor" href="#filtered-vector-search" aria-label="Link to this section">#</a></h3>
 <p>For a filter of estimated selectivity <em>s</em> over <em>n</em> rows and a top-<em>k</em> query, the strategies cost, in distance computations or their equivalent:</p>
 <p>$$
@@ -318,7 +321,7 @@ $$</p>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

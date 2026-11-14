@@ -1,6 +1,6 @@
 [package]
 name = "chloedb-crawl"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "A crawler on Strata: pages fetched, their fields extracted, a table's schema inferred from them, and the table fed and grown into shards"

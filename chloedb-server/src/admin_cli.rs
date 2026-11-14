@@ -128,8 +128,21 @@ pub async fn send(t: &Target, c: &Call) -> Result<(u16, Json), String> {
     let res = r.send().await.map_err(|e| format!("{url} cannot be reached: {e}"))?;
     let status = res.status().as_u16();
     let text = res.text().await.map_err(|e| format!("{url}: {e}"))?;
-    let j = serde_json::from_str(&text).unwrap_or_else(|_| json!({"text": text}));
-    Ok((status, j))
+    Ok((status, answer_of(status, &text)))
+}
+
+/// The answer to print: the body when it is JSON; else the HTTP status and
+/// the text, with an `error` naming the status when it is one (a 404 has an
+/// empty body, which alone said nothing).
+pub fn answer_of(status: u16, text: &str) -> Json {
+    serde_json::from_str(text).unwrap_or_else(|_| {
+        let mut j = json!({"status": status, "text": text});
+        if status >= 400 {
+            let reason = reqwest::StatusCode::from_u16(status).ok().and_then(|s| s.canonical_reason()).unwrap_or("error");
+            j["error"] = json!(format!("HTTP {status} {reason}"));
+        }
+        j
+    })
 }
 
 #[cfg(test)]
@@ -145,6 +158,14 @@ mod tests {
         assert_eq!(exit_code(503, &json!({"error_code": "unavailable", "retryable": true})), 4);
         assert_eq!(exit_code(429, &json!({"error": "too many queries running"})), 4);
         assert_eq!(exit_code(400, &json!({"error_code": "query_invalid"})), 1);
+    }
+
+    #[test]
+    fn an_answer_that_is_not_json_says_its_status() {
+        assert_eq!(answer_of(200, r#"{"ok": true}"#), json!({"ok": true}));
+        assert_eq!(answer_of(404, ""), json!({"status": 404, "text": "", "error": "HTTP 404 Not Found"}));
+        assert_eq!(exit_code(404, &answer_of(404, "")), 1);
+        assert_eq!(answer_of(200, "plain"), json!({"status": 200, "text": "plain"}));
     }
 
     #[test]

@@ -163,8 +163,12 @@ fn a_rollup_keeps_buckets_its_table_no_longer_has() {
     // Rows past the retention go; the buckets they began to leave stay as
     // the rollup folded them, and the newer ones still follow the table.
     let frozen = |g: &Groups| -> Groups { g.iter().filter(|(k, _)| k.0 < now - 55 * MIN).map(|(k, v)| (k.clone(), *v)).collect() };
+    let lines = |db: &Db| int(&rows(db, "SELECT COUNT(*) FROM logs")[0][0]);
+    let kept = lines(&db);
     db.optimize().unwrap();
-    assert!(frozen(&fresh(&db)) != frozen(&before), "the retention dropped rows");
+    // Asked of the table's rows, not of the groups the rollup froze: under
+    // load the clock moves on between the fold and the merge.
+    assert!(lines(&db) < kept, "the retention dropped rows");
     write(&db, &mut rng, 100, now - 20 * MIN, now);
     refresh(&db, true);
     let after = rolled(&db);
@@ -208,4 +212,25 @@ fn rollups_say_what_is_wrong() {
     db.sql("CREATE ROLLUP IF NOT EXISTS r ON logs AS SELECT date_bin('1 minute', ts), COUNT(*)", &Params::new()).unwrap();
     // An empty table: nothing to fold.
     assert_eq!(db.refresh_rollup("r", true).unwrap().folded, 0);
+}
+
+/// A rollup made before 0.3.3 keys its rows by text and keeps a copy of
+/// each: it is refreshed as it was made.
+#[test]
+fn a_rollup_made_with_text_keys_is_kept_as_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::create(&dir.path().join("r.strata"), logs(""), DbOptions::default()).unwrap();
+    let mut rng = Lcg(5);
+    let t0 = 1_700_000_000_000_000 / (5 * MIN) * (5 * MIN);
+    write(&db, &mut rng, 800, t0, t0 + 60 * MIN);
+    db.sql("CREATE TABLE logs_5m (rollup_key KEYWORD PRIMARY KEY, bucket TIMESTAMP, service KEYWORD, count INT, sum_latency INT, worst INT) OPTIONS(cluster_by = 'bucket')", &Params::new()).unwrap();
+    let statement = CREATE.split_whitespace().collect::<Vec<_>>().join(" ");
+    db.sql(&format!("CREATE OR REPLACE FUNCTION rollup__logs_5m() RETURNS TEXT AS '{}'", statement.replace('\'', "''")), &Params::new()).unwrap();
+    refresh(&db, true);
+    assert_eq!(rolled(&db), fresh(&db));
+    let keys = rows(&db, "SELECT rollup_key FROM logs_5m LIMIT 1");
+    assert!(matches!(keys[0][0], Value::Str(_)), "{keys:?}");
+    write(&db, &mut rng, 100, t0 + 50 * MIN, t0 + 70 * MIN);
+    refresh(&db, true);
+    assert_eq!(rolled(&db), fresh(&db));
 }

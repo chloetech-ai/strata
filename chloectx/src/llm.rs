@@ -81,11 +81,79 @@ pub fn scratch_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where Claude Code's hooks found the CLI on their own PATH, last: a
+/// daemon started by a process without it on PATH (a shell, an editor's
+/// MCP server) still finds it (CTX-3).
+static HOOK_CLI: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Remembers where a hook found the CLI ([`resolve_cli`] tries it after
+/// `CHLOECTX_CLAUDE`).
+pub fn set_hook_cli(path: &std::path::Path) {
+    if path.is_absolute() && is_executable(path) {
+        *HOOK_CLI.lock().unwrap() = Some(path.to_path_buf());
+    }
+}
+
+fn is_executable(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// `name` on this process's PATH.
+pub fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| is_executable(p))
+}
+
+/// Where the CLI is usually installed, for a process whose PATH lacks it.
+fn usual_places(name: &str) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) {
+        for d in [".local/bin", ".claude/local", ".npm-global/bin", ".bun/bin", ".volta/bin", "bin"] {
+            v.push(h.join(d).join(name));
+        }
+    }
+    for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        v.push(PathBuf::from(d).join(name));
+    }
+    v
+}
+
+/// The program to run for `command`: a path as it is; for a bare name,
+/// `CHLOECTX_CLAUDE` (for `claude`), where the hooks found it, this
+/// process's PATH, then the usual install places. The daemon inherits the
+/// environment of whichever process started it, so its PATH alone is not
+/// enough (CTX-3).
+pub fn resolve_cli(command: &str) -> std::result::Result<PathBuf, String> {
+    if command.contains('/') {
+        return Ok(PathBuf::from(command));
+    }
+    if command == "claude" {
+        if let Some(p) = std::env::var_os("CHLOECTX_CLAUDE").filter(|p| !p.is_empty()).map(PathBuf::from) {
+            return if is_executable(&p) { Ok(p) } else { Err(format!("CHLOECTX_CLAUDE is {}, which is not an executable file", p.display())) };
+        }
+    }
+    let hint = HOOK_CLI.lock().unwrap().clone().filter(|p| p.file_name().is_some_and(|n| n == command) && is_executable(p));
+    if let Some(p) = hint.or_else(|| on_path(command)).or_else(|| usual_places(command).into_iter().find(|p| is_executable(p))) {
+        return Ok(p);
+    }
+    Err(format!(
+        "`{command}` was not found on this process's PATH nor in the usual places (~/.local/bin, ~/.claude/local, ~/.npm-global/bin, ~/.bun/bin, ~/.volta/bin, ~/bin, /opt/homebrew/bin, /usr/local/bin, /usr/bin); set CHLOECTX_CLAUDE to its path, or restart the daemon (`chloectx stop`) so that the next Claude Code hook starts it"
+    ))
+}
+
 /// Runs the model once on `prompt` with `system` as its system prompt.
 pub fn complete(cli: &Cli, system: &str, prompt: &str) -> Result<Reply> {
     let t0 = Instant::now();
     let scratch = scratch_dir()?;
-    let mut cmd = Command::new(cli.command);
+    let exe = resolve_cli(cli.command).map_err(err)?;
+    let mut cmd = Command::new(&exe);
     cmd.args(["-p", "--system-prompt", system, "--tools", "", "--no-session-persistence", "--output-format", "json"]);
     if cli.isolated {
         cmd.args(["--setting-sources", "project", "--strict-mcp-config"]);
@@ -108,7 +176,7 @@ pub fn complete(cli: &Cli, system: &str, prompt: &str) -> Result<Reply> {
         .env("DISABLE_PROMPT_CACHING", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| err(format!("{}: {e}", cli.command)))?;
     // The prompt is written, and the answer read, on threads of their own
@@ -125,10 +193,24 @@ pub fn complete(cli: &Cli, system: &str, prompt: &str) -> Result<Reply> {
         let mut buf = Vec::new();
         stdout.read_to_end(&mut buf).map(|_| buf)
     });
+    // Its stderr, read the same way: what the CLI says when it fails
+    // (an unknown flag, a crash, a proxy error) is the cause (CTX-2).
+    let mut stderr = child.stderr.take().unwrap();
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_tail = |r: std::thread::JoinHandle<Vec<u8>>| -> String {
+        if !r.is_finished() {
+            return String::new();
+        }
+        tail_text(&r.join().unwrap_or_default(), STDERR_KEPT)
+    };
     let deadline = Instant::now() + cli.timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
         }
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -136,7 +218,7 @@ pub fn complete(cli: &Cli, system: &str, prompt: &str) -> Result<Reply> {
             return Err(err("model call timed out"));
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
     let _ = writer.join();
     // The child has exited; its stdout closes unless a process it started
     // still holds it, which the deadline bounds as well.
@@ -147,7 +229,18 @@ pub fn complete(cli: &Cli, system: &str, prompt: &str) -> Result<Reply> {
         return Err(err("model call timed out"));
     }
     let stdout = reader.join().map_err(|_| err("model output: the reader failed"))??;
-    let v: Json = serde_json::from_slice(&stdout).map_err(|e| err(format!("model output: {e}")))?;
+    while !err_reader.is_finished() && Instant::now() <= deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let v: Json = match serde_json::from_slice(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            let said = stderr_tail(err_reader);
+            let out = tail_text(&stdout, 300);
+            let what = if !said.is_empty() { said } else if !out.is_empty() { format!("stdout: {out}") } else { format!("no output ({e})") };
+            return Err(err(format!("{} exited with {}: {what}", cli.command, exit_text(&status))));
+        }
+    };
     if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
         return Err(err(format!("model call failed: {}", v.get("result").and_then(|r| r.as_str()).unwrap_or(""))));
     }
@@ -157,6 +250,39 @@ pub fn complete(cli: &Cli, system: &str, prompt: &str) -> Result<Reply> {
         usage: v.get("usage").map(Usage::of).unwrap_or_default(),
         ms: t0.elapsed().as_millis() as u64,
     })
+}
+
+/// How much of the CLI's stderr a failed call keeps in its error.
+const STDERR_KEPT: usize = 1500;
+
+/// The last `max` bytes of `bytes` as text, at a character boundary, its
+/// lines joined, prefixed with `…` when cut.
+fn tail_text(bytes: &[u8], max: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let s = s.trim();
+    let one: String = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" | ");
+    if one.len() <= max {
+        return one;
+    }
+    let mut i = one.len() - max;
+    while !one.is_char_boundary(i) {
+        i += 1;
+    }
+    format!("…{}", &one[i..])
+}
+
+fn exit_text(st: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = st.signal() {
+            return format!("signal {sig}");
+        }
+    }
+    match st.code() {
+        Some(c) => format!("status {c}"),
+        None => "an unknown status".into(),
+    }
 }
 
 /// Runs the model once through Anthropic's Messages API with `key`

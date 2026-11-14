@@ -105,14 +105,51 @@ pub fn survey(home: &Path) -> Vec<Entry> {
         .collect()
 }
 
+/// A store whose project folder is missing is not offered to `prune` for
+/// this long after its last use: the folder may have been moved or renamed
+/// (`chloectx move` attaches the store to its new place), or be on a drive
+/// that is not mounted (CTX-11).
+pub const MISSING_GRACE: i64 = 7 * 86_400;
+
+/// Whether `p` is on a removable or network drive whose mount point is not
+/// there now (`/Volumes/X`, `/media/user/X`, `/run/media/user/X`, `/mnt/X`):
+/// its folder is not gone, only out of reach.
+pub fn on_unmounted_drive(p: &str) -> bool {
+    let parts: Vec<&str> = p.split('/').filter(|c| !c.is_empty()).collect();
+    let depth = match parts.as_slice() {
+        ["Volumes", ..] | ["mnt", ..] => 2,
+        ["media", ..] => 3,
+        ["run", "media", ..] => 4,
+        _ => return false,
+    };
+    parts.len() > depth - 1 && !Path::new(&format!("/{}", parts[..depth.min(parts.len())].join("/"))).is_dir()
+}
+
+/// What is known of a store's project folder, for a person.
+pub fn project_state(e: &Entry, now: i64) -> Option<&'static str> {
+    let p = e.info.project.as_deref()?;
+    if Path::new(p).is_dir() {
+        None
+    } else if on_unmounted_drive(p) {
+        Some("drive not mounted")
+    } else if now - e.info.modified < MISSING_GRACE {
+        Some("project folder missing: moved?")
+    } else {
+        None
+    }
+}
+
 /// Why `e` may be pruned, if it may: `older_than` (seconds) adds every
-/// store not used for that long. A running store never is.
+/// store not used for that long. A running store never is, nor one whose
+/// folder is on a drive that is not mounted, or went missing in the last
+/// week (it may have moved).
 pub fn reason(e: &Entry, now: i64, older_than: Option<i64>) -> Option<Reason> {
     if e.running {
         return None;
     }
     let idle = now - e.info.modified;
     match e.info.project.as_deref() {
+        Some(p) if !Path::new(p).is_dir() && (on_unmounted_drive(p) || idle < MISSING_GRACE) => return None,
         Some(p) if !Path::new(p).is_dir() => return Some(Reason::Gone),
         Some(p) if is_temporary(p) && idle >= 86_400 => return Some(Reason::Temporary),
         None if idle >= 30 * 86_400 => return Some(Reason::Unknown),
@@ -141,9 +178,15 @@ fn line(e: &Entry, now: i64, why: Option<Reason>) -> String {
     }
     if let Some(r) = why {
         s += &format!("  [{}]", r.as_str());
+    } else if let Some(st) = project_state(e, now) {
+        s += &format!("  [{st}]");
     }
     s
 }
+
+/// The hint under a listing that shows a store whose folder is missing or
+/// gone.
+const MOVED_HINT: &str = "If a project folder was moved or renamed, `chloectx move OLD NEW` attaches its store to the new folder.";
 
 /// `chloectx stores`: one line per store, and what `prune` would remove.
 pub fn list(home: &Path, as_json: bool) -> i32 {
@@ -173,6 +216,7 @@ pub fn list(home: &Path, as_json: bool) -> i32 {
     }
     let total: u64 = all.iter().map(|e| e.bytes).sum();
     let gone: Vec<&Entry> = all.iter().filter(|e| reason(e, now, None).is_some()).collect();
+    let missing = all.iter().any(|e| e.info.project.as_deref().is_some_and(|p| !Path::new(p).is_dir()));
     println!("\n{} store{}, {} in {}.", all.len(), if all.len() == 1 { "" } else { "s" }, human(total), home.display());
     if !gone.is_empty() {
         let (n, b) = (gone.len(), human(gone.iter().map(|e| e.bytes).sum()));
@@ -180,6 +224,9 @@ pub fn list(home: &Path, as_json: bool) -> i32 {
             1 => println!("1 of them ({b}) belongs to a folder that is gone, temporary or unknown: `chloectx prune` removes it."),
             _ => println!("{n} of them ({b}) belong to folders that are gone, temporary or unknown: `chloectx prune` removes them."),
         }
+    }
+    if missing {
+        println!("{MOVED_HINT}");
     }
     0
 }
@@ -215,11 +262,23 @@ pub fn prune(home: &Path, o: &PruneOptions) -> i32 {
     let all = survey(home);
     let picked: Vec<(&Entry, Reason)> = all.iter().filter_map(|e| reason(e, now, older).map(|r| (e, r))).collect();
     if picked.is_empty() {
-        println!("Nothing to prune: all {} store{} in {} belong to project folders that exist.", all.len(), if all.len() == 1 { "" } else { "s" }, home.display());
+        let kept: Vec<&Entry> = all.iter().filter(|e| project_state(e, now).is_some()).collect();
+        if kept.is_empty() {
+            println!("Nothing to prune: all {} store{} in {} belong to project folders that exist.", all.len(), if all.len() == 1 { "" } else { "s" }, home.display());
+        } else {
+            println!("Nothing to prune now. Kept although their folder is missing (moved, or on a drive that is not mounted):");
+            for e in kept {
+                println!("{}", line(e, now, None));
+            }
+            println!("{MOVED_HINT}");
+        }
         return 0;
     }
     for (e, r) in &picked {
         println!("{}", line(e, now, Some(*r)));
+    }
+    if picked.iter().any(|(_, r)| *r == Reason::Gone) {
+        println!("\n{MOVED_HINT}");
     }
     let bytes: u64 = picked.iter().map(|(e, _)| e.bytes).sum();
     let what = format!("{} store{} ({})", picked.len(), if picked.len() == 1 { "" } else { "s" }, human(bytes));
@@ -253,6 +312,62 @@ pub fn prune(home: &Path, o: &PruneOptions) -> i32 {
     i32::from(failed > 0)
 }
 
+/// `chloectx move OLD NEW`: the store of the project that was at `old`
+/// becomes the store of `new` (a project moved or renamed, CTX-11). Its
+/// daemon is stopped first; `new` must exist and have no store of its own.
+pub fn relink(home: &Path, old: &Path, new: &Path) -> std::result::Result<String, String> {
+    let new = new.canonicalize().map_err(|e| format!("{}: {e}", new.display()))?;
+    if !new.is_dir() {
+        return Err(format!("{} is not a folder", new.display()));
+    }
+    let old_s = old.to_string_lossy().trim_end_matches('/').to_string();
+    let old_c = old.canonicalize().ok().map(|p| p.to_string_lossy().into_owned());
+    let all = list_stores(home);
+    let from = all
+        .iter()
+        .find(|s| s.project.as_deref().is_some_and(|p| p == old_s || Some(p) == old_c.as_deref()))
+        .or_else(|| all.iter().find(|s| s.dir.file_name().is_some_and(|n| n.to_string_lossy() == crate::paths::project_slug(old))))
+        .ok_or_else(|| format!("no store records the project {} (`chloectx stores` lists them)", old.display()))?;
+    let to = home.join("projects").join(crate::paths::project_slug(&new));
+    if to == from.dir {
+        return Err(format!("the store of {} is already that of {}", old.display(), new.display()));
+    }
+    if to.join("memory.strata").exists() {
+        return Err(format!(
+            "{} already has a store of its own ({}); a session ran there since the move. Remove it first (it is not merged), then run this again",
+            new.display(),
+            to.display()
+        ));
+    }
+    for d in [&from.dir, &to] {
+        let sock = crate::paths::StorePaths::new(d).socket;
+        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            let _ = crate::daemon::request_running(d, &json!({"op": "shutdown"}), Duration::from_secs(10));
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while std::os::unix::net::UnixStream::connect(&sock).is_ok() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    if to.exists() {
+        // Only what a client left there without a store (a lock, a log).
+        std::fs::remove_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+    }
+    let old_sock = crate::paths::StorePaths::new(&from.dir).socket;
+    std::fs::rename(&from.dir, &to).map_err(|e| format!("{} to {}: {e}", from.dir.display(), to.display()))?;
+    if !old_sock.starts_with(&from.dir) {
+        let _ = std::fs::remove_file(old_sock);
+    }
+    let _ = std::fs::remove_file(to.join("engram.sock"));
+    std::fs::write(to.join("project.txt"), format!("{}\n", new.display())).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "The memory of {} is now that of {} ({}). Records keep the paths they were written with.",
+        from.project.as_deref().unwrap_or(&old_s),
+        new.display(),
+        to.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,11 +394,14 @@ mod tests {
         let tmp_project = std::env::temp_dir().join(format!("chloectx-prune-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_project).unwrap();
         store(&home, "app-1", Some(live.to_str().unwrap()), 90);
-        store(&home, "gone-2", Some("/nowhere/at/all"), 0);
+        store(&home, "gone-2", Some("/nowhere/at/all"), 10);
         store(&home, "tmp-3", Some(tmp_project.to_str().unwrap()), 2);
         store(&home, "tmpnew-4", Some(tmp_project.to_str().unwrap()), 0);
         store(&home, "unknown-5", None, 40);
         store(&home, "unknownnew-6", None, 1);
+        store(&home, "moved-7", Some("/nowhere/moved"), 2);
+        store(&home, "moved-old-8", Some("/nowhere/moved/long/ago"), 30);
+        store(&home, "drive-9", Some("/Volumes/NoSuchDrive-chloectx/work/app"), 60);
         let now = crate::now();
         let all = survey(&home);
         let why = |id: &str, older: Option<i64>| reason(all.iter().find(|e| e.info.id == id).unwrap(), now, older);
@@ -294,15 +412,52 @@ mod tests {
         assert_eq!(why("unknown-5", None), Some(Reason::Unknown));
         assert_eq!(why("unknownnew-6", None), None);
         assert_eq!(why("app-1", Some(30 * 86_400)), Some(Reason::Idle));
+        assert_eq!(why("moved-7", None), None, "a folder missing for a few days may have moved");
+        assert_eq!(why("moved-old-8", None), Some(Reason::Gone));
+        assert_eq!(why("drive-9", None), None, "a drive that is not mounted");
 
         // A dry run changes nothing; --yes removes the four.
         assert_eq!(prune(&home, &PruneOptions { older_than_days: None, yes: false, dry_run: true }), 0);
-        assert_eq!(survey(&home).len(), 6);
+        assert_eq!(survey(&home).len(), 9);
         assert_eq!(prune(&home, &PruneOptions { older_than_days: None, yes: true, dry_run: false }), 0);
         let left: Vec<String> = survey(&home).into_iter().map(|e| e.info.id).collect();
-        assert_eq!(left.len(), 3, "{left:?}");
+        assert_eq!(left.len(), 5, "{left:?}");
         assert!(left.contains(&"app-1".to_string()) && left.contains(&"tmpnew-4".to_string()) && left.contains(&"unknownnew-6".to_string()));
         let _ = std::fs::remove_dir_all(&tmp_project);
+    }
+
+    /// CTX-11: a moved project gets its store back with `chloectx move`.
+    #[test]
+    fn a_moved_project_takes_its_store_along() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let old = t.path().join("old-name");
+        let new = t.path().join("new-name");
+        std::fs::create_dir_all(&new).unwrap();
+        let old_s = old.to_str().unwrap().to_string();
+        let slug = crate::paths::project_slug(&old);
+        store(&home, &slug, Some(&old_s), 0);
+        std::fs::write(home.join("projects").join(&slug).join("events.log"), "{}\n").unwrap();
+        let msg = relink(&home, &old, &new).unwrap();
+        assert!(msg.contains("new-name"), "{msg}");
+        let to = home.join("projects").join(crate::paths::project_slug(&new));
+        assert!(to.join("memory.strata").is_file() && to.join("events.log").is_file());
+        assert_eq!(std::fs::read_to_string(to.join("project.txt")).unwrap().trim(), new.canonicalize().unwrap().to_str().unwrap());
+        assert!(!home.join("projects").join(&slug).exists());
+        // Not again, and not over a store the new folder has.
+        assert!(relink(&home, &old, &new).is_err());
+        let other = t.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        store(&home, &crate::paths::project_slug(&other), Some(other.to_str().unwrap()), 0);
+        assert!(relink(&home, &new, &other).unwrap_err().contains("already has a store"));
+    }
+
+    #[test]
+    fn unmounted_drives() {
+        assert!(on_unmounted_drive("/Volumes/NoSuchDrive-chloectx/code/app"));
+        assert!(on_unmounted_drive("/media/me/NoSuchDrive-chloectx/app"));
+        assert!(!on_unmounted_drive("/home/me/app"));
+        assert!(!on_unmounted_drive("/Volumes"));
     }
 
     #[test]

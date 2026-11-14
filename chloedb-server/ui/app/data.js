@@ -8,7 +8,7 @@
 // longer or older windows read `/v1/timeseries?from=&to=` (per-minute points
 // from the server's `load` table). While paused nothing redraws.
 
-import { api, bus, every, store, provide, connection, fmt, span } from "./core.js";
+import { api, bus, every, store, provide, provideRoutes, roleOf, connection, fmt, span } from "./core.js";
 
 /** The ranges the picker offers: [key, minutes]. */
 export const RANGES = [["15m", 15], ["1h", 60], ["6h", 360], ["24h", 1440], ["7d", 10080]];
@@ -329,8 +329,15 @@ async function pollFleet() {
 export async function refreshSystem() {
   try { state.system = await api("/v1/system", T); bus.emit("system"); } catch { /* shown by the views */ }
 }
+let routesFor = null;
 export async function refreshWho() {
   try { state.whoami = await api("/v1/whoami", T); } catch { state.whoami = null; }
+  // A key for operations (ops, propose) acts by route: the catalog says
+  // which routes its role may call, read once a key.
+  const role = roleOf(state.whoami);
+  if (role && routesFor !== state.whoami.key) {
+    try { provideRoutes((await api("/v1/catalog", T)).routes); routesFor = state.whoami.key; } catch { provideRoutes(null); routesFor = null; }
+  }
   provide({ whoami: state.whoami });
   bus.emit("whoami");
 }

@@ -1,0 +1,63 @@
+name: Docs URLs
+
+# The downloads, images and packages the docs tell people to install exist
+# (scripts/check-doc-urls.py): the release archives and tarballs they pin,
+# the archives install.sh fetches for every program a page installs with
+# --with, the ghcr.io image tags, a Homebrew tap, and PyPI's chloedb at the
+# latest release docs/site/versions.json names. The guide's `# install`
+# blocks are shown, not run (docs/guide/run.py), so nothing else catches a
+# page that pins a version before its release exists: GitHub Pages
+# publishes main's docs/ at once.
+#
+# It runs on a push to main that changes the docs, after each release
+# workflow and the image's, every night (a failed scheduled run opens an
+# issue, nightly-report.yml), by hand, and on a pull request that changes
+# the check. It is not part of `CI result`: the version's pull request
+# moves the docs' pins before the release that publishes them, and a
+# release's own runs are what make this pass.
+on:
+  schedule:
+    - cron: "47 5 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "!docs/site/docs/v*/**"
+      - README.md
+      - "*/README.md"
+      - scripts/check-doc-urls.py
+      - .github/workflows/docs-urls.yml
+  pull_request:
+    paths:
+      - scripts/check-doc-urls.py
+      - .github/workflows/docs-urls.yml
+  workflow_run:
+    workflows: [chloedb-server release, chloedb-py release, chloedb-js release, Image]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-urls-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: what the docs install exists
+    # After a release workflow: only a tag's run published anything.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # main's docs: what Pages serves (a pull request's own, for its check).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: python3 scripts/check-doc-urls.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/check-doc-urls.py

@@ -7,7 +7,7 @@ A shop in one page: search, stock that never oversells, holds that expire, and c
 Download the server for your machine (no Rust or build needed), and start it on a new database:
 
 ```sh
-v=0.3.2 p=linux-x86_64   # or linux-aarch64, macos-arm64, macos-x86_64
+v=0.3.3 p=linux-x86_64   # or linux-aarch64, macos-arm64, macos-x86_64
 curl -LO https://github.com/chloetech-ai/chloedb/releases/download/chloedb-server-v$v/chloedb-server-$p.tar.gz
 tar xzf chloedb-server-$p.tar.gz && cp chloedb-server-$p/chloedb-server ./chloedb-server
 ./chloedb-server --db shop.chloedb --seq-no

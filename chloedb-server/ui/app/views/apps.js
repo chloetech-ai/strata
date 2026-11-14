@@ -27,10 +27,18 @@ let asked = null;
 /** The server's apps, asked once (again with `again`). */
 export function loadApps(again = false) {
   if (!asked || again) {
-    asked = core.api("/v1/apps", { timeout: 8000 }).then((j) => { apps = j.apps || []; appsError = null; bus.emit("apps"); return apps; }).catch((e) => { apps = apps || []; appsError = e; return apps; });
+    asked = core.api("/v1/apps", { timeout: 8000 }).then((j) => {
+      const was = JSON.stringify(apps);
+      apps = j.apps || []; appsError = null;
+      if (JSON.stringify(apps) !== was) bus.emit("apps");
+      return apps;
+    }).catch((e) => { apps = apps || []; appsError = e; return apps; });
   }
   return asked;
 }
+// The list is asked again every minute (the server keeps the manifests), so
+// the nav learns that an app went down or came back without a reload.
+core.every(60000, () => (apps ? loadApps(true) : null), false);
 export const listApps = () => apps || [];
 // Why the listing failed (a refusal is not "no apps").
 let appsError = null;
@@ -105,8 +113,12 @@ function render(page, route) {
     if (!a.view) { page.append(empty("box", `${a.title} has no view`, "Its manifest names none.")); return; }
     // An app that does not check a key limited to tables itself takes a key of every table.
     if (core.limited() && !a.checks_callers) { page.append(empty("lock", `This key can't open ${a.title}`, `${a.title} acts on the cluster with its own token and does not check a key limited to tables, so it takes a key of every table. This key is limited to ${core.grantsText(data.state.whoami?.tables)}.`)); return; }
+    // The view module can take a while: say so until it is there.
+    const waiting = empty("box", `Loading ${a.title}…`, "");
+    page.append(waiting);
     load(a).then((m) => {
       if (gone) return;
+      waiting.remove();
       const view = m.default || m;
       const ctx = {
         core, charts, data, app: a, route,
@@ -122,7 +134,13 @@ function render(page, route) {
       };
       const r = view.render(page, ctx);
       stop = typeof r === "function" ? r : r && typeof r.stop === "function" ? () => r.stop() : null;
-    }).catch((e) => { if (!gone) page.append(failure(e, `${a.title}'s view`)); });
+    }).catch((e) => {
+      if (gone) return;
+      waiting.remove();
+      // A failed load is not cached (load forgets it): asking again asks the list too, which says whether the app is up.
+      page.append(failure(e, `${a.title}'s view`),
+        h("div", { style: { marginTop: "12px" } }, h("button", { class: "btn sm", onclick: () => loadApps(true).then(draw) }, core.icon("refresh"), "Ask again")));
+    });
   };
   if (apps) draw(apps); else loadApps().then(draw);
   return () => { gone = true; for (const l of watching) removeEventListener("hashchange", l); try { stop?.(); } catch (e) { console.warn(e); } };
