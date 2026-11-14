@@ -566,7 +566,7 @@ function render(page, r) {
     const host = h("div");
     pane.append(host);
     try {
-      const c = inspector.render(host, { id: "inspector", rest: [], params: new URLSearchParams({ table: t.table }) });
+      const c = inspector.render(host, { id: "inspector", rest: [], params: new URLSearchParams({ table: t.table }), embedded: true });
       return typeof c === "function" ? c : null;
     } catch (e) { clear(host, failure(e, "The storage")); return null; }
   }
