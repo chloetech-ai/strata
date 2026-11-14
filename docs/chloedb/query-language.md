@@ -60,7 +60,7 @@ FROM <table> [JOIN <table> ON ...] | <WITH name> | (SELECT ...) AS t
 - **Strings** are single-quoted, `'sale'`. Where a value goes, a double-quoted `"sale"` is a string too, as SQLite and MySQL read it, and a bare name is an error rather than a string: `WHERE tag = sale` says `no such column: sale`.
 - **Clauses ChloeDB does not run are errors**, never ignored: `FETCH`, `FOR UPDATE`, `TOP`, `SELECT INTO`, `GROUP BY ... WITH ROLLUP` and the like. An error says where and why: the parser's give the line, the column and the token (`SQL syntax error at line 2, column 1 (near "FORM products"): ... found FORM (did you mean FROM?)`), and a misspelt column, table or function names the ones near it and what there is.
 - **Conditions the indexes cannot answer** test each row the others find: a function or arithmetic of a column (`lower(brand) = 'acme'`, `price * 2 > 100`, `CAST(price AS INT) = 5`), two columns compared (`price > rating`), `LIKE` with `%` or `_` inside the pattern, `ILIKE`, `IS NULL` of a field whose index does not keep it, a `CASE`, and a comparison of a `TEXT` field, by its stored text (`title LIKE '%tent%'`, `title = 'Tent 2'`). A field with a [substring index](#substrings-like-and-ilike-anywhere-in-a-value) answers `LIKE` and `ILIKE` itself. The other conditions of the `WHERE` still narrow the scan by their indexes, so `year = 2020 AND title LIKE '%tent%'` reads the rows of 2020 only, and a `WHERE` of such conditions alone reads every row of the table. A field that is not stored (a generated `TEXT` field, an embedded vector) has no value to test.
-- **`SELECT` of no table**, `SELECT 1 + 1` or `SELECT now()`, gives one row of its values.
+- **`SELECT` of no table**, `SELECT 1 + 1` or `SELECT now()`, gives one row of its values; its plan says it reads `one row of no table`. `SELECT *` of no table is an error, since there are no columns to give.
 - **`CAST(x AS type)`** (or `x::type`) makes an `INT` (rounded to the nearest whole number, as PostgreSQL rounds), a `FLOAT`, `TEXT`, and of a value a `BOOL` (`'true'`, `'yes'`, `1`) or a `TIMESTAMP` (`CAST('2026-11-02' AS TIMESTAMP)`); text that is not a number is an error.
 - **`SELECT *`** returns every stored, non-vector column.
 - **`score()`** is the value of the `ORDER BY` score for each row (over a `WITH` result read without an `ORDER BY`, the score the `WITH` ranked its rows by); **`hops()`** is a row's distance in a graph traversal ([below](#graphs)); **`seq_no()`** is the sequence number of the write that last changed the row, in a database that numbers its writes, for [conditional writes](server.md#conditional-writes). It is a column of a query on one table, and cannot be aggregated or ordered by. A [ranking expression](#features-the-values-a-ranking-read) that scores each row by itself is a column too (`bm25(title, :q) AS t`), and **`features()`** stands for the inputs of the query's ranking.
@@ -1518,7 +1518,7 @@ From Rust, `Db::query` takes a `SELECT` and a `Params` map, and `Db::sql` takes 
 
 ## Tables
 
-A database starts with the table it was created with, and `CREATE TABLE` adds more. An example, a table of orders:
+A database starts with the table it was created with, and `CREATE TABLE` adds more. `SHOW TABLES` lists their names, a row each (through `db.sql` or `POST /v1/sql`; a key limited to tables sees its own), and `GET /v1/tables` their columns too. An example, a table of orders:
 
 ```sql
 CREATE TABLE orders (id KEYWORD PRIMARY KEY, customer KEYWORD, status KEYWORD, total FLOAT, note TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
