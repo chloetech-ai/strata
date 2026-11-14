@@ -1000,10 +1000,6 @@ fn record(sup: &Supervisor, agent: &str, call: Call) {
         .set("use_id", opt_str(&call.use_id))
         .set("ts", ts(call.end_ms.min(now)))
         .set("seq", opt_int(seq));
-    let _ = sup.db().query(
-        "INSERT OR REPLACE INTO test_summaries (id, repo, agent, \"commit\", tree, runner, command, tests, passed, failed, skipped, complete, exit_code, ms, wait_ms, source, use_id, ts, seq) VALUES (:id, :repo, :agent, :commit, :tree, :runner, :command, :tests, :passed, :failed, :skipped, :complete, :exit_code, :ms, :wait_ms, :source, :use_id, :ts, :seq)",
-        &sp,
-    );
     let _ = sup.db().query("DELETE FROM test_runs WHERE run = :run", &Params::new().set("run", Value::Str(run.clone())));
     // A test without its own time gets the run's when it is the run's only
     // test (marked so: `own_ms` false).
@@ -1036,6 +1032,12 @@ fn record(sup: &Supervisor, agent: &str, call: Call) {
             &p,
         );
     }
+    // The summary goes in last: a reader that sees the command sees its
+    // tests too (they were written first).
+    let _ = sup.db().query(
+        "INSERT OR REPLACE INTO test_summaries (id, repo, agent, \"commit\", tree, runner, command, tests, passed, failed, skipped, complete, exit_code, ms, wait_ms, source, use_id, ts, seq) VALUES (:id, :repo, :agent, :commit, :tree, :runner, :command, :tests, :passed, :failed, :skipped, :complete, :exit_code, :ms, :wait_ms, :source, :use_id, :ts, :seq)",
+        &sp,
+    );
 }
 
 /// At a turn's end: its Bash test calls that fired no `PostToolUse` (they
