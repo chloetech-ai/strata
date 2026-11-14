@@ -396,6 +396,10 @@ impl Fleet {
         let mut m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         let now = i.now_ms;
         let shards: Vec<Json> = i.cluster["shards"].as_array().cloned().unwrap_or_default();
+        // A server that is not a coordinator, as one shard of itself
+        // ([`local_shard`]): its problems are this server's, not shard 0's.
+        let alone = shards.len() == 1 && shards[0]["local"] == true;
+        let at_shard = |shard: usize, name: &str| if alone { vec![name.to_string()] } else { vec![format!("shard {shard}"), name.to_string()] };
         let mut checks = Vec::new();
         let mut problems: Vec<Problem> = Vec::new();
 
@@ -811,7 +815,7 @@ impl Fleet {
                 rank: 4,
                 critical: true,
                 headline: title.clone(),
-                j: json!({"id": format!("damaged-{name}"), "severity": "critical", "title": title, "where": [format!("shard {shard}"), name], "since_ms": null,
+                j: json!({"id": format!("damaged-{name}"), "severity": "critical", "title": title, "where": at_shard(*shard, name), "since_ms": null,
                     "impact": format!("Searches that read the damaged segments fail on {name} (a coordinator tries another copy), and a primary elected from it would serve the damage"),
                     "next": {"text": format!("Replace {name} with a new copy (Cluster: Plan the repair), then remove it; or restore it from a checkpoint"), "view": "cluster", "params": {"shard": shard, "copy": name}}}),
             });
@@ -876,9 +880,15 @@ impl Fleet {
                     let fullest = if pct(lo) == pct(max) { if fills.is_empty() { String::new() } else { format!("; {name}{fills}") } } else { format!("; the fullest is {name}{fills}") };
                     (format!("{} copies' disks are {range} full{fullest}", over.len()), w)
                 } else {
-                    (format!("{name}'s disk is {} full{fills}", pct(max)), vec![format!("shard {shard}"), name.clone()])
+                    (format!("{name}'s disk is {} full{fills}", pct(max)), at_shard(shard, &name))
                 };
-                let impact = if over.len() > 1 { "Writes to a shard stop when its primary's disk is full".to_string() } else { format!("Writes to shard {shard} stop when its disk is full") };
+                let impact = if over.len() > 1 {
+                    "Writes to a shard stop when its primary's disk is full".to_string()
+                } else if alone {
+                    "Writes stop when the disk is full".to_string()
+                } else {
+                    format!("Writes to shard {shard} stop when its disk is full")
+                };
                 // The headline says the line crossed, not the share now
                 // and when it fills, which change every look.
                 let line = if critical { "95%" } else { "85%" };
@@ -1155,7 +1165,7 @@ pub fn local_shard(detail: &Json) -> Json {
     };
     let n = copies.len();
     let up = n - gone.len();
-    json!({"shards": [{"shard": 0, "state": state, "why": why, "serves_reads": reads, "takes_writes": writes, "majority": up * 2 > n,
+    json!({"shards": [{"shard": 0, "local": true, "state": state, "why": why, "serves_reads": reads, "takes_writes": writes, "majority": up * 2 > n,
         "failover": cap["failover_after_ms"].as_u64().unwrap_or(0) > 0, "primary": null, "replicas": copies}]})
 }
 
@@ -1197,6 +1207,17 @@ mod tests {
         let one = json!({"shards": [{"shard": 0, "state": "ok", "failover": true, "majority": true, "replicas": [at("s0-0", "a", 0.8), at("s0-1", "a", 0.9)]}]});
         let j = Fleet::default().judge(inputs(&one, &[]));
         assert!(j["problems"].as_array().unwrap().iter().all(|p| !p["id"].as_str().unwrap().starts_with("placement") && !p["id"].as_str().unwrap().starts_with("disk-balance")), "{j}");
+    }
+
+    /// CCW-14: a server that is no coordinator has no shard 0 to name.
+    #[test]
+    fn one_servers_disk_is_the_servers() {
+        let detail = json!({"capability": {}, "health": {"replication": {"role": "standalone"}}, "load": {"disk_used_ratio": 0.96}});
+        let c = local_shard(&detail);
+        let j = Fleet::default().judge(inputs(&c, &[]));
+        let p = j["problems"].as_array().unwrap().iter().find(|p| p["id"] == "disk").unwrap_or_else(|| panic!("{j}")).clone();
+        assert_eq!(p["where"], json!(["this server"]), "{p}");
+        assert_eq!(p["impact"], "Writes stop when the disk is full", "{p}");
     }
 
     #[test]

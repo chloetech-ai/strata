@@ -1795,9 +1795,31 @@ pub fn disk(path: &std::path::Path) -> Option<(u64, u64, u64)> {
     }
 }
 
+/// How full a file system is, as `df` counts it (CCW-14): what is used
+/// over what is used and what this user may still write, so that the
+/// blocks kept for root count neither as used nor as free. `None` for a
+/// file system with no blocks.
+pub fn disk_used_ratio(total: u64, free: u64, avail: u64) -> Option<f64> {
+    let used = total.saturating_sub(free);
+    (used + avail > 0).then(|| used as f64 / (used + avail) as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CCW-14: root's reserved blocks are not counted as used: 40 GB used
+    /// and 53 GB available on a 100 GB disk with 7 GB reserved is 43%
+    /// used, as df says, not 47%.
+    #[test]
+    fn disk_used_as_df_counts_it() {
+        let gb = 1u64 << 30;
+        let r = disk_used_ratio(100 * gb, 60 * gb, 53 * gb).unwrap();
+        assert!((r - 40.0 / 93.0).abs() < 1e-9, "{r}");
+        assert_eq!(disk_used_ratio(100, 100, 100), Some(0.0));
+        assert_eq!(disk_used_ratio(100, 5, 0), Some(1.0));
+        assert_eq!(disk_used_ratio(0, 0, 0), None);
+    }
 
     /// Every query with a key counts its client; coordinators' counts add
     /// up, each client naming the coordinators it went through (AC-4).

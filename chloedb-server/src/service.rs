@@ -5400,11 +5400,11 @@ impl Service {
             ] {
                 g.insert(k, v);
             }
-            if let Some((total, _, avail)) = telemetry::disk(db.storage().path()) {
+            if let Some((total, free, avail)) = telemetry::disk(db.storage().path()) {
                 g.insert("disk_total_bytes", total as f64);
                 g.insert("disk_free_bytes", avail as f64);
-                if total > 0 {
-                    g.insert("disk_used_ratio", 1.0 - avail as f64 / total as f64);
+                if let Some(r) = telemetry::disk_used_ratio(total, free, avail) {
+                    g.insert("disk_used_ratio", r);
                 }
             }
             match &self.replication() {
