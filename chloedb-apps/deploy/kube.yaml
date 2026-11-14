@@ -40,7 +40,7 @@ spec:
           command: [cp, /usr/local/bin/chloedb-server, /code/chloedb-server]
           volumeMounts: [{ name: code, mountPath: /code }]
         - name: fetch
-          image: mcr.microsoft.com/playwright:v1.63.0-noble
+          image: mcr.microsoft.com/playwright:v1.65.0-noble
           env:
             - { name: REF, value: __REF__ }
           command:
@@ -63,7 +63,7 @@ spec:
             limits: { memory: 1Gi }
       containers:
         - name: studio
-          image: mcr.microsoft.com/playwright:v1.63.0-noble
+          image: mcr.microsoft.com/playwright:v1.65.0-noble
           workingDir: /code/src/chloedb-apps
           command: [node, engine/server.mjs, --host, 127.0.0.1, --port, "7730", --data, /data]
           env:
@@ -83,7 +83,7 @@ spec:
             requests: { cpu: 250m, memory: 600Mi }
             limits: { cpu: "1", memory: 1536Mi }
         - name: gate
-          image: mcr.microsoft.com/playwright:v1.63.0-noble
+          image: mcr.microsoft.com/playwright:v1.65.0-noble
           command: [node, /code/src/chloedb-apps/deploy/gate.mjs, --port, "8080", --to, "http://127.0.0.1:7730"]
           env:
             - name: STRATA_APPS_GATE_KEY
