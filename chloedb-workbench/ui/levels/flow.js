@@ -242,8 +242,13 @@ export function mount(root, ctx) {
     const sugg = all.filter((s) => s.from !== "chloectx");
     const kinds = new Set(sugg.map((s) => s.action?.kind).filter(Boolean));
     const said = sugg.map((s) => `${s.title} ${s.detail}`).join(" ");
-    const folded = all.filter((s) => s.from === "chloectx").map((s) => ({ kind: s.kind, text: s.title, saves: s.saves, seconds: s.saves_ms != null ? s.saves_ms / 1000 : null }));
+    const folded = all.filter((s) => s.from === "chloectx").map((s) => ({ kind: s.kind, text: s.title, saves: s.saves, seconds: s.saves_ms != null ? s.saves_ms / 1000 : null, harness: s.harness || null }));
     const extra = (folded.length ? folded : d.report?.suggestions || []).filter((r) => ![...kinds].some((k) => COVERS[k] === r.kind) && !said.includes(String(r.text).slice(0, 40)));
+    // A report's advice that one of ours covers keeps its harness link: it
+    // goes beside ours (ours applies to this repo's agents, the link drafts
+    // the harness change for every session).
+    const hxOf = (kind) => (folded.find((r) => COVERS[kind] === r.kind && r.harness && r.harness.href) || {}).harness || null;
+    const hxLink = (hx) => h("a", { class: "btn sm fl-hx", href: hx.href, title: hx.allow && hx.allow.length ? `Opens Optimize the harness › Permissions with ${hx.allow.join(", ")} in a draft` : "Opens Optimize the harness › Permissions" }, hx.label || "Make this a harness change");
     const items = sugg.map((s, i) => {
       const a = s.action, done = S.applied.has(s.id), busy = S.busy.has(s.id);
       // Only an allow and a fix have something to switch on (SPEC.md, Flow).
@@ -267,7 +272,7 @@ export function mount(root, ctx) {
         h("div", { class: "fl-sb" },
           h("div", { class: "fl-st" }, md(s.title)),
           s.detail ? h("div", { class: "fl-sd" }, md(s.detail)) : null,
-          h("div", { class: "fl-acts" }, act, s.saves && s.saves_ms !== 0 && !/~0 s\b/.test(s.saves) && !(S.fixOpen === s.id) ? h("span", { class: "fl-saves" }, /^(saves|bears)\b/.test(s.saves) ? s.saves : `saves ${s.saves}`) : null),
+          h("div", { class: "fl-acts" }, act, a && !done && hxOf(a.kind) ? hxLink(hxOf(a.kind)) : null, s.saves && s.saves_ms !== 0 && !/~0 s\b/.test(s.saves) && !(S.fixOpen === s.id) ? h("span", { class: "fl-saves" }, /^(saves|bears)\b/.test(s.saves) ? s.saves : `saves ${s.saves}`) : null),
           S.errs.has(s.id) ? h("div", { class: "err" }, S.errs.get(s.id)) : null));
     });
     return h("aside", { class: "lv-card fl-coach" },
@@ -275,7 +280,10 @@ export function mount(root, ctx) {
       items.length ? h("ol", { class: "fl-sl" }, items) : h("div", { class: "lv-sub" }, "Nothing to suggest in this window: no repeated approvals, errors or rereads."),
       extra.length ? h("div", { class: "fl-rep" },
         h("div", { class: "fl-rep-h" }, ctxChip("From ChloeCtx's report of the day"), d.report ? h("span", { class: "lv-sub" }, `${d.report.turns} turns · ${d.report.tool_calls} tool calls · ${d.report.compactions} compactions`) : null),
-        h("ul", { class: "fl-rl" }, extra.map((r) => h("li", null, h("div", { class: "fl-sd" }, md(r.text)), r.seconds ? h("span", { class: "fl-saves" }, `bears on ~${fmtDur(r.seconds * 1000)}`) : null)))) : null,
+        h("ul", { class: "fl-rl" }, extra.map((r) => h("li", null, h("div", { class: "fl-sd" }, md(r.text)),
+          // ChloeCtx says to edit settings.json by hand; here it is a harness draft.
+          r.harness && r.harness.href ? hxLink(r.harness) : null,
+          r.seconds ? h("span", { class: "fl-saves" }, `bears on ~${fmtDur(r.seconds * 1000)}`) : null)))) : null,
       h("p", { class: "fl-foot" }, "Each suggestion is a query over the session records; applying one changes only what agents started from now on get."));
   }
 
@@ -342,6 +350,7 @@ useStyle("flow", `
 .fl-ax{position:relative;height:16px;color:var(--muted);font-size:11.5px}
 .fl-ax span{position:absolute;top:0;white-space:nowrap}.fl-ax span.mid{transform:translateX(-50%)}
 .fl-coach{padding:18px 20px}
+.fl-rl .fl-hx{margin:6px 8px 0 0}
 .fl-sl{list-style:none;margin:0;padding:0}
 .fl-sg{display:flex;gap:12px;padding:14px 0;border-top:1px solid var(--line)}
 .fl-sg:first-child{border-top:0;padding-top:4px}

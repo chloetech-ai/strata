@@ -68,6 +68,7 @@ impl Goal {
             "created": iso(self.created), "done": self.done.map(iso),
             "outcomes_total": live.len(), "outcomes_done": done,
             "needs_you": live.iter().filter(|o| o.state == "needs_you").count(),
+            "parts": parts_json(outcomes),
             "progress": if live.is_empty() { 0 } else { live.iter().map(|o| o.progress.clamp(0, 100)).sum::<i64>() / live.len() as i64 },
         })
     }
@@ -86,6 +87,9 @@ pub struct Outcome {
     pub progress: i64,
     pub created: i64,
     pub updated: i64,
+    /// Its agent's branch was merged by Review and the merge stands (not
+    /// a column: read from the merge's mark when the row is read).
+    pub merged: bool,
 }
 
 pub(crate) const OUTCOME_COLS: &str = "id, goal, title, detail, state, agent, ord, after, progress, created, updated";
@@ -104,6 +108,7 @@ impl Outcome {
             progress: get_int(&r[8]).unwrap_or(0),
             created: get_ms(&r[9]).unwrap_or(0),
             updated: get_ms(&r[10]).unwrap_or(0),
+            merged: false,
         }
     }
 
@@ -132,7 +137,7 @@ impl Outcome {
         json!({
             "id": self.id, "goal": self.goal, "title": self.title, "detail": self.detail, "state": self.state,
             "agent": self.agent, "agent_name": a.as_ref().map(|a| a.name.clone()), "agent_state": a.as_ref().map(|a| a.state.clone()),
-            "ord": self.ord, "after": self.after, "progress": self.progress,
+            "ord": self.ord, "after": self.after, "progress": self.progress, "merged": self.merged,
             "created": iso(self.created), "updated": iso(self.updated), "updated_ms": self.updated,
         })
     }
@@ -165,15 +170,61 @@ pub fn outcomes(sup: &Supervisor, goal: Option<&str>) -> Vec<Outcome> {
         None => sup.db().query(&format!("SELECT {OUTCOME_COLS} FROM outcomes LIMIT 100000"), &Params::new()),
     };
     let mut v: Vec<Outcome> = rows.unwrap_or_default().iter().map(|r| Outcome::of(r)).collect();
+    for o in v.iter_mut() {
+        o.merged = o.agent.as_deref().is_some_and(|a| merged_by_review(sup, a));
+    }
     v.sort_by_key(|o| (o.goal.clone(), o.ord, o.created));
     v
 }
 
+/// Whether Review merged an agent's branch and the merge stands (Undo
+/// marks it undone): the mark Review's merge writes, which `/api/repos`
+/// reads too.
+pub fn merged_by_review(sup: &Supervisor, agent: &str) -> bool {
+    sup.mark(&format!("review-merged:{agent}")).and_then(|s| serde_json::from_str::<Json>(&s).ok()).is_some_and(|m| m["undone"] != true)
+}
+
+/// A goal's parts and how many are merged (Dev: a batch had no "done"):
+/// `{total, merged, left, done, words}`, the dropped ones left out. The
+/// goal is done when every part is merged.
+pub fn parts_json(outcomes: &[Outcome]) -> Json {
+    let live: Vec<&Outcome> = outcomes.iter().filter(|o| o.state != "dropped").collect();
+    let total = live.len();
+    let merged = live.iter().filter(|o| o.merged).count();
+    let left = total - merged;
+    let part = |n: usize| if n == 1 { "1 part".to_string() } else { format!("{n} parts") };
+    let words = if total == 0 {
+        "no parts yet".to_string()
+    } else if left == 0 {
+        format!("{}, {merged} merged", part(total))
+    } else if merged == 0 {
+        format!("{}, none merged yet", part(total))
+    } else {
+        format!("{}, {merged} merged, {left} left", part(total))
+    };
+    json!({ "total": total, "merged": merged, "left": left, "done": total > 0 && left == 0, "words": words })
+}
+
+/// A goal whose parts are all merged is done: its state is written once,
+/// so Mission and the lists read it too. Returns whether it changed.
+fn settle(sup: &Supervisor, g: &mut Goal, os: &[Outcome]) -> bool {
+    if g.state != "active" || parts_json(os)["done"] != true {
+        return false;
+    }
+    g.state = "done".into();
+    g.done = Some(now_ms());
+    g.put(sup).is_ok()
+}
+
 /// The state an outcome's agent implies; `done` and `dropped` once set
-/// stay. `asking`: the agents with an open question.
+/// stay, and a merged branch is done. `asking`: the agents with an open
+/// question.
 fn derived(o: &Outcome, a: Option<&Agent>, running: bool, asking: &HashSet<String>) -> String {
     if matches!(o.state.as_str(), "done" | "dropped") {
         return o.state.clone();
+    }
+    if o.merged {
+        return "done".into();
     }
     let Some(a) = a else {
         return if o.agent.is_none() { "next".into() } else { o.state.clone() };
@@ -473,9 +524,10 @@ pub fn list(sup: &Supervisor, lv: &Levels, repo: Option<&str>) -> Result<Json, A
     };
     let all = refresh(sup, lv, None);
     let list: Vec<Json> = goals(sup, repo.as_deref())
-        .iter()
-        .map(|g| {
+        .into_iter()
+        .map(|mut g| {
             let os: Vec<Outcome> = all.iter().filter(|o| o.goal == g.id).cloned().collect();
+            settle(sup, &mut g, &os);
             g.to_json(&os)
         })
         .collect();
@@ -485,8 +537,9 @@ pub fn list(sup: &Supervisor, lv: &Levels, repo: Option<&str>) -> Result<Json, A
 /// `GET /api/goals/:id`: the goal, its outcomes and agents, its open
 /// questions, what ChloeCtx learned today, and its pulse.
 pub fn detail(sup: &Supervisor, lv: &Levels, id: &str) -> Result<Json, ApiError> {
-    let g = goal(sup, id)?;
+    let mut g = goal(sup, id)?;
     let os = refresh(sup, lv, Some(id));
+    settle(sup, &mut g, &os);
     let mut agents: Vec<Agent> = sup.agent_rows().into_iter().filter(|a| a.goal.as_deref() == Some(id) || os.iter().any(|o| o.agent.as_deref() == Some(&a.id))).collect();
     agents.sort_by_key(|a| a.created);
     let ids: HashSet<String> = agents.iter().map(|a| a.id.clone()).collect();
@@ -629,6 +682,7 @@ pub fn add_outcome(sup: &Supervisor, lv: &Levels, b: OutcomeBody, by: Option<&st
         progress: 0,
         created: now,
         updated: now,
+        merged: false,
     };
     o.put(sup)?;
     Ok(json!({ "outcome": o.to_json(sup) }))
@@ -836,5 +890,22 @@ mod tests {
         assert_eq!(derived(&o3, Some(&a), true, &none), "dropped");
         let o4 = Outcome { agent: None, state: "next".into(), ..Outcome::default() };
         assert_eq!(derived(&o4, None, false, &none), "next");
+        // A merged branch is done, whatever its agent is doing.
+        let o5 = Outcome { merged: true, ..o.clone() };
+        a.state = "idle".into();
+        assert_eq!(derived(&o5, Some(&a), true, &none), "done");
+    }
+
+    #[test]
+    fn a_batch_is_done_when_every_part_is_merged() {
+        let part = |merged: bool, state: &str| Outcome { merged, state: state.into(), agent: Some("a".into()), ..Outcome::default() };
+        let p = parts_json(&[part(true, "done"), part(false, "active"), part(false, "next")]);
+        assert_eq!((p["total"].as_u64(), p["merged"].as_u64(), p["left"].as_u64(), p["done"].as_bool()), (Some(3), Some(1), Some(2), Some(false)));
+        assert_eq!(p["words"], "3 parts, 1 merged, 2 left");
+        let p = parts_json(&[part(true, "done"), part(true, "done"), part(true, "done"), part(false, "dropped")]);
+        assert_eq!(p["words"], "3 parts, 3 merged");
+        assert_eq!(p["done"], true);
+        assert_eq!(parts_json(&[part(false, "active")])["words"], "1 part, none merged yet");
+        assert_eq!(parts_json(&[])["done"], false);
     }
 }

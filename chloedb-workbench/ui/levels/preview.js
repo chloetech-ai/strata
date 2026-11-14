@@ -159,6 +159,7 @@ export function mount(root, ctx) {
         a?.preview_url ? h("span", { class: "pv-url-m", title: "The server at this URL serves whatever checkout it was started in." }, `· ${nameOf(a)}'s preview URL`) : null),
       a?.preview_url ? h("button", { class: "btn ghost icon sm", title: "Reload", "aria-label": "Reload the preview", onclick: reload }, "↻") : null,
       a?.preview_url ? h("button", { class: "btn ghost sm", title: "Set another preview URL", onclick: () => { S.setting = true; renderFrame(); } }, "Change URL") : null,
+      a ? mainLink(a) : null,
       h("button", {
         class: "pv-ov" + (S.overlay ? " on" : ""), "aria-pressed": S.overlay ? "true" : "false", title: ovTitle(),
         onclick: (e) => {
@@ -180,6 +181,21 @@ export function mount(root, ctx) {
   function pickMode() {
     if (!frame || !frame.contentWindow) return;
     try { frame.contentWindow.postMessage({ type: "wb-pick-mode", on: !!S.overlay }, location.origin); } catch {}
+  }
+
+  // "Preview main" (Maya): after a merge the page to check is main's,
+  // through the same proxy; the project page holds it.
+  const mains = new Map();
+  function mainLink(a) {
+    const host = h("span", { class: "pv-main" });
+    const fill = (m) => {
+      if (!m || !m.project) return;
+      const merged = (m.merged || []).some((x) => x.agent === a.id);
+      host.replaceChildren(h("a", { class: `btn sm${merged ? " primary" : " ghost"}`, href: `#/p/${encodeURIComponent(m.project)}/main`, title: m.url ? `main's app at ${m.url}` : "Set where main's app runs" }, "Preview main"));
+    };
+    if (mains.has(a.repo)) fill(mains.get(a.repo));
+    else ctx.api(`/api/repos/main-preview?repo=${encodeURIComponent(a.repo)}`).then((m) => { mains.set(a.repo, m); fill(m); }, () => {});
+    return host;
   }
 
   function previewSrc(a) { return `/preview/${encodeURIComponent(a.id)}/?token=${encodeURIComponent(token(ctx))}`; }
@@ -565,5 +581,5 @@ useStyle("preview", `
 .pv-sent-b{min-width:0;flex:1}
 @media (max-width:1180px){.pv-body{grid-template-columns:minmax(0,1fr) 330px}}
 @media (max-width:860px){.pv-body{grid-template-columns:1fr;min-height:0}.pv-browser{height:min(640px,78vh)}.pv-side{overflow:visible}.pv-url-m{display:none}.pv-dots{display:none}}
-@media (max-width:560px){.pv-chrome{flex-wrap:wrap;height:auto;gap:6px;padding:6px 8px}.pv-url{order:5;flex-basis:100%}.pv-chrome .btn.sm:not(.icon){display:none}.pv-ov{padding:4px 8px;margin-left:auto}}
+@media (max-width:560px){.pv-chrome{flex-wrap:wrap;height:auto;gap:6px;padding:6px 8px}.pv-url{order:5;flex-basis:100%}.pv-chrome .btn.sm:not(.icon){display:none}.pv-chrome .pv-main .btn.sm{display:inline-flex}.pv-ov{padding:4px 8px;margin-left:auto}}
 `);

@@ -3159,4 +3159,67 @@ with Review (`ui/goals/review.js`, `src/review.rs`). What changed:
 - Test: `review_drafts_from_what_changed_counts_every_decision_and_says_merged`.
 
 Left out: a preview of main after a merge, and the Changes tab's diff
-wrapping on a phone.
+wrapping on a phone (both done in the next section).
+
+## Sixth build: the last leftovers
+
+From the simulated users' second run (Priya, Maya, Dev, Lee):
+
+- **The Changes tab wraps on a phone** as Review's key change does: no
+  sideways scroll inside the diff; Why? sits at the line's right edge.
+  The tab's body keeps most of the screen (a question card above it no
+  longer squeezes the diff to a few lines): the page scrolls to it.
+- **The task once.** The agent page's header holds the whole task, folded
+  to two lines with **Show the whole task**; Progress's Intent is a
+  one-line summary, and a narration that only repeats the task
+  ("spawned: …") says "Starting…"; a chapter whose prompt is the task says
+  "you: the task" rather than quoting it again.
+- **A batch is done when every part is merged.** A goal's JSON has
+  `parts {total, merged, left, done, words}` ("3 parts, 1 merged, 2 left",
+  "3 parts, 3 merged"); an outcome has `merged` (Review's merge mark, not
+  undone) and a merged one is `done`; a goal whose parts are all merged is
+  written `done`. Since you left lists the project's goals with their parts
+  and says "… is done (3 parts, 3 merged)"; an outcome's agent page says it
+  under Intent.
+- **Preview main.** `GET /api/repos/main-preview?repo=` → `{repo,
+  project, id, href, branch, url, by, found, merged}` and `PUT
+  /api/repos/main-preview {repo, url}` (empty clears). Main has its own id
+  in the preview proxy, `main-<12 hex of the path's FNV-1a>`, served at
+  `/preview/<id>/` with the same token, cookie, overlay and loopback-only
+  URL check as an agent's; its URL is kept in the mark
+  `preview-main:<repo>`, set by you or found: a process listening with the
+  main checkout as its working directory (`by: "found"`). The page is
+  `#/p/<project>/main`, reached from the project page's inspector and from
+  every agent's Preview tab (primary once that agent was merged).
+- **One count of decisions.** `GET /api/agents/:id/blast` adds `decided
+  {count, matter, routine}` from `review::decisions_of`; the Changes tab's
+  chip and Ship's tile read it.
+- **What a decision replaced says whose it was** by the timeline's rules
+  (`trail::said_by_you`: the note's words, its tag `stated`, its ctx `By:
+  user`, the user's steers to its agent): `capsule::records` reads `tag`,
+  `ctx` and `session`, and `replaces.who` is "yours" or "<agent>'s".
+- **The headline and the key change are the source.** Tests and checks
+  (`review::helper_path`: the test paths, `*_check.*`, `*.spec.*`,
+  `*.test.*`, `check_*`, `checks/`) come after the files a user sees;
+  lockfiles and generated files last.
+- **Search** puts a hit that defines a word of the query first, by its
+  symbol or by a line of its text (`def fmt`, `fn fmt`, `function fmt`, a
+  page's own script), above the tests that call it; it reads three times
+  the limit before cutting.
+- **Trace says when two reasons conflict**: `conflict {text, kind,
+  earlier, later}` when a later commit removes a line an earlier one added
+  (or brings back one it removed) and the earlier message gave a reason
+  (`because`, `after`, `for`, `ticket`, `#41`, `(finance asked)`, …): both
+  messages quoted, in one line under the timeline. No model.
+- **The Coach's "allow them in .claude/settings.json"** (ChloeCtx's
+  report) carries `harness {href, label, allow}`: **Make this a harness
+  change** opens `#/harness/edit/permissions` (also `#/harness/permissions`)
+  with the prefixes approved more than once in the window prefilled in the
+  draft, unsaved. When Workbench's own Allow covers the advice, the link
+  sits beside that Allow.
+- Trace orders commits made in the same second by their ancestry, so the
+  later of two is the one that descends from the other.
+- Tests: `a_batch_is_done_when_its_parts_merge_and_main_has_its_own_preview`,
+  `review_names_the_fix_before_its_check_search_the_definition_and_trace_the_conflict`,
+  `a_replaced_decision_that_was_yours_says_yours`, and unit tests in
+  goals, preview, blast, trail, review, search, trace and flow.

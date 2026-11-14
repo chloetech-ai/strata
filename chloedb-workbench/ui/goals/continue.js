@@ -2,7 +2,7 @@
 // Understand (`#/p/<p>/understand`) and Start a change (`#/p/<p>/change`),
 // three places under one row of steps, with Review and ship beside them.
 // `#/p` opens a folder.
-import { h, useStyle, page, btn, label, kc, pane, stateDot, since, ago, fmtClock, avatar, churnBar, toMs, GROUP_WORDS, icon } from "/levels/common.js";
+import { h, useStyle, page, btn, label, kc, pane, stateDot, since, ago, fmtClock, avatar, churnBar, toMs, GROUP_WORDS, icon, token } from "/levels/common.js";
 import { repoPicker } from "/levels/repos.js";
 import { groupOf, fleet, fleetWords, ORDER, sheet } from "/goals/shell.js";
 import { planFrom } from "/goals/newproject.js";
@@ -94,7 +94,7 @@ export function mount(root, ctx) {
   const el = h("div", { class: "g-proj" });
   root.append(el);
   const step = ctx.params.page;
-  const S = { digest: null, decisions: null, rules: null, views: [], draft: null, sending: false, guarded: null, flaky: null, route: null };
+  const S = { digest: null, decisions: null, rules: null, views: [], draft: null, sending: false, guarded: null, flaky: null, route: null, goals: null };
   const ASK = {}; // the ask boxes, kept across draws
   let alive = true;
 
@@ -105,7 +105,7 @@ export function mount(root, ctx) {
       openList(ctx), h("div", { class: "gp-sec" }, picker(ctx))));
     return { update() {}, unmount: () => el.remove() };
   }
-  const crumbs = { continue: "Since you left", understand: "Understand", change: "Start a change" };
+  const crumbs = { continue: "Since you left", understand: "Understand", change: "Start a change", main: "Preview main" };
   ctx.crumbs([{ label: "Start", href: "#/" }, { label: p.project, href: `#/p/${p.project}` }, ...(step === "continue" ? [] : [{ label: crumbs[step], href: location.hash }])]);
 
   // ----------------------------------------------------------- data
@@ -113,7 +113,14 @@ export function mount(root, ctx) {
     if (step === "continue") {
       ctx.api(`/api/digest?repo=${enc(p.path)}`).then((d) => { S.digest = d; draw(); }, () => {});
       ctx.api(`/api/decisions?repo=${enc(p.path)}&limit=30`).then((d) => { S.decisions = d; draw(); }, () => { S.decisions = { decisions: [] }; draw(); });
+      // The batches ("Split it into parts"): each with its parts merged.
+      ctx.api(`/api/goals?repo=${enc(p.path)}`).then(async (r) => {
+        const gs = ((r && r.goals) || []).filter((g) => g.parts && g.parts.total && (g.state === "active" || Date.now() - (toMs(g.done) || 0) < 3 * 86400000)).slice(0, 4);
+        S.goals = await Promise.all(gs.map((g) => ctx.api(`/api/goals/${enc(g.id)}`).catch(() => ({ goal: g, outcomes: [] }))));
+        draw();
+      }, () => { S.goals = []; });
     }
+    if (step === "main") ctx.api(`/api/repos/main-preview?repo=${enc(p.path)}`).then((m) => { S.main = m; S.mainDirty = true; draw(); }, (e) => { S.main = { error: e.message }; S.mainDirty = true; draw(); });
     if (step === "understand" || step === "change") ctx.api(`/api/rules?repo=${enc(p.path)}`).then((r) => { S.rules = r.rules || []; draw(); }, () => { S.rules = []; draw(); });
     if (step === "change") {
       ctx.api(`/api/guarded?repo=${enc(p.path)}`).then((r) => { S.guarded = (r.rules || []).filter((x) => x.on); draw(); }, () => { S.guarded = []; });
@@ -164,6 +171,9 @@ export function mount(root, ctx) {
       const live = new Set(c.filter(([, g]) => g !== "finished").map(([a]) => a.id));
       for (const e of d.ended || []) if (!live.has(e.agent)) bits.push(`${e.name} ended ${ago(e.ended_ms)}`);
     }
+    // A goal done comes first: it is the news an agent's line is part of.
+    const goalsDone = (S.goals || []).filter((gd) => gd.goal && gd.goal.parts && gd.goal.parts.done).map((gd) => `${String(gd.goal.text || "a goal").split(/[\n:.]/)[0]} is done (${gd.goal.parts.words})`);
+    bits.unshift(...goalsDone);
     const done = d ? (d.done || []).length : 0;
     if (done) bits.push(`${done} outcome${done === 1 ? "" : "s"} done`);
     if (!bits.length) return first ? `${when}: no agent has worked here yet.` : `${when}: nothing happened.`;
@@ -182,6 +192,25 @@ export function mount(root, ctx) {
       h("span", { class: "live" }, g === "finished" ? `${GROUP_WORDS.finished} ${ago(a.ended || a.state_since)}${a.task ? " · " + a.task : ""}` : live),
       r ? churnBar(r.added, r.removed) : h("span"),
       h("span", { class: "acts" }, acts));
+  }
+
+  /** A batch: its parts and how many are merged, one row a part, "done"
+   *  when every part is merged (Dev: "Batch: 3 parts, 3 merged"). */
+  function goalCard(d) {
+    const g = d.goal || {}, pa = g.parts || {}, os = (d.outcomes || []).filter((o) => o.state !== "dropped");
+    const title = String(g.text || "").split("\n")[0];
+    const word = (o) => (o.merged ? "merged" : o.state === "needs_you" ? "needs you" : o.state === "active" ? "working" : o.state === "done" ? "done, not merged" : "not started");
+    return h("div", { class: `g-goal pane${pa.done ? " done" : ""}` },
+      h("div", { class: "g-goal-h" },
+        h("b", { class: "g-goal-t", title: g.text || "" }, title),
+        h("span", { class: `chip${pa.done ? " add" : ""}` }, pa.done ? `Done: ${pa.words}` : pa.words)),
+      h("div", { class: "g-goal-bar", role: "img", "aria-label": pa.words }, os.map((o) => h("i", { class: o.merged ? "m" : o.state === "needs_you" ? "n" : o.state === "active" ? "w" : "" }))),
+      os.map((o) => h("div", { class: "g-goal-p" },
+        h("span", { class: `g-goal-s${o.merged ? " m" : ""}` }, o.merged ? "✓" : "·"),
+        o.agent ? h("a", { href: `#/a/${o.agent}` }, o.agent_name || o.title) : h("span", {}, o.title),
+        h("span", { class: "g-dim" }, word(o)),
+        !o.merged && o.agent && o.state !== "next" ? h("a", { class: "lv-link", href: `#/p/${p.project}/ship/${o.agent}` }, "Review") : null)),
+      pa.done ? h("p", { class: "g-dim" }, "Every part is merged: this goal is done.") : null);
   }
 
   function continuePage() {
@@ -205,17 +234,69 @@ export function mount(root, ctx) {
       h("section", {}, label(first ? "Decisions so far" : "Decisions made", h("span", { class: "num" }, String(newDecs.length))),
         !S.decisions ? h("p", { class: "g-dim" }, "Reading ChloeCtx…") : newDecs.length ? newDecs.slice(0, 3).map((d) => h("div", { class: "g-dec" }, h("span", { class: "lv-ctx" }, ""), h("div", {}, h("div", {}, d.words || d.text), h("small", {}, byWho(d), " · ", ago(d.ts))))) : h("p", { class: "g-dim" }, first ? "None yet." : "None since you left."),
         newDecs.length > 3 ? h("a", { class: "lv-link", href: "#/debug/records" }, `All ${newDecs.length} →`) : null),
+      h("section", {}, label("Main"),
+        h("p", { class: "g-dim" }, Object.keys(p.merged || {}).length ? "Merged work is on main now: check it in the page itself." : "The app as main has it, through the same preview as an agent's."),
+        btn("Preview main", { href: `#/p/${p.project}/main`, icon: "eye" })),
       h("section", {}, btn("I'm stepping away: notify me", { onclick: stepAway })),
       ctx.slot("rules-suggest"),
     ];
     return page({ kicker: "Project", title: `Continue ${p.project}`, sub: sinceSentence(list), aside: ready && !mine.length ? btn(`Review and ship (${ready})`, { primary: true, href: `#/p/${p.project}/ship`, kbd: "g r" }) : null, inspector: insp, wide: true },
       projectSteps(p, "continue"), ASK.c.el,
       h("div", { class: "gp-sec" }, label(fleetWords(list))),
+      (S.goals || []).length ? h("div", { class: "gp-sec" }, label("Goals", h("span", { class: "num" }, String(S.goals.length))), S.goals.map(goalCard)) : null,
       mine.length ? h("div", { class: "g-needs" }, label("Needs you", h("span", { class: "num" }, String(mine.length))), mine.map((it) => ctx.needCard(it))) : null,
       groups.filter(([, l]) => l.length).map(([g, l]) => h("div", { class: "gp-sec" }, label(GROUP_WORDS[g], h("span", { class: "num" }, String(l.length))), g === "finished" && !compact
         ? h("details", { class: "g-fold" }, h("summary", {}, `${l.length} finished · show`), h("div", { class: "pane" }, l.map((a) => agentRow(a, g, compact))))
         : h("div", { class: "pane" }, l.map((a) => agentRow(a, g, compact))))),
       !list.length ? h("div", { class: "gp-sec pane g-empty" }, h("b", {}, "No agents in this project yet."), h("p", {}, "Read it first under Understand, or start one."), btn("Start a change", { primary: true, href: `#/p/${p.project}/change`, kbd: "n" })) : null);
+  }
+
+  // ----------------------------------------------------------- Preview main
+  // The app as the project's main checkout serves it, after a merge (Maya
+  // started serve.py from main and had to borrow an agent's preview). The
+  // same proxy as an agent's, at /preview/main-<id>/; its URL is yours, or
+  // a server found listening in the main checkout.
+  function mainPage() {
+    const m = S.main;
+    const head = { kicker: p.project, title: "Preview main", sub: `The app as ${m && m.branch ? m.branch : "main"} has it now, in ${p.path}: what the merges put there.` };
+    if (!m) return page({ ...head, wide: true }, projectSteps(p, "main"), h("p", { class: "g-dim" }, "Looking for main's server…"));
+    if (m.error) return page({ ...head, wide: true }, projectSteps(p, "main"), h("p", { class: "g-bad" }, `Not loaded: ${m.error}`));
+    const insp = [
+      h("section", {}, label("What went into main", h("span", { class: "num" }, String((m.merged || []).length))),
+        (m.merged || []).length ? m.merged.slice(0, 8).map((x) => h("a", { class: "g-chg", href: `#/p/${p.project}/ship/${x.agent}` }, h("code", {}, x.name), h("span", { class: "g-dim" }, `${String(x.commit || "").slice(0, 7)}${x.ts ? ` · ${ago(x.ts)}` : ""}`)))
+          : h("p", { class: "g-dim" }, "Nothing merged through Review yet.")),
+      h("section", {}, label("Its server"),
+        m.url ? h("p", {}, h("code", {}, m.url), h("span", { class: "g-dim" }, m.by === "found" ? " · found running in the main checkout" : " · set by you")) : h("p", { class: "g-dim" }, "None known yet."),
+        m.url ? btn("Change URL", { sm: true, onclick: () => { S.mainSet = true; S.mainDirty = true; draw(); } }) : null),
+    ];
+    let body;
+    if (!m.url || S.mainSet) {
+      const input = h("input", { class: "field", value: m.url || "http://localhost:", placeholder: "http://localhost:8000", "aria-label": "Main's preview URL", spellcheck: "false" });
+      const err = h("p", { class: "g-bad", hidden: true });
+      const set = async (url) => {
+        try {
+          S.main = await ctx.api("/api/repos/main-preview", { method: "PUT", body: { repo: p.path, url } });
+          S.mainSet = false; S.mainDirty = true; draw();
+        } catch (e) { err.textContent = e.message; err.hidden = false; }
+      };
+      body = h("form", { class: "pane g-mset", onsubmit: (e) => { e.preventDefault(); set(input.value.trim()); } },
+        h("b", {}, m.url ? "Change where main's app runs" : "Main has no server Workbench knows of"),
+        h("p", { class: "g-dim" }, "Start the app from the main checkout (", h("code", {}, p.path), ") and Workbench finds it, or say where it runs. Only this machine: localhost or 127.0.0.1."),
+        (m.found || []).length ? h("div", { class: "g-mfound" }, m.found.map((f) => btn(`Use ${f.url.replace("http://", "")}`, { sm: true, onclick: () => set(f.url), title: f.command }))) : null,
+        h("div", { class: "g-mrow" }, input, btn("Set preview URL", { type: "submit", primary: true }), m.url ? btn("Cancel", { onclick: () => { S.mainSet = false; S.mainDirty = true; draw(); } }) : null),
+        err);
+    } else {
+      const src = `${m.href}?token=${enc(token(ctx))}`;
+      const frame = h("iframe", { class: "g-mframe", src, title: `${p.project}'s main` });
+      body = h("div", { class: "pane g-mbrowser" },
+        h("div", { class: "g-mchrome" },
+          h("span", { class: "g-mlabel" }, icon("branch", "i sm"), h("b", {}, m.branch || "main"), h("span", { class: "g-dim" }, ` · ${m.url.replace("http://", "")}`)),
+          h("span", { class: "sp" }),
+          btn("Reload", { sm: true, ghost: true, onclick: () => { try { frame.contentWindow.location.reload(); } catch { frame.src = src; } } }),
+          h("a", { class: "btn sm ghost", href: src, target: "_blank", rel: "noopener" }, "Open in a tab")),
+        frame);
+    }
+    return page({ ...head, inspector: insp, wide: true }, projectSteps(p, "main"), body);
   }
 
   // ----------------------------------------------------------- Understand
@@ -416,6 +497,8 @@ export function mount(root, ctx) {
     Object.assign(p, fresh);
     // Start a change is drawn once: its fields are kept, the inspector follows.
     if (step === "change" && el.querySelector(".g-comp")) { refreshInsp(); return; }
+    // Preview main is drawn when its data changes, never under the page in its frame.
+    if (step === "main") { if (!S.mainDirty && el.firstChild) return; S.mainDirty = false; el.replaceChildren(mainPage()); return; }
     // The ask box is moved, not rebuilt: give it its focus and caret back.
     const f = document.activeElement;
     const keep = f && el.contains(f) && f.matches("input,textarea") ? [f, f.selectionStart, f.selectionEnd] : null;
@@ -535,6 +618,25 @@ function picker(ctx) {
 }
 
 const CSS = `
+.g-mbrowser{padding:0;overflow:hidden;display:flex;flex-direction:column}
+.g-mchrome{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-2) var(--s-3);border-bottom:var(--hair) solid var(--line);flex-wrap:wrap}
+.g-mchrome .sp{flex:1}
+.g-mlabel{display:inline-flex;align-items:center;gap:4px;font:var(--w-text) var(--fs-sm)/var(--lh-sm) var(--mono);min-width:0;overflow-wrap:anywhere}
+.g-mframe{width:100%;height:min(70vh,760px);border:0;background:#fff}
+.g-mset{padding:var(--s-4);display:flex;flex-direction:column;gap:var(--s-2)}
+.g-mset p{margin:0}
+.g-mrow{display:flex;gap:var(--s-2);flex-wrap:wrap}.g-mrow .field{flex:1;min-width:200px}
+.g-mfound{display:flex;gap:var(--s-2);flex-wrap:wrap}
+.g-goal{padding:var(--s-3) var(--s-4);margin-bottom:var(--s-2)}
+.g-goal-h{display:flex;align-items:center;gap:var(--s-2);flex-wrap:wrap}
+.g-goal-t{flex:1;min-width:0;font-weight:var(--w-mid);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.g-goal-bar{display:flex;gap:3px;margin:var(--s-2) 0}
+.g-goal-bar i{flex:1;height:5px;border-radius:3px;background:var(--line-2)}
+.g-goal-bar i.w{background:var(--accent)}.g-goal-bar i.n{background:var(--warn)}.g-goal-bar i.m{background:var(--good)}
+.g-goal-p{display:flex;align-items:baseline;gap:var(--s-2);padding:2px 0;font-size:var(--fs-sm)}
+.g-goal-s{width:1em;color:var(--text-3)}.g-goal-s.m{color:var(--good)}
+.g-goal.done{border-color:color-mix(in srgb,var(--good) 40%,var(--line))}
+.g-goal>p{margin:var(--s-1) 0 0}
 .g-ptbl .g-ppath{white-space:normal;width:100%}.g-ptbl .g-ppath code{overflow-wrap:anywhere;word-break:break-all}
 @media (max-width:640px){.g-ptbl td.r{display:none}}
 .g-psteps{display:flex;gap:var(--s-5);border-bottom:var(--hair) solid var(--line);margin:0 0 var(--s-5);overflow-x:auto;align-items:center}

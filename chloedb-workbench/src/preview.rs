@@ -41,6 +41,8 @@ const INJECT: &str = "<script src=\"/preview-overlay.js\"></script>";
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/api/agents/:id/preview", put(set_preview))
+        // A preview of a project's main checkout, after a merge (Maya).
+        .route("/api/repos/main-preview", get(get_main).put(put_main))
         .route("/api/preview/route", post(route_pick))
         .route("/preview-overlay.js", get(overlay))
         .route("/preview/:agent", get(proxy_root).post(proxy_root))
@@ -129,6 +131,120 @@ async fn set_preview(State(app): State<App>, Path(id): Path<String>, body: Bytes
     Ok(AxJson(json!({ "agent": agent })).into_response())
 }
 
+// A preview of main.
+//
+// After a merge, the page to check is the project's main checkout, not an
+// agent's worktree (Maya started serve.py from main herself and pointed an
+// agent's preview at it, which then called it that agent's). Main has its
+// own address in the same proxy, `/preview/main-<hash of the repo>/`, and
+// its own URL, kept in the mark `preview-main:<repo>`: set by you, or
+// found as a server listening with the main checkout as its directory.
+
+/// The proxy's id for a repository's main checkout: `main-` and 12 hex
+/// digits of the path's FNV-1a hash (stable, never an agent's id).
+pub fn main_id(repo: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in repo.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("main-{:012x}", h & 0xffff_ffff_ffff)
+}
+
+fn main_key(repo: &str) -> String {
+    format!("preview-main:{repo}")
+}
+
+/// The repository whose main checkout `id` names, among those Workbench knows.
+fn main_repo(sup: &Supervisor, id: &str) -> Option<String> {
+    crate::repos::list(sup).into_iter().filter_map(|r| r["path"].as_str().map(str::to_string)).find(|p| main_id(p) == id)
+}
+
+/// The URL main's preview goes to, with how it was known (`you`, `found`).
+fn main_url(sup: &Supervisor, repo: &str) -> Option<(String, String)> {
+    let v: Json = serde_json::from_str(&sup.mark(&main_key(repo))?).ok()?;
+    Some((v["url"].as_str()?.to_string(), v["by"].as_str().unwrap_or("you").to_string()))
+}
+
+/// `GET /api/repos/main-preview?repo=`: `{repo, project, id, href, url,
+/// by, found: [{pid, command, ports, url}], merged: [{agent, name, commit,
+/// ts}]}`. With no URL set and one server found in the main checkout, that
+/// one is taken (`by: "found"`).
+pub fn main_preview(sup: &Supervisor, repo: &str) -> Json {
+    let found: Vec<Json> = servers::in_dir(std::path::Path::new(repo))
+        .into_iter()
+        .filter_map(|(pid, command, ports)| {
+            let port = *ports.iter().find(|p| Some(**p) != own_port(sup))?;
+            Some(json!({ "pid": pid, "command": command, "ports": ports, "url": format!("http://127.0.0.1:{port}") }))
+        })
+        .collect();
+    let mut url = main_url(sup, repo);
+    if url.is_none() {
+        if let Some(u) = found.first().and_then(|f| f["url"].as_str()) {
+            let _ = sup.set_mark(&main_key(repo), &json!({ "url": u, "by": "found" }).to_string());
+            url = Some((u.to_string(), "found".into()));
+        }
+    }
+    // What went into main through Review, newest first.
+    let mut merged: Vec<Json> = sup
+        .agent_rows()
+        .into_iter()
+        .filter(|a| a.repo == repo)
+        .filter_map(|a| {
+            let m: Json = serde_json::from_str(&sup.mark(&format!("review-merged:{}", a.id))?).ok()?;
+            (m["undone"] != true).then(|| json!({ "agent": a.id, "name": a.name, "commit": m["commit"], "onto": m["onto"], "ts": m["ts"] }))
+        })
+        .collect();
+    merged.sort_by_key(|m| std::cmp::Reverse(m["ts"].as_i64().unwrap_or(0)));
+    let id = main_id(repo);
+    let project = crate::repos::project_names(sup).get(repo).cloned().unwrap_or_else(|| std::path::Path::new(repo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+    json!({
+        "repo": repo, "project": project, "id": id, "href": format!("/preview/{id}/"),
+        "branch": git::current_branch(std::path::Path::new(repo)),
+        "url": url.as_ref().map(|u| u.0.clone()), "by": url.map(|u| u.1),
+        "found": found, "merged": merged,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct MainQ {
+    repo: Option<String>,
+}
+
+async fn get_main(State(app): State<App>, axum::extract::Query(q): axum::extract::Query<MainQ>) -> ApiResult {
+    let sup = app.sup.clone();
+    let v = blocking(move || {
+        let repo = trail::repo_dir(q.repo.as_deref())?;
+        Ok(main_preview(&sup, &repo.to_string_lossy()))
+    })
+    .await?;
+    Ok(AxJson(v).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct MainB {
+    repo: Option<String>,
+    url: Option<String>,
+}
+
+/// `PUT /api/repos/main-preview {repo, url}`: sets where main's app runs;
+/// an empty or null `url` clears it.
+async fn put_main(State(app): State<App>, body: Bytes) -> ApiResult {
+    let b: MainB = parse_body(&body)?;
+    let sup = app.sup.clone();
+    let v = blocking(move || {
+        let repo = trail::repo_dir(b.repo.as_deref())?.to_string_lossy().to_string();
+        let v = match b.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            Some(u) => json!({ "url": check_url(u, own_port(&sup)).map_err(ApiError::bad)?, "by": "you" }).to_string(),
+            None => String::new(),
+        };
+        sup.set_mark(&main_key(&repo), &v)?;
+        Ok(main_preview(&sup, &repo))
+    })
+    .await?;
+    Ok(AxJson(v).into_response())
+}
+
 // The overlay.
 
 async fn overlay(State(app): State<App>) -> Response {
@@ -213,20 +329,41 @@ async fn proxy(app: App, agent: String, rest: String, method: Method, uri: Uri, 
         let to = if query.is_empty() { format!("{prefix}/") } else { format!("{prefix}/?{query}") };
         return (StatusCode::SEE_OTHER, [(header::LOCATION, to)]).into_response();
     }
-    let Some(a) = app.sup.agent_row(&agent) else { return page(StatusCode::NOT_FOUND, &format!("There is no agent {agent}.")) };
-    let Some(base) = a.preview_url.clone() else {
-        return page(StatusCode::NOT_FOUND, &format!("{} has no preview yet: it sets one with the set_preview tool, or PUT /api/agents/{agent}/preview.", a.name));
+    // Main's own preview: the same proxy, the main checkout's URL.
+    let main = if agent.starts_with("main-") {
+        let sup = app.sup.clone();
+        let id = agent.clone();
+        let found = tokio::task::spawn_blocking(move || main_repo(&sup, &id).map(|r| (main_url(&sup, &r), r))).await.ok().flatten();
+        match found {
+            Some((Some((u, _)), r)) => Some((u, r)),
+            Some((None, _)) => return page(StatusCode::NOT_FOUND, "Main has no preview yet: set the URL its server runs at on the project page (Preview main)."),
+            None => return page(StatusCode::NOT_FOUND, &format!("There is no project whose main checkout is {agent}.")),
+        }
+    } else {
+        None
+    };
+    let (base, name) = match main {
+        Some((u, r)) => (u, format!("main of {}", std::path::Path::new(&r).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(r))),
+        None => {
+            let Some(a) = app.sup.agent_row(&agent) else { return page(StatusCode::NOT_FOUND, &format!("There is no agent {agent}.")) };
+            let Some(base) = a.preview_url.clone() else {
+                return page(StatusCode::NOT_FOUND, &format!("{} has no preview yet: it sets one with the set_preview tool, or PUT /api/agents/{agent}/preview.", a.name));
+            };
+            (base, a.name.clone())
+        }
     };
     let (req_method, req_rest) = (method.clone(), rest.clone());
     let req = Upstream { base, prefix: format!("{prefix}/"), rest, query, method, headers, body };
-    let name = a.name.clone();
     let mut res = match tokio::task::spawn_blocking(move || req.send()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => page(StatusCode::BAD_GATEWAY, &format!("{name}'s preview does not answer: {e}")),
         Err(e) => page(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    // Runtime blame: a 5xx is recorded as an error of the agent's app.
-    res = crate::runtime::after_proxy(&app, &agent, &req_method, &req_rest, res).await;
+    // Runtime blame: a 5xx is recorded as an error of the agent's app
+    // (main's is no agent's).
+    if !agent.starts_with("main-") {
+        res = crate::runtime::after_proxy(&app, &agent, &req_method, &req_rest, res).await;
+    }
     if let Some(c) = set_cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
         res.headers_mut().append(header::SET_COOKIE, c);
     }
@@ -585,6 +722,14 @@ pub fn route(sup: &Supervisor, preview_agent: &str, pick: &Json) -> Result<Json,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_has_its_own_stable_id_per_repository() {
+        let a = main_id("/home/u/shop");
+        assert_eq!(a, main_id("/home/u/shop"));
+        assert_ne!(a, main_id("/home/u/shop2"));
+        assert!(a.starts_with("main-") && a.len() == 17 && a[5..].chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+    }
 
     #[test]
     fn checks_preview_urls() {

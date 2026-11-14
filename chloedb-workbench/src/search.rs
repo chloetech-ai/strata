@@ -928,7 +928,10 @@ pub fn search(sup: &Supervisor, a: &Ask) -> Result<(Vec<Json>, Option<Json>), St
     }
     let w = scope(sup, a)?;
     let p = params(a);
-    let sql = format!("SELECT id, tree, path, lang, symbol, kind, start_line, end_line, text, score() FROM code_chunks WHERE {w} ORDER BY {RANK} DESC LIMIT {}", a.limit.clamp(1, 200));
+    // More than asked, so that a definition BM25 ranks a little lower is
+    // there to move to the front; cut to the limit after.
+    let limit = a.limit.clamp(1, 200);
+    let sql = format!("SELECT id, tree, path, lang, symbol, kind, start_line, end_line, text, score() FROM code_chunks WHERE {w} ORDER BY {RANK} DESC LIMIT {}", (limit * 3).min(200));
     let rows = q(sup, &sql, &p)?;
     // Which agents changed each path (for hits of the main tree).
     let mut over: HashMap<String, Vec<Json>> = HashMap::new();
@@ -968,7 +971,8 @@ pub fn search(sup: &Supervisor, a: &Ask) -> Result<(Vec<Json>, Option<Json>), St
             })
         })
         .collect();
-    let hits = definitions_first(hits, a.q);
+    let mut hits = definitions_first(hits, a.q);
+    hits.truncate(limit);
     let pack = match a.tokens {
         Some(n) if n > 0 => Some(pack(sup, a, &w, &p, n.clamp(100, 50_000))?),
         _ => None,
@@ -984,18 +988,45 @@ pub fn is_test_path(path: &str) -> bool {
 }
 
 /// The definition a query names comes before the tests that use it (Lee:
-/// `test_fmt` ranked above `def fmt`): a hit whose symbol is a word of the
-/// query, outside the tests, moves to the front; the rest keep BM25's order.
+/// `test_fmt` ranked above `def fmt`, and the checkout page's own
+/// `function fmt` came last): a hit outside the tests that defines a word of
+/// the query, by its symbol or by a line of its text (`def fmt`, `fn fmt`,
+/// `function fmt`, `const fmt = (…) =>`, also inside a page's script),
+/// moves to the front; the rest keep BM25's order. The words that only say
+/// "a definition" (`def`, `fn`, `function`) are not names.
 pub fn definitions_first(hits: Vec<Json>, q: &str) -> Vec<Json> {
-    let words: HashSet<String> = q.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    const KEYWORDS: [&str; 9] = ["def", "fn", "function", "func", "class", "struct", "const", "let", "type"];
+    let words: HashSet<String> = q.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).filter(|w| !w.is_empty()).map(str::to_lowercase).filter(|w| !KEYWORDS.contains(&w.as_str())).collect();
     let names = |h: &Json| -> bool {
+        let path = h["path"].as_str().unwrap_or("");
+        if is_test_path(path) {
+            return false;
+        }
         let sym = h["symbol"].as_str().unwrap_or("").to_lowercase();
         let last = sym.rsplit(['.', ' ', ':']).next().unwrap_or("").to_string();
-        !sym.is_empty() && (words.contains(&sym) || words.contains(&last)) && !is_test_path(h["path"].as_str().unwrap_or(""))
+        if !sym.is_empty() && (words.contains(&sym) || words.contains(&last)) {
+            return true;
+        }
+        defines_in_text(h["text"].as_str().unwrap_or(""), path, &words)
     };
     let (mut first, rest): (Vec<Json>, Vec<Json>) = hits.into_iter().partition(names);
     first.extend(rest);
     first
+}
+
+/// Whether a chunk's text defines one of `words` on one of its lines. A
+/// page's or a component's script (HTML, Vue, Svelte) is read as
+/// JavaScript, whatever its indent.
+fn defines_in_text(text: &str, path: &str, words: &HashSet<String>) -> bool {
+    let lang = lang_of(path);
+    let (lang, any_indent) = match lang {
+        "html" => ("javascript", true),
+        l => (l, path.ends_with(".vue") || path.ends_with(".svelte")),
+    };
+    text.lines().any(|l| {
+        let line = if any_indent { l.trim_start() } else { l };
+        def_of(line, lang).is_some_and(|(_, n)| words.contains(&n.to_lowercase()))
+    })
 }
 
 /// `PACK n TOKENS` on the same ranking: the one text an agent gets.
@@ -1267,6 +1298,17 @@ mod tests {
     fn the_definition_comes_before_its_tests() {
         let hits = vec![json!({"path": "test_money.py", "symbol": "test_fmt"}), json!({"path": "web/index.html", "symbol": null}), json!({"path": "money.py", "symbol": "fmt"})];
         assert_eq!(definitions_first(hits, "fmt").iter().map(|h| h["path"].as_str().unwrap().to_string()).collect::<Vec<_>>(), ["money.py", "test_money.py", "web/index.html"]);
+        // By a line of its text: a page's own script, and a query that says "def".
+        let hits = vec![
+            json!({"path": "test_money.py", "symbol": "test_fmt", "text": "def test_fmt():\n    assert fmt(5) == '$0.05'"}),
+            json!({"path": "web/index.html", "symbol": null, "text": "<script>\n      function fmt(c) { return '$' + Math.floor(c) / 100; }\n</script>"}),
+            json!({"path": "money.py", "symbol": "fmt", "text": "def fmt(c):\n    return f'${c/100:.2f}'"}),
+            json!({"path": "cart.py", "symbol": "total", "text": "def total(self):\n    return fmt(self.sum())"}),
+        ];
+        let order: Vec<String> = definitions_first(hits.clone(), "def fmt").iter().map(|h| h["path"].as_str().unwrap().to_string()).collect();
+        assert_eq!(order, ["web/index.html", "money.py", "test_money.py", "cart.py"]);
+        // A call is not a definition.
+        assert_eq!(definitions_first(hits, "total")[0]["path"], "cart.py");
         assert!(is_test_path("tests/cart.rs") && is_test_path("web/a.spec.ts") && is_test_path("pkg/x_test.go") && !is_test_path("money.py") && !is_test_path("latest.py"));
     }
 

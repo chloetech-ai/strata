@@ -151,7 +151,7 @@ export function mount(root, ctx) {
     // no second header with level pills, no terminal of its own.
     const embed = !!(ctx.params && ctx.params.embed);
     return h("div", { class: `sy-wrap${embed ? " embed" : ""}` }, embed ? null : agentsBar(),
-      h("div", { class: "sy-main" }, embed ? null : header(a), intentLevel(a), storyLevel(), stepsLevel(), embed ? null : terminalLevel(a)),
+      h("div", { class: "sy-main" }, embed ? null : header(a), intentLevel(a), storyLevel(a), stepsLevel(), embed ? null : terminalLevel(a)),
       h("aside", { class: "sy-side" }, dejaVu(a), knewCard(), embed ? null : talkCard(a)));
   }
 
@@ -203,23 +203,35 @@ export function mount(root, ctx) {
 
   function intentLevel(a) {
     const st = S.story, o = S.outcome;
-    // The task once: not again when the intent is its own first sentence.
-    const lead = String(st.intent || "").replace(/[.…\s]+$/, "");
-    const otherTask = a.task && a.task !== st.intent && !(lead && a.task.startsWith(lead));
+    // The task once (Maya saw it three times): Intent is a one-line
+    // summary; the whole task is the agent page's header, or, on the
+    // story's own page, folded under the summary. A narration that is only
+    // "spawned: <the task>" says "Starting…" instead.
+    const embed = !!(ctx.params && ctx.params.embed);
+    const summary = String(st.intent || a.task || "").replace(/\s+/g, " ").trim();
+    const otherTask = !embed && a.task && a.task.replace(/\s+/g, " ").trim() !== summary;
+    let now = a.narration || a.waiting_for || a.last_event || "";
+    if (/^spawned\b[^:]*:/.test(now)) now = a.state === "starting" ? "Starting…" : "";
     return level("intent", [
-      h("div", { class: "sy-intent" }, inlineCode(st.intent || a.task || "")),
-      h("div", { class: "sy-now" },
+      h("div", { class: "sy-intent", title: summary }, inlineCode(summary)),
+      now ? h("div", { class: "sy-now" },
         a.state === "working" ? h("i", { class: "sy-live-dot" }) : h("i", { class: `sy-dot s-${a.state}` }),
-        h("span", {}, inlineCode(a.narration || a.waiting_for || a.last_event || ""),
-          a.narration_ts ? h("span", { class: "muted" }, ` · ${fmtDur(Date.now() - toMs(a.narration_ts))} ago`) : null)),
-      o || otherTask ? h("div", { class: "sy-meta" },
-        o ? h("span", {}, "outcome ", h("b", {}, o.title), S.goal ? ` of ${S.goal.text.split(":")[0]}` : "") : null,
-        otherTask ? h("span", {}, "task: ", a.task) : null) : null,
+        h("span", {}, inlineCode(now),
+          a.narration_ts ? h("span", { class: "muted" }, ` · ${fmtDur(Date.now() - toMs(a.narration_ts))} ago`) : null)) : null,
+      o ? h("div", { class: "sy-meta" },
+        h("span", {}, "outcome ", h("b", {}, o.title), S.goal ? ` of ${S.goal.text.split(":")[0]}` : ""),
+        // The batch's state: how many of its parts are merged, and done.
+        S.goal && S.goal.parts && S.goal.parts.total > 1
+          ? h("span", { class: S.goal.parts.done ? "sy-gdone" : null }, S.goal.parts.done ? `goal done: ${S.goal.parts.words}` : S.goal.parts.words) : null) : null,
+      otherTask ? h("details", { class: "sy-task" }, h("summary", { class: "lv-link" }, "Show the whole task"), h("p", {}, a.task)) : null,
     ]);
   }
 
-  function storyLevel() {
+  function storyLevel(a) {
     const chs = S.story.chapters;
+    // A turn whose prompt is the task says so rather than quoting it again.
+    const flat = (t) => String(t || "").replace(/\s+/g, " ").trim();
+    const task = flat(a && a.task);
     if (!chs.length) return level("story", h("div", { class: "muted" }, "No turn yet: its first prompt has not been answered."));
     return level("story", h("div", { class: "sy-chs", style: { "--n": Math.min(chs.length, 4) } }, chs.map((c) => {
       // Now: accent. A turn of recalling and reading, no edit or command: a
@@ -233,7 +245,7 @@ export function mount(root, ctx) {
       },
         h("div", { class: "sy-ch-h" }, h("b", {}, `${c.turn} · ${c.title}`), h("span", {}, dur)),
         h("div", { class: "sy-ch-s" }, inlineCode(c.summary || "")),
-        h("div", { class: "sy-ch-f" }, h("span", { class: "sy-by" }, c.prompt?.by === "you" ? "you" : c.prompt?.by || "", ":\u00a0"), h("span", { class: "sy-pr" }, `“${c.prompt?.text || ""}”`)));
+        h("div", { class: "sy-ch-f" }, h("span", { class: "sy-by" }, c.prompt?.by === "you" ? "you" : c.prompt?.by || "", ":\u00a0"), task && flat(c.prompt?.text) === task ? h("span", { class: "sy-pr" }, "the task") : h("span", { class: "sy-pr" }, `“${c.prompt?.text || ""}”`)));
     })));
   }
 
@@ -488,7 +500,8 @@ useStyle("story", `
 .sy-lab small{display:block;font-weight:500;text-transform:none;letter-spacing:0;font-size:11.5px;margin-top:3px;color:var(--muted)}
 .sy-lab-x{display:block;font-weight:500;text-transform:none;letter-spacing:0;font-size:11.5px;margin-top:6px;color:var(--muted)}
 .sy-body{min-width:0}
-.sy-intent{font-size:16.5px;font-weight:620;line-height:1.4;letter-spacing:-.005em;text-wrap:pretty}
+.sy-intent{font-size:16.5px;font-weight:620;line-height:1.4;letter-spacing:-.005em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sy-task{margin-top:6px;font-size:12.5px;color:var(--text-2)}.sy-task>summary{cursor:pointer;list-style:none}.sy-task>summary::-webkit-details-marker{display:none}.sy-task p{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
 .sy-now{display:flex;align-items:baseline;gap:7px;margin-top:8px;color:var(--text-2)}
 .sy-live-dot,.sy-dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--good);align-self:center}
 .sy-live-dot{animation:sy-live 1.8s ease-out infinite}
@@ -496,6 +509,7 @@ useStyle("story", `
 .sy-dot.s-waiting{background:var(--warn)}.sy-dot.s-idle,.sy-dot.s-exited{background:var(--muted)}
 .sy-meta{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:6px;color:var(--muted);font-size:12.5px}
 .sy-meta b{color:var(--text-2);font-weight:600}
+.sy-gdone{color:var(--good);font-weight:600}
 .sy-chs{display:grid;grid-template-columns:repeat(var(--n),minmax(0,1fr));gap:10px}
 .sy-ch{display:flex;flex-direction:column;text-align:left;font:inherit;color:inherit;background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--tone);border-radius:10px;padding:10px 12px 11px;cursor:pointer;min-width:0;box-shadow:var(--shadow-1);transition:border-color .12s,box-shadow .12s}
 .sy-ch:hover{border-color:var(--line-2);border-top-color:var(--tone)}

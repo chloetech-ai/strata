@@ -6192,3 +6192,155 @@ fn an_agent_may_not_kill_processes_it_did_not_start() {
     other.kill().unwrap();
     let _ = other.wait();
 }
+
+// ------------------------------------------------- fix4: the last leftovers
+
+#[test]
+fn a_batch_is_done_when_its_parts_merge_and_main_has_its_own_preview() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((fid, _fcwd, fsid), (cid, _ccwd, _)) = two_branches(&s, &r);
+    hook_as(&s, &fid, json!({ "hook_event_name": "Stop" }));
+    hook_as(&s, &cid, json!({ "hook_event_name": "Stop" }));
+
+    // The chip beside the diff counts the decisions Review counts.
+    let sid8: String = fsid.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    std::fs::write(ctx.path().join("sql.json"), json!({ "text": "3 rows", "columns": ["id", "kind", "text", "ts", "session", "tag", "links", "ctx", "files"], "rows": [
+        [format!("{sid8}:1"), "decision", "The agent freeship said: shipping is free over 50 euros, counted before tax.", now_s(), fsid, "", "", "By: assistant", "src/cart.ts"],
+        [format!("{sid8}:2"), "decision", "The user decided: My decision: keep every existing test.", now_s(), fsid, "stated", "", "By: user", ""],
+        [format!("{sid8}:3"), "fact", "The agent freeship said: cartTotal is called from createSession.", now_s(), fsid, "", "", "By: assistant", "src/cart.ts"]
+    ] }).to_string()).unwrap();
+    let (_, o) = s.get(&format!("/api/agents/{fid}/review"));
+    let (status, b) = s.get(&format!("/api/agents/{fid}/blast"));
+    assert_eq!(status, 200, "{b}");
+    assert_eq!(b["decided"]["count"], o["decisions"]["count"], "blast {} vs review {}", b["decided"], o["decisions"]);
+    assert_eq!(b["decided"]["count"], 2, "{b}");
+
+    // A batch of the two: its parts, none merged, then one, then both: done.
+    let (status, g) = s.post("/api/goals", json!({ "repo": r, "text": "Batch: free shipping and integer cents", "agents": [fid, cid] }));
+    assert_eq!(status, 201, "{g}");
+    let gid = g["goal"]["id"].as_str().unwrap().to_string();
+    assert_eq!(g["goal"]["parts"]["words"], "2 parts, none merged yet", "{g}");
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [cid] }));
+    assert_eq!(status, 200, "{m}");
+    let (_, l) = s.get(&format!("/api/goals?repo={}", enc_q(&r.to_string_lossy())));
+    let row = l["goals"].as_array().unwrap().iter().find(|x| x["id"] == json!(gid)).cloned().unwrap();
+    assert_eq!((row["parts"]["words"].as_str(), row["parts"]["done"].as_bool(), row["state"].as_str()), (Some("2 parts, 1 merged, 1 left"), Some(false), Some("active")), "{row}");
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!(status, 200, "{m}");
+    let (_, d) = s.get(&format!("/api/goals/{gid}"));
+    assert_eq!((d["goal"]["parts"]["words"].as_str(), d["goal"]["parts"]["done"].as_bool()), (Some("2 parts, 2 merged"), Some(true)), "{d}");
+    assert_eq!(d["goal"]["state"], "done", "a batch whose parts are all merged is done: {d}");
+    assert!(d["outcomes"].as_array().unwrap().iter().all(|o| o["merged"] == true && o["state"] == "done"), "{d}");
+
+    // Preview main: its own id in the same proxy, a URL you set, what went in.
+    let (port, _seen) = tiny_app();
+    let q = format!("/api/repos/main-preview?repo={}", enc_q(&r.to_string_lossy()));
+    let (status, mp) = s.get(&q);
+    assert_eq!(status, 200, "{mp}");
+    let mid = mp["id"].as_str().unwrap().to_string();
+    assert!(mid.starts_with("main-") && mp["url"].is_null() && mp["project"] == "proj", "{mp}");
+    assert_eq!(mp["merged"].as_array().unwrap().len(), 2, "{mp}");
+    let jar = format!("wb_preview={TOKEN}");
+    assert_eq!(http_raw().get(format!("{}/preview/{mid}/", s.url)).header("cookie", &jar).call().unwrap().status().as_u16(), 404, "no URL yet");
+    assert_eq!(s.put("/api/repos/main-preview", json!({ "repo": r, "url": "http://example.com:80" })).0, 400);
+    let (status, mp) = s.put("/api/repos/main-preview", json!({ "repo": r, "url": format!("http://127.0.0.1:{port}/") }));
+    assert_eq!(status, 200, "{mp}");
+    assert_eq!((mp["url"].as_str(), mp["by"].as_str()), (Some(format!("http://127.0.0.1:{port}").as_str()), Some("you")), "{mp}");
+    assert_eq!(http_raw().get(format!("{}/preview/{mid}/", s.url)).call().unwrap().status().as_u16(), 401, "the token, as for an agent's");
+    let mut res = http_raw().get(format!("{}/preview/{mid}/", s.url)).header("cookie", &jar).call().unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let body = res.body_mut().read_to_string().unwrap();
+    assert!(body.contains("<script src=\"/preview-overlay.js\"></script>") && body.contains(&format!("href=\"/preview/{mid}/style.css\"")), "{body}");
+    assert_eq!(http_raw().get(format!("{}/preview/main-000000000000/", s.url)).header("cookie", &jar).call().unwrap().status().as_u16(), 404);
+    let (_, mp) = s.put("/api/repos/main-preview", json!({ "repo": r, "url": "" }));
+    assert!(mp["url"].is_null(), "{mp}");
+
+    // The Coach's "allow them in .claude/settings.json" becomes a harness draft.
+    std::fs::write(ctx.path().join("report.json"), json!({ "turns": 3, "tool_calls": 9, "compactions": 0, "suggestions": [
+        { "kind": "permission", "text": "Claude asked for permission 9 times (Bash 9 times) and waited 8m54s in all for the answers: allowing the ones you always approve in the project's `.claude/settings.json` (`permissions.allow`) would spare the waits.", "seconds": 534 },
+        { "kind": "reread", "text": "`cart.ts` was read 6 times.", "seconds": 120 }
+    ] }).to_string()).unwrap();
+    let (status, f) = s.get(&format!("/api/flow?repo={}&minutes=60", enc_q(&r.to_string_lossy())));
+    assert_eq!(status, 200, "{f}");
+    let sg = f["suggestions"].as_array().unwrap();
+    let perm = sg.iter().find(|x| x["from"] == "chloectx" && x["kind"] == "permission").unwrap_or_else(|| panic!("{f}"));
+    assert!(perm["harness"]["href"].as_str().unwrap().starts_with("#/harness/edit/permissions?project=proj&from=coach"), "{perm}");
+    assert_eq!(perm["harness"]["label"], "Make this a harness change");
+    assert!(sg.iter().find(|x| x["kind"] == "reread").unwrap()["harness"].is_null());
+}
+
+#[test]
+fn review_names_the_fix_before_its_check_search_the_definition_and_trace_the_conflict() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = repo();
+    std::fs::create_dir_all(r.join("web")).unwrap();
+    std::fs::write(r.join("web/index.html"), "<button id=pay disabled>Pay</button>\n<script>\nfunction fmt(c) { return '$' + Math.floor(c) / 100; }\n</script>\n").unwrap();
+    std::fs::write(r.join("money.py"), "ROUNDING = \"floor\"\n\n\ndef fmt(cents):\n    return f\"${cents / 100:.2f}\"\n").unwrap();
+    std::fs::write(r.join("test_money.py"), "from money import fmt\n\n\ndef test_fmt():\n    assert fmt(5) == \"$0.05\"\n").unwrap();
+    git(&r, &["add", "."]);
+    git(&r, &["commit", "-q", "-m", "money: rounding down"]);
+    // Rounding changed twice, each time for a reason; the second undoes the first.
+    std::fs::write(r.join("money.py"), "ROUNDING = \"half_up\"\n\n\ndef fmt(cents):\n    return f\"${cents / 100:.2f}\"\n").unwrap();
+    git(&r, &["commit", "-q", "-am", "money: round half up", "-m", "Support ticket #41: customers complained totals were a cent short."]);
+    std::fs::write(r.join("money.py"), "ROUNDING = \"half_even\"\n\n\ndef fmt(cents):\n    return f\"${cents / 100:.2f}\"\n").unwrap();
+    git(&r, &["commit", "-q", "-am", "money: banker's rounding to match the ledger export (finance asked)"]);
+
+    // Trace: the two reasons, in one line, no model.
+    let (status, t) = s.get(&format!("/api/trace?repo={}&q={}", enc_q(&r.to_string_lossy()), enc_q("when and why did ROUNDING change?")));
+    assert_eq!(status, 200, "{t}");
+    let c = &t["conflict"];
+    let text = c["text"].as_str().unwrap_or_else(|| panic!("no conflict: {t}"));
+    assert!(text.contains("ticket #41") && text.contains("finance asked"), "{text}");
+    assert_eq!(c["earlier"]["short"].as_str().unwrap(), &git(&r, &["rev-parse", "--short=7", "HEAD~1"])[..7], "{c}");
+
+    // Search: the definitions of fmt (the page's own too) before the test that calls it.
+    let (status, v) = s.get(&format!("/api/search/quick?repo={}&q=fmt", enc_q(&r.to_string_lossy())));
+    assert_eq!(status, 200, "{v}");
+    let paths: Vec<&str> = v["code"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap()).collect();
+    let at = |p: &str| paths.iter().position(|x| *x == p).unwrap_or_else(|| panic!("{p} not in {paths:?}"));
+    assert!(at("money.py") < at("test_money.py") && at("web/index.html") < at("test_money.py"), "{paths:?}");
+
+    // Review: a one-line fix of the page and a Playwright check with a
+    // function of its own; the headline and the key change are the fix.
+    let a = s.spawn(json!({ "repo": r, "name": "paybutton", "task": "Make the Pay button work" }));
+    let id = a["id"].as_str().unwrap().to_string();
+    let a = s.wait(&id, "idle");
+    let cwd = PathBuf::from(a["cwd"].as_str().unwrap());
+    std::fs::write(cwd.join("web/index.html"), "<button id=pay>Pay</button>\n<script>\nfunction fmt(c) { return '$' + Math.floor(c) / 100; }\n</script>\n").unwrap();
+    std::fs::write(cwd.join("pay_check.js"), "const { chromium } = require('playwright');\n\nasync function checkPay(url) {\n  const b = await chromium.launch();\n  const p = await b.newPage();\n  await p.goto(url);\n  await p.click('#pay');\n  await b.close();\n}\n\ncheckPay(process.argv[2]);\n").unwrap();
+    git(&cwd, &["add", "."]);
+    git(&cwd, &["commit", "-q", "-m", "Pay button: enable it, with a check"]);
+    hook_as(&s, &id, json!({ "hook_event_name": "Stop" }));
+    let (status, o) = s.get(&format!("/api/agents/{id}/review"));
+    assert_eq!(status, 200, "{o}");
+    let head = o["verdict"]["text"].as_str().unwrap();
+    assert!(head.contains("Changes web/index.html") && !head.contains("checkPay"), "the fix, not the check: {head}");
+    assert_eq!(o["pieces"][0]["files"], json!(["web/index.html"]), "{}", o["pieces"]);
+}
+
+#[test]
+fn a_replaced_decision_that_was_yours_says_yours() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((fid, _fcwd, fsid), _) = two_branches(&s, &r);
+    hook_as(&s, &fid, json!({ "hook_event_name": "Stop" }));
+    let sid8: String = fsid.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    // The old note reads as the agent's words, but ChloeCtx kept who said it
+    // (ctx "By: user"); a later one replaces it.
+    std::fs::write(ctx.path().join("sql.json"), json!({ "text": "2 rows", "columns": ["id", "kind", "text", "ts", "session", "tag", "links", "ctx", "files"], "rows": [
+        [format!("{sid8}:1"), "decision", "The agent freeship said: shipping is free over 100 euros.", now_s() - 60, fsid, "superseded", format!("superseded_by:{sid8}:2"), "By: user", "src/cart.ts"],
+        [format!("{sid8}:2"), "decision", "The agent freeship said: shipping is free over 50 euros, counted before tax.", now_s(), fsid, "", format!("supersedes:{sid8}:1"), "By: assistant", "src/cart.ts"]
+    ] }).to_string()).unwrap();
+    let (status, o) = s.get(&format!("/api/agents/{fid}/review"));
+    assert_eq!(status, 200, "{o}");
+    let d = o["decisions"]["list"].as_array().unwrap().iter().find(|d| d["why"] == "replaces").cloned().unwrap_or_else(|| panic!("{}", o["decisions"]));
+    assert_eq!(d["replaces"]["who"], "yours", "{d}");
+    assert_eq!(d["replaces"]["text"], "Shipping is free over 100 euros.", "{d}");
+}

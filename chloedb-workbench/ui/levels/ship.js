@@ -216,7 +216,7 @@ export function mount(root, ctx) {
       h("div", { class: "lv-card-head" }, h("h2", { class: "lv-h2" }, "If this merges")),
       h("div", { class: "sh-tiles" },
         tile(t.functions, "functions changed"), tile(t.callers, t.test_callers ? `callers (+${t.test_callers} in tests)` : "callers"), tile(t.tests, "tests cover them", untested.length ? "warn" : null),
-        tile(t.decisions, "decisions", "ctx"), tile(t.agents, "other agents", t.agents ? "warn" : null), tile(t.files, "files")),
+        tile(b.decided ? b.decided.count : t.decisions, "decisions", "ctx"), tile(t.agents, "other agents", t.agents ? "warn" : null), tile(t.files, "files")),
       untested.length ? h("div", { class: "sh-note warn" }, h("b", {}, "No test names "), untested.map((f, i) => [i ? ", " : "", h("code", { class: "lv-code" }, f.name)]))
         : (b.functions || []).length ? h("div", { class: "sh-note good" }, `Every changed function is named by a test (${plural(b.functions.length, "function")}).`)
         : (b.test_functions || []).length ? h("div", { class: "sh-note" }, h("b", {}, "Only tests changed: "), b.test_functions.map((f, i) => [i ? ", " : "", h("code", { class: "lv-code" }, f.name), h("span", { class: "muted" }, ` ${f.status === "added" ? "new" : f.status === "deleted" ? "removed" : "changed"}`)]))

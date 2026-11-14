@@ -412,11 +412,22 @@ fn names_a_file(text: &str, files: &[String]) -> bool {
 /// …", signed as yours), and the rules of yours that name a changed file.
 /// Facts are not decisions. Those that matter come first: one that replaces
 /// an earlier decision (waits for Still right), yours, a rule.
+/// Who made a decision that another replaces, as Review shows it: "yours"
+/// when it was the user's (by the timeline's rules), else its agent's.
+fn replaced_who(rec: Option<&crate::capsule::Record>) -> Json {
+    match rec {
+        Some(r) if r.text.is_empty() => Json::Null,
+        Some(r) if r.yours => json!("yours"),
+        Some(r) => r.agent.as_ref().map_or(Json::Null, |n| json!(format!("{n}'s"))),
+        None => Json::Null,
+    }
+}
+
 pub(crate) fn decisions_of(sup: &Supervisor, a: &Agent, part: &Json) -> Json {
     let ds = part["decisions"].as_array().cloned().unwrap_or_default();
     let files: Vec<String> = part["blast"]["files"].as_array().into_iter().flatten().filter_map(|f| f["path"].as_str().map(str::to_string)).collect();
     let wanted: Vec<String> = ds.iter().filter_map(|d| d["supersedes"].as_str().map(str::to_string)).collect();
-    let texts = if wanted.is_empty() { HashMap::new() } else { crate::capsule::record_texts(sup, a, &wanted) };
+    let texts = if wanted.is_empty() { HashMap::new() } else { crate::capsule::records(sup, a, &wanted) };
     let mut list: Vec<Json> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for d in &ds {
@@ -433,10 +444,11 @@ pub(crate) fn decisions_of(sup: &Supervisor, a: &Agent, part: &Json) -> Json {
             "agent": d["agent"], "confirmed": confirmed(sup, &id), "why": Json::Null,
         });
         if let Some(old) = d["supersedes"].as_str() {
-            let was = texts.get(old).map(String::as_str).unwrap_or("");
+            let rec = texts.get(old);
+            let was = rec.map(|r| r.text.as_str()).unwrap_or("");
             m["why"] = json!("replaces");
             m["replaces"] = json!({ "id": old, "text": if was.is_empty() { Json::Null } else { json!(crate::capsule::plain_words(was)) },
-                "who": if was.is_empty() { Json::Null } else if crate::capsule::by_user(was, "", "") { json!("yours") } else { Json::Null } });
+                "who": replaced_who(rec), "yours": rec.is_some_and(|r| r.yours) });
         } else if yours {
             m["why"] = json!("yours");
         } else if d["kind"] == "preference" {
@@ -680,6 +692,33 @@ fn entry_point(path: &str) -> bool {
         || ["web/", "pages/", "routes/", "api/", "bin/", "public/", "handlers/", "views/", "cmd/"].iter().any(|d| p.starts_with(d) || p.contains(&format!("/{d}")))
 }
 
+/// A test or a check that drives the app (`pay_check.js`, a Playwright
+/// check; `cart.spec.ts`; `tests/…`): code that checks the change, not the
+/// change a user sees. The headline and the key change name the source
+/// first (Maya: the key change was the test helper, not the fix).
+pub(crate) fn helper_path(path: &str) -> bool {
+    if blast::is_test_path(path) {
+        return true;
+    }
+    let p = path.to_ascii_lowercase();
+    let name = p.rsplit('/').next().unwrap_or(&p);
+    let stem = name.split('.').next().unwrap_or(name);
+    name.contains(".test.") || name.contains(".spec.") || name.contains(".check.") || stem.ends_with("_check") || stem.ends_with("-check") || stem.starts_with("check_")
+        || format!("/{p}").contains("/checks/")
+}
+
+/// How far down a changed file goes when the headline names files: the
+/// source first, then tests and checks, then lockfiles and generated ones.
+fn file_rank(path: &str) -> u8 {
+    if lockfile(path) || generated(path) {
+        2
+    } else if helper_path(path) {
+        1
+    } else {
+        0
+    }
+}
+
 fn lockfile(path: &str) -> bool {
     let name = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("");
     matches!(name, "Cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "poetry.lock" | "Gemfile.lock" | "go.sum" | "composer.lock" | "uv.lock" | "Pipfile.lock" | "bun.lockb")
@@ -780,7 +819,8 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
     // The rings.
     let funcs: Vec<&Json> = b["functions"].as_array().into_iter().flatten().filter(|f| f["status"] != "deleted").collect();
     let mut by_callers = funcs.clone();
-    by_callers.sort_by_key(|f| std::cmp::Reverse(f["callers_total"].as_u64().unwrap_or(0)));
+    // The source's functions before a test's or a check's, then by callers.
+    by_callers.sort_by_key(|f| (helper_path(f["path"].as_str().unwrap_or("")), std::cmp::Reverse(f["callers_total"].as_u64().unwrap_or(0))));
     let fn_names: Vec<String> = by_callers.iter().filter_map(|f| f["name"].as_str().map(|n| format!("{n}()"))).collect();
     let mut callers: Vec<String> = Vec::new();
     let mut texts: HashMap<String, Option<String>> = HashMap::new();
@@ -901,9 +941,16 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
     // What it changes, in its own terms (functions, else files): never what
     // the agent said in chat, which can cut a URL at its first dot.
     let mut changed_files: Vec<String> = files_json.iter().filter_map(|f| f["path"].as_str().map(str::to_string)).collect();
-    // The code it changes before its tests.
-    changed_files.sort_by_key(|p| blast::is_test_path(p));
-    let what_changed = if !fn_names.is_empty() {
+    // The code it changes before its tests and checks.
+    changed_files.sort_by_key(|p| file_rank(p));
+    // The source's functions, else its files, before a check's functions.
+    let src_fns: Vec<String> = by_callers.iter().filter(|f| !helper_path(f["path"].as_str().unwrap_or(""))).filter_map(|f| f["name"].as_str().map(|n| format!("{n}()"))).collect();
+    let src_files: Vec<String> = changed_files.iter().filter(|p| file_rank(p) == 0).cloned().collect();
+    let what_changed = if !src_fns.is_empty() {
+        format!("Changes {}", top(&src_fns, 2))
+    } else if !src_files.is_empty() {
+        format!("Changes {}", top(&src_files, 2))
+    } else if !fn_names.is_empty() {
         format!("Changes {}", top(&fn_names, 2))
     } else if !changed_files.is_empty() {
         format!("Changes {}", top(&changed_files, 2))
@@ -1077,9 +1124,11 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         "medium" => 1,
         _ => 2,
     };
-    // Code before its tests and docs at the same risk: the key change is the fix, not its test helper.
-    let aside = |p: &Json| p["kind"] != "code";
-    pieces.sort_by_key(|p| (rank(p["risk"].as_str().unwrap_or("")), aside(p), std::cmp::Reverse(p["added"].as_u64().unwrap_or(0) + p["removed"].as_u64().unwrap_or(0))));
+    // The source a user sees before its tests, checks and docs, whatever
+    // their risk: the key change is the fix, not its test helper (Maya: a
+    // Playwright check, untested itself, came first as the riskier piece).
+    let aside = |p: &Json| p["kind"] != "code" || p["files"].as_array().is_some_and(|fs| !fs.is_empty() && fs.iter().all(|f| helper_path(f.as_str().unwrap_or(""))));
+    pieces.sort_by_key(|p| (aside(p), rank(p["risk"].as_str().unwrap_or("")), std::cmp::Reverse(p["added"].as_u64().unwrap_or(0) + p["removed"].as_u64().unwrap_or(0))));
     let more = pieces.len().saturating_sub(MAX_PIECES);
     let shown: Vec<Json> = pieces.iter().take(MAX_PIECES).cloned().collect();
     let what: Vec<String> = mech_what.iter().map(|(w, n)| if *n == 1 { format!("1 {}", w.trim_end_matches('s')) } else { format!("{n} {w}") }).collect();
@@ -1262,6 +1311,31 @@ pub fn undo(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checks_and_tests_rank_after_the_source() {
+        for p in ["pay_check.js", "web/pay_check.js", "e2e/checkout.spec.ts", "src/cart.test.ts", "tests/test_cart.py", "checks/pay.js", "check_pay.py", "pay-check.mjs", "x.check.js"] {
+            assert!(helper_path(p), "{p}");
+        }
+        for p in ["web/index.html", "money.py", "src/checkout.ts", "checker.py", "src/checks.rs"] {
+            assert!(!helper_path(p), "{p}");
+        }
+        let mut files = vec!["pay_check.js", "Cargo.lock", "test_checkout_page.py", "web/index.html"];
+        files.sort_by_key(|p| file_rank(p));
+        assert_eq!(files, ["web/index.html", "pay_check.js", "test_checkout_page.py", "Cargo.lock"]);
+    }
+
+    #[test]
+    fn a_replaced_decision_says_whose_it_was() {
+        use crate::capsule::Record;
+        let r = |text: &str, yours: bool, agent: Option<&str>| Record { text: text.into(), yours, agent: agent.map(str::to_string) };
+        // Yours by the timeline's rules, though its words name the agent.
+        assert_eq!(replaced_who(Some(&r("The agent centoff said: half up.", true, Some("centoff")))), json!("yours"));
+        assert_eq!(replaced_who(Some(&r("The agent centoff said: half up.", false, Some("centoff")))), json!("centoff's"));
+        assert_eq!(replaced_who(Some(&r("Half up.", false, None))), Json::Null);
+        assert_eq!(replaced_who(Some(&r("", true, None))), Json::Null);
+        assert_eq!(replaced_who(None), Json::Null);
+    }
 
     #[test]
     fn mechanical_changes_are_told_apart() {

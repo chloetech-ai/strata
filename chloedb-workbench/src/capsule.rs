@@ -558,15 +558,48 @@ fn session_decisions(sup: &Supervisor, a: &Agent, mine: &[Agent], missing: &mut 
 /// The texts of records by id (`chloectx sql`), for the successors of
 /// superseded decisions.
 pub(crate) fn record_texts(sup: &Supervisor, a: &Agent, ids: &[String]) -> HashMap<String, String> {
+    records(sup, a, ids).into_iter().map(|(id, r)| (id, r.text)).collect()
+}
+
+/// A ChloeCtx record read by id: its text, whether it was yours (the same
+/// rules as the decisions timeline, `trail::said_by_you`: the note's own
+/// words, its tag and ctx, and your steers to its agent), and its agent's
+/// name when its session was a Workbench agent's.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Record {
+    pub text: String,
+    pub yours: bool,
+    pub agent: Option<String>,
+}
+
+pub(crate) fn records(sup: &Supervisor, a: &Agent, ids: &[String]) -> HashMap<String, Record> {
     let ids: Vec<String> = ids.iter().filter(|i| i.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_'))).map(|i| format!("'{i}'")).collect();
     if ids.is_empty() {
         return HashMap::new();
     }
-    let sql = format!("SELECT id, text FROM memory WHERE id IN ({}) LIMIT 50", ids.join(", "));
+    let sql = format!("SELECT id, text, tag, ctx, session FROM memory WHERE id IN ({}) LIMIT 50", ids.join(", "));
     let Ran::Out(out) = trail::run_chloectx(&sup.cfg.chloectx_bin, &place(a), &["sql", "--json", &sql], Duration::from_secs(30)) else { return HashMap::new() };
     let cols: Vec<String> = out["columns"].as_array().into_iter().flatten().map(|c| c.as_str().or_else(|| c["name"].as_str()).unwrap_or("").to_string()).collect();
-    let (Some(i), Some(t)) = (cols.iter().position(|c| c == "id"), cols.iter().position(|c| c == "text")) else { return HashMap::new() };
-    out["rows"].as_array().into_iter().flatten().filter_map(Json::as_array).filter_map(|r| Some((r.get(i)?.as_str()?.to_string(), r.get(t)?.as_str()?.to_string()))).collect()
+    let col = |r: &Vec<Json>, name: &str| cols.iter().position(|c| c == name).and_then(|i| r.get(i)).and_then(Json::as_str).unwrap_or("").to_string();
+    if !cols.iter().any(|c| c == "id") || !cols.iter().any(|c| c == "text") {
+        return HashMap::new();
+    }
+    let sessions = trail::Sessions::load(sup);
+    let mut told = HashMap::new();
+    let mut out_map = HashMap::new();
+    for r in out["rows"].as_array().into_iter().flatten().filter_map(Json::as_array) {
+        let id = col(r, "id");
+        if id.is_empty() {
+            continue;
+        }
+        let text = col(r, "text");
+        let session = col(r, "session");
+        let owner = if session.is_empty() { None } else { sessions.agent(&session) };
+        let yours = trail::said_by_you(sup, &text, &col(r, "tag"), &col(r, "ctx"), owner, &mut told);
+        let agent = crate::ask::phrase(&text).0.or_else(|| owner.map(|o| o.name.clone()));
+        out_map.insert(id, Record { text, yours, agent });
+    }
+    out_map
 }
 
 /// The last thing the agent said when its turn ended (Claude Code's

@@ -48,7 +48,38 @@ pub fn routes() -> Router<App> {
 
 async fn blast_route(State(app): State<App>, AxPath(id): AxPath<String>) -> ApiResult {
     let sup = app.sup.clone();
-    Ok(AxJson(blocking(move || blast(&sup, &id)).await?).into_response())
+    Ok(AxJson(
+        blocking(move || {
+            let mut b = blast(&sup, &id)?;
+            // The decisions to show beside it, counted as Review and Ship
+            // count them (one source: `review::decisions_of`), not the
+            // records about these lines that the risk reads.
+            b["decided"] = decided(&sup, &id);
+            Ok(b)
+        })
+        .await?,
+    )
+    .into_response())
+}
+
+/// An agent's decisions as Review and Ship count them: `{count, matter,
+/// routine}`, or null when its branch cannot be read.
+pub(crate) fn decided(sup: &Supervisor, id: &str) -> Json {
+    let Some(a) = sup.agent_row(id) else { return Json::Null };
+    let mut missing = Vec::new();
+    match crate::capsule::part(sup, &a, &mut missing) {
+        Ok(part) => decided_counts(&crate::review::decisions_of(sup, &a, &part)),
+        Err(_) => Json::Null,
+    }
+}
+
+/// The counts of `review::decisions_of`'s answer.
+pub(crate) fn decided_counts(d: &Json) -> Json {
+    json!({
+        "count": d["count"].as_u64().unwrap_or(0),
+        "matter": d["matter"].as_array().map_or(0, Vec::len),
+        "routine": d["routine"].as_u64().unwrap_or(0),
+    })
 }
 
 /// `git <args>` in `dir`: its output, or why it failed.
@@ -1569,6 +1600,13 @@ pub(crate) fn plural(n: usize, one: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chip_counts_what_review_counts() {
+        let d = json!({ "list": [{}, {}, {}], "count": 3, "matter": [{ "why": "yours" }], "routine": 2, "routine_list": [{}, {}] });
+        assert_eq!(decided_counts(&d), json!({ "count": 3, "matter": 1, "routine": 2 }));
+        assert_eq!(decided_counts(&json!({})), json!({ "count": 0, "matter": 0, "routine": 0 }));
+    }
 
     #[test]
     fn finds_definitions_per_language() {

@@ -2983,7 +2983,7 @@ function answered(id, { quiet = false } = {}) {
 const G = { r: null, view: null, req: 0, key: "", ukey: "" };
 const GOAL = {
   start: "/goals/start.js", new: "/goals/newproject.js", needs: "/goals/needs.js",
-  open: "/goals/continue.js", continue: "/goals/continue.js", understand: "/goals/continue.js", change: "/goals/continue.js",
+  open: "/goals/continue.js", continue: "/goals/continue.js", understand: "/goals/continue.js", change: "/goals/continue.js", main: "/goals/continue.js",
   ship: "/goals/review.js", debug: "/goals/debug.js", more: "/goals/more.js",
   harness: "/goals/harness/index.js",
 };

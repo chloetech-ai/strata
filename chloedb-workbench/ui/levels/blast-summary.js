@@ -14,6 +14,21 @@ const KEEP_MS = 5_000;
 const TONE = { low: "good", medium: "warn", high: "crit" };
 const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
 
+/** The decisions, counted as Review and Ship count them (the server's
+ *  `decided`, from review::decisions_of): the ones that matter, the
+ *  routine ones folded. An older server without it: the records about
+ *  these lines. */
+export function decisionsChip(b) {
+  const d = b && b.decided;
+  if (!d) {
+    const n = (b && b.totals && b.totals.decisions) || 0;
+    return n ? ctxChip(plural(n, "decision"), "decisions about these lines, from ChloeCtx") : h("span", {}, "no decisions");
+  }
+  if (!d.count) return h("span", {}, "no decisions");
+  const why = d.matter ? `${d.matter} to confirm or that matter${d.routine ? `, ${d.routine} routine` : ""}` : `${d.routine} routine`;
+  return ctxChip(plural(d.count, "decision"), `${why}: the same decisions Review and Ship list`);
+}
+
 export function mount(host, { api, go }) {
   const box = h("div", { class: "bs", "aria-live": "polite" });
   host.append(box);
@@ -49,7 +64,7 @@ export function mount(host, { api, go }) {
         h("span", {}, plural(t.functions || 0, "function")),
         h("span", {}, plural(t.tests || 0, "test")),
         untested ? h("span", { class: "bs-bad", title: `${untested} changed ${untested === 1 ? "function has" : "functions have"} no test that names ${untested === 1 ? "it" : "them"}` }, `${untested} untested`) : null,
-        t.decisions ? ctxChip(plural(t.decisions, "decision"), "decisions about these lines, from ChloeCtx") : h("span", {}, "no decisions"),
+        decisionsChip(b),
         h("span", { class: "bs-ags", title: (b.agents || []).map((g) => g.detail).join("\n") || null }, (b.agents || []).length ? [(b.agents || []).slice(0, 4).map((g) => avatar(g.agent, 16)), ` ${plural(b.agents.length, "agent")}`] : "no other agent")),
       h("span", { class: "bs-sp" }),
       h("button", { class: "bs-open", type: "button", onclick: () => go(`#/ship/${current}`) }, "Ship →")),

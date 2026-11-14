@@ -489,6 +489,26 @@ export function mount(root, ctx) {
       d.rewind ? linkBtn(I.play, "Rewind", () => ctx.openRewind(d.rewind)) : null);
   }
 
+  /** Two recorded reasons that pull apart, in one line under the timeline
+   *  (the server's `conflict`, read from the diffs and the messages, no
+   *  model): Priya found "half up for ticket #41" against "half even for
+   *  finance" herself. Each commit's tag scrolls to its card. */
+  function conflictLine() {
+    const c = S.data && S.data.conflict;
+    if (!c || !c.text) return null;
+    const go = (side) => {
+      const card = el.querySelector(`[data-item="${CSS.escape(side.id || "")}"]`);
+      if (card) { card.scrollIntoView({ block: "center", behavior: "smooth" }); card.classList.add("flash"); setTimeout(() => card.classList.remove("flash"), 1600); }
+    };
+    return h("div", { class: "tr-conflict", role: "note" },
+      h("span", { class: "tr-conflict-k" }, "⚠ Reasons conflict"),
+      h("span", { class: "tr-conflict-t" }, c.text),
+      h("span", { class: "tr-conflict-l" },
+        h("button", { class: "lv-link", type: "button", onclick: () => go(c.earlier) }, c.earlier.short),
+        " → ",
+        h("button", { class: "lv-link", type: "button", onclick: () => go(c.later) }, c.later.short)));
+  }
+
   function timeline() {
     const d = S.data;
     const r = d.reading || {};
@@ -631,6 +651,7 @@ export function mount(root, ctx) {
           h("div", { class: "tr-left" },
             h("div", { class: "tr-tl-h" }, h("h2", { class: "lv-h2" }, "Where it happened"), h("span", { class: "tr-mut" }, plural((d.timeline || []).length, "card"), ", oldest first")),
             timeline(),
+            conflictLine(),
             missingCard()),
           h("div", { class: "tr-right" }, whoRow(), nowPanel(), thenPanel()))) : null,
     ];
@@ -722,6 +743,11 @@ useStyle("trace", `
 .tr-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,520px);gap:20px;align-items:start}
 .tr-right{display:flex;flex-direction:column;gap:14px;position:sticky;top:0}
 .tr-tl-h{display:flex;gap:10px;align-items:baseline;margin:2px 0 6px}
+.tr-conflict{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;margin:10px 0 4px;padding:9px 12px;border:1px solid var(--warn-line);background:var(--warn-soft);border-radius:8px;font-size:13px;line-height:1.45}
+.tr-conflict-k{font-weight:650;color:var(--warn-ink);white-space:nowrap}
+.tr-conflict-t{flex:1 1 280px;min-width:0;overflow-wrap:anywhere}
+.tr-conflict-l{font:12px var(--mono);white-space:nowrap}
+.tr-it.flash .tr-card{box-shadow:0 0 0 2px var(--warn-line)}
 .tr-tl{list-style:none;margin:0;padding:0;position:relative}
 .tr-tl::before{content:"";position:absolute;left:93px;top:8px;bottom:8px;width:2px;background:var(--line);border-radius:2px}
 .tr-day{padding:14px 0 8px 110px;font-size:11.5px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}

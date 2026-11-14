@@ -741,6 +741,12 @@ struct Commit {
     /// (path, sign, line number, text).
     lines: Vec<(String, char, Option<i64>, String)>,
     files: Vec<String>,
+    /// The message's body (after its subject line).
+    body: String,
+    /// Every line it added and removed in the traced files, normalized
+    /// (whitespace collapsed), for "a later commit undid this one".
+    added: Vec<String>,
+    removed: Vec<String>,
 }
 
 fn pathspecs(r: &Reading) -> Vec<String> {
@@ -782,14 +788,27 @@ fn commits(main: &Path, r: &Reading, ns: &[Needle], missing: &mut Vec<String>) -
     let mut list: Vec<(String, (i64, String, String))> = metas.into_iter().collect();
     list.sort_by_key(|(_, m)| std::cmp::Reverse(m.0));
     list.truncate(24);
+    // Commits made in the same second: the one that descends from more of
+    // the others is the later (git's own order is lost in the map).
+    let depth: HashMap<String, usize> = list
+        .iter()
+        .map(|(sha, m)| {
+            let tied = list.iter().filter(|(o, n)| n.0 == m.0 && o != sha);
+            (sha.clone(), tied.filter(|(o, _)| git(main, &["merge-base", "--is-ancestor", o, sha]).is_ok()).count())
+        })
+        .collect();
+    list.sort_by_key(|(sha, m)| (std::cmp::Reverse(m.0), std::cmp::Reverse(depth.get(sha).copied().unwrap_or(0))));
     let (x, y) = (ns.iter().find(|n| n.role == 'x'), ns.iter().find(|n| n.role == 'y'));
     let mut out = Vec::new();
     for (sha, (at_ms, author, subject)) in list {
-        let mut a: Vec<String> = vec!["show".into(), "--format=".into(), "--no-color".into(), "--no-ext-diff".into(), "-U0".into(), sha.clone(), "--".into()];
+        let mut a: Vec<String> = vec!["show".into(), "--format=%b%x1e".into(), "--no-color".into(), "--no-ext-diff".into(), "-U0".into(), sha.clone(), "--".into()];
         a.extend(specs.iter().cloned());
         let args: Vec<&str> = a.iter().map(String::as_str).collect();
-        let Ok(text) = git(main, &args) else { continue };
-        let files = crate::git::parse_diff(&text);
+        let Ok(shown) = git(main, &args) else { continue };
+        let (body, text) = shown.split_once('\u{1e}').unwrap_or(("", shown.as_str()));
+        let body = body.trim().to_string();
+        let files = crate::git::parse_diff(text);
+        let (mut added, mut removed): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         let mut lines = Vec::new();
         let (mut minus_x, mut plus_y, mut plus_x, mut minus_y, mut any) = (false, false, false, false, false);
         let mut touched = Vec::new();
@@ -803,6 +822,10 @@ fn commits(main: &Path, r: &Reading, ns: &[Needle], missing: &mut Vec<String>) -
                         continue;
                     }
                     let t = l["text"].as_str().unwrap_or("");
+                    let norm_line = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if norm_line.chars().filter(|c| c.is_alphanumeric()).count() >= 3 && added.len() + removed.len() < 600 {
+                        if sign == '+' { added.push(norm_line) } else { removed.push(norm_line) }
+                    }
                     let hit = ns.iter().filter(|n| n.finds(t)).collect::<Vec<_>>();
                     let no = if sign == '+' { l["new_line"].as_i64() } else { l["old_line"].as_i64() };
                     if ns.is_empty() {
@@ -853,7 +876,7 @@ fn commits(main: &Path, r: &Reading, ns: &[Needle], missing: &mut Vec<String>) -
         });
         lines.truncate(MAX_LINES);
         lines.sort_by(|a, b| (a.0.as_str(), a.2.unwrap_or(0), a.1 != '-').cmp(&(b.0.as_str(), b.2.unwrap_or(0), b.1 != '-')));
-        out.push(Commit { sha, at_ms, author, subject, change, lines, files: touched });
+        out.push(Commit { sha, at_ms, author, subject, change, lines, files: touched, body, added, removed });
     }
     // With x and y: the commits that only brought x in count where y came
     // later to the same file (where it started), the others are noise.
@@ -1161,6 +1184,10 @@ pub fn trace(sup: &Supervisor, q: &TraceQ) -> Result<Json_, ApiError> {
         it["tag"] = json!(format!("E{}", n + 1));
     }
 
+    // Two recorded reasons that pull apart (Priya: half up after a ticket
+    // about totals a cent short, then half even for finance's ledger).
+    let conflict = conflict_of(&cs);
+
     // The answer.
     let answer = answer_of(&reading, &ns, &items);
     let key = answer.as_ref().and_then(|a| a["key"].as_str().map(str::to_string));
@@ -1177,11 +1204,66 @@ pub fn trace(sup: &Supervisor, q: &TraceQ) -> Result<Json_, ApiError> {
         "reading": reading_json(&reading, &ns),
         "answer": answer,
         "timeline": items,
+        "conflict": conflict,
         "now": now,
         "links": links,
         "missing": missing,
         "ms": started.elapsed().as_millis() as u64,
     }))
+}
+
+/// The words that say a commit message gives a reason.
+const REASON_WORDS: [&str; 16] = ["because", "after ", " for ", "ticket", "complain", "asked", "so that", "to match", "to fix", "request", "per ", "reported", "customer", "issue", "required", "since "];
+
+/// The reason a commit message gives, quoted from it: its subject, and the
+/// body's first sentence that says why when the subject does not. None when
+/// neither says why (no model: the words of [`REASON_WORDS`], or `#41`).
+fn reason_of(subject: &str, body: &str) -> Option<String> {
+    let says = |s: &str| {
+        let l = format!(" {} ", s.to_lowercase());
+        REASON_WORDS.iter().any(|w| l.contains(w)) || l.as_bytes().windows(2).any(|w| w[0] == b'#' && w[1].is_ascii_digit()) || (l.contains('(') && l.contains(')'))
+    };
+    let subject = one_line(subject, 140);
+    if says(&subject) {
+        return Some(subject);
+    }
+    let sentence = body.split(['.', '\n']).map(str::trim).find(|s| s.len() > 6 && says(s))?;
+    Some(format!("{subject}: {}", one_line(sentence, 140)))
+}
+
+/// When a later commit takes out what an earlier one brought in (a line it
+/// added) or brings back what it took out, and the earlier message gave a
+/// reason: both reasons, quoted, in one line. The newest such pair; no
+/// model, only the diffs and the messages.
+fn conflict_of(cs: &[Commit]) -> Json_ {
+    let mut list: Vec<&Commit> = cs.iter().collect();
+    list.sort_by_key(|c| c.at_ms);
+    for j in (1..list.len()).rev() {
+        let later = list[j];
+        for i in (0..j).rev() {
+            let earlier = list[i];
+            let Some(why) = reason_of(&earlier.subject, &earlier.body) else { continue };
+            let undid = later.removed.iter().any(|l| earlier.added.contains(l));
+            let back = later.added.iter().any(|l| earlier.removed.contains(l));
+            if !undid && !back {
+                continue;
+            }
+            let later_why = reason_of(&later.subject, &later.body).unwrap_or_else(|| one_line(&later.subject, 140));
+            let (es, ls): (String, String) = (earlier.sha.chars().take(7).collect(), later.sha.chars().take(7).collect());
+            let verb = if back { "reverses" } else { "changes what" };
+            let text = if back {
+                format!("Two reasons conflict: {ls} reverses {es}, which was made for \u{201c}{why}\u{201d}; {ls} says \u{201c}{later_why}\u{201d}. Nothing records which one holds now.")
+            } else {
+                format!("Two reasons conflict: {es} was made for \u{201c}{why}\u{201d}, and {ls} changed it for \u{201c}{later_why}\u{201d}. Nothing records which one holds now.")
+            };
+            return json!({
+                "text": text, "kind": verb,
+                "earlier": { "sha": earlier.sha, "short": es, "reason": why, "ts_ms": earlier.at_ms, "id": format!("c-{es}") },
+                "later": { "sha": later.sha, "short": ls, "reason": later_why, "ts_ms": later.at_ms, "id": format!("c-{ls}") },
+            });
+        }
+    }
+    Json_::Null
 }
 
 fn count(items: &[Json_], kind: &str) -> usize {
@@ -1997,6 +2079,30 @@ mod tests {
         let r = read("when and why did to_cents switch between banker's rounding and half up?", None);
         assert_eq!((r.x.as_deref(), r.y.as_deref(), r.between), (Some("banker rounding"), Some("half up"), true), "{r:?}");
         assert_eq!(r.subjects, ["to_cents"]);
+    }
+
+    #[test]
+    fn says_when_two_reasons_conflict() {
+        let c = |sha: &str, at: i64, subject: &str, body: &str, added: &[&str], removed: &[&str]| Commit {
+            sha: sha.into(), at_ms: at, author: "Dana".into(), subject: subject.into(), change: "changed", lines: Vec::new(), files: vec!["money.py".into()], body: body.into(),
+            added: added.iter().map(|s| s.to_string()).collect(), removed: removed.iter().map(|s| s.to_string()).collect(),
+        };
+        let floor = c("4e51a20aa", 1_000, "money: rounding down", "", &["return int(amount * 100)"], &[]);
+        let up = c("9355961bb", 2_000, "money: round half up", "Support ticket #41: customers complained floor lost a cent.", &["return int(Decimal(amount * 100).quantize(1, ROUND_HALF_UP))"], &["return int(amount * 100)"]);
+        let even = c("b72f105cc", 3_000, "money: banker's rounding to match the ledger export (finance asked)", "", &["return round(amount * 100)"], &["return int(Decimal(amount * 100).quantize(1, ROUND_HALF_UP))"]);
+        let v = conflict_of(&[floor.clone(), up.clone(), even.clone()]);
+        let text = v["text"].as_str().unwrap();
+        assert!(text.contains("9355961") && text.contains("b72f105") && text.contains("ticket #41") && text.contains("finance asked"), "{text}");
+        assert_eq!((v["earlier"]["short"].as_str(), v["later"]["short"].as_str()), (Some("9355961"), Some("b72f105")));
+        // A later commit that brings back what a reasoned one took out reverses it.
+        let back = c("d00d000dd", 4_000, "money: back to half up", "", &["return int(Decimal(amount * 100).quantize(1, ROUND_HALF_UP))"], &["return round(amount * 100)"]);
+        let v = conflict_of(&[up.clone(), even.clone(), back]);
+        assert_eq!(v["kind"], "reverses", "{v}");
+        // No reason given, or nothing of the earlier one touched: nothing to say.
+        assert!(conflict_of(&[floor.clone(), c("5", 2_000, "tidy", "", &["x = 1 + 2"], &["y = 3 + 4"])]).is_null());
+        assert!(conflict_of(&[c("1", 1_000, "money: rounding down", "", &["return int(amount * 100)"], &[]), c("2", 2_000, "half up", "", &["z"], &["return int(amount * 100)"])]).is_null());
+        assert_eq!(reason_of("money: round half up", "Support ticket #41: customers complained.").as_deref(), Some("money: round half up: Support ticket #41: customers complained"));
+        assert_eq!(reason_of("rename helpers", "Tidy."), None);
     }
 
     #[test]

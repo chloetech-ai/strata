@@ -209,6 +209,8 @@ function report() {
     errors: [], rereads: [],
     suggestions: [
       { kind: "slow_command", text: "`cargo test -p ledger` took 312 s over 9 runs; run the one test you changed (`cargo test -p ledger refund`) while iterating.", seconds: 312 },
+      // As chloectx's report words it (chloectx/src/report.rs).
+      { kind: "permission", text: "Claude asked for permission 6 times (Bash 6 times) and waited 3m10s in all for the answers: allowing the ones you always approve in the project's `.claude/settings.json` (`permissions.allow`) would spare the waits.", seconds: 190 },
       { kind: "compaction", text: "One session compacted after 2 h; start a fresh session per outcome rather than one long one.", seconds: 60 },
     ],
   });

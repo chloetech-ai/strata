@@ -62,7 +62,11 @@ project, or find out why something went wrong.
 
 `#/p/<project>` is **Since you left**: one sentence on what happened since
 you last looked (agents that ended, branches merged, outcomes done), the
-cards that need you, the agents by state, and the decisions made. **I'm
+cards that need you, the agents by state, and the decisions made. A goal
+split into parts says how many are merged ("3 parts, 1 merged, 2 left")
+and that it is done once every part is. **Preview main** shows the app as
+the main checkout serves it, after a merge, through the same preview as an
+agent's. **I'm
 stepping away** marks the moment; it asks the browser for notifications and
 says plainly what will reach you (a desktop notification while the tab is
 open; nothing by phone or email).
@@ -78,8 +82,9 @@ command still asks. **Read only** starts it changing nothing.
 
 ### The agent page
 
-`#/a/<agent>`: its task, the question it asks you, its Progress (a chapter
-per turn), Changes, Preview and Terminal. **Review and ship** and **Tell**
+`#/a/<agent>`: its task (once, folded: **Show the whole task**), the
+question it asks you, its Progress (a chapter per turn), Changes, Preview
+and Terminal. **Review and ship** and **Tell**
 stay side by side in that order, so one never turns into the other under
 the pointer.
 
@@ -93,7 +98,8 @@ Pick an agent and a turn, and Debug walks to where it went wrong.
 **Why the code is like this** (Trace) answers "when and why did this
 change" from git on every branch, Workbench's events and ChloeCtx; its
 example questions come from this project's own most-changed files and
-commits. **What is failing** lists the tests the agents ran, flaky ones
+commits; when a later commit undid one that gave a reason, it says the two
+reasons conflict. **What is failing** lists the tests the agents ran, flaky ones
 marked. **What agents remember** is ChloeCtx's records.
 
 On a line of a diff, **Why?** says who wrote it and why: the agent's edit

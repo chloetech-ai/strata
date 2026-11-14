@@ -917,6 +917,7 @@ In short:
 | `#/p/<project>` | B1 Since you left |
 | `#/p/<project>/understand[?q=]` | B2 Understand |
 | `#/p/<project>/change` | B3 Start a change |
+| `#/p/<project>/main` | Preview main: the app as the main checkout serves it, after merges |
 | `#/p/<project>/ship`, `/ship/<agent>` | C Review and ship |
 | `#/a/<agent>`, `/changes`, `/preview`, `/terminal` | the agent page and its tabs |
 | `#/debug`, `#/debug/<agent>/<turn>`, `…/wrong` | D, steps 1 to 4 |

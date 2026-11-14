@@ -786,6 +786,31 @@ pub(crate) fn files_of(v: &Json) -> Vec<String> {
     }
 }
 
+/// Who decided a ChloeCtx record: you when you said it ("My decision: …" in
+/// a prompt, or the note says so: its tag `stated`, its ctx `By: user`), or
+/// when it repeats what you told its agent (a steer); else the agent. The
+/// one rule for the decisions timeline and for what a decision replaced.
+/// `told` keeps each agent's steers across calls.
+pub(crate) fn said_by_you(sup: &Supervisor, text: &str, tag: &str, ctx: &str, agent: Option<&Agent>, told: &mut HashMap<String, Vec<String>>) -> bool {
+    if yours_by(text, tag, ctx, &[]) {
+        return true;
+    }
+    agent.is_some_and(|a| {
+        let words = told.entry(a.id.clone()).or_insert_with(|| crate::levels::steers(sup, &a.id).into_iter().map(|x| x.text).collect());
+        yours_by(text, tag, ctx, words)
+    })
+}
+
+/// [`said_by_you`] given the agent's steers.
+pub(crate) fn yours_by(text: &str, tag: &str, ctx: &str, steers: &[String]) -> bool {
+    let (_, said_you, _) = crate::ask::phrase(text);
+    if said_you || crate::capsule::by_user(text, tag, ctx) {
+        return true;
+    }
+    let ts = crate::ask::terms(text);
+    steers.iter().any(|w| crate::ask::overlap(&ts, w) >= 3.min(ts.len().max(1)))
+}
+
 /// `GET /api/decisions`: the repository's decision notes, newest first.
 pub fn decisions(sup: &Supervisor, repo: Option<&str>, limit: usize) -> Result<Json, ApiError> {
     let dir = repo_dir(repo)?;
@@ -805,17 +830,7 @@ pub fn decisions(sup: &Supervisor, repo: Option<&str>, limit: usize) -> Result<J
         let superseded_by = linked(&col(row, "links"), "superseded_by").into_iter().next();
         let agent = session.as_str().and_then(|sid| s.agent(sid));
         let text = col(row, "text").as_str().unwrap_or("").to_string();
-        // Who decided: you when you said it ("My decision: …" in a prompt,
-        // or the note says so), or when it repeats what you told the agent
-        // (a steer or a rule); else the agent, with your Still right if given.
-        let (_, said_you, _) = crate::ask::phrase(&text);
-        let yours = said_you
-            || crate::capsule::by_user(&text, col(row, "tag").as_str().unwrap_or(""), col(row, "ctx").as_str().unwrap_or(""))
-            || agent.is_some_and(|a| {
-                let words = told.entry(a.id.clone()).or_insert_with(|| crate::levels::steers(sup, &a.id).into_iter().map(|x| x.text).collect());
-                let ts = crate::ask::terms(&text);
-                words.iter().any(|w| crate::ask::overlap(&ts, w) >= 3.min(ts.len().max(1)))
-            });
+        let yours = said_by_you(sup, &text, col(row, "tag").as_str().unwrap_or(""), col(row, "ctx").as_str().unwrap_or(""), agent, &mut told);
         let id = col(row, "id");
         list.push(json!({
             "id": id,
@@ -898,6 +913,19 @@ pub fn recording(sup: &Supervisor, id: &str, from_ms: Option<u64>, to_ms: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_is_yours_by_its_words_its_tag_its_ctx_or_your_steers() {
+        assert!(yours_by("The user decided: keep half to even.", "", "", &[]));
+        assert!(yours_by("My decision: keep half to even for now.", "", "", &[]));
+        // The agent's words, but the note says it was the user's.
+        assert!(yours_by("The agent centoff said: to_cents keeps half even.", "stated", "", &[]));
+        assert!(yours_by("The agent centoff said: to_cents keeps half even.", "", "Asked: x\nBy: user", &[]));
+        // It repeats what you told its agent.
+        let steers = vec!["to_cents keeps half to even for the ledger export".to_string()];
+        assert!(yours_by("The agent centoff said: to_cents keeps half to even for the ledger export.", "", "", &steers));
+        assert!(!yours_by("The agent centoff said: tax rounds per line.", "", "By: assistant", &steers));
+    }
 
     #[test]
     fn an_edit_made_by_a_shell_command_is_found() {

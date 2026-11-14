@@ -909,6 +909,11 @@ button.flag.warn:hover { border-color: var(--warn-line); }
   .ag-tabs { padding: 0 var(--s-4); gap: var(--s-4); }
   .ag-tabs a { min-height: var(--touch); }
   .zbody { display: flex; flex-direction: column; }
+  /* A question card above the tabs leaves the diff a sliver of the screen:
+     the tab's body keeps most of the screen and the page scrolls to it. */
+  #zoom-view { overflow-y: auto; overscroll-behavior: contain; }
+  #zoom-view > * { flex-shrink: 0; }
+  #zoom-view > .zbody[data-tab="changes"] { flex: 1 0 auto; min-height: 72svh; }
   .zbody > .termbox, .zbody > .side, .zbody > .changes, .zbody > .ag-host { flex: 1; min-height: 0; }
   .zbody[data-tab="term"] > .side { display: none; }
   .zbody[data-tab="events"] > .termbox { display: none; }
@@ -925,8 +930,14 @@ button.flag.warn:hover { border-color: var(--warn-line); }
   .toasts { left: 12px; right: 12px; bottom: calc(var(--tabh) + env(safe-area-inset-bottom) + 12px); align-items: stretch; }
   .ch-keys { display: none; }
   .dl .gut span { width: 34px; padding-right: 6px; }
-  .hk { padding-left: 86px; }
+  .hk { padding-left: 86px; overflow-wrap: anywhere; }
   .dl .why { opacity: 0; }
+  /* The diff wraps on a phone, as Review's key change does: no sideways
+     scroll inside it (Priya, 26-changes.png). */
+  .cf-body { overflow-x: visible; }
+  .cf-inner { width: auto; min-width: 0; }
+  .dl .t { flex: 1 1 0; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 8px; }
+  .dl .why { position: absolute; right: 6px; top: 1px; margin-left: 0; }
   .sheet { top: 0; width: 100vw; z-index: 30; border-left: 0; animation-name: sheet-up; }
   .sh-head { padding-top: max(8px, env(safe-area-inset-top)); }
   .sh-body { padding: 14px 16px 48px; }

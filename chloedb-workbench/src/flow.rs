@@ -602,6 +602,27 @@ fn applied_key(repo: &str, id: &str) -> String {
     format!("flow:{repo}:{id}")
 }
 
+/// Whether a report's suggestion asks for a hand edit of Claude Code's
+/// settings (its permissions), which Workbench makes as a harness change.
+pub(crate) fn settings_advice(kind: &str, text: &str) -> bool {
+    kind == "permission" || text.contains("settings.json") || text.contains("permissions.allow")
+}
+
+/// Optimize the harness's permissions page with `allow` prefilled in its
+/// draft: `{href, label, allow}`.
+pub(crate) fn harness_link(project: &str, allow: &[String]) -> Json {
+    let enc = |s: &str| -> String {
+        s.bytes()
+            .map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') { (b as char).to_string() } else { format!("%{b:02X}") })
+            .collect()
+    };
+    let mut href = format!("#/harness/edit/permissions?project={}&from=coach", enc(project));
+    for a in allow {
+        href.push_str(&format!("&allow={}", enc(a)));
+    }
+    json!({ "href": href, "label": "Make this a harness change", "allow": allow })
+}
+
 /// The coach's suggestions over the window's rows, then the report's.
 fn suggestions(sup: &Supervisor, repo: &str, flows: &[AgentFlow], from: i64, to: i64, minutes: i64, report: Option<&Json>) -> Vec<Json> {
     let mut out = Vec::new();
@@ -620,6 +641,12 @@ fn suggestions(sup: &Supervisor, repo: &str, flows: &[AgentFlow], from: i64, to:
             }
         }
     }
+    // Every prefix approved more than once, for the report's "allow them
+    // in settings.json": Workbench's way is a harness draft.
+    let mut approved_all: Vec<(String, usize)> = approved.iter().filter(|(_, v)| v.0 >= 2).map(|(p, v)| (format!("Bash({p}:*)"), v.0)).collect();
+    approved_all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let approved_all: Vec<String> = approved_all.into_iter().take(6).map(|x| x.0).filter(|p| !allowed.contains(p)).collect();
+    let project = crate::repos::project_names(sup).get(repo).cloned().unwrap_or_else(|| Path::new(repo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
     let mut allow: Vec<(String, (usize, i64, HashSet<String>))> = approved.into_iter().filter(|(_, v)| v.0 >= ALLOW_AFTER).collect();
     allow.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
     for (prefix, (n, waited, _)) in allow {
@@ -728,7 +755,12 @@ fn suggestions(sup: &Supervisor, repo: &str, flows: &[AgentFlow], from: i64, to:
     // The report's own.
     for (i, s) in report.and_then(|r| r["suggestions"].as_array()).into_iter().flatten().enumerate() {
         let secs = s["seconds"].as_i64();
+        // ChloeCtx says to edit `.claude/settings.json` by hand; Workbench
+        // never touches it, and has a place for that change: a harness
+        // draft (Dev: "no apply button").
+        let harness = settings_advice(s["kind"].as_str().unwrap_or(""), s["text"].as_str().unwrap_or("")).then(|| harness_link(&project, &approved_all));
         out.push(json!({
+            "harness": harness,
             "id": format!("report:{i}"),
             "kind": s["kind"],
             "title": s["text"],
@@ -841,6 +873,17 @@ fn apply(sup: &Supervisor, b: ApplyB) -> Result<Json, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_advice_becomes_a_harness_draft_link() {
+        assert!(settings_advice("permission", "Claude asked for permission 9 times"));
+        assert!(settings_advice("other", "allow them in the project's `.claude/settings.json` (`permissions.allow`)"));
+        assert!(!settings_advice("reread", "`cart.py` was read 9 times"));
+        let l = harness_link("my shop", &["Bash(python3 -m pytest:*)".to_string(), "Bash(ls:*)".to_string()]);
+        assert_eq!(l["href"], "#/harness/edit/permissions?project=my%20shop&from=coach&allow=Bash%28python3%20-m%20pytest%3A%2A%29&allow=Bash%28ls%3A%2A%29");
+        assert_eq!(l["label"], "Make this a harness change");
+        assert_eq!(l["allow"].as_array().unwrap().len(), 2);
+    }
 
     fn ev(seq: i64, ts: i64, kind: &str, tool: Option<&str>, data: Json) -> Event {
         Event { id: format!("a:{seq}"), seq, ts, agent: "a".into(), kind: kind.into(), tool: tool.map(str::to_string), summary: data["message"].as_str().map(str::to_string), data: Some(data.to_string()) }

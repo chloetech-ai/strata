@@ -82,6 +82,21 @@ pub fn scan(sup: &Supervisor) -> Vec<Server> {
     out
 }
 
+/// The processes that listen on a port with `dir` as their working
+/// directory (a dev server started in a project's main checkout, by
+/// anyone): `(pid, command, ports)`, Workbench's own left out.
+pub fn in_dir(dir: &std::path::Path) -> Vec<(i32, String, Vec<u16>)> {
+    let want = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut out: Vec<(i32, String, Vec<u16>)> = listeners()
+        .into_iter()
+        .filter(|l| l.pid != std::process::id() as i32)
+        .filter(|l| l.cwd.as_deref().is_some_and(|c| std::path::Path::new(c).canonicalize().map(|c| c == want).unwrap_or(false)))
+        .map(|l| (l.pid, l.command, l.ports))
+        .collect();
+    out.sort_by_key(|x| x.0);
+    out
+}
+
 /// One agent's servers.
 pub fn of_agent(sup: &Supervisor, id: &str) -> Vec<Server> {
     scan(sup).into_iter().filter(|s| s.agent == id).collect()

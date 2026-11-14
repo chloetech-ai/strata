@@ -15,7 +15,7 @@ import * as sees from "./sees.js";
 import * as versions from "./versions.js";
 
 const ROUTES = [
-  [/^#\/harness\/edit\/permissions/, permissions],
+  [/^#\/harness\/(edit\/)?permissions/, permissions],
   [/^#\/harness\/edit\/memory/, memory],
   [/^#\/harness\/sees/, sees],
   [/^#\/harness\/versions/, versions],

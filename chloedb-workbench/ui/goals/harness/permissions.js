@@ -17,6 +17,21 @@ export function render(host, ctx) {
   const load = () => ctx.api(`/api/harness/permissions?${repoQ(ctx)}`).then((d) => {
     if (!S.alive) return;
     Object.assign(S, { d, repo: d.repo, v: d.version, edits: { ...EMPTY(), ...d.edits }, rules: d.rules, flags: d.lint, impact: d.impact, widens: d.widens, text: d.block, textOk: true, dirty: false });
+    // From the Coach ("Make this a harness change"): its rules prefilled in
+    // the draft, not saved; Save and Promote stay yours.
+    // Read from the address itself: the shell may keep this page mounted
+    // across a change of its query.
+    const q = new URLSearchParams(String(location.hash || "").split("?")[1] || "");
+    const want = q.getAll("allow").map((x) => x.trim()).filter(Boolean);
+    if (want.length && !S.prefillDone) {
+      S.prefillDone = true;
+      S.prefilled = want.filter((t) => !S.rules.some((r) => r.decision === "allow" && r.text === t) && !S.edits.allow.includes(t));
+      S.prefillFrom = q.get("from") || "";
+      for (const t of S.prefilled) S.edits.allow.push(t);
+      draw();
+      if (S.prefilled.length) fromEdits();
+      return;
+    }
     draw();
   }).catch((err) => { if (S.alive) host.replaceChildren(failed(err)); });
 
@@ -54,7 +69,7 @@ export function render(host, ctx) {
   }
   async function save() {
     const r = await saveDraft(ctx, S.repo, S.v.id, { permissions: S.edits });
-    S.v = r.version; S.dirty = false;
+    S.v = r.version; S.dirty = false; S.prefilled = null;
     toast(`Saved to ${r.version.name}.`);
     return r.version;
   }
@@ -121,8 +136,12 @@ export function render(host, ctx) {
     mainCols = h("div", { class: `hx-ed ${S.view}` }, h("div", { class: "pane hx-rpane" }, rulesBox), textPane);
     sideBox = h("div", { class: "hx-side" });
     const sub = `What agents of ${repoName(S.repo)} may do without asking, must ask for, or may never do. Hits are the last 7 days' ${d.calls} tool calls each rule decided; ${d.prompts} of them asked you.`;
+    const pre = S.prefilled ? h("div", { class: "callout hx-prefill", role: "status" }, icon("check", "i"), h("div", {},
+      h("b", {}, S.prefilled.length ? `${S.prefilled.length === 1 ? "1 rule" : `${S.prefilled.length} rules`} from ${S.prefillFrom === "coach" ? "Where the time went" : "the Coach"} in the draft` : "Those rules are already here"),
+      h("p", {}, S.prefilled.length ? [S.prefilled.map((t, i) => [i ? ", " : "", h("code", {}, t)]), ". Nothing is saved yet: check the impact on the right, then Save to a draft and Promote. Your ~/.claude settings are not touched."] : "Every rule the Coach suggested is already allowed in this version."))) : null;
     host.replaceChildren(page({ kicker: `Optimize the harness · editing ${S.v.name}${S.v.state === "draft" ? `, from ${d.current.name}` : " (current)"}`, title: "Permissions", sub, inspector: sideBox, cls: "hx-page" },
       tabs("permissions"),
+      pre,
       h("section", {},
         label(h("span", {}, "Rules ", h("span", { class: "hx-num" }, String(S.rules.length))), h("span", { class: "hx-mut hx-rule-word" }, "deny wins over ask, ask over allow"),
           seg([["structured", "Structured"], ["split", "Split"], ["text", "Text"]], S.view, (k) => { S.view = k; mainCols.className = `hx-ed ${k}`; draw(); }, { label: "View" })),

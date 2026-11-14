@@ -36,6 +36,7 @@ export function resolve(hash, { project = null, agentIds = [] } = {}) {
       if (!c) return { page: "continue", project: b, query };
       if (c === "understand") return { page: "understand", project: b, query };
       if (c === "change") return { page: "change", project: b, query };
+      if (c === "main") return { page: "main", project: b, query };
       if (c === "ship") return { page: "ship", project: b, agent: d || null, query };
       return { redirect: `#/p/${encodeURIComponent(b)}` };
     case "a":

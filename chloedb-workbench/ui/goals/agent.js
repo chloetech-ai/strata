@@ -35,7 +35,7 @@ export function head(a, o = {}) {
     avatar(a, 28),
     h("div", { class: "ag-t" },
       h("h1", {}, a.name, stateDot(g, word), o.project ? h("span", { class: "ag-proj" }, o.project) : null),
-      a.task ? h("p", { class: "ag-task", title: a.task }, a.task) : h("p", { class: "ag-task" }, "No task: it started at a prompt."),
+      taskBlock(a),
       h("div", { class: "ag-meta" },
         a.branch ? h("span", {}, icon("branch", "i sm"), a.branch) : null,
         a.model ? h("span", {}, a.model) : null,
@@ -44,6 +44,27 @@ export function head(a, o = {}) {
         m && o.ship ? h("a", { class: "lv-link", href: o.ship }, "Merged: Undo or see what went in") : null,
         a.read_only ? h("span", {}, "read-only") : null)),
     h("div", { class: "ag-act" }, primary, menu));
+}
+
+// The task, once and in full (Maya counted it three times on this page):
+// folded to two lines with "Show the whole task", which stays open across
+// re-renders of the header. Progress's Intent is a one-line summary of it.
+const openTasks = new Set();
+export function taskBlock(a) {
+  if (!a.task) return h("p", { class: "ag-task" }, "No task: it started at a prompt.");
+  const open = openTasks.has(a.id);
+  const long = a.task.length > 140 || a.task.includes("\n");
+  const p = h("p", { class: `ag-task${open ? " open" : ""}` }, a.task);
+  if (!long) return p;
+  const b = h("button", { type: "button", class: "lv-link ag-more", "aria-expanded": String(open) }, open ? "Show less" : "Show the whole task");
+  b.onclick = () => {
+    if (openTasks.has(a.id)) openTasks.delete(a.id); else openTasks.add(a.id);
+    const now = openTasks.has(a.id);
+    p.classList.toggle("open", now);
+    b.textContent = now ? "Show less" : "Show the whole task";
+    b.setAttribute("aria-expanded", String(now));
+  };
+  return h("div", { class: "ag-taskbox" }, p, b);
 }
 
 /** The tab links. `cur` is one of TABS' keys; `n` the changed files' count. */
@@ -85,6 +106,8 @@ const CSS = `
 .ag-mlist>*:hover,.ag-mlist>*:focus-visible{background:var(--surface-2)}
 .ag-mlist b{font-weight:var(--w-mid)}
 .ag-mlist span{color:var(--text-2);font-size:var(--fs-sm)}
+.ag-head .ag-task.open{display:block;-webkit-line-clamp:unset;white-space:pre-wrap;overflow-wrap:anywhere}
+.ag-more{font-size:var(--fs-sm)}
 .ag-tabs .narrow-tab{display:none}
 @media (max-width:640px){.ag-tabs .narrow-tab{display:inline-flex}.ag-head>.lv-av{display:none}.ag-head .ag-act{width:100%}.ag-head .ag-act>.btn{flex:1}.ag-mlist{width:min(300px,calc(100vw - 32px))}}
 `;
