@@ -241,5 +241,23 @@ for (const v of VIEWS) {
 }
 for (const [, list] of NAV) for (const e of list) assert.ok(VIEWS.some((v) => v.id === e.id || v.id === e.fallback), e.id);
 
+// APC-27: a request of an app's page that is lost on its way says nothing of
+// the server (it forwards the app's requests); the server's own does.
+{
+  const { api, connection } = await import(new URL("core.js", app));
+  globalThis.fetch = async () => ({ status: 200, ok: true, text: async () => "{}" });
+  await api("/v1/health");
+  assert.equal(connection().ok, true);
+  globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
+  await assert.rejects(api("/v1/apps/netops/api/status"), (e) => e.status === 0 && e.answered === false);
+  await assert.rejects(api("/v1/apps/apps/api/apps/a1/sql", { method: "POST", body: {} }));
+  assert.equal(connection().ok, true, "an app's lost request is the app page's to say");
+  await assert.rejects(api("/v1/health"));
+  assert.equal(connection().ok, false, "the server's own lost request says it is not answering");
+  globalThis.fetch = async () => ({ status: 200, ok: true, text: async () => "{}" });
+  await api("/v1/health");
+  assert.equal(connection().ok, true);
+}
+
 console.log("ok");
 process.exit(0);
