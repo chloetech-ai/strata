@@ -1001,7 +1001,9 @@ async fn auth(State(app): State<App>, mut req: Request, next: Next) -> Response 
             }
             let follow: Option<Arc<str>> = follow.map(Into::into);
             let own = who.as_ref().is_some_and(|w| w.root);
-            telemetry::calling(Arc::new(caller), crate::service::FOLLOW.scope(follow, crate::service::OWN.scope(own, keys::noting_change(next.run(req))))).await
+            let scope = who.as_ref().map_or(Scope::Feed, |w| if w.root { Scope::Admin } else { w.scope });
+            let run = Box::pin(crate::service::SCOPE.scope(scope, keys::noting_change(next.run(req))));
+            telemetry::calling(Arc::new(caller), crate::service::FOLLOW.scope(follow, crate::service::OWN.scope(own, run))).await
         }
     };
     let status = res.status().as_u16();
@@ -3568,8 +3570,8 @@ async fn derive_preview(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res 
         let d = chloedb::content::DictEntities::new(model, analyzer).map_err(|e| ApiError::bad(e.to_string()))?;
         let dict = schema_of(&d.table)?;
         let f = dict.field(&d.field).filter(|f| f.ty == chloedb::schema::FieldType::Keyword).ok_or_else(|| ApiError::bad(format!("{}.{} is not a KEYWORD field", dict.table, d.field)))?;
-        let key = (dict.table.clone(), f.name.clone(), analyzer);
-        if let Some(g) = app.svc.gazetteers(std::slice::from_ref(&key), None).await?.get(&key) {
+        let need = chloedb::query::understand::Need::listed((dict.table.clone(), f.name.clone(), analyzer));
+        if let Some(g) = app.svc.gazetteers(std::slice::from_ref(&need), None).await?.get(&need.key) {
             d.set(g.clone());
         }
         return Ok(AxJson(json!({"model": model, "many": true, "values": d.of(text)})));

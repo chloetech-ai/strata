@@ -248,6 +248,10 @@ fn derived_keywords_tag_rows_with_builtin_models_and_dictionaries() {
         ("CREATE TABLE t (id KEYWORD PRIMARY KEY, body TEXT, l KEYWORD[] OPTIONS(derive = 'body', model = 'builtin:lang'))", "makes a stored KEYWORD field"),
         ("CREATE TABLE t (id KEYWORD PRIMARY KEY, body TEXT, l KEYWORD OPTIONS(derive = 'body', model = 'builtin:guess'))", "builtin:lang"),
         ("CREATE TABLE t (id KEYWORD PRIMARY KEY, n INT, l KEYWORD OPTIONS(derive = 'n', model = 'builtin:lang'))", "stored TEXT or KEYWORD field"),
+        // A dictionary of the table itself, which each write would read
+        // again (audit 4, X-C2).
+        ("CREATE TABLE t (id KEYWORD PRIMARY KEY, body TEXT, kind KEYWORD, k KEYWORD[] OPTIONS(derive = 'body', model = 'dict:T.kind'))", "itself"),
+        ("ALTER TABLE news ADD COLUMN again KEYWORD[] OPTIONS(derive = 'body', model = 'dict:news.lang')", "itself"),
     ] {
         let e = db.sql(sql, &Params::new()).unwrap_err().to_string();
         assert!(e.contains(says), "{sql}: {e}");

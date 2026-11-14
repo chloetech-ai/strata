@@ -240,6 +240,44 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The options as JSON, which [`Options::from_json`] reads back.
+    pub fn to_json(&self) -> Json {
+        json!({
+            "log": self.log, "judgments": self.judgments, "table": self.table, "profile": self.profile, "since": self.since,
+            "k": self.k, "max_queries": self.max_queries, "budget": self.budget, "held_out": self.held_out, "seed": self.seed,
+            "min_gain": self.min_gain, "alpha": self.alpha, "max_slowdown": self.max_slowdown, "min_queries": self.min_queries, "max_holes": self.max_holes,
+        })
+    }
+
+    /// The options a kept proposal (`row`, with its `proof` as JSON text
+    /// or as an object) was measured with, for its table and profile: as
+    /// its proof names them, or, for a proof kept before proofs named
+    /// them, the defaults with the proof's seed and depth.
+    pub fn of_proposal(row: &Json) -> Result<Options> {
+        let proof = match row.get("proof") {
+            Some(Json::String(t)) => serde_json::from_str::<Json>(t).unwrap_or(Json::Null),
+            Some(j) => j.clone(),
+            None => Json::Null,
+        };
+        let mut o = match proof.get("options") {
+            Some(j @ Json::Object(_)) => Options::from_json(j)?,
+            _ => {
+                let mut o = Options::default();
+                if let Some(seed) = proof.get("seed").and_then(|v| v.as_u64()) {
+                    o.seed = seed;
+                }
+                if let Some(k) = proof.get("k").and_then(|v| v.as_u64()).filter(|k| *k > 0) {
+                    o.k = k as usize;
+                }
+                o
+            }
+        };
+        let s = |k: &str| row.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+        o.table = s("target");
+        o.profile = s("profile");
+        Ok(o)
+    }
+
     /// Options from JSON: an object of the fields above by name (`since` as
     /// ISO 8601 text or microseconds); unknown names are refused.
     pub fn from_json(j: &Json) -> Result<Options> {
@@ -462,6 +500,9 @@ pub struct Report {
     pub per_query: Vec<Measured>,
     pub holes: Vec<Hole>,
     pub seed: u64,
+    /// The options it was made with ([`Options::to_json`]), which a
+    /// proposal's proof is made again with ([`reprove`]).
+    pub options: Json,
     pub took_ms: f64,
 }
 
@@ -495,6 +536,7 @@ impl Report {
             per_query: Vec::new(),
             holes: Vec::new(),
             seed: o.seed,
+            options: o.to_json(),
             took_ms: 0.0,
         }
     }
@@ -530,6 +572,7 @@ impl Report {
             "per_query": self.per_query.iter().map(|m| json!({"qid": m.qid, "query": m.text, "held_out": m.held_out, "before": r4(m.before), "after": r4(m.after), "keys_before": m.keys_before, "keys_after": m.keys_after})).collect::<Vec<_>>(),
             "holes": self.holes.iter().map(|h| json!({"qid": h.qid, "query": h.query, "row_key": h.row_key})).collect::<Vec<_>>(),
             "seed": self.seed,
+            "options": self.options,
             "took_ms": r4(self.took_ms),
         })
     }
@@ -551,17 +594,20 @@ pub fn proposal_id(r: &Report, ts: i64) -> String {
     format!("{:x}-{}", ts / 1_000_000, r.candidate.as_ref().map(|c| c.hash()).unwrap_or_else(|| "none".into()))
 }
 
-/// The statement that applies proposal row `row` (a JSON object of its
-/// columns) to a database whose profile of that name hashes to
-/// `current_hash` now: refused when it was applied or dismissed, when the
+/// The candidate and the statement that applies proposal row `row` (a
+/// JSON object of its columns) to a database whose profile of that name
+/// is `current` now: refused when it was applied or dismissed, when the
 /// profile changed since it was measured (the proof is of another
 /// profile), and, unless `force`, when its verdict was not to propose.
 ///
 /// The row is data, which whoever may write the proposals table could
 /// have changed: its statement is run only as a `CREATE OR REPLACE RANK
 /// PROFILE` of the row's profile on the row's table, rebuilt from what it
-/// parses to, and never as anything else (a `DROP TABLE`, a function).
-pub fn check_apply(row: &Json, current_hash: Option<&str>, force: bool) -> Result<String> {
+/// parses to, and never as anything else (a `DROP TABLE`, a function);
+/// and only when that profile is the one now with some of its numbers
+/// moved ([`knobs::moved`]), never a ranking of the row's own. Its proof
+/// is a claim too: [`check_reproof`] holds the proof made again.
+pub fn check_apply(row: &Json, current: Option<&RankProfile>, force: bool) -> Result<(RankProfile, String)> {
     let s = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let id = s("id");
     match s("status") {
@@ -572,23 +618,47 @@ pub fn check_apply(row: &Json, current_hash: Option<&str>, force: bool) -> Resul
     if statement.is_empty() {
         return Err(bad(format!("proposal {id} changes nothing: the search found no better numbers")));
     }
-    if current_hash != Some(s("baseline_hash")) {
+    let current_hash = current.map(|p| p.hash());
+    let (Some(current), true) = (current, current_hash.as_deref() == Some(s("baseline_hash"))) else {
         return Err(bad(format!(
             "rank profile {} of {} changed since proposal {id} was measured (it was {}, it is {}): run the autopilot again for a proof of the profile as it is",
             s("profile"),
             s("target"),
             s("baseline_hash"),
-            current_hash.unwrap_or("gone")
+            current_hash.as_deref().unwrap_or("gone")
         )));
-    }
+    };
     if s("verdict") != Verdict::Propose.as_str() && !force {
         return Err(bad(format!("proposal {id}'s verdict is {}, not propose: apply it with force to apply it anyway", s("verdict"))));
     }
     let not_profile = || bad(format!("proposal {id}'s statement is not CREATE OR REPLACE RANK PROFILE {} ON {}: it is not applied", s("profile"), s("target")));
     match crate::query::profile::parse_statement(statement).map_err(|_| not_profile())? {
-        Some(crate::query::profile::Statement::Create { table, profile, replace: true }) if table.eq_ignore_ascii_case(s("target")) && profile.name.eq_ignore_ascii_case(s("profile")) => Ok(knobs::statement(&table, &profile)),
+        Some(crate::query::profile::Statement::Create { table, profile, replace: true }) if table.eq_ignore_ascii_case(s("target")) && profile.name.eq_ignore_ascii_case(s("profile")) => {
+            let profile = RankProfile { name: current.name.clone(), ..profile };
+            if knobs::moved(current, &profile).map_err(|e| bad(format!("proposal {id} is not applied: {e}")))?.is_empty() {
+                return Err(bad(format!("proposal {id} changes nothing: its statement is rank profile {} as it is", current.name)));
+            }
+            let statement = knobs::statement(&table, &profile);
+            Ok((profile, statement))
+        }
         _ => Err(not_profile()),
     }
+}
+
+/// Refuses to apply proposal row `row` when its proof, made again now
+/// ([`reprove`], `again`), does not propose it, unless `force`: the row's
+/// own verdict, gain and proof are what was written to the proposals
+/// table, and the rank log and the grades may have moved since.
+pub fn check_reproof(row: &Json, again: &Report, force: bool) -> Result<()> {
+    if again.verdict == Verdict::Propose || force {
+        return Ok(());
+    }
+    let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    Err(bad(format!(
+        "proposal {id}'s proof, made again now on the rank log and the grades as they are, does not propose it ({}: {}): run the autopilot again, or apply it with force to apply it anyway",
+        again.verdict.as_str(),
+        again.reason
+    )))
 }
 
 // ------------------------------------------------------------ running it
@@ -678,6 +748,22 @@ const EPS: f64 = 1e-4;
 
 /// Runs the autopilot on `snap` of `db` ([`Db::autopilot`]).
 pub fn run(db: &Db, snap: &Snapshot, exec: &ExecOptions, o: &Options) -> Result<Report> {
+    measure(db, snap, exec, o, None)
+}
+
+/// Makes the proof of `candidate` again on `snap` of `db`, without a
+/// search: the profile now and `candidate` replayed on the logged queries
+/// as [`run`] replays them, on the held-out queries of the same split, to
+/// the same verdict. Applying a proposal does this first
+/// ([`Db::apply_proposal`]), so that what is applied is what was measured
+/// now, not what a row of the proposals table says was measured (audit 4,
+/// N-C1 and A6). `candidate` must be the profile with numbers moved
+/// ([`knobs::moved`]).
+pub fn reprove(db: &Db, snap: &Snapshot, exec: &ExecOptions, o: &Options, candidate: &RankProfile) -> Result<Report> {
+    measure(db, snap, exec, o, Some(candidate))
+}
+
+fn measure(db: &Db, snap: &Snapshot, exec: &ExecOptions, o: &Options, fixed: Option<&RankProfile>) -> Result<Report> {
     let t0 = Instant::now();
     let report = |v: Verdict, why: String| Report::empty(v, why, o);
     let Some(log) = snap.table(&o.log) else {
@@ -834,48 +920,12 @@ pub fn run(db: &Db, snap: &Snapshot, exec: &ExecOptions, o: &Options) -> Result<
         judged[0].held_out = false;
     }
     let train: Vec<&Query> = judged.iter().filter(|q| !q.held_out).collect();
-    // The search: coordinate ascent over the profile's numbers.
     let start = knobs::knobs(&profile)?;
-    let mut values: Vec<f64> = start.iter().map(|s| s.value).collect();
-    let mut best = replay.score(&train, &profile, o.k)?;
-    out.evaluations = 1;
-    let mut seen: HashMap<String, f64> = HashMap::new();
-    'rounds: for _round in 0..4 {
-        let mut moved = false;
-        for i in 0..start.len() {
-            for next in tries(values[i]) {
-                if out.evaluations >= o.budget {
-                    break 'rounds;
-                }
-                let mut v = values.clone();
-                v[i] = next;
-                let settings: Vec<Setting> = start.iter().zip(&v).map(|(s, x)| Setting { knob: s.knob.clone(), value: *x }).collect();
-                let Ok(cand) = knobs::with(&profile, &settings) else { continue };
-                let key = cand.hash();
-                let score = match seen.get(&key) {
-                    Some(s) => *s,
-                    None => {
-                        out.evaluations += 1;
-                        let s = replay.score(&train, &cand, o.k).unwrap_or(f64::NEG_INFINITY);
-                        seen.insert(key, s);
-                        s
-                    }
-                };
-                if score > best + EPS {
-                    best = score;
-                    values = v;
-                    moved = true;
-                    break;
-                }
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    let settings: Vec<Setting> = start.iter().zip(&values).map(|(s, x)| Setting { knob: s.knob.clone(), value: *x }).collect();
-    out.changes = start.iter().zip(&values).filter(|(s, x)| s.value != **x).map(|(s, x)| (s.clone(), *x)).collect();
-    let candidate = knobs::with(&profile, &settings)?;
+    let (changes, candidate) = match fixed {
+        Some(c) => (knobs::moved(&profile, c)?, c.clone()),
+        None => search(&replay, &train, &profile, &start, o, &mut out)?,
+    };
+    out.changes = changes;
     // The proof: both rankings on every judged query, on this snapshot,
     // the order of the two alternating so that neither always runs warm.
     let (mut lat_b, mut lat_a) = (Vec::new(), Vec::new());
@@ -922,25 +972,83 @@ pub fn run(db: &Db, snap: &Snapshot, exec: &ExecOptions, o: &Options) -> Result<
     let shown = (judged.len() * o.k).max(1) as f64;
     out.judged_before = jb as f64 / shown;
     out.judged_after = ja as f64 / shown;
-    let metric = format!("nDCG@{}", o.k);
-    let h = &out.held_out;
-    (out.verdict, out.reason) = if out.changes.is_empty() {
-        (Verdict::NoChange, format!("no change to {pname}'s numbers did better on the {} training queries ({} candidates replayed)", train.len(), out.evaluations))
-    } else if h.delta() <= o.min_gain {
-        (Verdict::NoGain, format!("better in training ({:.4} to {:.4}) but not on the {} held-out queries ({:.4} to {:.4}, the least gain proposed is {})", out.train.before, out.train.after, h.queries, h.before, h.after, o.min_gain))
-    } else if h.p > o.alpha {
-        (Verdict::NotSignificant, format!("held-out {metric} {:.4} to {:.4}, {} queries better and {} worse, which the sign test does not tell from chance (p = {:.3} > {})", h.before, h.after, h.better, h.worse, h.p, o.alpha))
-    } else if out.latency_after.1 > out.latency_before.1 * o.max_slowdown && out.latency_after.1 - out.latency_before.1 > 2.0 {
-        (Verdict::Slower, format!("better ({metric} {:.4} to {:.4}) but its p95 is {:.1} ms against {:.1} ms now", h.before, h.after, out.latency_after.1, out.latency_before.1))
-    } else {
-        (Verdict::Propose, format!("held-out {metric} {:.4} to {:.4} ({:+.4}, 95% interval {:+.4} to {:+.4}): {} queries better, {} worse (sign test p = {:.3})", h.before, h.after, h.delta(), h.ci.0, h.ci.1, h.better, h.worse, h.p))
-    };
+    (out.verdict, out.reason) = verdict(&out, o, &pname, train.len());
     if !out.changes.is_empty() {
         out.statement = Some(knobs::statement(&table, &candidate));
         out.candidate = Some(candidate);
     }
     out.took_ms = t0.elapsed().as_secs_f64() * 1e3;
     Ok(out)
+}
+
+/// The verdict on a report's held-out queries and its latency, and why.
+/// The held-out mean must rise by more than the least gain, more queries
+/// must be better than worse and the sign test must tell the split from
+/// chance: the sign test is two-sided, so a gain made of a few queries up
+/// by much and more queries down by a little has a small p too, which
+/// alone would propose it (audit 4, A1).
+fn verdict(out: &Report, o: &Options, pname: &str, trained: usize) -> (Verdict, String) {
+    let metric = format!("nDCG@{}", o.k);
+    let h = &out.held_out;
+    if out.changes.is_empty() {
+        (Verdict::NoChange, format!("no change to {pname}'s numbers did better on the {trained} training queries ({} candidates replayed)", out.evaluations))
+    } else if h.delta() <= o.min_gain {
+        (Verdict::NoGain, format!("better in training ({:.4} to {:.4}) but not on the {} held-out queries ({:.4} to {:.4}, the least gain proposed is {})", out.train.before, out.train.after, h.queries, h.before, h.after, o.min_gain))
+    } else if h.better <= h.worse {
+        (Verdict::NotSignificant, format!("held-out {metric} {:.4} to {:.4}, but {} queries better and {} worse: a gain of a few queries paid for by more is not proposed", h.before, h.after, h.better, h.worse))
+    } else if h.p > o.alpha {
+        (Verdict::NotSignificant, format!("held-out {metric} {:.4} to {:.4}, {} queries better and {} worse, which the sign test does not tell from chance (p = {:.3} > {})", h.before, h.after, h.better, h.worse, h.p, o.alpha))
+    } else if out.latency_after.1 > out.latency_before.1 * o.max_slowdown && out.latency_after.1 - out.latency_before.1 > 2.0 {
+        (Verdict::Slower, format!("better ({metric} {:.4} to {:.4}) but its p95 is {:.1} ms against {:.1} ms now", h.before, h.after, out.latency_after.1, out.latency_before.1))
+    } else {
+        (Verdict::Propose, format!("held-out {metric} {:.4} to {:.4} ({:+.4}, 95% interval {:+.4} to {:+.4}): {} queries better, {} worse (sign test p = {:.3})", h.before, h.after, h.delta(), h.ci.0, h.ci.1, h.better, h.worse, h.p))
+    }
+}
+
+/// The search: coordinate ascent over the profile's numbers, on the
+/// training queries; the knobs moved and the best candidate.
+#[allow(clippy::type_complexity)]
+fn search(replay: &Replay, train: &[&Query], profile: &RankProfile, start: &[Setting], o: &Options, out: &mut Report) -> Result<(Vec<(Setting, f64)>, RankProfile)> {
+    let mut values: Vec<f64> = start.iter().map(|s| s.value).collect();
+    let mut best = replay.score(train, profile, o.k)?;
+    out.evaluations = 1;
+    let mut seen: HashMap<String, f64> = HashMap::new();
+    'rounds: for _round in 0..4 {
+        let mut moved = false;
+        for i in 0..start.len() {
+            for next in tries(values[i]) {
+                if out.evaluations >= o.budget {
+                    break 'rounds;
+                }
+                let mut v = values.clone();
+                v[i] = next;
+                let settings: Vec<Setting> = start.iter().zip(&v).map(|(s, x)| Setting { knob: s.knob.clone(), value: *x }).collect();
+                let Ok(cand) = knobs::with(profile, &settings) else { continue };
+                let key = cand.hash();
+                let score = match seen.get(&key) {
+                    Some(s) => *s,
+                    None => {
+                        out.evaluations += 1;
+                        let s = replay.score(train, &cand, o.k).unwrap_or(f64::NEG_INFINITY);
+                        seen.insert(key, s);
+                        s
+                    }
+                };
+                if score > best + EPS {
+                    best = score;
+                    values = v;
+                    moved = true;
+                    break;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    let settings: Vec<Setting> = start.iter().zip(&values).map(|(s, x)| Setting { knob: s.knob.clone(), value: *x }).collect();
+    let changes = start.iter().zip(&values).filter(|(s, x)| s.value != **x).map(|(s, x)| (s.clone(), *x)).collect();
+    Ok((changes, knobs::with(profile, &settings)?))
 }
 
 #[cfg(test)]
@@ -977,23 +1085,33 @@ mod tests {
 
     #[test]
     fn apply_is_refused_when_stale_closed_or_not_proposed() {
-        let row = json!({"id": "p1", "status": "open", "statement": "CREATE OR REPLACE RANK PROFILE p ON t AS SELECT * FROM t ORDER BY x DESC", "baseline_hash": "aa", "profile": "p", "target": "t", "verdict": "propose"});
-        assert!(check_apply(&row, Some("aa"), false).is_ok());
-        assert!(check_apply(&row, Some("bb"), false).unwrap_err().to_string().contains("changed since"));
+        let (now, other) = (profile("SELECT * FROM t ORDER BY 0.5 * x DESC"), profile("SELECT * FROM t ORDER BY 0.7 * x DESC"));
+        let row = row_of(&now, "CREATE OR REPLACE RANK PROFILE p ON t AS SELECT * FROM t ORDER BY 0.25 * x DESC");
+        assert!(check_apply(&row, Some(&now), false).is_ok());
+        assert!(check_apply(&row, Some(&other), false).unwrap_err().to_string().contains("changed since"));
         assert!(check_apply(&row, None, true).unwrap_err().to_string().contains("gone"));
         let mut weak = row.clone();
         weak["verdict"] = json!("not_significant");
-        assert!(check_apply(&weak, Some("aa"), false).unwrap_err().to_string().contains("force"));
-        assert!(check_apply(&weak, Some("aa"), true).is_ok());
+        assert!(check_apply(&weak, Some(&now), false).unwrap_err().to_string().contains("force"));
+        assert!(check_apply(&weak, Some(&now), true).is_ok());
         let mut done = row.clone();
         done["status"] = json!("applied");
-        assert!(check_apply(&done, Some("aa"), true).is_err());
+        assert!(check_apply(&done, Some(&now), true).is_err());
+    }
+
+    fn profile(ranking: &str) -> RankProfile {
+        RankProfile { name: "p".into(), ranking: ranking.into(), defaults: Default::default() }
+    }
+
+    fn row_of(now: &RankProfile, statement: &str) -> Json {
+        json!({"id": "p1", "status": "open", "statement": statement, "baseline_hash": now.hash(), "profile": "p", "target": "t", "verdict": "propose"})
     }
 
     #[test]
     fn apply_runs_only_the_rank_profile_of_the_row() {
-        let row = json!({"id": "p1", "status": "open", "statement": "CREATE OR REPLACE RANK PROFILE p ON t AS SELECT * FROM t ORDER BY x DESC", "baseline_hash": "aa", "profile": "p", "target": "t", "verdict": "propose"});
-        assert!(check_apply(&row, Some("aa"), false).unwrap().starts_with("CREATE OR REPLACE RANK PROFILE p ON t AS "));
+        let now = profile("SELECT * FROM t ORDER BY 0.5 * x DESC");
+        let row = row_of(&now, "CREATE OR REPLACE RANK PROFILE p ON t AS SELECT * FROM t ORDER BY 0.25 * x DESC");
+        assert!(check_apply(&row, Some(&now), false).unwrap().1.starts_with("CREATE OR REPLACE RANK PROFILE p ON t AS "));
         for bad in [
             "DROP TABLE orders",
             "CREATE FUNCTION f(x INT) RETURNS INT AS 'x'",
@@ -1005,8 +1123,52 @@ mod tests {
         ] {
             let mut r = row.clone();
             r["statement"] = json!(bad);
-            let e = check_apply(&r, Some("aa"), true).unwrap_err().to_string();
+            let e = check_apply(&r, Some(&now), true).unwrap_err().to_string();
             assert!(e.contains("is not applied"), "{bad}: {e}");
         }
+        // A planted ranking of the row's own (audit 4, N-C1): the right
+        // statement, the right profile and table, a verdict to propose and
+        // a large gain, refused even with force, because it is not the
+        // profile now with its numbers moved.
+        let mut forged = row_of(&now, "CREATE OR REPLACE RANK PROFILE p ON t AS SELECT * FROM t ORDER BY CASE WHEN vendor = 'me' THEN 1e9 ELSE 0.5 * x END DESC");
+        forged["gain"] = json!(0.9);
+        let e = check_apply(&forged, Some(&now), true).unwrap_err().to_string();
+        assert!(e.contains("numbers moved"), "{e}");
+        // Nothing moved: nothing to apply.
+        let same = row_of(&now, "CREATE OR REPLACE RANK PROFILE p ON t AS SELECT * FROM t ORDER BY 0.5 * x DESC");
+        assert!(check_apply(&same, Some(&now), true).unwrap_err().to_string().contains("changes nothing"));
+    }
+
+    #[test]
+    fn a_few_queries_up_by_much_and_more_down_do_not_propose() {
+        // Audit 4, A1: 2 held-out queries up by 0.5 and 12 down by 0.01
+        // pass the least gain and a two-sided sign test (p = 0.013).
+        let o = Options::default();
+        let mut r = Report::empty(Verdict::NoWorkload, String::new(), &o);
+        r.changes = vec![(knobs::Setting { knob: knobs::Knob::Default("w".into()), value: 1.0 }, 2.0)];
+        let mut pairs = vec![(0.2, 0.7); 2];
+        pairs.extend(vec![(0.5, 0.49); 12]);
+        r.held_out = Side::of(&pairs, 1);
+        assert!(r.held_out.delta() > o.min_gain && r.held_out.p < o.alpha, "{:?}", r.held_out);
+        let (v, why) = verdict(&r, &o, "p", 30);
+        assert_eq!(v, Verdict::NotSignificant, "{why}");
+        // The same gain from more queries better than worse proposes.
+        let mut pairs = vec![(0.2, 0.3); 12];
+        pairs.extend(vec![(0.5, 0.49); 2]);
+        r.held_out = Side::of(&pairs, 1);
+        assert_eq!(verdict(&r, &o, "p", 30).0, Verdict::Propose);
+    }
+
+    #[test]
+    fn a_proposal_names_the_options_it_was_measured_with() {
+        let o = Options::from_json(&json!({"min_queries": 5, "seed": 7, "alpha": 0.01, "since": 12})).unwrap();
+        let back = Options::from_json(&o.to_json()).unwrap();
+        assert_eq!((back.min_queries, back.seed, back.alpha, back.since), (5, 7, 0.01, Some(12)));
+        let row = json!({"target": "t", "profile": "p", "proof": json!({"options": o.to_json()}).to_string()});
+        let p = Options::of_proposal(&row).unwrap();
+        assert_eq!((p.table.as_deref(), p.profile.as_deref(), p.min_queries, p.seed), (Some("t"), Some("p"), 5, 7));
+        // A proof kept before proofs named their options.
+        let old = Options::of_proposal(&json!({"target": "t", "profile": "p", "proof": {"seed": 9, "k": 5}})).unwrap();
+        assert_eq!((old.seed, old.k, old.min_queries), (9, 5, Options::default().min_queries));
     }
 }

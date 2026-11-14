@@ -130,6 +130,21 @@ tokio::task_local! {
     pub static OWN: bool;
 }
 
+tokio::task_local! {
+    /// The scope of the credential of the request being served: the
+    /// routes and calls from outside set it (HTTP's, gRPC's), so that a
+    /// write deep in the service can tell an admin's from a writer's
+    /// ([`below_admin`]).
+    pub static SCOPE: Scope;
+}
+
+/// Whether the request being served is from a credential below admin
+/// scope ([`SCOPE`]); work of the server's own, outside any request, is
+/// not.
+pub fn below_admin() -> bool {
+    SCOPE.try_with(|s| *s < Scope::Admin).unwrap_or(false) && !own()
+}
+
 /// The tables statement `command` changes: the one it writes, makes,
 /// alters or drops, or whose rank profile it makes or drops.
 fn changed_tables(command: &Command) -> Vec<&str> {
@@ -139,6 +154,17 @@ fn changed_tables(command: &Command) -> Vec<&str> {
         Command::DropTable { tables, .. } => tables.iter().map(String::as_str).collect(),
         Command::AlterTable { table: Some(t), .. } | Command::DropRankProfile { table: Some(t), .. } => vec![t.as_str()],
         _ => Vec::new(),
+    }
+}
+
+/// A field statement `command` makes (a table's, or a column it adds)
+/// that derives from a dictionary (`model = 'dict:<table>.<field>'`).
+fn dictionary_field(command: &Command) -> Option<&chloedb::schema::Field> {
+    let dict = |f: &&chloedb::schema::Field| f.derive.as_ref().is_some_and(|d| d.model.starts_with(chloedb::content::DICT));
+    match command {
+        Command::CreateTable { schema, .. } => schema.fields.iter().find(dict),
+        Command::AlterTable { alters, .. } => alters.iter().filter_map(|a| if let Alter::AddField(f) = a { Some(f) } else { None }).find(dict),
+        _ => None,
     }
 }
 
@@ -2758,25 +2784,26 @@ impl Service {
     /// server's from its database, read once per version of the table; a
     /// coordinator's by a query of its shards, kept for
     /// [`GAZETTEER_TTL`].
-    pub async fn gazetteers(self: &Arc<Self>, needs: &[(String, String, chloedb::text::Analyzer)], like: Option<&QueryReq>) -> Result<chloedb::query::understand::Gazetteers, ApiError> {
+    pub async fn gazetteers(self: &Arc<Self>, needs: &[chloedb::query::understand::Need], like: Option<&QueryReq>) -> Result<chloedb::query::understand::Gazetteers, ApiError> {
         if let Backend::Local(db) = &self.backend {
             let (db, needs) = (db.clone(), needs.to_vec());
             return Ok(tokio::task::spawn_blocking(move || db.gazetteers(&needs)).await.map_err(ApiError::internal)??);
         }
         let mut out = chloedb::query::understand::Gazetteers::new();
-        for key in needs {
+        for need in needs {
+            let key = &need.key;
             if let Some((at, g)) = self.gazetteers.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
-                if at.elapsed() < GAZETTEER_TTL {
+                if at.elapsed() < GAZETTEER_TTL && need.met_by(g) {
                     out.insert(key.clone(), g.clone());
                     continue;
                 }
             }
             let mut r = like.cloned().unwrap_or_default();
-            // The server's own read: a dictionary of up to
-            // MAX_LISTED_VALUES values, past --max-rows.
-            (r.sql, r.params, r.scroll, r.hold, r.own_read) = (chloedb::query::understand::dictionary_sql(&key.0, &key.1), Params::new(), None, false, true);
+            // The server's own read: a dictionary of up to the need's
+            // values, past --max-rows.
+            (r.sql, r.params, r.scroll, r.hold, r.own_read) = (need.sql(), Params::new(), None, false, true);
             let rs = Box::pin(self.query(r)).await?.rs;
-            let g = Arc::new(chloedb::query::understand::Gazetteer::build(&key.1, &rs, key.2));
+            let g = Arc::new(need.build(&rs));
             self.gazetteers.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), (Instant::now(), g.clone()));
             out.insert(key.clone(), g);
         }
@@ -2852,12 +2879,12 @@ impl Service {
     }
 
     /// The answers of [`chloedb::query::understand::Understood::checks`]'s queries.
-    async fn understanding_counts(self: &Arc<Self>, u: &chloedb::query::understand::Understood, like: Option<&QueryReq>) -> Result<Vec<u64>, ApiError> {
+    async fn understanding_counts(self: &Arc<Self>, u: &chloedb::query::understand::Understood, like: Option<&QueryReq>) -> Result<Vec<[u64; 2]>, ApiError> {
         let mut out = Vec::new();
         for c in u.checks() {
             let mut r = like.cloned().unwrap_or_default();
             (r.sql, r.params, r.scroll, r.hold, r.own_read) = (c, Params::new(), None, false, true);
-            out.push(chloedb::query::understand::count_of(&Box::pin(self.query(r)).await?.rs));
+            out.push(chloedb::query::understand::counts_of(&Box::pin(self.query(r)).await?.rs));
         }
         Ok(out)
     }
@@ -4195,6 +4222,19 @@ impl Service {
         // The connectors' configs, runs and state are the server's own.
         for t in changed_tables(&command) {
             crate::connectors::may_change(t, "a statement")?;
+            crate::autopilot::may_change(who.root || who.scope >= Scope::Admin, t, "a statement")?;
+        }
+        // A dictionary's derived field on a coordinator: each shard would
+        // tag its rows from its own slice of the dictionary's table, not
+        // from the dictionary the preview shows (audit 4, X-C2).
+        if matches!(self.backend, Backend::Cluster(_)) {
+            if let Some(f) = dictionary_field(&command) {
+                return Err(ApiError::bad(format!(
+                    "query error: field {} derives from a dictionary ({}), which does not run through a coordinator yet: each shard would tag its rows from its own share of the dictionary's rows. Derive it on one server, or tag the rows before writing them",
+                    f.name,
+                    f.derive.as_ref().map_or("", |d| d.model.as_str())
+                )));
+            }
         }
         if need == Scope::Admin {
             keys::note(obs::truncate(sql, 500).into_owned());
@@ -4683,6 +4723,8 @@ impl Service {
         own_marks_ok(&ops)?;
         // The connectors' configs, runs and state are the server's own.
         crate::connectors::may_write_ops(&ops, || self.default_table().ok().map(|t| t.table.clone()))?;
+        // The autopilot's proposals and judgments are an admin's.
+        crate::autopilot::may_write_ops(&ops, || self.default_table().ok().map(|t| t.table.clone()))?;
         let n = match &self.backend {
             Backend::Local(db) => {
                 // Before any work: a replica, a database behind on its

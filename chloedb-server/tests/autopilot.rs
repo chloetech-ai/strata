@@ -134,3 +134,66 @@ async fn options_refused(c: &reqwest::Client, base: &str) -> bool {
     let (st, j) = post(c, &format!("{base}/v1/relevance/autopilot"), json!({"profiles": "p"})).await;
     st == 400 && j.to_string().contains("no option")
 }
+
+/// The autopilot's proposals and judgments are written by an admin key
+/// only (audit 4, N-C1): a writer could otherwise plant a proposal, or
+/// the grades a proposal's verdict is drawn from, for an admin's Apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_an_admin_writes_the_proposals_and_the_judgments() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::create_empty(&dir.path().join("db"), DbOptions { publish_snapshots: true, ..DbOptions::default() }).unwrap());
+    let schema = (*db.schema()).clone();
+    let agent = AgentConfig { api_key: None, model: chloedb_server::agent::DEFAULT_MODEL.into(), base_url: "http://unused".into() };
+    let mut svc = Service::new(Backend::Local(db.clone()), schema, agent, 16, Duration::from_secs(20));
+    svc.keys = Arc::new(chloedb_server::keys::Keys::open(dir.path().join("keys.json")).unwrap());
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let access = Access { token: Some(chloedb_server::auth::Secret::new("root-token")), ..Default::default() };
+    tokio::spawn(server::serve_http(Arc::new(svc), l, access));
+    let c = chloedb_server::http_client().build().unwrap();
+    let call = |auth: String, path: &'static str, body: Json| {
+        let c = c.clone();
+        let url = format!("{base}{path}");
+        async move {
+            let r = c.post(url).bearer_auth(auth).json(&body).send().await.unwrap();
+            (r.status().as_u16(), r.json::<Json>().await.unwrap_or(Json::Null))
+        }
+    };
+    let root = "root-token".to_string();
+    let key = |scope: &'static str| {
+        let call = call.clone();
+        let root = root.clone();
+        async move {
+            let (st, j) = call(root, "/v1/admin/keys", json!({"name": format!("k-{scope}"), "scope": scope})).await;
+            assert_eq!(st, 200, "{j}");
+            j["secret"].as_str().unwrap().to_string()
+        }
+    };
+    let (writer, admin) = (key("write").await, key("admin").await);
+    for create in [autopilot::judgments_sql(autopilot::JUDGMENTS).unwrap(), autopilot::proposals_sql(autopilot::PROPOSALS).unwrap(), "CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT)".into()] {
+        let (st, j) = call(root.clone(), "/v1/sql", json!({"sql": create})).await;
+        assert_eq!(st, 200, "{j}");
+    }
+    let planted = json!({"id": "planted", "target": "docs", "profile": "p", "ts": "2026-11-14T00:00:00Z", "status": "open", "verdict": "propose", "gain": 0.9, "statement": "CREATE OR REPLACE RANK PROFILE p ON docs AS SELECT * FROM docs ORDER BY id DESC"});
+    let grade = autopilot::judgment_doc("q1", "w001", "d1", 3.0, "human", 0);
+    let writes = [
+        ("/v1/write", json!({"ops": [{"op": "upsert", "table": autopilot::PROPOSALS, "doc": planted}]})),
+        ("/v1/write", json!({"ops": [{"op": "upsert", "table": "notes", "doc": {"id": "n1", "body": "x"}}, {"op": "upsert", "table": autopilot::JUDGMENTS, "doc": grade}]})),
+        ("/v1/sql", json!({"sql": format!("UPDATE {} SET status = 'open' WHERE id = 'x'", autopilot::PROPOSALS)})),
+        ("/v1/sql", json!({"sql": format!("INSERT OR REPLACE INTO {} (id, qid, row_key, grade) VALUES ('q1#d1', 'q1', 'd1', 3.0)", autopilot::JUDGMENTS)})),
+    ];
+    for (path, body) in &writes {
+        let (st, j) = call(writer.clone(), path, body.clone()).await;
+        assert_eq!(st, 403, "{path} {body}: {j}");
+        assert_eq!(j["error_code"], "scope_refused", "{j}");
+        assert!(j["error"].as_str().unwrap().contains("admin key"), "{j}");
+    }
+    // Nothing of a refused write was written, and the writer's other
+    // tables are its own.
+    let (st, j) = call(writer.clone(), "/v1/write", json!({"ops": [{"op": "upsert", "table": "notes", "doc": {"id": "n1", "body": "x"}}]})).await;
+    assert_eq!(st, 200, "{j}");
+    for (path, body) in &writes {
+        let (st, j) = call(admin.clone(), path, body.clone()).await;
+        assert_eq!(st, 200, "{path} {body}: {j}");
+    }
+}

@@ -74,6 +74,67 @@ pub const MAX_VALUES: usize = 20_000;
 pub const MAX_LISTED_VALUES: usize = 200_000;
 /// The values of one field one run of words may name, most rows first.
 pub const MAX_MATCHES: usize = 50;
+/// The words of a query understood, its first: a longer text (a pasted
+/// page) names values in these alone, so that its cost has a bound
+/// (audit 4, X-C4).
+pub const MAX_WORDS: usize = 32;
+/// The runs of words one call confirms and uses, its first: each is a
+/// count query, two scatter rounds' worth through a coordinator.
+pub const MAX_RUNS: usize = 16;
+
+/// A gazetteer's key: its table, its keyword field and the analyzer of
+/// the text field whose words it reads.
+pub type Key = (String, String, Analyzer);
+
+/// A gazetteer a call needs: its key, and the most values to read of its
+/// field ([`MAX_VALUES`] and one more, to tell that a field is too large,
+/// when the field was not listed; [`MAX_LISTED_VALUES`] when it was).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Need {
+    pub key: Key,
+    pub limit: usize,
+}
+
+impl Need {
+    /// A need of every value up to [`MAX_LISTED_VALUES`]: a listed field's,
+    /// a dictionary's.
+    pub fn listed(key: Key) -> Need {
+        Need { key, limit: MAX_LISTED_VALUES }
+    }
+
+    /// A need of a field the call did not list: [`MAX_VALUES`] and one.
+    pub fn unlisted(key: Key) -> Need {
+        Need { key, limit: MAX_VALUES + 1 }
+    }
+
+    /// Whether gazetteer `g` (of this key) answers this need: it holds
+    /// all its field's values, or as many as are needed.
+    pub fn met_by(&self, g: &Gazetteer) -> bool {
+        g.complete || g.limit >= self.limit
+    }
+
+    /// The query that reads it ([`dictionary_sql`]).
+    pub fn sql(&self) -> String {
+        dictionary_sql(&self.key.0, &self.key.1, self.limit)
+    }
+
+    /// The gazetteer from the answer of [`Need::sql`].
+    pub fn build(&self, rows: &ResultSet) -> Gazetteer {
+        Gazetteer::build_read(&self.key.1, rows, self.key.2, self.limit)
+    }
+}
+
+/// `needs` with each key once, at the most values any asked.
+pub fn merge_needs(needs: impl IntoIterator<Item = Need>) -> Vec<Need> {
+    let mut out: Vec<Need> = Vec::new();
+    for n in needs {
+        match out.iter_mut().find(|o| o.key == n.key) {
+            Some(o) => o.limit = o.limit.max(n.limit),
+            None => out.push(n),
+        }
+    }
+    out
+}
 
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
@@ -170,9 +231,11 @@ pub fn fields(schema: &Schema, text_field: &str, listed: Option<&[String]>) -> R
 }
 
 /// The query that reads a field's dictionary: its values and their rows,
-/// most rows first, one more than [`MAX_VALUES`] to tell when it was cut.
-pub fn dictionary_sql(table: &str, field: &str) -> String {
-    format!("SELECT {f}, COUNT(*) FROM {t} GROUP BY {f} ORDER BY COUNT(*) DESC LIMIT {MAX_LISTED_VALUES}", f = Ident::new(field), t = Ident::new(table))
+/// most rows first, `limit` at most (a [`Need`]'s: one more than
+/// [`MAX_VALUES`] for a field not listed, to tell when it was cut, rather
+/// than [`MAX_LISTED_VALUES`] of a field that would be left out).
+pub fn dictionary_sql(table: &str, field: &str, limit: usize) -> String {
+    format!("SELECT {f}, COUNT(*) FROM {t} GROUP BY {f} ORDER BY COUNT(*) DESC LIMIT {limit}", f = Ident::new(field), t = Ident::new(table))
 }
 
 #[derive(Clone, Debug)]
@@ -189,15 +252,34 @@ pub struct Gazetteer {
     /// Whether the field has more values than [`MAX_VALUES`].
     pub cut: bool,
     pub values: usize,
+    /// The most values read ([`Need::limit`]), and whether they were all
+    /// the field's (fewer came).
+    pub limit: usize,
+    pub complete: bool,
     /// Entries by each of their terms.
     by_term: HashMap<String, Vec<u32>>,
     entries: Vec<Entry>,
 }
 
 impl Gazetteer {
-    /// The gazetteer of `field` from the answer of its [`dictionary_sql`].
+    /// The gazetteer of `field` from the answer of its [`dictionary_sql`]
+    /// of every value, up to [`MAX_LISTED_VALUES`].
     pub fn build(field: &str, rows: &ResultSet, a: Analyzer) -> Gazetteer {
-        let mut g = Gazetteer { field: field.to_string(), cut: rows.rows.len() > MAX_VALUES, ..Default::default() };
+        Self::build_read(field, rows, a, MAX_LISTED_VALUES)
+    }
+
+    /// The gazetteer of `field` from the answer of its [`dictionary_sql`]
+    /// of `limit` values. A field cut by a read of a field not listed
+    /// (`limit` [`MAX_VALUES`] and one) is left out by every call that
+    /// reads it so, and a call that lists it reads more: its values are
+    /// not analysed.
+    pub fn build_read(field: &str, rows: &ResultSet, a: Analyzer, limit: usize) -> Gazetteer {
+        let n = rows.rows.len();
+        let mut g = Gazetteer { field: field.to_string(), cut: n > MAX_VALUES, limit, complete: n < limit, ..Default::default() };
+        if g.cut && limit <= MAX_VALUES + 1 {
+            g.values = n;
+            return g;
+        }
         for r in &rows.rows {
             let (Some(Value::Str(v)), Some(n)) = (r.first(), r.get(1).and_then(|n| n.as_i64())) else { continue };
             g.add(v, n.max(0) as u64, a);
@@ -207,7 +289,7 @@ impl Gazetteer {
 
     /// The gazetteer of these values and their rows.
     pub fn of(field: &str, values: &[(&str, u64)], a: Analyzer) -> Gazetteer {
-        let mut g = Gazetteer { field: field.to_string(), ..Default::default() };
+        let mut g = Gazetteer { field: field.to_string(), limit: MAX_LISTED_VALUES, complete: true, ..Default::default() };
         for (v, n) in values {
             g.add(v, *n, a);
         }
@@ -369,30 +451,46 @@ impl Range {
 }
 
 impl Understood {
-    /// The counts [`Understood::confirm`] takes: for each run, the rows
-    /// whose text holds its words, then those of them that hold one of its
-    /// values.
+    /// The query that counts run `s`: the rows whose text holds its words,
+    /// and those of them that hold one of its values, in one query
+    /// ([`counts_of`]).
+    fn check_of(&self, s: &Span) -> String {
+        let words: Vec<String> = words_of(&s.words).iter().map(|(_, w)| w.to_lowercase()).collect();
+        format!(
+            "SELECT COUNT(*), SUM(CASE WHEN {} THEN 1 ELSE 0 END) FROM {} WHERE MATCH({}, {})",
+            s.condition(),
+            Ident::new(&self.table),
+            Ident::new(&self.field),
+            quote(&words.join(" "))
+        )
+    }
+
+    /// The counts [`Understood::confirm`] takes: a query per run (two runs
+    /// of the same words and values share one), each answering the rows
+    /// whose text holds the run's words and those of them that hold one of
+    /// its values ([`counts_of`]).
     pub fn checks(&self) -> Vec<String> {
-        let t = Ident::new(&self.table);
-        let f = Ident::new(&self.field);
-        let mut out = Vec::new();
+        let mut out: Vec<String> = Vec::new();
         for s in &self.spans {
-            let words: Vec<String> = words_of(&s.words).iter().map(|(_, w)| w.to_lowercase()).collect();
-            let m = format!("MATCH({f}, {})", quote(&words.join(" ")));
-            out.push(format!("SELECT COUNT(*) FROM {t} WHERE {m}"));
-            out.push(format!("SELECT COUNT(*) FROM {t} WHERE {m} AND {}", s.condition()));
+            let c = self.check_of(s);
+            if !out.contains(&c) {
+                out.push(c);
+            }
         }
         out
     }
 
     /// Each run's share from `counts` (the answers of
-    /// [`Understood::checks`]'s queries, in order); the runs whose share is
-    /// below [`Understood::min_share`] are dropped: words that most rows
-    /// saying them use otherwise (`up` for a brand named Up).
-    pub fn confirm(&mut self, counts: &[u64]) {
+    /// [`Understood::checks`]'s queries, in order, by [`counts_of`]); the
+    /// runs whose share is below [`Understood::min_share`] are dropped:
+    /// words that most rows saying them use otherwise (`up` for a brand
+    /// named Up).
+    pub fn confirm(&mut self, counts: &[[u64; 2]]) {
+        let checks = self.checks();
         let spans = std::mem::take(&mut self.spans);
-        for (i, mut s) in spans.into_iter().enumerate() {
-            let (all, held) = (counts.get(2 * i).copied().unwrap_or(0), counts.get(2 * i + 1).copied().unwrap_or(0));
+        for mut s in spans {
+            let at = checks.iter().position(|c| *c == self.check_of(&s));
+            let [all, held] = at.and_then(|i| counts.get(i)).copied().unwrap_or([0, 0]);
             // Words no row's text holds name what the values say.
             let share = if all == 0 { 1.0 } else { held as f64 / all as f64 };
             s.share = Some(share);
@@ -578,7 +676,7 @@ fn without(text: &str, ranges: &[Range]) -> String {
 pub fn spans(text: &str, gazetteers: &[&Gazetteer], a: Analyzer, skip: &[Range]) -> Vec<Span> {
     // Each word's terms, with its offsets.
     let mut words: Vec<(usize, usize, String)> = Vec::new();
-    for (o, w) in words_of(text) {
+    for (o, w) in words_of(text).into_iter().take(MAX_WORDS) {
         if skip.iter().any(|r| o >= r.start && o < r.end) {
             continue;
         }
@@ -667,6 +765,7 @@ pub fn spans(text: &str, gazetteers: &[&Gazetteer], a: Analyzer, skip: &[Range])
     if let Some(c) = cur.take() {
         flush(c, &mut out);
     }
+    out.truncate(MAX_RUNS);
     out
 }
 
@@ -927,7 +1026,7 @@ pub fn plan_sql(sql: &str, params: &Params) -> Result<Option<Understanding>> {
 /// What a caller looks up for [`Understanding::finish`]: a gazetteer of
 /// each (table, keyword field, analyzer), built from the answer of
 /// [`dictionary_sql`].
-pub type Gazetteers = HashMap<(String, String, Analyzer), Arc<Gazetteer>>;
+pub type Gazetteers = HashMap<Key, Arc<Gazetteer>>;
 
 fn schema_of<'a>(catalog: &'a [Arc<Schema>], table: &str) -> Result<&'a Arc<Schema>> {
     catalog.iter().find(|s| s.table.eq_ignore_ascii_case(table)).ok_or_else(|| err(format!("no table {table}")))
@@ -939,9 +1038,10 @@ fn analyzer_of(schema: &Schema, field: &str) -> Result<Analyzer> {
 
 /// The gazetteers understanding `field` of `schema` with `opts` needs:
 /// (table, keyword field, the text field's analyzer).
-pub fn needs_of(schema: &Schema, field: &str, opts: &Options) -> Result<Vec<(String, String, Analyzer)>> {
+pub fn needs_of(schema: &Schema, field: &str, opts: &Options) -> Result<Vec<Need>> {
     let a = analyzer_of(schema, field)?;
-    Ok(fields(schema, field, opts.fields.as_deref())?.keywords.into_iter().map(|k| (schema.table.clone(), k, a)).collect())
+    let fs = fields(schema, field, opts.fields.as_deref())?;
+    Ok(fs.keywords.into_iter().map(|k| (schema.table.clone(), k, a)).map(|key| if fs.listed { Need::listed(key) } else { Need::unlisted(key) }).collect())
 }
 
 /// What `text` says for `field` of `schema` with `opts`, from the
@@ -965,16 +1065,12 @@ pub fn understand_in(schema: &Schema, field: &str, text: &str, opts: &Options, g
 
 impl Understanding {
     /// The gazetteers [`Understanding::finish`] needs.
-    pub fn needs(&self, catalog: &[Arc<Schema>]) -> Result<Vec<(String, String, Analyzer)>> {
+    pub fn needs(&self, catalog: &[Arc<Schema>]) -> Result<Vec<Need>> {
         let mut out = Vec::new();
         for s in self.sites.iter().flatten() {
-            for n in needs_of(schema_of(catalog, &s.table)?, &s.field, &s.opts)? {
-                if !out.contains(&n) {
-                    out.push(n);
-                }
-            }
+            out.extend(needs_of(schema_of(catalog, &s.table)?, &s.field, &s.opts)?);
         }
-        Ok(out)
+        Ok(merge_needs(out))
     }
 
     /// What each call understood, before [`Understood::confirm`].
@@ -1005,8 +1101,8 @@ impl Understanding {
     }
 
     /// [`Understanding::understood`] and [`Understanding::rewrite`], each
-    /// run's share counted by `count` (a query's single number).
-    pub fn finish(&self, catalog: &[Arc<Schema>], gaz: &Gazetteers, params: &Params, mut count: impl FnMut(&str) -> Result<u64>) -> Result<(sql::Query, Vec<Understood>)> {
+    /// run's share counted by `count` (a check's two numbers, [`counts_of`]).
+    pub fn finish(&self, catalog: &[Arc<Schema>], gaz: &Gazetteers, params: &Params, mut count: impl FnMut(&str) -> Result<[u64; 2]>) -> Result<(sql::Query, Vec<Understood>)> {
         let mut made = self.understood(catalog, gaz, params)?;
         for u in &mut made {
             let counts = u.checks().iter().map(|c| count(c)).collect::<Result<Vec<_>>>()?;
@@ -1019,6 +1115,14 @@ impl Understanding {
 /// The number a `SELECT COUNT(*)` answered.
 pub fn count_of(rs: &ResultSet) -> u64 {
     rs.rows.first().and_then(|r| r.first()).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64
+}
+
+/// The two numbers a check of [`Understood::checks`] answered: the rows
+/// whose text holds a run's words, and those of them that hold one of its
+/// values (a `SUM` of no rows is NULL: 0).
+pub fn counts_of(rs: &ResultSet) -> [u64; 2] {
+    let n = |i: usize| rs.rows.first().and_then(|r| r.get(i)).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|x| x as i64))).unwrap_or(0).max(0) as u64;
+    [n(0), n(1)]
 }
 
 #[cfg(test)]
@@ -1060,6 +1164,45 @@ mod tests {
     }
 
     #[test]
+    fn a_long_text_is_understood_in_its_first_words_and_runs() {
+        // Audit 4, X-C4: a pasted page of colours and classes.
+        let g = gaz();
+        let gs: Vec<&Gazetteer> = g.iter().collect();
+        let page = ["white", "chair", "black", "lamp", "coffee", "table", "and"].iter().cycle().take(3000).copied().collect::<Vec<_>>().join(" ");
+        let u = understand("p", "body", &page, &opts(Mode::Boost), &gs, &[], Analyzer::English);
+        assert!(!u.spans.is_empty() && u.spans.len() <= MAX_RUNS, "{}", u.spans.len());
+        let last = words_of(&page).into_iter().nth(MAX_WORDS - 1).unwrap().0;
+        assert!(u.spans.iter().all(|s| s.start <= last), "a run past the first {MAX_WORDS} words");
+        // The same words and values are counted once, by one query of
+        // both numbers.
+        let checks = u.checks();
+        assert!(checks.len() < u.spans.len(), "{} checks for {} runs", checks.len(), u.spans.len());
+        assert!(checks.iter().all(|c| c.starts_with("SELECT COUNT(*), SUM(CASE WHEN ")), "{checks:?}");
+        let mut v = u.clone();
+        v.confirm(&checks.iter().map(|c| if c.contains("WHEN color") { [10, 0] } else { [10, 10] }).collect::<Vec<_>>());
+        assert!(v.dropped.iter().all(|s| s.words == "white" || s.words == "black"), "{:?}", v.dropped);
+        assert!(v.spans.iter().all(|s| s.share == Some(1.0)) && !v.spans.is_empty());
+    }
+
+    #[test]
+    fn a_field_not_listed_reads_one_more_than_it_keeps() {
+        let key = ("t".to_string(), "sku".to_string(), Analyzer::English);
+        let (small, all) = (Need::unlisted(key.clone()), Need::listed(key.clone()));
+        assert!(small.sql().ends_with(&format!("LIMIT {}", MAX_VALUES + 1)), "{}", small.sql());
+        assert!(all.sql().ends_with(&format!("LIMIT {MAX_LISTED_VALUES}")));
+        assert_eq!(merge_needs([small.clone(), all.clone(), small.clone()]), vec![all.clone()]);
+        // A field cut by the small read is not analysed, and answers only
+        // the small need; one that holds every value answers both.
+        let rows = |n: usize| ResultSet { columns: vec!["sku".into(), "n".into()], rows: (0..n).map(|i| vec![Value::Str(format!("sku {i}")), Value::Int(1)]).collect(), keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() };
+        let cut = small.build(&rows(MAX_VALUES + 1));
+        assert!(cut.cut && !cut.complete && cut.entries.is_empty());
+        assert!(small.met_by(&cut) && !all.met_by(&cut));
+        let whole = small.build(&rows(10));
+        assert!(whole.complete && !whole.cut && whole.entries.len() == 10);
+        assert!(all.met_by(&whole));
+    }
+
+    #[test]
     fn numbers_say_ranges() {
         let a = Analyzer::English;
         let r = ranges("sofa under $1,500", &["price".into()], a);
@@ -1097,10 +1240,10 @@ mod tests {
         schema.table = "products".into();
         let catalog = vec![Arc::new(schema)];
         let needs = u.needs(&catalog).unwrap();
-        assert_eq!(needs.iter().map(|n| n.1.as_str()).collect::<Vec<_>>(), vec!["class", "color", "finish"]);
+        assert_eq!(needs.iter().map(|n| n.key.1.as_str()).collect::<Vec<_>>(), vec!["class", "color", "finish"]);
         let g = gaz();
         let gaz: Gazetteers = g.into_iter().map(|g| (("products".to_string(), g.field.clone(), Analyzer::English), Arc::new(g))).collect();
-        let (q2, made) = u.finish(&catalog, &gaz, &p, |_| Ok(0)).unwrap();
+        let (q2, made) = u.finish(&catalog, &gaz, &p, |_| Ok([0, 0])).unwrap();
         let text = q2.to_string();
         // A filter keeps the values named in full, and rows without one.
         assert!(text.contains("WHERE (rating > 3) AND (color = 'white' OR finish = 'white' OR color IS NULL AND finish IS NULL) AND (class = 'Coffee Tables' OR class IS NULL)"), "{text}");
@@ -1110,19 +1253,19 @@ mod tests {
         assert!(!text.contains("understand"), "{text}");
         assert_eq!(made.len(), 1);
         // A run most rows saying its words do not hold is left out.
-        let (q2, made) = u.finish(&catalog, &gaz, &p, |c| Ok(if c.contains("class") && c.contains(" AND ") { 1 } else { 100 })).unwrap();
+        let (q2, made) = u.finish(&catalog, &gaz, &p, |c| Ok(if c.contains("WHEN class") { [100, 1] } else { [100, 100] })).unwrap();
         assert!(!q2.to_string().contains("class"), "{q2}");
         assert_eq!(made[0].dropped.len(), 1);
         assert_eq!(made[0].dropped[0].share, Some(0.01));
         // A boost ranks by the conditions a row meets.
         let q = super::super::sql::parse_query("SELECT id FROM products ORDER BY bm25(body, :q, understand => 'boost', understand_fields => 'class, price') DESC LIMIT 10").unwrap();
-        let (q2, made) = plan(&q, &p).unwrap().unwrap().finish(&catalog, &gaz, &p, |_| Ok(0)).unwrap();
+        let (q2, made) = plan(&q, &p).unwrap().unwrap().finish(&catalog, &gaz, &p, |_| Ok([0, 0])).unwrap();
         assert_eq!(q2.to_string(), "SELECT id FROM products ORDER BY (bm25(body, 'white coffee table') * (1 + 0.25 * (CASE WHEN class IN ('Coffee Tables', 'Coffee & Cocktail Tables') THEN 1 ELSE 0 END + CASE WHEN price < 300 THEN 1 ELSE 0 END))) DESC LIMIT 10");
         assert_eq!(made[0].line(), "bm25(body) understood 'white coffee table under 300' with boost of products: boost 0.25 for each of class IN ('Coffee Tables', 'Coffee & Cocktail Tables'), price < 300, ranking by 'white coffee table'");
         // understand => 'off' is the call as written.
         let q = super::super::sql::parse_query("SELECT id FROM products ORDER BY bm25(body, :q, understand => 'off', understand_weight => 2) DESC").unwrap();
         let u = plan(&q, &p).unwrap().unwrap();
-        let (q2, made) = u.finish(&catalog, &gaz, &p, |_| Ok(0)).unwrap();
+        let (q2, made) = u.finish(&catalog, &gaz, &p, |_| Ok([0, 0])).unwrap();
         assert_eq!(q2.to_string(), "SELECT id FROM products ORDER BY bm25(body, :q) DESC");
         assert!(made.is_empty());
     }

@@ -171,6 +171,65 @@ pub fn with(p: &RankProfile, settings: &[Setting]) -> Result<RankProfile> {
     Ok(out)
 }
 
+/// The ranking with every number [`knobs`] counts written as 0, and those
+/// numbers in order: two rankings of one shape differ in these alone.
+fn shape(ranking: &str) -> Result<(String, Vec<f64>)> {
+    let mut q = crate::query::sql::parse_query(ranking)?;
+    let mut found = Vec::new();
+    query_mut(&mut q, &mut |e| {
+        if let Some((x, _)) = number(e) {
+            found.push(x);
+            *e = Expr::value(sql::Value::Number("0".into(), false));
+        }
+    });
+    Ok((q.to_string(), found))
+}
+
+/// The knobs `cand` moved from `p`, each with its new value, when `cand`
+/// is `p` with some of its knobs' numbers changed and nothing else: the
+/// same ranking but for those numbers (a 0 or a 1, which are structure
+/// and no knob, as they were), the same parameters, the same defaults
+/// that are not numbers. Anything else is refused: a proposal changes a
+/// profile's numbers, never what it ranks by (audit 4, N-C1), so a row
+/// of the proposals table that someone wrote by hand cannot carry a
+/// ranking of its own.
+pub fn moved(p: &RankProfile, cand: &RankProfile) -> Result<Vec<(Setting, f64)>> {
+    let not = |why: String| Error::Query(format!("the candidate is not rank profile {} with some of its numbers moved: {why}", p.name));
+    let (a, xs) = shape(&p.ranking)?;
+    let (b, ys) = shape(&cand.ranking).map_err(|e| not(e.to_string()))?;
+    if a != b || xs.len() != ys.len() {
+        return Err(not("its ranking is another".into()));
+    }
+    if p.defaults.len() != cand.defaults.len() || p.defaults.keys().any(|k| !cand.defaults.contains_key(k)) {
+        return Err(not("its parameters are others".into()));
+    }
+    let mut out = Vec::new();
+    for s in knobs(p)? {
+        let to = match &s.knob {
+            Knob::Default(n) => cand.defaults.get(n).and_then(|v| v.as_f64()).ok_or_else(|| not(format!("its default of :{n} is not a number")))?,
+            Knob::Literal { index, .. } => ys[*index],
+        };
+        if !to.is_finite() {
+            return Err(not(format!("{} is not a finite number", s.knob)));
+        }
+        if to != s.value {
+            out.push((s, to));
+        }
+    }
+    // What is not a knob stays as it is.
+    for (i, (x, y)) in xs.iter().zip(&ys).enumerate() {
+        if (*x == 0.0 || *x == 1.0) && x != y {
+            return Err(not(format!("its number {i} of the ranking ({x}, which is structure, not a knob) is {y}")));
+        }
+    }
+    for (k, v) in &p.defaults {
+        if v.as_f64().is_none() && cand.defaults.get(k) != Some(v) {
+            return Err(not(format!("its default of :{k} is another")));
+        }
+    }
+    Ok(out)
+}
+
 /// The statement that makes `p` the profile of `table`.
 pub fn statement(table: &str, p: &RankProfile) -> String {
     let mut s = format!("CREATE OR REPLACE RANK PROFILE {} ON {table} AS {}", p.name, p.ranking);
@@ -226,6 +285,30 @@ mod tests {
         let again: Vec<f64> = knobs(&q).unwrap().iter().map(|s| s.value).collect();
         assert_eq!(again, vec![90.0, 0.75, 3.0]);
         assert_eq!(statement("t", &q), format!("CREATE OR REPLACE RANK PROFILE p ON t AS {} WITH (k => 90)", q.ranking));
+    }
+
+    #[test]
+    fn a_candidate_moves_numbers_and_nothing_else() {
+        let p = profile("SELECT * FROM t ORDER BY 0.3 * bm25(title, :q) + bm25(body, :q) * (1 + :w * coalesce(rating, 0)) DESC LIMIT 100", &[("w", json!(0.2)), ("lang", json!("en"))]);
+        let ks = knobs(&p).unwrap();
+        let set: Vec<Setting> = ks.iter().map(|s| Setting { knob: s.knob.clone(), value: s.value * 2.0 }).collect();
+        let q = with(&p, &set).unwrap();
+        let m = moved(&p, &q).unwrap();
+        assert_eq!(m.iter().map(|(_, to)| *to).collect::<Vec<_>>(), vec![0.4, 0.6]);
+        assert!(moved(&p, &p).unwrap().is_empty());
+        // A forged ranking, another parameter, a structural number, a text
+        // default: refused.
+        let forged = [
+            profile("SELECT * FROM t ORDER BY CASE WHEN vendor = 'me' THEN 1e9 ELSE bm25(body, :q) END DESC", &[("w", json!(0.2)), ("lang", json!("en"))]),
+            profile("SELECT * FROM t ORDER BY 0.3 * bm25(title, :q) + bm25(body, :q) * (1 + :w * coalesce(rating, 0)) DESC LIMIT 100", &[("w", json!(0.2)), ("lang", json!("en")), ("x", json!(1))]),
+            profile("SELECT * FROM t ORDER BY 0.3 * bm25(title, :q) + bm25(body, :q) * (1 + :w * coalesce(rating, 50)) DESC LIMIT 100", &[("w", json!(0.2)), ("lang", json!("en"))]),
+            profile("SELECT * FROM t ORDER BY 0.3 * bm25(title, :q) + bm25(body, :q) * (1 + :w * coalesce(rating, 0)) DESC LIMIT 100000", &[("w", json!(0.2)), ("lang", json!("en"))]),
+            profile("SELECT * FROM t ORDER BY 0.3 * bm25(title, :q) + bm25(body, :q) * (1 + :w * coalesce(rating, 0)) DESC LIMIT 100", &[("w", json!(0.2)), ("lang", json!("fr"))]),
+            profile("SELECT * FROM t WHERE vendor = 'me' ORDER BY 0.3 * bm25(title, :q) + bm25(body, :q) * (1 + :w * coalesce(rating, 0)) DESC LIMIT 100", &[("w", json!(0.2)), ("lang", json!("en"))]),
+        ];
+        for f in forged {
+            assert!(moved(&p, &f).is_err(), "{}", f.ranking);
+        }
     }
 
     #[test]

@@ -21,6 +21,11 @@
 //!   and queries kept in a Strata database of the server's own, and
 //!   searched across a cluster.
 
+// The request layers around a gRPC call (its scope, deadline, routing,
+// audit note, caller, follow and trace task-locals) nest deeper than the
+// compiler's default limit proves them Send.
+#![recursion_limit = "256"]
+
 pub mod agent;
 pub mod answers;
 pub mod alerts;

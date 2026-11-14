@@ -11,6 +11,34 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
+### Relevance autopilot and query understanding (audit 4: N-C1, A1, A6, X-C1, X-C2, X-C4)
+
+- **Auth change:** `relevance_proposals` and `relevance_judgments` are written
+  by admin keys only. A write key's write or statement that changes either
+  answers 403 `scope_refused`; the autopilot's own routes already needed an
+  admin key.
+- Applying a proposal no longer takes its row at its word. Its statement is
+  applied only when it is the rank profile now with some of its numbers
+  moved (a ranking of the row's own is refused, with `force` too), and its
+  proof is made again on the rank log and the grades as they are, with the
+  options it was measured with; when that proof does not propose it, Apply
+  is refused unless `force`. A proof now names its options (`options`).
+- The autopilot no longer proposes a change that made fewer held-out
+  queries better than worse: the two-sided sign test passed 2 queries up by
+  0.5 against 12 down by 0.01. Such a run is `not_significant`.
+- Query understanding reads at most 20,001 values of a field it was not
+  told to read (it read 200,000 and then left the field out), reads each
+  dictionary by one query at a time while the others use the one before,
+  and uses a dictionary up to a second old on a table that takes writes.
+  It understands a text's first 32 words and uses its first 16 runs, and
+  counts each run with one query instead of two (runs of the same words and
+  values share it).
+- A `dict:<table>.<field>` derived field on its own table is refused at
+  `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` (each write read the
+  whole table again); a coordinator refuses `dict:` derived fields, whose
+  shards would tag rows from their own share of the dictionary. Tables that
+  have one keep it.
+
 ## 0.3.3
 
 The afternoon audit's fixes, a ChloeCtx inspector organised by space, and
