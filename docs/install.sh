@@ -233,10 +233,10 @@ say "Try it: a demo catalogue of 20,000 products, with the query console at http
 say "  $bin --demo 20000 --db demo.chloedb"
 say "Then a first search, from another terminal:"
 say "  curl -s 127.0.0.1:7700/v1/sql -H 'content-type: application/json' -d '{\"sql\": \"SELECT title FROM products WHERE MATCH(body, '\\''waterproof jacket'\\'') LIMIT 5\"}'"
-say "The five-minute guide: https://chloetech-ai.github.io/chloedb/site/docs/quickstart.html"
+say "The five-minute guide: https://chloetech.ai/site/docs/quickstart.html"
 if "$INSTALL_DIR/chloedb-server" doctor --help > /dev/null 2>&1; then
   say "Something in the way? $bin doctor checks the version, the Python package, the models and port 7700."
 fi
 case " $EXTRA " in
-  *" chloectx "*) say "ChloeCtx for Claude Code: $INSTALL_DIR/chloectx fetch-model && $INSTALL_DIR/chloectx install --project /absolute/path/to/a/project (see https://chloetech-ai.github.io/chloedb/site/docs/chloectx-setup.html)" ;;
+  *" chloectx "*) say "ChloeCtx for Claude Code: $INSTALL_DIR/chloectx fetch-model && $INSTALL_DIR/chloectx install --project /absolute/path/to/a/project (see https://chloetech.ai/site/docs/chloectx-setup.html)" ;;
 esac
