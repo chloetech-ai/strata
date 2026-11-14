@@ -20,6 +20,8 @@ import inspector from "./inspector.js";
 export default { id: "table", title: "Tables", icon: "table", group: "Build", range: false, keywords: "tables table home search find rows data quality filled empty used by keys storage index meaning vectors semantic", render, onParams };
 
 const TABS = [["search", "Search"], ["data", "Data"], ["quality", "Quality"], ["used", "Used by"], ["storage", "Storage"]];
+/** Tables largest first, as the List sorts them by its Rows; those not counted last, by name. */
+export const tilesOrder = (ts, sizes) => [...ts].sort((a, b) => (sizes[b.table] ?? -1) - (sizes[a.table] ?? -1) || a.table.localeCompare(b.table));
 let again = null;
 function onParams(r) { again?.(r); }
 
@@ -212,7 +214,7 @@ function render(page, r) {
       const text = proseFields(t), vecs = meaningFields(t);
       const o = ownerOf(t.table);
       return h("a", { class: "tbl-tile", href: `#/table/${encodeURIComponent(t.table)}` },
-        h("div", { class: "row nw" }, icon("table"), h("b", { class: "grow ellipsis" }, t.table), sizes[t.table] != null ? h("span", { class: "small muted" }, fmt.si(sizes[t.table]) + " rows") : null),
+        h("div", { class: "row nw" }, icon("table"), h("b", { class: "grow ellipsis" }, t.table), sizes[t.table] != null ? h("span", { class: "small muted nowrap" }, fmt.plural(sizes[t.table], "row")) : null),
         h("div", { class: "small dim ellipsis" }, `${fmt.plural(fs.length, "field")}${text.length ? " · search " + text.map((f) => f.name).join(", ") : " · no text to search"}`),
         idx[t.table] ? h("div", { class: "small muted ellipsis", title: "on disk, and the use of the last 5 minutes" }, use(idx[t.table])) : null,
         h("div", { class: "row nw small", style: { gap: "6px", marginTop: "4px" } },
@@ -234,7 +236,10 @@ function render(page, r) {
     ], { rows: ts, sortKey: "docs", desc: true, onRow: (t) => { location.hash = `#/table/${encodeURIComponent(t.table)}`; } });
     let how = store.get("tables.how", "tiles");
     const host = h("div");
-    const draw = () => clear(host, how === "list" ? h("section", { class: "card" }, h("div", { class: "bd flush" }, listView())) : h("div", { class: "tbl-tiles" }, folded(ts, tile, { key: "tablehome", nameOf: (t) => t.table, label: "Tables of apps" })));
+    // Tiles in the List's order, largest first, their rows counted as the
+    // List counts them (CCB-24).
+    const bySize = tilesOrder(ts, sizes);
+    const draw = () => clear(host, how === "list" ? h("section", { class: "card" }, h("div", { class: "bd flush" }, listView())) : h("div", { class: "tbl-tiles" }, folded(bySize, tile, { key: "tablehome", nameOf: (t) => t.table, label: "Tables of apps" })));
     const total = Object.values(idx).reduce((a, x) => a + (x.bytes || 0), 0);
     const head = h("div", { class: "row", style: { gap: "12px", flexWrap: "wrap" } },
       h("span", { class: "small muted grow" }, `${fmt.plural(ts.length, "table")}${mine.length !== ts.length ? `, ${mine.length} yours` : ""}${total ? ` · ${fmt.bytes(total)} on disk` : ""}${Object.keys(idx).length ? " · use over the last 5 minutes" : ""}`),

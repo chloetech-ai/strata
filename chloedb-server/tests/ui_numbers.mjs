@@ -247,6 +247,9 @@ const lines = savedView.versionDiff(oldDef, newDef, sqlView.formatSql);
 assert.deepEqual(lines.filter(([k]) => k !== " ").map(([k, l]) => k + l), ["+WHERE price < 200"]);
 assert.ok(lines.length >= 5, JSON.stringify(lines));
 
+// CCB-24: the tiles are in the List's order, largest first.
+assert.deepEqual(tableView.tilesOrder([{ table: "products" }, { table: "events" }, { table: "notes" }, { table: "a" }], { products: 1200, events: 20000, notes: 3 }).map((t) => t.table), ["events", "products", "notes", "a"]);
+
 // CCW-10: the shell knows each view before its code loads: what views/index.js
 // says of a view (its title, icon, layout, the words the palette finds it by)
 // is what the view's module says, and each view's code loads.
