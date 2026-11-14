@@ -19,6 +19,7 @@
 //! receipts (missed memory, `recomputed` when a replay on the snapshot
 //! ChloeCtx kept gives the same decision). No model is called.
 
+mod fixes;
 mod memory;
 mod perms;
 mod stats;
@@ -1742,6 +1743,38 @@ async fn overview_route(State(app): State<App>, Query(q): Query<RepoQ>) -> ApiRe
     Ok(AxJson(blocking(move || overview(&sup, q)).await?).into_response())
 }
 
+/// `GET /api/harness/fixes`: every problem of the window as one ranked list
+/// of changes to the harness (src/harness/fixes.rs).
+async fn fixes_route(State(app): State<App>, Query(q): Query<RepoQ>) -> ApiResult {
+    let sup = app.sup.clone();
+    let v = blocking(move || {
+        let repo = repo_or_default(&sup, q.repo)?;
+        let days = q.days.unwrap_or(WINDOW_DAYS).clamp(1, 90);
+        let (from, to) = window_of(Some(days));
+        let cur = current(&sup, &repo);
+        let cur_e = edits_of(&sup, &cur.id);
+        let w = Win::load(&sup, &repo, from, to);
+        let rules = rules_under(&sup, &repo, &cur, &cur_e);
+        let found = find(&sup, &w, &rules, true);
+        let mut v = fixes::build(&sup, &w, &cur, &cur_e, &found);
+        v["window"] = json!({ "days": days, "from": iso(from), "to": iso(to) });
+        v["draft"] = versions(&sup, &repo).into_iter().find(|v| v.kind == "config" && v.state == "draft").map(|v| v.to_json()).unwrap_or(Json::Null);
+        Ok::<Json, ApiError>(v)
+    })
+    .await?;
+    Ok(AxJson(v).into_response())
+}
+
+/// `POST /api/harness/fixes/apply {repo, ids}`: the ticked fixes into one draft.
+async fn fixes_apply_route(State(app): State<App>, headers: HeaderMap, body: Bytes) -> ApiResult {
+    user_only(&app, &headers)?;
+    let b: fixes::ApplyB = parse_body(&body)?;
+    let sup = app.sup.clone();
+    let v = blocking(move || fixes::apply(&sup, b)).await?;
+    let status = if v["same"] == json!(true) { StatusCode::OK } else { StatusCode::CREATED };
+    Ok((status, AxJson(v)).into_response())
+}
+
 async fn findings_route(State(app): State<App>, Query(q): Query<RepoQ>) -> ApiResult {
     let sup = app.sup.clone();
     let v = blocking(move || overview(&sup, q)).await?;
@@ -1885,6 +1918,8 @@ pub fn routes() -> Router<App> {
     Router::new()
         .route("/api/harness", get(overview_route))
         .route("/api/harness/findings", get(findings_route))
+        .route("/api/harness/fixes", get(fixes_route))
+        .route("/api/harness/fixes/apply", post(fixes_apply_route))
         .route("/api/harness/versions", get(versions_route).post(new_version_route))
         .route("/api/harness/versions/:id", get(version_route))
         .route("/api/harness/versions/:id/promote", post(promote_route))

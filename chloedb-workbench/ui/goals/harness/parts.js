@@ -5,6 +5,7 @@ import { h, useStyle, icon, toMs } from "/levels/common.js";
 /** The goal's tabs; `on` is the one shown. */
 export const TABS = [
   ["overview", "Overview", "#/harness"],
+  ["fixes", "Fix the harness", "#/harness/fixes"],
   ["permissions", "Permissions", "#/harness/edit/permissions"],
   ["memory", "Memory", "#/harness/edit/memory"],
   ["sees", "What the model sees", "#/harness/sees"],

@@ -3,18 +3,21 @@
 // ctx = { api(path, opts), params: { repo }, go(hash), state } as the shell
 // gives every goal page. The pages are:
 //   #/harness                    the week's scorecard, findings, agents by version
+//   #/harness/fixes              every problem as one ranked list of fixes
 //   #/harness/edit/permissions   the permissions editor
 //   #/harness/edit/memory        the memory editor
 //   #/harness/sees[/<agent>]     what the model saw at a turn
 //   #/harness/versions           versions, promote and roll back
 import { h } from "/levels/common.js";
 import * as overview from "./overview.js";
+import * as fixes from "./fixes.js";
 import * as permissions from "./permissions.js";
 import * as memory from "./memory.js";
 import * as sees from "./sees.js";
 import * as versions from "./versions.js";
 
 const ROUTES = [
+  [/^#\/harness\/fixes/, fixes],
   [/^#\/harness\/(edit\/)?permissions/, permissions],
   [/^#\/harness\/edit\/memory/, memory],
   [/^#\/harness\/sees/, sees],
@@ -22,7 +25,7 @@ const ROUTES = [
   [/^#\/harness/, overview],
 ];
 
-const STEPS = [["#/harness/edit/permissions", "Permissions"], ["#/harness/edit/memory", "Memory"], ["#/harness/sees", "What the model sees"], ["#/harness/versions", "Versions"]];
+const STEPS = [["#/harness/fixes", "Fix the harness"], ["#/harness/edit/permissions", "Permissions"], ["#/harness/edit/memory", "Memory"], ["#/harness/sees", "What the model sees"], ["#/harness/versions", "Versions"]];
 
 export function mount(root, ctx) {
   const host = h("div", { class: "hx" });

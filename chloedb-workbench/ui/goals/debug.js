@@ -405,7 +405,8 @@ export function mount(root, ctx) {
     return [
       h("section", { id: "db-fix" }, label("Fix"),
         missed ? h("p", { class: "db-p s" }, "So that agents are reminded of it next time. Each fix stands on its own; none sends the agent anything.") : h("p", { class: "db-p s" }, `Workbench had no note about this turn's change that it left out, so there is nothing to tie to ${files[0] || "a file"}. Write the rule ${name} lacked, for every agent of ${project}:`),
-        list, ruleText, h("div", { class: "db-act" }, applyBtn, status), done),
+        list, ruleText, h("div", { class: "db-act" }, applyBtn, status), done,
+        h("p", { class: "db-p s" }, "This is one turn. ", h("a", { href: "#/harness/fixes" }, "See the best fixes across every problem this week"), ".")),
       h("section", {}, label(`Send ${name} back`), ta, h("div", { class: "db-row" }, sendBtn), sStatus),
     ];
   }

@@ -6019,6 +6019,56 @@ fn harness_promote_changes_what_a_new_agent_gets_widening_needs_its_name_and_rol
 }
 
 #[test]
+fn harness_fix_the_harness_lists_every_problem_as_fixes_and_applies_the_ticked_ones_to_a_draft() {
+    let s = Server::start(&[]);
+    let (_d, r) = repo();
+    let repo_s = r.to_string_lossy().to_string();
+    let (a1, _) = harness_spawn(&s, &r, "storm");
+    harness_storm(&s, &a1, "default");
+    // The same prompts, once more, from a second agent: one fix answers both.
+    let (a2, _) = harness_spawn(&s, &r, "again");
+    harness_storm(&s, &a2, "default");
+    let (st, f) = s.get(&format!("/api/harness/fixes?{}", harness_q(&r)));
+    assert_eq!(st, 200, "{f}");
+    let fixes = f["fixes"].as_array().unwrap();
+    let rule = "Bash(PYTHONPATH=. python3 -m pytest:*)";
+    let fix = fixes.iter().find(|x| x["edit"]["permissions"]["allow"][0] == rule).unwrap_or_else(|| panic!("no allow fix in {f}"));
+    assert_eq!(fix["part"], "permissions");
+    assert_eq!(fix["level"], "counted");
+    assert_eq!(fix["problems"], 1, "one problem, answered once: {fix}");
+    assert_eq!(fix["answers"][0]["agents"].as_array().unwrap().len(), 2, "{fix}");
+    assert_eq!(fix["applicable"], true);
+    // A new allow rule widens what agents may do, so it is never the recommended one.
+    assert_eq!(fix["widens"], true, "{fix}");
+    assert_eq!(fix["recommended"], false);
+    assert_eq!(f["recommended"], Value::Null, "{f}");
+    assert_eq!(f["summary"]["problems"].as_u64().unwrap() >= 1, true);
+    // Nothing is applied by reading it.
+    let (_, v) = s.get(&format!("/api/harness/versions?{}", harness_q(&r)));
+    assert!(v["versions"].as_array().unwrap().iter().all(|x| x["state"] != "draft"), "{v}");
+    // Ticking it makes a draft, never the current version, and sends no agent anything.
+    let id = fix["id"].as_str().unwrap();
+    let (st, d) = s.post("/api/harness/fixes/apply", json!({ "repo": repo_s, "ids": [id] }));
+    assert_eq!(st, 201, "{d}");
+    assert_eq!(d["version"]["state"], "draft");
+    assert_eq!(d["widens"], true);
+    assert_eq!(d["edits"]["permissions"]["allow"][0], rule);
+    assert!(d["version"]["note"].as_str().unwrap().contains("Fix the harness"), "{d}");
+    let (_, v) = s.get(&format!("/api/harness/versions?{}", harness_q(&r)));
+    let cur = v["versions"].as_array().unwrap().iter().find(|x| x["state"] == "current").unwrap();
+    assert_eq!(cur["name"], "1.0");
+    assert!(s.events(&a1).iter().all(|e| e["kind"] != "steer"), "no agent was sent anything");
+    // Once more is the same draft, a made-up id is refused, an empty list too.
+    let (st, again) = s.post("/api/harness/fixes/apply", json!({ "repo": repo_s, "ids": [id] }));
+    assert_eq!(st, 200, "{again}");
+    assert_eq!(again["same"], true);
+    let (st, e) = s.post("/api/harness/fixes/apply", json!({ "repo": repo_s, "ids": ["nope"] }));
+    assert_eq!((st, e["error_code"].as_str()), (409, Some("gone")), "{e}");
+    let (st, _) = s.post("/api/harness/fixes/apply", json!({ "repo": repo_s, "ids": [] }));
+    assert_eq!(st, 400);
+}
+
+#[test]
 fn harness_only_the_users_token_changes_the_harness_and_secrets_are_refused() {
     let s = Server::start(&[]);
     let (_d, r) = repo();
@@ -6059,7 +6109,7 @@ fn harness_only_the_users_token_changes_the_harness_and_secrets_are_refused() {
 #[test]
 fn harness_pages_are_served_under_goals() {
     let s = Server::start(&[]);
-    for f in ["index.js", "parts.js", "overview.js", "permissions.js", "memory.js", "sees.js", "versions.js"] {
+    for f in ["index.js", "parts.js", "overview.js", "fixes.js", "permissions.js", "memory.js", "sees.js", "versions.js"] {
         let r = http().get(format!("{}/goals/harness/{f}", s.url)).call().unwrap();
         assert_eq!(r.status().as_u16(), 200, "{f}");
     }

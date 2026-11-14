@@ -1013,6 +1013,36 @@ The Overview shows:
 - `ui/dev/harness-live.html` mounts the pages without the shell.
 - Screenshots: `H-*.png` in the project's `workbench/rewrite/` folder.
 
+## Built (H): Fix the harness
+
+`#/harness/fixes` (`GET /api/harness/fixes`, `POST /api/harness/fixes/apply`,
+`src/harness/fixes.rs`, `ui/goals/harness/fixes.js`) joins every problem of
+the window into one ranked list of changes to the harness. It is the
+aggregate of Debug's per-turn fixes.
+
+- A fix is a change that answers one or more findings. Problems that call
+  for the same edit are one fix: a pin for one record counts every turn that
+  missed it, and a storm's rule counts every agent that typed the command.
+- Two kinds can be applied now, because they have editors: an allow rule
+  (counted) and a pin (recomputed). The other findings are listed as ideas
+  with the editor they wait for (tools, hooks) or a link (Rules,
+  Permissions), so the total of problems stays honest.
+- The order is what a fix saves in time, then the problems it answers, then
+  counted before recomputed. A fix that widens what agents may do is shown
+  with the flag, goes last, and is never recommended.
+- One fix is recommended and ticked: the best that does not widen. A new
+  allow rule always widens (it takes a prompt to an allow), so a storm's rule
+  is offered, flagged, and left for the user to tick.
+- Apply puts the ticked fixes in the newest draft, or a new one from the
+  current version. It never promotes (promoting still asks for the widening
+  by name), and it sends no agent anything. Only the user's token applies.
+- Send back stays in Debug, in its own box, because a fix is about every
+  agent to come and a note is about one agent's work. This page links each
+  agent behind the problems to its turn there.
+- Reached from the Overview's primary button, the harness tabs and a link at
+  the end of Debug's Fix step. Tests: `harness_fix_the_harness_*` and the
+  ranking tests in `fixes.rs`.
+
 ## Risks
 
 - **Replay fidelity.** A session depends on things outside the commit: a

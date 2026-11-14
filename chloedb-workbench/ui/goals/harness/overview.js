@@ -111,7 +111,8 @@ function draw(host, ctx, d, reload, rules) {
         } catch (err) { toast(err.message, "bad"); }
       } }))),
     h("div", { class: "hx-dock" },
-      draft ? btn(`Review ${draft.name}`, { primary: true, kbd: "⌘↵", href: "#/harness/versions" }) : btn("Edit permissions", { primary: true, href: "#/harness/edit/permissions" }),
+      btn("Fix the harness", { primary: true, kbd: "⌘↵", href: "#/harness/fixes" }),
+      draft ? btn(`Review ${draft.name}`, { href: "#/harness/versions" }) : btn("Edit permissions", { href: "#/harness/edit/permissions" }),
       h("div", { class: "hx-est" }, h("span", {}, "current ", h("b", { class: "hx-num" }, d.current.name)), draft ? h("span", {}, "draft ", h("b", { class: "hx-num" }, draft.name)) : h("span", {}, "no draft"))),
   ];
   const rs = rules && (rules.suggestions || rules.suggested || rules.items);

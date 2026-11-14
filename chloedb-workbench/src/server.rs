@@ -262,6 +262,7 @@ const GOALS: &[(&str, &str)] = &[
     ("harness/permissions.js", include_str!("../ui/goals/harness/permissions.js")),
     ("harness/memory.js", include_str!("../ui/goals/harness/memory.js")),
     ("harness/sees.js", include_str!("../ui/goals/harness/sees.js")),
+    ("harness/fixes.js", include_str!("../ui/goals/harness/fixes.js")),
     ("harness/versions.js", include_str!("../ui/goals/harness/versions.js")),
 ];
 
