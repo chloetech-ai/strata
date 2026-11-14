@@ -4903,3 +4903,290 @@ fn a_done_check_is_its_own_clause_and_a_ghost_names_only_what_exists() {
     assert!(names.contains(&"integer") && !names.contains(&"total"), "{mg}");
     assert!(mg["why"].as_str().unwrap().contains("dropped"), "{mg}");
 }
+
+// ---------------------------------------------------------------- the goals rewrite: Review and ship, Debug (R2)
+
+/// Two agents of "shop" with a commit each: freeship changes src/cart.ts,
+/// cents adds src/money.ts. Returns (freeship, cents) as (id, cwd, session).
+fn two_branches(s: &Server, r: &Path) -> ((String, PathBuf, String), (String, PathBuf, String)) {
+    let mut out = Vec::new();
+    for (name, task) in [("freeship", "Free shipping over 50"), ("cents", "Money as integer cents")] {
+        let a = s.spawn(json!({ "repo": r, "name": name, "task": task }));
+        let id = a["id"].as_str().unwrap().to_string();
+        let a = s.wait(&id, "idle");
+        out.push((id, PathBuf::from(a["cwd"].as_str().unwrap()), a["session_id"].as_str().unwrap().to_string()));
+    }
+    let (f, c) = (out.remove(0), out.remove(0));
+    charge_tax(&f.1);
+    git(&f.1, &["commit", "-q", "-am", "Free shipping over 50"]);
+    std::fs::write(c.1.join("src/money.ts"), "export function toCents(x) {\n  return Math.round(x * 100);\n}\n").unwrap();
+    git(&c.1, &["add", "src/money.ts"]);
+    git(&c.1, &["commit", "-q", "-m", "Money as integer cents"]);
+    (f, c)
+}
+
+#[test]
+fn review_lists_what_is_ready_checks_one_and_merges_it_with_undo() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((fid, _fcwd, _), (cid, _ccwd, _)) = two_branches(&s, &r);
+    // Tests ran on both branches and passed.
+    bash_as(&s, &fid, "tf1", "cargo test", &cargo_out(true), false);
+    bash_as(&s, &cid, "tc1", "cargo test", &cargo_out(true), false);
+    // The turn ends: both are idle, ready to review.
+    hook_as(&s, &fid, json!({ "hook_event_name": "Stop" }));
+    hook_as(&s, &cid, json!({ "hook_event_name": "Stop" }));
+
+    // Step 1: both ready, by name, each merging cleanly; the order names them.
+    let l = s.get_until("/api/review?repo=proj", "two ready", |v| v["ready"].as_array().is_some_and(|a| a.len() == 2));
+    assert_eq!(l["onto"], "main", "{l}");
+    for row in l["ready"].as_array().unwrap() {
+        assert_eq!(row["merge"]["main"]["clean"], true, "{row}");
+        assert_eq!(row["tests"]["ran"], true, "{row}");
+        assert_eq!(row["tests"]["failed"], 0, "{row}");
+        assert!(row["tests"]["line"].as_str().unwrap().contains("pass on wb/"), "{row}");
+        assert_eq!(row["gate"]["can_merge"], true, "{row}");
+    }
+    assert_eq!(l["order"]["names"].as_array().unwrap().len(), 2, "{l}");
+    assert!(l["order"]["line"].as_str().unwrap().starts_with("Merge "), "{l}");
+    // By its path too, and an unknown project is a 404.
+    assert_eq!(s.get(&format!("/api/review?repo={}", r.display())).0, 200);
+    assert_eq!(s.get("/api/review?repo=nowhere").0, 404);
+
+    // Step 2: freeship checked, with its verdict, rings, pieces and plan.
+    let (status, o) = s.get(&format!("/api/agents/{fid}/review"));
+    assert_eq!(status, 200, "{o}");
+    assert_eq!(o["branch"], "wb/freeship");
+    assert!(o["verdict"]["head"].as_str().unwrap().ends_with("risk."), "{o}");
+    let rings = o["blast"]["rings"].as_array().unwrap();
+    assert_eq!(rings.len(), 3, "{o}");
+    assert!(rings[0]["names"].as_array().unwrap().contains(&json!("cartTotal()")), "{o}");
+    assert!(rings[1]["n"].as_u64().unwrap() >= 1, "createSession calls cartTotal: {o}");
+    let pieces = o["pieces"].as_array().unwrap();
+    assert!(!pieces.is_empty() && pieces[0]["hunk"]["path"] == "src/cart.ts", "{o}");
+    assert_eq!(o["checks"]["merge"]["clean"], true, "{o}");
+    assert_eq!(o["plan"]["onto_checked_out"], true, "{o}");
+    assert_eq!(o["last_merge"], Value::Null);
+
+    // Step 3: merge, then undo.
+    let before = git(&r, &["rev-parse", "main"]);
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!(status, 200, "{m}");
+    assert_eq!(m["message"], "Merged wb/freeship into main.", "{m}");
+    assert!(git(&r, &["log", "-1", "--format=%s", "main"]).starts_with("Merge wb/freeship"));
+    assert_eq!(git(&r, &["rev-parse", "main^1"]), before);
+    let (_, o) = s.get(&format!("/api/agents/{fid}/review"));
+    assert_eq!(o["last_merge"]["can_undo"], true, "{o}");
+    assert_eq!(o["last_merge"]["before"], json!(before));
+    // Merging again changes nothing.
+    let (_, again) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!(again["merged"][0]["how"], "already", "{again}");
+    let (status, u) = s.post("/api/review/undo", json!({ "agent": fid }));
+    assert_eq!(status, 200, "{u}");
+    assert_eq!(git(&r, &["rev-parse", "main"]), before, "main is back where it was");
+    assert!(git(&r, &["rev-parse", "wb/freeship"]) != before, "the branch is kept");
+    let (_, o) = s.get(&format!("/api/agents/{fid}/review"));
+    assert_eq!(o["last_merge"]["undone"], true, "{o}");
+    assert_eq!(s.post("/api/review/undo", json!({ "agent": fid })).0, 409, "an undone merge cannot be undone again");
+    assert_eq!(s.post("/api/review/undo", json!({ "agent": cid })).0, 404, "nothing of cents was merged");
+
+    // Once main moves on after a merge, Undo refuses rather than lose that work.
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!(status, 200, "{m}");
+    std::fs::write(r.join("NOTES"), "later\n").unwrap();
+    git(&r, &["add", "NOTES"]);
+    git(&r, &["commit", "-q", "-m", "later"]);
+    let (status, u) = s.post("/api/review/undo", json!({ "agent": fid }));
+    assert_eq!(status, 409, "{u}");
+    assert_eq!(u["error_code"], "moved", "{u}");
+    assert!(u["error"].as_str().unwrap().contains("git revert -m 1"), "{u}");
+}
+
+#[test]
+fn review_holds_merge_for_failing_tests_and_an_unconfirmed_decision() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((fid, fcwd, fsid), (cid, _, _)) = two_branches(&s, &r);
+
+    // cents' tests fail: Send back is the primary, Merge wants the branch's name.
+    bash_as(&s, &cid, "tc1", "cargo test", &cargo_out(false), true);
+    let (_, o) = s.get(&format!("/api/agents/{cid}/review"));
+    assert_eq!(o["checks"]["tests"]["failed"], 1, "{o}");
+    assert_eq!(o["checks"]["tests"]["failing"], json!(["totals::coupon"]), "{o}");
+    assert_eq!(o["gate"]["primary"], "send_back", "{o}");
+    assert_eq!(o["gate"]["can_merge"], true, "{o}");
+    assert_eq!(o["gate"]["anyway"], true, "{o}");
+    assert!(o["gate"]["label"].as_str().unwrap().starts_with("Merge anyway: 1 test fails"), "{o}");
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [cid] }));
+    assert_eq!((status, m["error_code"].as_str()), (409, Some("gated")), "{m}");
+    assert!(m["error"].as_str().unwrap().contains("type the branch name wb/cents"), "{m}");
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [cid], "anyway": ["wb/wrong"] }));
+    assert_eq!(status, 409, "a wrong name is no name: {m}");
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [cid], "anyway": ["wb/cents"] }));
+    assert_eq!(status, 200, "{m}");
+
+    // freeship decided something that replaces an earlier decision: Merge waits for "Still right".
+    let now = now_s();
+    let sid8: String = fsid.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    let mine = format!("{sid8}:4");
+    std::fs::write(ctx.path().join("sql.json"), json!({ "text": "2 rows", "columns": ["id", "kind", "text", "ts", "session", "tag", "links", "files", "ctx"], "rows": [
+        [mine, "decision", "Shipping is free over 50 euros", now, fsid, "", { "supersedes": "old00000:3" }, "src/cart.ts", "By: assistant"],
+        ["old00000:3", "decision", "Shipping is always charged", now - 100, "another-session", "superseded", { "superseded_by": mine }, "", "By: user"]
+    ] }).to_string()).unwrap();
+    let (_, o) = s.get(&format!("/api/agents/{fid}/review"));
+    let d = &o["decisions"]["matter"][0];
+    assert_eq!((d["id"].as_str(), d["why"].as_str(), d["confirmed"].as_bool()), (Some(mine.as_str()), Some("replaces"), Some(false)), "{o}");
+    assert_eq!(d["replaces"]["text"], "Shipping is always charged", "{o}");
+    assert_eq!(o["gate"]["can_merge"], false, "{o}");
+    assert_eq!(o["gate"]["label"], "Confirm 1 decision first", "{o}");
+    assert!(o["blast"]["exceptions"].as_array().unwrap().iter().any(|e| e["confirm"] == true && e["record"] == json!(mine)), "{o}");
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!((status, m["error_code"].as_str()), (409, Some("unconfirmed")), "{m}");
+    let (status, _) = s.post("/api/review/confirm", json!({ "record": mine, "ok": true }));
+    assert_eq!(status, 200);
+    let (_, o) = s.get(&format!("/api/agents/{fid}/review"));
+    assert_eq!(o["decisions"]["matter"][0]["confirmed"], true, "{o}");
+    assert_eq!(o["gate"]["can_merge"], true, "{o}");
+    // Not committed: nothing merges.
+    std::fs::write(fcwd.join("src/extra.ts"), "export const x = 1;\n").unwrap();
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!((status, m["error_code"].as_str()), (409, Some("uncommitted")), "{m}");
+    std::fs::remove_file(fcwd.join("src/extra.ts")).unwrap();
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
+    assert_eq!(status, 200, "{m}");
+}
+
+#[test]
+fn debug_reads_turns_flags_one_and_traces_what_it_changed() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((fid, _, _), _) = two_branches(&s, &r);
+
+    let (status, ss) = s.get("/api/debug/sessions?repo=proj");
+    assert_eq!(status, 200, "{ss}");
+    assert_eq!(ss["sessions"].as_array().unwrap().len(), 2, "{ss}");
+    let (status, t) = s.get(&format!("/api/agents/{fid}/turns"));
+    assert_eq!(status, 200, "{t}");
+    let turns = t["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1, "{t}");
+    assert_eq!(turns[0]["prompt"]["text"], "Free shipping over 50", "{t}");
+    assert_eq!(t["bad"], Value::Null, "nothing broke and nothing is flagged: {t}");
+
+    // You say turn 1 went wrong; it is the bad turn, and you can take it back.
+    let (status, f) = s.post(&format!("/api/agents/{fid}/turns/1/flag"), json!({ "on": true }));
+    assert_eq!(status, 200, "{f}");
+    assert_eq!(f["flagged"], json!([1]));
+    let (_, t) = s.get(&format!("/api/agents/{fid}/turns"));
+    assert_eq!((t["bad"].as_u64(), t["bad_from"].as_str()), (Some(1), Some("you")), "{t}");
+    assert_eq!(t["turns"][0]["flagged"], true);
+    assert_eq!(t["standout"][0]["text"], "You flagged it: this went wrong", "{t}");
+    let (_, ss) = s.get("/api/debug/sessions?repo=proj");
+    assert_eq!(ss["flagged"], json!(fid), "{ss}");
+    assert_eq!(s.post(&format!("/api/agents/{fid}/turns/9/flag"), json!({ "on": true })).0, 404);
+
+    // What it knew at turn 1, and turn 9 is not there.
+    let (status, c) = s.get(&format!("/api/agents/{fid}/turns/1/context"));
+    assert_eq!(status, 200, "{c}");
+    assert_eq!(c["prompt"]["text"], "Free shipping over 50");
+    assert_eq!(c["memory"]["threshold"]["value"], 0.4, "ChloeCtx's default: {c}");
+    assert_eq!(c["memory"]["lower"]["scope"], "project");
+    assert!(!c["missing"].as_array().unwrap().is_empty(), "no receipt is said, not an error: {c}");
+    assert_eq!(s.get(&format!("/api/agents/{fid}/turns/9/context")).0, 404);
+
+    // Where it went wrong: five rows, worst first.
+    let (status, b) = s.get(&format!("/api/agents/{fid}/turns/1/blast"));
+    assert_eq!(status, 200, "{b}");
+    assert_eq!(b["rows"].as_array().unwrap().len(), 5, "{b}");
+    assert!(b["verdict"].as_str().unwrap().starts_with("Turn 1 changed"), "{b}");
+    assert!(b["verdict"].as_str().unwrap().ends_with("0 reached main."), "{b}");
+
+    let (_, f) = s.post(&format!("/api/agents/{fid}/turns/1/flag"), json!({ "on": false }));
+    assert_eq!(f["flagged"], json!([]));
+}
+
+#[test]
+fn records_are_listed_with_who_said_them_corrected_pinned_and_forgotten() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((_, _, fsid), _) = two_branches(&s, &r);
+
+    // Without ChloeCtx's answer: an empty list that says why, not an error.
+    let (status, l) = s.get("/api/records?repo=proj");
+    assert_eq!(status, 200, "{l}");
+    assert_eq!(l["records"], json!([]));
+    assert!(!l["missing"].as_array().unwrap().is_empty(), "{l}");
+
+    let now = now_s();
+    std::fs::write(ctx.path().join("sql.json"), json!({ "text": "3 rows", "columns": ["id", "session", "kind", "tag", "ts", "files", "text", "ctx", "links"], "rows": [
+        ["d0000000:1", "another", "decision", "", now, "", "Shipping is not taxed", "By: user", {}],
+        ["d0000000:2", fsid, "preference", "task", now - 10, "src/cart.ts", "Use the staging database", "By: assistant", {}],
+        ["d0000000:3", "another", "decision", "superseded", now - 20, "", "Shipping is taxed", "By: workbench", { "superseded_by": "d0000000:1" }]
+    ] }).to_string()).unwrap();
+    let (_, l) = s.get("/api/records?repo=proj");
+    let recs = l["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2, "the replaced one is left out by default: {l}");
+    assert_eq!(recs[0]["by_label"], "you");
+    assert_eq!(recs[1]["by_label"], "freeship", "the session's agent: {l}");
+    assert_eq!(recs[1]["branch"], "wb/freeship");
+    assert_eq!(recs[1]["task_only"], true);
+    assert_eq!(l["superseded"], 1);
+    let (_, l) = s.get("/api/records?repo=proj&superseded=1&by=Workbench");
+    assert_eq!(l["records"].as_array().unwrap().len(), 1, "{l}");
+
+    // Correct and pin: ChloeCtx remembers the new words, replacing the old.
+    let store = ctx.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(ctx.path().join("rpc.json"), json!({ "ok": true, "id": "d0000000:9", "store": store.join("memory.strata") }).to_string()).unwrap();
+    let (status, p) = s.patch("/api/records/d0000000:1?repo=proj", json!({ "text": "Shipping is never taxed", "pin": "src/cart.ts" }));
+    assert_eq!(status, 200, "{p}");
+    assert_eq!(p["done"].as_array().unwrap().len(), 2, "{p}");
+    let req: Value = serde_json::from_str(args_of(ctx.path(), "rpc").last().unwrap()).unwrap();
+    assert_eq!((req["op"].as_str(), req["supersedes"].as_str(), req["by"].as_str()), (Some("remember"), Some("d0000000:9"), Some("user")), "the pin follows the correction: {req}");
+    assert_eq!(req["files"], json!(["src/cart.ts"]));
+    assert_eq!(s.patch("/api/records/d0000000:1?repo=proj", json!({ "pin": "../etc/passwd" })).0, 400);
+    assert_eq!(s.patch("/api/records/d0000000:1?repo=proj", json!({})).0, 400);
+    let mut res = http().delete(format!("{}/api/records/d0000000:1?repo=proj", s.url)).header("authorization", format!("Bearer {TOKEN}")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 200, "{}", res.body_mut().read_to_string().unwrap_or_default());
+    let req: Value = serde_json::from_str(args_of(ctx.path(), "rpc").last().unwrap()).unwrap();
+    assert_eq!(req, json!({ "op": "forget", "id": "d0000000:1" }));
+}
+
+#[test]
+fn the_threshold_is_set_for_the_project_and_undone() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    two_branches(&s, &r);
+    let store = ctx.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("config.json"), json!({ "knowledge": { "min_cos": 0.6, "max": 4 }, "other": true }).to_string()).unwrap();
+    std::fs::write(ctx.path().join("rpc.json"), json!({ "ok": true, "store": store.join("memory.strata") }).to_string()).unwrap();
+
+    let (status, g) = s.get("/api/repos/proj/threshold");
+    assert_eq!(status, 200, "{g}");
+    assert_eq!(g["value"], 0.6);
+    // By its path, encoded, as the page sends it.
+    let enc = r.to_string_lossy().replace('/', "%2F");
+    let (status, p) = s.put(&format!("/api/repos/{enc}/threshold"), json!({ "value": 0.55 }));
+    assert_eq!(status, 200, "{p}");
+    assert_eq!((p["value"].as_f64(), p["was"].as_f64(), p["scope"].as_str()), (Some(0.55), Some(0.6), Some("project")), "{p}");
+    assert!(p["text"].as_str().unwrap().contains("55% match (was 60%)"), "{p}");
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(store.join("config.json")).unwrap()).unwrap();
+    assert_eq!(cfg, json!({ "knowledge": { "min_cos": 0.55, "max": 4 }, "other": true }), "only the threshold changes");
+    assert!(ctx.path().join("stop.args").exists(), "the daemon is stopped so it reads the new value");
+    // Undo puts back what it was.
+    let (status, u) = s.put("/api/repos/proj/threshold", p["undo"].clone());
+    assert_eq!(status, 200, "{u}");
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(store.join("config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["knowledge"]["min_cos"], 0.6);
+    assert_eq!(s.put("/api/repos/proj/threshold", json!({ "value": 0.99 })).0, 400);
+}

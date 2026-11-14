@@ -158,6 +158,9 @@ pub fn router(app: App) -> Router {
         .route("/guide.md", get(guide_md))
         // Sixth build: "I'm stepping away" and the presence heartbeat (src/digest.rs).
         .merge(crate::digest::routes())
+        // The goals rewrite (R2): Review and ship; Debug's turns, records and threshold.
+        .merge(crate::review::routes())
+        .merge(crate::turns::routes())
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)

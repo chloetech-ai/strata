@@ -171,6 +171,55 @@ tests it ran by name with their last result, and packs the capsule from
 this branch's agents' sessions only. When branches stack, "Ship together"
 drafts one pull request for the whole stack, in merge order.
 
+Review and ship (`#/p/<project>/ship`) has three steps: what is ready,
+check it, and merge or send back.
+
+- **What is ready** lists the ready branches with their tests by name,
+  whether each merges cleanly (into main and with the others) and the
+  order to merge them in, with the reason.
+- **Check it** shows one branch's blast radius:
+  - a one-line verdict, then three rings: functions changed, callers
+    reached and things users see;
+  - only the exceptions;
+  - then the pieces of work, riskiest first, with the mechanical changes
+    folded.
+- **Merge** merges into main's checkout with `--no-ff`. First a sheet says
+  exactly what happens, and you can undo the merge while main has not
+  moved on and nothing is pushed. Otherwise Undo gives the `git revert -m
+  1` command.
+- Merge waits for you in two cases:
+  - when a decision replaces an earlier one, until you say it is still
+    right;
+  - when tests fail or the branch conflicts, until you type the branch's
+    name.
+- **Send back** resumes the agent with your note.
+- **Open a pull request instead** opens the draft.
+
+Debug (`#/debug`) follows one bad turn through four steps:
+
+1. **Session and turn**: the session's turns, the ones that stand out, and
+   **This went wrong** on each.
+2. **What it knew**: what Workbench reminded it of, and the note it had but
+   was not reminded of, with why ("58% match; notes under 60% are left
+   out").
+3. **Where it went wrong**: the turn's blast radius, worst first, and its
+   diff.
+4. **Fix**:
+   - always remind agents editing a file of that note;
+   - remind agents of more of your notes, which is a project-wide setting
+     you can undo;
+   - make it a rule.
+
+   Sending the agent back is separate.
+
+Debug has other ways in:
+
+- `#/debug/code` asks Trace why the code on main is like this.
+- `#/debug/failing` is Health, starting with what fails.
+- `#/debug/records` lists what agents remember about the project:
+  - who said each note (you or which agent) and on which branch;
+  - **Correct**, **Always remind**, **Make it a rule** and **Forget**.
+
 `--chloectx-bin` (`CHLOEDB_WORKBENCH_CHLOECTX`, default `chloectx`) names the
 ChloeCtx program. The tests use a fake one that prints canned JSON.
 

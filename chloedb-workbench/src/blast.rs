@@ -224,7 +224,7 @@ impl Landing {
 
 /// Whether two commits merge without a conflict (`git merge-tree
 /// --write-tree`), and the files that conflict.
-fn merges_clean(dir: &Path, a: &str, b: &str) -> Option<(bool, Vec<String>)> {
+pub(crate) fn merges_clean(dir: &Path, a: &str, b: &str) -> Option<(bool, Vec<String>)> {
     let out = Command::new("git").arg("-C").arg(dir).args(["merge-tree", "--write-tree", "--name-only", "--no-messages", a, b]).env("GIT_TERMINAL_PROMPT", "0").output().ok()?;
     match out.status.code() {
         Some(0) => Some((true, Vec::new())),

@@ -415,6 +415,64 @@ build (SPEC.md, "Ship and Trace tell the truth"):
 - the branch it lands on
 - stacked branches not counted as collisions
 
+### Built (C)
+
+`ui/goals/review.js` (`#/p/<project>/ship[/<agent>][/merge]`) over
+`src/review.rs`:
+
+- `GET /api/review?repo=` lists ready branches. Each row has its tests by
+  name, whether it merges cleanly into main and into each other ready
+  branch, the decisions to confirm, the risk and a gate.
+- `GET /api/agents/:id/review` returns:
+  - the verdict and the three rings (functions changed, callers reached,
+    things users see), with only the exceptions;
+  - the pieces of work, riskiest first, each with +/− bars and its key
+    hunk;
+  - the mechanical changes folded into "Not shown: …";
+  - the decisions that matter, with the routine ones folded;
+  - the checks: tests, merge, commits and order.
+- The merge order is computed and says why, naming the first pair that
+  conflicts ("merge X first, then send Y back to rebase"). **Merge both,
+  in this order** is the primary when every ready branch is clean.
+- Merge is gated (`gate()`), and the gate decides which of Merge and Send
+  back is the primary:
+  - A decision that replaces an earlier one must be confirmed first
+    (`POST /api/review/confirm`, with **Still right** / **Change it**).
+  - Failing tests or a conflict make Send back the primary. Merge stays
+    possible through **Merge anyway…**, which asks you to type the branch
+    name.
+- Merging (`POST /api/review/merge`) first shows a confirm sheet: from,
+  into, how, what is not done, what Undo does, and the commits.
+  - The merge is a `--no-ff` merge in the main checkout.
+  - It refuses with a plain sentence and a 409 code when the gate does
+    not allow it (`unconfirmed`, `gated`), when there are uncommitted
+    changes or a dirty checkout (`uncommitted`, `dirty`), or when the
+    branches conflict (`conflict`).
+- After a merge, a banner offers **Undo** (`POST /api/review/undo`):
+  - Undo puts main back while main is still at the merge and nothing has
+    been pushed.
+  - Otherwise it explains why not (`pushed`, `moved`) and gives the
+    `git revert -m 1` command.
+- **Send back** sends a prefilled note through steer, or restarts the
+  agent with the note when steer refuses.
+- **Open a pull request instead** opens Details, which is today's
+  `ship.js` with the draft.
+- Empty project and failing endpoint each show one plain sentence.
+- On a phone there is a sticky action bar and the exceptions come before
+  the rings.
+- Tests: `review_lists_what_is_ready_checks_one_and_merges_it_with_undo`
+  and `review_holds_merge_for_failing_tests_and_an_unconfirmed_decision`.
+
+Left out:
+
+- "Ship both together" as one squashed change. The primary merges the
+  branches one after another in the computed order, which keeps Undo per
+  merge.
+- "Public names" are the changed entry points (routes and pages) that the
+  blast already finds. There is no separate public-API analysis.
+- The CLI `open --review` entry. Entries and redirects belong to the
+  router (R1).
+
 ## D. Debug context and project
 
 Entry: Start › Debug · an alert in Needs you ("Open in Debug") · "Ask
@@ -471,6 +529,92 @@ Other ways in:
     - an agent's words filed as "the user's" (Dev 07:20, 07:31)
     - another branch's records told as fact (Maya 07:23, Sam 07:30,
       Lee 07:39)
+
+### Built (D)
+
+`ui/goals/debug.js` (`#/debug`, `#/debug/<agent>[/<n>[/wrong|/fix]]`,
+`#/debug/code`, `#/debug/failing`, `#/debug/records`) over `src/turns.rs`.
+
+**Step 1, Session and turn**:
+
+- `GET /api/debug/sessions` and `GET /api/agents/:id/turns` give each
+  session's turns.
+- The page shows the sessions, then the turn strip with phases on long
+  sessions.
+- "Turns that stand out" lists failed tests after a turn, a missed note
+  and a flagged turn.
+- Each turn has **This went wrong**
+  (`POST /api/agents/:id/turns/:n/flag`, 404 for a turn that does not
+  exist).
+
+**Step 2, What it knew** (`GET /api/agents/:id/turns/:n/context`):
+
+- the prompt, the context meter, and what Workbench reminded it of, as
+  counts with the top note;
+- **what it missed**, in plain words ("58% match; notes under 60% are left
+  out"), and what was rightly left out;
+- the nearby turns and the turn's diff.
+
+**Step 3, Where it went wrong** (`GET /api/agents/:id/turns/:n/blast`):
+
+- the verdict and the ranked list, worst first, with icon and text (never
+  colour alone);
+- the diff with the first changed line of each function marked;
+- **Replay its terminal at turn N (read only)**, through the existing
+  rewind.
+
+**Step 4, Fix** is kept apart from Send back:
+
+- One recommended fix is ticked: **Always remind agents editing <file>**
+  (pin, `PATCH /api/records/:id`).
+- **Remind agents of more of your decisions (looser match)**:
+  - it is labelled as a project setting and previews what else it would
+    have given at that turn, with the tokens;
+  - it is applied with `PUT /api/repos/:repo/threshold` and has its own
+    **Undo**.
+- **Make it a rule**.
+- With no missed note, the fix is a rule you write
+  (`POST /api/rules`).
+- **Send <agent> back** is a separate box with a prefilled note.
+
+The other ways in:
+
+- `#/debug/code` mounts Trace, saying "How it works now: the code on main".
+- `#/debug/failing` gives a summary sentence from `/api/tests` ("No test
+  runs recorded yet in X" when empty), then mounts Health.
+- `#/debug/records` (`GET /api/records`, `PATCH` and `DELETE
+  /api/records/:id`):
+  - it lists ChloeCtx's notes with **who said it** (you, an agent, or
+    Workbench) and the branch;
+  - its filters are kind, who, branch and **Show replaced notes**, all
+    kept in the URL;
+  - its actions are **Correct**, **Always remind…**, **Make it a rule**
+    and **Forget** (Forget asks first);
+  - notes for one task only, or tied to a branch, are marked as such.
+
+Every page shows one plain sentence when there is no data or the server
+fails.
+
+Tests:
+
+- `debug_reads_turns_flags_one_and_traces_what_it_changed`
+- `records_are_listed_with_who_said_them_corrected_pinned_and_forgotten`
+- `the_threshold_is_set_for_the_project_and_undone`
+
+Left out:
+
+- **The arithmetic that proves it** ("4748 + 392 + 499 = 5639"). Nothing
+  in the turn's data supports it without a model, so the page shows the
+  failing tests by name and the marked lines instead.
+- **A branch picker on `#/debug/code`**. Trace reads the main checkout,
+  so the page says that the code is main's.
+- **A threshold per kind or per author.** ChloeCtx has one value per
+  project (`knowledge.min_cos` in the store's `config.json`), so "your
+  decisions" is worded as a project-wide setting.
+- **One "Apply and send" primary.** Following the UX critique, Apply fixes
+  and Send back are kept separate.
+- **The CLI `open --debug` entry and the `#/why`, `#/trace` and `#/health`
+  redirects.** They belong to the router (R1).
 
 ## Dense views
 

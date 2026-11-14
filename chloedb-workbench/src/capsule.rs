@@ -452,9 +452,11 @@ fn session_decisions(sup: &Supervisor, a: &Agent, mine: &[Agent], missing: &mut 
         }
         let links = col("links").to_string();
         let superseded_by = links.split("superseded_by").nth(1).and_then(|r| r.split('"').find(|p| p.contains(':') && !p.contains(' ') && p.len() > 2)).map(|x| x.trim_start_matches(':').to_string());
+        // What it replaced (Review's "decisions that matter").
+        let supersedes = links.split("supersedes").nth(1).and_then(|r| r.split('"').find(|p| p.contains(':') && !p.contains(' ') && p.len() > 2)).map(|x| x.trim_start_matches(':').to_string());
         list.push(json!({
             "id": rid, "kind": col("kind"), "text": col("text"), "ts": trail::ctx_time(&col("ts")), "agent": ag.map(|g| g.name.clone()),
-            "superseded": col("tag") == "superseded" || superseded_by.is_some(), "superseded_by": superseded_by, "via": ["session"],
+            "superseded": col("tag") == "superseded" || superseded_by.is_some(), "superseded_by": superseded_by, "supersedes": supersedes, "via": ["session"],
         }));
     }
     list
@@ -462,7 +464,7 @@ fn session_decisions(sup: &Supervisor, a: &Agent, mine: &[Agent], missing: &mut 
 
 /// The texts of records by id (`chloectx sql`), for the successors of
 /// superseded decisions.
-fn record_texts(sup: &Supervisor, a: &Agent, ids: &[String]) -> HashMap<String, String> {
+pub(crate) fn record_texts(sup: &Supervisor, a: &Agent, ids: &[String]) -> HashMap<String, String> {
     let ids: Vec<String> = ids.iter().filter(|i| i.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_'))).map(|i| format!("'{i}'")).collect();
     if ids.is_empty() {
         return HashMap::new();
@@ -561,7 +563,7 @@ fn branch_tests(sup: &Supervisor, dir: &Path, mine: &[Agent], head: Option<&str>
 
 /// One branch's part of a pull request: its title, summary, commits,
 /// decisions, tests and blast radius.
-fn part(sup: &Supervisor, a: &Agent, missing: &mut Vec<String>) -> Result<Json, ApiError> {
+pub(crate) fn part(sup: &Supervisor, a: &Agent, missing: &mut Vec<String>) -> Result<Json, ApiError> {
     let b = blast::blast(sup, &a.id)?;
     for m in b["missing"].as_array().into_iter().flatten().filter_map(Json::as_str) {
         if !missing.iter().any(|x| x == m) {

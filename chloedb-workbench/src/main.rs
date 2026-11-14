@@ -45,6 +45,9 @@ mod complete;
 mod repos;
 // Sixth build: what a terminal shows, read for the prompt it waits on.
 mod screen;
+// The goals rewrite (JOURNEYS.md): Review and ship; Debug's turns and records.
+mod review;
+mod turns;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

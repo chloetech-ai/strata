@@ -1,0 +1,92 @@
+/* Dev only: the tokens of direction C, "Instrument" (JOURNEYS.md, "Shared
+   pieces", Tokens), for ui/dev/goals.html while ui/style.css does not have
+   them yet. The rewrite's style.css defines the same names; when it does,
+   this sheet only repeats it. Text tokens are at least 4.5:1 on --surface
+   and --bg in both themes. */
+@font-face { font-family: "Geist"; src: url("/fonts/Geist-normal.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "Geist Mono"; src: url("/fonts/GeistMono-normal.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+:root {
+  color-scheme: light;
+  --sans: "Geist", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans-features: "ss01";
+  --fs-xs: 11px; --lh-xs: 16px; --fs-sm: 12px; --lh-sm: 18px; --fs-body: 13px; --lh-body: 20px;
+  --fs-md: 15px; --lh-md: 22px; --fs-lg: 20px; --lh-lg: 28px; --fs-xl: 28px; --lh-xl: 34px;
+  --track-xl: -.025em; --track-md: -.01em; --track-label: .08em;
+  --w-text: 400; --w-mid: 500; --w-title: 600;
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 28px; --s-7: 40px;
+  --ctl-h: 30px; --ctl-h-lg: 36px; --touch: 44px; --kc-h: 18px; --top: 44px; --tabh: 56px;
+  --insp-w: 360px; --page-w: 1120px; --sheet-w: clamp(460px, 40vw, 600px);
+  --r: 10px; --r-sm: 6px; --r-xs: 4px; --r-pill: 999px; --hair: 1px;
+  --bg: #f2f2f3; --surface: #ffffff; --surface-2: #f7f7f8; --surface-3: #ececee; --sunken: #efeff1; --well: #efeff1;
+  --glass: rgba(250, 250, 251, .72); --glass-in: rgba(255, 255, 255, .6); --glass-blur: saturate(180%) blur(24px); --scrim: rgba(17, 17, 19, .32);
+  --text: #111113; --text-2: #55555e; --muted: #5f5f68; --text-3: #6a6a73;
+  --line: rgba(17, 17, 19, .085); --line-2: rgba(17, 17, 19, .16);
+  --accent: #4a4bd6; --accent-2: #3d3ec4; --accent-ink: #ffffff; --accent-text: #4243c4; --accent-soft: rgba(74, 75, 214, .09); --accent-line: rgba(74, 75, 214, .45); --focus: rgba(74, 75, 214, .3);
+  --good: #18794e; --good-ink: #136640; --good-soft: rgba(24, 121, 78, .1);
+  --warn: #a35f00; --warn-ink: #8a5000; --warn-soft: rgba(163, 95, 0, .1); --warn-line: #a35f00; --on-warn: #ffffff;
+  --crit: #cd2b31; --crit-ink: #b4232a; --crit-soft: rgba(205, 43, 49, .08);
+  --ctx: #7a4fd0;
+  --add-bg: rgba(24, 121, 78, .1); --add-gut: rgba(24, 121, 78, .16); --add-ink: #136640;
+  --del-bg: rgba(205, 43, 49, .08); --del-gut: rgba(205, 43, 49, .14); --del-ink: #b4232a;
+  --lane-1: #2a78d6; --lane-2: #eb6834; --lane-3: #1baf7a; --lane-4: #6250d6; --lane-5: #e87ba4; --lane-x: #8b93a0; --av-ink: #ffffff;
+  --shadow-1: none; --shadow-2: 0 0 0 .5px rgba(0, 0, 0, .06), 0 12px 32px -8px rgba(0, 0, 0, .12); --shadow-3: 0 24px 64px rgba(0, 0, 0, .22);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0b0b0d; --surface: #141416; --surface-2: #19191c; --surface-3: #222226; --sunken: #101012; --well: #1f1f23;
+    --glass: rgba(20, 20, 23, .7); --glass-in: rgba(28, 28, 32, .6); --scrim: rgba(0, 0, 0, .55);
+    --text: #ededef; --text-2: #a8a8b2; --muted: #9a9aa4; --text-3: #8e8e98;
+    --line: rgba(255, 255, 255, .08); --line-2: rgba(255, 255, 255, .15);
+    --accent: #5b5ce6; --accent-2: #6d6ef0; --accent-ink: #ffffff; --accent-text: #a4a5ff; --accent-soft: rgba(143, 144, 255, .12); --accent-line: rgba(143, 144, 255, .5); --focus: rgba(143, 144, 255, .35);
+    --good: #4cc38a; --good-ink: #5fd39a; --good-soft: rgba(76, 195, 138, .12);
+    --warn: #f1a10d; --warn-ink: #f5b84a; --warn-soft: rgba(241, 161, 13, .12); --warn-line: #f1a10d; --on-warn: #111113;
+    --crit: #ff6369; --crit-ink: #ff8a8f; --crit-soft: rgba(255, 99, 105, .12);
+    --ctx: #b494ff;
+    --add-bg: rgba(76, 195, 138, .1); --add-gut: rgba(76, 195, 138, .16); --add-ink: #6fd8a2;
+    --del-bg: rgba(255, 99, 105, .1); --del-gut: rgba(255, 99, 105, .16); --del-ink: #ff9b9f;
+    --shadow-2: 0 0 0 .5px rgba(255, 255, 255, .06), 0 16px 40px -8px rgba(0, 0, 0, .6); --shadow-3: 0 24px 72px rgba(0, 0, 0, .6);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0b0d; --surface: #141416; --surface-2: #19191c; --surface-3: #222226; --sunken: #101012; --well: #1f1f23;
+  --glass: rgba(20, 20, 23, .7); --glass-in: rgba(28, 28, 32, .6); --scrim: rgba(0, 0, 0, .55);
+  --text: #ededef; --text-2: #a8a8b2; --muted: #9a9aa4; --text-3: #8e8e98;
+  --line: rgba(255, 255, 255, .08); --line-2: rgba(255, 255, 255, .15);
+  --accent: #5b5ce6; --accent-2: #6d6ef0; --accent-ink: #ffffff; --accent-text: #a4a5ff; --accent-soft: rgba(143, 144, 255, .12); --accent-line: rgba(143, 144, 255, .5); --focus: rgba(143, 144, 255, .35);
+  --good: #4cc38a; --good-ink: #5fd39a; --good-soft: rgba(76, 195, 138, .12);
+  --warn: #f1a10d; --warn-ink: #f5b84a; --warn-soft: rgba(241, 161, 13, .12); --warn-line: #f1a10d; --on-warn: #111113;
+  --crit: #ff6369; --crit-ink: #ff8a8f; --crit-soft: rgba(255, 99, 105, .12);
+  --ctx: #b494ff;
+  --add-bg: rgba(76, 195, 138, .1); --add-gut: rgba(76, 195, 138, .16); --add-ink: #6fd8a2;
+  --del-bg: rgba(255, 99, 105, .1); --del-gut: rgba(255, 99, 105, .16); --del-ink: #ff9b9f;
+  --shadow-2: 0 0 0 .5px rgba(255, 255, 255, .06), 0 16px 40px -8px rgba(0, 0, 0, .6); --shadow-3: 0 24px 72px rgba(0, 0, 0, .6);
+}
+@media (max-width: 640px) { :root { --fs-body: 15px; --lh-body: 22px; --ctl-h: 44px; } }
+/* The base the rewrite's style.css gives every page (buttons, keycaps, chips, tables). */
+body { background: var(--bg); color: var(--text); font: var(--w-text) var(--fs-body)/var(--lh-body) var(--sans); font-feature-settings: var(--sans-features); overflow: auto; }
+code, .mono { font-family: var(--mono); font-size: .92em; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--s-2); height: var(--ctl-h); padding: 0 var(--s-3); border-radius: var(--r-sm); font: var(--w-mid) var(--fs-body)/1 var(--sans); color: var(--text); background: var(--surface); border: var(--hair) solid var(--line-2); white-space: nowrap; cursor: pointer; text-decoration: none; box-shadow: none; }
+.btn:hover { background: var(--surface-2); border-color: var(--line-2); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.btn.primary:hover { background: var(--accent-2); }
+.btn.lg { height: var(--ctl-h-lg); padding: 0 var(--s-4); }
+.btn.sm { height: 26px; padding: 0 var(--s-2); font-size: var(--fs-sm); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--accent-text); }
+.btn.danger { background: var(--surface); color: var(--crit-ink); border-color: var(--crit); }
+.btn[disabled] { opacity: 1; color: var(--text-3); background: var(--surface-2); border-color: var(--line); cursor: not-allowed; }
+.kc { font: var(--w-mid) var(--fs-xs)/16px var(--mono); min-width: 18px; height: var(--kc-h); padding: 0 4px; border-radius: var(--r-xs); border: var(--hair) solid var(--line-2); color: var(--text-2); display: inline-grid; place-items: center; background: var(--surface); }
+.btn.primary .kc { border-color: rgba(255, 255, 255, .35); background: transparent; color: inherit; }
+.chip { display: inline-flex; align-items: center; font: var(--w-mid) var(--fs-xs)/20px var(--mono); padding: 0 6px; border-radius: var(--r-xs); background: var(--line); color: var(--text-2); letter-spacing: .02em; }
+.chip::before { content: none; }
+.chip.add { color: var(--good-ink); } .chip.del { color: var(--crit-ink); }
+.tbl { width: 100%; border-collapse: collapse; }
+.tbl th { font: var(--w-mid) var(--fs-xs)/var(--lh-xs) var(--mono); letter-spacing: var(--track-label); text-transform: uppercase; color: var(--text-2); text-align: left; padding: var(--s-2) var(--s-4); border-bottom: var(--hair) solid var(--line); }
+.tbl td { padding: 10px var(--s-4); border-bottom: var(--hair) solid var(--line); vertical-align: middle; height: 44px; }
+.tbl tr:last-child td { border-bottom: 0; }
+svg.i { width: 16px; height: 16px; stroke-width: 1.5; }
+@media (max-width: 640px) { .btn { height: var(--touch); } }
+@media (pointer: coarse) { .btn { min-height: var(--touch); } }
