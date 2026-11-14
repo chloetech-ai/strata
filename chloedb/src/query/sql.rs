@@ -878,6 +878,7 @@ pub(crate) fn bind_query(q: &sql::Query, schema: &Schema, params: &Params) -> Re
 /// [`bind_query`] in a database of `tables`, whose edge tables its walks
 /// may follow.
 pub(crate) fn bind_query_in(q: &sql::Query, schema: &Schema, tables: &[&Schema], params: &Params) -> Result<Select> {
+    super::compound::check_planning()?;
     Binder { tables, ..Binder::new(schema, params) }.query(q)
 }
 
@@ -2316,10 +2317,12 @@ impl<'a> Binder<'a> {
                 // A NULL is kept: `x IN (1, NULL)` is UNKNOWN where x is not
                 // 1, so `NOT IN` holds for no row ([`Pred::three_valued`]).
                 let mut values = Vec::with_capacity(list.len());
-                for v in list {
+                for (i, v) in list.iter().enumerate() {
+                    super::compound::check_planning_every(i)?;
                     match as_list(self.literal(v)?) {
                         Ok(xs) => {
-                            for x in xs {
+                            for (j, x) in xs.into_iter().enumerate() {
+                                super::compound::check_planning_every(j)?;
                                 values.push(self.compared(f, x)?);
                             }
                         }
@@ -2493,7 +2496,9 @@ impl<'a> Binder<'a> {
         // 20,000 ids before the query started (finding N-B4).
         let mut values: Vec<Value> = Vec::with_capacity(items.len());
         let (mut texts, mut ints) = (std::collections::HashSet::new(), std::collections::HashSet::new());
-        for v in items {
+        for (i, v) in items.into_iter().enumerate() {
+            // The deadline, a thousand values apart (finding X-B3).
+            super::compound::check_planning_every(i)?;
             if v == Value::Null {
                 return Err(err(format!("{op}'s list holds a NULL, which no value of {} equals", field.name)));
             }

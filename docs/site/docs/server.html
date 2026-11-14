@@ -426,6 +426,11 @@ target/release/chloedb-server --demo 20000 --db products.chloedb</pre>
 <td>the most elements (words, values and symbols) such a statement may hold, as ClickHouse's <code>max_ast_elements</code> bounds; <code>id IN ('a', 'b', ...)</code> is two an id; 0: no limit <span class="since unreleased">since 0.3.4 (unreleased)</span></td>
 </tr>
 <tr>
+<td><code>--statement-budget SPEC</code></td>
+<td>none</td>
+<td>what one statement may cost, checked once its stored functions and rank profiles are written out and as it runs: <code>name=n</code> pairs apart by commas, of <code>nodes</code>, <code>depth</code>, <code>list</code>, <code>plan_ms</code> and <code>rows_read</code> (<code>nodes=50000,rows_read=10000000</code>); a key's budget and a request's <code>budget</code> lower it, never raise it (<a href="#statement-budgets">statement budgets</a>) <span class="since unreleased">since 0.3.4 (unreleased)</span></td>
+</tr>
+<tr>
 <td><code>--otlp-retain PERIOD</code></td>
 <td>none (kept for ever)</td>
 <td>how long a table <a href="#opentelemetry-logs">OpenTelemetry logs</a> make keeps its rows (<code>'30 days'</code>, <code>'12h'</code>); tables already there keep theirs</td>
@@ -2535,6 +2540,46 @@ curl -s localhost:7700/v1/query -H &#x27;content-type: application/json&#x27; -d
 <p>Answers are kept too, up to <code>--answer-cache-mb</code> (64 MiB, least recently used out first): the same query (its SQL, parameters and options, and over gRPC its plan) on the same version of the table is answered from memory, without a slot or the executor. A write moves the version, so a kept answer is never stale; it is simply not found again. A query that reads the clock, random numbers, <code>uuid()</code> or a model (<code>llm(</code>) is not kept, nor a scroll, a held snapshot, a profile, an Arrow answer, or an answer larger than a 128th of the budget (512 KiB of the default). A coordinator's shards keep their parts of its answers, so a coordinator's repeated query is answered by each shard from memory. Its steps say <code>answer cache</code>, and <code>chloedb_answer_cache_total{outcome="hit"|"miss"}</code>, <code>chloedb_answer_cache_answers</code> and <code>chloedb_answer_cache_bytes</code> show how it does. On a coordinator over 2 shards, all on one 4-core machine, with queries drawn from a Zipf law (the 100 commonest were half of them), it answered 3,568 to 3,671 queries a second instead of 2,192 to 2,256 and each query cost the shards 0.4 ms of CPU instead of 1.0; with every query different it was as fast as without it.</p>
 <p>An idle HTTP connection costs the server about 31 KB, most of it the 8 KiB buffers HTTP/1 reads and writes through, and a file descriptor: 10,000 connections held open on a coordinator took 314 MB and opened in 1.2 s on one 4-core machine. 100,000 clients then need about 3 GB over the coordinators (about 800 MB each on four) and an open-file limit above 100,000 on each: the server raises its soft limit to the hard one when it starts, so raise the hard limit where it is lower (<code>LimitNOFILE</code> in a systemd unit, <code>ulimit -Hn</code> in a shell; containers usually allow 1,048,576). Over gRPC or HTTP/2 one connection carries many clients' queries at once.</p>
 <p>Write requests are held in one queue, from embedding (a server embeds on as many writes at once as it has cores) through waiting for the writer to being applied. With <code>--max-queued-writes</code> (1,024) in it, a write or a SQL <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> is refused with 429 before any work, and counted in <code>chloedb_write_errors_total{status="429"}</code>; <code>chloedb_write_queue_requests</code> shows how many it holds. A body larger than its route allows is refused with 413: <code>--max-body-mb</code> (256 MiB) for <code>/v1/write</code> and <code>/v1/import</code>, 16 MiB for every other route.</p>
+<h4 id="statement-budgets">Statement budgets<a class="anchor" href="#statement-budgets" aria-label="Link to this section">#</a></h4>
+<p>The text of a statement is bounded before it is parsed (<code>--max-statement-bytes</code>, <code>--max-statement-elements</code>, and 1,000 levels of nesting), and its calls of stored functions written out hold at most 250,000 expressions. A budget is less, and is checked on what the statement becomes, not on what it says: <code>SELECT f(1)</code> may be a few bytes that write out to thousands of expressions, and <code>tags @&gt; :tags</code> fifteen bytes with 100,000 tags. As ClickHouse's <code>max_expanded_ast_elements</code>, <code>max_rows_to_read</code> and <code>max_execution_time</code> and PostgreSQL's <code>statement_timeout</code> per role, it has five parts, each left out when not given:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>budget</th>
+<th>bounds</th>
+<th>checked</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nodes</code></td>
+<td>the expressions of the statement written out (its stored functions and rank profiles in place)</td>
+<td>before it binds</td>
+</tr>
+<tr>
+<td><code>depth</code></td>
+<td>how deep they nest; a subquery is a level</td>
+<td>before it binds</td>
+</tr>
+<tr>
+<td><code>list</code></td>
+<td>the values of one list: <code>IN (...)</code>, <code>ARRAY[...]</code>, a list parameter</td>
+<td>before it binds</td>
+</tr>
+<tr>
+<td><code>plan_ms</code></td>
+<td>the time one plan takes to make</td>
+<td>as it plans, where the deadline is checked</td>
+</tr>
+<tr>
+<td><code>rows_read</code></td>
+<td>the rows its scans, filters and groups visit, and the rows its parts answer (a join's sides, a <code>WITH</code> result)</td>
+<td>as it runs, every 1,024 rows, and as each part answers</td>
+</tr>
+</tbody>
+</table></div>
+<p>A statement's budget is the tightest of three: the server's <code>--statement-budget</code>, its key's, and its request's <code>"budget"</code> on <code>/v1/query</code>, <code>/v1/sql</code>, <code>/v1/explain</code> and <code>/v1/sql/check</code> (<code>{"budget": {"rows_read": 100000}}</code>, or <code>"budget": "rows_read=100000"</code>). A request may so lower its key's budget, never raise it. A key gets one when it is made, <code>POST /v1/admin/keys {"name": "dashboards", "scope": "read", "budget": {"nodes": 20000, "rows_read": 5000000}}</code>, and <code>POST /v1/admin/keys/ID/budget {"rows_read": 1000000}</code> lowers it (a budget is lowered, never raised, as an expiry is brought nearer: the servers of a cluster merge a key's two budgets to the tighter, so a raise would not reach them; a key that needs more is a new key). A key another key made has its maker's budget. The key list shows each key's <code>budget</code>. A statement past its shape's budget is a 400 <code>query_invalid</code> before it runs, one past <code>rows_read</code> a 400 as soon as it reads the row past it, and one past <code>plan_ms</code> a timeout, each naming the budget. A coordinator holds a statement to <code>nodes</code>, <code>depth</code>, <code>list</code> and <code>plan_ms</code> as it plans it; <code>rows_read</code> is counted by a single server, not yet across a coordinator's shards. Embedded, <code>ExecOptions::budget</code> is the statement's budget, and <code>Db::query_with</code>, <code>Db::sql_with</code>, <code>Db::query_leaf_with</code> (Python's <code>query_arrow</code>), <code>Db::pack_with</code>, <code>Db::explain_with</code> and <code>Db::prepare_write_with</code> plan under it, with the deadline, on a thread with the stack a deep statement needs.</p>
+<p>A short statement plans on the thread that serves the request, a longer one on a blocking thread, where it holds none of the threads that serve the others and stops at its deadline: a statement is short by its text and its parameters both, so a short text that binds a long list plans on the blocking thread too. Planning, <code>EXPLAIN</code> (<code>/v1/explain</code>) and <code>/v1/sql/check</code> included, stops at the request's deadline, and checks it as it writes out each call of a stored function, as it binds each query, and every thousand values of a list.</p>
 <h3 id="health">Health<a class="anchor" href="#health" aria-label="Link to this section">#</a></h3>
 <p><code>GET /v1/health</code> reports <code>status</code>:</p>
 <ul>

@@ -3332,7 +3332,12 @@ impl Coordinator {
                     let refs: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
                     let profiles = self.rank_profiles();
                     let profile = |t: &str, n: &str| profiles.iter().find(|(pt, p)| pt.eq_ignore_ascii_case(t) && p.name.eq_ignore_ascii_case(n)).map(|(_, p)| p.clone());
-                    chloedb::query::compound::plan_read_calling(&f.def.body, &refs, &params, &profile, &self.functions()).map_err(|e| ApiError::bad(format!("query error: the body of {} does not plan: {e}", f.def.name)))?;
+                    // Planned as a statement is (X-B12): with the stack a
+                    // deep body needs, and stopped at a deadline.
+                    let opts = chloedb::query::exec::ExecOptions { deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)), ..Default::default() };
+                    let functions = self.functions();
+                    chloedb::query::budget::guarded(&f.def.body, &opts, |_| chloedb::query::compound::plan_read_calling(&f.def.body, &refs, &params, &profile, &functions))
+                        .map_err(|e| ApiError::bad(format!("query error: the body of {} does not plan: {e}", f.def.name)))?;
                 }
                 Some(Statement::Create { def: f.def.clone(), replace: true, at: Some(f.version) })
             }

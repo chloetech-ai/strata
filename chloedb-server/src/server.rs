@@ -122,6 +122,9 @@ pub struct Options {
     /// and [`chloedb::query::parse::STATEMENT_ELEMENTS`]; 0: no bound).
     pub max_statement_bytes: Option<usize>,
     pub max_statement_elements: Option<usize>,
+    /// What one statement may cost ([`chloedb::query::budget`];
+    /// `--statement-budget`): a key's budget and a request's may lower it.
+    pub statement_budget: chloedb::query::budget::Budget,
     /// Write requests held at once before more are refused (0: no limit).
     pub max_queued_writes: usize,
     /// The largest write or import body, in MiB (0: 256).
@@ -520,6 +523,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     if let Some(n) = o.max_statement_elements {
         svc.max_statement_elements = n;
     }
+    svc.statement_budget = o.statement_budget;
     svc.max_queued_writes = if o.max_queued_writes > 0 { o.max_queued_writes } else { usize::MAX };
     if o.max_body_mb > 0 {
         svc.max_body = o.max_body_mb.saturating_mul(1 << 20);

@@ -361,6 +361,15 @@ struct Args {
     /// (0: no limit).
     #[arg(long, default_value_t = chloedb::query::parse::STATEMENT_ELEMENTS)]
     max_statement_elements: usize,
+    /// What one statement may cost, checked once its stored functions and
+    /// rank profiles are written out and as it reads: `name=n` pairs apart
+    /// by commas, of `nodes` (expressions), `depth` (levels), `list`
+    /// (values in one list or list parameter), `plan_ms` (time to plan)
+    /// and `rows_read` (rows its scans and parts read), as in
+    /// `nodes=50000,rows_read=10000000`. A key's budget and a request's
+    /// `budget` may lower it, never raise it (default: none).
+    #[arg(long, default_value = "", value_parser = |s: &str| chloedb::query::budget::Budget::parse(s).map_err(|e| e.to_string()))]
+    statement_budget: chloedb::query::budget::Budget,
     /// Write requests the server holds at once (embedding, waiting for the
     /// writer, or being applied); more are refused with 429 (0: no limit).
     #[arg(long, default_value_t = 1024)]
@@ -1155,7 +1164,7 @@ const HELP_TOPICS: &[(&str, &[&str])] = &[
         "timeout_ms", "max_timeout_ms", "max_concurrent", "admission_wait_ms", "max_result_window",
         "max_scroll_rows", "max_groups", "max_rerank", "llm_rows", "llm_per_minute",
         "model_calls_per_key_day", "query_memory_mb", "filter_cache_mb", "answer_cache_mb",
-        "max_statement_bytes", "max_statement_elements", "max_queued_writes", "max_body_mb", "max_connections", "max_connections_per_client",
+        "max_statement_bytes", "max_statement_elements", "statement_budget", "max_queued_writes", "max_body_mb", "max_connections", "max_connections_per_client",
         "header_timeout_secs", "idle_timeout_secs", "body_timeout_secs", "write_timeout_secs",
         "drain_ms", "stop_grace_ms"
     ]),
@@ -1533,6 +1542,7 @@ async fn run() {
         answer_cache_mb: a.answer_cache_mb,
         max_statement_bytes: Some(a.max_statement_bytes),
         max_statement_elements: Some(a.max_statement_elements),
+        statement_budget: a.statement_budget,
         max_queued_writes: a.max_queued_writes,
         max_body_mb: a.max_body_mb,
         otlp_retain: a.otlp_retain,

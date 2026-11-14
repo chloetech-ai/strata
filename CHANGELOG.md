@@ -11,6 +11,36 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
+### Statement budgets (audit 4: X-B3, X-B12, proposal 1)
+
+- **Statement budgets**, checked on what a statement becomes rather than
+  what it says: `nodes` (expressions with its stored functions and rank
+  profiles written out), `depth`, `list` (values in one list or list
+  parameter), `plan_ms` (time to plan) and `rows_read` (rows its scans,
+  filters, groups and parts read, checked every 1,024 rows). On a server
+  the budget is the tightest of `--statement-budget` (none by default), the
+  key's (`POST /v1/admin/keys {..., "budget": {...}}`, lowered with
+  `POST /v1/admin/keys/ID/budget`) and the request's `"budget"` on
+  `/v1/query`, `/v1/sql`, `/v1/explain` and `/v1/sql/check`; a request
+  lowers its key's budget, never raises it. Embedded, `ExecOptions::budget`.
+  A coordinator holds `nodes`, `depth`, `list` and `plan_ms`; `rows_read` is
+  counted on a single server only. Nothing changes without a budget.
+- Every entry point plans a statement the same way, with the stack a deep
+  one needs, stopped at its deadline and within its budget: `Db::query_leaf`
+  (Python's `query_arrow`), `Db::pack` (new `Db::pack_with`), `Db::explain`
+  (new `Db::explain_with`), `Db::prepare_write` (new
+  `Db::prepare_write_with`), `POST /v1/explain`, `POST /v1/sql/check` and a
+  coordinator's check of a table function's body (X-B12).
+- Planning checks its deadline as it writes out each call of a stored
+  function, as it binds each single-table query and every thousand values
+  of a list, and a server plans a statement on a blocking thread when its
+  text and its parameters together are long, not its text alone: `tags @>
+  :tags` with 100,000 tags no longer holds a worker past the deadline
+  (X-B3).
+- Auth: a key carries a budget in the keys file, merged across a cluster to
+  the tighter of two copies. A server from before budgets admits the key
+  without its budget.
+
 ## 0.3.3
 
 The afternoon audit's fixes, a ChloeCtx inspector organised by space, and
