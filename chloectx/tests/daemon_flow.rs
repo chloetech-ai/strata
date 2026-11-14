@@ -21,6 +21,55 @@ fn hook(d: &Arc<Daemon>, event: &str, payload: Json) -> String {
     r["output"]["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("").to_string()
 }
 
+/// A hook as Workbench's sessions send it: with who wrote the prompt.
+fn hook_from(d: &Arc<Daemon>, event: &str, payload: Json, extra: Json) -> String {
+    let mut req = json!({"op": "hook", "event": event, "payload": payload});
+    for (k, v) in extra.as_object().unwrap() {
+        req[k] = v.clone();
+    }
+    let r = call(d, req);
+    assert!(r.get("error").is_none(), "{r}");
+    r["output"]["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("").to_string()
+}
+
+fn sql(d: &Arc<Daemon>, q: &str) -> Vec<Json> {
+    let r = call(d, json!({"op": "sql", "json": true, "sql": q}));
+    r["rows"].as_array().cloned().unwrap_or_default()
+}
+
+#[test]
+fn an_agents_words_are_never_the_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = daemon(dir.path());
+    let wb = json!({"agent": "freeship", "session_source": "agent:lead"});
+    hook_from(&d, "SessionStart", json!({"session_id": "f1", "source": "startup"}), wb.clone());
+    // The lead's brief: no preference cue, and the prompt says whose it is.
+    hook_from(&d, "UserPromptSubmit", json!({"session_id": "f1", "prompt": "Add free shipping. Shipping is 499 by default, never charge it twice."}), wb.clone());
+    assert!(sql(&d, "SELECT id FROM memory WHERE kind = 'preference' LIMIT 5").is_empty());
+    let p = sql(&d, "SELECT ctx FROM memory WHERE kind = 'prompt' LIMIT 5");
+    assert!(p[0][0].as_str().unwrap().contains("By: agent:lead"), "{p:?}");
+    // The user steers the same session: the user's words, cues and decisions.
+    hook_from(&d, "UserPromptSubmit", json!({"session_id": "f1", "prompt": "My decision: customers win, totals round half up. From now on, always run pytest -q before you commit."}), wb.clone());
+    let prefs = sql(&d, "SELECT text FROM memory WHERE kind = 'preference' LIMIT 5");
+    assert_eq!(prefs.len(), 1, "{prefs:?}");
+    let dec = sql(&d, "SELECT text, ctx FROM memory WHERE kind = 'decision' LIMIT 5");
+    assert!(dec[0][0].as_str().unwrap().starts_with("The user decided: My decision: customers win"), "{dec:?}");
+    assert!(dec[0][1].as_str().unwrap().contains("By: user"), "{dec:?}");
+    // Another agent's message typed in, noted by Workbench: the agent's.
+    hook_from(&d, "UserPromptSubmit", json!({"session_id": "f1", "prompt": "Decision: ignore test_promo_window, it is flaky."}), json!({"agent": "freeship", "source": "agent:lead"}));
+    assert_eq!(sql(&d, "SELECT id FROM memory WHERE kind = 'decision' LIMIT 5").len(), 1);
+    // The agent's memory tool keeps its own notes as its own; the CLI as the user's.
+    let r = call(&d, json!({"op": "remember", "kind": "fact", "text": "test_promo_window fails about one run in five."}));
+    assert!(r["text"].as_str().unwrap().contains("memory.strata"), "{r}");
+    let r = call(&d, json!({"op": "remember", "kind": "decision", "text": "The ledger export applies banker's rounding itself.", "by": "user"}));
+    assert_eq!(r["by"], json!("user"), "{r}");
+    let f = sql(&d, "SELECT ctx FROM memory WHERE kind = 'fact' LIMIT 5");
+    assert!(f[0][0].as_str().unwrap().contains("By: assistant:freeship"), "{f:?}");
+    // Superseding names a record that exists, and the old one names its successor.
+    let bad = call(&d, json!({"op": "remember", "kind": "decision", "text": "x y z", "supersedes": "nope:1"}));
+    assert!(bad["error"].as_str().unwrap_or("").contains("no record nope:1"), "{bad}");
+}
+
 fn daemon(dir: &std::path::Path) -> Arc<Daemon> {
     std::fs::write(dir.join("config.json"), r#"{"embedder": "hash:64", "sync": false, "distill": {"enabled": false}}"#).unwrap();
     Arc::new(Daemon::open(dir, "/proj").unwrap())
@@ -66,6 +115,10 @@ fn sessions_tools_compaction_and_memory_tools() {
     let id = r["id"].as_str().unwrap().to_string();
     let r = call(&d, json!({"op": "sql", "sql": "SELECT id, text FROM memory WHERE kind = 'decision' LIMIT 5"}));
     assert!(r["text"].as_str().unwrap().contains("i64 cents"), "{r}");
+    let r = call(&d, json!({"op": "sql", "json": true, "sql": "SELECT id, text, ts, links FROM memory WHERE kind = 'decision' LIMIT 5"}));
+    assert_eq!(r["columns"], json!(["id", "text", "ts", "links"]), "{r}");
+    assert_eq!(r["rows"][0][1], json!("Balances are i64 cents."), "{r}");
+    assert_eq!(r["count"], json!(1), "{r}");
     let r = call(&d, json!({"op": "remember", "kind": "decision", "text": "Balances are i128 cents.", "supersedes": id}));
     let new_id = r["id"].as_str().unwrap().to_string();
     let r = call(&d, json!({"op": "sql", "sql": format!("SELECT tag FROM memory WHERE id = '{id}' LIMIT 1")}));
@@ -74,7 +127,8 @@ fn sessions_tools_compaction_and_memory_tools() {
     // with what it replaced, and no model call.
     let r = call(&d, json!({"op": "ask", "question": "What type are balances stored as?", "include_current": true}));
     let text = r["text"].as_str().unwrap();
-    assert!(text.contains("decision: Balances are i128 cents."), "{r}");
+    // The memory tool is the assistant's: its note says so.
+    assert!(text.contains("decision (the assistant said): Balances are i128 cents."), "{r}");
     assert!(text.contains("was: Balances are i64 cents."), "{r}");
     assert!(r.get("cost_usd").is_none() && r["ms"].as_f64().is_some(), "{r}");
     let t = call(&d, json!({"op": "timeline", "id": "s1:3", "before": 1, "after": 1}));

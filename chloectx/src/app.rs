@@ -595,7 +595,8 @@ impl App {
         let prompt = distill::prompt_for(user, assistant, &[], &known, first.ts);
         let reply = self.model.complete(distill::SYSTEM, &prompt)?;
         let d = distill::parse(&reply.text);
-        let drafts: Vec<Draft> = d.drafts.into_iter().map(|x| x.link("from", first.id.clone())).collect();
+        // Who said each item, and one-off instructions kept to their task.
+        let drafts: Vec<Draft> = distill::attribute(d.drafts, user, &distill::Exchange::default()).into_iter().map(|x| x.link("from", first.id.clone())).collect();
         let n = drafts.len();
         let new = store.append(&first.session, first.turn, first.ts, drafts)?;
         // What the new notes replace, and planned work now done.

@@ -37,6 +37,7 @@ pub mod recall;
 pub mod receipt;
 pub mod record;
 pub mod redact;
+pub mod report;
 pub mod snapshots;
 pub mod sqlguard;
 pub mod store;

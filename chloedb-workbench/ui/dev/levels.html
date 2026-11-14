@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- A harness for one level screen (ui/levels/<screen>.js) against
+     dev/levels-mock.mjs, so each screen can be built and screenshotted on
+     its own: /dev/levels.html?screen=mission[&agent=<id>][&theme=dark] -->
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Workbench level</title><link rel="stylesheet" href="../style.css">
+<style>body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 var(--sans)}#root{height:100vh}</style>
+</head><body><div id="root"></div>
+<script type="module">
+const q = new URLSearchParams(location.search);
+if (q.get("theme")) document.documentElement.dataset.theme = q.get("theme");
+const screen = q.get("screen") || "mission";
+const api = async (path, { method = "GET", body } = {}) => {
+  const r = await fetch(path, { method, headers: { authorization: "Bearer dev", "content-type": "application/json" }, body: body == null ? undefined : JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, body: j });
+  return j;
+};
+const state = { agents: (await api("/api/agents?all=1")).agents, events: [] };
+const ctx = {
+  api, state,
+  params: { agent: q.get("agent"), repo: q.get("repo") },
+  go: (hash) => console.log("go", hash),
+  openWhy: (a) => console.log("openWhy", a),
+  openRewind: (a) => console.log("openRewind", a),
+  zoom: (id) => console.log("zoom", id),
+};
+const mod = await import(`../levels/${screen}.js`);
+window.view = mod.mount(document.getElementById("root"), ctx);
+</script></body></html>

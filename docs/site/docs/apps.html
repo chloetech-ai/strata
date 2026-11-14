@@ -191,7 +191,7 @@ answer = call(&quot;chloectx&quot;, &quot;/v1/spaces/billing/ask&quot;, {&quot;q
 print(answer[&quot;tokens&quot;] &lt;= 500)
 print(answer[&quot;context&quot;])</pre>
 <pre data-lang="text" data-title="Output" class="output">True
-Notes from earlier conversations with the user, in their current versions, oldest first (date, kind, note; what it replaced in brackets). Rules come first; a later note can change what an earlier one says:
+Notes from earlier sessions, in their current versions, oldest first (date, kind, who said it when it was not the user, note; what it replaced in brackets). Rules come first; a later note can change what an earlier one says:
 - 2026-10-15 decision: Refunds above 1000 EUR need the finance manager&#x27;s approval; team leads approve up to 1000 EUR. (changed 2026-10-15; was: Refunds above 500 EUR need a team lead&#x27;s approval.)
 - 2026-10-20 fact: Refunds are paid back to the original card within 5 working days.</pre>
 <p>The context holds the current decision and says what it replaced; the old one is left out. No model is called to answer: it is a BM25 and vector search under the space's rules (<a href="chloectx.html">how ChloeCtx searches</a>).</p>

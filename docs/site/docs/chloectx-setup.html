@@ -156,7 +156,7 @@
 <tbody>
 <tr>
 <td>hooks</td>
-<td>the same nine events, from the plugin, through its launcher</td>
+<td>the same eleven events, from the plugin, through its launcher</td>
 <td>in <code>~/.claude/settings.json</code></td>
 </tr>
 <tr>
@@ -298,7 +298,7 @@ cargo install --path . --bin chloectx --root ~/.local       # a stable path for 
 chloectx fetch-model                                        # potion-retrieval-32M, 129 MB, at a pinned revision, SHA-256 checked
 chloectx install --user --distill-model haiku               # or: chloectx install --project /path/to/project
 chloectx doctor</pre>
-<p><code>chloectx install --user</code> merges nine hooks and a permission for the memory tools into <code>~/.claude/settings.json</code> (saving the previous file next to it as <code>settings.json.chloectx-&lt;time&gt;.bak</code>) and registers the MCP server at user scope with <code>claude mcp add-json</code>. A project install backs up the project's <code>.claude/settings.local.json</code> and <code>.mcp.json</code> the same way before it changes them (delete the <code>.bak</code> files once you are happy, and do not commit them). Every settings file is written to a file beside it and renamed into place, so an interrupted install leaves the old file whole, and its keys stay in the order they were. A project with its own <code>chloectx install</code> keeps using that one; the user-level hooks step aside there, so nothing is recorded twice.</p>
+<p><code>chloectx install --user</code> merges eleven hooks and a permission for the memory tools into <code>~/.claude/settings.json</code> (saving the previous file next to it as <code>settings.json.chloectx-&lt;time&gt;.bak</code>) and registers the MCP server at user scope with <code>claude mcp add-json</code>. A project install backs up the project's <code>.claude/settings.local.json</code> and <code>.mcp.json</code> the same way before it changes them (delete the <code>.bak</code> files once you are happy, and do not commit them). Every settings file is written to a file beside it and renamed into place, so an interrupted install leaves the old file whole, and its keys stay in the order they were. A project with its own <code>chloectx install</code> keeps using that one; the user-level hooks step aside there, so nothing is recorded twice.</p>
 <h2 id="check-it">Check it<a class="anchor" href="#check-it" aria-label="Link to this section">#</a></h2>
 <pre data-lang="sh">$ chloectx doctor
 ChloeCtx 0.3.3 for /home/you/code/app
@@ -366,7 +366,7 @@ chloectx ui --home ~/chloectx-demo/chloectx  # stores kept elsewhere (here: the 
 </tr>
 <tr>
 <td>stores</td>
-<td><code>~/.local/share/chloectx/projects/&lt;folder&gt;-&lt;hash&gt;/</code>, one per project directory: <code>memory.strata</code> and its WAL, <code>state.json</code>, <code>events.log</code> (recall and distill decisions), <code>daemon.log</code>, <code>project.txt</code>. A machine that has <code>~/.local/share/engram</code> from before the rename, and no <code>~/.local/share/chloectx</code>, keeps using the old folder</td>
+<td><code>~/.local/share/chloectx/projects/&lt;folder&gt;-&lt;hash&gt;/</code>, one per project directory (a repository's worktrees share its main checkout's): <code>memory.strata</code> and its WAL, <code>state.json</code>, <code>events.log</code> (recall and distill decisions), <code>daemon.log</code>, <code>project.txt</code>. A machine that has <code>~/.local/share/engram</code> from before the rename, and no <code>~/.local/share/chloectx</code>, keeps using the old folder</td>
 </tr>
 <tr>
 <td>embedding model</td>

@@ -718,7 +718,7 @@ pub fn fmt_recall_checked(items: &[(Record, String)], now: i64, weak: bool, mut 
     };
     for (r, snip) in items {
         let label = match check.as_deref_mut() {
-            Some(c) if r.kind.is_knowledge() => c.check_record(&r).label(),
+            Some(c) => c.label_record(r),
             _ => String::new(),
         };
         s += "\n";
@@ -856,8 +856,10 @@ pub fn fmt_knowledge_checked(items: &[(Record, f64, f64)], now: i64, mut check: 
     let mut s = String::from("ChloeCtx notes from earlier sessions that may bear on this request (decisions, rules and requirements agreed before; check them before deciding):\n");
     for (r, _, _) in items {
         let t = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let fresh = check.as_deref_mut().map(|c| c.check_record(&r).label()).unwrap_or_default();
-        s += &format!("- [{}] {t} ({}, {}){fresh}\n", note_label(r), r.id, fmt_ago(r.ts, now));
+        let fresh = check.as_deref_mut().map(|c| c.label_record(r)).unwrap_or_default();
+        let w = r.said_by();
+        let whose = if w.is_empty() || t.to_lowercase().starts_with(&w.to_lowercase()) { String::new() } else { format!(", {w} said") };
+        s += &format!("- [{}{whose}] {t} ({}, {}){fresh}\n", note_label(r), r.id, fmt_ago(r.ts, now));
     }
     s
 }
@@ -888,7 +890,7 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
     }
     s += ". Requirements, decisions and conventions agreed in earlier conversations are often not in the code: \
           before a design decision, and whenever a task refers to earlier work, search memory (memory_ask answers a question about earlier work from notes, replies and messages at once; \
-          memory_search is one quick search; memory_timeline shows a record's surroundings; memory_sql runs structured queries). memory_remember stores a new decision or fact.\n";
+          memory_search is one quick search; memory_timeline shows a record's surroundings; memory_sql runs structured queries). memory_remember stores a new decision or fact: keep decisions there, not in memory files of your own, where the user and later sessions do not look.\n";
     let clip = |t: &str, n: usize| -> String {
         let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
         if t.chars().count() > n {
@@ -912,19 +914,21 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
             if r.tag == "superseded" || r.tag == "done" || (distilled && r.tag == "cue") || crate::envelope::is_envelope_record(&r) || !seen.insert(norm(&r.text)) {
                 continue;
             }
-            let fresh = match check.as_deref_mut() {
-                Some(c) if r.kind.is_knowledge() => c.check_record(&r),
-                _ => crate::anchor::Freshness::Current,
+            let (fresh, label) = match check.as_deref_mut() {
+                Some(c) if r.kind.is_knowledge() => (c.check_record(&r), c.label_record(&r)),
+                _ => (crate::anchor::Freshness::Current, String::new()),
             };
-            if fresh.is_stale() {
-                stale.push((r, fresh.label()));
+            // Another branch's note whose work is not here, or one whose
+            // code is gone: in a section of their own, labelled.
+            if fresh.is_stale() || label.contains("not merged here") {
+                stale.push((r, label));
                 continue;
             }
             if lines.len() == keep {
                 unshown.push(r);
                 continue;
             }
-            lines.push((r.id.clone(), format!("- {} ({}, {}){}\n", crate::envelope::defuse(&clip(&r.text, n)), r.id, fmt_ago(r.ts, now), fresh.label())));
+            lines.push((r.id.clone(), format!("- {} ({}, {}){}\n", crate::envelope::defuse(&clip(&r.text, n)), r.id, fmt_ago(r.ts, now), label)));
         }
         lines.reverse();
         let head = format!("\n{title}\n");
@@ -948,7 +952,7 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
     section("Facts about the project:", store.latest(&[Kind::Fact, Kind::Note], 80, &none)?, 260, 10, &mut s, &mut stale, &mut unshown);
     let mut stale_ids: Vec<String> = Vec::new();
     if !stale.is_empty() {
-        let head = "\nNotes that may be out of date (the code they describe has changed since they were written; check it before relying on them):\n";
+        let head = "\nNotes that may be out of date or from another branch (the code they describe has changed since, or is not merged into this worktree; check it before relying on them):\n";
         let mut added = false;
         for (r, label) in stale.iter().take(6) {
             let line = format!("- {} ({}, {}){label}\n", crate::envelope::defuse(&clip(&r.text, 220)), r.id, fmt_ago(r.ts, now));

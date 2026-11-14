@@ -43,12 +43,13 @@ APPS = {
     "chloectx/": ({"chloectx"}, {"smoke_ctx", "docs"}),
     "chloedb-crawl/": ({"chloedb-crawl"}, {"smoke_crawl", "docs"}),
     "chloedb-sheets/": ({"chloedb-sheets"}, {"smoke_sheets", "docs"}),
+    "chloedb-workbench/": ({"chloedb-workbench"}, set()),
     "chloedb-apps/": (set(), {"smoke_apps"}),
     "chloedb-py/": (set(), {"python", "docs"}),
     "chloedb-js/": (set(), {"javascript"}),
     "chloedb-java/": (set(), {"java"}),
 }
-CRATES = ["chloedb", "chloectx", "chloedb-server", "chloedb-crawl", "chloedb-sheets"]
+CRATES = ["chloedb", "chloectx", "chloedb-server", "chloedb-crawl", "chloedb-sheets", "chloedb-workbench"]
 SMOKE = ["smoke_crawl", "smoke_sheets", "smoke_ctx", "smoke_apps"]
 # The demo train (demos.yml): nothing in CI.
 DEMOS = ("chloedb-netops/", "chloedb-swarm/", "examples/feature-store/", "examples/parley/")
@@ -117,6 +118,7 @@ def self_test():
     assert on(["examples/parley/parley/app.py", "examples/feature-store/featurestore.py"]) == set()
     assert on(["chloedb-netops/src/lib.rs", "chloedb-sheets/src/lib.rs"]) == {"any", "test:chloedb-sheets", "smoke", "smoke_sheets", "docs", "server"}
     assert on(["chloedb-crawl/src/lib.rs"]) == {"any", "test:chloedb-crawl", "smoke", "smoke_crawl", "docs", "server"}
+    assert on(["chloedb-workbench/src/main.rs"]) == {"any", "test:chloedb-workbench"}
     assert on(["chloectx/src/app.rs"]) == {"any", "test:chloectx", "smoke", "smoke_ctx", "docs", "server"}
     assert on(["chloedb-apps/src/x.js"]) == {"any", "smoke", "smoke_apps", "server"}
     assert on(["chloedb-swarm/x.js"]) == set()

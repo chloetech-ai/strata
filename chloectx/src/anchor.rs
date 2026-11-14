@@ -21,6 +21,37 @@ use crate::embed::fnv;
 /// Files larger than this are not hashed.
 const MAX_FILE: u64 = 4 << 20;
 
+/// The tag of the event a session's worktree, branch and commit are kept
+/// in, when its hooks first name them and whenever the branch changes.
+pub const WORKTREE_TAG: &str = "worktree";
+
+/// The branches of each session's worktree over time, from the worktree
+/// events: session -> (since, branch, head), oldest first.
+pub type SessionBranches = HashMap<String, Vec<(i64, String, String)>>;
+
+/// Every session's branches, read from the store's worktree events.
+pub fn session_branches(store: &crate::store::Store) -> SessionBranches {
+    let mut out: SessionBranches = HashMap::new();
+    let sql = format!("SELECT session, ts, text FROM memory WHERE kind = 'event' AND tag = '{WORKTREE_TAG}' ORDER BY ts ASC LIMIT 100000");
+    let Ok(rs) = store.query(&sql) else { return out };
+    for row in &rs.rows {
+        let (Some(chloedb::Value::Str(sid)), Some(ts), Some(chloedb::Value::Str(text))) = (row.first(), row.get(1).and_then(|v| v.as_f64()), row.get(2)) else { continue };
+        if let Some(a) = Anchor::parse(text) {
+            out.entry(sid.clone()).or_default().push((ts as i64, a.branch, a.head));
+        }
+    }
+    out
+}
+
+/// The anchor of a record about one file of `project` as it is now (a
+/// file the agent read or changed): the commit, the branch and the file's
+/// hash, so that a later recall can tell the code changed since.
+pub fn of_file(project: &Path, rel: &str) -> Anchor {
+    let (head, branch) = git_head(project);
+    let files = read(project, rel).map(|c| vec![(rel.to_string(), hash(&c))]).unwrap_or_default();
+    Anchor { head, branch, files, idents: Vec::new() }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Anchor {
     /// Abbreviated commit the repository was at.
@@ -267,11 +298,81 @@ pub struct Checker {
     pub project: PathBuf,
     branch: Option<String>,
     files: HashMap<String, Option<(String, String)>>,
+    /// Each session's branches, for records without an anchor of their own.
+    sessions: SessionBranches,
+    /// By branch: the commit time of its merge base with this worktree's
+    /// HEAD (None: no such branch, or git could not say).
+    bases: HashMap<String, Option<i64>>,
 }
 
 impl Checker {
     pub fn new(project: &Path) -> Checker {
-        Checker { project: project.to_path_buf(), branch: None, files: HashMap::new() }
+        Checker { project: project.to_path_buf(), branch: None, files: HashMap::new(), sessions: HashMap::new(), bases: HashMap::new() }
+    }
+
+    /// Knows the branch each session's records came from.
+    pub fn with_sessions(mut self, sessions: SessionBranches) -> Checker {
+        self.sessions = sessions;
+        self
+    }
+
+    /// The branch a record came from: its anchor's, else its session's
+    /// branch at the time.
+    pub fn branch_of(&self, r: &crate::record::Record) -> String {
+        if let Some(a) = Anchor::parse(&r.ctx).filter(|a| !a.branch.is_empty()) {
+            return a.branch;
+        }
+        self.sessions.get(&r.session).and_then(|v| v.iter().rev().find(|(t, _, _)| *t <= r.ts).or(v.first())).map(|(_, b, _)| b.clone()).unwrap_or_default()
+    }
+
+    /// The commit time of the merge base of `branch` with HEAD.
+    fn base_time(&mut self, branch: &str) -> Option<i64> {
+        if let Some(t) = self.bases.get(branch) {
+            return *t;
+        }
+        let git = |args: &[&str]| -> Option<String> {
+            let out = std::process::Command::new("git").arg("-C").arg(&self.project).args(args).stderr(std::process::Stdio::null()).output().ok()?;
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+        };
+        let r = format!("refs/heads/{branch}");
+        let t = git(&["merge-base", &r, "HEAD"]).and_then(|mb| git(&["show", "-s", "--format=%ct", &mb])).and_then(|t| t.parse::<i64>().ok());
+        if self.bases.len() < 64 {
+            self.bases.insert(branch.to_string(), t);
+        }
+        t
+    }
+
+    /// The branch a record came from when its work is not in this
+    /// worktree: another branch, and the record was written after the last
+    /// commit that branch and this worktree share (so what it saw was not
+    /// committed, or not merged here). `None` when it is from this branch,
+    /// from history the two share, or nobody knows.
+    pub fn elsewhere(&mut self, r: &crate::record::Record) -> Option<String> {
+        let b = self.branch_of(r);
+        if b.is_empty() || b == "(detached)" || b == self.branch() {
+            return None;
+        }
+        let t = self.base_time(&b)?;
+        (t + crate::clock_offset() < r.ts).then_some(b)
+    }
+
+    /// The label shown after a record: how its code stands now, and, when
+    /// it came from another branch whose work is not here, which. A record
+    /// whose files are the same here as when it was written needs neither.
+    pub fn label_record(&mut self, r: &crate::record::Record) -> String {
+        let fresh = self.check_record(r);
+        let same_code = Anchor::parse(&r.ctx).is_some_and(|a| !a.files.is_empty()) && fresh == Freshness::Current;
+        match self.elsewhere(r) {
+            Some(b) if !same_code => {
+                let what = match &fresh {
+                    Freshness::Current => String::new(),
+                    Freshness::Changed(f) => format!("; {} differ{} here", f.join(", "), if f.len() == 1 { "s" } else { "" }),
+                    Freshness::Stale(why) | Freshness::Drifted(why) => format!("; {why} here"),
+                };
+                format!(" [from branch {b}, not merged here{what}: not a description of this worktree's code]")
+            }
+            _ => fresh.label(),
+        }
     }
 
     fn file(&mut self, rel: &str) -> Option<(String, String)> {
@@ -405,6 +506,60 @@ mod tests {
         assert!(ck.check_record(&fact).is_stale());
         let f = ck.check_record(&rule);
         assert!(!f.is_stale() && f.label().contains("still follows"), "{f:?}");
+    }
+
+    #[test]
+    fn records_from_unmerged_branches_say_so() {
+        const T0: i64 = 1_700_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let git = |args: &[&str], when: i64| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(args)
+                .env("GIT_COMMITTER_DATE", format!("{} +0000", T0 + when))
+                .env("GIT_AUTHOR_DATE", format!("{} +0000", T0 + when))
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        git(&["init", "-q", "-b", "main"], 0);
+        std::fs::write(p.join("money.py"), "def to_cents(x):\n    return round(x * 100)\n").unwrap();
+        git(&["add", "."], 0);
+        git(&["commit", "-q", "-m", "base"], 1_000);
+        git(&["branch", "wb/paybutton"], 1_000);
+        git(&["checkout", "-q", "-b", "wb/cents"], 1_000);
+        let rec = |session: &str, ts: i64, ctx: &str| crate::record::Record::from_draft(crate::record::Draft::new(crate::record::Kind::ToolResult, "def to_cents(x): return round(x * 100)").ctx(ctx), session, 1, 1, T0 + ts);
+        let mut sessions: SessionBranches = HashMap::new();
+        sessions.insert("pay".into(), vec![(1_500, "wb/paybutton".into(), "x".into())]);
+        sessions.insert("old".into(), vec![(500, "main".into(), "x".into())]);
+        let mut ck = Checker::new(p).with_sessions(sessions);
+        assert_eq!(ck.branch(), "wb/cents");
+        // Read in paybutton's worktree after it forked, with nothing merged.
+        let pay = rec("pay", 2_000, "");
+        assert_eq!(ck.elsewhere(&pay).as_deref(), Some("wb/paybutton"));
+        assert!(ck.label_record(&pay).contains("from branch wb/paybutton, not merged here"), "{}", ck.label_record(&pay));
+        // Its anchor names the file, and the file is the same here: no label.
+        let same = rec("pay", 2_000, &Anchor { head: "x".into(), branch: "wb/paybutton".into(), files: vec![("money.py".into(), hash(&std::fs::read_to_string(p.join("money.py")).unwrap()))], idents: vec![] }.to_line());
+        assert_eq!(ck.label_record(&same), "");
+        // From before the fork: shared history.
+        assert_eq!(ck.elsewhere(&rec("old", 900, "")), None);
+        // paybutton commits and is merged here: its earlier records are here.
+        git(&["checkout", "-q", "wb/paybutton"], 3_000);
+        std::fs::write(p.join("pay.js"), "pay()\n").unwrap();
+        git(&["add", "."], 3_000);
+        git(&["commit", "-q", "-m", "pay"], 3_000);
+        git(&["checkout", "-q", "wb/cents"], 3_000);
+        git(&["merge", "-q", "--no-edit", "wb/paybutton"], 3_100);
+        let mut ck = Checker::new(p).with_sessions(ck.sessions.clone());
+        assert_eq!(ck.elsewhere(&pay), None);
+        // A record written after paybutton's last commit is not.
+        assert_eq!(ck.elsewhere(&rec("pay", 4_000, "")).as_deref(), Some("wb/paybutton"));
     }
 
     #[test]

@@ -992,7 +992,7 @@ fn distilled_store(u: &Unit, dir: &Path, embedder: &str, e: &Arc<dyn Embedder>) 
         if t.role != "user" {
             answer.insert_str(0, &format!("{}\n", t.text));
         }
-        d.distill_turn(&t.session_id, i as i64, ts, prompt, &answer, &[], &[]);
+        d.distill_turn(&t.session_id, i as i64, ts, prompt, &answer, &[], &[], &chloectx::distill::Exchange::default());
         n += 1;
         if n % 25 == 0 {
             eprintln!("  {}: {n} exchanges distilled, {:.0} s", u.unit_id, t0.elapsed().as_secs_f64());

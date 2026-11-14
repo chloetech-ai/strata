@@ -143,6 +143,32 @@ pub struct Session {
     /// Failed commands followed until they pass ([`crate::fixes`]).
     #[serde(default)]
     pub fixes: crate::fixes::Tracker,
+    /// The folder the session runs in, as its hooks name it: a worktree of
+    /// the repository whose store this is, which may not be the folder the
+    /// daemon was started for ([`crate::paths::store_root`]). Its paths
+    /// are relative to it and its notes are checked against its files.
+    /// Empty for a session whose hooks predate it: the daemon's project.
+    #[serde(default)]
+    pub worktree: String,
+    /// The branch checked out in the worktree when its hooks last ran.
+    #[serde(default)]
+    pub branch: String,
+    /// Who wrote the current turn's prompt ([`crate::record::Source`]):
+    /// `user` unless Workbench said otherwise (`CHLOECTX_PROMPT_SOURCE`,
+    /// `CHLOECTX_PROMPT_LOG`).
+    #[serde(default)]
+    pub source: String,
+    /// The session's agent name, when Workbench gave one (`CHLOECTX_AGENT_NAME`).
+    #[serde(default)]
+    pub agent: String,
+    /// The end of the assistant's last answer: a prompt may answer a
+    /// question it asked (a rule asked for, [`crate::capture::standing_rule`]).
+    #[serde(default)]
+    pub prev_answer: String,
+    /// When each tool call of the turn was made, by `tool_use_id`, from the
+    /// transcript, kept until its result arrives ([`crate::report`]).
+    #[serde(skip)]
+    pub calls: HashMap<String, i64>,
 }
 
 /// A query-understanding search started after a prompt (`async` mode).
@@ -343,7 +369,19 @@ impl Daemon {
             "ping" => Ok((json!({"ok": true, "pid": std::process::id(), "records": self.store.len()}), None)),
             "hook" => {
                 self.note_hook_settings(req);
-                self.hook(req.get("event").and_then(|v| v.as_str()).unwrap_or(""), req.get("payload").unwrap_or(&Json::Null))
+                let payload = req.get("payload").unwrap_or(&Json::Null);
+                let sid = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                self.note_worktree(sid, req);
+                if let Some(a) = req.get("agent").and_then(|v| v.as_str()).filter(|a| !a.is_empty()) {
+                    let mut st = self.state.lock().unwrap();
+                    if let crate::record::Source::Agent(n) = crate::record::Source::parse(&format!("agent:{a}")) {
+                        st.sessions.entry(sid.to_string()).or_default().agent = n;
+                    }
+                }
+                if req.get("event").and_then(|v| v.as_str()) == Some("UserPromptSubmit") {
+                    self.note_source(sid, req);
+                }
+                self.hook(req.get("event").and_then(|v| v.as_str()).unwrap_or(""), payload)
             }
             "search" => self.op_search(req).map(|r| (r, Some(self.after(|me| me.keep_after_recall())))),
             "receipts" => self.op_receipts(req).map(|r| (r, None)),
@@ -371,9 +409,10 @@ impl Daemon {
             // shows a space of the cluster ([`crate::app::view`]).
             "view" => crate::app::view::by_name(&self.store.pinned(), req).map(|r| (r, None)),
             "capsule" => self.op_capsule(req).map(|r| (r, None)),
+            "report" => self.op_report(req).map(|r| (r, None)),
             "briefing" => {
                 let sid = req.get("session").and_then(|v| v.as_str()).unwrap_or("");
-                let mut ck = self.checker();
+                let mut ck = self.checker_in(&self.tree_of(req));
                 recall::briefing_checked(&self.store, sid, self.cfg.briefing_chars, now(), Some(&mut ck)).map(|(t, _)| (json!({"text": t}), None))
             }
             "sync" => self.op_sync(req).map(|r| (r, None)),
@@ -510,7 +549,7 @@ impl Daemon {
                     }
                     s.last_prompts.clone()
                 });
-                let mut ck = self.checker();
+                let mut ck = self.checker_in(&self.tree(&sid));
                 let pinned = self.store.pinned();
                 let (mut text, shown) = recall::briefing_checked(&pinned, &sid, self.cfg.briefing_chars, now(), Some(&mut ck))?;
                 if !shown.is_empty() {
@@ -612,7 +651,8 @@ impl Daemon {
                         if due {
                             me.keep_after_recall();
                         }
-                        if let Err(e) = me.store.append(&sid, turn, now(), capture::prompt_drafts(&prompt)) {
+                        let by = me.source_of(&sid);
+                        if let Err(e) = me.store.append(&sid, turn, now(), capture::prompt_drafts_by(&prompt, &by)) {
                             me.log(&json!({"ts": now(), "error": e.to_string(), "event": "UserPromptSubmit"}));
                         }
                         if !due {
@@ -633,6 +673,15 @@ impl Daemon {
                 ))
             }
             "PreToolUse" => {
+                // When the call was made, which its result's record notes.
+                if let Some(id) = p.get("tool_use_id").and_then(|v| v.as_str()).filter(|i| !i.is_empty()) {
+                    let mut st = self.state.lock().unwrap();
+                    let s = st.sessions.entry(sid.clone()).or_default();
+                    if s.calls.len() > 64 {
+                        s.calls.clear();
+                    }
+                    s.calls.insert(id.to_string(), now());
+                }
                 if !self.cfg.file_notes {
                     return Ok((json!({"output": null}), None));
                 }
@@ -641,7 +690,8 @@ impl Daemon {
                 if !matches!(tool, "Edit" | "MultiEdit" | "Write") || path.is_empty() {
                     return Ok((json!({"output": null}), None));
                 }
-                let rel = path.strip_prefix(&self.project).map(|x| x.trim_start_matches('/')).unwrap_or(path).to_string();
+                let tree = self.tree(&sid);
+                let rel = path.strip_prefix(tree.as_str()).map(|x| x.trim_start_matches('/')).unwrap_or(path).to_string();
                 let mut text = self.file_notes(&sid, &rel)?;
                 if self.cfg.next_files {
                     let next = self.next_file_notes(&sid, &rel, &text)?;
@@ -659,12 +709,16 @@ impl Daemon {
                 if event == "PostToolUseFailure" {
                     resp = json!({"is_error": true, "error": p.get("error").cloned().unwrap_or(resp)});
                 }
-                let project = self.project.clone();
+                let project = self.tree(&sid);
                 let fixes_on = self.cfg.error_fixes;
-                let (turn, ctx, fixed) = self.with_session(&sid, |s| {
+                let end = now();
+                let call_id = p.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tpath = p.get("transcript_path").and_then(|v| v.as_str()).map(String::from);
+                let (turn, ctx, fixed, started) = self.with_session(&sid, |s| {
+                    let started = s.calls.remove(&call_id);
                     s.episode.add_tool(&tool, &input, &resp, &project);
                     let fixed = if fixes_on { s.fixes.observe(&tool, &input, &resp, &project) } else { Vec::new() };
-                    (s.turn, format!("Turn {} request: {}", s.turn, s.episode.prompt.chars().take(200).collect::<String>()), fixed)
+                    (s.turn, format!("Turn {} request: {}", s.turn, s.episode.prompt.chars().take(200).collect::<String>()), fixed, started)
                 });
                 let mut text = self.take_deep(&sid, turn, Duration::ZERO, false).unwrap_or_default();
                 if fixes_on && tool == "Bash" {
@@ -676,7 +730,38 @@ impl Daemon {
                 Ok((
                     ctx_out(event, text),
                     Some(self.after(move |me| {
-                        let mut drafts: Vec<Draft> = capture::tool_drafts(&tool, &input, &resp, &project).into_iter().map(|d| d.ctx(ctx.clone())).collect();
+                        // A file the call read or changed is anchored: its
+                        // branch, commit and content hash now, so a later
+                        // recall into another worktree can tell its code
+                        // from this one's ([`anchor::Checker::label_record`]).
+                        let file = ["file_path", "notebook_path"].iter().find_map(|k| input.get(*k).and_then(|v| v.as_str())).unwrap_or("");
+                        let rel = file.strip_prefix(project.as_str()).map(|x| x.trim_start_matches('/')).unwrap_or("");
+                        let aline = if matches!(tool.as_str(), "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit") && !rel.is_empty() {
+                            anchor::of_file(Path::new(&project), rel).to_line()
+                        } else {
+                            String::new()
+                        };
+                        let agent = me.state.lock().unwrap().sessions.get(&sid).map(|s| s.agent.clone()).unwrap_or_default();
+                        let mut drafts: Vec<Draft> = capture::tool_drafts(&tool, &input, &resp, &project)
+                            .into_iter()
+                            .map(|d| {
+                                let mut c = ctx.clone();
+                                for extra in [d.ctx.as_str(), if d.kind == Kind::ToolCall || d.kind == Kind::ToolResult { aline.as_str() } else { "" }] {
+                                    if !extra.is_empty() {
+                                        c = format!("{c}\n{extra}");
+                                    }
+                                }
+                                let memo = d.tag == capture::MEMORY_FILE_TAG;
+                                let d = d.ctx(c);
+                                if memo { d.by(&crate::record::Source::Assistant(agent.clone())) } else { d }
+                            })
+                            .collect();
+                        // How long the call took: from its PreToolUse, else
+                        // from its message in the transcript.
+                        let started = started.or_else(|| tpath.as_deref().and_then(|t| crate::transcript::call_ts(Path::new(t), &call_id)));
+                        if let Some(t0) = started {
+                            capture::took(&mut drafts, end - t0);
+                        }
                         if !fixed.is_empty() {
                             let from = me.prompt_of(&sid, turn);
                             for f in &fixed {
@@ -688,7 +773,7 @@ impl Daemon {
                             }
                             me.log(&json!({"ts": now(), "event": "fix", "session": sid, "turn": turn, "fixes": fixed.len()}));
                         }
-                        if let Err(e) = me.store.append(&sid, turn, now(), drafts) {
+                        if let Err(e) = me.store.append(&sid, turn, end, drafts) {
                             me.log(&json!({"ts": now(), "error": e.to_string(), "event": "PostToolUse"}));
                         }
                         me.store.warm();
@@ -716,10 +801,16 @@ impl Daemon {
                         return Ok((json!({"output": {"decision": "block", "reason": reason}}), None));
                     }
                 }
-                let (turn, ep, first) = self.with_session(&sid, |s| {
+                let (turn, ep, first, ex) = self.with_session(&sid, |s| {
                     let first = !s.episode_stored;
                     s.episode_stored = true;
-                    (s.turn, s.episode.clone(), first)
+                    let ex = crate::distill::Exchange { by: Some(crate::record::Source::parse(&s.source)), agent: s.agent.clone(), prev_answer: s.prev_answer.clone() };
+                    if first {
+                        // Redacted: the state is a file too.
+                        let tail: Vec<char> = crate::redact::redact(&answer).chars().collect();
+                        s.prev_answer = tail[tail.len().saturating_sub(800)..].iter().collect();
+                    }
+                    (s.turn, s.episode.clone(), first, ex)
                 });
                 if !first {
                     return Ok((json!({"output": null}), None));
@@ -739,7 +830,7 @@ impl Daemon {
                         }
                         me.store.warm();
                         let files: Vec<String> = ep.files.iter().cloned().collect();
-                        me.distill_turn(&sid, turn, now(), &ep.prompt, &answer, &ep.commands, &files);
+                        me.distill_turn(&sid, turn, now(), &ep.prompt, &answer, &ep.commands, &files, &ex);
                     })),
                 ))
             }
@@ -760,12 +851,38 @@ impl Daemon {
             "PreCompact" => {
                 let tpath = p.get("transcript_path").and_then(|v| v.as_str()).map(String::from);
                 let (turn, prompt) = self.with_session(&sid, |s| (s.turn, s.episode.prompt.clone()));
+                // When it started, for `chloectx report`.
+                let started = capture::event_draft(event, p);
+                let at = now();
                 Ok((
                     json!({"output": null}),
                     Some(self.after(move |me| {
+                        if let Some(d) = started {
+                            if let Err(e) = me.store.append(&sid, turn, at, vec![d]) {
+                                me.log(&json!({"ts": now(), "error": e.to_string(), "event": "PreCompact"}));
+                            }
+                        }
                         if let Some(t) = &tpath {
                             let ctx = format!("Turn {turn} request: {}", prompt.chars().take(200).collect::<String>());
                             me.sync_narration(&sid, turn, t, "", &ctx);
+                        }
+                    })),
+                ))
+            }
+            // When the agent waited for the user (a permission prompt, an
+            // idle notice) and when a sub-agent finished: recorded for
+            // `chloectx report`, never shown ([`Kind::Event`]). Nothing is
+            // answered, so a sub-agent is never held back.
+            "Notification" | "SubagentStop" => {
+                let Some(draft) = capture::event_draft(event, p) else { return Ok((json!({"output": null}), None)) };
+                let turn = self.state.lock().unwrap().sessions.get(&sid).map_or(0, |s| s.turn);
+                let at = now();
+                let event = event.to_string();
+                Ok((
+                    json!({"output": null}),
+                    Some(self.after(move |me| {
+                        if let Err(e) = me.store.append(&sid, turn, at, vec![draft]) {
+                            me.log(&json!({"ts": now(), "error": e.to_string(), "event": event}));
                         }
                     })),
                 ))
@@ -784,7 +901,7 @@ impl Daemon {
     /// already noted, replacements (the old item is marked superseded), and
     /// planned work it completed (marked done).
     #[allow(clippy::too_many_arguments)]
-    pub fn distill_turn(&self, sid: &str, turn: i64, ts: i64, prompt: &str, answer: &str, commands: &[String], files: &[String]) {
+    pub fn distill_turn(&self, sid: &str, turn: i64, ts: i64, prompt: &str, answer: &str, commands: &[String], files: &[String], ex: &crate::distill::Exchange) {
         if !self.distill_cfg().active() || (prompt.trim().is_empty() && answer.trim().is_empty()) {
             return;
         }
@@ -806,7 +923,7 @@ impl Daemon {
         known.sort_by_key(|r| -r.seq);
         let listed: Vec<(String, Kind, String)> = known.iter().rev().map(|r| (r.id.clone(), r.kind, r.text.clone())).collect();
         let t0 = Instant::now();
-        match crate::distill::distill(&self.distill_cfg(), prompt, answer, commands, &listed, ts) {
+        match crate::distill::distill_exchange(&self.distill_cfg(), prompt, answer, commands, &listed, ts, ex) {
             Ok(d) => {
                 let is_known = |id: &String| known.iter().any(|r| &r.id == id);
                 let replaced: Vec<String> = d.replaced.into_iter().filter(|id| is_known(id)).collect();
@@ -819,6 +936,7 @@ impl Daemon {
                 let source = self.prompt_of(sid, turn);
                 let n = d.drafts.len();
                 let mut drafts = Vec::new();
+                let tree = self.tree(sid);
                 for x in d.drafts {
                     let t = terms(&x.text);
                     let dup = seen.iter().any(|s| {
@@ -829,7 +947,7 @@ impl Daemon {
                     if !dup {
                         seen.push(t);
                         // Anchored to the code the note is about, as it is now.
-                        let a = anchor::make(Path::new(&self.project), &x.text, &x.files, files);
+                        let a = anchor::make(Path::new(&tree), &x.text, &x.files, files);
                         let ctx = if a.is_empty() { ctx.clone() } else { format!("{ctx}\n{}", a.to_line()) };
                         let mut x = x.ctx(ctx);
                         if let Some(src) = &source {
@@ -839,14 +957,30 @@ impl Daemon {
                     }
                 }
                 let kept = drafts.len();
-                if !drafts.is_empty() {
-                    if let Err(e) = self.store.append(sid, turn, ts, drafts) {
-                        self.log(&json!({"ts": now(), "error": e.to_string(), "event": "distill"}));
+                let stored = if drafts.is_empty() {
+                    Vec::new()
+                } else {
+                    match self.store.append(sid, turn, ts, drafts) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.log(&json!({"ts": now(), "error": e.to_string(), "event": "distill"}));
+                            Vec::new()
+                        }
                     }
-                }
-                for id in &replaced {
-                    let _ = self.store.retag(id, "superseded");
-                }
+                };
+                // A note is superseded only by a stored note that names it
+                // and says the same thing anew ([`successor_of`]); one whose
+                // replacement was dropped, or does not cover it, stays.
+                let replaced: Vec<String> = replaced
+                    .into_iter()
+                    .filter(|id| {
+                        let Some(old) = known.iter().find(|r| &r.id == id) else { return false };
+                        match successor_of(old, &stored) {
+                            Some(new) => self.store.supersede(id, &new).unwrap_or(false),
+                            None => false,
+                        }
+                    })
+                    .collect();
                 for id in &done {
                     let _ = self.store.retag(id, "done");
                 }
@@ -941,8 +1075,87 @@ impl Daemon {
         self.from_hooks.lock().unwrap().1.clone().unwrap_or_else(|| self.cfg.deep.clone())
     }
 
-    fn checker(&self) -> Checker {
-        Checker::new(Path::new(&self.project))
+    /// A checker of notes against the files of `tree` (a worktree).
+    fn checker_in(&self, tree: &str) -> Checker {
+        Checker::new(Path::new(tree)).with_sessions(anchor::session_branches(&self.store))
+    }
+
+    /// The folder session `sid` runs in: the worktree its hooks named,
+    /// else the daemon's project.
+    fn tree(&self, sid: &str) -> String {
+        let st = self.state.lock().unwrap();
+        st.sessions.get(sid).map(|s| s.worktree.clone()).filter(|w| !w.is_empty()).unwrap_or_else(|| self.project.clone())
+    }
+
+    /// The folder a request came from (`worktree`, which the clients send),
+    /// else the daemon's project.
+    fn tree_of(&self, req: &Json) -> String {
+        req.get("worktree").and_then(|v| v.as_str()).filter(|w| !w.is_empty()).map(String::from).unwrap_or_else(|| self.project.clone())
+    }
+
+    /// Remembers the folder a session's hooks run in (they may come from
+    /// any worktree of the repository) and, when it is new for the session,
+    /// logs it with the branch checked out there.
+    fn note_worktree(&self, sid: &str, req: &Json) {
+        let Some(wt) = req.get("worktree").and_then(|v| v.as_str()).filter(|w| !w.is_empty()) else { return };
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            let s = st.sessions.entry(sid.to_string()).or_default();
+            let changed = s.worktree != wt;
+            if changed {
+                s.worktree = wt.to_string();
+            }
+            changed
+        };
+        // The branch is looked at on every hook (two small file reads): a
+        // session can switch it.
+        let (head, branch) = anchor::git_head(Path::new(wt));
+        let moved = {
+            let mut st = self.state.lock().unwrap();
+            let s = st.sessions.entry(sid.to_string()).or_default();
+            let moved = !branch.is_empty() && s.branch != branch;
+            if moved {
+                s.branch = branch.clone();
+            }
+            moved
+        };
+        if changed || moved {
+            self.dirty.store(true, Ordering::Release);
+            self.log(&json!({"ts": now(), "event": "worktree", "session": sid, "worktree": wt, "branch": branch, "head": head}));
+        }
+        if moved {
+            // Kept with the records, so that every record of the session
+            // has a branch and a commit: its session's at the time
+            // ([`anchor::Checker::with_sessions`]).
+            let turn = self.state.lock().unwrap().sessions.get(sid).map_or(0, |s| s.turn);
+            let d = Draft::new(Kind::Event, anchor::Anchor { head, branch, files: Vec::new(), idents: Vec::new() }.to_line()).tag(anchor::WORKTREE_TAG).ctx(format!("Worktree: {wt}"));
+            if let Err(e) = self.store.append(sid, turn, now(), vec![d]) {
+                self.log(&json!({"ts": now(), "error": e.to_string(), "event": "worktree"}));
+            }
+        }
+    }
+
+    /// Who wrote the prompt a hook carries: a source Workbench noted for
+    /// its text (`source`, from `CHLOECTX_PROMPT_LOG`), else for the
+    /// session's first prompt the source of the task it was started with
+    /// (`session_source`, `CHLOECTX_PROMPT_SOURCE`), else the user.
+    fn note_source(&self, sid: &str, req: &Json) {
+        let noted = req.get("source").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let first = req.get("session_source").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let mut st = self.state.lock().unwrap();
+        let s = st.sessions.entry(sid.to_string()).or_default();
+        let src = match (noted, first) {
+            (Some(n), _) => n.to_string(),
+            (None, Some(f)) if s.turn == 0 => f.to_string(),
+            _ => "user".to_string(),
+        };
+        s.source = crate::record::Source::parse(&src).as_str();
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Who wrote the current turn's prompt.
+    fn source_of(&self, sid: &str) -> crate::record::Source {
+        crate::record::Source::parse(&self.state.lock().unwrap().sessions.get(sid).map(|s| s.source.clone()).unwrap_or_default())
     }
 
     /// Runs query understanding for a prompt of a session: the context
@@ -954,9 +1167,10 @@ impl Daemon {
             (s.window_start, s.injected)
         };
         let filter = Filter { exclude_window: Some((sid.to_string(), w)), ..Default::default() };
-        let project = Path::new(&self.project);
+        let tree = self.tree(sid);
+        let project = Path::new(&tree);
         let res = crate::deep::run(&self.store, &self.deep_cfg(), &self.distill_cfg(), prompt, recent, &filter, Some(project), now());
-        let text = crate::deep::format(&res, &shown, now(), Some(project));
+        let text = crate::deep::format(&res, &shown, now(), Some(self.checker_in(&tree)));
         let mut log = crate::deep::log_json(&res);
         log["ts"] = json!(now());
         log["event"] = json!("deep");
@@ -995,7 +1209,7 @@ impl Daemon {
         if !capture::looks_like_error(resp, &text) {
             return String::new();
         }
-        let Some((sig, _)) = crate::fixes::signature(&text, &self.project) else { return String::new() };
+        let Some((sig, _)) = crate::fixes::signature(&text, &self.tree(sid)) else { return String::new() };
         // Not one the model was shown, nor one of this session's live window
         // (in its context already).
         let (shown, window) = self.with_session(sid, |s| (s.injected.clone(), s.window_start));
@@ -1095,7 +1309,8 @@ impl Daemon {
         if !req.get("include_current").and_then(|v| v.as_bool()).unwrap_or(false) && !active.is_empty() {
             filter.exclude_window = Some((active.clone(), w));
         }
-        let project = Path::new(&self.project);
+        let tree = self.tree_of(req);
+        let project = Path::new(&tree);
         let distill = self.distill_cfg();
         let mut res = crate::deep::run(&self.store, &cfg, &distill, &q, &[], &filter, Some(project), now());
         // A question asked on purpose gets an answer even when the planner
@@ -1106,7 +1321,7 @@ impl Daemon {
             let r = crate::deep::rank(&self.store, &cfg, &distill, &q, &cands, &HashMap::new(), false, now());
             res.adopt(r, cands);
         }
-        let mut text = crate::deep::format(&res, &HashSet::new(), now(), Some(project));
+        let mut text = crate::deep::format(&res, &HashSet::new(), now(), Some(self.checker_in(&tree)));
         if text.is_empty() {
             text = format!("ChloeCtx found nothing relevant in memory ({} searches over {} candidates).", res.plan.queries.len() + 2, res.candidates.len());
         }
@@ -1153,7 +1368,7 @@ impl Daemon {
         let n = turns.len();
         for ((sid, turn), (p, a, c, ts, files)) in turns {
             if !p.trim().is_empty() {
-                self.distill_turn(&sid, turn, ts, p.trim(), a.trim(), &c, &files);
+                self.distill_turn(&sid, turn, ts, p.trim(), a.trim(), &c, &files, &crate::distill::Exchange::default());
             }
         }
         Ok((n, (self.store.len() - before) as usize))
@@ -1202,7 +1417,7 @@ impl Daemon {
         let out = crate::receipt::retrieve(&store, &inputs)?;
         let decision = out.decision.unwrap_or(Decision::Skip);
         let mut parts = Vec::new();
-        let mut ck = self.checker();
+        let mut ck = self.checker_in(&self.tree(sid));
         if !out.known.is_empty() {
             parts.push(recall::fmt_knowledge_checked(&out.known, now(), Some(&mut ck)));
         }
@@ -1307,10 +1522,10 @@ impl Daemon {
             return Ok(String::new());
         }
         let mut s = format!("ChloeCtx notes on {rel} from earlier work (newest first):\n");
-        let mut ck = self.checker();
+        let mut ck = self.checker_in(&self.tree(sid));
         for r in recs.iter().take(2) {
             let snip: String = r.text.chars().take(500).collect();
-            let label = if r.kind.is_knowledge() { ck.check_record(&r).label() } else { String::new() };
+            let label = ck.label_record(&r);
             s += &format!("\n{}\n", recall::fmt_record_labeled(r, &snip, now(), &label));
         }
         Ok(s)
@@ -1329,7 +1544,8 @@ impl Daemon {
             nf.update(&self.store)?;
             nf.after(rel, 2, 1.0)
         };
-        let next: Vec<String> = next.into_iter().map(|(f, _)| f).filter(|f| Path::new(&self.project).join(f).exists()).collect();
+        let tree = self.tree(sid);
+        let next: Vec<String> = next.into_iter().map(|(f, _)| f).filter(|f| Path::new(&tree).join(f).exists()).collect();
         if next.is_empty() {
             return Ok(String::new());
         }
@@ -1338,7 +1554,7 @@ impl Daemon {
         let filter = Filter { exclude_window: Some((sid.to_string(), w)), kinds, ..Default::default() };
         let mut s = format!("In earlier work, edits of {rel} were usually followed by edits of: {}.\n", next.join(", "));
         let mut shown = shown.to_string();
-        let mut ck = self.checker();
+        let mut ck = self.checker_in(&tree);
         for f in &next {
             let terms: Vec<String> = chloedb::text::analyze(f);
             if terms.is_empty() {
@@ -1351,7 +1567,7 @@ impl Daemon {
             let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).filter(|r| !shown.contains(&format!("[{}]", r.id))).collect();
             if let Some(r) = recs.iter().find(|r| r.kind.is_knowledge()).or(recs.first()).cloned() {
                 let snip: String = r.text.chars().take(300).collect();
-                let label = if r.kind.is_knowledge() { ck.check_record(&r).label() } else { String::new() };
+                let label = ck.label_record(&r);
                 let one = format!("\nChloeCtx note on {f}:\n{}\n", recall::fmt_record_labeled(&r, &snip, now(), &label));
                 shown += &one;
                 s += &one;
@@ -1471,7 +1687,19 @@ impl Daemon {
         if text.is_empty() {
             text = "No receipts yet.".into();
         }
-        let list: Vec<Json> = rs.iter().map(|r| json!({"id": r.id, "ts": r.ts, "session": r.session, "turn": r.turn, "source": r.source, "decision": r.decision, "shown": r.shown, "tokens": r.tokens, "txn": r.snapshot.txn, "query": r.inputs.query.chars().take(200).collect::<String>()})).collect();
+        // The rows each one showed, with their text as it is now (none
+        // when deleted since), for programs (`chloectx receipts --json`).
+        let mut ids: Vec<String> = rs.iter().flat_map(|r| r.rows.iter().filter(|x| x.shown()).map(|x| x.id.clone())).collect();
+        ids.sort();
+        ids.dedup();
+        let texts: std::collections::HashMap<String, String> = self.store.get(&ids)?.into_iter().map(|x| (x.id.clone(), x.text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect())).collect();
+        let list: Vec<Json> = rs
+            .iter()
+            .map(|r| {
+                let rows: Vec<Json> = r.rows.iter().filter(|x| x.shown()).map(|x| json!({"id": x.id, "kind": x.kind, "tag": x.tag, "rank": x.rank, "score": x.score, "decision": x.decision, "text": texts.get(&x.id)})).collect();
+                json!({"id": r.id, "ts": r.ts, "session": r.session, "turn": r.turn, "source": r.source, "decision": r.decision, "shown": r.shown, "rows": rows, "tokens": r.tokens, "txn": r.snapshot.txn, "query": r.inputs.query.chars().take(200).collect::<String>()})
+            })
+            .collect();
         Ok(json!({"text": text, "receipts": list}))
     }
 
@@ -1508,7 +1736,7 @@ impl Daemon {
         let target = req.get("target").and_then(|v| v.as_str()).ok_or_else(|| err("blame needs a target: path or path:line"))?;
         let replay = req.get("replay").and_then(|v| v.as_bool()).unwrap_or(true);
         self.save_receipts();
-        crate::blame::blame(&self.store, self.receipts.get(), &self.snapshots, &self.project, target, replay)
+        crate::blame::blame(&self.store, self.receipts.get(), &self.snapshots, &self.tree_of(req), target, replay)
     }
 
     /// `{"op": "snapshot", "what": "keep" | "list" | "drop", "name"?}`.
@@ -1589,6 +1817,11 @@ impl Daemon {
     fn op_sql(&self, req: &Json) -> Result<Json> {
         let sql = req.get("sql").and_then(|v| v.as_str()).unwrap_or("").trim();
         let rs = self.store.query_guarded(sql, &chloedb::query::Params::new(), &crate::sqlguard::Limits::TOOL)?;
+        if req.get("json").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // The cells as JSON values, for programs (`chloectx sql --json`).
+            let rows: Vec<Json> = rs.rows.iter().take(1000).map(|r| Json::Array(r.iter().map(value_json).collect())).collect();
+            return Ok(json!({"text": rows_text(&rs), "columns": rs.columns, "rows": rows, "count": rs.rows.len()}));
+        }
         Ok(json!({"text": rows_text(&rs)}))
     }
 
@@ -1602,26 +1835,40 @@ impl Daemon {
         let (sid, _) = self.active_session();
         let sid = if sid.is_empty() { "manual".to_string() } else { sid };
         let turn = self.with_session(&sid, |s| s.turn);
-        let mut replaced = None;
-        if let Some(old) = req.get("supersedes").and_then(|v| v.as_str()) {
-            if let Some(mut r) = self.store.get(&[old.to_string()])?.pop() {
-                r.tag = "superseded".into();
-                r.importance *= 0.3;
-                self.store.insert(&[r])?;
-                replaced = Some(old.to_string());
+        let old = match req.get("supersedes").and_then(|v| v.as_str()).filter(|o| !o.is_empty()) {
+            Some(o) => Some(self.store.get(&[o.to_string()])?.pop().ok_or_else(|| err(format!("no record {o} to supersede")))?),
+            None => None,
+        };
+        // Who asks to keep it: `by` (the CLI says `user`: a person ran it,
+        // or Workbench for one); else the memory tool, which the session's
+        // agent calls.
+        let by = match req.get("by").and_then(|v| v.as_str()).filter(|b| !b.is_empty()) {
+            Some(b) => crate::record::Source::parse(b),
+            None => {
+                let agent = self.state.lock().unwrap().sessions.get(&sid).map(|s| s.agent.clone()).unwrap_or_default();
+                crate::record::Source::Assistant(agent)
             }
-        }
-        let a = anchor::make(Path::new(&self.project), &text, &files, &[]);
-        let mut d = Draft::new(kind, text).files(files).tag("remembered");
+        };
+        let a = anchor::make(Path::new(&self.tree_of(req)), &text, &files, &[]);
+        let mut d = Draft::new(kind, text).files(files).tag("remembered").by(&by);
         if !a.is_empty() {
             d = d.ctx(a.to_line());
         }
         // What it replaced, as a distilled replacement links it.
-        if let Some(old) = replaced {
-            d = d.link("supersedes", old);
+        if let Some(o) = &old {
+            d = d.link("supersedes", o.id.clone());
         }
         let recs = self.store.append(&sid, turn, now(), vec![d])?;
-        Ok(json!({"id": recs[0].id, "text": format!("Stored {} as {}.", kind.as_str(), recs[0].id)}))
+        let mut replaced = None;
+        if let Some(o) = &old {
+            if self.store.supersede(&o.id, &recs[0].id)? {
+                replaced = Some(o.id.clone());
+            }
+        }
+        let place = self.paths.dir.join("memory.strata");
+        Ok(json!({"id": recs[0].id, "supersedes": replaced, "store": place, "by": by.as_str(),
+            "text": format!("Stored {} as {}{} in ChloeCtx ({}), where Workbench and every later session see it.", kind.as_str(), recs[0].id,
+                replaced.as_ref().map(|o| format!(", replacing {o}")).unwrap_or_default(), place.display())}))
     }
 
     /// `{"op": "forget", "id": ID}`, or `{"op": "forget", "ids": [...]}` for
@@ -1955,6 +2202,22 @@ impl Daemon {
         Ok(json!({"dir": dir, "capsules": list}))
     }
 
+    /// `chloectx report`: where the time went ([`crate::report`]), from the
+    /// records of the last `days` days; reads, writes nothing.
+    fn op_report(&self, req: &Json) -> Result<Json> {
+        let days = req.get("days").and_then(|v| v.as_f64()).filter(|d| *d > 0.0).unwrap_or(7.0);
+        let session = req.get("session").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+        let at = now();
+        let since = at - (days * 86_400.0) as i64;
+        let kinds = "'prompt', 'answer', 'episode', 'tool_call', 'tool_result', 'error', 'summary', 'event'";
+        let rs = self.store.query(&format!("SELECT {} FROM memory WHERE ts >= {since} AND kind IN ({kinds}) ORDER BY seq ASC LIMIT 10000000", crate::record::COLUMNS))?;
+        let recs: Vec<Record> = rs.rows.iter().filter_map(|r| crate::store::row_record(r)).collect();
+        let worktrees: HashMap<String, String> = self.state.lock().unwrap().sessions.iter().map(|(k, s)| (k.clone(), s.worktree.clone())).collect();
+        let opts = crate::report::Options { project: self.project.clone(), days, session, now: at };
+        let r = crate::report::build(&recs, &worktrees, &opts);
+        Ok(json!({"text": crate::report::render(&r), "report": r}))
+    }
+
     fn op_stats(&self) -> Result<Json> {
         let db = self.store.db().ok_or_else(|| err("the store is a table of a ChloeDB server"))?;
         let fs = db.storage().file_stats();
@@ -2027,6 +2290,26 @@ fn snippet_at(text: &str, at: usize, width: usize) -> String {
 
 /// One hybrid search of `store`, as `memory_search` shows it: the first
 /// `limit` hits with a snippet each, their ids, and the search's evidence.
+/// The stored note that replaces `old`: one of `stored` that links to it
+/// with `supersedes` and says the same thing anew, sharing a fair part of
+/// its words (a replacement keeps what still holds, [`crate::distill`]).
+/// A note about something else that names `old` replaces nothing: half a
+/// ruling is not superseded by the other half.
+pub fn successor_of(old: &Record, stored: &[Record]) -> Option<String> {
+    let terms = |t: &str| -> HashSet<String> { chloedb::text::analyze(t).into_iter().collect() };
+    let o = terms(&old.text);
+    stored
+        .iter()
+        .filter(|r| r.linked("supersedes").any(|t| t == old.id))
+        .find(|r| {
+            let n = terms(&r.text);
+            let shared = o.intersection(&n).count() as f64;
+            let least = o.len().min(n.len()).max(1) as f64;
+            o.is_empty() || shared / least >= 0.3
+        })
+        .map(|r| r.id.clone())
+}
+
 pub fn search_text(store: &Store, q: &str, f: &Filter, rank: &RankParams, limit: usize) -> Result<(String, Vec<String>, Json)> {
     let (hits, ev) = recall::search(store, q, f, rank)?;
     let terms: HashSet<String> = chloedb::text::analyze_query(q).into_iter().collect();
@@ -2047,7 +2330,9 @@ pub fn search_text(store: &Store, q: &str, f: &Filter, rank: &RankParams, limit:
 pub fn timeline_text(store: &Store, id: &str, before: usize, after: usize) -> Result<String> {
     let store = store.pinned();
     let rec = store.get(&[id.to_string()])?.pop().ok_or_else(|| err(format!("no record {id}")))?;
-    let near = store.range(&rec.session, rec.seq - 200, rec.seq + 200)?;
+    // Events (notifications, sub-agents' ends) are not part of what was said.
+    let mut near = store.range(&rec.session, rec.seq - 200, rec.seq + 200)?;
+    near.retain(|r| r.kind != Kind::Event || r.id == rec.id);
     let at = near.iter().position(|r| r.id == rec.id).unwrap_or(0);
     let lo = at.saturating_sub(before);
     let hi = (at + after + 1).min(near.len());
@@ -2057,6 +2342,21 @@ pub fn timeline_text(store: &Store, id: &str, before: usize, after: usize) -> Re
         text += &format!("{}{}\n\n", if r.id == rec.id { ">> " } else { "" }, recall::fmt_record(r, &body, now()));
     }
     Ok(text)
+}
+
+/// A cell as JSON: numbers, text and lists as themselves, a timestamp as
+/// its text, a vector as its length (`"vector(384)"`).
+pub fn value_json(v: &chloedb::Value) -> Json {
+    match v {
+        chloedb::Value::Null => Json::Null,
+        chloedb::Value::Int(x) => json!(x),
+        chloedb::Value::Float(x) => json!(x),
+        chloedb::Value::Str(s) => json!(s),
+        chloedb::Value::Vector(v) => json!(format!("vector({})", v.len())),
+        chloedb::Value::List(xs) => Json::Array(xs.iter().map(value_json).collect()),
+        chloedb::Value::Bool(b) => json!(b),
+        chloedb::Value::Timestamp(t) => json!(chloedb::timestamp::format(*t)),
+    }
 }
 
 /// A result set as `memory_sql` shows it: a header, at most 100 rows of
@@ -2188,9 +2488,21 @@ fn try_request(socket: &Path, req: &Json, deadline: Instant) -> std::io::Result<
 }
 
 /// Sends one request to the project's daemon, starting it if needed.
+/// `project` is the folder the request comes from: it travels with the
+/// request as `worktree` (the daemon serves every worktree of a
+/// repository), and the daemon is started for the folder its store is
+/// keyed by ([`crate::paths::store_root`]).
 pub fn request(dir: &Path, project: &str, req: &Json, timeout: Duration) -> Result<Json> {
     let paths = StorePaths::new(dir);
     let deadline = Instant::now() + timeout;
+    let mut with_tree;
+    let req = if !project.is_empty() && req.is_object() && req.get("worktree").is_none() {
+        with_tree = req.clone();
+        with_tree["worktree"] = json!(project);
+        &with_tree
+    } else {
+        req
+    };
     match try_request(&paths.socket, req, deadline) {
         Ok(r) => return Ok(r),
         // A daemon that died as the request reached it (CTX-16): a new one
@@ -2339,7 +2651,8 @@ fn spawn(paths: &StorePaths, project: &str) -> Result<()> {
     let exe: PathBuf = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&paths.log)?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["serve", "--dir"]).arg(&paths.dir).arg("--project").arg(project);
+    let root = if project.is_empty() { PathBuf::new() } else { crate::paths::store_root(Path::new(project)) };
+    cmd.args(["serve", "--dir"]).arg(&paths.dir).arg("--project").arg(&root);
     cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: setsid is async-signal-safe; it detaches the daemon from the hook's session.
     unsafe {

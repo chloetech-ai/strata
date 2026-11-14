@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- A harness for the goal pages of R2 (ui/goals/review.js and debug.js)
+     against dev/levels-mock.mjs (fixtures/goals.mjs is the shop of
+     JOURNEYS.md), until the router mounts them:
+       node chloedb-workbench/ui/dev/levels-mock.mjs --port 7790
+       http://127.0.0.1:7790/dev/goals.html?m=review#/p/shop/ship
+       http://127.0.0.1:7790/dev/goals.html?m=debug#/debug
+     &theme=dark|light, &empty=1 (a project with nothing in it),
+     &fail=1 (every endpoint fails), &real=1&token=T against a real
+     `chloedb-workbench serve` that serves this folder. -->
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Workbench goal page</title>
+<link rel="stylesheet" href="../style.css">
+<style>html,body{height:auto;min-height:100%}body{margin:0}#root{min-height:100vh}</style>
+</head><body><div id="root"></div>
+<script type="module">
+const q = new URLSearchParams(location.search);
+if (q.get("theme")) document.documentElement.dataset.theme = q.get("theme");
+const m = q.get("m") || (location.hash.startsWith("#/debug") ? "debug" : "review");
+const extra = q.get("empty") === "1" ? "empty=1" : "";
+const token = q.get("token") || "dev";
+const api = async (path, { method = "GET", body } = {}) => {
+  if (q.get("fail") === "1") throw Object.assign(new Error("The Workbench server did not answer."), { status: 0 });
+  const p = extra ? path + (path.includes("?") ? "&" : "?") + extra : path;
+  let r;
+  try { r = await fetch(p, { method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: body == null ? undefined : JSON.stringify(body) }); }
+  catch { throw Object.assign(new Error("The Workbench server did not answer."), { status: 0 }); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, code: j.error_code, body: j });
+  return j;
+};
+let agents = [];
+try { agents = (await api(q.get("real") ? "/api/agents?all=1" : "/api/dev/goal-agents")).agents || []; } catch {}
+const project = q.get("project") || "shop";
+const ctx = {
+  api, state: { agents, events: [] },
+  params: { agent: null, repo: q.get("repo") || null },
+  project: { name: project, path: q.get("repo") || null },
+  crumbs: (list) => { document.title = ["Workbench", ...list.map((c) => c.label)].join(" / "); },
+  go: (hash) => { location.hash = hash; },
+  needs: () => 0,
+  openWhy: (a) => console.log("openWhy", a),
+  openRewind: (a) => console.log("openRewind", a),
+  zoom: (id) => console.log("zoom", id),
+};
+const mod = await import(`../goals/${m}.js`);
+window.view = mod.mount(document.getElementById("root"), ctx);
+window.ready = true;
+</script></body></html>

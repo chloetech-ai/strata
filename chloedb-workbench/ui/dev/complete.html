@@ -1,0 +1,61 @@
+<!doctype html>
+<!-- Autocomplete and intent checks (ui/levels/complete.js) on the boxes
+     that take them, against dev/levels-mock.mjs (fixtures/complete.mjs):
+       /dev/complete.html?demo=task   the New agent dialog of index.html, over Trace
+       /dev/complete.html?demo=sql    Health's rule editor
+       /dev/complete.html?demo=quick  the quick search, handing a question to Trace
+       /dev/complete.html?demo=steer  Story's steer box of ledger (fixtures/story.mjs)
+     add &theme=dark or &theme=light. -->
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Workbench autocomplete</title><link rel="stylesheet" href="../style.css">
+<style>body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 var(--sans)}#root{height:100vh;position:relative}</style>
+</head><body><div id="root"></div>
+<script type="module">
+const q = new URLSearchParams(location.search);
+if (q.get("theme")) document.documentElement.dataset.theme = q.get("theme");
+const demo = q.get("demo") || "task";
+const SHOP = "/home/user/src/shop";
+const api = async (path, { method = "GET", body } = {}) => {
+  const r = await fetch(path, { method, headers: { authorization: "Bearer dev", "content-type": "application/json" }, body: body == null ? undefined : JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status, body: j });
+  return j;
+};
+const state = { agents: (await api("/api/agents?all=1")).agents, events: [] };
+const go = (hash) => { console.log("go", hash); document.body.dataset.went = hash; };
+const ctx = { api, state, params: { agent: q.get("agent"), repo: demo === "sql" ? null : SHOP }, go, openWhy: () => {}, openRewind: () => {}, zoom: () => {}, repo: () => SHOP };
+const { attachComplete } = await import("../levels/complete.js");
+window.attachComplete = attachComplete;
+const root = document.getElementById("root");
+if (demo === "task") {
+  // Trace of the shop behind, the real dialog of index.html in front.
+  const trace = await import("../levels/trace.js");
+  history.replaceState(null, "", location.pathname + location.search + "#/trace?q=" + encodeURIComponent("when and why did we change the cart total rounding from floor to half-up, and how does it work now?"));
+  window.view = trace.mount(root, { ...ctx, params: { ...ctx.params, q: "when and why did we change the cart total rounding from floor to half-up, and how does it work now?" } });
+  const html = await (await fetch("../index.html")).text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const sprite = doc.querySelector("body > svg");
+  if (sprite) document.body.prepend(document.importNode(sprite, true));
+  const dlg = document.importNode(doc.getElementById("new-dialog"), true);
+  document.body.append(dlg);
+  dlg.querySelector("#f-repo").value = SHOP;
+  dlg.querySelector("#wt-help").textContent = "A new branch wb/<name> from the repository's HEAD, so agents don't step on each other.";
+  dlg.showModal();
+  attachComplete(dlg.querySelector("#f-task"), { field: "task", ctx, repo: () => dlg.querySelector("#f-repo").value.trim() });
+  dlg.querySelector("#f-task").focus();
+} else if (demo === "sql") {
+  const health = await import("../levels/health.js");
+  history.replaceState(null, "", location.pathname + location.search + "#/health/rules");
+  window.view = health.mount(root, ctx);
+} else if (demo === "steer") {
+  const story = await import("../levels/story.js");
+  history.replaceState(null, "", location.pathname + location.search + "#/story/a1ed6e12");
+  window.view = story.mount(root, { ...ctx, params: { ...ctx.params, agent: "a1ed6e12" } });
+} else if (demo === "quick") {
+  const trace = await import("../levels/trace.js");
+  window.view = trace.mount(root, { ...ctx, params: { ...ctx.params, q: "" } });
+  const qs = await import("../levels/quicksearch.js");
+  window.quick = qs.open(ctx);
+}
+document.body.dataset.ready = "1";
+</script></body></html>

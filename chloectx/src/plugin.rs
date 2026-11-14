@@ -2,7 +2,7 @@
 //! repository's marketplace (`.claude-plugin/marketplace.json`, the
 //! marketplace `chloedb`), installed with `/plugin install chloectx@chloedb`.
 //!
-//! The plugin brings the same nine hooks as `chloectx install --user` and
+//! The plugin brings the same eleven hooks as `chloectx install --user` and
 //! the MCP server, each through its launcher (`scripts/chloectx-launch`),
 //! which finds or downloads the chloectx program and runs it with
 //! `CHLOECTX_PLUGIN=1` set. Claude Code names the plugin server's tools

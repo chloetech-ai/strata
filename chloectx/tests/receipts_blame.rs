@@ -63,6 +63,11 @@ fn a_line_is_blamed_on_the_recall_before_its_edit_and_the_recall_replays() {
     let list = rs["receipts"].as_array().unwrap();
     let brc = list.iter().find(|r| r["source"] == "briefing").unwrap_or_else(|| panic!("{rs}"));
     assert!(brc["shown"].as_array().unwrap().iter().any(|i| i == decision.as_str()), "{brc}");
+    // With the rows it showed and their text (`chloectx receipts --json`).
+    let shown = brc["rows"].as_array().unwrap().iter().find(|r| r["id"] == decision.as_str()).unwrap_or_else(|| panic!("{brc}"));
+    assert_eq!((shown["kind"].as_str(), shown["decision"].as_str()), (Some("decision"), Some("briefing")), "{shown}");
+    assert!(shown["text"].as_str().unwrap().contains("fixed 2 second delay"), "{shown}");
+    assert!(shown["score"].is_number(), "{shown}");
     let id = brc["id"].as_str().unwrap().to_string();
     let full = ok(call(&d, json!({"op": "receipt", "id": id, "text": true})));
     let receipt = &full["receipt"];

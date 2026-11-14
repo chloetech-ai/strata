@@ -35,7 +35,9 @@ pub fn parse_ts(s: &str) -> Option<i64> {
 #[derive(Clone, Debug)]
 pub enum Event {
     Prompt { text: String },
-    Tool { name: String, input: Json, response: Json },
+    /// A tool call and its result; `started` is when the call was made
+    /// (the result's time is the event's).
+    Tool { name: String, input: Json, response: Json, started: i64 },
     Stop { answer: String },
     Compact { summary: String },
     /// Assistant text between tool calls (not the turn's final message).
@@ -79,7 +81,7 @@ fn is_synthetic(text: &str) -> bool {
 pub fn read(path: &Path) -> Result<Vec<Timed>> {
     let f = std::fs::File::open(path)?;
     let mut out = Vec::new();
-    let mut calls: HashMap<String, (String, Json)> = HashMap::new();
+    let mut calls: HashMap<String, (String, Json, i64)> = HashMap::new();
     let mut last_answer = String::new();
     let mut in_turn = false;
     let mut last_ts = 0;
@@ -112,12 +114,12 @@ pub fn read(path: &Path) -> Result<Vec<Timed>> {
                         if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                             had_result = true;
                             let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                            if let Some((name, input)) = calls.remove(id) {
+                            if let Some((name, input, started)) = calls.remove(id) {
                                 let mut response = d.get("toolUseResult").cloned().filter(|r| !r.is_null()).unwrap_or_else(|| b.get("content").cloned().unwrap_or(Json::Null));
                                 if b.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
                                     response = serde_json::json!({"is_error": true, "error": capture::response_text(&b.get("content").cloned().unwrap_or(Json::Null))});
                                 }
-                                push(&mut out, Event::Tool { name, input, response });
+                                push(&mut out, Event::Tool { name, input, response, started });
                             }
                         }
                     }
@@ -157,7 +159,7 @@ pub fn read(path: &Path) -> Result<Vec<Timed>> {
                             Some("tool_use") => {
                                 let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                calls.insert(id, (name, b.get("input").cloned().unwrap_or(Json::Null)));
+                                calls.insert(id, (name, b.get("input").cloned().unwrap_or(Json::Null), ts));
                             }
                             _ => {}
                         }
@@ -207,10 +209,12 @@ pub fn drafts(events: &[Timed], project: &str) -> Vec<Batch> {
                 ep = EpisodeAcc { prompt: text.clone(), ..Default::default() };
                 (capture::prompt_drafts(text), false)
             }
-            Event::Tool { name, input, response } => {
+            Event::Tool { name, input, response, started } => {
                 let c = ctx();
                 ep.add_tool(name, input, response, project);
-                (capture::tool_drafts(name, input, response, project).into_iter().map(|d| d.ctx(c.clone())).collect(), false)
+                let mut d: Vec<Draft> = capture::tool_drafts(name, input, response, project).into_iter().map(|d| d.ctx(c.clone())).collect();
+                capture::took(&mut d, e.ts - started);
+                (d, false)
             }
             Event::Stop { answer } => {
                 let c = ctx();
@@ -233,6 +237,42 @@ pub fn drafts(events: &[Timed], project: &str) -> Vec<Batch> {
     }
     out.retain(|b| !b.drafts.is_empty());
     out
+}
+
+/// When the tool call `tool_use_id` was made, from the assistant message
+/// that holds it near the end of the transcript (the live daemon's
+/// `PostToolUse` reads it, off the hook's path, to time the call). Reads
+/// the last 256 KiB, then the last 4 MiB; `None` when the call is not
+/// there.
+pub fn call_ts(path: &Path, tool_use_id: &str) -> Option<i64> {
+    use std::io::{Read, Seek, SeekFrom};
+    if tool_use_id.is_empty() {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let needle = format!("\"{tool_use_id}\"");
+    for window in [256u64 << 10, 4 << 20] {
+        let from = len.saturating_sub(window);
+        f.seek(SeekFrom::Start(from)).ok()?;
+        let mut buf = Vec::new();
+        f.by_ref().take(window).read_to_end(&mut buf).ok()?;
+        for line in buf.split(|&b| b == b'\n').rev() {
+            if !line.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                continue;
+            }
+            let Ok(d) = serde_json::from_slice::<Json>(line) else { continue };
+            let Some(Json::Array(blocks)) = d.pointer("/message/content") else { continue };
+            let is_call = blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use") && b.get("id").and_then(|v| v.as_str()) == Some(tool_use_id));
+            if is_call {
+                return d.get("timestamp").and_then(|t| t.as_str()).and_then(parse_ts);
+            }
+        }
+        if from == 0 {
+            break;
+        }
+    }
+    None
 }
 
 /// Assistant text blocks in transcript lines after `offset` bytes (for the
@@ -299,5 +339,12 @@ mod tests {
         let all: Vec<_> = b.iter().flat_map(|b| b.drafts.iter().map(|d| d.kind.as_str())).collect();
         assert!(all.contains(&"preference") && all.contains(&"error") && all.contains(&"episode") && all.contains(&"todo"), "{all:?}");
         assert!(b.last().unwrap().compact);
+        // The call took from its message (00:05) to its result (00:09).
+        let call = b.iter().flat_map(|b| &b.drafts).find(|d| d.kind == crate::record::Kind::ToolCall).unwrap();
+        assert_eq!(crate::capture::took_of(&call.ctx), 4, "{}", call.ctx);
+        // And the live daemon finds when it was made.
+        assert_eq!(call_ts(&p, "t1"), parse_ts("2026-01-01T00:00:05Z"));
+        assert_eq!(call_ts(&p, "t2"), None);
+        assert_eq!(call_ts(&p, ""), None);
     }
 }

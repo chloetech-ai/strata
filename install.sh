@@ -7,6 +7,8 @@
 #
 #   ./install.sh                         every Claude Code session on this machine
 #   ./install.sh --project ~/code/app    one project only
+#   ./install.sh --workbench             ChloeCtx and Workbench (chloedb-workbench), which
+#                                        wires ChloeCtx into each session it starts itself
 #
 # Options:
 #   --project DIR          install for one project instead of every session
@@ -15,6 +17,8 @@
 #   --prefix DIR           where the binary goes (default: ~/.local, so ~/.local/bin/chloectx;
 #                          ~/.local/bin/engram, its name before the rename, is a link to it)
 #   --no-wire              install the binary only; leave Claude Code alone
+#   --workbench            also build and install chloedb-workbench; Claude Code's
+#                          settings are left alone (add --user-too to wire them as well)
 #   --no-model             do not download the embedding model (fetch it later
 #                          with chloectx fetch-model)
 #   --prebuilt             take the release's prebuilt chloectx; never build
@@ -36,6 +40,8 @@ PREFIX="$HOME/.local"
 PROJECT=""
 DISTILL="haiku"
 WIRE=1
+WORKBENCH=0
+USER_TOO=0
 MODEL=1
 MODE=auto
 while [ $# -gt 0 ]; do
@@ -49,6 +55,8 @@ while [ $# -gt 0 ]; do
       esac
       shift 2 ;;
     --no-wire) WIRE=0; shift ;;
+    --workbench) WORKBENCH=1; shift ;;
+    --user-too) USER_TOO=1; shift ;;
     --no-model) MODEL=0; shift ;;
     --prebuilt) MODE=prebuilt; shift ;;
     --source) MODE=source; shift ;;
@@ -58,6 +66,9 @@ while [ $# -gt 0 ]; do
 done
 
 say() { printf '==> %s\n' "$*"; }
+# Workbench wires each session it starts; the user's settings stay as they
+# are unless --user-too asks for every other session too.
+if [ "$WORKBENCH" = 1 ] && [ "$USER_TOO" = 0 ] && [ -z "$PROJECT" ]; then WIRE=0; fi
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -70,6 +81,7 @@ esac
 
 command -v curl >/dev/null 2>&1 || die "curl not found"
 if ! command -v claude >/dev/null 2>&1; then
+  [ "$WORKBENCH" = 1 ] && die "the Claude Code CLI (claude) is not on PATH; Workbench runs it for each agent: install it from https://claude.com/claude-code"
   if [ "$WIRE" = 1 ]; then die "the Claude Code CLI (claude) is not on PATH; install it from https://claude.com/claude-code, or pass --no-wire"; fi
 fi
 # Rust and a C compiler (for the tokenizer's regex library), to build.
@@ -217,6 +229,35 @@ else
 fi
 if [ "$MODEL" = 1 ]; then
   "$BIN" fetch-model || die "the embedding model did not download or did not match its pinned SHA-256; run ./install.sh again"
+fi
+
+if [ "$WORKBENCH" = 1 ]; then
+  why=$(toolchain) || die "$why"
+  say "building Workbench ($(cargo --version))"
+  (cd "$ROOT/chloedb-workbench" && cargo build --locked --release --bin chloedb-workbench) ||
+    die "the Workbench build failed; if cargo says the lock file needs updating, git pull (or git checkout chloedb-workbench/Cargo.lock)"
+  WTARGET="${CARGO_TARGET_DIR:-target}"
+  case "$WTARGET" in /*) ;; *) WTARGET="$ROOT/chloedb-workbench/$WTARGET" ;; esac
+  WB="$PREFIX/bin/chloedb-workbench"
+  cp "$WTARGET/release/chloedb-workbench" "$WB.new" && mv -f "$WB.new" "$WB"
+  say "installed $WB"
+  # What each session will get: Workbench asks chloectx this at every start.
+  "$BIN" wiring --project "$HOME" >/dev/null || die "$BIN wiring failed; this ChloeCtx is too old for Workbench"
+  if [ "$WIRE" = 0 ]; then
+    claude auth status 2>/dev/null | grep -q '"loggedIn": *true' ||
+      say "note: the claude CLI is logged out; ChloeCtx's distiller (claude -p) needs it: run claude auth login"
+    cat <<EOF
+
+Next:
+  - $WB serve          then open the URL it prints (it has the access token)
+    (CHLOEDB_WORKBENCH_CHLOECTX=$BIN if $PREFIX/bin is not on PATH)
+  - Each agent Workbench starts gets ChloeCtx's hooks and memory tools in its
+    own settings; your Claude Code settings were not changed (--user-too wires
+    every other session as well).
+  - $BIN ui            browse what ChloeCtx stored, per project and session
+EOF
+    exit 0
+  fi
 fi
 
 [ "$WIRE" = 1 ] || { say "done (Claude Code not changed: --no-wire)"; exit 0; }

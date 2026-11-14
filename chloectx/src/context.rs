@@ -337,9 +337,15 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
     let said = |r: &Record| -> (i64, i64) { *source.get(&(r.session.clone(), r.turn)).unwrap_or(&(r.ts, r.seq)) };
     let changes = change_labels(store, &refs, |r| said(r).0);
     let terms: HashSet<String> = chloedb::text::analyze_query(question).into_iter().collect();
-    let note_line = |r: &Record| format!("- {} {}: {}{}\n", date(said(r).0), note_kind(r), one_line(&r.text), changes.get(&r.id).map(|s| s.as_str()).unwrap_or(""));
+    // Who said a note, when it was not the user: an agent's claim is
+    // its own, never the user's note.
+    let whose = |r: &Record| {
+        let w = r.said_by();
+        if w.is_empty() || r.text.to_lowercase().starts_with(&w.to_lowercase()) { String::new() } else { format!(" ({w} said)") }
+    };
+    let note_line = |r: &Record| format!("- {} {}{}: {}{}\n", date(said(r).0), note_kind(r), whose(r), one_line(&r.text), changes.get(&r.id).map(|s| s.as_str()).unwrap_or(""));
     let excerpt = |r: &Record| {
-        let role = if r.kind == Kind::Answer { "assistant" } else { "user" };
+        let role = if r.kind == Kind::Answer { "assistant".to_string() } else { r.source().map(|s| s.role()).unwrap_or_else(|| "user".into()) };
         format!("[{} · session {}] {role}: {}\n", recall::fmt_time(r.ts), r.session, one_line(&recall::snippet(&r.text, &terms, p.excerpt_chars)))
     };
 
@@ -426,7 +432,8 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
             let mut block = format!("[{} · session {}]", recall::fmt_time(e.ts), key.0);
             let mut recs = Vec::new();
             if let Some(r) = e.user.first() {
-                block += &format!(" user: {}\n", one_line(&brief_text(&joined(&e.user), p.reply_user_chars)));
+                let role = r.source().map(|s| s.role()).unwrap_or_else(|| "user".into());
+                block += &format!(" {role}: {}\n", one_line(&brief_text(&joined(&e.user), p.reply_user_chars)));
                 recs.push(r.clone());
             } else {
                 block.push('\n');
@@ -463,7 +470,7 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
             (ts.div_euclid(86_400), seq)
         });
         text += if every { "Every note" } else { "Notes" };
-        text += " from earlier conversations with the user, in their current versions, oldest first (date, kind, note; what it replaced in brackets). Rules come first; a later note can change what an earlier one says:\n";
+        text += " from earlier sessions, in their current versions, oldest first (date, kind, who said it when it was not the user, note; what it replaced in brackets). Rules come first; a later note can change what an earlier one says:\n";
         let rule_ids: HashSet<String> = rule_lines.iter().map(|(r, _)| r.id.clone()).collect();
         for (r, l) in rule_lines.into_iter().chain(picked[0].drain(..)) {
             let section = if rule_ids.contains(&r.id) {

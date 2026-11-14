@@ -134,6 +134,29 @@ fn a_record_redaction_changed_gets_a_vector_of_its_new_text() {
 }
 
 #[test]
+fn a_capsule_can_hold_only_some_sessions() {
+    // A branch's capsule: its agents' sessions only, and what they link to.
+    let dir = tempfile::tempdir().unwrap();
+    let store = source(dir.path());
+    store.append("s2", 1, 1_700_000_100, vec![Draft::new(Kind::Decision, "The CSV export uses semicolons.").entities(vec!["CSV export".into()])]).unwrap();
+    store.flush().unwrap();
+    let out = dir.path().join("cap");
+    let m = capsule::pack(&store, "hash:32", "/w/p", &out, &PackOptions { sessions: vec!["s2".into()], ..Default::default() }).unwrap();
+    assert_eq!(m.sessions, vec!["s2".to_string()]);
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["sessions"], json!(["s2"]));
+    let caps = vec![capsule::open(&out, &dir.path().join("work"), Some(Arc::new(HashEmbedder { dim: 32 }))).unwrap()];
+    let rs = caps[0].store.query("SELECT session, kind FROM memory LIMIT 10").unwrap();
+    let rows: Vec<(String, String)> = rs.rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_str().unwrap().to_string())).collect();
+    assert!(rows.iter().all(|(s, k)| s == "s2" || k == "entity"), "{rows:?}");
+    assert!(rows.iter().any(|(_, k)| k == "entity"), "{rows:?}");
+    // Without sessions, the manifest says nothing of them: every session's.
+    let all = dir.path().join("all");
+    capsule::pack(&store, "hash:32", "/w/p", &all, &PackOptions::default()).unwrap();
+    assert!(!std::fs::read_to_string(all.join("manifest.json")).unwrap().contains("\"sessions\""));
+}
+
+#[test]
 fn a_capped_capsule_keeps_the_newest_records() {
     // C3.
     let dir = tempfile::tempdir().unwrap();

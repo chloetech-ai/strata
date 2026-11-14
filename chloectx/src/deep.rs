@@ -258,7 +258,7 @@ const RANK_PROMPT: &str = r#"<request>
 {request}
 </request>
 
-Records found in the memory of earlier sessions (id in brackets; a label in square brackets after a note says the code it describes changed since):
+Records found in the memory of earlier sessions (id in brackets; a label in square brackets after a record says the code it describes changed since, or that it came from another branch whose work is not merged here: such a record never describes the code of this worktree, so never present it as the current code):
 
 {cands}
 
@@ -267,7 +267,7 @@ Pick the records an assistant working on this request should see: those that sta
 Output {"relevant": [{"id": "<id>", "why": "<under 20 words: what it tells the assistant>"}], "answer": "<for a question about earlier work or conversations, 1 to 3 sentences answering it from the picked records, citing ids; otherwise the one or two things the assistant must keep in mind; empty if nothing applies>", "confidence": "high" or "medium" or "low" or "none"}"#;
 
 fn kinds_of(v: &Json) -> Vec<Kind> {
-    v.get("kinds").and_then(|k| k.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().and_then(Kind::parse)).filter(|k| *k != Kind::Entity).collect()).unwrap_or_default()
+    v.get("kinds").and_then(|k| k.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().and_then(Kind::parse)).filter(|k| !k.is_hidden()).collect()).unwrap_or_default()
 }
 
 /// Parses the planner's reply.
@@ -375,7 +375,7 @@ pub fn plan(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str,
 pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<Vec<Record>> {
     let mut f = filter.clone();
     f.kinds = q.kinds.clone();
-    let useful = |r: &Record| r.kind != Kind::Entity && r.tag != "uncertain" && r.tag != "superseded";
+    let useful = |r: &Record| !r.kind.is_hidden() && r.tag != "uncertain" && r.tag != "superseded";
     let out: Vec<Record> = match q.kind.as_str() {
         "text" => recall::search(store, &q.q, &f, &RankParams { n: n.max(20), ..Default::default() })?.0.into_iter().map(|h| h.record).collect(),
         "keywords" => {
@@ -672,13 +672,11 @@ pub fn run(store: &Store, cfg: &DeepConfig, cli: &DistillConfig, request: &str, 
     }
     let mut labels = HashMap::new();
     if let Some(p) = project {
-        let mut ck = Checker::new(p);
+        let mut ck = Checker::new(p).with_sessions(crate::anchor::session_branches(store));
         for c in &cands {
-            if c.record.kind.is_knowledge() {
-                let l = ck.check_record(&c.record).label();
-                if !l.is_empty() {
-                    labels.insert(c.record.id.clone(), l);
-                }
+            let l = ck.label_record(&c.record);
+            if !l.is_empty() {
+                labels.insert(c.record.id.clone(), l);
             }
         }
     }
@@ -711,21 +709,21 @@ impl DeepResult {
 /// The context block for a result: the picked records not shown already
 /// (`shown`), why each matters, and the ranker's reading. Empty when there
 /// is nothing new.
-pub fn format(res: &DeepResult, shown: &HashSet<String>, now: i64, project: Option<&Path>) -> String {
+pub fn format(res: &DeepResult, shown: &HashSet<String>, now: i64, check: Option<Checker>) -> String {
     let new: Vec<&(Record, String)> = res.picks.iter().filter(|(r, _)| !shown.contains(&r.id)).collect();
     if new.is_empty() || res.confidence == "none" {
         return String::new();
     }
-    let mut ck = project.map(Checker::new);
+    let mut ck = check;
     let mut s = format!(
         "ChloeCtx searched the memory of earlier sessions for this request ({} searches) and judged these records relevant, most important first. They may be outdated; the current files take precedence.\n",
         res.plan.queries.len() + 2
     );
     let terms: HashSet<String> = HashSet::new();
     for (r, why) in &new {
-        let label = match (&mut ck, r.kind.is_knowledge()) {
-            (Some(c), true) => c.check_record(&r).label(),
-            _ => String::new(),
+        let label = match &mut ck {
+            Some(c) => c.label_record(r),
+            None => String::new(),
         };
         s += &format!("\n{}", describe(r, &terms, now, &label, 700));
         if !why.is_empty() {

@@ -78,9 +78,87 @@ pub fn project_slug(project: &Path) -> String {
     format!("{base}-{:08x}", crate::embed::fnv(&s) as u32)
 }
 
-/// The store directory of a project.
+/// The store directory of a project: one per repository, so that sessions
+/// in its linked worktrees share the memory of its main checkout (see
+/// [`store_root`]).
 pub fn store_dir(project: &Path) -> PathBuf {
-    home().join("projects").join(project_slug(project))
+    home().join("projects").join(project_slug(&store_root(project)))
+}
+
+/// `CHLOECTX_PER_WORKTREE=1`: each git worktree keeps a store of its own,
+/// as before stores were shared by a repository's worktrees.
+pub fn per_worktree() -> bool {
+    std::env::var("CHLOECTX_PER_WORKTREE").is_ok_and(|v| v == "1")
+}
+
+/// The folder a project's store is keyed by: for a folder in a linked git
+/// worktree, the same folder in the repository's main working tree (for a
+/// bare repository, which has none, its git directory); for any other
+/// folder (a main checkout, a folder outside git, a submodule) the folder
+/// itself, as given, so its store is the one it always had. With
+/// [`per_worktree`], always the folder itself.
+pub fn store_root(project: &Path) -> PathBuf {
+    if per_worktree() {
+        return project.to_path_buf();
+    }
+    main_checkout_of(project).unwrap_or_else(|| project.to_path_buf())
+}
+
+/// For a folder inside a linked worktree (its `.git` is a file naming a
+/// git directory that has a `commondir`, as `<common>/worktrees/<name>`
+/// does), the same folder in the main working tree. Read from the files,
+/// without running git. `None` anywhere else.
+pub fn main_checkout_of(project: &Path) -> Option<PathBuf> {
+    let abs = project.canonicalize().ok()?;
+    let mut dir = Some(abs.as_path());
+    while let Some(d) = dir {
+        let g = d.join(".git");
+        if g.is_dir() {
+            return None;
+        }
+        if g.is_file() {
+            let text = std::fs::read_to_string(&g).ok()?;
+            let rel = text.trim().strip_prefix("gitdir:")?.trim();
+            let gd = d.join(rel);
+            // A submodule's git directory has no commondir: not a worktree.
+            let common = std::fs::read_to_string(gd.join("commondir")).ok()?;
+            let common = gd.join(common.trim());
+            let common = common.canonicalize().unwrap_or(common);
+            let main = if common.file_name().is_some_and(|n| n == ".git") {
+                common.parent()?.to_path_buf()
+            } else {
+                // A bare repository, or a git directory kept apart from its
+                // working tree (core.worktree).
+                core_worktree(&common).unwrap_or(common)
+            };
+            let sub = abs.strip_prefix(d).ok()?;
+            return Some(if sub.as_os_str().is_empty() { main } else { main.join(sub) });
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// `core.worktree` in a git directory's config, resolved against it.
+fn core_worktree(git_dir: &Path) -> Option<PathBuf> {
+    let cfg = std::fs::read_to_string(git_dir.join("config")).ok()?;
+    let mut in_core = false;
+    for line in cfg.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_core = line.trim_matches(['[', ']']).trim().eq_ignore_ascii_case("core");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("worktree") {
+                let p = git_dir.join(v.trim().trim_matches('"'));
+                return Some(p.canonicalize().unwrap_or(p));
+            }
+        }
+    }
+    None
 }
 
 /// The project a hook or MCP server runs for: `$CLAUDE_PROJECT_DIR`, else `cwd`.
@@ -261,6 +339,62 @@ mod tests {
         assert_eq!(home_in(d), d.join("engram"), "an install from before the rename");
         std::fs::create_dir(d.join("chloectx")).unwrap();
         assert_eq!(home_in(d), d.join("chloectx"), "the new folder wins once it exists");
+    }
+
+    /// A repository laid out as `git worktree add` leaves it, written by
+    /// hand (no git needed): `main/.git/` and `wt/.git` pointing at
+    /// `main/.git/worktrees/wt`.
+    fn repo_with_worktree(t: &Path) -> (PathBuf, PathBuf) {
+        let main = t.join("main");
+        let wt = t.join("wt");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        std::fs::write(main.join(".git/worktrees/wt/HEAD"), "ref: refs/heads/feature\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", main.join(".git/worktrees/wt").display())).unwrap();
+        (main.canonicalize().unwrap(), wt.canonicalize().unwrap())
+    }
+
+    // The environment is the process's: the per-worktree switch is tested
+    // in the same test, not in one running beside it.
+    #[test]
+    fn a_worktree_shares_its_repositorys_store() {
+        let t = tempfile::tempdir().unwrap();
+        let (main, wt) = repo_with_worktree(t.path());
+        std::env::remove_var("CHLOECTX_PER_WORKTREE");
+        // The main checkout keeps its slug; the worktree takes it.
+        assert_eq!(store_root(&main), main);
+        assert_eq!(project_slug(&store_root(&main)), project_slug(&main));
+        assert_eq!(store_root(&wt), main);
+        assert_eq!(project_slug(&store_root(&wt)), project_slug(&main));
+        // A folder inside either maps to the same folder of the main checkout.
+        assert_eq!(store_root(&wt.join("src")), main.join("src"));
+        assert_eq!(store_root(&main.join("src")), main.join("src"));
+        // Outside git: unchanged, as given.
+        let plain = t.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(store_root(&plain), plain);
+        // A submodule (a .git file without commondir) is not a worktree.
+        let sub = t.path().join("sub");
+        std::fs::create_dir_all(main.join(".git/modules/sub")).unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", main.join(".git/modules/sub").display())).unwrap();
+        assert_eq!(store_root(&sub), sub);
+        // A relative gitdir, and a bare repository's worktree.
+        let bare = t.path().join("repo.git");
+        std::fs::create_dir_all(bare.join("worktrees/b")).unwrap();
+        std::fs::write(bare.join("worktrees/b/commondir"), "../..\n").unwrap();
+        let b = t.path().join("b");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join(".git"), "gitdir: ../repo.git/worktrees/b\n").unwrap();
+        assert_eq!(store_root(&b), bare.canonicalize().unwrap());
+        // The old behaviour on request.
+        std::env::set_var("CHLOECTX_PER_WORKTREE", "1");
+        assert_eq!(store_root(&wt), wt);
+        assert_ne!(project_slug(&store_root(&wt)), project_slug(&main));
+        std::env::remove_var("CHLOECTX_PER_WORKTREE");
     }
 
     /// B-13: a `/tmp/engram-<uid>` that another user made first is never

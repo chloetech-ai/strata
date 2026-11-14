@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::Value as Json;
 
-use crate::record::{Draft, Kind};
+use crate::record::{Draft, Kind, Source};
 use crate::redact::redact;
 
 /// Largest chunk stored as one record. Small records make precise keys and
@@ -162,14 +162,99 @@ fn sentences(text: &str) -> Vec<&str> {
 /// harness's envelopes around it ([`crate::envelope`]) are left out, so
 /// that a reminder's "never ..." is not taken for the user's rule.
 pub fn prompt_drafts(prompt: &str) -> Vec<Draft> {
+    prompt_drafts_by(prompt, &Source::User)
+}
+
+/// A prompt written by `by`. Only a person's prompt yields preference
+/// cues: another agent's brief ("by default, shipping is 499") is that
+/// agent's instruction for one task, never the user's preference. A
+/// prompt someone other than the user wrote is stored with its source.
+pub fn prompt_drafts_by(prompt: &str, by: &Source) -> Vec<Draft> {
     let prompt = redact(&crate::envelope::clean(prompt));
     if prompt.trim().is_empty() {
         return Vec::new();
     }
     let files = paths_in(&prompt);
-    let mut out: Vec<Draft> = chunk(&prompt, CHUNK_CHARS).into_iter().map(|c| Draft::new(Kind::Prompt, c).files(files.clone())).collect();
-    for s in preference_sentences(&prompt) {
-        out.push(Draft::new(Kind::Preference, format!("User preference: {s}")).tag("cue").files(paths_in(&s)));
+    let mark = |d: Draft| if by.is_user() { d } else { d.by(by) };
+    let mut out: Vec<Draft> = chunk(&prompt, CHUNK_CHARS).into_iter().map(|c| mark(Draft::new(Kind::Prompt, c).files(files.clone()))).collect();
+    if by.is_user() {
+        for s in preference_sentences(&prompt) {
+            out.push(Draft::new(Kind::Preference, format!("User preference: {s}")).tag("cue").files(paths_in(&s)));
+        }
+        for s in decision_sentences(&prompt) {
+            out.push(Draft::new(Kind::Decision, format!("The user decided: {s}")).tag("stated").files(paths_in(&s)).by(by));
+        }
+    }
+    out
+}
+
+/// Words that make an instruction a standing rule rather than a one-off
+/// for the task at hand: "always", "never", "from now on", "by default",
+/// "every time", "as a rule", "in future", "our convention"...
+fn standing_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(always|never|from now on|from here on|going forward|in (?:the )?future|for future|by default|every time|each time|whenever|any ?time|as a (?:general )?rule|in general|(?:our|the team'?s|the project'?s|house) (?:convention|rule|policy|standard)s?|convention|policy|standing rule|for (?:all|every) (?:future )?(?:tasks?|work|changes|sessions|agents|prs?))\b").unwrap()
+    })
+}
+
+/// Whether a rule the distiller found in an exchange is a standing one:
+/// the user said so in words ("always", "never", "from now on" ... in a
+/// sentence of the request that shares its subject), or answered a
+/// question of the assistant that asked for a rule (its previous message
+/// asked whether to do something always, from now on, by default...).
+/// Anything else the user told an agent to do or not do is an instruction
+/// for that task ("Don't touch money.py or cart.py").
+pub fn standing_rule(request: &str, prev_answer: &str, rule: &str) -> bool {
+    let re = standing_re();
+    let terms = |t: &str| -> BTreeSet<String> { chloedb::text::analyze(t).into_iter().collect() };
+    let rule_terms = terms(rule);
+    for s in sentences(request) {
+        if !re.is_match(s) {
+            continue;
+        }
+        let st = terms(s);
+        let shared = st.intersection(&rule_terms).count();
+        if shared >= 2.min(st.len().max(1)) || rule_terms.is_empty() {
+            return true;
+        }
+    }
+    // An answer to a question asking for a rule: the request is short (a
+    // "yes", a choice) and the question before it asked about the future.
+    let short = request.split_whitespace().count() <= 40;
+    short && sentences(prev_answer).into_iter().rev().take(6).any(|s| re.is_match(s) && prev_answer.contains(&format!("{s}?")))
+}
+
+/// The tag of a note copied from a memory file an agent wrote.
+pub const MEMORY_FILE_TAG: &str = "memory-file";
+
+/// A path outside the project (absolute) in a memory folder: Claude Code's
+/// own (`~/.claude/projects/<p>/memory/`, `/tmp/claude/memory/...`).
+pub fn is_memory_file(path: &str) -> bool {
+    path.starts_with('/') && path.ends_with(".md") && path.split('/').any(|c| c == "memory")
+}
+
+/// Sentences of a person's prompt that state a decision ("My decision:
+/// customers win", "We decided to ..."): kept as the user's decisions at
+/// once, whether or not the distiller runs, so a decision made in
+/// Workbench (a steer, a typed answer) is always a ChloeCtx record.
+pub fn decision_sentences(prompt: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)^\W*(?:my decision|decision|our decision|the decision is|i(?:'ve| have)? decided|we(?:'ve| have)? decided|i decide|ruling)\b").unwrap());
+    // Sentences split at line ends, so a decision's "X: y. Because z." keeps its line.
+    let mut out = Vec::new();
+    for line in prompt.lines() {
+        let l = line.trim();
+        if re.is_match(l) && l.len() >= 16 {
+            out.push(clip(l, 600));
+        }
+    }
+    if out.is_empty() {
+        for s in sentences(prompt) {
+            if re.is_match(s) && s.len() >= 16 {
+                out.push(clip(s, 600));
+            }
+        }
     }
     out
 }
@@ -257,6 +342,22 @@ pub fn tool_drafts(tool: &str, input: &Json, resp: &Json, project: &str) -> Vec<
     let out_text = redact(&response_text(resp));
     let failed = looks_like_error(resp, &out_text);
     let mut d = Vec::new();
+    // A note the agent kept in a memory file of its own, outside the
+    // repository (Claude Code's memory folder): what it says is kept here
+    // too, saying where the file is, so that it is not only somewhere
+    // Workbench and later sessions never look.
+    if matches!(tool, "Write" | "Edit" | "MultiEdit") && !failed && is_memory_file(&path) {
+        let body = if tool == "Write" { s("content") } else { input.get("edits").and_then(|e| e.as_array()).map(|l| l.iter().filter_map(|e| e.get("new_string").and_then(|v| v.as_str())).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| s("new_string")) };
+        // Without its front matter (`---` ... `---`).
+        let body = match body.trim_start().strip_prefix("---") {
+            Some(rest) => rest.split_once("\n---").map(|(_, b)| b.to_string()).unwrap_or_default(),
+            None => body,
+        };
+        let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.len() >= 20 {
+            d.push(Draft::new(Kind::Note, format!("The agent kept this in its own memory file {path} (outside the repository): {}", clip(&redact(&body), 600))).tag(MEMORY_FILE_TAG).ctx(format!("Lives: {path}")));
+        }
+    }
     let result_chunks = |kind: Kind, files: Vec<String>, d: &mut Vec<Draft>| {
         for c in head_tail_chunks(&out_text) {
             let mut f = files.clone();
@@ -345,6 +446,79 @@ pub fn tool_drafts(tool: &str, input: &Json, resp: &Json, project: &str) -> Vec<
         }
     }
     d
+}
+
+/// The line a tool call's record carries in its context when the call took
+/// a second or more: how long, in whole seconds, from the call to its
+/// result (`chloectx report` reads it; the record's `ts` is the result's).
+pub const TOOK: &str = "Took: ";
+
+/// Notes on the first tool call of `drafts` that the call took `secs`
+/// seconds (nothing under a second).
+pub fn took(drafts: &mut [Draft], secs: i64) {
+    if secs < 1 {
+        return;
+    }
+    if let Some(d) = drafts.iter_mut().find(|d| d.kind == Kind::ToolCall) {
+        d.ctx = if d.ctx.is_empty() { format!("{TOOK}{secs}s") } else { format!("{}\n{TOOK}{secs}s", d.ctx) };
+    }
+}
+
+/// The seconds a tool call's record says it took ([`took`]); 0 when it says
+/// nothing.
+pub fn took_of(ctx: &str) -> i64 {
+    ctx.lines().find_map(|l| l.strip_prefix(TOOK)).and_then(|s| s.trim_end_matches('s').parse().ok()).unwrap_or(0)
+}
+
+/// The tag of an event record of a sub-agent that finished.
+pub const SUBAGENT_STOP: &str = "subagent_stop";
+/// The tag of an event record of a notification: `notification:<type>`
+/// (`permission_prompt`, `idle_prompt`, ...), or `notification` alone.
+pub const NOTIFICATION: &str = "notification";
+
+/// The event record of a `Notification`, `SubagentStop` or `PreCompact`
+/// hook, which recall never shows ([`Kind::Event`]). A notification's type comes from
+/// the payload, or for an older Claude Code that sends none from its
+/// message ("Claude needs your permission to use Bash" is a permission
+/// prompt, "Claude is waiting for your input" an idle one).
+pub fn event_draft(event: &str, p: &Json) -> Option<Draft> {
+    let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    match event {
+        "Notification" => {
+            let message = clip(&redact(&s("message")), 300);
+            let mut ty = s("notification_type");
+            if ty.is_empty() {
+                let m = message.to_lowercase();
+                ty = if m.contains("permission") {
+                    "permission_prompt".into()
+                } else if m.contains("waiting for your input") || m.contains("idle") {
+                    "idle_prompt".into()
+                } else {
+                    String::new()
+                };
+            }
+            let ty: String = ty.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(40).collect();
+            let tag = if ty.is_empty() { NOTIFICATION.to_string() } else { format!("{NOTIFICATION}:{ty}") };
+            let text = if message.is_empty() { format!("Notification ({})", if ty.is_empty() { "no message" } else { &ty }) } else { format!("Notification: {message}") };
+            Some(Draft::new(Kind::Event, text).tag(tag))
+        }
+        "SubagentStop" => {
+            let ty = clip(&s("agent_type"), 80);
+            let id = clip(&s("agent_id"), 80);
+            let mut text = if ty.is_empty() { "A sub-agent finished".to_string() } else { format!("Sub-agent {ty} finished") };
+            if !id.is_empty() {
+                text += &format!(" (agent {id})");
+            }
+            Some(Draft::new(Kind::Event, text).tag(SUBAGENT_STOP))
+        }
+        // When a compaction started, which its summary (`PostCompact`) ends.
+        "PreCompact" => {
+            let trigger: String = s("trigger").chars().filter(|c| c.is_ascii_alphanumeric()).take(20).collect();
+            let text = if trigger.is_empty() { "Compaction started".to_string() } else { format!("Compaction started ({trigger})") };
+            Some(Draft::new(Kind::Event, text).tag(crate::report::COMPACT_START))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- answers and summaries
@@ -501,6 +675,11 @@ mod tests {
 
     #[test]
     fn preferences_and_past_references() {
+        // Only a person's prompt yields cues; an agent's brief is stored
+        // as that agent's, with none.
+        let brief = prompt_drafts_by("Add tests. Shipping is 499 by default, never charge it twice.", &Source::Agent("lead".into()));
+        assert!(brief.iter().all(|d| d.kind == Kind::Prompt && d.by.as_deref() == Some("agent:lead")), "{brief:?}");
+        assert!(prompt_drafts("Shipping is 499 by default, never charge it twice.").iter().any(|d| d.kind == Kind::Preference));
         let p = preference_sentences("Fix the test. From now on, always run clippy before committing! Thanks");
         assert_eq!(p, vec!["From now on, always run clippy before committing"]);
         assert!(preference_sentences("Implement the parser").is_empty());
@@ -537,6 +716,28 @@ mod tests {
     }
 
     #[test]
+    fn events_and_tool_durations() {
+        let d = event_draft("Notification", &json!({"message": "Claude needs your permission to use Bash", "notification_type": "permission_prompt"})).unwrap();
+        assert_eq!((d.kind, d.tag.as_str(), d.text.as_str()), (Kind::Event, "notification:permission_prompt", "Notification: Claude needs your permission to use Bash"));
+        // An older Claude Code names no type: told from the message.
+        assert_eq!(event_draft("Notification", &json!({"message": "Claude is waiting for your input"})).unwrap().tag, "notification:idle_prompt");
+        assert_eq!(event_draft("Notification", &json!({})).unwrap().tag, "notification");
+        let d = event_draft("SubagentStop", &json!({"agent_type": "Explore", "agent_id": "a1"})).unwrap();
+        assert_eq!((d.tag.as_str(), d.text.as_str()), (SUBAGENT_STOP, "Sub-agent Explore finished (agent a1)"));
+        assert!(event_draft("Stop", &json!({})).is_none());
+        assert!(d.files.is_empty() && d.links.is_empty());
+
+        let mut d = tool_drafts("Bash", &json!({"command": "cargo build"}), &json!({"stdout": "Finished"}), "/p");
+        d.iter_mut().for_each(|x| x.ctx = "Turn 1 request: build".into());
+        took(&mut d, 0);
+        assert_eq!(took_of(&d[0].ctx), 0);
+        took(&mut d, 42);
+        assert_eq!(d[0].ctx, "Turn 1 request: build\nTook: 42s");
+        assert_eq!(took_of(&d[0].ctx), 42);
+        assert_eq!(took_of(&d[1].ctx), 0, "only the call carries it");
+    }
+
+    #[test]
     fn uncertain_answers() {
         assert!(is_uncertain("I don't know. Nothing in this conversation mentions it."));
         assert!(is_uncertain("**I couldn't find** that"));
@@ -551,5 +752,37 @@ mod tests {
         assert_eq!(d.len(), 3);
         assert_eq!(d[0].tag, "primary_request_and_intent");
         assert_eq!(d[2].kind, Kind::Todo);
+    }
+
+    #[test]
+    fn decisions_and_memory_files_are_kept() {
+        let d = prompt_drafts("My decision: customers win, totals round half up. The ledger export applies banker's rounding itself.");
+        let dec: Vec<&Draft> = d.iter().filter(|x| x.kind == Kind::Decision).collect();
+        assert_eq!(dec.len(), 1, "{d:?}");
+        assert!(dec[0].text.starts_with("The user decided: My decision: customers win") && dec[0].text.contains("ledger export"), "{}", dec[0].text);
+        assert!(prompt_drafts_by("Decision: ship it.", &Source::Agent("lead".into())).iter().all(|x| x.kind == Kind::Prompt));
+        let input = serde_json::json!({"file_path": "/tmp/claude/memory/team/silo/money-rounding-half-up.md", "content": "---\nname: rounding\ntype: decision\n---\nMaya decided customers win: to_cents rounds half up.\n"});
+        let t = tool_drafts("Write", &input, &serde_json::json!({}), "/repo");
+        let n: Vec<&Draft> = t.iter().filter(|x| x.tag == MEMORY_FILE_TAG).collect();
+        assert_eq!(n.len(), 1, "{t:?}");
+        assert!(n[0].text.contains("/tmp/claude/memory/team/silo/money-rounding-half-up.md") && n[0].text.contains("Maya decided customers win"), "{}", n[0].text);
+        assert!(!n[0].text.contains("type: decision"), "{}", n[0].text);
+        let inside = serde_json::json!({"file_path": "/repo/docs/memory/notes.md", "content": "Some notes about the memory layout of the parser."});
+        assert!(tool_drafts("Write", &inside, &serde_json::json!({}), "/repo").iter().all(|x| x.tag != MEMORY_FILE_TAG));
+    }
+
+    #[test]
+    fn one_off_instructions_are_not_standing_rules() {
+        // Maya's instruction to one agent, and what the distiller made of it.
+        let req = "Fix the cent bug in to_cents. Don't touch money.py or cart.py beyond that, and don't touch web/. Commit on your branch when done.";
+        assert!(!standing_rule(req, "", "money.py and cart.py must not be touched in pay or checkout bug-fix work."));
+        // Said as a standing rule.
+        assert!(standing_rule("From now on, never touch the migrations folder without asking me.", "", "The migrations folder must never be changed without asking the user."));
+        assert!(standing_rule("Our convention: money is integer cents everywhere.", "", "Money is kept as integer cents everywhere (team convention)."));
+        // "always" about something else does not make the instruction standing.
+        assert!(!standing_rule("Tests always pass on main. Don't touch cart.py in this task.", "", "cart.py must not be changed in checkout work."));
+        // The answer to a question that asked for a rule.
+        assert!(standing_rule("Yes, do that.", "I rounded half up. Should I always round half up from now on?", "Amounts are always rounded half up."));
+        assert!(!standing_rule("Yes, do that.", "Shall I commit it?", "Commits go on the agent's branch."));
     }
 }

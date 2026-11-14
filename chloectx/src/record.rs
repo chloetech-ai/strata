@@ -25,10 +25,14 @@ pub enum Kind {
     /// Records link to it, so records about the same thing are one hop
     /// apart through it.
     Entity,
+    /// A moment of a session that is not part of the conversation: a
+    /// notification (a permission prompt, an idle notice) or a sub-agent
+    /// that finished. Kept for `chloectx report`, never recalled.
+    Event,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 13] = [
+    pub const ALL: [Kind; 14] = [
         Kind::Prompt,
         Kind::Answer,
         Kind::ToolCall,
@@ -42,6 +46,7 @@ impl Kind {
         Kind::Todo,
         Kind::Note,
         Kind::Entity,
+        Kind::Event,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -59,6 +64,7 @@ impl Kind {
             Kind::Todo => "todo",
             Kind::Note => "note",
             Kind::Entity => "entity",
+            Kind::Event => "event",
         }
     }
 
@@ -76,13 +82,19 @@ impl Kind {
             Kind::Error | Kind::Episode => 0.6,
             Kind::Answer => 0.5,
             Kind::ToolCall | Kind::ToolResult => 0.3,
-            Kind::Entity => 0.0,
+            Kind::Entity | Kind::Event => 0.0,
         }
     }
 
     /// Durable knowledge (shown in briefings, pinned).
     pub fn is_knowledge(self) -> bool {
         matches!(self, Kind::Preference | Kind::Decision | Kind::Fact | Kind::Todo | Kind::Note)
+    }
+
+    /// Records search and recall never return unless asked for by kind:
+    /// entities (what records link to) and events (not what was said).
+    pub fn is_hidden(self) -> bool {
+        matches!(self, Kind::Entity | Kind::Event)
     }
 }
 
@@ -164,11 +176,19 @@ pub struct Draft {
     /// which joins the lexical key and the vector).
     #[serde(default)]
     pub when: Vec<String>,
+    /// Who said it ([`Source`]), stored in the context as a `By:` line.
+    #[serde(default)]
+    pub by: Option<String>,
 }
 
 impl Draft {
     pub fn new(kind: Kind, text: impl Into<String>) -> Draft {
-        Draft { kind, tag: "-".into(), files: Vec::new(), text: text.into(), ctx: String::new(), importance: None, links: Vec::new(), entities: Vec::new(), when: Vec::new() }
+        Draft { kind, tag: "-".into(), files: Vec::new(), text: text.into(), ctx: String::new(), importance: None, links: Vec::new(), entities: Vec::new(), when: Vec::new(), by: None }
+    }
+    /// Who said it.
+    pub fn by(mut self, s: &Source) -> Draft {
+        self.by = Some(s.as_str());
+        self
     }
     pub fn link(mut self, label: &str, to: impl Into<String>) -> Draft {
         self.links.push(Link::new(label, to));
@@ -227,6 +247,14 @@ impl Record {
             }
             ctx += &format!("When: {}", when.join("; "));
         }
+        if let Some(by) = d.by.as_deref().filter(|b| !b.is_empty()) {
+            if !ctx.lines().any(|l| l.starts_with("By: ")) {
+                if !ctx.is_empty() {
+                    ctx.push('\n');
+                }
+                ctx += &format!("By: {by}");
+            }
+        }
         Record {
             id: record_id(session, seq),
             session: session.to_string(),
@@ -240,6 +268,27 @@ impl Record {
             text: d.text,
             ctx,
             links: d.links,
+        }
+    }
+
+    /// Who said it: the `By:` line of its context. A record written before
+    /// sources were kept has none; a prompt then counts as the user's.
+    pub fn source(&self) -> Option<Source> {
+        self.ctx.lines().find_map(|l| l.strip_prefix("By: ")).map(Source::parse)
+    }
+
+    /// An instruction kept for the session it was given in only (a
+    /// one-off for that task, not a standing rule).
+    pub fn task_scoped(&self) -> bool {
+        self.tag == TASK_TAG
+    }
+
+    /// Who said it, in words, for the line a view shows ("" when the user
+    /// did or nobody knows).
+    pub fn said_by(&self) -> String {
+        match self.source() {
+            Some(Source::User) | None => String::new(),
+            Some(s) => s.who(),
         }
     }
 
@@ -295,6 +344,82 @@ impl Record {
     /// written to resemble the later requests the note answers.
     pub fn embed_text(&self) -> String {
         self.key_text()
+    }
+}
+
+/// The tag of an instruction kept for its own session only.
+pub const TASK_TAG: &str = "task";
+
+/// Who said what a record holds. A coding agent's words are never a user's
+/// preference, and what it claims is "the agent said", not a fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Typed by a person: at the terminal, or through Workbench (a steer,
+    /// an answer, a task in the New agent dialog).
+    User,
+    /// Written by Workbench itself: a goal's brief to its lead.
+    Workbench,
+    /// Written by another coding agent (its name): a spawn brief, a message
+    /// it sent with `send_to_agent`.
+    Agent(String),
+    /// The assistant of this session (what it found or concluded), with the
+    /// session's agent name when Workbench gave one.
+    Assistant(String),
+}
+
+impl Source {
+    /// `user`, `workbench`, `agent:<name>` or `assistant[:<name>]`;
+    /// anything else is the user.
+    pub fn parse(s: &str) -> Source {
+        let s = s.trim();
+        let name = |r: &str| r.trim().chars().filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')).take(40).collect::<String>();
+        if s == "workbench" {
+            Source::Workbench
+        } else if let Some(r) = s.strip_prefix("agent") {
+            Source::Agent(name(r.trim_start_matches(':')))
+        } else if let Some(r) = s.strip_prefix("assistant") {
+            Source::Assistant(name(r.trim_start_matches(':')))
+        } else {
+            Source::User
+        }
+    }
+
+    pub fn as_str(&self) -> String {
+        match self {
+            Source::User => "user".into(),
+            Source::Workbench => "workbench".into(),
+            Source::Agent(n) if n.is_empty() => "agent".into(),
+            Source::Agent(n) => format!("agent:{n}"),
+            Source::Assistant(n) if n.is_empty() => "assistant".into(),
+            Source::Assistant(n) => format!("assistant:{n}"),
+        }
+    }
+
+    pub fn is_user(&self) -> bool {
+        *self == Source::User
+    }
+
+    /// Who it is, in words: "the user", "Workbench", "the agent lead",
+    /// "the agent cents" or "the assistant".
+    pub fn who(&self) -> String {
+        match self {
+            Source::User => "the user".into(),
+            Source::Workbench => "Workbench".into(),
+            Source::Agent(n) | Source::Assistant(n) if !n.is_empty() => format!("the agent {n}"),
+            Source::Agent(_) => "another agent".into(),
+            Source::Assistant(_) => "the assistant".into(),
+        }
+    }
+
+    /// The role a message of this source plays in a conversation excerpt.
+    pub fn role(&self) -> String {
+        match self {
+            Source::User => "user".into(),
+            Source::Workbench => "Workbench's brief".into(),
+            Source::Agent(n) if !n.is_empty() => format!("agent {n}"),
+            Source::Agent(_) => "another agent".into(),
+            Source::Assistant(_) => "assistant".into(),
+        }
     }
 }
 
@@ -354,6 +479,21 @@ mod tests {
         assert_eq!(entity_id("berries").as_deref(), Some("e:berry"));
         assert_eq!(entity_id("Dr. Smith's").as_deref(), Some("e:dr smith"));
         assert_eq!(entity_id("  "), None);
+    }
+
+    #[test]
+    fn sources_round_trip_into_the_context() {
+        for s in ["user", "workbench", "agent:lead", "agent", "assistant:cents", "assistant"] {
+            assert_eq!(Source::parse(s).as_str(), s);
+        }
+        assert_eq!(Source::parse("someone"), Source::User);
+        let r = Record::from_draft(Draft::new(Kind::Prompt, "Add tests.").ctx("Turn 1 request: x").by(&Source::Agent("lead".into())), "s", 1, 2, 3);
+        assert_eq!(r.source(), Some(Source::Agent("lead".into())));
+        assert_eq!(r.said_by(), "the agent lead");
+        assert!(r.ctx.starts_with("Turn 1 request: x\nBy: agent:lead"), "{}", r.ctx);
+        let plain = Record::from_draft(Draft::new(Kind::Prompt, "Add tests."), "s", 1, 2, 3);
+        assert_eq!(plain.source(), None);
+        assert_eq!(plain.said_by(), "");
     }
 
     #[test]

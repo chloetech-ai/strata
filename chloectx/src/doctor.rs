@@ -63,8 +63,9 @@ fn check_hooks(r: &mut Report, what: &str, path: &Path) -> bool {
         r.fail(what, format!("{} has the hook command `{}`, which a shell cannot run ({e}); run `chloectx install` again", path.display(), hooks[0].1));
     } else if old_name {
         r.warn(what, format!("{} calls {exe}, ChloeCtx's name before the rename; run `chloectx install` again to move to the new names", path.display()));
-    } else if events.len() < 9 {
-        r.warn(what, format!("{} has ChloeCtx hooks for {} events only ({}); run `chloectx install` again", path.display(), events.len(), events.join(", ")));
+    } else if install::EVENTS.iter().any(|(e, _, _)| !events.contains(e)) {
+        let missing: Vec<&str> = install::EVENTS.iter().map(|(e, _, _)| *e).filter(|e| !events.contains(e)).collect();
+        r.warn(what, format!("{} has ChloeCtx hooks for {} events only, without {}; run `chloectx install` again", path.display(), events.len(), missing.join(", ")));
     } else {
         r.ok(what, format!("{} ({} events, {exe})", path.display(), events.len()));
     }

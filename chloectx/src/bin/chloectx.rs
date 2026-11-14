@@ -19,10 +19,10 @@ as usual; it records each session, recalls what bears on each prompt and writes
 down decisions and rules. `chloectx doctor` says whether that is happening.
 
 More commands (`chloectx help <command>` explains each):
-  look into memory   blame, receipts, receipt, snapshot, sql, stats, briefing
+  look into memory   report, blame, receipts, receipt, snapshot, sql, stats, briefing
   maintain a store   forget, move, redact, distill, consolidate, backup, fetch-model, ingest-transcript
   share memory       sync, pack, mount, app
-  run by Claude Code (not by hand): hook, mcp, serve, rpc";
+  run by Claude Code (not by hand): hook, mcp, serve, rpc, wiring";
 
 #[derive(Parser)]
 #[command(name = "chloectx", version = env!("CHLOECTX_VERSION_LINE"), about = "Automatic long-term context for Claude Code, stored in ChloeDB", after_help = MORE)]
@@ -72,6 +72,18 @@ enum Cmd {
     /// Run the MCP server on stdio.
     #[command(hide = true)]
     Mcp,
+    /// For programs that start their own Claude Code sessions (Workbench):
+    /// the hooks, permission and MCP server to give a session in this
+    /// folder, as JSON; empty when it is already wired.
+    #[command(hide = true)]
+    /// (The session's folder is --project, default the current one.)
+    Wiring {
+        /// Path of the chloectx binary to call (default: this one).
+        #[arg(long)]
+        exe: Option<String>,
+        #[arg(long, default_value = "haiku")]
+        distill_model: String,
+    },
     /// Run the daemon in the foreground.
     #[command(hide = true)]
     Serve {
@@ -106,7 +118,12 @@ enum Cmd {
     },
     /// Run read-only SQL over the memory table.
     #[command(hide = true)]
-    Sql { sql: String },
+    Sql {
+        sql: String,
+        /// Print `{"columns", "rows", "count", "text"}` (at most 1000 rows).
+        #[arg(long)]
+        json: bool,
+    },
     /// Store a decision, preference, fact, todo or note.
     #[command(display_order = 8)]
     Remember { kind: String, text: String },
@@ -170,6 +187,10 @@ enum Cmd {
         session: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Print the JSON result: each receipt with the rows it showed
+        /// (`id`, `kind`, `tag`, `score`, `decision`, `text`).
+        #[arg(long)]
+        json: bool,
     },
     /// One receipt: every candidate's scores, tokens and decision, and the
     /// recall replayed on the snapshot kept at its commit and on today's store.
@@ -194,6 +215,23 @@ enum Cmd {
     /// Counts and sizes.
     #[command(hide = true)]
     Stats,
+    /// Where the project's time went, from what the store recorded: the
+    /// model's, the tools', waiting for you and compactions, for each
+    /// session and in all; the commands that took most time, errors seen
+    /// again and again, files read many times, and up to five suggestions.
+    /// Reads the store and writes nothing. Times are whole seconds.
+    #[command(hide = true)]
+    Report {
+        /// The last N days.
+        #[arg(long, default_value_t = 7.0)]
+        days: f64,
+        /// Only this session (its id, or the start of it).
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Copy the project's store to a new directory while ChloeCtx runs: a
     /// consistent copy of the database, the session state and the event
     /// log. To restore, run `chloectx stop` and copy the files back.
@@ -357,6 +395,11 @@ enum Cmd {
         /// Print the manifest as JSON.
         #[arg(long)]
         json: bool,
+        /// Only the records of these sessions (Claude Code session ids,
+        /// comma-separated), and the entities they link to: a branch's
+        /// agents' sessions. `CHLOECTX_PACK_SESSIONS` says the same.
+        #[arg(long, value_delimiter = ',')]
+        sessions: Vec<String>,
     },
     /// Serve capsules to Claude Code as an MCP server on stdio
     /// (capsule_ask, capsule_search, capsule_timeline, capsule_sql).
@@ -484,9 +527,15 @@ fn main() {
     match cli.cmd {
         Cmd::Hook { event, user } => std::process::exit(hook::run(&event, user)),
         Cmd::Mcp => std::process::exit(mcp::run()),
+        Cmd::Wiring { exe, distill_model } => {
+            let exe = exe.unwrap_or_else(|| std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "chloectx".into()));
+            println!("{}", install::wiring(&project, &exe, Some(&distill_model)));
+        }
         Cmd::Serve { dir } => {
             let dir = dir.unwrap_or_else(|| paths::store_dir(&project));
-            if let Err(e) = daemon::serve(&dir, &project.to_string_lossy()) {
+            // The folder the store is keyed by: a worktree's sessions reach
+            // the daemon of its repository's main checkout.
+            if let Err(e) = daemon::serve(&dir, &paths::store_root(&project).to_string_lossy()) {
                 eprintln!("chloectx serve: {e}");
                 std::process::exit(1);
             }
@@ -518,7 +567,14 @@ fn main() {
                 text(&r);
             }
         }
-        Cmd::Sql { sql } => text(&send(&project, json!({"op": "sql", "sql": sql}), 30)),
+        Cmd::Sql { sql, json: as_json } => {
+            let r = send(&project, json!({"op": "sql", "sql": sql, "json": as_json}), 30);
+            if as_json {
+                println!("{}", serde_json::to_string(&r).unwrap());
+            } else {
+                text(&r);
+            }
+        }
         Cmd::Blame { target, no_replay, json: as_json } => {
             // Relative to where it is typed, not to the daemon's directory.
             let (path, line) = chloectx::blame::parse_target(&target);
@@ -535,7 +591,14 @@ fn main() {
             }
         }
         Cmd::Receipts { switch: Some(s), purge, .. } => text(&send(&project, json!({"op": "receipts_switch", "on": s == "on", "purge": purge}), 600)),
-        Cmd::Receipts { switch: None, session, limit, .. } => text(&send(&project, json!({"op": "receipts", "session": session, "limit": limit}), 30)),
+        Cmd::Receipts { switch: None, session, limit, json: as_json, .. } => {
+            let r = send(&project, json!({"op": "receipts", "session": session, "limit": limit}), 30);
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&r).unwrap());
+            } else {
+                text(&r);
+            }
+        }
         Cmd::Receipt { id, no_replay, text: show, json: as_json } => {
             let r = send(&project, json!({"op": "receipt", "id": id, "replay": !no_replay, "text": show}), 120);
             if as_json {
@@ -552,7 +615,17 @@ fn main() {
             };
             text(&send(&project, req, 600));
         }
-        Cmd::Remember { kind, text: t } => text(&send(&project, json!({"op": "remember", "kind": kind, "text": t}), 30)),
+        // A person ran it, or Workbench on one's behalf (an answer, a rule):
+        // the user's.
+        Cmd::Remember { kind, text: t } => text(&send(&project, json!({"op": "remember", "kind": kind, "text": t, "by": "user"}), 30)),
+        Cmd::Report { days, session, json: as_json } => {
+            let r = send(&project, json!({"op": "report", "days": days, "session": session}), 120);
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&r["report"]).unwrap());
+            } else {
+                print!("{}", r["text"].as_str().unwrap_or(""));
+            }
+        }
         Cmd::Stats => println!("{}", serde_json::to_string_pretty(&send(&project, json!({"op": "stats"}), 30)).unwrap()),
         Cmd::Backup { dest } => {
             let dest = std::path::absolute(&dest).unwrap_or(dest);
@@ -646,7 +719,11 @@ fn main() {
         }
         Cmd::Stores { json: as_json } => std::process::exit(chloectx::stores::list(&paths::home(), as_json)),
         Cmd::Prune { older_than, yes, dry_run } => std::process::exit(chloectx::stores::prune(&paths::home(), &chloectx::stores::PruneOptions { older_than_days: older_than, yes, dry_run })),
-        Cmd::Pack { out, kinds, since_days, max_records, title, json: as_json } => {
+        Cmd::Pack { out, kinds, since_days, max_records, title, json: as_json, sessions } => {
+            let mut sessions: Vec<String> = sessions.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            if sessions.is_empty() {
+                sessions = std::env::var("CHLOECTX_PACK_SESSIONS").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
             let t0 = std::time::Instant::now();
             let out = std::path::absolute(&out).unwrap_or(out);
             let kinds: Vec<chloectx::record::Kind> = if kinds.iter().any(|k| k == "all") {
@@ -677,7 +754,7 @@ fn main() {
             };
             let embedder: std::sync::Arc<dyn embed::Embedder> = std::sync::Arc::from(embed::open(&spec).unwrap_or_else(|e| fail(e)));
             let store = chloectx::store::Store::open(&backup.join("memory.strata"), embedder, chloectx::store::StoreOptions { sync: false, ..Default::default() }).unwrap_or_else(|e| fail(e));
-            let opts = chloectx::capsule::PackOptions { kinds, since_ts: since_days.map(|d| chloectx::now() - (d * 86_400.0) as i64), max_records, title };
+            let opts = chloectx::capsule::PackOptions { kinds, since_ts: since_days.map(|d| chloectx::now() - (d * 86_400.0) as i64), max_records, title, sessions };
             let m = chloectx::capsule::pack(&store, &spec, &project.to_string_lossy(), &out, &opts).unwrap_or_else(|e| fail(e));
             drop(store);
             let _ = std::fs::remove_dir_all(&tmp);

@@ -29,7 +29,7 @@ Only one process at a time may write a ChloeDB file, and hooks are short-lived p
 - **Reads in parallel, one writer.** Reads run on each client's own thread against a snapshot, any number at once, and the searches behind one prompt share that snapshot and run side by side while cores are free. Every write goes to one writer thread, which commits whatever is queued in one transaction and builds the new version before the write returns, so a reader never waits for a write or for the index build after it. In-memory chunks hold 256 records and scan their vectors instead of building an HNSW graph, so that build stays cheap. A full memtable becomes a segment, and segments merge, on ChloeDB's background threads, not on the writer's: with 150,000 appends back to back in the cloud container (4-core Xeon), the longest took 0.2–0.4 s, against 12–15 s when the writer flushed and merged itself ([results](https://github.com/chloetech-ai/chloedb/tree/main/chloectx/results/writes)).
 - **Never in the way.** A client that cannot reach the daemon within its deadline prints nothing and exits 0. A memory failure never blocks a prompt or a tool call.
 
-The store lives outside the repository, in `${CHLOECTX_HOME:-~/.local/share/chloectx}/<project-slug>/` (in `~/.local/share/engram` on a machine that has it from before the rename), because transcripts can contain secrets. A redaction pass replaces keys, tokens, private keys, passwords in URLs and headers, and values assigned to names such as `DB_PASSWORD` with markers before anything is stored or synced; `chloectx redact` applies it to a store written before ([what is redacted](setup.md#secrets-and-chloectx-redact)).
+The store lives outside the repository, in `${CHLOECTX_HOME:-~/.local/share/chloectx}/<project-slug>/` (in `~/.local/share/engram` on a machine that has it from before the rename), because transcripts can contain secrets. A repository has one store, whichever of its git worktrees a session runs in: the slug of a linked worktree (a folder whose `.git` file points at `<repo>/.git/worktrees/<name>`) is that of the same folder in the main checkout, so agents in different worktrees read and add to one memory, through one daemon. A main checkout and a folder outside git keep the slug they always had. Each session remembers the folder it runs in (in the store's session state, and in `events.log` with its branch): its paths are stored relative to it, and notes tied to the code are checked against its files, not the main checkout's. `CHLOECTX_PER_WORKTREE=1` gives each worktree its own store again. A redaction pass replaces keys, tokens, private keys, passwords in URLs and headers, and values assigned to names such as `DB_PASSWORD` with markers before anything is stored or synced; `chloectx redact` applies it to a store written before ([what is redacted](setup.md#secrets-and-chloectx-redact)).
 
 ## The data model
 
@@ -39,7 +39,7 @@ One ChloeDB table, `memory`. Each record is one key–value pair with attributes
 |---|---|---|
 | `id` | KEYWORD, primary key | `<session-prefix>:<seq>` |
 | `session` | KEYWORD | Claude Code session id |
-| `kind` | KEYWORD | `prompt`, `answer`, `tool_call`, `tool_result`, `error`, `episode`, `summary`, `decision`, `preference`, `fact`, `todo`, `note` |
+| `kind` | KEYWORD | `prompt`, `answer`, `tool_call`, `tool_result`, `error`, `episode`, `summary`, `decision`, `preference`, `fact`, `todo`, `note`, `entity`, `event` |
 | `tag` | KEYWORD | tool name, summary section, `distilled`, `planned`, `superseded`, … |
 | `turn`, `seq`, `ts` | INT | user turn, project-wide sequence number, Unix seconds |
 | `importance` | FLOAT | salience prior in [0, 1]; for an entity, how many records link to it |
@@ -72,11 +72,15 @@ Storage is cheap (a durable commit costs about 4 ms on a Mac, where it flushes t
 |---|---|
 | `SessionStart` | session registered; live window opened |
 | `UserPromptSubmit` | `prompt`, plus `preference` records for cue sentences ("always", "never", "from now on", …) |
-| `PostToolUse` | `tool_call` and `tool_result` (or `error`), asynchronously |
+| `PostToolUse` | `tool_call` and `tool_result` (or `error`), asynchronously; a call that took a second or more says how long (`Took: 12s` in its context, timed from its message in the transcript) |
 | `Stop` | the answer, the commentary written between tool calls, the turn's `episode`, then distilled knowledge |
-| `PreCompact` | commentary not yet captured |
+| `PreCompact` | commentary not yet captured; an `event` (`compact_start`) |
 | `PostCompact` | the summary, by section; the live window restarts here |
+| `Notification` | an `event` tagged `notification:<type>` (`permission_prompt`, `idle_prompt`, ...) |
+| `SubagentStop` | an `event` tagged `subagent_stop` |
 | `SessionEnd` | flush |
+
+Events are records of when something happened rather than of what was said: a permission prompt, an idle notice, a built-in sub-agent that finished, a compaction that started. They are never injected or returned by search, recall or a timeline unless asked for by kind; [`chloectx report`](#where-the-time-went) reads them.
 
 `chloectx ingest-transcript` back-fills old sessions from Claude Code's JSONL transcripts.
 
@@ -94,10 +98,13 @@ After each `Stop`, off the prompt's path, the daemon gives the turn (request, co
 | rule, constraint, convention | `preference` | `distilled` |
 | requirement of work planned but not done | `todo` | `planned` |
 | fact about the project or its environment, failed approaches | `fact` | `distilled` |
-| `replaces: id` | the old item is retagged | `superseded` |
+| an instruction for the task at hand ("don't touch cart.py") | `note`, kept to its session | `task` |
+| `replaces: id` | the old item is retagged, and names its successor (`superseded_by`) | `superseded` |
 | `done: id` | the planned item is retagged | `done` |
 
-A new item whose analysed terms overlap an existing one by a Jaccard index J ≥ 0.6 is dropped. Distillation costs about **$0.0013 a turn** and 8 s with a small model, and never delays a prompt.
+A new item whose analysed terms overlap an existing one by a Jaccard index J ≥ 0.6 is dropped. A note is superseded only by a stored note that names it and shares at least 30% of its words; when the replacement was dropped or is about something else, the old note stays live.
+
+**Who said it.** Every item says whether the request stated it or the assistant found it, and the record keeps its source in a `By:` line: `user`, `workbench` (a brief Workbench wrote), `agent:<name>` (another agent's brief or message) or `assistant[:<name>]`. Only the user makes rules: a rule stays a `preference` only when the user stated it as standing ("always", "never", "from now on", "by default", a convention, in a sentence about the same thing) or answered the assistant's question asking for one. Any other instruction, and anything an agent or Workbench told an agent to do, becomes a note for that session's task, which other sessions, the briefing and recall never see. A decision or fact another agent stated, or a Workbench agent concluded, reads "The agent lead said: …"; it is that agent's claim, not a fact. A person's prompt that states a decision ("My decision: …", "We decided …") is kept at once as the user's decision, whether or not the distiller runs. Workbench tells ChloeCtx who wrote each prompt with `CHLOECTX_PROMPT_SOURCE` (the session's task), `CHLOECTX_PROMPT_LOG` (later prompts it typed) and `CHLOECTX_AGENT_NAME`; a prompt nothing names is the user's. Distillation costs about **$0.0013 a turn** and 8 s with a small model, and never delays a prompt.
 
 Each note also carries **the situations it will matter in** (`when`), written at the same time: "choosing a library or standard-library module", "parsing a config file" for a note that the client machines run Python 3.8. A later request rarely uses the words of the note it needs; it uses the words of the task. The situations join the note's lexical key and its embedding, so "add a settings.toml loader" finds the Python 3.8 note although they share no word. This is document expansion (doc2query) done once, when the note is written.
 
@@ -116,6 +123,8 @@ A note about code goes stale when the code changes. Each note records what it wa
 | the file is gone, or an identifier it names no longer occurs | **may be out of date**: moved to its own briefing section | **the code may now break it**: stays with the rules, with "the code changed since this was stated; check that it still follows it" |
 
 A rule does not go stale because the code moved away from it: a teammate who switched invoices to banker's rounding did not cancel the client's requirement, so the rule stays where the model will see it, with a warning that the code may now break it.
+
+**Branches.** Worktrees of one repository share one store, but not their code. Each session's worktree, branch and commit are kept as an event when its hooks first name them and whenever the branch changes, so every record has a branch: its anchor's, else its session's at the time. A file an agent read or changed is anchored too (commit, branch, content hash). When a record is shown in another worktree, ChloeCtx asks git for the merge base of the record's branch with this HEAD: a record written after that commit came from work this worktree does not have, and is labelled "from branch wb/paybutton, not merged here: not a description of this worktree's code", unless its anchored files are the same here. The briefing moves such notes to the section of notes that may be out of date, and the query engine's ranker is told never to present them as the current code.
 
 ## When to load
 
@@ -300,6 +309,7 @@ chloectx distill                                                          # dist
 chloectx consolidate                                                      # merge overlapping notes now
 chloectx backup ~/backups/chloectx-2026-10-28                             # a consistent copy of this project's store
 chloectx redact [--all] [--dry-run]                                       # redact secrets a store recorded before redaction caught them
+chloectx report [--days 7] [--session ID] [--json]                         # where the project's time went
 chloectx stats | briefing | stop
 chloectx pack ./work.capsule                                              # a capsule another agent mounts
 chloectx mount ./work.capsule                                             # serve it as MCP tools (stdio)
@@ -307,9 +317,25 @@ chloectx mount ./work.capsule                                             # serv
 
 A capsule hands a slice of this memory to another agent as one read-only file it queries: [capsules](capsules.md).
 
+### Where the time went
+
+`chloectx report` reads the store and writes nothing. For each session of the last `--days` days (7 by default; `--session` picks one by its id or the start of it) and in all, it splits the time between the records into:
+
+| share | from | to |
+|---|---|---|
+| model | a prompt, or a tool's result | the next tool call, or the answer |
+| tools | a tool call | its result (while any call runs) |
+| waiting | an answer, or a notification (a permission prompt, an idle notice) | the next prompt; one wait counts up to 30 minutes, the rest is *away*, counted apart |
+| compaction | a compaction's start | its summary |
+
+Anything that ends in a prompt is waiting (a turn the user interrupted, which has no answer). A permission wait lasts until the tool's result, so it includes the tool's own run after the user answered. Records keep Unix seconds, so every span is whole seconds, and a tool call has a length only when its record says how long it took: calls under a second, and calls recorded before ChloeCtx timed them, count as instants.
+
+Then: the commands that took most time, normalised as [error to fix](#when-to-load) matches them (`cd x && cargo test 2>&1 | tail` is `cargo test`), with their runs, time per run and failures; time by tool; errors seen three or more times, by signature, with the session they came back most often in; files read four or more times in one session; compactions per hour of use. Last, up to five suggestions, each with the numbers behind it: a slow command run often, a loop on one error, a file reread often, permissions waited on often, frequent compactions. `--json` prints the same as JSON.
+
 | variable | effect |
 |---|---|
 | `CHLOECTX_DISABLE=1` | turns the hooks off |
+| `CHLOECTX_PER_WORKTREE=1` | a store for each git worktree, instead of one for the repository |
 | `CHLOECTX_HOME`, `CHLOECTX_MODELS` | relocate the store and the models |
 | `CHLOECTX_DISTILL=0` | turns distillation off (or `"distill": {"enabled": false}` in the store's `config.json`) |
 | `CHLOECTX_DISTILL_MODEL` | the model the distiller and consolidation use |

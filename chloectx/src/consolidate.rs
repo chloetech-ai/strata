@@ -252,12 +252,20 @@ pub fn run(store: &Store, cfg: &ConsolidateConfig, cli: &DistillConfig, now: i64
             }
             let mut d = draft.ctx(ctx);
             d.importance = Some(olds.iter().map(|r| r.importance).fold(0.0, f64::max));
+            // Who said it, when they all agree.
+            let by: Vec<Option<crate::record::Source>> = olds.iter().map(|r| r.source()).collect();
+            if let Some(Some(b)) = by.first().filter(|b| by.iter().all(|x| x == *b)) {
+                d = d.by(b);
+            }
             for id in &replaces {
                 d = d.link("supersedes", id.clone());
             }
-            store.append(&newest.session, newest.turn, said, vec![d])?;
-            for id in &replaces {
-                let _ = store.retag(id, "superseded");
+            let stored = store.append(&newest.session, newest.turn, said, vec![d])?;
+            // Each old note names the merged one as its successor.
+            if let Some(new) = stored.iter().find(|r| r.kind.is_knowledge()) {
+                for id in &replaces {
+                    let _ = store.supersede(id, &new.id);
+                }
             }
             rep.replaced += replaces.len();
             rep.written += 1;

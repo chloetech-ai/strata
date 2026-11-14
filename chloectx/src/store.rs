@@ -32,7 +32,7 @@ use chloedb::{Document, Value, VectorIndexKind};
 use crate::cluster::{self, Cluster};
 use crate::embed::Embedder;
 use crate::redact::redact;
-use crate::record::{entity_id, file_entity_id, links_of, record_id, schema, Draft, Kind, Link, Record, COLUMNS};
+use crate::record::{entity_id, file_entity_id, links_of, record_id, schema, Draft, Kind, Link, Record, COLUMNS, TASK_TAG};
 use crate::{err, Error, Result};
 
 /// One search result with its component scores.
@@ -74,8 +74,8 @@ impl Filter {
 
     /// The filter's conditions, which name the values of
     /// [`Filter::params`] (`:window_session`, `:session`) rather than
-    /// quote them. Entity records are never results unless asked for by
-    /// kind.
+    /// quote them. Entity and event records are never results unless asked
+    /// for by kind ([`Kind::is_hidden`]).
     pub fn conds(&self) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some((_, w)) = &self.exclude_window {
@@ -96,6 +96,15 @@ impl Filter {
         }
         if self.kinds.is_empty() {
             parts.push("kind != 'entity'".into());
+            parts.push("kind != 'event'".into());
+        }
+        // An instruction given for one task ([`crate::record::TASK_TAG`])
+        // is that session's only: never a rule another session is given.
+        if self.session.is_none() {
+            parts.push(match &self.exclude_window {
+                Some(_) => format!("NOT (tag = '{TASK_TAG}' AND session != :window_session)"),
+                None => format!("tag != '{TASK_TAG}'"),
+            });
         }
         parts
     }
@@ -486,6 +495,28 @@ impl Store {
         self.run(Op::Flush).map(|_| ())
     }
 
+    /// Marks `old` as replaced by `new`, which must be a stored record:
+    /// `old` is tagged superseded and links to its successor
+    /// (`superseded_by`), so every view can name what replaced it. A
+    /// record is never superseded by nothing. Returns whether it was.
+    pub fn supersede(&self, old: &str, new: &str) -> Result<bool> {
+        if old == new {
+            return Ok(false);
+        }
+        let mut got = self.get(&[old.to_string(), new.to_string()])?;
+        let Some(i) = got.iter().position(|r| r.id == old) else { return Ok(false) };
+        if !got.iter().any(|r| r.id == new) {
+            return Ok(false);
+        }
+        let mut r = got.swap_remove(i);
+        r.tag = "superseded".into();
+        if !r.links.iter().any(|l| l.label == "superseded_by" && l.to == new) {
+            r.links.push(Link::new("superseded_by", new));
+        }
+        self.insert(&[r])?;
+        Ok(true)
+    }
+
     /// Changes a record's tag (e.g. planned work that is now done).
     pub fn retag(&self, id: &str, tag: &str) -> Result<bool> {
         let Some(mut r) = self.get(&[id.to_string()])?.pop() else { return Ok(false) };
@@ -620,7 +651,7 @@ impl Store {
 
     /// The newest `n` records of `session`, newest first, with their vectors.
     pub fn tail(&self, session: &str, n: usize) -> Result<Vec<(Record, Option<Vec<f32>>)>> {
-        let sql = format!("SELECT {COLUMNS}, emb FROM memory WHERE session = :session ORDER BY seq DESC LIMIT {n}");
+        let sql = format!("SELECT {COLUMNS}, emb FROM memory WHERE session = :session AND kind != 'event' ORDER BY seq DESC LIMIT {n}");
         let rs = self.query_with(&sql, &Params::new().set("session", Value::Str(session.to_string())))?;
         Ok(rs
             .rows
@@ -1051,6 +1082,29 @@ mod tests {
         assert_eq!(p.last_seq(), at);
         assert_eq!(p.pinned().last_seq(), at);
         assert_eq!(s.last_seq(), at + 2);
+    }
+
+    #[test]
+    fn task_notes_stay_in_their_session_and_supersede_needs_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let task = s.append("cents", 1, 100, vec![Draft::new(Kind::Note, "For cents's task only (the user said, not a standing rule): don't touch cart.py").tag(TASK_TAG)]).unwrap();
+        let rule = s.append("maya", 1, 101, vec![Draft::new(Kind::Preference, "Money is always integer cents.").tag("distilled")]).unwrap();
+        let ids = |f: &Filter| -> Vec<String> { s.latest(&[Kind::Note, Kind::Preference], 10, f).unwrap().into_iter().map(|r| r.id).collect() };
+        // Another session, a briefing, Workbench's view: no task note.
+        assert_eq!(ids(&Filter::default()), vec![rule[0].id.clone()]);
+        assert_eq!(ids(&Filter { exclude_window: Some(("paybutton".into(), 1_000)), ..Default::default() }), vec![rule[0].id.clone()]);
+        // Its own session still has it.
+        assert!(ids(&Filter { exclude_window: Some(("cents".into(), 1_000)), ..Default::default() }).contains(&task[0].id));
+        assert!(ids(&Filter { session: Some("cents".into()), ..Default::default() }).contains(&task[0].id));
+        // Superseded only by a stored record, which it then names.
+        assert!(!s.supersede(&rule[0].id, "nobody:9").unwrap());
+        assert_eq!(s.get(&[rule[0].id.clone()]).unwrap()[0].tag, "distilled");
+        let new = s.append("maya", 2, 102, vec![Draft::new(Kind::Preference, "Money is always integer cents, rounded half up.").link("supersedes", rule[0].id.clone())]).unwrap();
+        assert!(s.supersede(&rule[0].id, &new[0].id).unwrap());
+        let old = s.get(&[rule[0].id.clone()]).unwrap().pop().unwrap();
+        assert_eq!(old.tag, "superseded");
+        assert_eq!(old.linked("superseded_by").collect::<Vec<_>>(), vec![new[0].id.as_str()]);
     }
 
     #[test]

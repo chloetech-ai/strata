@@ -30,6 +30,8 @@ fn budget(event: &str, deep: &crate::deep::DeepConfig) -> Duration {
         "Stop" => 2000 + deep.stop_wait().as_millis() as u64,
         "PostCompact" => 5000,
         "PreToolUse" => 1500,
+        // Recorded and answered at once; nothing waits on them.
+        "Notification" | "SubagentStop" => 1000,
         _ => 2000,
     })
 }
@@ -67,7 +69,18 @@ pub fn run(event: &str, user: bool) -> i32 {
     // switched off in its environment (CTX-3).
     let claude = crate::llm::on_path("claude");
     let distill = std::env::var("CHLOECTX_DISTILL").ok().filter(|v| !v.is_empty()).map(|v| v != "0");
-    let req = json!({"op": "hook", "event": event, "payload": payload, "deep": deep, "distill_model": distill_model, "receipts": daemon::receipts_env(), "claude": claude, "distill": distill});
+    let mut req = json!({"op": "hook", "event": event, "payload": payload, "deep": deep, "distill_model": distill_model, "receipts": daemon::receipts_env(), "claude": claude, "distill": distill});
+    // Who wrote a prompt, when Workbench says (see [`prompt_source`]), and
+    // the session's agent name.
+    if let Ok(a) = std::env::var("CHLOECTX_AGENT_NAME") {
+        req["agent"] = json!(a);
+    }
+    if event == "UserPromptSubmit" {
+        let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let log = std::env::var_os("CHLOECTX_PROMPT_LOG").map(std::path::PathBuf::from);
+        req["source"] = json!(log.and_then(|l| prompt_source(&l, prompt, crate::now() - crate::clock_offset())));
+        req["session_source"] = json!(std::env::var("CHLOECTX_PROMPT_SOURCE").ok());
+    }
     let wait = budget(&event, &deep);
     match daemon::request(&dir, &project.to_string_lossy(), &req, wait) {
         Ok(resp) => {
@@ -81,4 +94,41 @@ pub fn run(event: &str, user: bool) -> i32 {
         Err(e) => eprintln!("chloectx: {e}"),
     }
     0
+}
+
+/// The source Workbench noted for a prompt in `log` (`CHLOECTX_PROMPT_LOG`):
+/// JSON lines `{"ts": <unix seconds>, "text": <the prompt's start>,
+/// "source": "user" | "workbench" | "agent:<name>"}`, written just before
+/// it types a prompt into the session (another agent's `send_to_agent`, a
+/// goal's brief). The newest line of the last hour whose text starts the
+/// prompt (spaces aside) is the one; a prompt with no line is the user's.
+pub fn prompt_source(log: &std::path::Path, prompt: &str, now: i64) -> Option<String> {
+    let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let p = norm(prompt);
+    if p.is_empty() {
+        return None;
+    }
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines().rev().take(200).filter_map(|l| serde_json::from_str::<Json>(l).ok()).find_map(|v| {
+        let ts = v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0);
+        let start = norm(v.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+        let src = v.get("source").and_then(|s| s.as_str())?;
+        (now - ts <= 3600 && !start.is_empty() && p.starts_with(&start)).then(|| src.to_string())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prompts_get_the_source_workbench_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("prompt-sources.jsonl");
+        std::fs::write(&log, "{\"ts\": 1000, \"text\": \"Add tests  for shipping\", \"source\": \"agent:lead\"}\nnot json\n{\"ts\": 1000, \"text\": \"You lead the work\", \"source\": \"workbench\"}\n").unwrap();
+        assert_eq!(super::prompt_source(&log, "Add tests for shipping: 499 by default.", 1100).as_deref(), Some("agent:lead"));
+        assert_eq!(super::prompt_source(&log, "You lead the work on a goal", 1100).as_deref(), Some("workbench"));
+        assert_eq!(super::prompt_source(&log, "Don't touch money.py", 1100), None);
+        // An hour later the note is stale.
+        assert_eq!(super::prompt_source(&log, "Add tests for shipping", 5000), None);
+        assert_eq!(super::prompt_source(&dir.path().join("none"), "Add tests", 1100), None);
+    }
 }

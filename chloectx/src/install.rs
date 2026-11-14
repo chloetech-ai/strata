@@ -27,7 +27,8 @@ use serde_json::{json, Value as Json};
 
 use crate::{err, Result};
 
-const EVENTS: [(&str, Option<&str>, u64); 9] = [
+/// The hooks installed: event, matcher, timeout in seconds.
+pub const EVENTS: [(&str, Option<&str>, u64); 11] = [
     ("SessionStart", None, 15),
     // Long enough for query understanding in `sync` mode.
     ("UserPromptSubmit", None, 90),
@@ -39,6 +40,10 @@ const EVENTS: [(&str, Option<&str>, u64); 9] = [
     ("PreCompact", None, 15),
     ("PostCompact", None, 15),
     ("SessionEnd", None, 10),
+    // Recorded for `chloectx report` (when the agent waited for the user,
+    // when a sub-agent finished), never recalled.
+    ("Notification", None, 5),
+    ("SubagentStop", None, 5),
 ];
 
 /// The MCP server's name; its tools are `mcp__chloectx__*`.
@@ -463,6 +468,52 @@ pub fn user_has_hooks() -> bool {
     hooks.values().filter_map(|l| l.as_array()).flatten().any(is_user_hook)
 }
 
+/// What a program that starts Claude Code sessions of its own (Workbench)
+/// adds to each session so that ChloeCtx records it and its agent has the
+/// memory tools, without writing any settings file of the user's:
+/// `settings` (merge into the session's `--settings` file) and `mcp` (into
+/// its `--mcp-config`). Both are empty when `cwd` is already wired, by the
+/// user's settings (`wired: "user"`) or its project's (`"project"`), so a
+/// session is never recorded twice.
+pub fn wiring(cwd: &Path, exe: &str, distill_model: Option<&str>) -> Json {
+    let wired = if project_has_hooks(cwd) {
+        Some("project")
+    } else if user_has_hooks() {
+        Some("user")
+    } else {
+        None
+    };
+    let (settings, mcp) = if wired.is_some() {
+        (json!({}), json!({}))
+    } else {
+        let mut s = json!({});
+        add_to_settings(&mut s, exe, false, distill_model);
+        // The server comes from --mcp-config, not a project's .mcp.json.
+        if let Some(o) = s.as_object_mut() {
+            o.remove("enabledMcpjsonServers");
+        }
+        (s, json!({ SERVER: {"type": "stdio", "command": exe, "args": ["mcp"]} }))
+    };
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "exe": exe,
+        "wired": wired,
+        "settings": settings,
+        "mcp": mcp,
+        "store": crate::paths::store_dir(cwd).to_string_lossy(),
+        "model": model_status(),
+    })
+}
+
+/// Whether recall's embedding model is there (`chloectx fetch-model`
+/// downloads it); another embedder set in the environment needs none.
+fn model_status() -> Json {
+    let spec = std::env::var("CHLOECTX_EMBEDDER").unwrap_or_else(|_| "static".into());
+    let dir = crate::embed::models_dir().join("potion-retrieval-32M");
+    let ok = spec != "static" || dir.join("model.safetensors").is_file();
+    json!({"ok": ok, "embedder": spec, "path": dir.to_string_lossy(), "fix": if ok { Json::Null } else { json!("chloectx fetch-model") }})
+}
+
 /// The nearest folder above `p` that exists, for a mistyped path.
 fn nearest_existing(p: &Path) -> Option<&Path> {
     p.ancestors().skip(1).find(|a| a.is_dir() && a.parent().is_some())
@@ -661,6 +712,24 @@ pub fn uninstall_user() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn wiring_skips_a_project_with_its_own_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = wiring(dir.path(), "/opt/chloectx", Some("haiku"));
+        if !user_has_hooks() {
+            assert_eq!(w["wired"], Json::Null, "{w}");
+            assert!(w["settings"]["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap().contains("/opt/chloectx hook Stop"), "{w}");
+            assert_eq!(w["settings"]["env"]["CHLOECTX_DISTILL_MODEL"], "haiku");
+            assert!(w["settings"].get("enabledMcpjsonServers").is_none());
+            assert_eq!(w["mcp"]["chloectx"]["args"], json!(["mcp"]));
+        }
+        install(dir.path(), "/opt/chloectx", false, None).unwrap();
+        let w = wiring(dir.path(), "/opt/chloectx", Some("haiku"));
+        assert_eq!(w["wired"], "project", "{w}");
+        assert_eq!(w["settings"], json!({}));
+        assert_eq!(w["mcp"], json!({}));
+    }
     use super::*;
 
     fn commands(settings: &Json) -> Vec<String> {

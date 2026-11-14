@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 
 use crate::embed::{self, Embedder};
-use crate::record::Kind;
+use crate::record::{Kind, Record};
 use crate::store::{Filter, Store, StoreOptions};
 use crate::{err, now, Result};
 
@@ -86,6 +86,10 @@ pub struct Manifest {
     pub pack_ms: f64,
     /// The entities the capsule's records link to most (names only).
     pub topics: Vec<String>,
+    /// The sessions it was cut to (a branch's agents' sessions); absent
+    /// when it holds every session's records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
 }
 
 /// Which records go into a capsule.
@@ -95,12 +99,24 @@ pub struct PackOptions {
     pub since_ts: Option<i64>,
     pub max_records: usize,
     pub title: Option<String>,
+    /// Only the records of these sessions (and the entities they link
+    /// to); empty: every session's.
+    pub sessions: Vec<String>,
 }
 
 impl Default for PackOptions {
     fn default() -> Self {
-        PackOptions { kinds: DEFAULT_KINDS.to_vec(), since_ts: None, max_records: 200_000, title: None }
+        PackOptions { kinds: DEFAULT_KINDS.to_vec(), since_ts: None, max_records: 200_000, title: None, sessions: Vec::new() }
     }
+}
+
+/// The records of `sessions` among `rows`, and the entities they link to.
+pub fn of_sessions<T>(rows: Vec<(Record, T)>, sessions: &[String]) -> Vec<(Record, T)> {
+    if sessions.is_empty() {
+        return rows;
+    }
+    let linked: std::collections::HashSet<String> = rows.iter().filter(|(r, _)| sessions.contains(&r.session)).flat_map(|(r, _)| r.links.iter().map(|l| l.to.clone())).collect();
+    rows.into_iter().filter(|(r, _)| if r.kind == Kind::Entity { linked.contains(&r.id) } else { sessions.contains(&r.session) }).collect()
 }
 
 const DB: &str = "memory.strata";
@@ -119,7 +135,13 @@ pub fn pack(store: &Store, embedder_spec: &str, project: &str, out: &Path, opts:
         return Err(err(format!("{} exists", out.display())));
     }
     let filter = Filter { kinds: opts.kinds.clone(), since_ts: opts.since_ts, ..Default::default() };
-    let rows = store.export(&filter, opts.max_records.max(1))?;
+    let rows = if opts.sessions.is_empty() {
+        store.export(&filter, opts.max_records.max(1))?
+    } else {
+        let mut rows = of_sessions(store.export(&filter, 5_000_000)?, &opts.sessions);
+        rows.truncate(opts.max_records.max(1));
+        rows
+    };
     let mut recs = Vec::with_capacity(rows.len());
     let mut embs = Vec::with_capacity(rows.len());
     let mut missing = Vec::new();
@@ -202,6 +224,7 @@ pub fn pack(store: &Store, embedder_spec: &str, project: &str, out: &Path, opts:
         sha256,
         pack_ms: t0.elapsed().as_secs_f64() * 1000.0,
         topics: topics.into_iter().map(|(n, _)| clean_text(&n, MAX_TOPIC)).filter(|n| !n.is_empty()).take(MAX_TOPICS).collect(),
+        sessions: opts.sessions.clone(),
     };
     std::fs::write(out.join(MANIFEST), serde_json::to_string_pretty(&m)?)?;
     Ok(m)

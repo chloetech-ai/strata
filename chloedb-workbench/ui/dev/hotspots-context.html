@@ -1,0 +1,97 @@
+<!doctype html>
+<!-- What an agent sees when its first Edit of a hotspot file in a session
+     gets the PreToolUse hook's additionalContext (SPEC.md, "Fifth build:
+     Hotspots"), drawn as Claude Code shows it in the agent's terminal, for
+     the screenshot hotspots-agent-context.png. The text is the mock's
+     /api/hotspots (ui/dev/fixtures/hotspots.mjs), as src/hotspots.rs writes it.
+       /dev/hotspots-context.html[?theme=dark] -->
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hotspot context</title><link rel="stylesheet" href="../style.css">
+<style>
+:root{--ctx:#7c3aed}:root[data-theme="dark"]{--ctx:#b48cff}
+body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 var(--sans)}
+.hx-wrap{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:18px;padding:20px 24px;height:100vh;box-sizing:border-box}
+.hx-head{grid-column:1/-1;display:flex;align-items:baseline;gap:12px}
+.hx-head h1{margin:0;font-size:22px;font-weight:680}
+.hx-head .hx-sub{color:var(--muted)}
+.hx-term{background:#0d1014;border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-height:0}
+.hx-bar{display:flex;align-items:center;gap:10px;padding:9px 14px;background:#151a20;border-bottom:1px solid #232a33;color:#9aa4b2;font-size:12.5px}
+.hx-bar .hx-av{width:20px;height:20px;border-radius:6px;display:inline-grid;place-items:center;font-weight:750;font-size:11px;color:#0b0d10;background:hsl(222 80% 68%)}
+.hx-bar b{color:#e6edf3}.hx-bar .hx-st{margin-left:auto;display:inline-flex;align-items:center;gap:6px}
+.hx-bar .hx-st i{width:7px;height:7px;border-radius:50%;background:#3fb950}
+pre{margin:0;padding:16px 18px;font:13px/1.55 var(--mono);color:#d7dde4;white-space:pre-wrap;overflow:auto;flex:1}
+.hx-u{color:#9aa4b2}.hx-dot{color:#e6edf3}.hx-ok{color:#3fb950}.hx-bad{color:#f85149}.hx-m{color:#7d8590}.hx-tool{color:#e6edf3;font-weight:700}
+.hx-hk{color:#d2a8ff}.hx-ctx{display:block;border-left:2px solid #b48cff;padding-left:12px;margin:2px 0 2px 5ch;color:#e2d6ff;background:rgba(180,140,255,.07)}
+.hx-side{display:flex;flex-direction:column;gap:12px;min-height:0;overflow:auto}
+.hx-card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow-1)}
+.hx-card h2{margin:0 0 8px;font-size:11.5px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.hx-kv{display:grid;grid-template-columns:86px 1fr;gap:6px 10px;font-size:12.5px}.hx-kv dt{color:var(--muted)}.hx-kv dd{margin:0}
+code{font:12px var(--mono)}
+.hx-chip{display:inline-flex;align-items:center;border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600;margin:2px 3px 0 0}
+.hx-w{background:var(--warn-soft);color:var(--warn-ink)}.hx-c{background:var(--crit-soft);color:var(--crit-ink)}.hx-a{background:var(--accent-soft);color:var(--accent)}
+.hx-ctxc{color:var(--ctx);font-weight:600;font-size:12px}
+.hx-ctxc::before{content:"";display:inline-block;width:7px;height:7px;border-radius:2px;background:currentColor;transform:rotate(45deg);margin-right:6px}
+.hx-score{display:inline-flex;align-items:center;border-radius:7px;padding:1px 7px;font:700 12.5px var(--mono);color:var(--crit);background:var(--crit-soft)}
+p{margin:6px 0 0;color:var(--text-2)}
+</style></head><body>
+<div class="hx-wrap">
+  <div class="hx-head"><h1>cart</h1><span class="hx-sub">wb/cart · Cart totals with coupons, rounding and tax · the terminal as the agent sees it</span></div>
+  <div class="hx-term">
+    <div class="hx-bar"><span class="hx-av">C</span><b>cart</b><span>~/…/worktrees/shop-5e7d1a90/cart</span><span class="hx-st"><i></i>working</span></div>
+<pre><span class="hx-u">&gt; The coupon test still fails. Fix applies_coupon, and keep the rounding rule.</span>
+
+<span class="hx-dot">⏺</span> I'll look at how apply_coupon feeds round_line_total first.
+
+<span class="hx-dot">⏺</span> <span class="hx-tool">Read</span>(src/cart/totals.rs)
+  <span class="hx-m">⎿  Read 420 lines (ctrl+r to expand)</span>
+
+<span class="hx-dot">⏺</span> <span class="hx-tool">Update</span>(src/cart/totals.rs)
+  <span class="hx-m">⎿</span>  <span class="hx-hk">PreToolUse:Edit hook additional context:</span>
+<span class="hx-ctx" id="ctx"></span>
+<span class="hx-dot">⏺</span> This file has a history: the rounding was changed back and forth and a rule
+  now says round half-even, once, on the line total. I'll leave
+  round_line_total alone and run the pinned test before touching anything.
+
+<span class="hx-dot">⏺</span> <span class="hx-tool">Bash</span>(cargo test totals::applies_coupon)
+  <span class="hx-m">⎿</span>  running 1 test
+     test totals::applies_coupon ... <span class="hx-bad">FAILED</span>
+     <span class="hx-m">  left: 1799</span>
+     <span class="hx-m"> right: 1800</span>
+     <span class="hx-m">… +9 lines (ctrl+r to expand)</span>
+
+<span class="hx-dot">⏺</span> The coupon is applied after rounding, so 10% off 19.99 loses a cent. The fix
+  belongs in apply_coupon: discount the line total in cents, then round once.
+
+<span class="hx-dot">⏺</span> <span class="hx-tool">Update</span>(src/cart/totals.rs)
+  <span class="hx-m">⎿  Updated src/cart/totals.rs with 3 additions and 2 removals</span>
+
+<span class="hx-dot">⏺</span> <span class="hx-tool">Bash</span>(cargo test totals)
+  <span class="hx-m">⎿</span>  test result: <span class="hx-ok">ok</span>. 12 passed; 0 failed
+
+<span class="hx-m">✻ Thinking…</span></pre>
+  </div>
+  <div class="hx-side">
+    <div class="hx-card"><h2>Told once</h2>
+      <dl class="hx-kv">
+        <dt>File</dt><dd><code>src/cart/totals.rs</code> <span class="hx-score">42.5</span></dd>
+        <dt>When</dt><dd>its first Edit of the file in this session (PreToolUse)</dd>
+        <dt>Not again</dt><dd>the second Update of the file got nothing: one delivery per session and file</dd>
+        <dt>Row</dt><dd><code>deliveries</code> · <code>b2c4e6a8:hot:7a11…:src/cart/totals.rs</code></dd>
+      </dl></div>
+    <div class="hx-card"><h2>Built from</h2>
+      <span class="hx-chip hx-w">11 re-edits</span><span class="hx-chip hx-w">2 agents</span><span class="hx-chip hx-c">3 reverts</span><span class="hx-chip hx-c">6 test fails</span><span class="hx-chip hx-a">2 corrections</span><span class="hx-chip hx-a">1 question</span><span class="hx-chip hx-c">2 incidents</span>
+      <p>SQL over <code>file_edits</code>, <code>test_runs</code> (ASOF JOIN to the edit before each failure), <code>runtime_errors</code>, <code>events</code> (steers), <code>questions</code>, <code>incidents</code> and the git log's reverts.</p></div>
+    <div class="hx-card"><h2>What ChloeCtx adds</h2>
+      <div class="hx-ctxc">rule</div><p>Round half-even, once, on the line total; never per unit.</p>
+      <div class="hx-ctxc" style="margin-top:8px">decision</div><p>Money is integer cents; round half-even once, on the line total, before tax.</p></div>
+    <div class="hx-card"><h2>Its suggestion</h2>
+      <p>Run <code>cargo test totals::applies_coupon</code> first, and again after (pinned in Health › Hotspots).</p></div>
+  </div>
+</div>
+<script type="module">
+const q = new URLSearchParams(location.search);
+if (q.get("theme")) document.documentElement.dataset.theme = q.get("theme");
+const d = await fetch("/api/hotspots?limit=1").then((r) => r.json()).catch(() => ({}));
+document.getElementById("ctx").textContent = (d.hotspots && d.hotspots[0] && d.hotspots[0].context) || "";
+</script>
+</body></html>
