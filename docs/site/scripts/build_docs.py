@@ -431,7 +431,11 @@ TEMPLATE = """<!doctype html>
   <div><h4>Source</h4><ul><li><a href="{github}">GitHub</a></li><li><a href="{github}/blob/{branch}/docs/reproduce.md">Reproduce the results</a></li></ul></div>
 </div></footer>
 <script src="{up}assets/site.js?v={h_site_js}"></script>
-<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+<script>
+// On a narrow screen the sidebar and, on a phone, "On this page" start closed, so the page's text is in the first screen.
+if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;
+if (window.matchMedia("(max-width: 760px)").matches) document.querySelectorAll(".doc-toc").forEach(function (d) {{ d.open = false; }});
+</script>
 {mermaid}
 </body>
 </html>

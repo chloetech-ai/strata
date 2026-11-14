@@ -141,9 +141,24 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .top-links a { color: var(--ink); text-decoration: none; }
 .top-links a:hover { color: var(--accent); }
 .top-links a.btn { color: var(--accent-ink); padding: 8px 14px; }
+/* A phone gets two short rows: the mark and the links, then the site's
+ * pages in one line that scrolls sideways (with a fade at the edge that
+ * says so), instead of three rows that took a fifth of the screen. */
 @media (max-width: 760px) {
-  .nav { order: 3; flex-basis: 100%; gap: 2px 18px; font-size: 0.9rem; }
-  .top-links { margin-left: auto; }
+  .top .wrap { gap: 0 12px; padding-block: 8px 0; min-height: 0; }
+  .mark { font-size: 1.15rem; gap: 8px; }
+  .mark i { width: 18px; }
+  .top-links { margin-left: auto; gap: 14px; font-size: 0.9rem; }
+  .top-links a.btn { padding: 7px 12px; font-size: 0.88rem; }
+  .nav {
+    order: 3; flex: 1 0 100%; flex-wrap: nowrap; gap: 18px; font-size: 0.88rem;
+    overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; white-space: nowrap;
+    margin-top: 4px; padding-right: 24px;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav a { padding-block: 6px 7px; flex: none; }
 }
 
 main { display: block; }
