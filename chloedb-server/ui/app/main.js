@@ -405,7 +405,7 @@ function drawCluster() {
   const sandbox = isSandbox();
   envBadge.className = "env" + (env || sandbox ? "" : " hidden") + (prod ? " prod" : "") + (sandbox ? " sandbox" : "");
   envBadge.textContent = env ? (prod ? "PROD" : env.toUpperCase().slice(0, 12)) : sandbox ? "SANDBOX" : "";
-  envBadge.title = env ? `Environment: ${env}${prod ? ". Changes here reach production." : ""}` : sandbox ? "A sandbox: no environment is set and this page is opened on this machine, so writes run without a second ask. Start the server with --environment (production, staging…) to treat it as one." : "";
+  envBadge.title = env ? `Environment: ${env}${prod ? ". Changes here reach production." : ""}` : sandbox ? "A sandbox: no environment is set and this page is opened on this machine, so writes are on without asking for a reason first (a write in the workbench still shows the rows it changes before it runs). Start the server with --environment (production, staging…) to treat it as one." : "";
   top.classList.toggle("prod", prod);
   document.title = `${currentEntry?.title || "ChloeDB"} · ${name || "ChloeDB"}${prod ? " · PROD" : ""}`;
   if (name || env) remember(location.origin, name, env);

@@ -430,7 +430,7 @@ export const isProduction = () => { const e = environment(); return e == null ? 
 /**
  * A sandbox: a server with no environment set, opened on this machine
  * (localhost), not through a hub: someone trying ChloeDB, whose writes
- * need no second ask. Naming an environment (--environment) ends it.
+ * are on without a reason asked (each still shows the rows it changes). Naming an environment (--environment) ends it.
  */
 export const isSandbox = () => environment() == null && /^(localhost|127(\.\d{1,3}){3}|\[::1\]|::1)$/i.test(location.hostname) && !/^\/c\//.test(location.pathname);
 
