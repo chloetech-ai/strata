@@ -429,14 +429,11 @@ target/release/chloedb-server --demo 20000 --db products.chloedb</pre>
 <td>the most elements (words, values and symbols) such a statement may hold, as ClickHouse's <code>max_ast_elements</code> bounds; <code>id IN ('a', 'b', ...)</code> is two an id; 0: no limit <span class="since unreleased">since 0.3.4 (unreleased)</span></td>
 </tr>
 <tr>
-<<<<<<< HEAD
 <td><code>--statement-budget SPEC</code></td>
 <td>none</td>
 <td>what one statement may cost, checked once its stored functions and rank profiles are written out and as it runs: <code>name=n</code> pairs apart by commas, of <code>nodes</code>, <code>depth</code>, <code>list</code>, <code>plan_ms</code> and <code>rows_read</code> (<code>nodes=50000,rows_read=10000000</code>); a key's budget and a request's <code>budget</code> lower it, never raise it (<a href="#statement-budgets">statement budgets</a>) <span class="since unreleased">since 0.3.4 (unreleased)</span></td>
 </tr>
 <tr>
-=======
->>>>>>> origin/main
 <td><code>--otlp-retain PERIOD</code></td>
 <td>none (kept for ever)</td>
 <td>how long a table <a href="#opentelemetry-logs">OpenTelemetry logs</a> make keeps its rows (<code>'30 days'</code>, <code>'12h'</code>); tables already there keep theirs</td>
