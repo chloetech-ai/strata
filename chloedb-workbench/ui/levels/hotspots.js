@@ -365,8 +365,12 @@ export function withHotspots(mountHealth) {
     function body() {
       if (!S.data) return S.err ? h("section", { class: "lv-card" }, h("div", { class: "err" }, S.err), h("button", { class: "btn sm", onclick: () => fetchList(true) }, "Try again")) : empty("Scoring the files…");
       const all = S.data.hotspots || [];
-      const shown = all.filter((x) => S.filter === "all" || (S.filter === "hot" ? x.level === "hot" : (x.reasons || []).some((r) => r.kind === S.filter)));
-      const sel = all.find((x) => x.id === S.sel);
+      // A filter's kinds: Tests is failing and flaky tests both.
+      const kinds = { test_fails: ["test_fails", "flaky"] }[S.filter] || [S.filter];
+      const shown = all.filter((x) => S.filter === "all" || (S.filter === "hot" ? x.level === "hot" : (x.reasons || []).some((r) => kinds.includes(r.kind))));
+      // The pane shows one of the list as filtered, never one it hides.
+      const sel = shown.find((x) => x.id === S.sel) || shown[0];
+      if (sel && sel.id !== S.sel) setTimeout(() => pick(sel.id), 0);
       return [
         stats(),
         h("div", { class: "hs-grid" },
@@ -375,7 +379,7 @@ export function withHotspots(mountHealth) {
               h("div", { class: "hs-filters", role: "group", "aria-label": "Show" }, [["all", "All"], ["hot", "Hot"], ["reverts", "Reverts"], ["test_fails", "Tests"], ["steers", "Corrected"]].map(([k, l]) =>
                 h("button", { class: "hs-f" + (S.filter === k ? " on" : ""), "aria-pressed": S.filter === k ? "true" : "false", onclick: () => { S.filter = k; draw(); } }, l)))),
             shown.length ? shown.map((x) => row(x, all.indexOf(x) + 1)) : h("div", { class: "hs-calm" }, all.length ? "None of these here." : [h("b", null, "Nothing is hot."), " No file was corrected, reverted or broken more than once in this window."])),
-          sel ? board(sel) : h("section", { class: "lv-card hs-board" }, empty(all.length ? "Pick a hotspot." : "When agents keep re-editing, reverting or breaking a file, it shows here with the evidence."))),
+          sel ? board(sel) : h("section", { class: "lv-card hs-board" }, empty(all.length ? (shown.length ? "Pick a hotspot." : "No hotspot of this kind. Pick another filter.") : "When agents keep re-editing, reverting or breaking a file, it shows here with the evidence."))),
       ];
     }
 
@@ -386,11 +390,12 @@ export function withHotspots(mountHealth) {
       // tiles add up with the list (hotspots or not).
       const levels = [t.hot ? `${t.hot} hot` : null, t.warm ? `${t.warm} warm` : null, t.mild ? `${t.mild} mild` : null].filter(Boolean).join(" · ") || "none over the bar";
       return h("section", { class: "lv-card hs-stats" },
-        tile(t.hotspots, t.hotspots === 1 ? "hotspot" : "hotspots", `${levels} · of ${t.files || 0} files with signals`, "crit"),
+        // Its colour is its hottest level's: red for hot, amber for warm, plain for mild.
+        tile(t.hotspots, t.hotspots === 1 ? "hotspot" : "hotspots", `${levels} · of ${t.files || 0} files with signals`, t.hot ? "crit" : t.warm ? "warn" : null),
         tile(t.edits, "agent edits", `in the last ${S.data.window?.days || S.days} days`),
-        tile(t.commits, "commits", `${t.fixes ? `${t.fixes} of them fixes · ` : ""}from git log, on every branch`),
+        tile(t.commits, t.commits === 1 ? "commit" : "commits", `${t.fixes ? `${t.fixes} of them fixes · ` : ""}from git log, on every branch, each counted once`),
         tile(t.reverts, "reverts", "revert commits and edits put back", "warn"),
-        tile(t.test_fails, "test failures", "right after an edit to the file", "warn"),
+        tile(t.test_fails, "test failures", "after an edit, or of a test file's own tests", "warn"),
         tile(t.steers, "corrections", "your steers, prompts mid-work and permissions you refused", "acc"),
         h("div", { class: "hs-win" },
           h("div", { class: "hs-filters" }, [7, 14, 30].map((d) => h("button", { class: "hs-f" + (S.days === d ? " on" : ""), onclick: () => { S.days = d; S.boards.clear(); fetchList(); } }, `${d} d`))),

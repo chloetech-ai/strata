@@ -167,6 +167,9 @@ struct Signals {
     /// Per file: the evidence, by kind.
     items: BTreeMap<String, Vec<Item>>,
     tests: HashMap<String, TestStat>,
+    /// Every correction of the window (steers, prompts that correct, edits
+    /// refused), put down to a file or not.
+    corrections: HashSet<String>,
     missing: Vec<String>,
 }
 
@@ -185,17 +188,24 @@ struct Totals {
 }
 
 impl Totals {
-    fn of(all: &[Scored]) -> Totals {
+    /// A commit that touched 3 files is one commit, a test failure put
+    /// down to its edit and to its test file one failure: the distinct
+    /// things over every file, and every correction of the window.
+    fn of(all: &[Scored], s: &Signals) -> Totals {
         let sum = |f: &dyn Fn(&Counts) -> i64| all.iter().map(|x| f(&x.counts)).sum::<i64>();
+        let distinct = |kinds: &[&str], commit: bool| -> i64 {
+            all.iter().flat_map(|x| x.items.iter()).filter(|i| kinds.contains(&i.kind) && (!commit || i.link.get("commit").is_some())).map(|i| i.id.as_str()).collect::<HashSet<_>>().len() as i64
+        };
+        let steers = distinct(&["steer", "prompt"], false);
         Totals {
             files: all.len() as i64,
             edits: sum(&|c| c.edits),
-            reverts: sum(&|c| c.reverts),
-            test_fails: sum(&|c| c.test_fails + c.flaky_fails),
-            errors: sum(&|c| c.errors),
-            steers: sum(&|c| c.steers),
-            commits: sum(&|c| c.commits),
-            fixes: sum(&|c| c.fixes),
+            reverts: distinct(&["revert"], false),
+            test_fails: distinct(&["test_fail"], false),
+            errors: distinct(&["error"], false),
+            steers: steers.max(s.corrections.len() as i64),
+            commits: distinct(&["commit", "fix", "revert"], true),
+            fixes: distinct(&["fix"], true),
         }
     }
     fn to_json(self, hotspots: &[Json]) -> Json {
@@ -326,17 +336,28 @@ fn collect(db: &StateDb, repo: &str, since_ms: i64, agents: &HashMap<String, Str
         if let Some(c) = get_str(&r[5]) {
             s.tests.entry(test.clone()).or_default().command.get_or_insert(c);
         }
-        let Some((file, edit_ms)) = edit.filter(|(_, t)| at - t <= NEAR_MS) else { continue };
+        // Put down to the file edited just before, and to the test's own
+        // file: a test file whose tests fail is trouble too.
+        let edit = edit.filter(|(_, t)| at - t <= NEAR_MS && at >= *t);
+        let own = test_file(&test).filter(|f| s.edits.contains_key(*f) || FsPath::new(repo).join(f).is_file()).map(str::to_string);
+        if edit.is_none() && own.is_none() {
+            continue;
+        }
         let mut it = Item::new(id, "test_fail", at, Some(agent), format!("{test} failed"));
-        let mins = (at - edit_ms) / 60_000;
         let err = get_str(&r[6]).map(|e| err_line(&e));
-        it.detail = Some(match err {
-            Some(e) => format!("{e} · {} after the edit", if mins < 1 { "under a minute".into() } else { plural(mins as usize, "min", "min") }),
-            None => format!("{} after the edit", if mins < 1 { "under a minute".into() } else { plural(mins as usize, "min", "min") }),
+        let after = edit.as_ref().map(|(_, edit_ms)| {
+            let mins = (at - edit_ms) / 60_000;
+            format!("{} after the edit", if mins < 1 { "under a minute".into() } else { plural(mins as usize, "min", "min") })
         });
+        it.detail = Some([err, after].into_iter().flatten().collect::<Vec<_>>().join(" · ")).filter(|d| !d.is_empty());
         it.link = json!({ "test": test, "run": get_str(&r[1]) });
         it.key = Some(test);
-        s.add(&file, it);
+        if let Some((file, _)) = &edit {
+            s.add(file, it.clone());
+        }
+        if let Some(o) = own.filter(|o| edit.as_ref().is_none_or(|(f, _)| f != o)) {
+            s.add(&o, it);
+        }
     }
 
     // Runtime errors put down to a file.
@@ -378,6 +399,14 @@ fn collect(db: &StateDb, repo: &str, since_ms: i64, agents: &HashMap<String, Str
                 .collect()
         }
     };
+    // The edit of `agent` after `at`, within NEAR_MS: what a correction
+    // typed before the agent touched anything led to.
+    let after = |agent: &str, at: i64| -> Option<String> {
+        let v = edits_of.get(agent)?;
+        let i = v.partition_point(|(t, _)| *t < at);
+        let (t, f) = v.get(i)?;
+        (t - at <= NEAR_MS).then(|| f.clone())
+    };
     let mut ev: Vec<_> = ev.into_iter().filter(|(r, _)| get_str(&r[1]).is_some_and(|a| agents.contains_key(&a))).collect();
     // Steers first: a steer typed to an idle agent is its prompt too.
     ev.sort_by_key(|(r, _)| (get_str(&r[2]).as_deref() != Some("steer"), get_ms(&r[3]).unwrap_or(0)));
@@ -394,7 +423,10 @@ fn collect(db: &StateDb, repo: &str, since_ms: i64, agents: &HashMap<String, Str
         } else if steer_texts.contains(&text) || !corrects(&text) {
             continue;
         }
-        let Some((file, _)) = edit.filter(|(_, t)| at - t <= NEAR_MS && at >= *t) else { continue };
+        let cid = if kind == "steer" { d["id"].as_str().map(str::to_string).unwrap_or_else(|| id.clone()) } else { id.clone() };
+        s.corrections.insert(cid);
+        let file = edit.filter(|(_, t)| at - t <= NEAR_MS && at >= *t).map(|(f, _)| f).or_else(|| known_file_in(&text, repo, &s)).or_else(|| after(&agent, at));
+        let Some(file) = file else { continue };
         let name = agents.get(&agent).cloned().unwrap_or_else(|| agent.clone());
         let mut it = Item::new(if kind == "steer" { d["id"].as_str().map(str::to_string).unwrap_or(id) } else { id }, if kind == "steer" { "steer" } else { "prompt" }, at, None, one_line(&text, 300));
         it.detail = Some(format!("you, to {name}{}", if kind == "steer" { "" } else { " (typed in its terminal)" }));
@@ -413,6 +445,7 @@ fn collect(db: &StateDb, repo: &str, since_ms: i64, agents: &HashMap<String, Str
             continue;
         }
         let words = format!("{} {}", get_str(&r[2]).unwrap_or_default(), get_str(&r[3]).unwrap_or_default());
+        s.corrections.insert(id.clone());
         let Some(file) = known_file_in(&words, repo, &s) else { continue };
         let at = get_ms(&r[5]).unwrap_or(0);
         let name = agents.get(&agent).cloned().unwrap_or_else(|| agent.clone());
@@ -462,10 +495,27 @@ fn collect(db: &StateDb, repo: &str, since_ms: i64, agents: &HashMap<String, Str
         }
     }
 
-    // Incidents naming a file.
+    // Incidents naming a file, or a test of a file (their firings').
+    let mut test_files: HashMap<String, Vec<String>> = HashMap::new();
+    for r in db.query("SELECT incident, entity, detail FROM alert_firings WHERE repo = :repo AND last_seen >= :since LIMIT 100000", &p).unwrap_or_default() {
+        let Some(i) = get_str(&r[0]) else { continue };
+        for t in [get_str(&r[1]), get_str(&r[2])].into_iter().flatten() {
+            if let Some(f) = test_file(&t).filter(|f| s.edits.contains_key(*f) || FsPath::new(repo).join(f).is_file()) {
+                let v = test_files.entry(i.clone()).or_default();
+                if !v.iter().any(|x| x == f) {
+                    v.push(f.to_string());
+                }
+            }
+        }
+    }
     for r in db.query("SELECT id, title, files, started, agents FROM incidents WHERE repo = :repo AND updated >= :since LIMIT 10000", &p).unwrap_or_default() {
         let Some(id) = get_str(&r[0]) else { continue };
-        let files: Vec<String> = get_str(&r[2]).and_then(|f| serde_json::from_str(&f).ok()).unwrap_or_default();
+        let mut files: Vec<String> = get_str(&r[2]).and_then(|f| serde_json::from_str(&f).ok()).unwrap_or_default();
+        for f in test_files.remove(&id).unwrap_or_default() {
+            if !files.contains(&f) {
+                files.push(f);
+            }
+        }
         let first_agent: Option<String> = get_str(&r[4]).and_then(|a| serde_json::from_str::<Vec<String>>(&a).ok()).and_then(|a| a.into_iter().next());
         for f in files {
             let mut it = Item::new(id.clone(), "incident", get_ms(&r[3]).unwrap_or(0), first_agent.clone(), one_line(&get_str(&r[1]).unwrap_or_default(), 200));
@@ -531,6 +581,15 @@ fn known_file_in(text: &str, repo: &str, s: &Signals) -> Option<String> {
         .filter(|w| w.contains('.') && !w.starts_with('-'))
         .map(|w| w.strip_prefix(&prefix).unwrap_or(w).trim_start_matches("./").to_string())
         .find(|w| !w.starts_with('/') && FsPath::new(repo).join(w).is_file())
+}
+
+/// The file of a test named as its runner names it: `tests/test_x.py` of
+/// `tests/test_x.py::test_y` (pytest, and the junit reports that name a
+/// file), `None` for a name without one (`module::tests::name`).
+fn test_file(test: &str) -> Option<&str> {
+    let (f, _) = test.split_once("::")?;
+    let ext = f.rsplit_once('.').map(|(_, e)| e)?;
+    (!f.is_empty() && !f.contains(char::is_whitespace) && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric())).then_some(f)
 }
 
 /// Words with which a commit's subject says it fixes something.
@@ -738,14 +797,18 @@ fn reasons(x: &Scored, names: &HashMap<String, String>) -> Vec<Json> {
     };
     push("reverts", c.reverts, rtext, ids(&["revert"]));
     let hard: Vec<&(String, TestStat, i64)> = x.tests.iter().filter(|t| !t.1.flaky).collect();
+    let own = |t: &str| test_file(t) == Some(x.file.as_str());
     let ttext = match hard.as_slice() {
+        [one] if own(&one.0) => format!("{} failed {}", one.0, times(one.2 as usize)),
         [one] => format!("{} failed {} after edits here", one.0, times(one.2 as usize)),
+        many if many.iter().all(|t| own(&t.0)) => format!("{} failures of its tests, most {}", c.test_fails, many.first().map(|t| t.0.as_str()).unwrap_or("")),
         _ => format!("{} test failures after edits here{}", c.test_fails, hard.first().map(|t| format!(", most {}", t.0)).unwrap_or_default()),
     };
     push("test_fails", c.test_fails, ttext, ids(&["test_fail"]));
     let fl: Vec<&(String, TestStat, i64)> = x.tests.iter().filter(|t| t.1.flaky).collect();
     let ftext = match fl.as_slice() {
         [one] => format!("{} is flaky", one.0),
+        many if many.iter().all(|t| own(&t.0)) => format!("{} of its tests are flaky", many.len()),
         _ => format!("{} flaky tests fail after edits here", fl.len()),
     };
     push("flaky", c.flaky, ftext, ids(&["test_fail"]));
@@ -1080,7 +1143,7 @@ pub fn make(sup: &Supervisor, repo: &str, since_ms: i64) -> Made {
     let mut hotspots = Vec::new();
     let mut evidence = HashMap::new();
     let all = score_files(&s);
-    let totals = Totals::of(&all);
+    let totals = Totals::of(&all, &s);
     for x in all.into_iter().filter(|x| x.counts.score() >= MIN_SCORE) {
         let id = id_of(repo, &x.file);
         let syms = symbol_edits(sup, repo, &x.file, since_ms, x.per_agent.first().map(|a| a.0.as_str()));
@@ -1598,7 +1661,7 @@ mod tests {
         let scored = score_files(&s);
         // The header's totals are the sums of the files' own counts: no
         // "2 test failures after an edit" beside "0 edits".
-        let t = Totals::of(&scored);
+        let t = Totals::of(&scored, &s);
         assert_eq!(t.edits, 8);
         assert_eq!(t.test_fails, s.items.values().flatten().filter(|i| i.kind == "test_fail").count() as i64);
         assert_eq!(t.files, scored.len() as i64);
@@ -1622,6 +1685,65 @@ mod tests {
         assert_eq!(s.churn["src/totals.rs"].values().sum::<i64>(), 7);
         let summ = summary(top, Some("round_line_total"), &rs, &[], &names);
         assert!(summ.starts_with("agents re-edited round_line_total 5 times in 30 min (cart 5, checkout 2)"), "{summ}");
+        db.close();
+    }
+
+    #[test]
+    fn a_test_file_whose_tests_fail_is_ranked_and_totals_count_things_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("shop");
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("tests/test_coupons.py"), "def test_promo_window():\n    pass\n").unwrap();
+        let repo = repo.to_string_lossy().to_string();
+        let db = StateDb::open(&dir.path().join("db")).unwrap();
+        let t0 = now_ms() - 3_600_000;
+        let m = 60_000;
+        let test = "tests/test_coupons.py::test_promo_window";
+        // No agent edited anything: it ran the tests, failing and passing
+        // on one commit (flaky), and was steered.
+        for (i, (outcome, at)) in [("failed", 1), ("passed", 2), ("failed", 3), ("passed", 4)].iter().enumerate() {
+            let p = Params::new()
+                .set("id", Value::Str(format!("r{i}")))
+                .set("run", Value::Str(format!("t{i}")))
+                .set("repo", Value::Str(repo.clone()))
+                .set("agent", Value::Str("a1".into()))
+                .set("commit", Value::Str("c1".into()))
+                .set("tree", Value::Str("clean".into()))
+                .set("command", Value::Str("python3 -m pytest".into()))
+                .set("test", Value::Str(test.into()))
+                .set("outcome", Value::Str((*outcome).into()))
+                .set("ts", ts(t0 + at * m));
+            put(&db, "INSERT INTO test_runs (id, run, repo, agent, \"commit\", tree, command, test, outcome, ts) VALUES (:id, :run, :repo, :agent, :commit, :tree, :command, :test, :outcome, :ts)", p);
+        }
+        let p = Params::new().set("id", Value::Str("v1".into())).set("seq", Value::Int(1)).set("ts", ts(t0 + 5 * m)).set("agent", Value::Str("a1".into())).set("kind", Value::Str("steer".into())).set("data", Value::Str(json!({ "id": "s1", "text": "Keep it simple: just run the tests." }).to_string()));
+        put(&db, "INSERT INTO events (id, seq, ts, agent, kind, data) VALUES (:id, :seq, :ts, :agent, :kind, :data)", p);
+        // An alert fired on the test, in an incident naming no file.
+        let p = Params::new().set("id", Value::Str("f1".into())).set("rule", Value::Str("mine".into())).set("repo", Value::Str(repo.clone())).set("entity", Value::Str(test.into())).set("incident", Value::Str("i1".into())).set("last_seen", ts(t0 + 4 * m));
+        put(&db, "INSERT INTO alert_firings (id, rule, repo, entity, incident, last_seen) VALUES (:id, :rule, :repo, :entity, :incident, :last_seen)", p);
+        let p = Params::new().set("id", Value::Str("i1".into())).set("repo", Value::Str(repo.clone())).set("title", Value::Str("test failing twice".into())).set("files", Value::Str("[]".into())).set("agents", Value::Str("[]".into())).set("started", ts(t0 + 3 * m)).set("updated", ts(t0 + 4 * m));
+        put(&db, "INSERT INTO incidents (id, repo, title, files, agents, started, updated) VALUES (:id, :repo, :title, :files, :agents, :started, :updated)", p);
+        let names: HashMap<String, String> = [("a1".to_string(), "flake-hunt".to_string())].into();
+        let mut s = collect(&db, &repo, t0 - m, &names);
+        // One commit that touched three files is one commit.
+        for f in ["money.py", "tests/test_money.py", "README.md"] {
+            let mut it = Item::new("9f098a11".into(), "fix", t0, None, "fix rounding".into());
+            it.link = json!({ "commit": "9f098a11aa" });
+            s.add(f, it);
+        }
+        let scored = score_files(&s);
+        let t = Totals::of(&scored, &s);
+        assert_eq!((t.commits, t.fixes), (1, 1));
+        // The steer counts though the agent had edited nothing.
+        assert_eq!(t.steers, 1);
+        assert_eq!(t.test_fails, 2);
+        let x = scored.iter().find(|x| x.file == "tests/test_coupons.py").expect("the test file is scored");
+        assert_eq!((x.counts.flaky, x.counts.incidents), (1, 1), "{:?}", x.items.iter().map(|i| i.kind).collect::<Vec<_>>());
+        assert!(x.counts.score() >= MIN_SCORE, "{}", x.counts.score());
+        let rs = reasons(x, &names);
+        assert!(rs.iter().any(|r| r["kind"] == "flaky" && r["text"] == format!("{test} is flaky")), "{rs:?}");
+        assert_eq!(test_file(test), Some("tests/test_coupons.py"));
+        assert_eq!(test_file("totals::coupon"), None);
+        assert_eq!(test_file("tests::it works"), None);
         db.close();
     }
 
