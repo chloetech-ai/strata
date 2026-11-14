@@ -41,7 +41,7 @@ chloedb-server ... --app netops=http://netops-host:7840   # with CHLOEDB_APP_TOK
 
 The key needs admin scope on the tables `netops_*` (a key [limited to tables](server.md#security), `netops_*=admin`, is enough: the app touches no other table). `--token` (or `CHLOEDB_NETOPS_TOKEN`) is the bearer token its API requires; the server sends its `CHLOEDB_APP_TOKEN` ([apps](server.md#apps)). Requests that carry an `Origin` header are refused, so a page on another site cannot reach the app even from inside the network.
 
-On a coordinator over shards the graph steps (`REACHABLE`, `ppr`, `PATH`), which a coordinator does not answer yet, are walked by the app over the same links table; every page says which of the two it used.
+On a coordinator over shards the graph steps (`REACHABLE`, `ppr`, `PATH`), which a coordinator does not answer yet, are walked by the app over the same links table; every page says which of the two it used. The app knows a coordinator from its `/v1/health`, or from the first graph statement it refuses, and then sends it none.
 
 `--no-simulate` turns the simulator off: the app reads its network from the inventory tables and writes no telemetry of its own ([your own network](#your-own-network)).
 
@@ -157,7 +157,7 @@ A sentence becomes a plan, and only a plan becomes SQL: every value in it is one
 
 Measured on one server in a 4-vCPU cloud container, with 170,337 objects, 173,133 links and about 470,000 events: the estate is written in about 25 seconds; a window is read in 10 to 75 ms depending on how much is in it; the eight queries behind one object take about 17 ms together; the statement above takes 5 to 10 ms, a walk of the 20,000 objects behind one aggregation router with a condition 22 to 30 ms, and "not changed in the last month" about 290 ms.
 
-On a cluster of shards the range queries, the grouping and the subquery run through the coordinator as they are. A coordinator does not walk graphs yet, so the walks are done by the app over the estate it made, and the page says so.
+On a cluster of shards the range queries, the grouping and the subquery run through the coordinator as they are. A coordinator does not walk graphs yet, so the walks are done by the app over the estate it made, and the page says so. The rows a walk reached are then read by key, at most 400 keys a statement, when there are up to 1,600 of them; a larger walk is read as plain queries over the hubs, metros or regions that hold it, 10,000 rows a page, and the app keeps the rows its walk reached. A search counts its matches by place in the app and reads its first 300 in full by key, so no statement names thousands of keys.
 
 ## Where is it broken
 
