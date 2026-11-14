@@ -270,7 +270,7 @@ pub fn defaults() -> Vec<Rule> {
         (rule("disk-critical", "Disk nearly full", "disk_used_ratio", ">", 0.97, "mean", 120, 0, "critical", c, "Under 3% of the copy's disk is left: writes fail when it is full. Free space or move slots off the copy now."), 0.95),
         (rule("disk-filling", "Disk full within 12 hours", "disk_hours_to_full", "<", 12.0, "mean", 1800, 0, "warning", c, "At the rate the copy's disk filled over the last 30 minutes, it is full in under 12 hours."), 24.0),
         (rule("p99", "", "p99_ms", ">", 0.0, "mean", 300, 0, "warning", s, ""), 0.0),
-        (rule("p99-jump", "Query p99 doubled", "p99_ms", ">", 2.0, "mean", 300, 0, "warning", s, "The p99 of the last 5 minutes is over twice the p99 of the 5 minutes before, and over 20 ms: a p99 under 20 ms is not judged."), 1.5),
+        (rule("p99-jump", "Query p99 doubled", "p99_ms", ">", 2.0, "mean", 300, 0, "warning", s, "The p99 of the last 5 minutes is over twice the p99 of the 5 minutes before, and over half the p99 objective (--slo-p99-ms), 20 ms at least: a lower p99 is not judged."), 1.5),
         (rule("errors", "", "error_ratio", ">", 0.0, "mean", 300, 0, "warning", s, ""), 0.0),
         (rule("key-failing", "A client's calls fail", "key_error_ratio", ">", 0.2, "mean", 300, 0, "warning", s, "Over 20% of one key's calls failed in 5 minutes (its own errors included: bad SQL, its own deadline), for a key with 30 calls or more. Tell the key's owner."), 0.1),
         (rule("key-flood", "A client crowds out the others", "key_busy_ratio", ">", 1.0, "mean", 60, 0, "warning", s, "Over a minute, one key's queries took over half of this server's query time, and ran more at once than the server has cores, while other keys queried too: their queries wait. Queries, Running now, grouped by key, shows its queries; Contain a key limits it. Tell the key's owner."), 0.5),
@@ -1114,6 +1114,12 @@ impl Alerts {
     /// server's service level objective ([`follow`]): the built-in one,
     /// and the default ones as long as nobody changed their threshold
     /// (the defaults before they followed it, 5% and 1 s, included).
+    /// The p99 objective the rules follow ([`Alerts::follow_slo`]), else
+    /// the default one.
+    fn slo_p99_ms(&self) -> f64 {
+        lock(&self.slo).map_or(crate::service::Slo::default().p99_ms, |(_, p)| p)
+    }
+
     pub fn follow_slo(&self, error_ratio: f64, p99_ms: f64) {
         let slo = crate::service::Slo::default();
         let stock = |r: &Rule| match r.id.as_str() {
@@ -1414,6 +1420,7 @@ impl Alerts {
     /// `key_error_ratio` and `key_busy_ratio`.
     pub fn check_with(&self, points: &[Arc<Json>], t: u64, keys: &dyn Fn(u64, u64) -> Vec<KeyCalls>) -> Vec<Arc<Event>> {
         let rules = self.rules();
+        let slo_p99_ms = self.slo_p99_ms();
         let routes = self.routes();
         let mut changes = Vec::new();
         {
@@ -1438,7 +1445,7 @@ impl Alerts {
                     }
                     (v, None)
                 } else {
-                    window_of(r, points, t)
+                    window_of(r, points, t, slo_p99_ms)
                 };
                 // A server that took the role within the window (a primary
                 // elected a moment ago, whose old primary is still starting
@@ -2777,7 +2784,7 @@ impl Alerts {
         for (i, p) in points.iter().enumerate() {
             let t = p["t"].as_u64().unwrap_or(0);
             // The points up to this one.
-            let v = window_value(r, &points[..=i], t);
+            let v = window_value(r, &points[..=i], t, self.slo_p99_ms());
             out.push(json!({"t": t, "value": p[&r.metric], "window": v, "state": st.state}));
             match st.step(r, v, t) {
                 Some("firing") => open = Some(t),
@@ -2816,8 +2823,8 @@ fn answers(r: &Json) -> bool {
 /// window has the metric. While the series spans less than the window (a
 /// server just started), over the points there are. The mean of
 /// `error_ratio` and `availability` weighs each point by its queries.
-pub fn window_value(r: &Rule, points: &[Arc<Json>], t: u64) -> Option<f64> {
-    window_of(r, points, t).0
+pub fn window_value(r: &Rule, points: &[Arc<Json>], t: u64, slo_p99_ms: f64) -> Option<f64> {
+    window_of(r, points, t, slo_p99_ms).0
 }
 
 /// How long a series must span before a window it does not cover yet is
@@ -2930,6 +2937,18 @@ const STUCK_S: f64 = 86_400.0;
 /// "p99 rose" asks for over 20 ms too. A copy's p99 that goes from 1 ms to
 /// 2 ms doubled, and nobody waits for it (LIV-3).
 pub const JUMP_MIN_MS: f64 = 20.0;
+
+/// The latency under which a rule `vs: "before"` over `metric` judges a
+/// window unchanged: [`JUMP_MIN_MS`], and for the query p99 half its
+/// service level objective (`--slo-p99-ms`) too. A p99 that went from 26
+/// ms to 54 ms at 4 queries a second doubled, against an objective of 250
+/// ms, and nobody is to be paged for it (CCW-19).
+pub fn jump_floor(metric: &str, slo_p99_ms: f64) -> f64 {
+    match metric {
+        "p99_ms" => JUMP_MIN_MS.max(slo_p99_ms / 2.0),
+        _ => JUMP_MIN_MS,
+    }
+}
 /// The fewest requests (or queries) of a window whose share that failed
 /// (`http_5xx_ratio`, `error_ratio`, `availability`) is judged, unless
 /// [`RATIO_MIN_FAILED`] of them failed: below both, the window counts as
@@ -3026,7 +3045,7 @@ pub fn value_of(p: &Json, metric: &str) -> Option<f64> {
 /// less than the window; no value while it spans less than
 /// [`PARTIAL_MIN_MS`]. A rule `vs: "before"` takes the window's value over
 /// the one of the window before it (both whole).
-fn window_of(r: &Rule, points: &[Arc<Json>], t: u64) -> (Option<f64>, Option<u64>) {
+fn window_of(r: &Rule, points: &[Arc<Json>], t: u64, slo_p99_ms: f64) -> (Option<f64>, Option<u64>) {
     if r.vs == "before" {
         let w = r.window_s * 1000;
         let (now, partial) = window_own(r, points, t);
@@ -3034,8 +3053,8 @@ fn window_of(r: &Rule, points: &[Arc<Json>], t: u64) -> (Option<f64>, Option<u64
         if partial.is_some() || partial_before.is_some() {
             return (None, partial);
         }
-        // A latency under JUMP_MIN_MS now has not risen that matters.
-        let floor = r.metric.ends_with("_ms") && now.is_some_and(|n| n < JUMP_MIN_MS);
+        // A latency under the floor now has not risen that matters.
+        let floor = r.metric.ends_with("_ms") && now.is_some_and(|n| n < jump_floor(&r.metric, slo_p99_ms));
         return (now.zip(before.filter(|b| *b > 0.0)).map(|(n, b)| if floor { (n / b).min(1.0) } else { n / b }), None);
     }
     window_own(r, points, t)
@@ -4726,8 +4745,20 @@ mod tests {
         // The p99 from 1 ms to 2.1 ms: under 20 ms, unchanged.
         let s = one(d("p99-jump"), &at(&|i| json!({"p99_ms": if i > 150 { 2.1 } else { 1.0 }})));
         assert_eq!((s["state"].as_str(), s["value"].as_f64()), (Some("ok"), Some(1.0)), "{s}");
-        // From 15 ms to 45 ms: tripled, and over 20 ms.
+        // From 15 ms to 45 ms: tripled, and over 20 ms, but under half
+        // the objective of 250 ms (CCW-19); as the live cluster's 26 ms to
+        // 54 ms. Against an objective of 50 ms it is judged.
         let s = one(d("p99-jump"), &at(&|i| json!({"p99_ms": if i > 150 { 45.0 } else { 15.0 }})));
+        assert_eq!((s["state"].as_str(), s["value"].as_f64()), (Some("ok"), Some(1.0)), "{s}");
+        let s = one(d("p99-jump"), &at(&|i| json!({"p99_ms": if i > 150 { 54.0 } else { 26.0 }})));
+        assert_eq!(s["state"], "ok", "{s}");
+        let a = Alerts::new(None, None).unwrap();
+        a.set_rules(vec![d("p99-jump")], "t").unwrap();
+        a.follow_slo(0.01, 50.0);
+        a.check(&at(&|i| json!({"p99_ms": if i > 150 { 45.0 } else { 15.0 }})), t);
+        assert_eq!(a.one("p99-jump").unwrap()["state"], "firing");
+        // From 50 ms to 150 ms: tripled, and over half the objective.
+        let s = one(d("p99-jump"), &at(&|i| json!({"p99_ms": if i > 150 { 150.0 } else { 50.0 }})));
         assert_eq!(s["state"], "firing", "{s}");
         // One 5xx of 45 requests in 5 minutes: not judged.
         let s = one(d("5xx"), &at(&|i| json!({"http_s": 0.15, "http_5xx_s": if i == 200 { 0.5 } else { 0.0 }, "secs": 2.0})));
