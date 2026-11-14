@@ -22,6 +22,9 @@ export const MAX_FILE = 15 * 1024 * 1024;
 const EMAIL_RE = /^[^\s@<>()",;]+@[^\s@<>()",;]+\.[^\s@<>()",;]+$/;
 const err = (message, status = 400) => Object.assign(new Error(message), { status });
 
+// A membership not taken yet: role invited:<the role offered>.
+const INVITED = /^invited:(admin|member)$/;
+
 export class Services {
   constructor(engine, { filesDir, log = () => {}, smtpUrl = process.env.SMTP_URL, smtpFrom = process.env.SMTP_FROM, geocoder = process.env.STRATA_APPS_GEOCODER } = {}) {
     this.engine = engine;
@@ -170,19 +173,28 @@ export class Services {
   // person in some with a role there (admin or member). Rows scoped by
   // :company_id (access.mjs) are the company's the person works in now.
 
-  async companies(appId, personId) {
+  // The companies a person works in, and (invited: true, with invited the
+  // role they would have) the ones that asked them to join and they have not
+  // joined yet.
+  async companies(appId, personId, { invited = true } = {}) {
     if (!personId) return [];
     const ms = await this.db.query('SELECT company, role, created FROM sa_memberships WHERE app = :a AND person = :p ORDER BY created LIMIT 200', { a: appId, p: personId });
     if (!ms.length) return [];
     const rows = await this.db.get('sa_companies', ms.map((m) => m.company));
-    return ms.map((m, i) => (rows[i] ? { id: rows[i].id, name: rows[i].name, role: m.role } : null)).filter(Boolean);
+    return ms.map((m, i) => {
+      if (!rows[i]) return null;
+      const asked = INVITED.exec(String(m.role || ''));
+      if (asked && !invited) return null;
+      return asked ? { id: rows[i].id, name: rows[i].name, role: null, invited: asked[1] } : { id: rows[i].id, name: rows[i].name, role: m.role };
+    }).filter(Boolean);
   }
 
   // The company a person works in now: the one asked for (x-sa-company)
-  // when they belong to it, else their first; null when they have none.
+  // when they belong to it, else their first; null when they have none. A
+  // company they are only invited to is never it.
   async companyOf(appId, personId, wanted) {
     if (!personId) return null;
-    const list = await this.companies(appId, personId);
+    const list = await this.companies(appId, personId, { invited: false });
     return (wanted && list.find((c) => c.id === String(wanted))?.id) || list[0]?.id || null;
   }
 
@@ -200,14 +212,20 @@ export class Services {
     return { id, name: n, role: 'admin' };
   }
 
+  // A person's role in a company: admin or member; null when they are not
+  // in it (an invitation they have not taken is no role).
   async companyRole(appId, companyId, personId) {
     if (!personId || !companyId) return null;
     const [m] = await this.db.get('sa_memberships', [`${appId}#${companyId}#${personId}`]);
-    return m ? m.role : null;
+    return m && !INVITED.test(String(m.role || '')) ? m.role : null;
   }
 
-  // Someone with an account joins a company of the app, added by one of its
-  // admins (or the studio, by = null).
+  // Someone with an account is added to a company of the app by one of its
+  // admins (by), or by the studio (by = null). The studio adds them at once.
+  // An admin on the app's page invites them: the company is theirs only
+  // once they join it themselves (joinCompany), so nobody is put in a
+  // company, and has the rows they write land in it, without saying so
+  // (audit 4, X-G3). An admin changes the role of someone already in it.
   async addToCompany(appId, companyId, by, { email, role = 'member' } = {}) {
     const [c] = await this.db.get('sa_companies', [String(companyId || '')]);
     if (!c || c.app !== appId) throw err('no such company', 404);
@@ -215,9 +233,28 @@ export class Services {
     if (!['admin', 'member'].includes(role)) throw err('role is admin or member');
     const p = await this.personByEmail(email || '');
     if (!p) throw err('Nobody has an account with that email: ask them to sign up first', 404);
-    await this.join(appId, p.id, { pub: true });
-    await this.db.write([{ op: 'upsert', table: 'sa_memberships', doc: { id: `${appId}#${c.id}#${p.id}`, app: appId, company: c.id, person: p.id, role } }]);
+    const id = `${appId}#${c.id}#${p.id}`;
+    const [had] = await this.db.get('sa_memberships', [id]);
+    const already = had && !INVITED.test(String(had.role || ''));
+    if (by && !already) {
+      await this.db.write([{ op: 'upsert', table: 'sa_memberships', doc: { id, app: appId, company: c.id, person: p.id, role: `invited:${role}` } }]);
+      return { company: c.id, person: p.id, name: personName(p), role: null, invited: role };
+    }
+    if (!by) await this.join(appId, p.id, { pub: true });
+    await this.db.write([{ op: 'upsert', table: 'sa_memberships', doc: { id, app: appId, company: c.id, person: p.id, role } }]);
     return { company: c.id, person: p.id, name: personName(p), role };
+  }
+
+  // A person joins a company that invited them, with the role it offered.
+  async joinCompany(appId, companyId, personId) {
+    if (!personId) throw err('Sign in first: a company is joined by someone signed in', 401);
+    const id = `${appId}#${String(companyId || '')}#${personId}`;
+    const [m] = await this.db.get('sa_memberships', [id]);
+    const asked = m && INVITED.exec(String(m.role || ''));
+    if (!m) throw err('This company has not invited you', 404);
+    if (!asked) return { company: m.company, role: m.role };
+    await this.db.write([{ op: 'upsert', table: 'sa_memberships', doc: { ...m, role: asked[1] } }]);
+    return { company: m.company, role: asked[1] };
   }
 
   async removeFromCompany(appId, companyId, by, personId) {
@@ -259,12 +296,23 @@ export class Services {
 
   // ---- email
 
-  async email(appId, msg = {}, by = null) {
+  // sender: the app's person on the public path (a published app's visitor
+  // or member, {role, user}) whose action sends it, directly or through a
+  // function or trigger; none for the studio and the app's schedules. Such a
+  // person, unless the app's admin or owner, writes only to the app's own
+  // people (its members, with the email they signed up with): the engine's
+  // mail identity is not for strangers to write to anyone (audit 4, X-G5).
+  async email(appId, msg = {}, by = null, { sender = null } = {}) {
     const to = [].concat(msg.to || []).flatMap((x) => String(x).split(',')).map((x) => x.trim().toLowerCase()).filter(Boolean);
     if (!to.length) throw err('email: say who it goes to (to)');
     if (to.length > 10) throw err('email: at most 10 recipients');
     const bad = to.find((x) => !EMAIL_RE.test(x));
     if (bad) throw err(`email: ${bad} is not an email address`);
+    if (sender && !['admin', 'owner'].includes(sender.role)) {
+      const ours = new Set((await this.people(appId)).map((p) => String(p.email || '').toLowerCase()).filter(Boolean));
+      const out = to.filter((x) => !ours.has(x));
+      if (out.length) throw Object.assign(err(`email: this app writes only to its own people; ${out.length === 1 ? `${out[0]} is not one of them` : `${out.join(', ')} are not among them`}`, 403), { refused: 'access' });
+    }
     const subject = String(msg.subject || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 200);
     const body = String(msg.text ?? msg.body ?? '').slice(0, 20000);
     if (!subject && !body) throw err('email: give it a subject or a text');
