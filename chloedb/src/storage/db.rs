@@ -423,6 +423,11 @@ pub struct Database {
     /// it ([`Database::try_writer`]).
     background_waiting: AtomicUsize,
     background_holding: AtomicUsize,
+    /// Extents written in the one file zero the rest of their last page
+    /// ([`Database::set_zero_page_tails`]); `zeroing` counts calls of
+    /// [`Database::zero_free_pages`] running, which do too.
+    zero_tails: AtomicBool,
+    zeroing: AtomicUsize,
     /// Told the term and number of each numbered transaction once it is
     /// committed ([`Database::on_commit`]).
     commit_hook: RwLock<Option<CommitHook>>,
@@ -620,7 +625,9 @@ impl std::io::Write for ImageOut<'_> {
 /// may be reused, and what an older extent left past the new one's end
 /// (a forgotten record's segment, under a manifest written there) would
 /// otherwise stay in the file ([`Database::zero_free_pages`]). Nothing
-/// reads those bytes.
+/// reads those bytes. Only when [`Database::set_zero_page_tails`] is on,
+/// or while `zero_free_pages` runs: otherwise the file's bytes are what
+/// they were (the format fixtures compare them byte for byte).
 fn zero_page_tail(file: &File, end: u64) -> std::io::Result<()> {
     let tail = (PAGE - end % PAGE) % PAGE;
     if tail == 0 {
@@ -1144,6 +1151,8 @@ impl Database {
             flusher: Mutex::new(None),
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
+            zero_tails: AtomicBool::new(false),
+            zeroing: AtomicUsize::new(0),
             commit_hook: RwLock::new(None),
             feeds: RwLock::new(Arc::new(Vec::new())),
             codebooks: RwLock::new(Vec::new()),
@@ -1508,6 +1517,8 @@ impl Database {
             flusher: Mutex::new(None),
             background_waiting: AtomicUsize::new(0),
             background_holding: AtomicUsize::new(0),
+            zero_tails: AtomicBool::new(false),
+            zeroing: AtomicUsize::new(0),
             commit_hook: RwLock::new(None),
             feeds: RwLock::new(Arc::new(Vec::new())),
             codebooks: RwLock::new(Vec::new()),
@@ -3641,7 +3652,7 @@ impl Database {
             let mut out = ImageOut { file: f, at: base, buf: Vec::with_capacity(IMAGE_CHUNK), pacer, crc: crc32fast::Hasher::new() };
             sections.write_to(&mut out)?;
             out.drain()?;
-            if self.dir.is_none() {
+            if self.dir.is_none() && self.zeroes_tails() {
                 zero_page_tail(f, out.at)?;
             }
             match self.dir {
@@ -3938,6 +3949,20 @@ impl Database {
         Ok(before.saturating_sub(lock(&self.state).meta.page_count) * PAGE)
     }
 
+    /// Makes every extent written in the database's one file write zeros
+    /// over the rest of its last page (off by default): a page freed by a
+    /// rewrite and reused by a smaller extent (a manifest) keeps no bytes
+    /// of what it held. A store that forgets what it held turns it on
+    /// ([`Database::zero_free_pages`] turns it on while it runs). Costs a
+    /// write of at most a page per extent; nothing in the format changes.
+    pub fn set_zero_page_tails(&self, on: bool) {
+        self.zero_tails.store(on, Ordering::Release);
+    }
+
+    fn zeroes_tails(&self) -> bool {
+        self.zero_tails.load(Ordering::Acquire) || self.zeroing.load(Ordering::Acquire) > 0
+    }
+
     /// Writes zeros over the file's free pages, so that what deleted rows
     /// and rewritten segments left there cannot be read back from the
     /// file (a forget of a secret: [`Database::merge_only`] rewrites the
@@ -3951,6 +3976,14 @@ impl Database {
     /// A database in directory layout frees a segment by removing its
     /// file: nothing to do. The file's length is unchanged.
     pub fn zero_free_pages(&self) -> Result<FreeZeroed> {
+        struct On<'a>(&'a AtomicUsize);
+        impl Drop for On<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.zeroing.fetch_add(1, Ordering::AcqRel);
+        let _on = On(&self.zeroing);
         let mut wal = self.try_writer()?;
         self.check_poisoned()?;
         if self.dir.is_some() {
@@ -5753,7 +5786,9 @@ impl<'a> VersionWriter<'a> {
         let page = self.fl.alloc(pages_for(bytes.len()));
         self.grow()?;
         io::write_at(&self.db.file, bytes, page * PAGE)?;
-        zero_page_tail(&self.db.file, page * PAGE + bytes.len() as u64)?;
+        if self.db.zeroes_tails() {
+            zero_page_tail(&self.db.file, page * PAGE + bytes.len() as u64)?;
+        }
         self.bytes_written += bytes.len() as u64;
         Ok(Extent { page, len: bytes.len() as u64 })
     }
@@ -5927,7 +5962,9 @@ impl<'a> VersionWriter<'a> {
         // a mapping of the same file can deadlock in the kernel.
         let bytes = map[e.range()].to_vec();
         io::write_at(&self.db.file, &bytes, page * PAGE)?;
-        zero_page_tail(&self.db.file, page * PAGE + bytes.len() as u64)?;
+        if self.db.zeroes_tails() {
+            zero_page_tail(&self.db.file, page * PAGE + bytes.len() as u64)?;
+        }
         self.bytes_written += e.len;
         self.fl.defer(self.txn, e);
         let to = Extent { page, len: e.len };
@@ -6075,7 +6112,9 @@ impl<'a> VersionWriter<'a> {
             let page = self.fl.alloc_low(pages_for(mbytes.len()));
             self.grow()?;
             io::write_at(&db.file, &mbytes, page * PAGE)?;
-            zero_page_tail(&db.file, page * PAGE + mbytes.len() as u64)?;
+            if db.zeroes_tails() {
+                zero_page_tail(&db.file, page * PAGE + mbytes.len() as u64)?;
+            }
             self.bytes_written += mbytes.len() as u64;
             Extent { page, len: mbytes.len() as u64 }
         } else {
@@ -6085,7 +6124,9 @@ impl<'a> VersionWriter<'a> {
         let (freelist, fbytes) = place_freelist(&mut self.fl, &reserved, self.meta_low);
         self.grow()?;
         io::write_at(&db.file, &fbytes, freelist.page * PAGE)?;
-        zero_page_tail(&db.file, freelist.page * PAGE + fbytes.len() as u64)?;
+        if db.zeroes_tails() {
+            zero_page_tail(&db.file, freelist.page * PAGE + fbytes.len() as u64)?;
+        }
         self.bytes_written += fbytes.len() as u64;
         // A failed sync of the file is fatal for the handle: the kernel may
         // have dropped dirty pages of any writer on it (a merge's image

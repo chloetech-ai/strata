@@ -231,6 +231,11 @@ impl Daemon {
         let cfg = Config::load(&paths.config);
         let embedder: Arc<dyn embed::Embedder> = Arc::from(embed::open(&cfg.embedder)?);
         let store = Arc::new(Store::open(&paths.db, embedder, StoreOptions { sync: cfg.sync, ..Default::default() })?);
+        // A forgotten record's bytes must leave the file: pages freed by a
+        // rewrite are zeroed, and so is the tail of every page written after.
+        if let Some(db) = store.db() {
+            db.storage().set_zero_page_tails(true);
+        }
         let state: State = std::fs::read_to_string(&paths.state).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let receipts = std::sync::OnceLock::new();
         if cfg.receipts.enabled || dir.join(crate::receipt::BOOK_FILE).exists() {
