@@ -1643,18 +1643,34 @@ async fn run() {
     };
     let coordinator = !o.shards.is_empty();
     server::set_drain(std::time::Duration::from_millis(a.drain_ms));
+    // ONB-13: every address is taken before the database is opened or
+    // made, so that one in use, or no address at all, leaves no files.
+    let http_l = take(&a.listen, "--listen").await;
+    let grpc_l = match a.grpc != "off" && !coordinator {
+        true => Some(take(&a.grpc, "--grpc").await),
+        false => None,
+    };
+    let opensearch_l = match &a.opensearch_listen {
+        Some(addr) => Some(take(addr, "--opensearch-listen").await),
+        None => None,
+    };
+    let beside_l = match &beside {
+        Some((addr, ..)) => Some(take(addr, "--coordinator-listen").await),
+        None => None,
+    };
     let svc = server::service(&o).await.unwrap_or_else(|e| fail(&e));
     svc.reads.set_on(!a.no_read_stats);
     svc.model_budget.set_per_day(a.model_calls_per_key_day);
     if token.is_none() && cluster.is_none() && !svc.keys.is_empty() && !svc.keys.managed() {
         tracing::warn!("this server has no token and no admin key that never expires: once its admin keys expire, only starting it with --token manages it. Make an admin key without expires_days");
     }
-    let bind = |addr: &str| {
+    // A listener taken above, once the keys are known: an open server
+    // listens on this machine only.
+    let bind = |l: tokio::net::TcpListener, addr: &str| {
         let addr = addr.to_string();
         // API keys close a server as a token does.
         let open = token.is_none() && cluster.is_none() && svc.keys.is_empty() && !a.no_token;
         async move {
-            let l = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}")));
             let ip = l.local_addr().unwrap_or_else(|e| fail(&format!("listen on {addr}: {e}"))).ip();
             if open && !ip.is_loopback() {
                 fail(&format!("{addr} is reachable beyond this machine: set --token (or $CHLOEDB_TOKEN), make an API key, or pass --no-token to serve it open"));
@@ -1662,7 +1678,7 @@ async fn run() {
             (l, ip)
         }
     };
-    let (http, ip) = bind(&a.listen).await;
+    let (http, ip) = bind(http_l, &a.listen).await;
     let access = Access { token: token.clone(), cluster: cluster.clone(), hosts: auth::allowed_hosts(ip, &a.allow_host), tls, limits: auth::Limits {
         header_read: std::time::Duration::from_secs(a.header_timeout_secs.max(1)),
         idle: std::time::Duration::from_secs(a.idle_timeout_secs),
@@ -1692,8 +1708,8 @@ async fn run() {
     }
     let mut tasks = Vec::new();
     // A coordinator answers queries but is not itself a shard.
-    if a.grpc != "off" && !coordinator {
-        let (l, _) = bind(&a.grpc).await;
+    if let Some(l) = grpc_l {
+        let (l, _) = bind(l, &a.grpc).await;
         tracing::info!("gRPC on {}{}", a.grpc, if access.tls.is_some() { " (TLS)" } else { "" });
         let (svc, access) = (svc.clone(), access.clone());
         tasks.push(tokio::spawn(async move {
@@ -1706,8 +1722,8 @@ async fn run() {
     // coordinator (--coordinator-listen), for the cluster, once the
     // coordinator is up.
     let mut opensearch = None;
-    if let Some(addr) = &a.opensearch_listen {
-        let (l, ip) = bind(addr).await;
+    if let (Some(addr), Some(l)) = (&a.opensearch_listen, opensearch_l) {
+        let (l, ip) = bind(l, addr).await;
         let scheme = if access.tls.is_some() { "https" } else { "http" };
         tracing::info!("OpenSearch API on {scheme}://{addr}/ (version {})", a.opensearch_version);
         opensearch = Some((l, Access { hosts: auth::allowed_hosts(ip, &a.allow_host), ..access.clone() }, a.opensearch_version.clone()));
@@ -1717,9 +1733,9 @@ async fn run() {
             tasks.push(tokio::spawn(serve_opensearch(svc.clone(), l, os_access, version)));
         }
     }
-    if let Some((addr, url, mut co)) = beside {
+    if let (Some((addr, url, mut co)), Some(l)) = (beside, beside_l) {
         co.coord.local = Some(chloedb_server::coord::LocalShard { url, service: server::grpc_service(svc.clone(), &access) });
-        let (l, cip) = bind(&addr).await;
+        let (l, cip) = bind(l, &addr).await;
         let access = Access { hosts: auth::allowed_hosts(cip, &a.allow_host), ..access.clone() };
         let (peer, no_read_stats, model_calls) = (a.peer_url.clone(), a.no_read_stats, a.model_calls_per_key_day);
         // Its shards, this one among them, may answer only later: the
@@ -1817,6 +1833,26 @@ enum AdminCmd {
 fn fail(msg: &str) -> ! {
     tracing::error!("{msg}");
     std::process::exit(1)
+}
+
+/// The listener of `addr`, given as `flag`, or the server stops saying
+/// why: an address that is no address, or one in use, named with what to
+/// do about it ([`listen_error`]).
+async fn take(addr: &str, flag: &str) -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| fail(&listen_error(addr, flag, &e)))
+}
+
+/// Why `addr` (option `flag`) could not be listened on (ONB-13).
+fn listen_error(addr: &str, flag: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            let port = addr.rsplit(':').next().unwrap_or(addr);
+            format!("listen on {addr}: the address is in use, by another chloedb-server or another program (lsof -i :{port} names it): stop it, or give {flag} another port")
+        }
+        std::io::ErrorKind::PermissionDenied => format!("listen on {addr}: {e} (a port below 1024 needs root: give {flag} a port of 1024 or more)"),
+        _ if addr.parse::<std::net::SocketAddr>().is_err() && !addr.contains(':') => format!("listen on {addr}: {flag} is a host and a port, such as 127.0.0.1:7700 ({e})"),
+        _ => format!("listen on {addr}: {e} ({flag} is a host and a port, such as 127.0.0.1:7700, a port up to 65535)"),
+    }
 }
 
 #[cfg(test)]
