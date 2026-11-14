@@ -503,7 +503,9 @@ async function route() {
   // they show (SH-11).
   setPolls({ cluster: v.cluster || (COPY_NUMBERS.has(v.id) ? "full" : "brief"), alerts: ALERTS_SHOWN.has(v.id) ? "full" : "slow", series: v.range !== false });
   moreBtn.querySelector("svg").replaceWith(icon(v.range === false ? "dots" : "clock"));
-  if (unknown && unknown !== "home") toast(`There is no view "${unknown}": this is Home`);
+  // The address says Home too, so a reload or a copied link does not ask
+  // for the view again (CCW-15).
+  if (unknown && unknown !== "home") { toast(`There is no view "${unknown}": this is Home`); try { history.replaceState(null, "", location.pathname + location.search + "#/home"); } catch { /* old browser */ } }
   if (!v.mod) {
     // Its code is not here yet: the view before it goes, and a page says so if it takes a moment.
     try { cleanup?.(); } catch (err) { console.error(err); }
