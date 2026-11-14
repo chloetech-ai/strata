@@ -54,6 +54,8 @@ mod rulesuggest;
 // The rewrite around goals (JOURNEYS.md): the one Needs-you count, and what
 // sessions were allowed without asking.
 mod needs;
+// Optimize the harness: versions, findings, the permissions and memory editors.
+mod harness;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -95,6 +95,14 @@ Every page answers one question, and the goal comes first:
   terminal is read-only until **Type**.
 - **Review and ship** (`#/p/<project>/ship`) and **Debug** (`#/debug`):
   below.
+- **Optimize the harness** (`#/harness`, from Start and More): what your
+  agents' setup cost them this week. It shows permission prompts by
+  command and mode, what auto mode blocked, missed memory, redo loops and
+  unused tools, each with how it is known. Permissions and memory each have
+  an editor that shows a change's impact on the week. A draft is promoted to
+  new agents, and a wider permission is promoted only once you name it.
+  Each agent records the version it ran, and a version is rolled back in
+  one step ([HARNESS.md](HARNESS.md)).
 - **Needs you** (`#/needs`, or `.` for the drawer): every question,
   permission prompt, trust prompt and alert that asks you, across
   projects, in one card each. Filter by project, agent and kind; sort by

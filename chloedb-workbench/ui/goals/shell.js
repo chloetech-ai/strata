@@ -208,6 +208,7 @@ export const MORE = [
   ["decisions", "branch", "Decisions timeline", "Every decision of the project, one lane per agent"],
   ["library", "book", "Library", "Docs, notes and code search"],
   ["rules", "check", "Rules and grants", "What agents are told, and what they may do without asking; Revoke"],
+  ["harness", "spark", "Optimize the harness", "What cost time this week; permissions, memory and versions"],
   ["settings", "gear", "Settings", "Open on the inbox, compact rows"],
   ["guide", "why", "Guide", "What each page is for"],
   ["keys", "kbd", "Keys", "The keyboard, all of it"],

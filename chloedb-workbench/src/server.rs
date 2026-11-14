@@ -111,7 +111,7 @@ pub fn router(app: App) -> Router {
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
         .route("/levels/:file", get(ui_level))
-        .route("/goals/:file", get(ui_goal))
+        .route("/goals/*file", get(ui_goal))
         .route("/fonts/:file", get(ui_font))
         .route("/api/health", get(health))
         .route("/api/agents", get(list).post(spawn))
@@ -169,6 +169,8 @@ pub fn router(app: App) -> Router {
         // The rewrite: suggested rules and grants, and the interrupt model.
         .merge(crate::rulesuggest::routes())
         .merge(crate::notify::routes())
+        // Optimize the harness (src/harness.rs).
+        .merge(crate::harness::routes())
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -253,6 +255,14 @@ const GOALS: &[(&str, &str)] = &[
     ("agent.js", include_str!("../ui/goals/agent.js")),
     ("more.js", include_str!("../ui/goals/more.js")),
     ("needs.js", include_str!("../ui/goals/needs.js")),
+    // Optimize the harness (src/harness.rs), at /goals/harness/<file>.
+    ("harness/index.js", include_str!("../ui/goals/harness/index.js")),
+    ("harness/parts.js", include_str!("../ui/goals/harness/parts.js")),
+    ("harness/overview.js", include_str!("../ui/goals/harness/overview.js")),
+    ("harness/permissions.js", include_str!("../ui/goals/harness/permissions.js")),
+    ("harness/memory.js", include_str!("../ui/goals/harness/memory.js")),
+    ("harness/sees.js", include_str!("../ui/goals/harness/sees.js")),
+    ("harness/versions.js", include_str!("../ui/goals/harness/versions.js")),
 ];
 
 async fn ui_goal(State(app): State<App>, Path(file): Path<String>) -> Response {

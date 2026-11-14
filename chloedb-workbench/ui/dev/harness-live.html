@@ -1,0 +1,110 @@
+<!doctype html>
+<!-- Optimize the harness on a live server, before the goal shell mounts it
+     (R1 owns app.js, index.html and style.css). It sets direction C's
+     tokens ("Instrument", JOURNEYS.md "Tokens") itself, then mounts
+     /goals/harness/index.js as the shell will. Served from disk only, by
+     `chloedb-workbench serve` with CHLOEDB_WORKBENCH_UI_DIR=ui:
+       /dev/harness-live.html?token=TOKEN&repo=/path#/harness   (?t=dark|light) -->
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Optimize the harness</title>
+<style>
+@font-face { font-family: "Geist"; font-style: normal; font-weight: 400 700; font-display: swap; src: url(/dev/harness/fonts/Geist-normal.woff2) format("woff2"); }
+@font-face { font-family: "Geist Mono"; font-style: normal; font-weight: 400 600; font-display: swap; src: url(/dev/harness/fonts/GeistMono-normal.woff2) format("woff2"); }
+:root {
+  color-scheme: light;
+  --sans: "Geist", system-ui, sans-serif; --mono: "Geist Mono", ui-monospace, monospace; --sans-features: "ss01";
+  --fs-xs: 11px; --lh-xs: 16px; --fs-sm: 12px; --lh-sm: 18px; --fs-body: 13px; --lh-body: 20px; --fs-md: 15px; --lh-md: 22px; --fs-lg: 20px; --lh-lg: 28px; --fs-xl: 28px; --lh-xl: 34px;
+  --track-xl: -.025em; --track-md: -.01em; --track-label: .08em; --w-text: 400; --w-mid: 500; --w-title: 600;
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 28px; --s-7: 40px;
+  --ctl-h: 30px; --ctl-h-lg: 36px; --touch: 44px; --kc-h: 18px; --top: 44px; --tabh: 0px; --insp-w: 360px; --page-w: 1180px; --sheet-w: 560px;
+  --r: 10px; --r-sm: 6px; --r-xs: 4px; --r-pill: 999px; --hair: 1px;
+  --bg: #f2f2f3; --surface: #ffffff; --surface-2: #f7f7f8; --surface-3: #ececef; --sunken: #efeff1; --well: #efeff1;
+  --glass: rgba(250, 250, 251, .72); --glass-in: rgba(255, 255, 255, .6); --glass-blur: saturate(180%) blur(24px); --scrim: rgba(17, 17, 19, .32);
+  --text: #111113; --text-2: #5b5b64; --muted: #5b5b64; --text-3: #8d8d96; --line: rgba(17, 17, 19, .085); --line-2: rgba(17, 17, 19, .16);
+  --accent: #4a4bd6; --accent-2: #3d3ec4; --accent-ink: #ffffff; --accent-text: #4243c4; --accent-soft: rgba(74, 75, 214, .09); --accent-line: rgba(74, 75, 214, .45); --focus: rgba(74, 75, 214, .3);
+  --good: #18794e; --good-ink: #18794e; --good-soft: rgba(24, 121, 78, .1);
+  --warn: #a35f00; --warn-ink: #8a5000; --warn-soft: rgba(163, 95, 0, .09); --warn-line: rgba(163, 95, 0, .35); --on-warn: #ffffff;
+  --crit: #cd2b31; --crit-ink: #b4232a; --crit-soft: rgba(205, 43, 49, .08); --ctx: #0e7c86;
+  --add-bg: rgba(24, 121, 78, .1); --add-gut: rgba(24, 121, 78, .16); --add-ink: #18794e; --del-bg: rgba(205, 43, 49, .08); --del-gut: rgba(205, 43, 49, .14); --del-ink: #b4232a;
+  --term-bg: #fbfbfc; --term-fg: #1f2328; --term-line: #e6e8ec;
+  --lane-1: #2a78d6; --lane-2: #eb6834; --lane-3: #1baf7a; --lane-4: #6250d6; --lane-5: #e87ba4; --lane-x: #8b93a0; --av-ink: #111113;
+  --shadow-1: none; --shadow-2: 0 0 0 .5px rgba(0, 0, 0, .06), 0 12px 32px -8px rgba(0, 0, 0, .12); --shadow-3: 0 24px 64px rgba(0, 0, 0, .22);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0b0b0d; --surface: #141416; --surface-2: #19191c; --surface-3: #222226; --sunken: #101012; --well: #1f1f23;
+    --glass: rgba(20, 20, 23, .7); --glass-in: rgba(28, 28, 32, .6); --scrim: rgba(0, 0, 0, .55);
+    --text: #ededef; --text-2: #a1a1ab; --muted: #a1a1ab; --text-3: #6b6b74; --line: rgba(255, 255, 255, .07); --line-2: rgba(255, 255, 255, .13);
+    --accent: #5b5ce6; --accent-2: #6d6ef0; --accent-ink: #ffffff; --accent-text: #9d9eff; --accent-soft: rgba(143, 144, 255, .12); --accent-line: rgba(143, 144, 255, .5); --focus: rgba(143, 144, 255, .35);
+    --good: #4cc38a; --good-ink: #4cc38a; --good-soft: rgba(76, 195, 138, .12);
+    --warn: #f1a10d; --warn-ink: #f1a10d; --warn-soft: rgba(241, 161, 13, .12); --warn-line: rgba(241, 161, 13, .4);
+    --crit: #ff6369; --crit-ink: #ff6369; --crit-soft: rgba(255, 99, 105, .12); --ctx: #3fc1c9;
+    --add-bg: rgba(76, 195, 138, .1); --add-ink: #4cc38a; --del-bg: rgba(255, 99, 105, .1); --del-ink: #ff6369;
+    --shadow-2: 0 0 0 .5px rgba(255, 255, 255, .06), 0 16px 40px -8px rgba(0, 0, 0, .6); --shadow-3: 0 24px 72px rgba(0, 0, 0, .6);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0b0d; --surface: #141416; --surface-2: #19191c; --surface-3: #222226; --sunken: #101012; --well: #1f1f23;
+  --glass: rgba(20, 20, 23, .7); --glass-in: rgba(28, 28, 32, .6); --scrim: rgba(0, 0, 0, .55);
+  --text: #ededef; --text-2: #a1a1ab; --muted: #a1a1ab; --text-3: #6b6b74; --line: rgba(255, 255, 255, .07); --line-2: rgba(255, 255, 255, .13);
+  --accent: #5b5ce6; --accent-2: #6d6ef0; --accent-ink: #ffffff; --accent-text: #9d9eff; --accent-soft: rgba(143, 144, 255, .12); --accent-line: rgba(143, 144, 255, .5); --focus: rgba(143, 144, 255, .35);
+  --good: #4cc38a; --good-ink: #4cc38a; --good-soft: rgba(76, 195, 138, .12);
+  --warn: #f1a10d; --warn-ink: #f1a10d; --warn-soft: rgba(241, 161, 13, .12); --warn-line: rgba(241, 161, 13, .4);
+  --crit: #ff6369; --crit-ink: #ff6369; --crit-soft: rgba(255, 99, 105, .12); --ctx: #3fc1c9;
+  --add-bg: rgba(76, 195, 138, .1); --add-ink: #4cc38a; --del-bg: rgba(255, 99, 105, .1); --del-ink: #ff6369;
+  --shadow-2: 0 0 0 .5px rgba(255, 255, 255, .06), 0 16px 40px -8px rgba(0, 0, 0, .6); --shadow-3: 0 24px 72px rgba(0, 0, 0, .6);
+}
+@media (max-width: 640px) { :root { --fs-body: 15px; --lh-body: 22px; --ctl-h: 44px; --ctl-h-lg: 44px; } }
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: var(--w-text) var(--fs-body)/var(--lh-body) var(--sans); font-feature-settings: var(--sans-features); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--accent-text); }
+code { font-family: var(--mono); font-size: .92em; letter-spacing: -.01em; }
+svg.i { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+svg.i.sm { width: 13px; height: 13px; }
+.kc { display: inline-grid; place-items: center; min-width: var(--kc-h); height: var(--kc-h); padding: 0 4px; border: var(--hair) solid var(--line-2); border-radius: var(--r-xs); font: var(--w-mid) 10.5px/1 var(--mono); color: var(--text-2); background: var(--surface); }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--s-2); min-height: var(--ctl-h-lg); padding: 0 var(--s-4); border: var(--hair) solid var(--line-2); border-radius: var(--r-sm); background: var(--surface); color: var(--text); font-weight: var(--w-mid); text-decoration: none; cursor: pointer; white-space: nowrap; }
+.btn:hover { background: var(--surface-2); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { background: var(--accent-2); }
+.btn.primary .kc { background: transparent; color: inherit; border-color: color-mix(in srgb, var(--accent-ink) 45%, transparent); }
+.btn.sm { min-height: var(--ctl-h); padding: 0 var(--s-3); font-size: var(--fs-sm); }
+.top { position: sticky; top: 0; z-index: 10; height: var(--top); display: flex; align-items: center; gap: var(--s-3); padding: 0 var(--s-4); background: var(--glass); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); border-bottom: var(--hair) solid var(--line); }
+.mark { display: flex; align-items: center; gap: var(--s-2); font-weight: var(--w-title); letter-spacing: var(--track-md); }
+.mark i { width: 16px; height: 16px; border-radius: var(--r-xs); border: 1.5px solid var(--text); position: relative; }
+.mark i::after { content: ""; position: absolute; inset: 2px 7px 2px 2px; background: var(--text); border-radius: 1px; }
+.crumb { display: flex; align-items: center; gap: 2px; font: var(--w-text) var(--fs-sm) var(--mono); color: var(--text-2); min-width: 0; overflow: hidden; white-space: nowrap; }
+.crumb b { color: var(--text); font-weight: var(--w-mid); background: var(--line); padding: 4px 6px; border-radius: var(--r-xs); }
+.crumb span { padding: 4px 6px; }
+#host { min-height: calc(100vh - var(--top)); }
+</style>
+</head><body>
+<header class="top"><span class="mark"><i></i>Workbench</span><span class="crumb" id="crumb"><span id="crumb-repo">repository</span><span>/</span><b>harness</b></span></header>
+<div id="host"></div>
+<script type="module">
+const q = new URLSearchParams(location.search);
+const theme = q.get("t") || q.get("theme");
+if (theme) document.documentElement.dataset.theme = theme;
+const token = q.get("token") || "";
+const repo = q.get("repo") || null;
+if (repo) document.getElementById("crumb-repo").textContent = repo.split("/").filter(Boolean).pop();
+async function api(path, { method = "GET", body } = {}) {
+  const headers = { Authorization: `Bearer ${token}` };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  let j = {};
+  try { j = JSON.parse(await r.text()); } catch { j = {}; }
+  if (!r.ok) throw Object.assign(new Error(j.error || `${r.status} ${r.statusText}`), { status: r.status, code: j.error_code });
+  return j;
+}
+if (!location.hash.startsWith("#/harness")) location.hash = "#/harness";
+const { mount } = await import("/goals/harness/index.js");
+mount(document.getElementById("host"), { api, state: { agents: [], events: [] }, params: { repo }, go: (h) => { location.hash = h; } });
+</script>
+</body></html>

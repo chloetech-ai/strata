@@ -46,6 +46,8 @@ const AGENTS: &str = "CREATE TABLE IF NOT EXISTS agents (
 const AGENTS_ADDED: &str = "ALTER TABLE agents ADD COLUMN IF NOT EXISTS base KEYWORD, ADD COLUMN IF NOT EXISTS started_ms INT";
 /// The columns the levels added (Preview), for a database made before them.
 const AGENTS_ADDED_PREVIEW: &str = "ALTER TABLE agents ADD COLUMN IF NOT EXISTS preview_url KEYWORD";
+/// The harness version the agent ran (src/harness.rs).
+const AGENTS_ADDED_HARNESS: &str = "ALTER TABLE agents ADD COLUMN IF NOT EXISTS harness KEYWORD";
 
 /// Small key/value state: allow-lists, applied suggestions.
 const MARKS: &str = "CREATE TABLE IF NOT EXISTS marks (
@@ -135,7 +137,7 @@ const EVENTS: &str = "CREATE TABLE IF NOT EXISTS events (
   data TEXT
 )";
 
-const AGENT_COLS: &str = "id, name, repo, cwd, branch, task, parent, depth, state, state_since, waiting_for, last_event, session_id, pid, exit_code, model, created, ended, base, started_ms, preview_url, goal, outcome, narration, narration_ts";
+const AGENT_COLS: &str = "id, name, repo, cwd, branch, task, parent, depth, state, state_since, waiting_for, last_event, session_id, pid, exit_code, model, created, ended, base, started_ms, preview_url, goal, outcome, narration, narration_ts, harness";
 const EVENT_COLS: &str = "id, seq, ts, agent, kind, tool, summary, data";
 
 /// Milliseconds since the Unix epoch.
@@ -183,6 +185,8 @@ pub struct Agent {
     /// One live sentence of what it does, and when it was set (ms).
     pub narration: Option<String>,
     pub narration_ts: Option<i64>,
+    /// The run version of the harness it was started with (src/harness.rs).
+    pub harness: Option<String>,
 }
 
 impl Agent {
@@ -215,6 +219,7 @@ impl Agent {
             "outcome": self.outcome,
             "narration": self.narration,
             "narration_ts": self.narration_ts.map(iso),
+            "harness": self.harness,
             "running": running,
             "children": children,
         })
@@ -317,6 +322,10 @@ impl StateDb {
         db.sql(AGENTS_ADDED, &Params::new()).map_err(e)?;
         db.sql(AGENTS_ADDED_LEVELS, &Params::new()).map_err(e)?;
         db.sql(AGENTS_ADDED_PREVIEW, &Params::new()).map_err(e)?;
+        db.sql(AGENTS_ADDED_HARNESS, &Params::new()).map_err(e)?;
+        for t in crate::harness::TABLES {
+            db.sql(t, &Params::new()).map_err(e)?;
+        }
         db.sql(MARKS, &Params::new()).map_err(e)?;
         for t in LEVEL_TABLES {
             db.sql(t, &Params::new()).map_err(e)?;
@@ -401,7 +410,8 @@ impl StateDb {
             .set("goal", opt_str(&a.goal))
             .set("outcome", opt_str(&a.outcome))
             .set("narration", opt_str(&a.narration))
-            .set("narration_ts", a.narration_ts.map_or(Value::Null, ts));
+            .set("narration_ts", a.narration_ts.map_or(Value::Null, ts))
+            .set("harness", opt_str(&a.harness));
         let names: Vec<String> = AGENT_COLS.split(", ").map(|c| format!(":{c}")).collect();
         let sql = format!("INSERT OR REPLACE INTO agents ({AGENT_COLS}) VALUES ({})", names.join(", "));
         self.db.sql(&sql, &p).map_err(e)?;
@@ -439,6 +449,7 @@ impl StateDb {
                 outcome: r.get(22).and_then(get_str),
                 narration: r.get(23).and_then(get_str),
                 narration_ts: r.get(24).and_then(get_ms),
+                harness: r.get(25).and_then(get_str),
             })
             .collect())
     }

@@ -67,6 +67,9 @@ export function mount(root, ctx) {
       tile("Review", "g r", "Review and ship", "The change, its checks, and the merge.", readyN ? `${readyN} ready: ${readyNames.join(", ")}` : "Nothing is ready yet", btn("Review", { href: cont ? `#/p/${(projects.find((p) => p.counts && p.counts.ready) || cont).project}/ship` : "#/p", primary: goal === "review" }), goal === "review"),
       tile("Debug", "g d", "Find out why something went wrong", "An agent's turn, a line of code, or a failing test.", N.items.some((i) => i.kind === "alert") ? `${N.items.filter((i) => i.kind === "alert").length} alert asks you` : "Pick a turn, a line or a test", btn("Debug", { href: "#/debug" }), false));
     goals.classList.add("g-goals");
+    // Optimize the harness (HARNESS.md, "Where it plugs in"): the goal
+    // after the four, as a line.
+    const hx = h("a", { class: "g-hx", href: "#/harness" }, icon("spark"), h("span", {}, h("b", {}, "Optimize the harness"), " What cost your agents time this week, and a change to keep."), icon("chev", "i sm"));
     const dense = ctx.prefs.get("compact");
     const rows = projects.map((p) => {
       const c = p.counts || {};
@@ -86,7 +89,7 @@ export function mount(root, ctx) {
       ctx.slot("rules-suggest"),
     ];
     return page({ kicker: "Start", title: "What do you want to do?", sub, wide: true, inspector: insp },
-      goals,
+      goals, hx,
       h("div", { class: "gp-sec" }, pane("Your projects", h("a", { href: "#/p" }, "Open another"),
         h("table", { class: "tbl" }, h("thead", {}, h("tr", {}, h("th", {}, "Project"), h("th", {}, "State"), h("th", { class: "g-hide" }, "Agents"), h("th", { class: "r" }, "Active"), h("th", { class: "r" }, ""))), h("tbody", {}, rows)))),
       h("div", { class: "gp-sec" }, setupLine()));
@@ -111,6 +114,8 @@ const CSS = `
 .g-trust b{color:var(--text);font-weight:var(--w-mid)}
 .g-path{font:var(--w-text) var(--fs-xs)/var(--lh-xs) var(--mono);color:var(--text-2);margin-top:2px;overflow-wrap:anywhere}
 .g-dim{color:var(--text-2)}
+.g-hx{display:flex;align-items:center;gap:var(--s-3);margin-top:var(--s-3);padding:var(--s-3) var(--s-4);min-height:var(--touch);border:var(--hair) solid var(--line);border-radius:var(--r);background:var(--surface);color:var(--text-2);text-decoration:none;font-size:var(--fs-body)}
+.g-hx b{color:var(--text);font-weight:var(--w-mid);margin-right:var(--s-1)}.g-hx>span{flex:1;min-width:0}.g-hx:hover{border-color:var(--line-2)}
 .g-start .tbl td{white-space:nowrap}.g-start .tbl td:first-child{white-space:normal;width:100%}
 .g-acts{display:inline-flex;gap:var(--s-2)}
 .g-avs{display:inline-flex}.g-avs .lv-av{border-radius:50%;box-shadow:0 0 0 1.5px var(--surface)}.g-avs .lv-av+.lv-av{margin-left:-5px}

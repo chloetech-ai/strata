@@ -2933,6 +2933,7 @@ const GOAL = {
   start: "/goals/start.js", new: "/goals/newproject.js", needs: "/goals/needs.js",
   open: "/goals/continue.js", continue: "/goals/continue.js", understand: "/goals/continue.js", change: "/goals/continue.js",
   ship: "/goals/review.js", debug: "/goals/debug.js", more: "/goals/more.js",
+  harness: "/goals/harness/index.js",
 };
 
 function go(hash) {
@@ -3026,7 +3027,7 @@ async function route(hash) {
   showView("goal-view");
   // Review and Debug follow their own steps (their hashchange): a step
   // within one of them keeps the page mounted.
-  const key = r.page === "ship" ? JSON.stringify([r.page, r.project]) : r.page === "debug" ? JSON.stringify([r.page])
+  const key = r.page === "ship" || r.page === "harness" ? JSON.stringify([r.page, r.project]) : r.page === "debug" ? JSON.stringify([r.page])
     : JSON.stringify([r.page, r.project, r.agent, r.step, r.item, r.rest, r.tab, r.query.toString()]);
   if (G.view && G.key === key) { G.ukey = ""; goalUpdate(); return; }
   unmountGoal();

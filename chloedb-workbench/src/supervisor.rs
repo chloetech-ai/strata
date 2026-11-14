@@ -650,8 +650,10 @@ impl Supervisor {
             mcp_json(&exe, &self.cfg.url, &token, &id),
             &who,
         )?;
-        write_private(&settings, &settings_v)?;
-        write_private(&mcp, &mcp_v)?;
+        // The repository's current harness version, applied and recorded (src/harness.rs).
+        let applied = crate::harness::at_spawn(self, &co.main.to_string_lossy(), &cwd, &session_dir, &id, &name, settings_v, mcp_v);
+        write_private(&settings, &applied.settings)?;
+        write_private(&mcp, &applied.mcp)?;
 
         // The process.
         let session_id = uuid4();
@@ -753,6 +755,7 @@ impl Supervisor {
             outcome: req.outcome.clone(),
             narration: None,
             narration_ts: None,
+            harness: applied.version,
         };
         let mut extra = serde_json::Map::new();
         if read_only {

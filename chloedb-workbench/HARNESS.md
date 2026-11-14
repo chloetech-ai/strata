@@ -873,6 +873,146 @@ lint on its output, auto within limits, nightly, the phone's approvals.
 parts that are not about one repository), instructions, and Claude Code's
 own updates as a version change to test.
 
+## Built (H): steps 1 and 2
+
+Steps 1 and 2 of the MVP are built, with no model and no replay. The
+server side is `src/harness.rs`, `src/harness/perms.rs` (the rules, lint,
+impact and widening), `src/harness/memory.rs` (receipts, misses, the
+recompute and the preview) and `src/harness/stats.rs` (the no-difference
+statistics). The pages are `ui/goals/harness/*.js`, at `#/harness` in R1's
+router. Tests are the `harness_*` tests in `tests/workbench.rs` and the
+unit tests of each module.
+
+**Versions.**
+- At spawn (`harness::at_spawn`, one call in `supervisor.rs`), Workbench
+  applies the current version's edits to the session's own `--settings`
+  and `--mcp-config`. `<worktree>` becomes the full path of the session's
+  worktree.
+- It then records the version the agent ran on `agents.harness`, in
+  `harness_versions` and `harness_parts`. The version is made from the
+  normalized parts: permissions, hooks, env, tools, brief, memory and
+  `claude --version`. The session's own paths are placeholders, so two
+  agents of one config share one version.
+- `1.0` is Workbench's own harness. Saving makes a draft (one per
+  repository). Promote makes it current for new agents, and Roll back is
+  one step back.
+- A draft that widens what agents may do is refused with 409 `widens`
+  until `approve_widening` names every pattern. The page asks with one
+  checkbox per pattern.
+- A secret in any part is refused (400 `secret`). An unchanged save is
+  refused (409 `unchanged`).
+- Only the user's token changes the harness: an agent's key gets 403.
+
+**Findings** (`GET /api/harness`, `/findings`). Each finding has its
+evidence level.
+- Permission storms, with each session's permission mode. A storm the
+  current rules already allow is shown as handled and suggests nothing.
+- Auto mode's blocks and escalations.
+- Unused skills, subagents and MCP servers, with what they cost.
+- Slow hooks: p50 and p95, from the opt-in timing.
+- Redo loops, from `test_runs`.
+- Your corrections: the same words typed to two or more agents, and
+  Hotspots' corrected files.
+- Missed memory, from ChloeCtx's full receipts (`chloectx receipt ID --json
+  --no-replay`). A miss is a decision, rule or fact that was left out and
+  names a file the agent then edited, followed by a failing test.
+
+The Overview shows:
+- the week's live scorecard: done by checks, interventions, prompts, wall
+  time, tokens and missed memory, plus the modes line;
+- the findings, worst first;
+- agents by version, with each one's mode;
+- the current version against the one before;
+- suggestions, which go into the draft: a storm's rule, or a missed record
+  as a pin.
+
+**Editors.**
+- **Permissions:**
+  - the rules with their 7-day hits;
+  - autocomplete from the commands agents ran (`/api/harness/complete`);
+  - lint: unreachable, conflicting, shadowed, wider than needed, widens,
+    secrets;
+  - the counted impact against the current rules, with a prompt the
+    current rules already allow counted as `already`, not as the change's;
+  - Structured, Split and Text views, with the JSON and the table kept in
+    sync both ways through `/api/harness/lint`.
+- **Memory:**
+  - the gate, the knowledge threshold, the budgets and pins;
+  - a live preview of one turn's recall under the draft;
+  - every recall of the week recomputed: exact on decisions, and estimated
+    on which records a changed decision packs;
+  - lint of the misses.
+
+**Market adjustments.**
+1. *Auto mode*, the default for Pro, Max and Team since Aug 14, 2026:
+   - Every call carries the session's `permission_mode` from the hook's
+     input.
+   - A `PermissionDenied` event counts as auto mode blocking a call.
+   - A permission prompt in a session in auto mode counts as an
+     escalation.
+   - The scorecard says which mode each session ran in, and storms say it
+     too.
+   - Workbench does not wire the `PermissionDenied` hook itself, so blocks
+     are counted only where that event exists.
+2. *What the model sees*:
+   - Counted, from Debug's turn context (R2's `GET
+     /api/agents/:id/turns/:n/context`): the turn's size, the prompt and
+     ChloeCtx's records.
+   - Injected, from `/api/harness/sees`: what Workbench put in (rules,
+     steers, pins).
+   - Estimated, and labelled so: everything Claude Code assembles itself
+     (system prompt, tools, conversation, CLAUDE.md, skills).
+   - `OTEL_LOG_RAW_API_BODIES` is reported only as set or not set. Its
+     bodies are not read yet, because `runtime.rs` keeps only errors of the
+     OTLP export; storing `claude_code.api_request_body` there is the
+     integration point. Workbench never turns the export on.
+3. *No detectable difference* is a result in its own right:
+   - Both the impact and the comparison of two versions say it.
+   - A comparison gives the effect that its session counts could detect: a
+     two-proportion test or Poisson rates at 95% confidence and 80% power.
+   - Fewer than 3 sessions a side is "too few".
+
+**Reused, not duplicated.**
+- P's routes:
+  - `GET /api/rules/suggested` is linked from the Overview. A rule
+    accepted there lands in `allow:<repo>`, which the baseline reads as
+    "Flow".
+  - `grantSheet` comes from `ui/goals/rules-suggest.js` for every allow
+    added in the editor.
+- R2's routes:
+  - the turn context;
+  - `/api/repos/:p/threshold`, which Promote sets when a version changes
+    the knowledge threshold.
+- R1's router (`case "harness"`), `GOAL` map, Start (a line under the four
+  goals) and More (an entry).
+
+**Left out, and why.**
+- The gate and the budgets reach new sessions as `CHLOECTX_RECALL` and are
+  recomputed here. ChloeCtx reads them from its store's `config.json`, so
+  they are not yet applied per session.
+- The knowledge threshold is per project, through R2's API.
+- Pins arrive at session start (a SessionStart hook), not as the agent
+  touches the file.
+- Hook timing is opt-in per version. It uses `date +%s%N`, so it works on
+  Linux and not on macOS.
+- The tools, routing and hooks editors, replay, evals, the proposer and
+  auto-learn beyond "Suggest" are not built. They belong to step 3 and
+  later.
+
+**Dev.**
+- `node ui/dev/harness-seed.mjs` starts a server with the fake `claude` and
+  `ui/dev/harness-fake-chloectx.mjs`, then seeds a week:
+  - storms;
+  - an agent in auto mode;
+  - a redo loop;
+  - a correction;
+  - a missed record;
+  - 1.1 promoted with its widening named;
+  - a 1.2 draft.
+- It prints `/?token=dev#/harness`.
+- `ui/dev/harness-live.html` mounts the pages without the shell.
+- Screenshots: `H-*.png` in the project's `workbench/rewrite/` folder.
+
 ## Risks
 
 - **Replay fidelity.** A session depends on things outside the commit: a

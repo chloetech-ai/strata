@@ -42,7 +42,10 @@ export function resolve(hash, { project = null, agentIds = [] } = {}) {
       if (!b) return { redirect: "#/" };
       return { page: "agent", agent: b, tab: ["changes", "preview", "terminal", "events"].includes(c) ? c : "progress", query };
     case "debug": return { page: "debug", rest: parts.slice(1), query };
+    // Optimize the harness (HARNESS.md): its pages follow their own hash.
+    case "harness": return { page: "harness", rest: parts.slice(1), project: query.get("project") || p, query };
     case "more":
+      if (b === "harness") return { redirect: "#/harness" };
       if (MORE.includes(b)) return { page: "more", item: b, query };
       return { page: "more", item: null, query };
     // Today's routes, for a release (JOURNEYS.md, "URL routes").

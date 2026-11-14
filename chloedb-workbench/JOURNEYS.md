@@ -922,6 +922,7 @@ In short:
 | `#/debug`, `#/debug/<agent>/<turn>`, `…/wrong` | D, steps 1 to 4 |
 | `#/debug/code[?q=]`, `#/debug/failing`, `#/debug/records` | D's other ways in |
 | `#/more/terminals`, `/time`, `/decisions`, `/library`, `/rules`, `/guide`, `/keys`, `/setup` | More |
+| `#/harness`, `/edit/permissions`, `/edit/memory`, `/sees/<agent>[?turn=]`, `/versions` | Optimize the harness ([HARNESS.md](HARNESS.md)); `#/more/harness` redirects there |
 
 `<project>` is a short name the server gives each repository: its
 folder's name, made unique (`shop`, `shop-2`). A route never carries an
@@ -1178,6 +1179,15 @@ The grants are P's (`/api/rules/grants`); R1's own `/api/grants` was
 dropped when P's landed. The tokens that R2's harness took from
 `ui/dev/goals-tokens.css` are all in `ui/style.css`, so that file is
 gone.
+
+## Built (H): Optimize the harness
+
+The goal of [HARNESS.md](HARNESS.md), steps 1 and 2 of its MVP (its
+"Built (H)" section says what is done and what is left out). It mounts
+from R1's router as the page `harness` (`ui/goals/harness/index.js`, which
+follows its own hash between Overview, Permissions, Memory, What the model
+sees and Versions, as Review and Debug do). Start shows it as a line under
+the four goals, and More lists it. Its pages set the shell's crumbs.
 
 ## What the rewrite changes
 
