@@ -179,7 +179,7 @@ impl App {
         let store = self.space(space)?;
         let ks: Vec<_> = kinds.iter().filter_map(|k| note_kind(k).map(|x| x.0)).collect();
         let got = store.latest(&ks, (limit * 3).min(cluster::WINDOW), &Filter::default())?;
-        Ok(got.into_iter().filter(|r| r.tag != "superseded" && r.tag != "done" && !exclude.contains(&r.id)).take(limit).collect())
+        Ok(got.into_iter().filter(|r| !crate::record::closed_tag(&r.tag) && r.tag != "done" && !exclude.contains(&r.id)).take(limit).collect())
     }
 
     /// What a build costs here, measured, and what the engine may spend.

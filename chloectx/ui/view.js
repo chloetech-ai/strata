@@ -270,7 +270,7 @@ a.cx-kpi:hover { border-color: var(--line-2); box-shadow: var(--shadow-2); }
 }`;
 
 const SECTION = {
-  rule: ["var(--s7)", "rule", "Rules go in first, whatever the question"],
+  rule: ["var(--s7)", "rule", "Rules that apply go in first: close in meaning to the question, found by its words, or every rule of a small space"],
   note: ["var(--s1)", "note", "A note the searches found for the question"],
   timeline: ["var(--s3)", "timeline", "Every note, oldest first: the question asks about the whole history"],
   reply: ["var(--s4)", "earlier reply", "A past exchange whose reply answers something like this"],
@@ -278,7 +278,12 @@ const SECTION = {
 };
 const KINDS = [["decision", "Decision"], ["rule", "Rule"], ["fact", "Fact"], ["todo", "To do"], ["note", "Note"]];
 const KIND_LABEL = Object.fromEntries(KINDS.map(([k, l]) => [k, l]));
-const LEFT = { superseded: ["Replaced", "A later note replaced it; the context shows the change on the note that replaced it"], uncertain: ["Uncertain", "Marked uncertain: kept out unless asked for"], budget: ["No room", "Found, but the budget was spent on closer matches"] };
+const LEFT = { superseded: ["Replaced", "A later note replaced it; the context shows the change on the note that replaced it"], retired: ["Retired", "Retired by hand, with nothing in its place"], uncertain: ["Uncertain", "Marked uncertain: kept out unless asked for"], budget: ["No room", "Found, but the budget was spent on closer matches"] };
+// A note that no longer holds: replaced by a later one, or retired by hand
+// (tagged "retired"; before, a retired note was "superseded" with nothing
+// that replaced it).
+const closed = (n) => n.tag === "superseded" || n.tag === "retired";
+const closedWord = (n) => (n.tag === "superseded" && n.superseded_by?.length ? "replaced" : "retired");
 const day = (secs) => (secs ? new Date(secs * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "–");
 
 function render(el, ctx) {
@@ -413,8 +418,8 @@ function sourceOf(ctx, type, id) {
       const j = await api(`/v1/memory/records?${p}&q=${encodeURIComponent(question)}&limit=40`);
       // A note that was replaced or done is history, not an answer.
       cache = cache || await notes(true);
-      const past = new Set(cache.filter((x) => x.tag === "superseded" || x.tag === "done").map((x) => x.id));
-      const keep = (j.records || []).filter((r) => r.kind !== "entity" && r.kind !== "tool_call" && r.kind !== "tool_result" && !past.has(r.id) && r.tag !== "superseded" && r.tag !== "done");
+      const past = new Set(cache.filter((x) => closed(x) || x.tag === "done").map((x) => x.id));
+      const keep = (j.records || []).filter((r) => r.kind !== "entity" && r.kind !== "tool_call" && r.kind !== "tool_result" && !past.has(r.id) && !closed(r) && r.tag !== "done");
       const items = keep.slice(0, 14).map((r, i) => ({ ...r, kind: r.kind === "prompt" ? "user" : r.kind === "answer" ? "assistant" : kindOf(r.kind), section: r.kind === "preference" ? "rule" : r.kind === "prompt" || r.kind === "answer" ? "excerpt" : "note", rank: i, tokens: Math.ceil((r.text || "").length / 4) }));
       return { question, items, left_out: [], tokens: items.reduce((a, x) => a + x.tokens, 0), budget: null, ms: performance.now() - t0, words_only: true, context: items.map((x) => x.text).join("\n\n"), chars: items.reduce((a, x) => a + x.text.length, 0) };
     },
@@ -632,13 +637,13 @@ function spacePage(root, ctx, src, rest) {
 /** A note as a line of a list: its text (struck through when replaced), kind, date, and what it replaced. */
 function noteLine(ctx, src, n, opts = {}) {
   const { h } = ctx.core;
-  const old = n.tag === "superseded";
+  const old = closed(n);
   return h("li", { class: "plain cx-note", onclick: () => historyDrawer(ctx, src, n.id) },
     h("div", {},
       h("div", { class: "cx-text" + (old ? " old" : "") }, n.text),
       h("div", { class: "cx-why" }, opts.kind === false ? null : kindBadge(ctx, n.kind), h("span", {}, day(n.ts)),
         n.was?.length ? h("span", { class: "was" }, "was: ", h("s", {}, n.was[0].text)) : n.supersedes?.length ? h("span", { class: "was" }, "updates an earlier note") : null,
-        old ? h("span", {}, n.superseded_by?.length ? "replaced" : "retired") : n.tag === "done" ? h("span", {}, "done") : null)),
+        old ? h("span", {}, closedWord(n)) : n.tag === "done" ? h("span", {}, "done") : null)),
     opts.tools || h("span"));
 }
 
@@ -762,7 +767,7 @@ function drawAnswer(ctx, out, a, src) {
     h("div", {}, h("div", { class: "cx-text" }, x.text), h("div", { class: "cx-why" }, kindBadge(ctx, x.kind), when(x),
       x.replaced ? h("span", { class: "was" }, "was: ", h("s", {}, x.replaced.replace(/^changed [0-9-]+; was: /, ""))) : null)), h("span"));
   const leadEl = lead ? h("div", { class: "cx-lead" },
-    h("div", { class: "cx-leadk" }, kindBadge(ctx, lead.kind), h("span", {}, `${lead.kind === "rule" ? "a rule" : "noted"} ${day(lead.ts)}`), lead.session && lead.session !== "-" ? h("a", { class: "mono", href: ctx.href(src.type, src.id, "sessions", lead.session) }, `session ${short(lead.session)}`) : null),
+    h("div", { class: "cx-leadk" }, kindBadge(ctx, lead.kind), h("span", {}, `noted ${day(lead.ts)}`), lead.session && lead.session !== "-" ? h("a", { class: "mono", href: ctx.href(src.type, src.id, "sessions", lead.session) }, `session ${short(lead.session)}`) : null),
     h("div", { class: "cx-leadt" }, lead.text),
     lead.replaced ? h("div", { class: "cx-leadw" }, "This replaced an earlier note: ", h("s", {}, lead.replaced.replace(/^changed [0-9-]+; was: /, ""))) : null,
     lead.id ? h("a", { href: "javascript:void 0", class: "small", onclick: () => historyDrawer(ctx, src, lead.id) }, "Its history") : null) : null;
@@ -790,7 +795,7 @@ function drawAnswer(ctx, out, a, src) {
     others.length ? [h("div", { class: "cx-sub" }, "Also relevant"), h("ul", { class: "cx-list" }, others.map(line))] : null,
     talk.length ? h("details", { class: "cx-context" }, h("summary", {}, `From past conversations (${talk.length})`), h("ul", { class: "cx-list" }, talk.map((x) => h("li", { class: "plain" }, h("div", {}, h("div", { class: "cx-text" }, h("span", { class: "muted" }, x.kind === "user" ? "Asked: " : "Answered: "), x.text), h("div", { class: "cx-why" }, when(x))), h("span"))))) : null,
     facts,
-    a.words_only ? null : h("details", { class: "cx-context" }, h("summary", {}, "Why these, with their scores"), h("div", { class: "cx-hint", style: { margin: "8px 0" } }, "Rules go in first; then the notes the searches found, by their words (BM25) and their meaning (cosine of the vectors), dated and in order until the budget is spent."), why),
+    a.words_only ? null : h("details", { class: "cx-context" }, h("summary", {}, "Why these, with their scores"), h("div", { class: "cx-hint", style: { margin: "8px 0" } }, "Rules that apply go in first; then the notes the searches found, by their words (BM25) and their meaning (cosine of the vectors), dated and in order until the budget is spent."), why),
     left ? h("details", { class: "cx-context" }, h("summary", {}, `Left out (${a.left_out.length})`), left) : null,
     a.context ? h("details", { class: "cx-context" }, h("summary", {}, `The context as the agent gets it (${fmt.n(a.chars)} characters)`), h("pre", { class: "code" }, a.context)) : null)));
 }
@@ -802,14 +807,14 @@ async function historyDrawer(ctx, src, id) {
   try { j = await src.history(id); }
   catch (e) { toast(e.message, "bad"); return; }
   const row = (n, now) => h("li", { class: "plain" },
-    h("div", {}, h("div", { class: "cx-text" + (n.tag === "superseded" && !now ? " old" : "") }, n.text),
-      h("div", { class: "cx-why" }, kindBadge(ctx, n.kind), h("span", {}, day(n.ts)), n.session ? h("a", { class: "mono", href: ctx.href(src.type, src.id, "sessions", n.session) }, `session ${short(n.session)}`) : null, n.tag === "superseded" ? h("span", {}, n.superseded_by?.length ? "replaced" : "retired") : n.tag === "done" ? h("span", {}, "done") : h("span", {}, "current"))),
+    h("div", {}, h("div", { class: "cx-text" + (closed(n) && !now ? " old" : "") }, n.text),
+      h("div", { class: "cx-why" }, kindBadge(ctx, n.kind), h("span", {}, day(n.ts)), n.session ? h("a", { class: "mono", href: ctx.href(src.type, src.id, "sessions", n.session) }, `session ${short(n.session)}`) : null, closed(n) ? h("span", {}, closedWord(n)) : n.tag === "done" ? h("span", {}, "done") : h("span", {}, "current"))),
     h("span"));
   drawer({
     title: "A note's history",
     sub: "Each version is kept; a context shows only the current one, with what it changed",
     body: h("div", {},
-      j.later.length ? [h("div", { class: "cx-sub" }, "Replaced by"), h("ul", { class: "cx-list" }, j.later.map((n) => row(n, n.tag !== "superseded")))] : null,
+      j.later.length ? [h("div", { class: "cx-sub" }, "Replaced by"), h("ul", { class: "cx-list" }, j.later.map((n) => row(n, !closed(n))))] : null,
       h("div", { class: "cx-sub" }, "This note"), h("ul", { class: "cx-list" }, row(j.note, true)),
       j.earlier.length ? [h("div", { class: "cx-sub" }, "It replaced"), h("ul", { class: "cx-list" }, j.earlier.map((n) => row(n, false)))] : null),
   });
@@ -837,7 +842,7 @@ function memoriesTab(page, ctx, src, only) {
       return;
     }
     body.replaceChildren(h("div", { class: "cx-hint", style: { marginBottom: "4px" } }, `${fmt.plural(ns.length, "note")}, the newest first. Open one for its history.`), h("ul", { class: "cx-list" }, ns.slice(0, 400).map((n) => noteLine(ctx, src, n, {
-      tools: src.writes && n.tag !== "superseded" ? h("div", { class: "cx-acts", onclick: (e) => e.stopPropagation() },
+      tools: src.writes && !closed(n) ? h("div", { class: "cx-acts", onclick: (e) => e.stopPropagation() },
         h("button", { class: "btn ghost icon sm", title: "Replace with a new version", "aria-label": "Replace", onclick: () => noteForm(ctx, src.id, n, load) }, icon("edit")),
         h("button", { class: "btn ghost icon sm", title: "Retire: leave it out of every context", "aria-label": "Retire", onclick: async () => {
           if (!(await ctx.core.confirm({ title: "Retire this note?", body: `“${n.text}” stays in the space's history but no context shows it again.`, ok: "Retire", danger: true }))) return;
@@ -1058,7 +1063,7 @@ function graphTab(page, ctx, src, focusId) {
     if (n.type === "entity") acts.push(h("a", { class: "btn sm", href: ctx.href(src.type, src.id, "ask", `What do we know about ${n.label}?`) }, "Ask about it"));
     if (n.type === "file" && src.tabs.includes("blame")) acts.push(h("a", { class: "btn sm", href: ctx.href(src.type, src.id, "blame", n.label) }, "Blame it"));
     side.replaceChildren(
-      h("div", { class: "cx-why" }, kind, n.type === "note" && !n.current ? h("span", {}, "replaced") : null, n.ts ? h("span", {}, day(n.ts)) : null),
+      h("div", { class: "cx-why" }, kind, n.type === "note" && !n.current ? h("span", {}, n.tag === "retired" ? "retired" : n.tag === "done" ? "done" : "replaced") : null, n.ts ? h("span", {}, day(n.ts)) : null),
       h("div", { class: "cx-gtitle" + (n.type === "note" && !n.current ? " old" : "") }, n.type === "note" ? n.text : n.label),
       acts.length ? h("div", { class: "row wrap", style: { gap: "6px", margin: "8px 0" } }, acts) : null,
       ...[...groups].map(([name, ms]) => h("div", { class: "cx-gnear" }, h("div", { class: "cx-gh" }, `${name} · ${ms.length}`),
@@ -1229,7 +1234,7 @@ function everyRecord(el, ctx, src, by) {
       const tool = r.kind === "tool_call" || r.kind === "tool_result";
       out.append(h("div", { class: "cx-rec" + (tool ? " tool" : ""), onclick: () => recordDrawer(ctx, src, r) },
         h("i", { class: "cx-sw", style: { background: color } }),
-        h("div", {}, h("div", { class: "cx-text" + (r.tag === "superseded" ? " old" : "") }, r.text),
+        h("div", {}, h("div", { class: "cx-text" + (closed(r) ? " old" : "") }, r.text),
           h("div", { class: "cx-why" }, h("span", { class: "badge" }, label), h("span", {}, when(r.ts)), h("a", { href: ctx.href(src.type, src.id, "sessions", r.session), onclick: (e) => e.stopPropagation(), class: "mono" }, short(r.session)),
             r.tag && r.tag !== "-" ? h("span", {}, r.tag) : null, r.files ? h("span", { class: "mono" }, r.files.split(/[,\n]/)[0]) : null))));
     }
@@ -1276,7 +1281,7 @@ function connectTab(page, ctx, src) {
           h("div", { class: "cx-hint" }, "Ask for context before a task, within a budget in tokens:"),
           h("pre", { class: "code cx-code" }, `curl -s ${b}/ask -H "authorization: Bearer $KEY" \\\n  -d '{"question": "Who approves a 700 EUR refund?", "budget": 2000}'`),
           h("div", { class: "cx-hint" }, "The records are rows of the space's table, so SQL reads them too:"),
-          sqlBlock(`SELECT kind, text, ts FROM ctx_${name} WHERE kind IN ('decision', 'preference') AND tag != 'superseded' ORDER BY ts DESC LIMIT 20`)),
+          sqlBlock(`SELECT kind, text, ts FROM ctx_${name} WHERE kind IN ('decision', 'preference') AND tag NOT IN ('superseded', 'retired') ORDER BY ts DESC LIMIT 20`)),
       }),
       handOver(ctx, src)), make.el);
     return make.stop;

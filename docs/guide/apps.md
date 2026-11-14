@@ -150,7 +150,7 @@ print(answer["context"])
 
 ```text output
 True
-Notes from earlier conversations with the user, in their current versions, oldest first (date, kind, note; what it replaced in brackets). Rules come first; a later note can change what an earlier one says:
+Notes from earlier conversations with the user, in their current versions, oldest first (date, kind, note; what it replaced in brackets). Rules that apply come first; a later note can change what an earlier one says:
 - 2026-10-15 decision: Refunds above 1000 EUR need the finance manager's approval; team leads approve up to 1000 EUR. (changed 2026-10-15; was: Refunds above 500 EUR need a team lead's approval.)
 - 2026-10-20 fact: Refunds are paid back to the original card within 5 working days.
 ```

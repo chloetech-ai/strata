@@ -86,6 +86,16 @@ impl Kind {
     }
 }
 
+/// The tag of a note retired by hand: it no longer holds, and no later note
+/// replaced it (one that did is tagged `superseded`).
+pub const RETIRED: &str = "retired";
+
+/// Whether a note's tag says it no longer holds: a later note replaced it
+/// (`superseded`), or it was retired ([`RETIRED`]).
+pub fn closed_tag(tag: &str) -> bool {
+    tag == "superseded" || tag == RETIRED
+}
+
 /// An edge from one record to another: `about` an entity, `from` the turn a
 /// note was written from, `supersedes` an older note, `touches` a file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

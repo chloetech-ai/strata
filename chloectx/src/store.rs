@@ -536,6 +536,17 @@ impl Store {
         Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
     }
 
+    /// The notes of `sessions` a later note superseded.
+    pub fn superseded_in(&self, sessions: &[String]) -> Result<Vec<Record>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let kinds: Vec<String> = Kind::ALL.iter().filter(|k| k.is_knowledge()).map(|k| format!("'{}'", k.as_str())).collect();
+        let sql = format!("SELECT {COLUMNS} FROM memory WHERE tag = 'superseded' AND kind IN ({}) AND session IN (:sessions) LIMIT 10000", kinds.join(", "));
+        let rs = self.query_with(&sql, &Params::new().set("sessions", strs(sessions)))?;
+        Ok(rs.rows.iter().filter_map(|r| row_record(r)).collect())
+    }
+
     /// The records of `session` with `seq` in `[lo, hi]`, in order.
     pub fn range(&self, session: &str, lo: i64, hi: i64) -> Result<Vec<Record>> {
         let rs = self.query_with(
