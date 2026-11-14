@@ -193,11 +193,13 @@ fn stat_cached(cwd: &str, main: &str, stamp: i64) -> Option<(usize, i64, i64)> {
 
 /// The journeys' group of an agent (JOURNEYS.md, "Global elements"): needs
 /// you, working, ready (its turn is over, or it finished, and its branch
-/// changed something main does not have) or finished.
+/// changed something main does not have), idle (its turn is over and it
+/// changed nothing: it waits for your next message) or finished.
 pub fn group_of(state: &str, running: bool, changed: bool) -> &'static str {
     match (running, state) {
         (true, "waiting") => "needs",
         (true, "idle") if changed => "ready",
+        (true, "idle") => "idle",
         (true, _) => "working",
         (false, _) if changed => "ready",
         (false, _) => "finished",
@@ -254,7 +256,7 @@ pub fn list_full(sup: &std::sync::Arc<Supervisor>, lv: &std::sync::Arc<crate::le
         let c = |k: &str| counts.get(k).copied().unwrap_or(0);
         r["project"] = json!(names.get(&path).cloned().unwrap_or_else(|| name_of(main)));
         r["trusted"] = json!(trusted(sup, &path));
-        r["counts"] = json!({ "needs": c("needs"), "working": c("working"), "ready": c("ready"), "finished": c("finished"), "running": c("running") });
+        r["counts"] = json!({ "needs": c("needs"), "working": c("working"), "idle": c("idle"), "ready": c("ready"), "finished": c("finished"), "running": c("running") });
         r["groups"] = Json::Object(groups);
         r["merged"] = Json::Object(merged_ids);
         r["ready"] = Json::Array(ready);
@@ -435,6 +437,15 @@ async fn dirs_route(Query(q): Query<PathQ>) -> ApiResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_agent_is_idle_not_working() {
+        assert_eq!(group_of("idle", true, false), "idle");
+        assert_eq!(group_of("idle", true, true), "ready");
+        assert_eq!(group_of("working", true, false), "working");
+        assert_eq!(group_of("waiting", true, false), "needs");
+        assert_eq!(group_of("exited", false, false), "finished");
+    }
 
     #[test]
     fn completes_folders_with_git_checkouts_first() {

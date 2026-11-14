@@ -514,7 +514,7 @@ export function bank(cols, ...tiles) {
 }
 
 /** A state dot and its word: group is needs|working|ready|finished|failed. */
-export const GROUP_WORDS = { needs: "needs you", working: "working", ready: "ready", finished: "finished", failed: "failed" };
+export const GROUP_WORDS = { needs: "needs you", working: "working", idle: "idle", ready: "ready", finished: "finished", failed: "failed" };
 export function stateDot(group, text) {
   return h("span", { class: `st ${group}` }, h("i", {}), text || GROUP_WORDS[group] || group);
 }
@@ -735,6 +735,7 @@ useStyle("goal-pieces", `
 .st.needs{color:var(--accent-text);font-weight:var(--w-mid)}.st.needs i{background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .st.working i{background:var(--good)}
 .st.ready i{background:transparent;border:1.5px solid var(--good)}
+.st.idle i{background:transparent;border:1.5px solid var(--text-3)}
 .st.failed{color:var(--crit-ink)}.st.failed i{background:var(--crit)}
 .kv{display:grid;grid-template-columns:96px minmax(0,1fr);gap:var(--s-2) var(--s-4);margin:var(--s-3) 0 0}
 .kv dt{font:var(--w-mid) var(--fs-xs)/var(--lh-body) var(--mono);letter-spacing:var(--track-label);text-transform:uppercase;color:var(--text-2)}

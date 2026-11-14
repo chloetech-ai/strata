@@ -530,6 +530,12 @@ pub fn check(sup: &Supervisor, id: &str, hook: &Json) -> Option<Json> {
         return Some(deny(path_reason(&pat, &rel)));
     }
     let cmd = hook["tool_input"]["command"].as_str()?;
+    // A pkill/killall that would end processes this session did not start
+    // (another agent, its server): src/killguard.rs.
+    if let Some(reason) = crate::killguard::check(sup, id, a.pid, cmd) {
+        note(format!("guarded: ends others' processes: {}", one_line(cmd, 160)), json!({ "command": cmd, "rule": "kill-others" }));
+        return Some(deny(reason));
+    }
     if let Some((rule, label)) = matches(cmd, &cwd, &cwd, &rules, &default_branch(&main), crate::git::current_branch(&cwd).as_deref()) {
         note(format!("guarded: {label}: {}", one_line(cmd, 160)), json!({ "command": cmd, "rule": rule }));
         return Some(deny(format!(

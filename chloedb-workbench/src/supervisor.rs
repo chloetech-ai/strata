@@ -343,10 +343,7 @@ pub fn summarize(kind: &str, hook: &Json) -> String {
         "Notification" => one_line(s("message"), 200),
         "Stop" => "turn finished".into(),
         "SubagentStop" => "subagent finished".into(),
-        "SessionEnd" => match s("reason") {
-            "" => "session ended".into(),
-            r => format!("session ended ({r})"),
-        },
+        "SessionEnd" => crate::endings::session_end_words(s("reason")),
         other => other.to_string(),
     }
 }
@@ -815,6 +812,14 @@ impl Supervisor {
     }
 
     fn exited(&self, id: &str, code: i64) {
+        // Why, in plain words: Stop pressed here, its SessionEnd reason, and
+        // other agents' commands that ended processes just before.
+        let end_reason = {
+            let p = chloedb::query::Params::new().set("agent", chloedb::Value::Str(id.to_string()));
+            let rows = self.db.query("SELECT data FROM events WHERE agent = :agent AND kind = 'SessionEnd' ORDER BY seq DESC LIMIT 1", &p).unwrap_or_default();
+            rows.first().and_then(|r| crate::db::get_str(&r[0])).and_then(|d| serde_json::from_str::<Json>(&d).ok()).and_then(|d| d["reason"].as_str().map(str::to_string))
+        };
+        let suspects = if code == 0 || code > 128 { crate::endings::kill_suspects(self, id, now_ms(), 20_000) } else { Vec::new() };
         let mut inner = self.inner.lock().unwrap();
         let Some(slot) = inner.slots.get_mut(id) else { return };
         if let Some(t) = &slot.term {
@@ -823,8 +828,15 @@ impl Supervisor {
         Self::set_state(&mut slot.agent, "exited");
         slot.agent.exit_code = Some(code);
         slot.agent.ended = Some(now_ms());
+        let stopped = slot.extra.get("stop_requested").is_some();
+        let why = crate::endings::exit_words(code, stopped, end_reason.as_deref(), &suspects);
+        if let Some(o) = slot.extra.as_object_mut() {
+            o.insert("ended_why".into(), json!(why));
+            o.remove("stop_requested");
+        }
+        let _ = self.db.set_mark(&extra_key(id), &slot.extra.to_string());
         let parent = slot.agent.parent.clone();
-        let _ = self.record(&mut inner, id, "exited", None, format!("exited with code {code}"), None);
+        let _ = self.record(&mut inner, id, "exited", None, format!("exited with code {code}: {why}"), Some(json!({ "code": code, "why": why, "stopped": stopped, "reason": end_reason, "suspects": suspects }).to_string()));
         if let Some(p) = parent {
             self.emit_agent(&inner, &p);
         }
@@ -1081,8 +1093,12 @@ impl Supervisor {
     /// chose once, else yes): see `preview::servers`.
     pub fn stop_with(&self, id: &str, servers: Option<bool>) -> Result<(), ApiError> {
         let term = {
-            let inner = self.inner.lock().unwrap();
-            let slot = inner.slots.get(id).ok_or_else(|| ApiError::not_found(format!("no agent {id}")))?;
+            let mut inner = self.inner.lock().unwrap();
+            let slot = inner.slots.get_mut(id).ok_or_else(|| ApiError::not_found(format!("no agent {id}")))?;
+            // So that its end says "Stopped from Workbench" (src/endings.rs).
+            if let Some(o) = slot.extra.as_object_mut() {
+                o.insert("stop_requested".into(), json!(now_ms()));
+            }
             slot.term.clone()
         };
         let with_servers = servers.unwrap_or_else(|| crate::preview::servers::policy(self).as_deref() != Some("keep"));

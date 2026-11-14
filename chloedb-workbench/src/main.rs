@@ -56,6 +56,9 @@ mod rulesuggest;
 mod needs;
 // Optimize the harness: versions, findings, the permissions and memory editors.
 mod harness;
+// Why a session ended, in plain words.
+mod endings;
+mod killguard;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
