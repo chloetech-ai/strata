@@ -3643,11 +3643,14 @@ details.card-ish[open] > summary { margin-bottom: 8px; }
 }
 
 /* A view with a time range fills the top bar: below 1600 px the buttons
-   keep their icons, the key its icon and the title its room to shrink, so
-   the bar never pushes the page wider than the window. */
+   keep their icons and the title its room to shrink, so the bar never
+   pushes the page wider than the window. The signed-in key keeps its
+   name, shorter, down to 1360 px (CCW-16). */
 .top .crumbs { flex: 0 0.25 auto; min-width: 0; }
 @media (max-width: 1600px) {
-  .top:not(.no-range) .btn:not(.ask-open) .lbl, .top:not(.no-range) .who span { display: none; }
+  .top:not(.no-range) .btn:not(.ask-open) .lbl { display: none; }
+  .top:not(.no-range) .who span { max-width: 120px; }
+  .top:not(.no-range) .search-btn { flex-shrink: 6; }
   .top:not(.no-range) .search-btn kbd { display: none; }
   .top:not(.no-range) .crumbs .sub, .top:not(.no-range) .crumbs:not(.titled) .cname, .top:not(.no-range) .crumbs:not(.titled) .csep { display: none; }
 }
