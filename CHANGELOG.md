@@ -11,6 +11,8 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
+- A client's own deadline that passes while its query is still being planned counts as the client's (`client_deadline`), as it does once the query runs, and no longer as the server's `timeout`. A slow runner planned past a 1 ms deadline and failed `a_shard_counts_its_client_s_deadline_as_the_client_s`.
+
 ## 0.3.3
 
 The afternoon audit's fixes, a ChloeCtx inspector organised by space, and

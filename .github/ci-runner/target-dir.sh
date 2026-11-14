@@ -19,10 +19,17 @@ if [ -n "${CI_RUNNER_CACHE:-}" ]; then
   fi
   mkdir -p "$dir"
   echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
-  # The compile cache both runners share (provision.sh installs sccache):
-  # a build folder that starts over recompiles from it, not from source.
+  # The compile cache (provision.sh installs sccache): a build folder that
+  # starts over recompiles from it, not from source. Each runner has its
+  # own folder and its own server: sccache's clients use whatever server
+  # is up on their port, and a server dies with the job that started it,
+  # so a shared one failed the other runner's builds (11-14: "Permission
+  # denied" on a folder that runner's job never named).
   if command -v sccache >/dev/null; then
-    { echo "RUSTC_WRAPPER=sccache"; echo "SCCACHE_DIR=$(dirname "$CI_RUNNER_CACHE")/sccache"; echo "SCCACHE_CACHE_SIZE=40G"; } >> "$GITHUB_ENV"
+    cache="$CI_RUNNER_CACHE/sccache"
+    mkdir -p "$cache"
+    n=$(basename "$CI_RUNNER_CACHE" | tr -dc 0-9)
+    { echo "RUSTC_WRAPPER=sccache"; echo "SCCACHE_DIR=$cache"; echo "SCCACHE_SERVER_PORT=$((4300 + ${n:-0}))"; echo "SCCACHE_CACHE_SIZE=30G"; } >> "$GITHUB_ENV"
   fi
   echo "building in $dir ($(df -h --output=avail "$dir" | tail -1 | tr -d ' ') free)"
 fi

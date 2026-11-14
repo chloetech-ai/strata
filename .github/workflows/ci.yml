@@ -256,7 +256,7 @@ jobs:
         crate: ${{ fromJSON(needs.changes.outputs.run).crates }}
     # chloedb-server's and ChloeDB's tests, the longest jobs, run on the
     # on-demand runner when it is up (job `runner`).
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && (matrix.crate == 'chloedb-server' || matrix.crate == 'chloedb') && needs.runner.outputs.label || matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (matrix.crate == 'chloedb-server' || matrix.crate == 'chloedb') && needs.runner.outputs.label || (matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os) }}
     # rust-cache saves only from a job that passed, so a macOS job that ran
     # out of time starts the next one cold too: chloedb-server's tests took
     # 59 minutes from a cold build on the macOS runner on 11-08, and Clippy
@@ -348,6 +348,12 @@ jobs:
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --locked --release --all-targets ${{ matrix.crate == 'chloedb' && '--features sqlite' || '' }} -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
 
+  # The macOS jobs run on the user's Mac (self-hosted runners labelled
+  # `chloedb-mac`) when the repository variable MAC_RUNNER names that
+  # label; unset, they run on macos-latest. macOS jobs run only on a push
+  # to main, the nightly run and by hand, never on a pull request, so no
+  # outside code reaches the Mac. Unset the variable to switch back.
+  #
   # ChloeDB's tests on macOS for a push to main: the `test` job's steps, in
   # a job of its own that CI result does not wait for (see the top of this
   # file). A pull request and the merge queue skip it. In the nightly run
@@ -360,7 +366,7 @@ jobs:
       matrix:
         os: [macos-latest]
         crate: [chloedb]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
     timeout-minutes: 60
     env: *test-env
     steps: *test-steps
@@ -532,7 +538,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
     timeout-minutes: 60
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
@@ -832,7 +838,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -975,7 +981,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1054,7 +1060,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
