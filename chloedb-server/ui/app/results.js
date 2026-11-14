@@ -60,10 +60,11 @@ export function csvLines(rows, sep = ",") { return rows.map((r) => r.map((v) => 
 export function asDelimited(j, sep = ",") { return [j.columns.map((c) => csvCell(c, sep)).join(sep), ...j.rows.map((r) => r.map((v) => csvCell(v, sep)).join(sep))].join("\n") + "\n"; }
 
 /**
- * The grid of an answer: grid(j, {onRow}). Sorted by a column's header,
- * columns resized by their edge, a row's details on a click.
+ * The grid of an answer: grid(j, {onRow, first}). Sorted by a column's
+ * header, columns resized by their edge, a row's details on a click.
+ * `first` numbers the first row (a page's rows go on from the last's).
  */
-export function grid(j, { max = 1000, onRow } = {}) {
+export function grid(j, { max = 1000, onRow, first = 1 } = {}) {
   const cols = j.columns || [];
   // The score column, unless it is a returned column again (ORDER BY n
   // gives each row's n as its score).
@@ -106,7 +107,7 @@ export function grid(j, { max = 1000, onRow } = {}) {
   function body() {
     clear(tbody, order.slice(0, shown).map((i, n) => {
       const r = j.rows[i];
-      const tr = h("tr", { class: "click", tabIndex: 0 }, h("td", { class: "rn" }, n + 1),
+      const tr = h("tr", { class: "click", tabIndex: 0 }, h("td", { class: "rn" }, first + n),
         scored ? h("td", { class: "num sc" }, h("div", { class: "scbar", style: { width: Math.abs(j.scores[i] ?? 0) / maxScore * 100 + "%" } }), h("span", {}, j.scores[i] == null ? "–" : fmt.n(j.scores[i], 4))) : null,
         r.map((v, ci) => h("td", { class: isNum(v) ? "num" : "", style: widths[ci] ? { maxWidth: widths[ci] + "px" } : null }, cell(v, j.columns?.[ci]))));
       const open = () => (onRow || rowDrawer)(i, j);

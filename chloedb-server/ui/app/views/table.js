@@ -7,7 +7,7 @@
 // search (a stored function, an endpoint, an agent's tool) from here.
 // #/table lists the tables, the user's own first.
 
-import { h, icon, clear, api, card, empty, failure, fmt, toast, copy, seg, gate, can, sqlBlock, store, debounce, table } from "../core.js";
+import { h, icon, clear, api, card, empty, failure, fmt, toast, copy, seg, gate, can, sqlBlock, store, debounce, table, bus, ApiError } from "../core.js";
 import { tables, cached, table as tableOf, isStored, isTestModel, typeBadge, invalidate } from "../catalog.js";
 import { ownerOf, isMine, folded } from "../owners.js";
 import { quoteName } from "../sqledit.js";
@@ -454,15 +454,27 @@ function render(page, r) {
         count.textContent = n ? `rows ${fmt.n(from)}–${fmt.n(to)}${total != null ? ` of ${fmt.n(total)}${where.trim() ? " matching" : ""}` : ""}` : where.trim() ? "no row matches" : "";
         next.disabled = n < size || (total != null && to >= total);
         clear(exp, n ? exportMenu(j, t.table) : null);
-        clear(out, n ? h("div", { class: "tbl-wrap" }, grid(j, { max: size })) : where.trim() ? empty("search", "No row matches", `Nothing in ${t.table} has ${where.trim()}.`, h("button", { class: "btn", onclick: () => { filter.value = where = ""; page = 0; keep(); load(); } }, "Clear the filter")) : empty("table", "No rows yet", "Import a file into it, or write rows from code.", gate(h("a", { class: "btn", href: "#/import" }, icon("import"), "Import into it"), "write")));
+        clear(out, n ? h("div", { class: "tbl-wrap" }, grid(j, { max: size, first: page * size + 1 })) : where.trim() ? empty("search", "No row matches", `Nothing in ${t.table} has ${where.trim()}.`, h("button", { class: "btn", onclick: () => { filter.value = where = ""; page = 0; keep(); load(); } }, "Clear the filter")) : empty("table", "No rows yet", "Import a file into it, or write rows from code.", gate(h("a", { class: "btn", href: "#/import" }, icon("import"), "Import into it"), "write")));
       } catch (e) {
         if (my !== seq) return;
+        // A refused condition or a server that does not answer leaves no
+        // page: not the last one's rows and count beside the error, nor a
+        // Next to a page that cannot be read (CCB-19).
+        failed = !(e instanceof ApiError && e.answered);
+        last = null; total = null;
         err.hidden = false;
-        clear(err, icon("warn"), " ", e.message, where.trim() ? h("span", { class: "muted" }, " · a condition is what follows WHERE: brand = 'x' AND price > 10") : null);
-        if (!last) clear(out);
+        clear(err, icon("warn"), " ", e.message, where.trim() && !failed ? h("span", { class: "muted" }, " · a condition is what follows WHERE: brand = 'x' AND price > 10") : null);
+        count.textContent = "";
+        next.disabled = true;
+        clear(exp);
+        clear(out, failed ? h("div", { class: "small muted", style: { padding: "12px" } }, "The rows show again once the server answers.") : null);
       } finally { if (my === seq) out.style.opacity = ""; }
     }
+    // A page the server did not answer is read again when it answers.
+    let failed = false;
+    const off = bus.on("connection", (c) => { if (c.ok && failed) { failed = false; load(); } });
     load();
+    return off;
   }
 
   // ---------------------------------------------------------- Quality
