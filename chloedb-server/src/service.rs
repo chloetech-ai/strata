@@ -3988,18 +3988,16 @@ impl Service {
     /// Refreshes the database's rollups ([`Db::refresh_rollup`]), every
     /// bucket of each when `full`, as a server that takes writes does
     /// every few seconds ([`crate::server::spawn_rollups`]): not a replica,
-    /// which applies the rollups' writes its primary ships. The buckets it
-    /// folded again.
-    pub fn refresh_rollups_due(&self, full: bool) -> chloedb::Result<u64> {
-        let Backend::Local(db) = &self.backend else { return Ok(0) };
+    /// which applies the rollups' writes its primary ships. Each rollup is
+    /// refreshed on its own, so that one whose refresh fails leaves the
+    /// others to go on ([`Db::refresh_rollups`]): each rollup's name and
+    /// what its refresh did, or why it failed.
+    pub fn refresh_rollups_due(&self, full: bool) -> chloedb::Result<Vec<(String, chloedb::Result<chloedb::db::RefreshStats>)>> {
+        let Backend::Local(db) = &self.backend else { return Ok(Vec::new()) };
         if matches!(self.replication(), Replication::Replica(_)) || self.failing().is_some() || self.moving.mask().is_some() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-        let mut folded = 0;
-        for r in db.rollups()? {
-            folded += db.refresh_rollup(&r.name, full)?.folded;
-        }
-        Ok(folded)
+        db.refresh_rollups(if full { chloedb::query::rollup::Refresh::Full } else { chloedb::query::rollup::Refresh::Recent })
     }
 
     /// Deletes the database's records of idempotency keys older than
@@ -4304,10 +4302,10 @@ impl Service {
         };
         let t0 = Instant::now();
         match st {
-            Statement::Refresh { name, full } => {
+            Statement::Refresh { name, mode } => {
                 self.takes_writes()?;
                 let db = db.clone();
-                let s = tokio::task::spawn_blocking(move || db.refresh_rollup(&name, full)).await.map_err(ApiError::internal)??;
+                let s = tokio::task::spawn_blocking(move || db.refresh_rollup_with(&name, mode)).await.map_err(ApiError::internal)??;
                 let columns = ["buckets_checked", "buckets_folded", "rows_written", "seconds"].map(String::from).to_vec();
                 let rows = vec![vec![Value::Int(s.checked as i64), Value::Int(s.folded as i64), Value::Int(s.rows_written as i64), Value::Float(s.seconds)]];
                 let rs = ResultSet { columns, rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() };

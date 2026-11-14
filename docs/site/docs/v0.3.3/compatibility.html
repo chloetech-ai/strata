@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Compatibility · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="What this code promises about the files it reads and writes, the protocol its servers speak to each other, and the names it was known by before; and what it does not promise yet. It describes the code as it is on…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/compatibility.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html" aria-current="page">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Server and cluster</span>
+      <h1>Compatibility</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/compatibility.md">docs/compatibility.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-database-file">The database file</a></li><li><a href="#the-packages-and-the-engine">The packages and the engine</a></li><li><a href="#a-cluster-of-mixed-versions">A cluster of mixed versions</a></li><li><a href="#old-names">Old names</a></li><li><a href="#not-promised-yet">Not promised yet</a></li></ol></details>
+    <div class="doc-body">
+
+<p>What this code promises about the files it reads and writes, the protocol
+its servers speak to each other, and the names it was known by before; and
+what it does not promise yet. It describes the code as it is on <code>main</code>
+(November 2026, every crate and package at version 0.3.0). The
+<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/CHANGELOG.md">changelog</a> says what changed.</p>
+<p>ChloeDB is pre-1.0: the statements below are the current behaviour, which
+the code enforces, not a support commitment with a time limit.</p>
+<h2 id="the-database-file">The database file<a class="anchor" href="#the-database-file" aria-label="Link to this section">#</a></h2>
+<p>A database is one file (or, with <code>directory</code>, a directory with a <code>CURRENT</code>
+file naming its manifest). Its format has two layers.</p>
+<p><strong>Format version.</strong> The file's meta slots carry a format version
+(<code>FORMAT_VERSION</code> in <code>chloedb/src/storage/pager.rs</code>, now 3):</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>format</th>
+<th>what it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>a database holding only the table it was created with</td>
+</tr>
+<tr>
+<td>2</td>
+<td>a database of several tables</td>
+</tr>
+<tr>
+<td>3</td>
+<td>format 2 with the list of features the database uses; the last format number: later changes add features instead</td>
+</tr>
+</tbody>
+</table></div>
+<p>This code opens formats 1 to 3 and refuses a higher number
+("unsupported format version").</p>
+<p><strong>Features.</strong> A format-3 manifest lists the features it uses,
+<code>{required: [...], optional: [...]}</code> (<code>chloedb/src/storage/manifest.rs</code>).
+A reader refuses a database that requires a feature it does not know, and
+names the feature; it ignores optional features and keys it does not know.
+This code knows: <code>added_fields</code>, <code>bool</code>, <code>cluster_by</code>, <code>cold_segments</code>,
+<code>compact_keys</code>, <code>default</code>, <code>derive</code>, <code>derive_keyword</code>, <code>derive_text</code>, <code>edge_table</code>,
+<code>expire_by</code>, <code>field_ids</code>, <code>functions</code>, <code>json</code>, <code>json_text</code>, <code>media</code>,
+<code>multi_vector</code>, <code>not_null</code>, <code>packed_positions</code>, <code>rank_profiles</code>, <code>rabitq</code>,
+<code>retain</code>, <code>semantic_id</code>, <code>seq_no</code>, <code>shard_by</code>, <code>sources</code>, <code>sparse_embed</code>,
+<code>substring:1</code>, <code>timestamp</code>, <code>vector_partition</code> and <code>zstd</code> (the list <code>FEATURES</code> in
+<code>manifest.rs</code> is the authority), and <code>analyzer:&lt;name&gt;:&lt;version&gt;</code> for each
+analyzer but <code>english</code> (<code>Analyzer::feature</code> in <code>chloedb/src/text/analyzer.rs</code>).</p>
+<p>0.3.0 added <code>analyzer:&lt;name&gt;:1</code> for its new analyzers (<code>simple</code>'s, from
+before, is unchanged), <code>substring:1</code> (a substring index), <code>sparse_embed</code> (a
+SPARSE field a model fills) and <code>derive_keyword</code> (a KEYWORD field derived
+from a text). Each is written only by a database that uses it: a 0.2.x build
+refuses such a database by name and opens every other database 0.3.0
+wrote.</p>
+<p><strong>What it writes.</strong> Every database this code creates is format 3 with
+feature <code>field_ids</code> (each field named by an id rather than its position).
+Other features are added as a database starts using them (a BOOL or
+TIMESTAMP field, a NOT NULL field or a DEFAULT, sequence numbers with
+<code>--seq-no</code>, a rank profile, ...). So a database stays readable by an older
+build exactly as long as it uses only features that build knows, and an
+older build that meets a newer feature refuses the file by name rather than
+misreading it. Starting to use a feature cannot be undone.</p>
+<p><strong>Rollups.</strong> A rollup made by 0.3.3 or later keys its rows by number,
+where one made by 0.3.1 or 0.3.2 keys them by text. 0.3.3 reads and
+refreshes both. 0.3.2 reads the new kind but cannot refresh it, so its
+definition carries the option <code>needs_chloedb_0_3_3</code>, which 0.3.2 refuses
+by name ("no option needs_chloedb_0_3_3"): a refresh by 0.3.2 fails with
+that message rather than leaving the rollup's newest buckets stale. Open a
+database whose rollups 0.3.3 made with 0.3.3 or later.</p>
+<p><strong>Databases from before field ids.</strong> A database written before field ids
+(format 1, 2, or 3 without <code>field_ids</code>) no longer opens for use. <code>upgrade()</code>
+(<code>chloedb.upgrade(path)</code> in Python, <code>upgrade(path)</code> in JavaScript;
+<code>chloedb/src/upgrade.rs</code>) copies it
+into a new database of this format in its place and keeps the old files
+beside it as <code>&lt;path&gt;.before-field-ids</code>. It refuses a database that numbers
+its writes (replication) or keeps stream offsets (<code>_sources</code>), since the
+copy could not continue their numbers: such a database is rebuilt from its
+source or from a replica instead.</p>
+<p><strong>Not promised.</strong> There is no downgrade: a file a newer build changed may
+not open in an older one. There is no stated period for which an old
+format stays readable by new builds; formats 1 to 3 and the <code>upgrade()</code>
+path are what this code has, and a change to that will be in the
+changelog.</p>
+<h2 id="the-packages-and-the-engine">The packages and the engine<a class="anchor" href="#the-packages-and-the-engine" aria-label="Link to this section">#</a></h2>
+<p>The Python wheel, the JavaScript addon and the Java library each compile
+the engine (<code>chloedb/</code>) into themselves from the same commit. A package
+version therefore opens what the engine of its commit opens (above), no
+more: a wheel built from an older commit refuses a file that uses a feature
+added since, by name. The Java jar checks that its native library is from
+the same checkout (<code>Native.ABI</code>) and refuses a mismatched pair.</p>
+<p>The HTTP clients (<code>chloedb.connect</code> in Python, <code>chloedb/client</code> in
+JavaScript) contain no engine: they speak the server's <code>/v1</code> HTTP JSON API
+and work with any server that has the routes they call. A client newer than
+its server may send an option the server does not know, and an older
+server may ignore it rather than refuse it (one from before Arrow answers
+ignores <code>"format": "arrow"</code>): the clients detect and fall back where their
+documentation says so (Arrow answers, scrolls), and otherwise assume a
+server of their own commit.</p>
+<p><strong>Not promised.</strong> A package does not yet expose the engine commit or the
+format version it was built with, and nothing checks that a client and a
+server are of the same release. Every crate and package carries the
+version of the last release (0.3.0), and keeps it between releases: name a
+build from a commit after a release by its commit.</p>
+<h2 id="a-cluster-of-mixed-versions">A cluster of mixed versions<a class="anchor" href="#a-cluster-of-mixed-versions" aria-label="Link to this section">#</a></h2>
+<p>Servers of a cluster (coordinators, shards, replicas, followers) talk over
+gRPC with a numbered shard protocol (<code>chloedb-server/src/grpc.rs</code>:
+<code>MIN_PROTOCOL</code> 1, <code>PROTOCOL</code> 21; <a href="server.html">the list of what each adds</a>).</p>
+<ul>
+<li>When a coordinator or a peer connects it calls <code>Hello</code> with the range it
+  speaks (1 to 20) and the server answers its own range, the plan version
+  it reads (plan IR version 1) and the plan features it has. The two use
+  the highest protocol both speak; if the ranges do not meet the connection
+  is refused, naming both ranges. A coordinator asks again every minute and
+  after a copy fails, since it may have restarted on another version.</li>
+<li>A coordinator keeps each shard copy's protocol, speaks the oldest any of
+  them speaks, and uses a newer call only where every server it needs
+  speaks it. Where one does not, it refuses
+  that request by name ("a coordinator refuses a scroll while a shard
+  speaks an older one") or falls back (rows instead of Arrow columns; a
+  read sent to the primary when a replica is older than protocol 5) rather
+  than sending a call the shard would misread.</li>
+<li>A server refuses a protocol newer than its own, and a plan of a newer
+  version or one that needs a feature it lacks, by name.
+  0.3.0 added the plan feature <code>terms_syntax</code>, which only a search with
+  query expansion (<code>bm25(.., expand =&gt; n)</code>) uses: a 0.2.x shard refuses
+  such a search by name, so upgrade the shards before using it.
+  0.3.1 added the plan features <code>asof_join</code> (<code>ASOF JOIN</code>), <code>date_bin</code> (a
+  <code>GROUP BY</code> of <code>date_bin</code> or <code>date_trunc</code> run on the columns) and
+  <code>approx_percentiles</code> (<code>approx_percentile</code>): a 0.3.0 shard refuses a
+  query that uses one by name, so upgrade the shards first here too.
+  0.3.2 moved the shard protocol to 21 (write receipts' counts, strict
+  writes, <code>insert_if_absent</code>) and added the plan feature <code>full_join</code>
+  (<code>FULL JOIN</code>): a coordinator counts and writes strictly only
+  through shards of 21, and a 0.3.1 shard refuses a full join by name, so
+  upgrade the shards before the coordinator.</li>
+</ul>
+<p>So a rolling upgrade works shard by shard: while versions are mixed, the
+cluster serves what the oldest server involved speaks, and the newer
+features turn on as the last server is upgraded (some, such as slot maps,
+only once the coordinator restarts after that). A replica is sent copies
+of its primary's rows and files, so the file-format rules above apply
+between them too: a replica older than its primary refuses a feature the
+primary started using. Upgrading the replicas of a shard before its
+primary avoids that.</p>
+<p><strong>Not promised.</strong> There is no stated lowest version a cluster can be
+upgraded from in one step, and mixed-version clusters are tested for the
+protocol fallbacks above, not as a matrix of releases.</p>
+<h2 id="old-names">Old names<a class="anchor" href="#old-names" aria-label="Link to this section">#</a></h2>
+<p>ChloeDB was called Strata, and ChloeCtx was called Engram, until November
+2026. The old names below are still accepted, and are promised "for a
+release": they will be removed in a release that the changelog names in
+advance.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>what</th>
+<th>new name</th>
+<th>old name, still accepted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>programs</td>
+<td><code>chloedb-server</code>, <code>chloedb-crawl</code>, <code>chloedb-sheets</code></td>
+<td><code>strata-server</code>, <code>strata-crawl</code>, <code>strata-sheets</code>, in the image and the release archives</td>
+</tr>
+<tr>
+<td>container image</td>
+<td><code>ghcr.io/chloetech-ai/chloedb-server</code></td>
+<td><code>ghcr.io/chloetech-ai/strata-server</code></td>
+</tr>
+<tr>
+<td>settings</td>
+<td><code>CHLOEDB_*</code></td>
+<td><code>STRATA_*</code></td>
+</tr>
+<tr>
+<td>the server an app writes to</td>
+<td><code>chloedb-crawl --server URL</code>, <code>chloedb-sheets --server URL</code> (0.3.2)</td>
+<td><code>--strata URL</code></td>
+</tr>
+<tr>
+<td>models folder</td>
+<td><code>~/.local/share/chloedb/models</code> (0.3.2)</td>
+<td><code>~/.local/share/strata/models</code>, used where it exists and the new folder does not</td>
+</tr>
+<tr>
+<td>HTTP headers and gRPC metadata</td>
+<td><code>x-chloedb-*</code></td>
+<td><code>x-strata-*</code></td>
+</tr>
+<tr>
+<td>Python package</td>
+<td><code>import chloedb</code>, <code>ChloeDBError</code></td>
+<td><code>import strata</code>, <code>StrataError</code> (with a <code>DeprecationWarning</code>)</td>
+</tr>
+<tr>
+<td>JavaScript errors</td>
+<td><code>ChloeDBError</code></td>
+<td><code>StrataError</code></td>
+</tr>
+<tr>
+<td>JDBC URLs</td>
+<td><code>jdbc:chloedb:</code></td>
+<td><code>jdbc:strata:</code></td>
+</tr>
+<tr>
+<td>ChloeCtx program</td>
+<td><code>chloectx</code></td>
+<td><code>engram</code>, a link to it</td>
+</tr>
+<tr>
+<td>ChloeCtx settings</td>
+<td><code>CHLOECTX_*</code></td>
+<td><code>ENGRAM_*</code></td>
+</tr>
+<tr>
+<td>repository</td>
+<td><code>chloetech-ai/chloedb</code></td>
+<td><code>chloetech-ai/strata</code> and <code>rkonow/engram</code>, which GitHub redirects</td>
+</tr>
+<tr>
+<td>website</td>
+<td>https://chloetech-ai.github.io/chloedb/</td>
+<td>the old address does not redirect</td>
+</tr>
+</tbody>
+</table></div>
+<p>For the server in particular: when both a <code>CHLOEDB_*</code> setting and its
+<code>STRATA_*</code> name are set, the new one wins; an answer carries its headers
+under both names (<code>x-chloedb-took-ms</code> and <code>x-strata-took-ms</code>); the browser
+UI moves what it saved under <code>strata.*</code> to <code>chloedb.*</code> the first time it
+loads; the MCP server introduces itself as <code>chloedb</code>, and the OpenSearch
+API's cluster is named <code>chloedb</code>. The Kubernetes operator's pods start the
+programs by their old names, with <code>STRATA_*</code> settings, which every image
+understands.</p>
+<p>The metrics were renamed outright, from <code>strata_*</code> to <code>chloedb_*</code>: a
+dashboard over servers from before and after the rename can match
+<code>{__name__=~"(chloedb|strata)_.*"}</code>. So were the alert messages, which begin <code>[chloedb FIRING ...]</code>
+rather than <code>[strata FIRING ...]</code>.</p>
+<p>Some names have not been renamed yet and keep the old spelling: the file
+format (<code>STRATADB</code> magic, ChloeCtx's <code>memory.strata</code> and <code>engram.sock</code>), the
+gRPC services, the Kubernetes operator's resources (the <code>StrataCluster</code>
+kind, the <code>strata.chloetech.ai</code> API group, the <code>strata-system</code> namespace),
+and the app engine in <code>chloedb-apps/</code>. The default models directory is
+<code>~/.local/share/chloedb/models</code> from 0.3.2 (<code>~/.local/share/strata/models</code>
+before); a machine that has the old folder and no <code>~/.local/share/chloedb</code>
+keeps using it, as a machine that already has ChloeCtx's old folder,
+<code>~/.local/share/engram</code>, does.</p>
+<h2 id="not-promised-yet">Not promised yet<a class="anchor" href="#not-promised-yet" aria-label="Link to this section">#</a></h2>
+<ul>
+<li>Semantic versioning, or any version bump rule.</li>
+<li>A support period for releases; fixes go to <code>main</code> and the next release
+  (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/SECURITY.md">SECURITY.md</a>).</li>
+<li>That a release tag is never rebuilt: the release workflows replace the
+  assets of an existing tag (<code>--clobber</code>). Check a download against the
+  release's <code>SHA256SUMS</code> (Python, JavaScript) or <code>.sha256</code> (server).</li>
+<li>Stability of anything not described above: the Rust crate's API, the
+  command center's routes, the operator's resource beyond its documented
+  fields.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/compatibility.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="opensearch.html">← OpenSearch API</a><a href="apps.html">Apps on a cluster →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>
