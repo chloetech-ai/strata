@@ -11,8 +11,6 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
-- A client's own deadline that passes while its query is still being planned counts as the client's (`client_deadline`), as it does once the query runs, and no longer as the server's `timeout`. A slow runner planned past a 1 ms deadline and failed `a_shard_counts_its_client_s_deadline_as_the_client_s`.
-
 ## 0.3.3
 
 The afternoon audit's fixes, a ChloeCtx inspector organised by space, and
@@ -156,6 +154,7 @@ variables with a prefix. These change by default:
 - `timeout_ms`, `snapshot` and the other whole-number fields of a request refuse a value of the wrong type (`"100"`, `-1`, `1e15`) with a 400. Before, they were read as missing. `POST /v1/query` answers `warnings` naming any field it does not know, such as a misspelt `timeout_ms` (audit PRF-8).
 - `GET /v1/schema?table=` of a table that does not exist answers 404. `GET /v1/kv/TABLE/KEY` with text for an `INT` key says the key is not a number, rather than `query_invalid`. A vector element past a 32-bit float's range says so, rather than that the vector does not fit its field (audit PRF-9, in part).
 - A non-ASCII `Idempotency-Key` header is refused with a sentence saying the header must be visible ASCII, not "is not text" (audit PRF-13).
+- A client's own deadline that passes while its query is still being planned counts as the client's (`client_deadline`), as it does once the query runs, and no longer as the server's `timeout`. (A slow runner planned past a 1 ms deadline.)
 
 ### Command center
 
@@ -178,6 +177,7 @@ variables with a prefix. These change by default:
 - Command center: the demo's test model is labelled "test vectors" and its tables search by words by default, not presented as search by meaning (CCB-11).
 - Command center: the palette finds saved searches, and speaks to a single server as one rather than as a cluster (CCB-13).
 - Command center: an app's page says it is loading, a failed view load has "Ask again", the list of apps is asked again every minute, and the nav's "!" for an app that stopped answering now shows (CCW-9).
+- The website, the command center and the README show the ChloeDB logo.
 
 ### Spreadsheets
 
