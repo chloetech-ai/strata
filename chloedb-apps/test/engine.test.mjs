@@ -3278,7 +3278,7 @@ test('a call nobody answered is not an error of the app: no record, no repair', 
 
 // A screen in a frame made as the studio makes one, its calls answered by
 // the test as the studio would: rows, a refusal, or no answer at all.
-async function screenInFrame(t, spec, { access = null, answer }) {
+async function screenInFrame(t, spec, { access = null, answer, head = '' }) {
   const { readFileSync } = await import('node:fs');
   const { loadPlaywright } = await import('../engine/checks.mjs');
   const pw = loadPlaywright();
@@ -3289,7 +3289,7 @@ async function screenInFrame(t, spec, { access = null, answer }) {
     : Array.isArray(v) ? v.map(walk) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)])) : v);
   const compiled = walk(spec);
   const close = (x) => x.replace(/<\/(script)/gi, '<\\/$1');
-  const doc = `<!doctype html><html><head><meta charset="utf-8"></head><body><div id="root"></div>
+  const doc = `<!doctype html><html><head><meta charset="utf-8">${head}</head><body><div id="root"></div>
 <script>window.__SA = ${JSON.stringify({ slug: 'list', cap: 'a1/view/list@1', app: 'a1', origin: 'https://studio.test', params: {}, access })};</script>
 <script>${close(web('frame.js'))}</script><script>${close(web('screen.js'))}</script>
 <script>window.__SA_EXPR = []; window.__SA_EXPR_SRC = ${JSON.stringify(exprs)};</script>
@@ -3357,6 +3357,23 @@ test('a visitor who may only look is offered no form and no write; a refusal is 
   assert.deepEqual((await own.seen()).filter((x) => x.kind === 'error'), [], 'and not reported as an error');
 });
 
+test('a phone\'s list cell says a number by its column\'s words and keeps the row\'s initials (APC-17)', async (t) => {
+  // The native look on a phone (the frame is 300 px wide): rows as cells.
+  const spec = { data: { plants: 'SELECT * FROM plants' },
+    body: [{ table: '=plants', columns: [{ key: 'name' }, { key: 'status', badge: true }, { key: 'every', label: 'Every (days)' }, { key: 'room' }],
+      actions: [{ label: 'Water', do: "=row => app.update('plants', row.id, { watered: app.today() })" }] }] };
+  const rows = [{ id: '1', name: 'Monstera', status: 'Today', every: 7, room: 'Living room' }, { id: '2', name: 'Fern', status: 'Soon', every: 3, room: 'Bathroom' }, { id: '3', name: 'Pothos', status: 'Later', every: 10, room: 'Kitchen' }];
+  const f = await screenInFrame(t, spec, { head: '<style>:root { --look: native; }</style>', answer: () => ({ value: rows }) });
+  if (!f) return;
+  await f.page.waitForTimeout(600);
+  const cells = await f.frame().$$eval('.rcell', (xs) => xs.map((x) => ({ icon: x.querySelector('.rc-icon')?.textContent, text: x.querySelector('.rc-name')?.innerText })));
+  const fern = cells.find((c) => /Fern/.test(c.text || ''));
+  assert.ok(fern, JSON.stringify(cells));
+  assert.doesNotMatch(fern.text, /every \(days\)/i, 'not "3 every (days)"');
+  assert.match(fern.text, /Every 3 days/, JSON.stringify(cells));
+  assert.equal(fern.icon, 'F', 'the row keeps its initials; its state is the cell\'s color');
+});
+
 test('an app is named shortly from its description, and one whose first build failed says so (APC-4)', async () => {
   const { shortName, firstBuildStatus } = await import('../engine/store.mjs');
   assert.equal(shortName('A tiny reading list: links with a title and a note, and whether I read them.'), 'Tiny reading list');
@@ -3416,4 +3433,35 @@ test('a screen written as JSON gets :today as a CREATE SCREEN does: in the build
   if (!f) return;
   await f.page.waitForTimeout(500);
   assert.match(params?.today || '', /^\d{4}-\d{2}-\d{2}$/);
+});
+
+test('the chosen chip of a native screen stands out in dark mode (APC-18)', async (t) => {
+  const { readFileSync } = await import('node:fs');
+  const { designCss, PRESETS } = await import('../web/design.js');
+  const kit = readFileSync(join(import.meta.dirname, '..', 'web', 'kit.css'), 'utf8');
+  const spec = { body: [{ chips: 'sort', options: ['Next watering', 'Name'] }] };
+  const lumOf = (c) => {
+    const n = (c.match(/[\d.]+/g) || []).map(Number);
+    const [r, g, b] = /^color\(srgb/.test(c) ? n.slice(0, 3) : n.slice(0, 3).map((x) => x / 255);
+    const lin = (x) => (x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  };
+  for (const scheme of ['dark', 'light']) {
+    const css = designCss({ ...PRESETS[0], look: 'native', scheme });
+    const f = await screenInFrame(t, spec, { head: `<style>${kit}</style><style>${css}</style>`, answer: () => ({ value: [] }) });
+    if (!f) return;
+    await f.page.waitForTimeout(500);
+    await f.frame().click('.chip:text("Next watering")');
+    await f.page.waitForTimeout(200);
+    const got = await f.frame().evaluate(() => {
+      const bg = (el) => getComputedStyle(el).backgroundColor;
+      return { track: bg(document.querySelector('.chips')), on: bg(document.querySelector('.chip.on')), look: document.documentElement.dataset.look };
+    });
+    assert.equal(got.look, 'native');
+    const [a, b] = [lumOf(got.on), lumOf(got.track)];
+    const ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    // a phone's light segmented control is its white card on a grey track
+    if (scheme === 'light') assert.equal(got.on, 'rgb(255, 255, 255)');
+    else assert.ok(ratio >= 1.4, `${scheme}: the chosen chip ${got.on} on its track ${got.track} is ${ratio.toFixed(2)}:1`);
+  }
 });
