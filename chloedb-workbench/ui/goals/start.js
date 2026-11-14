@@ -41,7 +41,7 @@ export function mount(root, ctx) {
           h("label", { class: "g-trust" }, h("input", { type: "checkbox", checked: true, onchange: (e) => { trust = e.target.checked; } }),
             h("span", {}, h("b", {}, "Let agents work here"), " Workbench answers Claude Code's “trust this folder?” for this project's folders, so agents do not stop at it."))),
         h("div", { class: "g-goal" }, label("New"), h("b", { class: "g-gt" }, "Start a new project"), h("p", {}, "From an empty folder or an idea: describe it, and a lead agent plans the parts before anything runs."),
-          h("div", { class: "g-fact" }, "Workbench runs git init and makes a first commit."), btn("Start a new project", { href: "#/new", primary: true }))),
+          h("div", { class: "g-fact" }, "Workbench runs git init and makes a first commit."), btn("Start a new project", { href: "#/new" }))),
       h("div", { class: "gp-sec" }, setupLine()));
   }
 

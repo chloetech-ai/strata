@@ -176,18 +176,7 @@ export function mount(root, ctx) {
       chips();
       if (ctx.params.query && ctx.params.query.get("focus") !== "0") queueMicrotask(() => F.what.focus());
     }
-    const list = fleet(p.path).filter((a) => a.running);
-    const compact = ctx.prefs.get("compact");
-    const insp = [
-      h("section", {}, label("Work in progress", h("span", { class: "num" }, String(list.length))),
-        list.length ? h("div", { class: "pane" }, list.map((a) => agentRow(a, groupOf(a), true))) : h("p", { class: "g-dim" }, "No agent is working in this project.")),
-      h("section", {}, label("What it starts with"),
-        h("dl", { class: "kv" }, h("dt", {}, "Memory"), h("dd", {}, "Remembers this project's decisions (ChloeCtx), in its own session's settings; yours are not touched."),
-          h("dt", {}, "Branch"), h("dd", {}, "Its own worktree on wb/<name> from the project's HEAD. Main is never edited."),
-          h("dt", {}, "Told"), h("dd", {}, "Your words, the done check, and the project's rules."))),
-    ];
-    void compact;
-    return page({ kicker: p.project, title: "Start a change", sub: "Say what should change and how you will know it is done.", inspector: insp, wide: true },
+    return page({ kicker: p.project, title: "Start a change", sub: "Say what should change and how you will know it is done.", inspector: changeInsp(), wide: true },
       projectSteps(p, "change"),
       h("form", { class: "g-comp pane", onsubmit: (e) => { e.preventDefault(); start(); } },
         h("div", { class: "bd" },
@@ -205,12 +194,27 @@ export function mount(root, ctx) {
         h("div", { class: "g-foot" }, h("span", { class: "g-dim" }, kc("⌘"), kc("↵"), " start"), h("span", { class: "sp" }), btn(S.sending ? "Starting…" : "Start agent", { primary: true, type: "submit", disabled: S.sending }))));
   }
 
+  /** Start a change's inspector: drawn again on its own, so the composer keeps what you typed. */
+  function changeInsp() {
+    const list = fleet(p.path).filter((a) => a.running);
+    return [
+      h("section", {}, label("Work in progress", h("span", { class: "num" }, String(list.length))),
+        list.length ? h("div", { class: "pane" }, list.map((a) => agentRow(a, groupOf(a), true))) : h("p", { class: "g-dim" }, "No agent is working in this project.")),
+      h("section", {}, label("What it starts with"),
+        h("dl", { class: "kv" }, h("dt", {}, "Memory"), h("dd", {}, "Remembers this project's decisions (ChloeCtx), in its own session's settings; yours are not touched."),
+          h("dt", {}, "Branch"), h("dd", {}, "Its own worktree on wb/<name> from the project's HEAD. Main is never edited."),
+          h("dt", {}, "Told"), h("dd", {}, "Your words, the done check, and the project's rules."))),
+    ];
+  }
+
   async function start() {
     const what = F.what.value.trim(), done = F.done.value.trim();
     F.err.hidden = true;
     if (!what) { F.err.textContent = "Say what should change first."; F.err.hidden = false; F.what.focus(); return; }
     const task = done ? `${what}\n\nDone when: ${done}` : what;
-    S.sending = true; draw();
+    S.sending = true;
+    const go = el.querySelector(".g-comp .btn.primary");
+    if (go) { go.disabled = true; go.textContent = "Starting…"; }
     try {
       if (F.split.checked) {
         ctx.go(`#/new/plan?repo=${enc(p.path)}&text=${enc(task)}`);
@@ -229,21 +233,20 @@ export function mount(root, ctx) {
     } catch (e) {
       F.err.textContent = e.status === 429 ? `${e.message}. Stop one first.` : e.message;
       F.err.hidden = false;
-    } finally { S.sending = false; if (alive) draw(); }
+    } finally { S.sending = false; if (alive && go) { go.disabled = false; go.textContent = "Start agent"; } }
   }
 
   function draw() {
     if (!alive) return;
     const fresh = ctx.projectByName(p.project) || p;
     Object.assign(p, fresh);
-    const keep = document.activeElement && el.contains(document.activeElement) && step === "change";
-    if (keep) { refreshInsp(); return; }
+    // Start a change is drawn once: its fields are kept, the inspector follows.
+    if (step === "change" && el.querySelector(".g-comp")) { refreshInsp(); return; }
     el.replaceChildren(step === "understand" ? understandPage() : step === "change" ? changePage() : continuePage());
   }
   function refreshInsp() {
     const old = el.querySelector(".gp-insp");
-    const nu = changePage().querySelector(".gp-insp");
-    if (old && nu) old.replaceWith(nu);
+    if (old) old.replaceChildren(...changeInsp());
   }
 
   load();
@@ -288,6 +291,7 @@ const CSS = `
 .g-arow .acts{display:flex;gap:var(--s-2)}
 .g-arow.compact{padding:4px var(--s-3);min-height:32px}
 .g-arow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.gp-insp .g-arow{grid-template-columns:20px minmax(0,1fr) auto;padding:8px var(--s-3)}.gp-insp .g-arow .acts,.gp-insp .g-arow .churn,.gp-insp .g-arow>span:empty{display:none}.gp-insp .g-arow .live{grid-column:2/-1;font-size:var(--fs-sm)}
 .g-fold summary{cursor:pointer;color:var(--text-2);font-size:var(--fs-sm);padding:var(--s-1) 0 var(--s-2)}
 .g-chg{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px var(--s-2);padding:var(--s-2) 0;border-bottom:var(--hair) solid var(--line);color:var(--text);text-decoration:none}
 .g-chg code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

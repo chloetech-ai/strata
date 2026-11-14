@@ -72,7 +72,7 @@ export function mount(root, ctx) {
     const who = (k, t, sub) => h("label", { class: `g-who${D.who === k ? " on" : ""}` }, h("input", { type: "radio", name: "who", value: k, checked: D.who === k || null, onchange: () => { D.who = k; draw(); } }), h("span", {}, h("b", {}, t), h("small", {}, sub)));
     const go = () => { sync(); if (!D.idea.trim()) { idea.focus(); return; } ctx.go(`#/new/plan?repo=${enc(D.repo || D.dir)}`); };
     queueMicrotask(() => { if (!D.idea) idea.focus(); });
-    return page({ steps: steps("what"), kicker: D.repo || D.dir, title: "What to build", sub: "Say it as you would to a colleague. Nothing runs yet." },
+    return page({ steps: steps("what"), kicker: `New project · ${String(D.repo || D.dir || "").split("/").filter(Boolean).pop() || ""}`, title: "What to build", sub: "Say it as you would to a colleague. Nothing runs yet." },
       h("div", { class: "pane g-form" }, h("div", { class: "bd" },
         label("The idea"), idea, label("Done when"), done, h("div", { class: "chips" }, chip))),
       h("div", { class: "gp-sec" }, label("Who builds it"),
@@ -140,7 +140,7 @@ export function mount(root, ctx) {
         h("dt", {}, "Branch"), h("dd", {}, "Its own worktree on wb/<part> from main. Main is never edited."),
         h("dt", {}, "Without asking"), h("dd", {}, "Edit files on its branch and run the tests (python3 -m pytest, npm test, cargo test). It asks for anything else, and never runs git push or pip install."),
         h("dt", {}, "At once"), h("dd", {}, `At most ${MAX_AT_ONCE} agents; a part that waits on another waits.`)))];
-    return page({ steps: steps("plan"), kicker: repo, title: "Plan it", sub: D.busy && !D.plan ? "The lead is reading the idea…" : D.plan && D.plan.drafted_by === "words" ? "Your own sentences, one part each: edit them, or tell the lead what to change." : "The lead's draft. Reorder, edit or remove parts before anything starts.", inspector: insp, wide: true },
+    return page({ steps: steps("plan"), kicker: `New project · ${String(repo || "").split("/").filter(Boolean).pop() || ""}`, title: "Plan it", sub: D.busy && !D.plan ? "The lead is reading the idea…" : D.plan && D.plan.drafted_by === "words" ? "Your own sentences, one part each: edit them, or tell the lead what to change." : "The lead's draft. Reorder, edit or remove parts before anything starts.", inspector: insp, wide: true },
       D.err ? h("div", { class: "g-err" }, D.err) : null,
       D.plan && (D.plan.missing || []).length ? h("p", { class: "g-dim" }, D.plan.missing.join(" · ")) : null,
       h("div", { class: "pane" }, h("div", { class: "hd" }, label(`The parts (${n})`, D.plan && D.plan.drafted_by === "model" ? h("span", {}, `drafted by ${D.plan.model || "haiku"}`) : null)),
