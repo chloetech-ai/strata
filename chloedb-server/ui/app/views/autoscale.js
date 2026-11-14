@@ -7,7 +7,7 @@
 // waits here, to apply or dismiss), or is off. The replay reads the load
 // every server keeps a row a minute of (its log store's `load` table).
 
-import { h, s, icon, clear, fmt, card, api, signInNeeded, toast, confirm, seg, pill, empty, tipOn, showTip, hideTip, debounce, failure, store, link, can, needs } from "../core.js";
+import { h, s, icon, clear, fmt, card, api, signInNeeded, toast, confirm, seg, pill, empty, tipOn, showTip, hideTip, debounce, failure, store, link, can, needs, experimental } from "../core.js";
 import { state, isCoordinator, isProduction } from "../data.js";
 import { live, scaleWords, keptRate } from "../spec.js";
 
@@ -260,7 +260,7 @@ function render(page) {
     }
     clear(head, h("div", { class: "page-head" },
       h("div", {},
-        h("h1", {}, "Autoscaling"),
+        h("h1", {}, "Autoscaling", " ", experimental("Autoscaling")),
         h("p", {}, managed() ? [h("b", {}, `${kube.namespace}/${kube.name}`), " · rules that change its copies, shards or volumes. Click an underlined word: last week replays at once."] : "Rules that change a cluster's copies, shards or volumes. Click an underlined word: last week replays at once.")),
       h("div", { class: "tools" }, tools)));
   }

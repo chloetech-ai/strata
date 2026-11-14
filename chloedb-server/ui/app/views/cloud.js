@@ -14,7 +14,7 @@
 // the same way, its name typed again; not the one this server runs on.
 
 import * as core from "../core.js";
-import { h, s, icon, clear, fmt, card, api, toast, confirm, seg, toggle, pill, empty, table, tipOn, hideTip, debounce, copy, failure, clamp, modal, menu, connectionName } from "../core.js";
+import { h, s, icon, clear, fmt, card, api, toast, confirm, seg, toggle, pill, empty, table, tipOn, hideTip, debounce, copy, failure, clamp, modal, menu, connectionName, experimental } from "../core.js";
 import { state } from "../data.js";
 
 export default {
@@ -256,7 +256,7 @@ function render(page, r) {
     const k = key();
     const label = !status ? null : k ? pill("ok", prov === "aws" ? (k.account ? `account ${k.account}` : "keys from the environment") : (k.account?.team ? `team ${k.account.team}` : "token from the environment")) : pill("pending", `no ${P.name} key`);
     clear(head, h("div", { class: "page-head" },
-      h("div", {}, h("h1", {}, "Cloud setup"), h("p", {}, `Plan a new ChloeDB cluster on ${P.k8s}: machines with their prices, where the copies go, what it costs, and what makes it.`)),
+      h("div", {}, h("h1", {}, "Cloud setup", " ", experimental("Cloud setup")), h("p", {}, `Plan a new ChloeDB cluster on ${P.k8s}: machines with their prices, where the copies go, what it costs, and what makes it.`)),
       h("div", { class: "tools" },
         seg(Object.entries(PROVIDERS).map(([k, v]) => [k, v.name]), prov, (v) => { location.hash = "#/cloud?provider=" + v; }, { "aria-label": "Cloud" }),
         label)));
