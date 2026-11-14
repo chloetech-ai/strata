@@ -164,6 +164,38 @@ fn a_proposal_measured_against_another_profile_is_refused() {
 }
 
 #[test]
+fn apply_makes_the_proof_again_and_refuses_a_planted_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, docs) = corpus(&dir.path().join("db"));
+    log_and_grade(&db, &docs);
+    let r = db.autopilot(&Options::default()).unwrap();
+    assert_eq!(r.verdict, Verdict::Propose, "{}", r.reason);
+    // The proof names the options it was made with.
+    assert_eq!(r.to_json()["options"]["min_queries"], 20);
+    let id = db.keep_proposal(&r).unwrap();
+
+    // A planted row (audit 4, N-C1): the profile's name and table, open,
+    // a verdict to propose and a large gain, whose ranking puts one
+    // writer's rows first. Refused, with force too.
+    let mut planted = db.proposal(&id, true).unwrap();
+    planted["id"] = json!("planted");
+    planted["gain"] = json!(0.9);
+    planted["statement"] = json!("CREATE OR REPLACE RANK PROFILE p ON docs AS SELECT * FROM docs ORDER BY CASE WHEN id = 'd7' THEN 1000000000.0 ELSE bm25(body, :q) + 0.05 * bm25(title, :q) END DESC");
+    db.add_judgments(autopilot::PROPOSALS, &[planted]).unwrap();
+    let e = db.apply_proposal("planted", true).unwrap_err().to_string();
+    assert!(e.contains("numbers moved"), "{e}");
+
+    // The grades are gone since it was measured: made again, the proof
+    // has too few judged queries, so it is not applied but with force.
+    sql(&db, &format!("DELETE FROM {} WHERE grade >= 0", autopilot::JUDGMENTS));
+    let e = db.apply_proposal(&id, false).unwrap_err().to_string();
+    assert!(e.contains("made again") && e.contains("too_few_judged"), "{e}");
+    assert_eq!(db.proposal(&id, false).unwrap()["status"], "open");
+    db.apply_proposal(&id, true).unwrap();
+    assert_eq!(db.proposal(&id, false).unwrap()["status"], "applied");
+}
+
+#[test]
 fn it_says_why_when_there_is_nothing_to_go_on() {
     let dir = tempfile::tempdir().unwrap();
     let (db, docs) = corpus(&dir.path().join("db"));

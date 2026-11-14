@@ -456,7 +456,9 @@ impl Grpc {
         // The call itself, on the heap: a query's future is many kilobytes,
         // and each wrapper below would otherwise move it again (a shard's
         // query spent an eighth of its time copying it).
-        let call = Box::pin(f(self.0.clone(), who.clone(), req.into_inner()));
+        // The credential's scope ([`crate::service::SCOPE`]).
+        let scope = if who.root { Scope::Admin } else { who.scope };
+        let call = Box::pin(crate::service::SCOPE.scope(scope, f(self.0.clone(), who.clone(), req.into_inner())));
         let call = keys::noting(crate::service::DEADLINE.scope(crate::service::Deadline::of_part(clients), crate::service::ROUTED.scope(std::cell::Cell::new(0), call)));
         let call = crate::telemetry::calling(Arc::new(caller), crate::service::FOLLOW.scope(follow, crate::service::OWN.scope(who.root, call)));
         let (r, note) = crate::telemetry::traced(crate::telemetry::Trace::new(), obs::scope(Some(id.clone()), call)).instrument(span.clone()).await;
@@ -635,6 +637,7 @@ impl pb::strata_server::Strata for Grpc {
         let svc = self.0.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let span = tracing::info_span!("request", id = %id, method = "WriteStream");
+        let scope = if who.root { Scope::Admin } else { who.scope };
         let run = async move {
             let t0 = Instant::now();
             let mut s = Stream::default();
@@ -675,7 +678,7 @@ impl pb::strata_server::Strata for Grpc {
             tracing::debug!(batches = s.batches, written = s.written, skipped = s.skipped, "stream ended");
             svc.metrics.grpc("WriteStream", code, t0.elapsed().as_secs_f64());
         };
-        tokio::spawn(run.instrument(span));
+        tokio::spawn(crate::service::SCOPE.scope(scope, run).instrument(span));
         Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
     }
 

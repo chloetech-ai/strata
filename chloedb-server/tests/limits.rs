@@ -405,6 +405,15 @@ async fn a_capped_coordinator_understands_and_corrects_as_one_server() {
     // Without understand_fields, every keyword field is read.
     let (status, a) = post(&coord, "/v1/understand", json!({"table": "products", "field": "body", "text": "leather boots"})).await;
     assert_eq!(status, 200, "{a}");
+    // A field derived from a dictionary is refused on a coordinator, whose
+    // shards would each tag rows from their own share of the dictionary
+    // (audit 4, X-C2); on one server it is made.
+    let news = "CREATE TABLE news (id KEYWORD PRIMARY KEY, body TEXT, brands KEYWORD[] OPTIONS(derive = 'body', model = 'dict:products.brand'))";
+    let (status, e) = post(&coord, "/v1/sql", json!({"sql": news})).await;
+    assert_eq!(status, 400, "{e}");
+    assert!(e["error"].as_str().unwrap_or("").contains("coordinator"), "{e}");
+    let (status, e) = post(&one, "/v1/sql", json!({"sql": news})).await;
+    assert_eq!(status, 200, "{e}");
 }
 
 /// Errors answered before a handler runs (a body that is not JSON, the
