@@ -3467,9 +3467,13 @@ textarea.fb-note { font-family: var(--sans); font-size: 13.5px; min-height: 96px
 .fb-n-redact { background: #111; border-radius: 4px; font-size: 9px; }
 .fb-warn { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-radius: var(--r-sm); background: var(--warn-soft); }
 .fb-send { display: flex; gap: 8px; justify-content: flex-end; margin-top: auto; padding-top: 10px; }
+/* Toasts go over the picture while the editor is open, clear of its Send
+   and Cancel (CCW-17); on a narrow screen, under its bar. */
+body:has(.fb-ed:not(.fb-away)) .toasts { right: 358px; }
 @media (max-width: 900px) {
   .fb-main { flex-direction: column; }
   .fb-side { width: auto; border-left: 0; border-top: 1px solid var(--line); max-height: 48vh; }
+  body:has(.fb-ed:not(.fb-away)) .toasts { right: 12px; left: 12px; bottom: auto; top: 64px; }
   .fb-stage { min-height: 40vh; }
   .fb-tool .lbl, .fb-retake .lbl, .fb-title .dim { display: none; }
   .fb-bar { gap: 6px; padding: 6px 8px; }
