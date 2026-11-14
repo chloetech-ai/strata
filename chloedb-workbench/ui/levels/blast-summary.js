@@ -41,7 +41,7 @@ export function mount(host, { api, go }) {
     const b = c.data, t = b.totals || {}, r = b.risk || {};
     if (!t.files) { box.replaceChildren(); return; }
     const untested = (b.functions || []).filter((f) => !(f.tests || []).length && f.status !== "deleted").length;
-    box.replaceChildren(h("div", { class: `bs-row ${TONE[r.level] || "mut"}` },
+    box.replaceChildren(...[h("div", { class: `bs-row ${TONE[r.level] || "mut"}` },
       h("span", { class: "bs-dot" }),
       h("span", { class: "bs-lab" }, "Blast radius"),
       r.level ? h("b", { class: "bs-lvl" }, `${r.level[0].toUpperCase()}${r.level.slice(1)} risk`) : null,
@@ -53,7 +53,7 @@ export function mount(host, { api, go }) {
         h("span", { class: "bs-ags", title: (b.agents || []).map((g) => g.detail).join("\n") || null }, (b.agents || []).length ? [(b.agents || []).slice(0, 4).map((g) => avatar(g.agent, 16)), ` ${plural(b.agents.length, "agent")}`] : "no other agent")),
       h("span", { class: "bs-sp" }),
       h("button", { class: "bs-open", type: "button", onclick: () => go(`#/ship/${current}`) }, "Ship →")),
-      r.line ? h("div", { class: "bs-line", title: (r.reasons || []).join("\n") }, r.line.replace(/^\w+ risk:\s*/i, ""), b.landing && b.landing.line ? ` ${b.landing.line}` : "") : null);
+      r.line ? h("div", { class: "bs-line", title: (r.reasons || []).join("\n") }, r.line.replace(/^\w+ risk:\s*/i, ""), b.landing && b.landing.line ? ` ${b.landing.line}` : "") : null].flat().filter((k) => k != null && k !== false));
   }
 
   async function load(id) {

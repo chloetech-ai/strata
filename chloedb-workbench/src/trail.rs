@@ -710,6 +710,28 @@ fn links_of(v: &Json) -> Vec<(String, String)> {
     }
 }
 
+/// The ids a record links to by `rel` (`supersedes`, `superseded_by`),
+/// whatever shape the links come in: a list of `{label, to}`, a map of
+/// `rel` to an id or ids, a JSON string of either, or `rel:id` words.
+pub(crate) fn linked(v: &Json, rel: &str) -> Vec<String> {
+    let id_like = |s: &str| {
+        let s = s.trim().trim_matches(|c: char| c == '"' || c == '\\' || c == ',' || c == '}' || c == ']');
+        (!s.is_empty() && s.contains(':') && !s.contains(' ')).then(|| s.to_string())
+    };
+    match v {
+        Json::String(s) => match serde_json::from_str::<Json>(s) {
+            Ok(j @ (Json::Array(_) | Json::Object(_))) => linked(&j, rel),
+            _ => s.split_whitespace().filter_map(|w| w.strip_prefix(rel).and_then(|r| r.strip_prefix(':'))).filter_map(id_like).collect(),
+        },
+        Json::Object(o) if o.get(rel).is_some() => match &o[rel] {
+            Json::String(x) => id_like(x).into_iter().collect(),
+            Json::Array(a) => a.iter().filter_map(Json::as_str).filter_map(id_like).collect(),
+            _ => Vec::new(),
+        },
+        _ => links_of(v).into_iter().filter(|(l, _)| l == rel).filter_map(|(_, to)| id_like(&to)).collect(),
+    }
+}
+
 pub(crate) fn files_of(v: &Json) -> Vec<String> {
     match v {
         Json::String(s) => s.split_whitespace().map(str::to_string).collect(),
@@ -721,7 +743,7 @@ pub(crate) fn files_of(v: &Json) -> Vec<String> {
 /// `GET /api/decisions`: the repository's decision notes, newest first.
 pub fn decisions(sup: &Supervisor, repo: Option<&str>, limit: usize) -> Result<Json, ApiError> {
     let dir = repo_dir(repo)?;
-    let sql = format!("SELECT id, ts, session, text, tag, files, links FROM memory WHERE kind = 'decision' ORDER BY ts DESC LIMIT {limit}");
+    let sql = format!("SELECT id, ts, session, text, tag, files, links, ctx FROM memory WHERE kind = 'decision' ORDER BY ts DESC LIMIT {limit}");
     let out = match run_chloectx(&sup.cfg.chloectx_bin, &dir, &["sql", "--json", &sql], Duration::from_secs(60)) {
         Ran::Out(v) => v,
         Ran::Missing => return Ok(json!({ "decisions": [], "missing": [not_installed(&sup.cfg.chloectx_bin)] })),
@@ -733,10 +755,18 @@ pub fn decisions(sup: &Supervisor, repo: Option<&str>, limit: usize) -> Result<J
     let mut list = Vec::new();
     for row in out["rows"].as_array().into_iter().flatten().filter_map(Json::as_array) {
         let session = col(row, "session");
-        let superseded_by = links_of(&col(row, "links")).into_iter().find(|(l, _)| l == "superseded_by").map(|(_, to)| to);
+        let superseded_by = linked(&col(row, "links"), "superseded_by").into_iter().next();
+        let text = col(row, "text").as_str().unwrap_or("").to_string();
+        // Yours when you said it ("My decision: …" in a prompt), even in an
+        // agent's session; an agent's otherwise, with your Still right if given.
+        let yours = crate::capsule::by_user(&text, col(row, "tag").as_str().unwrap_or(""), col(row, "ctx").as_str().unwrap_or(""));
+        let id = col(row, "id");
         list.push(json!({
-            "id": col(row, "id"),
-            "text": col(row, "text"),
+            "id": id,
+            "text": text,
+            "words": crate::capsule::plain_words(&text),
+            "by": if yours { "you" } else { "agent" },
+            "confirmed": id.as_str().is_some_and(|i| sup.mark(&format!("review-ok:{i}")).is_some_and(|v| v == "1")),
             "ts": ctx_time(&col(row, "ts")),
             "session": session,
             "agent": session.as_str().and_then(|sid| s.agent(sid)).map(|a| agent_json(sup, a)),

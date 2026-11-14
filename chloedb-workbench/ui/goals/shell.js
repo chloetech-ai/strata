@@ -108,7 +108,9 @@ export function update() {
   $("agents-avs").replaceChildren(...running.slice(0, 4).map((a) => avatar(a, 16)));
   const c = counts(list);
   // One count of what needs you, on the Needs-you button only (UX critique, issue 4).
-  $("agents-lb").textContent = `${list.length} agent${list.length === 1 ? "" : "s"}`;
+  // At work counts; one merged or finished is said apart, not counted as active.
+  const active = list.length - c.finished;
+  $("agents-lb").textContent = `${active} agent${active === 1 ? "" : "s"}${c.finished ? ` · ${c.finished} done` : ""}`;
   $("agents-btn").title = `${fleetWords(list)} (a)`;
   setCrumbs(O.crumbs);
   // An open drawer or switcher is drawn again only when what it lists

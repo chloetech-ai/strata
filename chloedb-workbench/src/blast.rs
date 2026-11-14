@@ -155,7 +155,11 @@ pub fn landing(sup: &Supervisor, a: &crate::db::Agent, dir: &Path, main: &Path) 
         }
         let Some(mb) = merge_base(dir, "HEAD", &tip) else { continue };
         if mb == h {
-            above.push((o, branch));
+            // Stacked above only when this branch has commits of its own: a
+            // branch still at its fork is under every branch from there.
+            if fork.as_deref() != Some(h.as_str()) {
+                above.push((o, branch));
+            }
             continue;
         }
         // Shares only what the landing branch has: an independent branch.

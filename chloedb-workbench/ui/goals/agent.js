@@ -13,11 +13,15 @@ export const TABS = [["progress", "Progress"], ["changes", "Changes"], ["preview
 export function head(a, o = {}) {
   useStyle("g-agent", CSS);
   const g = o.group || (a.running ? "working" : "finished");
-  const word = g === "needs" ? "needs you" : g === "working" ? (a.state === "starting" ? "starting" : "working") : g === "ready" ? "ready to review" : a.running ? "idle" : "finished";
+  const m = o.merged;
+  const word = g === "needs" ? "needs you" : g === "working" ? (a.state === "starting" ? "starting" : "working") : g === "ready" ? "ready to review"
+    : m ? `merged into ${m.onto || "main"}${m.commit ? ` as ${String(m.commit).slice(0, 7)}` : ""}` : a.running ? "idle" : "finished";
   const st = o.stat;
   const primary = g === "ready" && o.ship
     ? btn("Review and ship", { primary: true, href: o.ship, icon: "ship" })
     : a.running && o.onTell ? btn(`Tell ${a.name}…`, { primary: g !== "needs", icon: "send", onclick: o.onTell }) : null;
+  // A finished turn can still be told something (a change, a question): Tell stays beside Review.
+  const tell = g === "ready" && o.ship && a.running && o.onTell ? btn(`Tell ${a.name}…`, { icon: "send", onclick: o.onTell }) : null;
   const menu = h("details", { class: "ag-menu" },
     h("summary", { class: "btn", "aria-label": "More for this agent" }, a.running ? [icon("stop", "i sm"), "Stop"] : [icon("rewind", "i sm"), "Restart"], icon("down", "i sm")),
     h("div", { class: "ag-mlist", role: "menu" },
@@ -35,9 +39,10 @@ export function head(a, o = {}) {
         a.branch ? h("span", {}, icon("branch", "i sm"), a.branch) : null,
         a.model ? h("span", {}, a.model) : null,
         st && (st.added || st.removed) ? h("span", {}, churnBar(st.added, st.removed), st.files ? ` · ${st.files} file${st.files === 1 ? "" : "s"}` : "") : null,
-        a.state_since ? h("span", { class: "num" }, `${word} for ${since(a.state_since)}`) : null,
+        a.state_since && !m ? h("span", { class: "num" }, `${word} for ${since(a.state_since)}`) : null,
+        m && o.ship ? h("a", { class: "lv-link", href: o.ship }, "Merged: Undo or see what went in") : null,
         a.read_only ? h("span", {}, "read-only") : null)),
-    h("div", { class: "ag-act" }, primary, menu));
+    h("div", { class: "ag-act" }, primary, tell, menu));
 }
 
 /** The tab links. `cur` is one of TABS' keys; `n` the changed files' count. */
@@ -47,7 +52,7 @@ export function tabs(a, cur, { n, preview } = {}) {
       role: "tab", href: `#/a/${a.id}${k === "progress" ? "" : "/" + k}`, "aria-selected": String(k === cur), class: k === "events" ? "narrow-tab" : null,
     }, t, k === "changes" ? h("span", { class: "n" }, n ? String(n) : "") : null)),
     cur === "terminal" ? null : h("span", { class: "hint" }, kc("t"), " terminal ", kc("c"), " changes"),
-  ];
+  ].filter(Boolean); // spread into replaceChildren, where a null would show as "null"
 }
 
 /** The banner over the terminal. On a phone: read-only until Type. */

@@ -2732,7 +2732,9 @@ fn blast_radius_names_functions_tests_decisions_and_agents_and_the_pr_carries_a_
     for h in ["## Summary", "## Decisions behind it", "## Blast radius", "## Tests run", "## Ask why"] {
         assert!(body.contains(h), "no {h} in {body}");
     }
-    assert!(body.contains(&format!("◆ `{mine}`")) && body.contains("`taxFor` (new)") && body.contains("No capsule was packed"), "{body}");
+    // Decisions in plain words, signed by whose they are; never the record's id.
+    assert!(body.contains("- Tax is added to the cart total, rounded per order (checkout-tax's)") && !body.contains(&format!("`{mine}`")), "{body}");
+    assert!(body.contains("`taxFor` (new)") && body.contains("No capsule was packed"), "{body}");
     assert_eq!(p["sections"]["decisions"][0]["id"], json!(mine), "its session's decision first: {p}");
     let file = PathBuf::from(p["body_file"].as_str().unwrap());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), body);
@@ -5058,6 +5060,90 @@ fn review_holds_merge_for_failing_tests_and_an_unconfirmed_decision() {
     std::fs::remove_file(fcwd.join("src/extra.ts")).unwrap();
     let (status, m) = s.post("/api/review/merge", json!({ "agents": [fid] }));
     assert_eq!(status, 200, "{m}");
+}
+
+#[test]
+fn review_drafts_from_what_changed_counts_every_decision_and_says_merged() {
+    let ctx = tempfile::tempdir().unwrap();
+    let bin = fake_chloectx(ctx.path());
+    let s = Server::start(&["--chloectx-bin", bin.to_str().unwrap()]);
+    let (_d, r) = shop();
+    let ((fid, fcwd, fsid), (cid, _ccwd, _)) = two_branches(&s, &r);
+    // freeship's last chat reply names a URL: it is neither a title nor a headline.
+    hook_as(&s, &fid, json!({ "hook_event_name": "Stop", "last_assistant_message": "The checkout page is running at http://127.0.0.1:8761 and I committed it as abc1234. Everything passes." }));
+    hook_as(&s, &cid, json!({ "hook_event_name": "Stop" }));
+    // A third agent, nothing committed: its title is what it was asked to do.
+    let p = s.spawn(json!({ "repo": r, "name": "paybutton", "task": "On the checkout page the Pay button does nothing. Make Pay show a confirmation with the total. Done when the tests pass." }));
+    let pid = p["id"].as_str().unwrap().to_string();
+    let p = s.wait(&pid, "idle");
+    std::fs::write(PathBuf::from(p["cwd"].as_str().unwrap()).join("src/pay.ts"), "export function pay(total) {\n  return `Paid ${total}`;\n}\n").unwrap();
+    hook_as(&s, &pid, json!({ "hook_event_name": "Stop", "last_assistant_message": "I haven't committed anything. Pay works now: it shows the total." }));
+
+    // ChloeCtx: freeship's decision, the user's own in its session ("My decision: …"), a fact.
+    let now = now_s();
+    let sid8: String = fsid.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    std::fs::write(ctx.path().join("sql.json"), json!({ "text": "3 rows", "columns": ["id", "kind", "text", "ts", "session", "tag", "links", "ctx", "files"], "rows": [
+        [format!("{sid8}:1"), "decision", "The agent freeship said: shipping is free over 50 euros, counted before tax.", now, fsid, "", "", "By: assistant", "src/cart.ts"],
+        [format!("{sid8}:2"), "decision", "The user decided: My decision: keep every existing test.", now, fsid, "stated", "", "By: user", ""],
+        [format!("{sid8}:3"), "fact", "The agent freeship said: cartTotal is called from createSession.", now, fsid, "", "", "By: assistant", "src/cart.ts"]
+    ] }).to_string()).unwrap();
+    // A rule of yours that names the changed file.
+    let (status, _) = s.post("/api/rules", json!({ "repo": r, "text": "Never change cart.ts without a test that covers it." }));
+    assert_eq!(status, 201);
+
+    let (status, o) = s.get(&format!("/api/agents/{fid}/review"));
+    assert_eq!(status, 200, "{o}");
+    let head = o["verdict"]["text"].as_str().unwrap();
+    assert!(head.starts_with("Changes cartTotal()") && !head.contains("127"), "the headline is what changed: {head}");
+    // One count of decisions: the agent's, yours (signed yours), the rule; never the fact.
+    let list = o["decisions"]["list"].as_array().unwrap();
+    assert_eq!(o["decisions"]["count"], 3, "{o}");
+    let yours = list.iter().find(|d| d["by"] == "you").unwrap();
+    assert_eq!((yours["text"].as_str(), yours["why"].as_str()), (Some("Keep every existing test."), Some("yours")), "{o}");
+    assert!(list.iter().any(|d| d["why"] == "rule" && d["text"].as_str().unwrap().contains("cart.ts")), "{o}");
+    assert!(list.iter().all(|d| d["kind"] != "fact"), "{o}");
+    assert_eq!(list.iter().find(|d| d["by"] == "agent").unwrap()["text"], "Shipping is free over 50 euros, counted before tax.", "{o}");
+
+    // The pull request: titled by its commit, summed up from what changed, decisions in plain words.
+    let (_, pr) = s.get(&format!("/api/agents/{fid}/pr"));
+    assert_eq!(pr["title"], "Free shipping over 50", "{pr}");
+    let body = pr["body"].as_str().unwrap();
+    assert!(body.contains("What changed:") && body.contains("`src/cart.ts`") && body.contains("changes `cartTotal`"), "{body}");
+    assert!(!body.contains("running at") && !body.contains("abc1234"), "never the chat reply: {body}");
+    assert!(!body.contains(&format!("{sid8}:")) && !body.contains("freeship said"), "never raw notes: {body}");
+    assert!(body.contains("Keep every existing test. (yours)"), "{body}");
+    let (_, pr) = s.get(&format!("/api/agents/{pid}/pr"));
+    assert_eq!((pr["title"].as_str(), pr["title_from"].as_str()), (Some("Make Pay show a confirmation with the total"), Some("task")), "{pr}");
+    assert!(!pr["body"].as_str().unwrap().contains("haven't committed"), "{pr}");
+
+    // One description for several branches, in the order given.
+    let (status, c) = s.post("/api/review/pr", json!({ "agents": [cid, fid] }));
+    assert_eq!(status, 200, "{c}");
+    assert_eq!(c["title"], "Money as integer cents; Free shipping over 50", "{c}");
+    assert!(c["body"].as_str().unwrap().contains("2 changes, merged in this order: `wb/cents`, then `wb/freeship`."), "{c}");
+    assert!(c["gh"].as_str().unwrap().contains("--head wb/together-cents-freeship") && c["make"].as_str().unwrap().contains("git merge --no-ff wb/cents wb/freeship"), "{c}");
+    assert_eq!(s.post("/api/review/pr", json!({ "agents": [] })).0, 400);
+
+    // Merged: the page says so, and the project counts it done, not at work.
+    let (status, m) = s.post("/api/review/merge", json!({ "agents": [cid] }));
+    assert_eq!(status, 200, "{m}");
+    let (_, o) = s.get(&format!("/api/agents/{cid}/review"));
+    assert_eq!(o["state"], "Merged", "{o}");
+    assert_eq!(o["merged"]["onto"], "main", "{o}");
+    assert_eq!(o["merged_commits"][0]["subject"], "Money as integer cents", "{o}");
+    let (_, repos) = s.get("/api/repos");
+    let row = repos["repos"].as_array().unwrap().iter().find(|x| x["path"] == json!(r.to_string_lossy())).cloned().unwrap();
+    assert_eq!(row["groups"][&cid], "finished", "{row}");
+    assert!(row["merged"][&cid]["commit"].is_string(), "{row}");
+
+    // Merge-ability counts what is not committed yet: freeship adding its own
+    // src/money.ts conflicts with main now, and the list says so before it commits.
+    std::fs::write(fcwd.join("src/money.ts"), "export const cents = (x) => x;\n").unwrap();
+    let l = s.get_until("/api/review?repo=proj", "freeship ready", |v| v["ready"].as_array().is_some_and(|a| a.iter().any(|x| x["agent"]["id"] == json!(fid))));
+    let row = l["ready"].as_array().unwrap().iter().find(|x| x["agent"]["id"] == json!(fid)).cloned().unwrap();
+    assert_eq!(row["merge"]["main"]["clean"], false, "{row}");
+    assert_eq!(row["merge"]["main"]["with_uncommitted"], true, "{row}");
+    assert_eq!(row["merge"]["main"]["conflicts"], json!(["src/money.ts"]), "{row}");
 }
 
 #[test]

@@ -155,7 +155,8 @@ export function mount(root, ctx) {
       h("label", { class: "pv-pickw", style: a ? `--c:${agentColor(a)}` : null }, a ? avatar(a, 18) : null, pick),
       h("div", { class: "pv-url", title: a?.preview_url || "" },
         h("span", { class: "pv-url-t" }, url),
-        a?.preview_url ? h("span", { class: "pv-url-m" }, `· ${nameOf(a)}'s worktree, live`) : null),
+        // Workbench cannot tell which checkout the server at this URL serves (an agent's worktree, main…): say only whose URL it is.
+        a?.preview_url ? h("span", { class: "pv-url-m", title: "The server at this URL serves whatever checkout it was started in." }, `· ${nameOf(a)}'s preview URL`) : null),
       a?.preview_url ? h("button", { class: "btn ghost icon sm", title: "Reload", "aria-label": "Reload the preview", onclick: reload }, "↻") : null,
       a?.preview_url ? h("button", { class: "btn ghost sm", title: "Set another preview URL", onclick: () => { S.setting = true; renderFrame(); } }, "Change URL") : null,
       h("button", {
@@ -215,7 +216,8 @@ export function mount(root, ctx) {
       h("div", { class: "pv-set-r" }, input, h("button", { class: "btn primary", type: "submit" }, "Set preview URL"),
         a.preview_url ? h("button", { class: "btn", type: "button", onclick: () => { S.setting = false; S.setErr = null; renderFrame(); } }, "Cancel") : null),
       S.setErr ? h("div", { class: "err" }, S.setErr) : null);
-    requestAnimationFrame(() => { input.focus(); input.setSelectionRange(input.value.length, input.value.length); });
+    // Focus only when you asked to change it: an empty tab's box would take the page's keys (t, c).
+    if (S.setting) requestAnimationFrame(() => { input.focus(); input.setSelectionRange(input.value.length, input.value.length); });
     if (S.setting) { dropEsc?.(); dropEsc = onEscape(() => { dropEsc?.(); dropEsc = null; S.setting = false; S.setErr = null; renderFrame(); }); }
     return f;
   }
@@ -424,9 +426,13 @@ export function mount(root, ctx) {
           whys.length ? h("span", { class: "lv-sub" }, " · ", [...new Set(whys)].slice(0, 2).join(", ")) : null,
           h("span", { class: "lv-sub" }, " · ", nameOf(g.f.agent)),
           h("button", { class: "lv-link pv-why", onclick: () => ctx.openWhy({ agent: g.f.agent.id, path: g.f.path, line }) }, "Why?"))));
-    }) : [h("div", { class: "lv-sub" }, a ? `${nameOf(a)} has not changed anything yet.` : "Pick an agent.")];
+    }) : [h("div", { class: "lv-sub" }, a ? `${nameOf(a)}'s branch has nothing ${(S.diffs.get(a.id)?.landing || {}).onto || "main"} does not have: it changed nothing yet, or its change is merged.` : "Pick an agent.")];
+    // The page itself may be a file it changed (/ is index.html).
+    const pageFile = S.path === "/" || !S.path ? "index.html" : base(S.path);
+    const isPage = fallback && rows.find((r) => base(r.g.f.path) === pageFile);
+    const note = !fallback || !rows.length ? null : isPage ? `This page is served from ${isPage.g.f.path}, which ${nameOf(a)} changed; no element on it is matched to a line yet.` : "None of it is matched to an element of this page yet.";
     return card(fallback ? `What ${nameOf(a)} changed` : "Changes on this page", fallback ? null : h("span", { class: "lv-sub" }, `${rows.length} from ${new Set(rows.map((r) => r.g.f.agent.id)).size} agents`),
-      fallback && rows.length ? h("div", { class: "lv-sub pv-note" }, "None of it is matched to this page yet.") : null, ...body);
+      note ? h("div", { class: "lv-sub pv-note" }, note) : null, ...body);
   }
 
   function sinceCard() {
@@ -438,7 +444,11 @@ export function mount(root, ctx) {
     return card(`Since you last looked · ${fmtClock(S.since)}`, null,
       h("p", { class: "pv-p" }, list.length
         ? [h("b", null, `${list.length} file${list.length > 1 ? "s" : ""} changed`), ` by ${nAgents} agent${nAgents > 1 ? "s" : ""}`, here ? [`; ${here} of them on this page, and those glow.`] : "; none of them on this page."]
-        : "Nothing changed since."),
+        : (() => {
+          // No edit recorded since then is not "nothing changed": the branches may still differ (a commit, a merge, an edit through the shell).
+          const n = [...S.diffs.values()].reduce((k, d) => k + ((d && d.files) || []).length, 0);
+          return n ? `No file edit was recorded since then; the agents' branches differ from main in ${n} file${n === 1 ? "" : "s"}, under What changed.` : "Nothing changed since.";
+        })()),
       list.length ? h("div", { class: "pv-since" }, list.slice(0, 8).map((e) => h("div", { class: "pv-since-r" },
         avatar(e.agent, 18), h("code", { class: "pv-since-p", title: e.path }, base(e.path)),
         onPage.has(e.agent.id + " " + e.path) ? pill("on this page", "acc") : null,

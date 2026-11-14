@@ -27,10 +27,10 @@ export async function askSheet(ctx, p, q) {
   try {
     const r = await ctx.api("/api/ask", { method: "POST", body: { repo: p.path, question: q } });
     const text = (r.answer && (r.answer.text || r.answer)) || r.text || "";
-    body.replaceChildren(
+    body.replaceChildren(...[
       text ? h("div", { class: "g-md" }, md(String(text))) : h("p", {}, "ChloeCtx has nothing on this yet. Debug › Why the code is like this reads the code and its history."),
       (r.missing || []).length ? h("p", { class: "g-dim" }, r.missing.join(" · ")) : null,
-      r.ms != null ? h("p", { class: "g-dim num" }, `${r.ms} ms · no model`) : null);
+      r.ms != null ? h("p", { class: "g-dim num" }, `${r.ms} ms · no model`) : null].flat().filter((k) => k != null && k !== false));
   } catch (e) { body.replaceChildren(h("p", { class: "g-bad" }, `Not answered: ${e.message}`)); }
 }
 
@@ -66,11 +66,13 @@ export function mount(root, ctx) {
     const d = S.digest;
     const when = d && d.since_ms ? `Since you left at ${fmtClock(d.since_ms)}, ${since(d.since_ms)} ago` : "Since you last looked";
     const c = list.map((a) => [a, groupOf(a)]);
+    const merged = (((ctx.projectByName && p && ctx.projectByName(p.project)) || p || {}).merged) || {};
     const bits = [];
     for (const [a, g] of c) {
       if (g === "needs") bits.push(`${a.name} waits on you`);
       else if (g === "ready") bits.push(`${a.name} is ready to review`);
       else if (g === "working") bits.push(`${a.name} is working`);
+      else if (merged[a.id] && Date.now() - (merged[a.id].ts || 0) < 86400000) bits.push(`${a.name} was merged into ${merged[a.id].onto || "main"}`);
     }
     const done = d ? (d.done || []).length : 0;
     if (done) bits.push(`${done} outcome${done === 1 ? "" : "s"} done`);
@@ -110,7 +112,7 @@ export function mount(root, ctx) {
         changed.length ? changed.map((r) => h("a", { class: "g-chg", href: `#/p/${p.project}/ship/${r.id}` }, h("code", {}, r.branch || r.name), h("span", { class: "g-dim" }, `${r.files} file${r.files === 1 ? "" : "s"}`), churnBar(r.added, r.removed)))
           : h("p", { class: "g-dim" }, "No branch has changes waiting.")),
       h("section", {}, label("Decisions made", h("span", { class: "num" }, String(newDecs.length))),
-        !S.decisions ? h("p", { class: "g-dim" }, "Reading ChloeCtx…") : newDecs.length ? newDecs.slice(0, 3).map((d) => h("div", { class: "g-dec" }, h("span", { class: "lv-ctx" }, ""), h("div", {}, h("div", {}, d.text), h("small", {}, d.agent ? `${d.agent.name}, on its own` : "you", " · ", since(d.ts), " ago")))) : h("p", { class: "g-dim" }, "None since you left."),
+        !S.decisions ? h("p", { class: "g-dim" }, "Reading ChloeCtx…") : newDecs.length ? newDecs.slice(0, 3).map((d) => h("div", { class: "g-dec" }, h("span", { class: "lv-ctx" }, ""), h("div", {}, h("div", {}, d.words || d.text), h("small", {}, d.by === "you" || !d.agent ? "you" : d.confirmed ? `${d.agent.name}, you confirmed it` : `${d.agent.name}, on its own`, " · ", since(d.ts), " ago")))) : h("p", { class: "g-dim" }, "None since you left."),
         newDecs.length > 3 ? h("a", { class: "lv-link", href: "#/debug/records" }, `All ${newDecs.length} →`) : null),
       h("section", {}, btn("I'm stepping away: notify me", { onclick: async () => { try { await ctx.api("/api/away/leave", { method: "POST", body: {} }); ctx.toast("Marked. Since you left counts from now."); ctx.notify && ctx.notify(); } catch (e) { ctx.toast(e.message, true); } } })),
       ctx.slot("rules-suggest"),

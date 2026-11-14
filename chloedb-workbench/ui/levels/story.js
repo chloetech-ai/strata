@@ -203,15 +203,18 @@ export function mount(root, ctx) {
 
   function intentLevel(a) {
     const st = S.story, o = S.outcome;
+    // The task once: not again when the intent is its own first sentence.
+    const lead = String(st.intent || "").replace(/[.…\s]+$/, "");
+    const otherTask = a.task && a.task !== st.intent && !(lead && a.task.startsWith(lead));
     return level("intent", [
       h("div", { class: "sy-intent" }, inlineCode(st.intent || a.task || "")),
       h("div", { class: "sy-now" },
         a.state === "working" ? h("i", { class: "sy-live-dot" }) : h("i", { class: `sy-dot s-${a.state}` }),
         h("span", {}, inlineCode(a.narration || a.waiting_for || a.last_event || ""),
           a.narration_ts ? h("span", { class: "muted" }, ` · ${fmtDur(Date.now() - toMs(a.narration_ts))} ago`) : null)),
-      o || (a.task && a.task !== st.intent) ? h("div", { class: "sy-meta" },
+      o || otherTask ? h("div", { class: "sy-meta" },
         o ? h("span", {}, "outcome ", h("b", {}, o.title), S.goal ? ` of ${S.goal.text.split(":")[0]}` : "") : null,
-        a.task && a.task !== st.intent ? h("span", {}, "task: ", a.task) : null) : null,
+        otherTask ? h("span", {}, "task: ", a.task) : null) : null,
     ]);
   }
 

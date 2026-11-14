@@ -107,6 +107,9 @@ export function mount(root, ctx) {
     if (!same) { data = null; err = null; list = null; result = null; load(); } else if (r.merge && data && !sheet) openMerge();
   };
   window.addEventListener("hashchange", onHash);
+  const mq = matchMedia(PHONE);
+  const onMq = () => { if (alive && data) render(); };
+  mq.addEventListener("change", onMq);
 
   // ------------------------------------------------------------ loading
   async function load() {
@@ -201,9 +204,18 @@ export function mount(root, ctx) {
         h("ol", { class: "rv-order" }, ready.map((r) => h("li", {}, h("span", { class: "num" }, String(r.order)), h("b", {}, r.agent.name), h("code", {}, r.branch)))),
         order.line ? h("p", { class: "rv-p" }, order.line) : null,
         null));
+      // One pull request for several branches: pick them, get one description.
+      if (ready.length) {
+        const picked = new Set(ready.map((r) => r.agent.id));
+        const draftBtn = btn(ready.length > 1 ? "Draft one pull request" : "Draft the pull request", { sm: true, onclick: () => openPr(ready.filter((r) => picked.has(r.agent.id)).map((r) => r.agent.id)) });
+        insp.push(h("section", {}, label("One pull request"),
+          ready.length > 1 ? h("div", { class: "rv-pick" }, ready.map((r) => h("label", {}, h("input", { type: "checkbox", checked: true, onchange: (e) => { if (e.target.checked) picked.add(r.agent.id); else picked.delete(r.agent.id); draftBtn.disabled = !picked.size; } }), h("b", {}, r.agent.name), h("span", { class: "rv-why" }, r.title || r.branch)))) : null,
+          h("p", { class: "rv-why" }, ready.length > 1 ? "One title and one description for the changes you tick, in merge order: what each changed, its tests and decisions." : "A title and description from what the branch changed."),
+          draftBtn));
+      }
       const gated = ready.filter((r) => r.gate && r.gate.primary !== "merge");
       if (gated.length) insp.push(h("section", {}, label("Not mergeable yet"), gated.map((r) => h("p", { class: "rv-p" }, h("b", {}, r.agent.name), `: ${r.gate.label}.`))));
-      insp.push(h("div", { class: "rv-act" }, primary, ready.length > 1 && !allClean ? h("p", { class: "rv-why" }, "Merge each change from its own page: some need you first.") : null));
+      if (!matchMedia(PHONE).matches) insp.push(h("div", { class: "rv-act" }, primary, ready.length > 1 && !allClean ? h("p", { class: "rv-why" }, "Merge each change from its own page: some need you first.") : null));
     }
     return page({
       kicker: `Review and ship · ${plural(ready.length, "change")} ready`,
@@ -211,7 +223,7 @@ export function mount(root, ctx) {
       sub: ready.length ? `Tests on each branch, whether it merges into ${onto} cleanly, and the order to merge them in.` : null,
       steps: steps(1),
       inspector: insp.length ? insp : null,
-    }, ...body, ready.length ? phoneBar([primary && primary.cloneNode(true)], () => (allClean ? openMergeMany(ready) : go(`${base()}/${enc(first.agent.id)}`))) : null);
+    }, ...body, ready.length && matchMedia(PHONE).matches ? phoneBar([primary && primary.cloneNode(true)], () => (allClean ? openMergeMany(ready) : go(`${base()}/${enc(first.agent.id)}`))) : null);
   }
 
   /** The phone's sticky bar: the same actions, once (the inspector's are hidden there). */
@@ -237,6 +249,8 @@ export function mount(root, ctx) {
     const g = d.gate || {};
     const name = d.agent.name;
     const onto = d.onto || "main";
+    const phone = matchMedia(PHONE).matches;
+    if (d.merged) return mergedView(d, phone);
     const at = list && list.ready ? list.ready.findIndex((r) => r.agent.id === d.agent.id) : -1;
     const kicker = at >= 0 ? `Review and ship · ${at + 1} of ${list.ready.length} ready` : `Review and ship · ${d.state || ""}`;
     const t = d.totals || {};
@@ -256,16 +270,6 @@ export function mount(root, ctx) {
     if (tf.failed && !ex.some((x) => /fail/.test(`${x.text} ${x.sub || ""}`))) ex.unshift({ tone: "crit", text: tf.line });
     const verdictNode = [h("b", {}, v.head || ""), " ", v.text || ""];
     const blastNode = blastCompact({ verdict: verdictNode, tone: v.tone || "warn", rings, exceptions: ex.map((x) => ({ tone: x.tone, text: x.text, sub: x.sub })), tests: tf.failed ? null : blast.tests, title: "Blast radius" });
-    // The exceptions that ask for you get their button.
-    const exNodes = blastNode.querySelectorAll(".blast-ex .ex");
-    ex.forEach((x, i) => {
-      if (!x.confirm || !exNodes[i]) return;
-      const dec = (d.decisions.matter || []).find((m) => m.id === x.record);
-      exNodes[i].classList.add("act");
-      exNodes[i].append(dec && dec.confirmed ? h("span", { class: "rv-ok" }, icon("check", "i sm"), "Still right") : h("div", { class: "rv-exb" },
-        btn("Still right", { sm: true, disabled: confirming.has(x.record), onclick: () => confirm(x.record) }),
-        btn("Change it", { sm: true, ghost: true, href: `#/debug/records?id=${enc(x.record)}` })));
-    });
 
     // Pieces of work, riskiest first.
     const pieces = d.pieces || [];
@@ -288,6 +292,7 @@ export function mount(root, ctx) {
     const body = [
       result ? resultBanner() : null,
       lastMergeBanner(d),
+      gateBanner(d),
       d.checks && d.checks.merge && d.checks.merge.clean === false ? conflictBanner(d) : null,
       blastNode,
       piecesNode,
@@ -300,28 +305,84 @@ export function mount(root, ctx) {
     const tests = c.tests || {};
     const m = c.merge || {};
     const orderNames = list && list.order && list.order.names && list.order.names.length > 1 ? list.order.names.join(", then ") : null;
+    const fails = (tests.failing_out || []).filter((x) => x && x.name);
+    const failNode = tests.failed ? h("details", { class: "rv-fails" },
+      h("summary", { class: "lv-link" }, `Why ${tests.failed === 1 ? "it fails" : "they fail"}`),
+      fails.length ? fails.map((x) => h("div", {}, h("code", {}, x.name), x.error ? h("pre", {}, x.error) : h("p", { class: "rv-why" }, "Its run printed no error for this test.")))
+        : h("p", { class: "rv-why" }, `No output was kept for these tests. ${name}'s terminal has the run.`),
+      h("a", { class: "lv-link", href: `#/a/${enc(d.agent.id)}/terminal` }, `Open ${name}'s terminal`)) : null;
     const checks = h("section", {}, label("Checks"),
       checkRow("Tests", tests.ran ? tests.ok : null, tests.ran ? h("span", {}, h("b", { class: "num" }, String(tests.passed)), " pass", tests.failed ? [" · ", h("b", { class: "num bad" }, String(tests.failed)), " fail"] : "") : "No test has run",
-        tests.failed ? (tests.failing || []).slice(0, 3).join(", ") : tests.ran ? `on ${d.branch}` : `Ask ${name} to run them, or run them in its terminal.`),
-      checkRow("Merge", m.clean, m.clean === false ? `Conflicts with ${onto}` : m.clean ? `Cleanly into ${onto}` : `Not checked`, m.clean === false ? `in ${(m.conflicts || []).slice(0, 3).join(", ")}` : m.clean ? null : m.line),
+        tests.failed ? [(tests.failing || []).slice(0, 3).join(", "), failNode] : tests.ran ? [`on ${d.branch}`, (tests.ignored || []).length ? ` · ${plural(tests.ignored.length, "known flaky test")} left out by your rule` : ""] : `Ask ${name} to run them, or run them in its terminal.`),
+      checkRow("Merge", m.clean, m.clean === false ? `Conflicts with ${onto}` : m.clean ? `Cleanly into ${onto}` : `Not checked`, m.clean === false ? `in ${(m.conflicts || []).slice(0, 3).join(", ")}` : m.clean ? (m.with_uncommitted ? "counting its uncommitted changes" : null) : m.line),
       c.uncommitted && c.uncommitted.length ? checkRow("Commits", false, `${plural(c.uncommitted.length, "file")} not committed`, c.uncommitted.slice(0, 3).join(", ")) : null,
       orderNames ? checkRow("Order", "info", orderNames, list.order.line && list.order.line !== `Merge ${orderNames}.` ? list.order.line.replace(/^Merge [^.]*\.\s*/, "") : null) : null);
     const key = pieces.find((p) => p.hunk);
     const keyNode = key ? h("section", {}, label("Key change", h("code", { class: "rv-where" }, key.hunk.where || key.hunk.path)), hunkView(key.hunk.lines, { max: 14 })) : null;
-    const dm = (d.decisions && d.decisions.matter) || [];
-    const routine = (d.decisions && d.decisions.routine) || 0;
-    const decNode = dm.length || routine ? h("section", {},
-      label(["Decisions ", h("span", { class: "c num" }, String(dm.length))], routine ? h("span", {}, `${routine} routine, folded`) : h("span")),
-      dm.map((x) => h("div", { class: "rv-dec" },
-        h("p", {}, x.text),
-        h("div", { class: "s" }, [x.agent && x.agent.name ? x.agent.name : "an agent", x.ts ? since(x.ts) + " ago" : null, x.why === "replaces" ? "replaces an earlier one" : "a new rule"].filter(Boolean).join(" · ")),
-        x.why === "replaces" && x.replaces && x.replaces.text ? h("div", { class: "s was" }, `Was: “${x.replaces.text}”`) : null,
-        x.why === "replaces" ? (x.confirmed ? h("span", { class: "rv-ok" }, icon("check", "i sm"), "You confirmed it") : h("div", { class: "rv-exb" }, btn("Still right", { sm: true, onclick: () => confirm(x.id) }), btn("Change it", { sm: true, ghost: true, href: `#/debug/records?id=${enc(x.id)}` }))) : null))) : null;
+    const decNode = decisionsNode(d);
 
     const acts = actions(d);
-    const insp = [checks, keyNode, decNode, h("div", { class: "rv-act" }, acts.nodes(), acts.why)];
+    const insp = [checks, keyNode, decNode, phone ? null : h("div", { class: "rv-act" }, acts.nodes(), acts.why)];
     return page({ kicker, title: name, sub: d.title && d.title !== name ? d.title : null, aside: null, steps: steps(route.merge || (d.last_merge && !d.last_merge.undone) ? 3 : 2, d.agent.id), inspector: insp },
-      chips, ...body, h("div", { class: "rv-bar" }, acts.nodes(true), acts.why ? acts.why.cloneNode(true) : null));
+      chips, ...body, phone ? h("div", { class: "rv-bar" }, acts.nodes(true), acts.why) : null);
+  }
+
+  /** Who a decision is from, in words: you, a rule of yours, or the agent. */
+  function decWho(x) {
+    const who = x.by === "you" ? "you" : x.by === "rule" ? "your rule" : x.who || "an agent";
+    return [who, x.confirmed && x.by !== "you" ? "you confirmed it" : null, x.ts ? since(x.ts) + " ago" : null].filter(Boolean).join(" · ");
+  }
+
+  /** Every decision behind the change, one count: what waits for you first, the rest folded but open-able. */
+  function decisionsNode(d) {
+    const ds = d.decisions || {};
+    const all = ds.list || [];
+    if (!all.length) return h("section", {}, label(["Decisions ", h("span", { class: "c num" }, "0")]), h("p", { class: "rv-why" }, "ChloeCtx holds no decision of this branch's work, and no rule of yours names its files."));
+    const top = all.filter((x) => x.why);
+    const rest = all.filter((x) => !x.why);
+    const row = (x) => h("div", { class: "rv-dec" },
+      h("p", {}, x.text),
+      h("div", { class: "s" }, [decWho(x), x.why === "replaces" ? "replaces an earlier one" : x.why === "rule" ? "a rule that names these files" : x.why === "new rule" ? "a new rule" : null].filter(Boolean).join(" · ")),
+      x.why === "replaces" && x.replaces && x.replaces.text ? h("div", { class: "s was" }, `Was: “${x.replaces.text}”${x.replaces.who ? ` (${x.replaces.who})` : ""}`) : null,
+      x.why === "replaces" ? (x.confirmed ? h("span", { class: "rv-ok" }, icon("check", "i sm"), "You confirmed it") : h("span", { class: "rv-why" }, "Waits for you: Still right or Change it, at the top of the page.")) : null);
+    return h("section", {}, label(["Decisions ", h("span", { class: "c num" }, String(all.length))], rest.length ? h("span", {}, `${rest.length} routine`) : h("span")),
+      top.map(row),
+      rest.length ? h("details", { class: "rv-decmore", open: !top.length || null }, h("summary", {}, top.length ? `Show the ${plural(rest.length, "routine one")}` : `The ${plural(rest.length, "routine decision")}`), rest.map(row)) : null);
+  }
+
+  /** What holds the merge, near the top: a decision to confirm (one Still right on the page), or what is not committed. */
+  function gateBanner(d) {
+    const g = d.gate || {};
+    const waiting = ((d.decisions && d.decisions.list) || []).filter((x) => x.why === "replaces" && !x.confirmed);
+    if (!waiting.length) return null;
+    return h("div", { class: "pane rv-gate", role: "status" }, icon("why", "i"),
+      h("div", {}, h("b", {}, waiting.length === 1 ? "One decision waits for you before this merges" : `${waiting.length} decisions wait for you before this merges`),
+        waiting.map((x) => h("div", {},
+          h("p", {}, h("b", {}, `${decWho(x)}: `), x.text),
+          x.replaces && x.replaces.text ? h("p", {}, `It replaces: “${x.replaces.text}”${x.replaces.who ? ` (${x.replaces.who})` : ""}`) : null,
+          h("div", { class: "rv-exb" },
+            btn("Still right", { sm: true, primary: true, disabled: confirming.has(x.id), onclick: () => confirm(x.id) }),
+            btn("Change it", { sm: true, ghost: true, href: `#/debug/records?id=${enc(x.id)}` })))),
+        g.blocked && g.blocked.length ? h("p", {}, `Also: ${g.blocked.join(", ")}.`) : null));
+  }
+
+  /** After the merge: what is in main now, Undo while it can, and where to go next. */
+  function mergedView(d, phone) {
+    const lm = d.merged;
+    const name = d.agent.name;
+    const next = btn("Back to what is ready", { primary: true, kbd: phone ? null : "⌘↵", href: base() });
+    if (!phone) next.setAttribute("data-primary", "");
+    const commits = d.merged_commits || [];
+    const insp = phone ? null : [h("section", {}, label("Merged"),
+      checkRow("Into", true, h("span", {}, h("code", {}, lm.onto), ` as ${short(lm.commit)}`), `${since(lm.ts)} ago`),
+      checkRow("Undo", lm.can_undo ? "info" : null, lm.can_undo ? "Possible" : "Off", lm.can_undo ? `puts ${lm.onto} back at ${short(lm.before)}` : lm.pushed ? "it was pushed" : `${lm.onto} moved on since`)),
+      h("div", { class: "rv-act" }, h("div", { class: "rv-btns" }, next, btn(`Tell ${name} something…`, { onclick: () => openSendBack() })))];
+    return page({ kicker: `Review and ship · merged`, title: name, sub: `Merged as ${short(lm.commit)} into ${lm.onto}`, steps: steps(3, d.agent.id), inspector: insp },
+      result ? resultBanner() : null,
+      lastMergeBanner(d),
+      commits.length ? h("section", { class: "gp-sec" }, label(["What it brought into ", h("code", {}, lm.onto)]), h("ul", { class: "rv-commits" }, commits.slice(0, 12).map((c) => h("li", {}, h("code", {}, short(c.sha)), " ", c.subject || "")))) : null,
+      h("p", { class: "rv-p" }, `${name}'s branch ${d.branch} and its worktree are kept. Nothing was pushed.`),
+      phone ? h("div", { class: "rv-bar" }, h("div", { class: "rv-btns" }, next)) : null);
   }
 
   /** Merge, Send back and Open a pull request, by the gate. */
@@ -329,27 +390,20 @@ export function mount(root, ctx) {
     const g = d.gate || {};
     const name = d.agent.name;
     const onto = d.onto || "main";
-    const lm = d.last_merge;
-    const merged = lm && !lm.undone;
     let why = null;
     if (!g.can_merge) why = h("p", { class: "rv-why" }, `${g.label}.`, g.unconfirmed ? " A decision that replaces an earlier one waits for you to say it is still right." : "");
     else if (g.anyway) why = h("p", { class: "rv-why" }, `${(g.warn || []).map((w) => w[0].toUpperCase() + w.slice(1)).join("; ")}. Send ${name} back, or merge anyway by typing the branch's name.`);
     const nodes = (phone) => {
-      const mergeFirst = g.primary === "merge" && g.can_merge && !merged;
-      const mergeBtn = merged ? null : btn(g.can_merge && g.anyway ? "Merge anyway…" : `Merge into ${onto}`, {
+      const mergeFirst = g.primary === "merge" && g.can_merge;
+      const mergeBtn = btn(g.can_merge && g.anyway ? "Merge anyway…" : `Merge into ${onto}`, {
         primary: mergeFirst, kbd: mergeFirst && !phone ? "⌘↵" : null, disabled: !g.can_merge, title: g.can_merge ? null : g.label,
         onclick: () => openMerge(),
       });
-      const backBtn = btn(`Send ${name} back…`, { primary: !mergeFirst && !merged, kbd: !mergeFirst && !merged && !phone ? "⌘↵" : null, onclick: () => openSendBack() });
-      const prBtn = merged || phone ? null : btn("Open a pull request instead", { ghost: true, onclick: () => openDetails() });
-      if (merged) {
-        const next = btn("Back to what is ready", { primary: true, kbd: phone ? null : "⌘↵", href: base() });
-        if (!phone) next.setAttribute("data-primary", "");
-        return h("div", { class: "rv-btns" }, next, btn(`Send ${name} back…`, { onclick: () => openSendBack() }));
-      }
-      if (mergeBtn) mergeBtn.dataset.act = "merge";
+      const backBtn = btn(`Send ${name} back…`, { primary: !mergeFirst, kbd: !mergeFirst && !phone ? "⌘↵" : null, onclick: () => openSendBack() });
+      const prBtn = phone ? null : btn("Open a pull request instead", { ghost: true, onclick: () => openDetails() });
+      mergeBtn.dataset.act = "merge";
       backBtn.dataset.act = "back";
-      for (const b of [mergeBtn, backBtn]) if (b && b.classList.contains("primary") && !phone) b.setAttribute("data-primary", "");
+      for (const b of [mergeBtn, backBtn]) if (b.classList.contains("primary")) b.setAttribute("data-primary", "");
       return h("div", { class: "rv-btns" }, mergeFirst ? [mergeBtn, backBtn] : [backBtn, mergeBtn], prBtn);
     };
     return { nodes, why };
@@ -383,11 +437,11 @@ export function mount(root, ctx) {
       row.setAttribute("aria-expanded", String(open.v));
       if (!open.v) return more.replaceChildren();
       const all = h("div", { class: "rv-all", hidden: true }, (p.all || []).map((f) => h("div", {}, h("code", { class: "rv-where" }, f.path), (f.hunks || []).map((hk) => hunkView(hk.lines)))), p.truncated ? none("The rest is cut here; the full diff is under All details.") : null);
-      more.replaceChildren(
+      more.replaceChildren(...[
         h("p", { class: "rv-p s" }, p.words),
         p.hunk ? h("div", {}, h("div", { class: "lbl" }, h("span", {}, "Key change"), h("span", { class: "sp" }), h("code", { class: "rv-where" }, p.hunk.where)), hunkView(p.hunk.lines)) : null,
         p.hunks > 1 ? h("button", { class: "lv-link rv-showall", type: "button", onclick: (e) => { all.hidden = !all.hidden; e.target.textContent = all.hidden ? `Show all ${p.hunks} hunks` : "Show only the key change"; } }, `Show all ${p.hunks} hunks`) : null,
-        all);
+        all].flat().filter((k) => k != null && k !== false));
     };
     const row = h("button", { class: "rv-pc", type: "button", onclick: () => { open.v = !open.v; fill(); } },
       h("span", {}, riskLabel(p.risk)),
@@ -487,7 +541,7 @@ export function mount(root, ctx) {
     const plan = d.plan || {};
     const commits = d.commits || [];
     const t = d.totals || {};
-    const typed = g.anyway ? h("input", { class: "field", placeholder: `type ${d.branch}`, "aria-label": `Type ${d.branch} to merge anyway`, autocomplete: "off", spellcheck: "false", oninput: () => { go1.disabled = typed.value.trim() !== d.branch; } }) : null;
+    const typed = g.anyway ? h("input", { class: "field", placeholder: `type ${d.branch}`, "aria-label": `Type ${d.branch} to merge anyway`, autocomplete: "off", spellcheck: "false", oninput: () => { go1.disabled = typed.value.trim() !== d.branch; }, onkeydown: (e) => { if (e.key === "Enter" && !go1.disabled) { e.preventDefault(); go1.click(); } } }) : null;
     const status = h("p", { class: "rv-why", role: "status" });
     const go1 = btn(g.anyway ? `Merge ${d.branch} anyway` : `Merge into ${onto}`, { primary: true, disabled: !!g.anyway, onclick: async () => {
       go1.disabled = true; status.textContent = "Merging…";
@@ -495,6 +549,7 @@ export function mount(root, ctx) {
         const r = await api("/api/review/merge", { method: "POST", body: { agents: [d.agent.id], anyway: typed ? [typed.value.trim()] : [] } });
         closeSheet();
         result = null; // the merge's own banner says it, with Undo
+        if (ctx.toast) ctx.toast(r.message || `Merged ${d.branch} into ${onto}.`);
         await load();
       } catch (e) {
         go1.disabled = false;
@@ -538,6 +593,31 @@ export function mount(root, ctx) {
       h("div", { class: "rv-btns" }, go1, btn("Cancel", { onclick: () => closeSheet() })), status);
   }
 
+  /** One pull request description for several branches (POST /api/review/pr). */
+  async function openPr(ids) {
+    if (!ids.length) return;
+    const box = openSheet(ids.length > 1 ? `One pull request for ${plural(ids.length, "branch", "branches")}` : "The pull request", "Written from what changed: files, functions, tests and decisions.", none("Writing it…"));
+    const bd = box.querySelector(".rv-sh-bd");
+    let r;
+    try { r = await api("/api/review/pr", { method: "POST", body: { agents: ids } }); }
+    catch (e) { bd.replaceChildren(none(`It could not be written: ${e.message}.`)); return; }
+    if (!sheet || !box.isConnected) return;
+    const status = h("p", { class: "rv-why", role: "status" });
+    const copy = async (what, text) => {
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch { /* the browser may refuse */ }
+      status.textContent = ok ? `${what} copied.` : "The browser did not allow copying: select the text instead.";
+    };
+    bd.replaceChildren(h("div", { class: "rv-pr" },
+      h("div", { class: "lbl" }, h("span", {}, "Title")), h("p", { class: "t" }, r.title),
+      h("div", { class: "lbl" }, h("span", {}, "Description"), h("span", { class: "sp" }), h("code", { class: "rv-where" }, r.body_file || "")),
+      h("pre", {}, r.body),
+      h("div", { class: "rv-btns" }, btn("Copy description", { primary: true, onclick: () => copy("The description", r.body) }), btn("Copy title", { onclick: () => copy("The title", r.title) }), btn("Copy the commands", { ghost: true, onclick: () => copy("The commands", `${r.make}\n${r.gh}`) })),
+      h("p", { class: "rv-why" }, (r.branches || []).length > 1 ? `The branches are separate: the commands make ${r.head} from ${r.onto} with them merged, push it and open the pull request. Nothing is run for you.` : "Push the branch, then open the pull request with the command. Nothing is run for you."),
+      h("code", { class: "sh-cmd" }, r.make), h("code", { class: "sh-cmd" }, r.gh),
+      ...(r.missing || []).map((m) => none(m)), status));
+  }
+
   /** Send back: a note written for you from what is wrong, yours to change. */
   function openSendBack() {
     const d = data;
@@ -550,7 +630,7 @@ export function mount(root, ctx) {
     const untested = ((d.blast && d.blast.exceptions) || []).find((x) => /^Untested: /.test(x.text));
     if (untested) lines.push(`Add tests for ${untested.text.replace(/^Untested: /, "")}.`);
     if (c.uncommitted && c.uncommitted.length) lines.push(`Commit your changes: ${plural(c.uncommitted.length, "file")} ${c.uncommitted.length === 1 ? "is" : "are"} not committed.`);
-    const note = h("textarea", { class: "field", rows: "6", "aria-label": `What ${name} should do` }, lines.join("\n"));
+    const note = h("textarea", { class: "field", rows: "6", "aria-label": `What ${name} should do`, onkeydown: (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.stopPropagation(); send.click(); } } }, lines.join("\n"));
     const status = h("p", { class: "rv-why", role: "status" });
     const send = btn(`Send ${name} back`, { primary: true, onclick: async () => {
       const text = note.value.trim();
@@ -561,12 +641,15 @@ export function mount(root, ctx) {
         catch (e) { if (e.status !== 409) throw e; await api(`/api/agents/${enc(d.agent.id)}/restart`, { method: "POST", body: { prompt: text } }); }
         closeSheet();
         result = { ok: true, title: `Sent ${name} back`, text: `It has your note and works on ${d.branch} again. This page updates when it is ready.` };
+        if (ctx.toast) ctx.toast(`Sent ${name} back with your note.`);
         render();
+        el.scrollTop = 0;
+        try { el.closest(".gp-main, main, .view")?.scrollTo?.({ top: 0 }); window.scrollTo({ top: 0 }); } catch { /* nothing to scroll */ }
       } catch (e) {
         send.disabled = false; status.textContent = `Not sent: ${e.message}`;
       }
     } });
-    openSheet(`Send ${name} back`, lines.length ? "Workbench wrote the note from what is wrong; change it as you like." : `Say what ${name} should change.`,
+    openSheet(d.merged ? `Tell ${name} something` : `Send ${name} back`, lines.length ? "Workbench wrote the note from what is wrong; change it as you like. ⌘↵ sends." : `Say what ${name} should do. ⌘↵ sends.`,
       note, h("div", { class: "rv-btns" }, send, btn("Cancel", { onclick: () => closeSheet() })), status);
   }
 
@@ -587,6 +670,7 @@ export function mount(root, ctx) {
       alive = false;
       document.removeEventListener("keydown", onKey);
       window.removeEventListener("hashchange", onHash);
+      mq.removeEventListener("change", onMq);
       if (sheet) sheet.remove();
       if (child && child.unmount) child.unmount();
       el.remove();
@@ -679,7 +763,26 @@ button.rv-pc[aria-expanded=true]{background:var(--surface-2)}
 .rv-det>summary{list-style:none;cursor:pointer;padding:var(--s-3) 0;border-top:var(--hair) solid var(--line);min-height:var(--touch);display:flex;align-items:center}
 .rv-det>summary::-webkit-details-marker{display:none}
 .rv-det>summary .lbl{flex:1;color:var(--accent-text)}
-.rv-ship{margin-top:var(--s-3)}
+.rv-ship{margin-top:var(--s-3);position:relative}
+.rv-ship>.lv-screen{position:static;inset:auto;height:auto;overflow:visible}
+.rv-ship .sh-wrap{padding:0}
+.rv-ship .sh-crumb{display:none}
+.rv-gate{display:flex;gap:var(--s-3);align-items:flex-start;padding:var(--s-3) var(--s-4);margin-bottom:var(--s-4);border-left:3px solid var(--ctx, var(--accent))}
+.rv-gate>div{flex:1;min-width:0}
+.rv-gate p{margin:2px 0 0;color:var(--text-2);font-size:var(--fs-sm);line-height:var(--lh-sm)}
+.rv-gate .rv-exb{margin-top:var(--s-2)}
+.rv-decmore>summary{cursor:pointer;color:var(--accent-text);font-size:var(--fs-sm);padding:var(--s-2) 0;list-style:none}
+.rv-decmore>summary::-webkit-details-marker{display:none}
+.rv-pick{display:flex;flex-direction:column;gap:var(--s-1);margin:var(--s-2) 0}
+.rv-pick label{display:flex;gap:var(--s-2);align-items:center;font-size:var(--fs-sm)}
+.rv-pr pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:50vh;overflow:auto;margin:0;padding:var(--s-3);background:var(--surface-2);border-radius:var(--r-sm);font:var(--w-text) var(--fs-sm)/var(--lh-sm) var(--mono)}
+.rv-pr .t{font-weight:var(--w-title)}
+@media (max-width:640px){.rv-pr .lbl .rv-where{display:none}}
+.rv-pr .sh-cmd{display:block;font:var(--w-text) var(--fs-xs)/var(--lh-xs) var(--mono);padding:var(--s-2);background:var(--surface-2);border-radius:var(--r-sm);overflow-wrap:anywhere;white-space:pre-wrap}
+.rv-fails{margin-top:var(--s-2)}
+.rv-fails>summary{cursor:pointer;list-style:none}
+.rv-fails>summary::-webkit-details-marker{display:none}
+.rv-fails pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto;margin:var(--s-1) 0 var(--s-2);padding:var(--s-2);background:var(--surface-2);border-radius:var(--r-sm);font:var(--w-text) var(--fs-xs)/var(--lh-xs) var(--mono)}
 .rv-banner{display:flex;gap:var(--s-3);align-items:flex-start;padding:var(--s-3) var(--s-4);margin-bottom:var(--s-4);border-left:3px solid var(--text-3)}
 .rv-banner>div{flex:1;min-width:0}
 .rv-banner p{margin:2px 0 0;color:var(--text-2);font-size:var(--fs-sm);line-height:var(--lh-sm)}
@@ -721,8 +824,10 @@ button.rv-pc[aria-expanded=true]{background:var(--surface-2)}
   .rv-pc .dd{grid-column:2;justify-self:start}
   .rv-pc-x{padding:0 var(--s-4) var(--s-4)}
   .rv-bar{display:flex;flex-direction:column;gap:var(--s-2);position:sticky;bottom:0;z-index:5;margin:var(--s-5) calc(-1 * var(--s-4)) 0;padding:var(--s-3) var(--s-4) max(var(--s-3),env(safe-area-inset-bottom));background:var(--glass);-webkit-backdrop-filter:var(--glass-blur);backdrop-filter:var(--glass-blur);border-top:var(--hair) solid var(--line)}
-  .rv-bar .rv-btns .btn{flex:1 1 40%;height:48px}
-  .rv-bar .rv-btns .btn.primary{flex-basis:100%}
+  .rv-bar{gap:var(--s-1);padding-top:var(--s-2);padding-bottom:max(var(--s-2),env(safe-area-inset-bottom))}
+  .rv-bar .rv-btns{flex-wrap:nowrap}
+  .rv-bar .rv-btns .btn{flex:1 1 0;min-width:0;height:auto;min-height:44px}
+  .rv-bar .rv-why{font-size:var(--fs-xs);line-height:var(--lh-xs);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .rv-scrim{place-items:end stretch;padding:0}
   .rv-sheet{width:100%;max-height:92vh;border-radius:var(--r) var(--r) 0 0}
   .rv-sh-bd .kv{grid-template-columns:minmax(0,1fr)}

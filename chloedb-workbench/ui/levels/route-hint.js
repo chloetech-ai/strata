@@ -57,7 +57,7 @@ export function attach(dialog, { api }) {
     const chosen = model.value.trim();
     const use = h("button", { type: "button", class: "btn sm rh-use" + (chosen === s.model ? " on" : ""), onclick: () => { model.value = s.model; model.dispatchEvent(new Event("input", { bubbles: true })); render(v); } },
       chosen === s.model ? `Using ${nice(s.model)}` : `Use ${nice(s.model)}`);
-    host.replaceChildren(
+    host.replaceChildren(...[
       h("div", { class: "rh-top" },
         routeIcon(),
         h("div", { class: "rh-main" },
@@ -76,7 +76,7 @@ export function attach(dialog, { api }) {
       v.apply === false ? h("div", { class: "rh-foot rh-dim" }, `${v.similar} similar past task${v.similar === 1 ? "" : "s"}: an agent's spawn_agent keeps the default model until there are 5.`)
         : (v.examples || []).length ? h("div", { class: "rh-foot" }, h("span", { class: "rh-dim" }, "Like "), v.examples.slice(0, 2).map((e, i) => [i ? h("span", { class: "rh-dim" }, ", ") : null,
           h("span", { class: "rh-ex", title: `${e.name}: ${e.model}, ${e.done ? "finished" : "not finished"}${usd(e.cost_usd) ? `, ${usd(e.cost_usd)}` : ""}` }, `“${clip(e.task, 54)}”`, h("span", { class: "rh-dim" }, ` ${nice(e.model)}${usd(e.cost_usd) ? `, ${usd(e.cost_usd)}` : ""}`))]),
-          h("span", { class: "rh-dim" }, ` · from ${v.similar} past tasks in this repository`)) : null);
+          h("span", { class: "rh-dim" }, ` · from ${v.similar} past tasks in this repository`)) : null].flat().filter((k) => k != null && k !== false));
   }
 
   const soon = () => { clearTimeout(t); t = setTimeout(refresh, 350); };

@@ -502,7 +502,7 @@ export function mount(root, ctx) {
         h("div", { class: "lv-card-head" }, h("h2", { class: "lv-h2" }, "Pull request draft"),
           h("span", { class: "sh-bh" }, h("code", {}, p.base_branch || "main"), " ← ", h("code", {}, p.branch || a.branch))),
         h("input", { class: "sh-title-in", "data-key": "title", value: title, "aria-label": "Title", oninput: (e) => { S.title = e.target.value; const c = el.querySelector(".sh-gh code"); if (c) c.textContent = ghCommand(p, S.title); } }),
-        p.title_from ? h("div", { class: "muted sm sh-from" }, `Title from ${{ outcome: "its outcome", goal: "the goal it leads", commit: "its commit", summary: "what it said when it finished", task: "its task (it said nothing else to use)", name: "its name" }[p.title_from] || p.title_from}.`) : null,
+        p.title_from ? h("div", { class: "muted sm sh-from" }, `Title from ${{ outcome: "its outcome", goal: "the goal it leads", commit: "its commit", summary: "what it said when it finished", task: "what it was asked to do", name: "its name" }[p.title_from] || p.title_from}.`) : null,
         stackCard(p),
         h("div", { class: "sh-bodybar" },
           h("div", { class: "sh-seg" }, h("button", { class: S.raw ? null : "on", "data-key": "md-off", onclick: () => { S.raw = false; render(); } }, "Preview"), h("button", { class: S.raw ? "on" : null, "data-key": "md-on", onclick: () => { S.raw = true; render(); } }, "Markdown")),

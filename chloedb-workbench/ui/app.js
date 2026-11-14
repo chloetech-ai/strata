@@ -816,11 +816,12 @@ function renderZoom() {
   const files = C.id === a.id && C.data ? (C.data.files || []).length : 0;
   const mine = N.items.filter((it) => it.agent && it.agent.id === a.id);
   const group = Shell.groupOf(a);
-  const headKey = JSON.stringify([a.name, a.state, a.state_since, a.task, a.branch, a.model, a.running, a.read_only, group, proj && proj.project, ready, Z.tab, files, mine.map((it) => it.id)]);
+  const merged = (proj && proj.merged && proj.merged[a.id]) || null;
+  const headKey = JSON.stringify([a.name, a.state, a.state_since, a.task, a.branch, a.model, a.running, a.read_only, group, proj && proj.project, ready, Z.tab, files, mine.map((it) => it.id), merged]);
   if (headKey !== Z.headKey) {
     Z.headKey = headKey;
     $("ag-head").replaceChildren(AG.head(a, {
-      group, project: proj && proj.project,
+      group, project: proj && proj.project, merged,
       stat: ready ? { files: ready.files, added: ready.added, removed: ready.removed } : null,
       ship: proj ? `#/p/${proj.project}/ship/${a.id}` : null,
       onStop: () => confirmStop(a.id), onRestart: () => restartAgent(a.id), onTell: () => tellSheet(a),
@@ -2835,10 +2836,9 @@ function openRewindCard(o) {
   beginCard("rewind", `rw\u0001${o.agent}\u0001${o.from_ms}`, (b) => openRewindCard({ ...o, back: b }), { push: true });
   sheetHead("Rewind", a ? nameOf(a) : o.agent);
   const host = h("div", { class: "rw" });
-  $("sh-body").replaceChildren(
+  $("sh-body").replaceChildren(...[
     o.label ? h("p", { class: "rw-label", text: o.label }) : null,
-    host,
-  );
+    host].flat().filter((k) => k != null && k !== false));
   T.player = new Rewind(host, { agent: o.agent, from: o.from_ms, to: o.to_ms, edit: o.edit_ms ?? o.to_ms - 3000, name: a ? nameOf(a) : o.agent, onWrite: () => {} });
 }
 

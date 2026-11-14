@@ -219,6 +219,7 @@ pub fn list_full(sup: &std::sync::Arc<Supervisor>, lv: &std::sync::Arc<crate::le
         let mut counts: HashMap<&str, i64> = HashMap::new();
         let mut ready: Vec<Json> = Vec::new();
         let mut groups = serde_json::Map::new();
+        let mut merged_ids = serde_json::Map::new();
         let mut last = r["last_ms"].as_i64().unwrap_or(0);
         let mine: Vec<&crate::db::Agent> = agents.iter().filter(|a| a.repo == path).collect();
         for a in &mine {
@@ -232,7 +233,12 @@ pub fn list_full(sup: &std::sync::Arc<Supervisor>, lv: &std::sync::Arc<crate::le
             let own = a.cwd != a.repo && Path::new(&a.cwd).is_dir() && (running || now - a.ended.unwrap_or(a.state_since) < 7 * 86_400_000);
             let stat = if own && (a.state == "idle" || !running) { stat_cached(&a.cwd, &path, a.state_since) } else { None };
             let changed = stat.is_some_and(|(f, _, _)| f > 0);
-            let g = group_of(&a.state, running, changed);
+            // Merged by Review with nothing new since: done, not counted as at work.
+            let merged = sup.mark(&format!("review-merged:{}", a.id)).and_then(|s| serde_json::from_str::<Json>(&s).ok()).filter(|m| m["undone"] != true);
+            let g = if merged.is_some() && !changed { "finished" } else { group_of(&a.state, running, changed) };
+            if let Some(m) = merged.filter(|_| !changed) {
+                merged_ids.insert(a.id.clone(), json!({ "commit": m["commit"], "onto": m["onto"], "ts": m["ts"] }));
+            }
             *counts.entry(g).or_default() += 1;
             if running {
                 *counts.entry("running").or_default() += 1;
@@ -250,6 +256,7 @@ pub fn list_full(sup: &std::sync::Arc<Supervisor>, lv: &std::sync::Arc<crate::le
         r["trusted"] = json!(trusted(sup, &path));
         r["counts"] = json!({ "needs": c("needs"), "working": c("working"), "ready": c("ready"), "finished": c("finished"), "running": c("running") });
         r["groups"] = Json::Object(groups);
+        r["merged"] = Json::Object(merged_ids);
         r["ready"] = Json::Array(ready);
         r["unmerged"] = json!(unmerged.into_iter().take(20).collect::<Vec<_>>());
         r["needs"] = json!(by_repo[&path].as_u64().unwrap_or(0));

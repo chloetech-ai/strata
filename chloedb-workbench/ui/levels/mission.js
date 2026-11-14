@@ -385,12 +385,12 @@ function mountMission(root, ctx) {
       } else {
         const list = running();
         for (const id of [...G.picked]) if (!list.some((a) => a.id === id)) G.picked.delete(id);
-        panel.replaceChildren(list.length
+        panel.replaceChildren(...[list.length
           ? h("div", { class: "mi-gagents" }, list.map((a) => h("label", { class: "mi-ga" + (G.picked.has(a.id) ? " on" : "") },
             h("input", { type: "checkbox", checked: G.picked.has(a.id), "data-key": `ga:${a.id}`, onchange: (e) => { if (e.target.checked) G.picked.add(a.id); else G.picked.delete(a.id); sync(); } }),
             avatar(a, 20), h("b", {}, a.name), h("span", { class: "muted mi-gat" }, a.task ? String(a.task).split("\n")[0].slice(0, 140) : a.state))))
           : h("p", { class: "muted mi-gp" }, "No agent is running in this repository. Start them with New agent (n), then come back to set their goal."),
-        list.length ? h("p", { class: "muted mi-gp" }, "Each one you tick becomes an outcome of the goal (its task is the title) and is told so at its next step.") : null);
+        list.length ? h("p", { class: "muted mi-gp" }, "Each one you tick becomes an outcome of the goal (its task is the title) and is told so at its next step.") : null].flat().filter((k) => k != null && k !== false));
         const n = G.picked.size;
         go.firstChild.textContent = n ? `Set the goal for ${n} agent${n === 1 ? "" : "s"}` : "Set the goal";
       }

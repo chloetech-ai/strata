@@ -45,6 +45,7 @@ pub fn routes() -> Router<App> {
         .route("/api/review/merge", post(merge_route))
         .route("/api/review/undo", post(undo_route))
         .route("/api/review/confirm", post(confirm_route))
+        .route("/api/review/pr", post(pr_route))
         .route("/api/agents/:id/review", get(one_route))
 }
 
@@ -96,7 +97,7 @@ fn gate(branch: &str, tests: &Json, decisions: &Json, level: &str, dirty: &[Stri
     let failing = tests["failed"].as_u64().unwrap_or(0) as usize;
     let mut warn: Vec<String> = Vec::new();
     if failing > 0 {
-        warn.push(format!("{} on {branch}", plural(failing, "test fails").replace("tests fails", "tests fail")));
+        warn.push(format!("{} on {branch}", fails_words(failing)));
     }
     if level == "high" {
         warn.push("its risk is high".into());
@@ -114,9 +115,30 @@ fn gate(branch: &str, tests: &Json, decisions: &Json, level: &str, dirty: &[Stri
     json!({ "can_merge": can, "blocked": blocked, "unconfirmed": unconfirmed, "anyway": !warn.is_empty(), "warn": warn, "primary": if can && warn.is_empty() { "merge" } else { "send_back" }, "label": label })
 }
 
+/// "1 test fails", "2 tests fail".
+pub(crate) fn fails_words(n: usize) -> String {
+    if n == 1 {
+        "1 test fails".into()
+    } else {
+        format!("{n} tests fail")
+    }
+}
+
 #[derive(Deserialize)]
 struct RepoQ {
     repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PrB {
+    agents: Vec<String>,
+}
+
+/// `POST /api/review/pr {agents}`: one pull request description for several branches.
+async fn pr_route(State(app): State<App>, body: Bytes) -> ApiResult {
+    let b: PrB = parse_body(&body)?;
+    let sup = app.sup.clone();
+    Ok(AxJson(blocking(move || crate::capsule::pr_many(&sup, &b.agents)).await?).into_response())
 }
 
 async fn list_route(State(app): State<App>, Query(q): Query<RepoQ>) -> ApiResult {
@@ -192,6 +214,35 @@ fn branch_agents(sup: &Supervisor, repo: &Path) -> Vec<Agent> {
     by.into_values().collect()
 }
 
+/// A commit of a worktree as it is now, its uncommitted changes and new
+/// files included (a private index; nothing in the worktree or its branch
+/// changes), to check merges before the agent commits. `None` when git
+/// cannot make it.
+pub(crate) fn worktree_commit(dir: &Path) -> Option<String> {
+    let head = git::rev_parse(dir, "HEAD")?;
+    let idx = std::env::temp_dir().join(format!("wb-index-{}-{}-{}", std::process::id(), crate::db::now_ms(), dir.file_name().and_then(|n| n.to_str()).unwrap_or("wt")));
+    let run = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(dir).args(args).env("GIT_INDEX_FILE", &idx).env("GIT_TERMINAL_PROMPT", "0").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let out = (|| {
+        run(&["read-tree", &head])?;
+        run(&["add", "-A"])?;
+        let tree = run(&["write-tree"])?;
+        run(&["-c", "user.name=Workbench", "-c", "user.email=workbench@localhost", "commit-tree", &tree, "-p", &head, "-m", "uncommitted changes (Workbench's merge check)"])
+    })();
+    let _ = std::fs::remove_file(&idx);
+    out.filter(|s| !s.is_empty())
+}
+
+/// An agent's branch as it would merge: its worktree with what is not committed.
+fn effective_head(dir: &Path) -> Option<String> {
+    if uncommitted(dir).is_empty() {
+        git::rev_parse(dir, "HEAD")
+    } else {
+        worktree_commit(dir)
+    }
+}
+
 fn main_of(a: &Agent) -> PathBuf {
     git::checkout(Path::new(&a.cwd)).map(|c| c.main).unwrap_or_else(|_| PathBuf::from(&a.repo))
 }
@@ -230,6 +281,69 @@ fn state_words(sup: &Supervisor, a: &Agent) -> &'static str {
 
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
+}
+
+/// Failing tests a rule of yours names (a known flaky test: "always ignore
+/// test_promo_window"): they do not hold the merge.
+fn known_by_rule(sup: &Supervisor, repo: &str, failing: &[String]) -> Vec<String> {
+    let rules = crate::questions::rules(sup, Some(repo), true);
+    failing
+        .iter()
+        .filter(|t| {
+            let short = t.rsplit("::").next().unwrap_or(t).trim();
+            short.len() >= 4 && rules.iter().any(|r| r.text.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == short))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The last error each failing test printed, from Health's test_runs.
+fn failing_out(sup: &Supervisor, agents: &[String], failing: &[String]) -> Vec<Json> {
+    if failing.is_empty() {
+        return Vec::new();
+    }
+    let rows = sup.db().query("SELECT agent, test, error, ts, passed FROM test_runs LIMIT 100000", &chloedb::query::Params::new()).unwrap_or_default();
+    let mut last: HashMap<String, (i64, Option<String>)> = HashMap::new();
+    for r in &rows {
+        let (Some(ag), Some(t)) = (crate::db::get_str(&r[0]), crate::db::get_str(&r[1])) else { continue };
+        if !agents.contains(&ag) || !failing.contains(&t) || crate::db::get_int(&r[4]).unwrap_or(0) != 0 {
+            continue;
+        }
+        let ts = crate::db::get_ms(&r[3]).unwrap_or(0);
+        if last.get(&t).is_none_or(|(at, _)| *at <= ts) {
+            last.insert(t, (ts, crate::db::get_str(&r[2]).filter(|e| !e.trim().is_empty())));
+        }
+    }
+    failing.iter().map(|t| json!({ "name": t, "error": last.get(t).and_then(|(_, e)| e.as_ref()).map(|e| e.chars().take(4000).collect::<String>()) })).collect()
+}
+
+/// [`tests_of`], with the failing tests a rule names left out of the count
+/// (said, not hidden) and each failing test's output.
+fn tests_for(sup: &Supervisor, a: &Agent, part: &Json, branch: &str) -> Json {
+    let mut t = tests_of(part, branch);
+    let failing: Vec<String> = t["failing"].as_array().into_iter().flatten().filter_map(Json::as_str).map(str::to_string).collect();
+    let ignored = known_by_rule(sup, &a.repo, &failing);
+    if !ignored.is_empty() {
+        let left: Vec<String> = failing.iter().filter(|f| !ignored.contains(f)).cloned().collect();
+        let passed = t["passed"].as_u64().unwrap_or(0);
+        t["failed"] = json!(left.len());
+        t["failing"] = json!(left);
+        t["ok"] = json!(left.is_empty());
+        t["line"] = json!(if left.is_empty() {
+            format!("{passed} pass on {branch} · {} your rule calls known: {}", plural(ignored.len(), "failing test"), top(&ignored, 3))
+        } else {
+            format!("{passed} pass · {} fail on {branch}: {} · {} your rule calls known", left.len(), top(&left, 3), plural(ignored.len(), "other"))
+        });
+    }
+    t["ignored"] = json!(ignored);
+    let mut ids = vec![a.id.clone()];
+    for n in part["agents"].as_array().into_iter().flatten().filter_map(Json::as_str) {
+        if let Some(o) = sup.agent_rows().into_iter().find(|o| o.name == n && o.repo == a.repo) {
+            ids.push(o.id);
+        }
+    }
+    t["failing_out"] = json!(failing_out(sup, &ids, &failing));
+    t
 }
 
 /// A test summary of a branch, from `capsule::part`'s tests.
@@ -281,33 +395,73 @@ fn top(names: &[String], n: usize) -> String {
     }
 }
 
-/// The decisions behind a branch that matter (they replace an earlier one,
-/// or are a standing preference: a rule), and how many are routine.
-fn decisions_of(sup: &Supervisor, a: &Agent, part: &Json) -> Json {
+/// Whether a rule's words name one of the changed files (`money.py`, or
+/// `money` for money.py).
+fn names_a_file(text: &str, files: &[String]) -> bool {
+    let words: Vec<&str> = text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))).map(|w| w.trim_end_matches('.')).filter(|w| !w.is_empty()).collect();
+    files.iter().any(|f| {
+        let name = Path::new(f).file_name().and_then(|n| n.to_str()).unwrap_or(f);
+        let stem = Path::new(f).file_stem().and_then(|n| n.to_str()).unwrap_or("");
+        words.iter().any(|w| *w == f || *w == name || (stem.len() >= 4 && *w == stem))
+    })
+}
+
+/// Every decision behind a branch, from one source, so Review, Ship and
+/// the project page count the same: ChloeCtx's decisions and preferences of
+/// the branch's agents' sessions (the user's own among them, "My decision:
+/// …", signed as yours), and the rules of yours that name a changed file.
+/// Facts are not decisions. Those that matter come first: one that replaces
+/// an earlier decision (waits for Still right), yours, a rule.
+pub(crate) fn decisions_of(sup: &Supervisor, a: &Agent, part: &Json) -> Json {
     let ds = part["decisions"].as_array().cloned().unwrap_or_default();
+    let files: Vec<String> = part["blast"]["files"].as_array().into_iter().flatten().filter_map(|f| f["path"].as_str().map(str::to_string)).collect();
     let wanted: Vec<String> = ds.iter().filter_map(|d| d["supersedes"].as_str().map(str::to_string)).collect();
     let texts = if wanted.is_empty() { HashMap::new() } else { crate::capsule::record_texts(sup, a, &wanted) };
-    let mut matter = Vec::new();
-    let mut routine = Vec::new();
+    let mut list: Vec<Json> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for d in &ds {
-        if d["superseded"] == true {
+        if d["superseded"] == true || d["kind"] == "fact" {
             continue;
         }
-        let base = json!({ "id": d["id"], "kind": d["kind"], "text": d["text"], "ts": d["ts"], "agent": d["agent"], "confirmed": d["id"].as_str().is_some_and(|i| confirmed(sup, i)) });
+        let id = d["id"].as_str().unwrap_or("").to_string();
+        seen.insert(id.clone());
+        let raw = d["text"].as_str().unwrap_or("");
+        let yours = d["by"] == "you";
+        let mut m = json!({
+            "id": id, "kind": d["kind"], "text": crate::capsule::plain_words(raw), "raw": raw, "ts": d["ts"],
+            "by": if yours { "you" } else { "agent" }, "who": if yours { json!("you") } else { d["agent"].clone() },
+            "agent": d["agent"], "confirmed": confirmed(sup, &id), "why": Json::Null,
+        });
         if let Some(old) = d["supersedes"].as_str() {
-            let mut m = base;
+            let was = texts.get(old).map(String::as_str).unwrap_or("");
             m["why"] = json!("replaces");
-            m["replaces"] = json!({ "id": old, "text": texts.get(old) });
-            matter.push(m);
+            m["replaces"] = json!({ "id": old, "text": if was.is_empty() { Json::Null } else { json!(crate::capsule::plain_words(was)) },
+                "who": if was.is_empty() { Json::Null } else if crate::capsule::by_user(was, "", "") { json!("yours") } else { Json::Null } });
+        } else if yours {
+            m["why"] = json!("yours");
         } else if d["kind"] == "preference" {
-            let mut m = base;
             m["why"] = json!("new rule");
-            matter.push(m);
-        } else {
-            routine.push(base);
+        }
+        list.push(m);
+    }
+    if !files.is_empty() {
+        for r in crate::questions::rules(sup, Some(&a.repo), true) {
+            if r.ctx_id.as_ref().is_some_and(|c| seen.contains(c)) || !names_a_file(&r.text, &files) {
+                continue;
+            }
+            list.push(json!({ "id": r.id, "kind": "rule", "text": r.text, "ts": crate::db::iso(r.created), "by": "rule", "who": "you", "confirmed": true, "why": "rule" }));
         }
     }
-    json!({ "matter": matter, "routine": routine.len(), "routine_list": routine })
+    let rank = |d: &Json| match d["why"].as_str() {
+        Some("replaces") => 0,
+        Some("yours") => 1,
+        Some("rule") | Some("new rule") => 2,
+        _ => 3,
+    };
+    list.sort_by_key(rank);
+    let matter: Vec<Json> = list.iter().filter(|d| !d["why"].is_null()).cloned().collect();
+    let routine: Vec<Json> = list.iter().filter(|d| d["why"].is_null()).cloned().collect();
+    json!({ "list": list, "count": list.len(), "matter": matter, "routine": routine.len(), "routine_list": routine })
 }
 
 // ---------------------------------------------------------------- the list
@@ -360,12 +514,16 @@ pub fn list(sup: &Supervisor, repo: &str) -> Result<Json, ApiError> {
             }
         };
         let b = &part["blast"];
-        let tests = tests_of(&part, &branch);
+        let tests = tests_for(sup, &a, &part, &branch);
         let decisions = decisions_of(sup, &a, &part);
         let dirty = uncommitted(&dir);
+        // Merge-ability is counted on the worktree as it is, uncommitted
+        // changes included, so it says now what merging will say once they
+        // are committed (and the same as the blast radius's exceptions).
+        let head = if dirty.is_empty() { head } else { worktree_commit(&dir).unwrap_or(head) };
         let onto_tip = target.as_deref().and_then(|t| git::rev_parse(&main, &format!("refs/heads/{t}")));
         let into_main = match (&onto_tip, blast::merges_clean(&main, onto_tip.as_deref().unwrap_or(""), &head)) {
-            (Some(_), Some((clean, conflicts))) => json!({ "clean": clean, "conflicts": conflicts }),
+            (Some(_), Some((clean, conflicts))) => json!({ "clean": clean, "conflicts": conflicts, "with_uncommitted": !dirty.is_empty() }),
             _ => json!({ "clean": Json::Null, "conflicts": [] }),
         };
         let level = b["risk"]["level"].as_str().unwrap_or("medium").to_string();
@@ -557,6 +715,18 @@ fn mechanical_hunk(h: &Json) -> Option<&'static str> {
     (!a.is_empty() && a == d).then_some("formatting")
 }
 
+/// The tests a change adds or edits in these files: test functions, not
+/// their helpers (`_run_page`); all of them when none is named test….
+fn test_count(b: &Json, paths: &[String]) -> usize {
+    let names: Vec<&str> = b["test_functions"].as_array().into_iter().flatten().filter(|f| f["status"] != "deleted" && f["path"].as_str().is_none_or(|p| paths.iter().any(|x| x == p))).filter_map(|f| f["name"].as_str()).collect();
+    let tests = names.iter().filter(|n| n.trim_start_matches('_').to_lowercase().starts_with("test")).count();
+    if tests > 0 {
+        tests
+    } else {
+        names.len()
+    }
+}
+
 fn count(h: &Json, k: &str) -> usize {
     h["lines"].as_array().map_or(0, |ls| ls.iter().filter(|l| l["kind"] == k).count())
 }
@@ -583,11 +753,29 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
     let onto = b["landing"]["onto"].as_str().unwrap_or("main").to_string();
     let main = main_of(&a);
     let head = b["head"].as_str().unwrap_or("").to_string();
-    let tests = tests_of(&part, &branch);
+    let tests = tests_for(sup, &a, &part, &branch);
     let decisions = decisions_of(sup, &a, &part);
     let dirty = uncommitted(&dir);
     let onto_tip = git::rev_parse(&main, &format!("refs/heads/{onto}"));
-    let into_main = onto_tip.as_deref().and_then(|t| blast::merges_clean(&main, t, &head));
+    // Checked on the worktree as it is, as the list does.
+    let eff = if dirty.is_empty() { head.clone() } else { worktree_commit(&dir).unwrap_or_else(|| head.clone()) };
+    let into_main = onto_tip.as_deref().and_then(|t| blast::merges_clean(&main, t, &eff));
+    // Merged: its last merge stands and its branch is in the landing branch.
+    let lm = last_merge(sup, id);
+    let merged = !lm.is_null()
+        && lm["undone"] != true
+        && dirty.is_empty()
+        && git::rev_parse(&dir, "HEAD").zip(onto_tip.as_deref()).is_some_and(|(h, t)| git::is_ancestor(&main, &h, t));
+    let merged_commits: Vec<Json> = if merged {
+        git_out(&main, &["log", "--no-merges", "--format=%h%x09%s", &format!("{}..{}", lm["before"].as_str().unwrap_or(""), lm["commit"].as_str().unwrap_or(""))])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(sha, s)| json!({ "sha": sha, "subject": s }))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // The rings.
     let funcs: Vec<&Json> = b["functions"].as_array().into_iter().flatten().filter(|f| f["status"] != "deleted").collect();
@@ -624,6 +812,28 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
             }
         }
     }
+    // A page that shows what a changed function computes (the checkout page
+    // showing the tax) is something users see, though it does not call it.
+    let short_names: Vec<String> = funcs
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .map(|n| n.rsplit(['.', ':']).next().unwrap_or(n).to_string())
+        .filter(|n| n.len() >= 3 && !matches!(n.as_str(), "get" | "set" | "add" | "run" | "main" | "init" | "new" | "__init__" | "len" | "str"))
+        .collect();
+    if !short_names.is_empty() {
+        for p in git_out(&dir, &["ls-files"]).unwrap_or_default().lines().filter(|p| entry_point(p) && !blast::is_test_path(p)).take(300) {
+            if public.iter().any(|x| x == p) {
+                continue;
+            }
+            let Ok(t) = std::fs::read_to_string(dir.join(p)) else { continue };
+            if t.len() > 400_000 {
+                continue;
+            }
+            if let Some(n) = short_names.iter().find(|n| t.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == n.as_str())) {
+                public.push(format!("{p} (shows {n})"));
+            }
+        }
+    }
     let rings = json!([
         { "n": funcs.len(), "label": if funcs.len() == 1 { "function changed" } else { "functions changed" }, "names": fn_names.iter().take(RING_NAMES).collect::<Vec<_>>(), "code": true },
         { "n": n_callers, "label": if n_callers == 1 { "caller" } else { "callers" }, "names": callers.iter().take(RING_NAMES).collect::<Vec<_>>() },
@@ -644,10 +854,18 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         let who = g["agent"]["name"].as_str().unwrap_or("another agent");
         let kinds: Vec<&str> = g["kinds"].as_array().into_iter().flatten().filter_map(Json::as_str).collect();
         let file = g["files"].as_array().and_then(|f| f.first()).and_then(Json::as_str).unwrap_or("");
+        let other = g["agent"]["id"].as_str().and_then(|i| sup.agent_row(i)).filter(|o| Path::new(&o.cwd).is_dir());
+        let other_head = other.as_ref().and_then(|o| effective_head(Path::new(&o.cwd)));
+        // A branch already merged into the landing branch is part of it now: nothing to say.
+        if other.as_ref().is_some_and(|o| uncommitted(Path::new(&o.cwd)).is_empty()) && other_head.as_deref().zip(onto_tip.as_deref()).is_some_and(|(h, t)| git::is_ancestor(&main, h, t)) {
+            continue;
+        }
         if kinds.contains(&"same_file") {
-            let sub = match g["merges_clean"].as_bool() {
+            let clean = other_head.as_deref().and_then(|h| blast::merges_clean(&main, &eff, h)).map(|m| m.0).or(g["merges_clean"].as_bool());
+            let sub = match clean {
                 Some(false) => format!("Merging the two conflicts: merge {} first, then send {who} back to rebase", a.name),
-                _ => format!("They merge without a conflict; merge {} first", a.name),
+                Some(true) => format!("They merge without a conflict; merge {} first", a.name),
+                None => format!("Whether they conflict is not known yet; merge {} first", a.name),
             };
             exceptions.push(json!({ "tone": "warn", "text": format!("{who} also changes {file}"), "sub": sub }));
         } else if kinds.contains(&"calls_changed") {
@@ -680,12 +898,22 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
     } else {
         "warn"
     };
-    let title = part["title"].as_str().unwrap_or("").trim_end_matches('.').to_string();
-    let what = if fn_names.is_empty() { String::new() } else { format!(" ({})", top(&fn_names.iter().take(2).cloned().collect::<Vec<_>>(), 2)) };
+    // What it changes, in its own terms (functions, else files): never what
+    // the agent said in chat, which can cut a URL at its first dot.
+    let mut changed_files: Vec<String> = files_json.iter().filter_map(|f| f["path"].as_str().map(str::to_string)).collect();
+    // The code it changes before its tests.
+    changed_files.sort_by_key(|p| blast::is_test_path(p));
+    let what_changed = if !fn_names.is_empty() {
+        format!("Changes {}", top(&fn_names, 2))
+    } else if !changed_files.is_empty() {
+        format!("Changes {}", top(&changed_files, 2))
+    } else {
+        "Changes nothing yet".to_string()
+    };
     let because = if !untested.is_empty() {
         format!("{} {} no test", plural(untested.len(), "changed function"), if untested.len() == 1 { "has" } else { "have" })
     } else if tests["ok"] == false {
-        format!("{} on the branch", plural(tests["failed"].as_u64().unwrap_or(0) as usize, "test fails").replace("tests fails", "tests fail"))
+        format!("{} on the branch", fails_words(tests["failed"].as_u64().unwrap_or(0) as usize))
     } else if funcs.is_empty() {
         "no function changed".to_string()
     } else if n_callers > 0 {
@@ -694,7 +922,7 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         "every changed function is tested".to_string()
     };
     let cap = |s: &str| s[..1].to_uppercase() + &s[1..];
-    let verdict = json!({ "tone": tone, "level": level, "head": format!("{} risk.", cap(level)), "text": format!("{}{what}; {because}.", if title.is_empty() { "This change".into() } else { title.clone() }) });
+    let verdict = json!({ "tone": tone, "level": level, "head": format!("{} risk.", cap(level)), "text": format!("{what_changed}; {because}.") });
 
     // The pieces of work.
     let diff = git::diff(&dir, b["base"].as_str().unwrap_or("HEAD")).unwrap_or_default();
@@ -779,7 +1007,7 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         let others = b["agents"].as_array().into_iter().flatten().any(|g| g["files"].as_array().is_some_and(|fl| fl.iter().any(|x| paths.iter().any(|p| x == p))));
         let calls: u64 = fs.iter().filter_map(|f| f["callers_total"].as_u64()).sum();
         let (risk, title, words) = if key == "~tests" {
-            let n = b["test_functions"].as_array().map_or(0, |v| v.len());
+            let n = test_count(b, &paths);
             ("low", "Tests".to_string(), if n > 0 { format!("{} added or changed in {}.", plural(n, "test"), plural(paths.len(), "file")) } else { format!("Changes in {}.", plural(paths.len(), "test file")) })
         } else if key == "~docs" {
             ("low", "Docs".to_string(), format!("{} of text.", plural(paths.len(), "file")))
@@ -841,21 +1069,25 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
             })
             .collect();
         let n_hunks: usize = files.iter().map(|(_, hs)| hs.len()).sum();
-        pieces.push(json!({ "title": title, "words": words, "files": paths, "added": add, "removed": del, "risk": risk, "hunk": hunk, "hunks": n_hunks, "all": all, "truncated": budget == 0 }));
+        let kind = if key == "~tests" { "tests" } else if key == "~docs" { "docs" } else { "code" };
+        pieces.push(json!({ "kind": kind, "title": title, "words": words, "files": paths, "added": add, "removed": del, "risk": risk, "hunk": hunk, "hunks": n_hunks, "all": all, "truncated": budget == 0 }));
     }
     let rank = |r: &str| match r {
         "high" => 0,
         "medium" => 1,
         _ => 2,
     };
-    pieces.sort_by_key(|p| (rank(p["risk"].as_str().unwrap_or("")), std::cmp::Reverse(p["added"].as_u64().unwrap_or(0) + p["removed"].as_u64().unwrap_or(0))));
+    // Code before its tests and docs at the same risk: the key change is the fix, not its test helper.
+    let aside = |p: &Json| p["kind"] != "code";
+    pieces.sort_by_key(|p| (rank(p["risk"].as_str().unwrap_or("")), aside(p), std::cmp::Reverse(p["added"].as_u64().unwrap_or(0) + p["removed"].as_u64().unwrap_or(0))));
     let more = pieces.len().saturating_sub(MAX_PIECES);
     let shown: Vec<Json> = pieces.iter().take(MAX_PIECES).cloned().collect();
     let what: Vec<String> = mech_what.iter().map(|(w, n)| if *n == 1 { format!("1 {}", w.trim_end_matches('s')) } else { format!("{n} {w}") }).collect();
     let totals = &b["totals"];
 
     Ok(json!({
-        "agent": trail::agent_json(sup, &a), "branch": branch, "onto": onto, "repo": a.repo, "state": state_words(sup, &a),
+        "agent": trail::agent_json(sup, &a), "branch": branch, "onto": onto, "repo": a.repo, "state": if merged { "Merged" } else { state_words(sup, &a) },
+        "merged": if merged { lm.clone() } else { Json::Null }, "merged_commits": merged_commits,
         "title": part["title"], "said": part["summary"], "commits": part["commits"],
         "totals": { "files": totals["files"], "added": totals["added"], "removed": totals["removed"] },
         "turns": sup.all_events(id).map(|e| e.iter().filter(|e| e.kind == "UserPromptSubmit").count()).unwrap_or(0),
@@ -863,14 +1095,14 @@ pub fn one(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         "blast": { "rings": rings, "exceptions": exceptions, "tests": tests_line, "risk": b["risk"] },
         "checks": {
             "tests": tests,
-            "merge": { "onto": onto, "clean": into_main.as_ref().map(|m| m.0), "conflicts": into_main.as_ref().map(|m| m.1.clone()).unwrap_or_default(), "line": merge_line },
+            "merge": { "onto": onto, "clean": into_main.as_ref().map(|m| m.0), "conflicts": into_main.as_ref().map(|m| m.1.clone()).unwrap_or_default(), "line": merge_line, "with_uncommitted": !dirty.is_empty() },
             "uncommitted": dirty,
         },
         "pieces": shown, "more_pieces": more,
         "mechanical": { "files": mech_files, "added": mech_add, "removed": mech_del, "what": what.join(", ") },
         "decisions": decisions,
         "gate": gate(&branch, &tests, &decisions, level, &dirty, into_main.as_ref().map(|m| m.0)),
-        "last_merge": last_merge(sup, id),
+        "last_merge": lm,
         "plan": {
             "how": if git::current_branch(&main).as_deref() == Some(onto.as_str()) { "merge commit" } else { "merge commit, written without touching a checkout" },
             "where": main,
@@ -938,7 +1170,7 @@ pub fn merge(sup: &Supervisor, ids: &[String], anyway: &[String]) -> Result<Json
         let mut missing = Vec::new();
         let part = crate::capsule::part(sup, &a, &mut missing)?;
         let decisions = decisions_of(sup, &a, &part);
-        let tests = tests_of(&part, &branch);
+        let tests = tests_for(sup, &a, &part, &branch);
         let g = gate(&branch, &tests, &decisions, part["blast"]["risk"]["level"].as_str().unwrap_or(""), &[], None);
         if g["unconfirmed"].as_u64().unwrap_or(0) > 0 {
             return Err(ApiError::new(409, "unconfirmed", format!("{} replaces an earlier decision: confirm it is still right (or change it) before merging {branch}.", plural(g["unconfirmed"].as_u64().unwrap_or(0) as usize, "decision"))));

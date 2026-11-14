@@ -4,7 +4,7 @@
 //! prompts and answers ChloeCtx kept since the agent started (`pack` has
 //! no session filter, so it is the repository's memory over that time).
 //! `GET /api/agents/:id/pr` drafts the pull request: a title, and a body
-//! with a summary, the decisions behind the change (◆ ids), its blast
+//! with a summary, the decisions behind the change (in plain words), its blast
 //! radius, the tests it ran, and how to ask the capsule (`chloectx
 //! mount`); the body is saved to `<session dir>/pr.md` for `gh pr create
 //! --body-file`. Workbench never opens the pull request itself.
@@ -108,10 +108,100 @@ fn span(ms: i64) -> String {
     }
 }
 
-fn first_sentence(s: &str, max: usize) -> String {
+/// The first sentence, at most `max` characters, cut between words. A
+/// sentence ends at a line's end or at `.`, `!` or `?` followed by a space,
+/// so a URL (`http://127.0.0.1:8761`), a number (`2.5`) or a file name
+/// (`money.py`) is never cut inside.
+pub(crate) fn first_sentence(s: &str, max: usize) -> String {
+    let s = s.trim().lines().next().unwrap_or("").trim();
+    let b = s.as_bytes();
+    let end = (0..b.len()).find(|&i| matches!(b[i], b'.' | b'!' | b'?') && b.get(i + 1).is_none_or(|c| c.is_ascii_whitespace())).unwrap_or(s.len());
+    clip_words(&s[..end], max)
+}
+
+/// `s` cut to at most `max` characters at a word's end, with "…" when cut;
+/// an unclosed backtick is dropped rather than left dangling.
+pub(crate) fn clip_words(s: &str, max: usize) -> String {
     let s = s.trim();
-    let end = s.find(['.', '\n', '!', '?']).unwrap_or(s.len());
-    crate::supervisor::one_line(&s[..end], max)
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    let cut = head.rfind(char::is_whitespace).filter(|&i| i > max / 3).unwrap_or(head.len());
+    let mut out = head[..cut].trim_end_matches([',', ';', ':', ' ', '(', '-']).to_string();
+    if out.matches('`').count() % 2 == 1 {
+        if let Some(i) = out.rfind('`') {
+            out.remove(i);
+        }
+    }
+    out.push('…');
+    out
+}
+
+/// A record's words without the label ChloeCtx stores with them ("The agent
+/// centoff said: ", "The user decided: My decision: "): the decision itself.
+pub(crate) fn plain_words(text: &str) -> String {
+    let mut t = text.trim();
+    for _ in 0..3 {
+        let before = t;
+        if let Some(r) = t.strip_prefix("The user decided:").or_else(|| t.strip_prefix("The user said:")) {
+            t = r.trim_start();
+        }
+        if t.starts_with("The agent ") {
+            if let Some(i) = t.find(" said: ").filter(|&i| i < 60) {
+                t = t[i + 7..].trim_start();
+            }
+        }
+        for p in ["My decision:", "Our decision:", "Decision:", "The decision is"] {
+            if t.len() > p.len() && t.is_char_boundary(p.len()) && t[..p.len()].eq_ignore_ascii_case(p) {
+                t = t[p.len()..].trim_start();
+            }
+        }
+        if t == before {
+            break;
+        }
+    }
+    let mut out = t.to_string();
+    // "keep every test" reads as a sentence; `to_cents …` keeps its name.
+    let first = out.split_whitespace().next().unwrap_or("");
+    if t.len() < text.trim().len() && first.chars().all(|c| c.is_ascii_lowercase()) {
+        if let Some(c) = out.get(..1) {
+            out = c.to_uppercase() + &out[1..];
+        }
+    }
+    out
+}
+
+/// A pull request's title from the task: the sentence that says what to do
+/// ("Make Pay show a confirmation with the total"), not the one that
+/// describes the bug, nor "Done when …"; else its first sentence.
+pub(crate) fn task_title(task: &str, max: usize) -> String {
+    const DO: &[&str] = &["make", "fix", "add", "remove", "change", "update", "show", "round", "use", "keep", "let", "move", "rename", "write", "support", "allow", "stop", "handle", "refactor", "document", "replace", "drop", "return", "split", "merge", "test", "ensure", "implement", "build", "create", "convert", "format", "charge", "give", "send"];
+    let text = task.trim();
+    let b = text.as_bytes();
+    let mut sentences: Vec<&str> = Vec::new();
+    let mut from = 0;
+    for i in 0..b.len() {
+        let end = (matches!(b[i], b'.' | b'!' | b'?') && b.get(i + 1).is_none_or(|c| c.is_ascii_whitespace())) || b[i] == b'\n';
+        if end {
+            sentences.push(text[from..i].trim());
+            from = i + 1;
+        }
+    }
+    sentences.push(text[from..].trim());
+    let sentences: Vec<&str> = sentences.into_iter().filter(|s| s.len() > 8).take(4).collect();
+    let skip = |s: &str| {
+        let l = s.to_lowercase();
+        l.starts_with("done when") || l.starts_with("do not") || l.starts_with("don't") || l.starts_with("dont")
+    };
+    let pick = sentences.iter().find(|s| !skip(s) && s.split_whitespace().next().is_some_and(|w| DO.contains(&w.to_lowercase().as_str()))).or_else(|| sentences.iter().find(|s| !skip(s))).copied().unwrap_or(text);
+    clip_words(pick, max)
+}
+
+/// Whether the user made a record, from its words, its tag and ChloeCtx's
+/// `ctx` ("By: user").
+pub(crate) fn by_user(text: &str, tag: &str, ctx: &str) -> bool {
+    text.trim_start().starts_with("The user decided") || tag == "stated" || ctx.lines().any(|l| l.trim().eq_ignore_ascii_case("By: user"))
 }
 
 /// The capsule kept for an agent, if its directory is still there.
@@ -427,7 +517,7 @@ fn branch_agents(sup: &Supervisor, a: &Agent, head: Option<&str>) -> Vec<Agent> 
 /// since the first of them started: `chloectx sql --json` in its worktree.
 fn session_decisions(sup: &Supervisor, a: &Agent, mine: &[Agent], missing: &mut Vec<String>) -> Vec<Json> {
     let since = mine.iter().map(|m| m.started_ms.unwrap_or(m.created)).min().unwrap_or(a.created) / 1000 - 60;
-    let sql = format!("SELECT id, kind, text, ts, session, tag, links FROM memory WHERE (kind = 'decision' OR kind = 'preference' OR kind = 'fact') AND ts >= {since} ORDER BY ts LIMIT 500");
+    let sql = format!("SELECT id, kind, text, ts, session, tag, links, ctx, files FROM memory WHERE (kind = 'decision' OR kind = 'preference' OR kind = 'fact') AND ts >= {since} ORDER BY ts LIMIT 500");
     let out = match trail::run_chloectx(&sup.cfg.chloectx_bin, &place(a), &["sql", "--json", &sql], Duration::from_secs(60)) {
         Ran::Out(v) => v,
         Ran::Missing => {
@@ -450,12 +540,15 @@ fn session_decisions(sup: &Supervisor, a: &Agent, mine: &[Agent], missing: &mut 
         if rid.is_empty() || !ag.is_some_and(|ag| ids.contains(ag.id.as_str())) {
             continue;
         }
-        let links = col("links").to_string();
-        let superseded_by = links.split("superseded_by").nth(1).and_then(|r| r.split('"').find(|p| p.contains(':') && !p.contains(' ') && p.len() > 2)).map(|x| x.trim_start_matches(':').to_string());
+        let links = col("links");
+        let superseded_by = trail::linked(&links, "superseded_by").into_iter().next();
         // What it replaced (Review's "decisions that matter").
-        let supersedes = links.split("supersedes").nth(1).and_then(|r| r.split('"').find(|p| p.contains(':') && !p.contains(' ') && p.len() > 2)).map(|x| x.trim_start_matches(':').to_string());
+        let supersedes = trail::linked(&links, "supersedes").into_iter().next();
+        let text = col("text").as_str().unwrap_or("").to_string();
+        let user = by_user(&text, col("tag").as_str().unwrap_or(""), col("ctx").as_str().unwrap_or(""));
         list.push(json!({
-            "id": rid, "kind": col("kind"), "text": col("text"), "ts": trail::ctx_time(&col("ts")), "agent": ag.map(|g| g.name.clone()),
+            "id": rid, "kind": col("kind"), "text": text, "ts": trail::ctx_time(&col("ts")), "agent": ag.map(|g| g.name.clone()),
+            "by": if user { "you" } else { "agent" }, "files": trail::files_of(&col("files")),
             "superseded": col("tag") == "superseded" || superseded_by.is_some(), "superseded_by": superseded_by, "supersedes": supersedes, "via": ["session"],
         }));
     }
@@ -581,8 +674,8 @@ pub(crate) fn part(sup: &Supervisor, a: &Agent, missing: &mut Vec<String>) -> Re
         .collect();
     let mine = branch_agents(sup, a, head.as_deref());
 
-    // Title: the outcome, the goal it leads, its one commit, what it said
-    // when it finished, the first commit; the task only when nothing else.
+    // Title: the outcome, the goal it leads, its one commit, the task (what
+    // it was asked to do), its last commit. Never what it said in chat.
     let q1 = |sql: &str, id: &str| -> Option<String> {
         let rows = sup.db().query(sql, &chloedb::query::Params::new().set("id", chloedb::Value::Str(id.to_string()))).ok()?;
         rows.first().and_then(|r| crate::db::get_str(&r[0])).filter(|t| !t.trim().is_empty())
@@ -597,12 +690,10 @@ pub(crate) fn part(sup: &Supervisor, a: &Agent, missing: &mut Vec<String>) -> Re
         (first_sentence(&g, 72), "goal")
     } else if commits.len() == 1 {
         (commits[0]["subject"].as_str().unwrap_or("").to_string(), "commit")
-    } else if let Some(s) = summary.as_deref().map(|s| first_sentence(s.trim_start_matches(['#', ' ', '*']), 72)).filter(|s| s.len() > 8) {
-        (s, "summary")
+    } else if let Some(t) = task.map(|t| task_title(t, 72)).filter(|t| t.len() > 8) {
+        (t, "task")
     } else if let Some(c) = commits.last() {
         (c["subject"].as_str().unwrap_or("").to_string(), "commit")
-    } else if let Some(t) = task {
-        (first_sentence(t, 72), "task")
     } else {
         (format!("Changes from {}", a.name), "name")
     };
@@ -616,7 +707,8 @@ pub(crate) fn part(sup: &Supervisor, a: &Agent, missing: &mut Vec<String>) -> Re
         let did = d["id"].as_str().unwrap_or("").to_string();
         let ours = d["agent"]["id"].as_str().is_some_and(|x| ids.contains(x));
         if ours && seen.insert(did.clone()) {
-            decisions.push(json!({ "id": did, "kind": d["kind"], "text": d["text"], "ts": d["ts"], "superseded": d["superseded"], "superseded_by": d["superseded_by"], "via": d["via"] }));
+            let user = by_user(d["text"].as_str().unwrap_or(""), "", "");
+            decisions.push(json!({ "id": did, "kind": d["kind"], "text": d["text"], "ts": d["ts"], "agent": d["agent"]["name"], "by": if user { "you" } else { "agent" }, "files": d["files"], "superseded": d["superseded"], "superseded_by": d["superseded_by"], "via": d["via"] }));
         }
     }
     let others = b["decisions"].as_array().map_or(0, |v| v.iter().filter(|d| !seen.contains(d["id"].as_str().unwrap_or(""))).count());
@@ -640,20 +732,39 @@ pub(crate) fn part(sup: &Supervisor, a: &Agent, missing: &mut Vec<String>) -> Re
     }))
 }
 
+/// The decisions still in force (not facts, not replaced), in plain words
+/// and who made them: what a reviewer reads, never ChloeCtx's raw notes.
+pub(crate) fn live_decisions(decisions: &[Json]) -> Vec<&Json> {
+    decisions.iter().filter(|d| d["kind"] != "fact" && d["superseded"] != true && d["superseded_by"].is_null()).collect()
+}
+
+fn who_of(d: &Json) -> String {
+    if d["by"] == "you" {
+        "yours".into()
+    } else {
+        d["agent"].as_str().map(|a| format!("{a}'s")).unwrap_or_else(|| "an agent's".into())
+    }
+}
+
 fn decision_lines(decisions: &[Json]) -> String {
     let mut body = String::new();
-    for d in decisions {
-        let did = d["id"].as_str().unwrap_or("");
-        let kind = d["kind"].as_str().unwrap_or("decision");
-        let label = match (d["superseded_by"].as_str(), d["successor"].as_str()) {
-            (Some(by), Some(t)) => format!("(superseded by `{by}`: {})", crate::supervisor::one_line(t, 160)),
-            (Some(by), None) => format!("(superseded by `{by}`)"),
-            (None, _) if d["superseded"] == true => "(marked superseded; ChloeCtx names no successor)".into(),
-            (None, _) => format!("{kind}:"),
-        };
-        body += &format!("- ◆ `{did}` {label} {}\n", d["text"].as_str().unwrap_or("").trim());
+    for d in live_decisions(decisions) {
+        let words = clip_words(&plain_words(d["text"].as_str().unwrap_or("")), 400);
+        let replaces = if d["supersedes"].is_string() { " It replaces an earlier decision." } else { "" };
+        body += &format!("- {words} ({}){replaces}\n", who_of(d));
+    }
+    if body.is_empty() {
+        body += "No decision was recorded for this work.\n";
     }
     body
+}
+
+/// Test function names a change added or edited: the tests themselves, not
+/// their helpers (`_run_page`).
+fn test_names(b: &Json) -> Vec<(String, String)> {
+    let all: Vec<(String, String)> = b["test_functions"].as_array().into_iter().flatten().filter(|f| f["status"] != "deleted").filter_map(|f| Some((f["name"].as_str()?.to_string(), f["status"].as_str().unwrap_or("changed").to_string()))).collect();
+    let tests: Vec<(String, String)> = all.iter().filter(|(n, _)| n.trim_start_matches('_').to_lowercase().starts_with("test")).cloned().collect();
+    if tests.is_empty() { all } else { tests }
 }
 
 fn test_lines(p: &Json) -> String {
@@ -709,22 +820,48 @@ fn test_lines(p: &Json) -> String {
     body
 }
 
+/// What changed, in words a reviewer reads: the commits, each file with the
+/// functions it adds, changes or removes, the tests, the decisions. Never
+/// the agent's chat reply, never the prompt (SPEC.md, "Sixth build").
 fn summary_lines(p: &Json) -> String {
     let mut body = String::new();
-    if let Some(s) = p["summary"].as_str() {
-        let s: String = s.chars().take(1600).collect();
-        body += &format!("{}\n\n", s.trim());
-    }
-    // Never the task's prompt (SPEC.md, "Sixth build"): what was done is
-    // the commits, or the files when nothing is committed yet.
     let commits = p["commits"].as_array().cloned().unwrap_or_default();
     for c in commits.iter().take(12) {
         body += &format!("- {} (`{}`)\n", c["subject"].as_str().unwrap_or(""), c["sha"].as_str().unwrap_or(""));
     }
-    if commits.is_empty() {
-        for f in p["blast"]["files"].as_array().into_iter().flatten().take(12) {
-            body += &format!("- `{}` +{} −{}\n", f["path"].as_str().unwrap_or(""), f["added"], f["removed"]);
+    if !commits.is_empty() {
+        body += "\n";
+    }
+    let b = &p["blast"];
+    let files: Vec<&Json> = b["files"].as_array().into_iter().flatten().collect();
+    if !files.is_empty() {
+        body += "What changed:\n\n";
+    }
+    for f in files.iter().take(12) {
+        let path = f["path"].as_str().unwrap_or("");
+        let mut what: Vec<String> = Vec::new();
+        for g in b["functions"].as_array().into_iter().flatten().filter(|g| g["path"] == path) {
+            let n = g["name"].as_str().unwrap_or("");
+            what.push(match g["status"].as_str() {
+                Some("added") => format!("adds `{n}`"),
+                Some("deleted") => format!("removes `{n}`"),
+                _ => format!("changes `{n}`"),
+            });
         }
+        let tests: Vec<String> = b["test_functions"].as_array().into_iter().flatten().filter(|g| g["path"] == path).filter_map(|g| g["name"].as_str()).filter(|n| n.trim_start_matches('_').to_lowercase().starts_with("test")).map(|n| format!("`{n}`")).collect();
+        if !tests.is_empty() {
+            what.push(format!("tests {}", tests.join(", ")));
+        }
+        let new = if f["status"] == "added" || f["status"] == "untracked" { "new, " } else { "" };
+        body += &format!("- `{path}` ({new}+{} −{}){}\n", f["added"], f["removed"], if what.is_empty() { String::new() } else { format!(": {}", what.join("; ")) });
+    }
+    if files.len() > 12 {
+        body += &format!("- and {} more\n", plural(files.len() - 12, "file"));
+    }
+    let tests = test_names(b);
+    if !tests.is_empty() {
+        let added = tests.iter().filter(|(_, s)| s == "added").count();
+        body += &format!("\nTests: {} added or changed ({added} new): {}.\n", tests.len(), tests.iter().map(|(t, _)| format!("`{t}`")).collect::<Vec<_>>().join(", "));
     }
     body
 }
@@ -944,9 +1081,89 @@ pub fn pr_stack(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
     }))
 }
 
+/// `POST /api/review/pr {agents}`: one pull request description for the
+/// branches of several agents of one project, in the order given (Review's
+/// merge order): one title, then each change's part. The branches are not
+/// one branch yet, so it gives the commands that make one and open it.
+pub fn pr_many(sup: &Supervisor, ids: &[String]) -> Result<Json, ApiError> {
+    if ids.is_empty() {
+        return Err(ApiError::bad("agents is empty: pick the agents whose branches the pull request is about"));
+    }
+    let mut missing = Vec::new();
+    let mut parts: Vec<(Agent, Json)> = Vec::new();
+    for id in ids {
+        let a = agent_of(sup, id)?;
+        if parts.first().is_some_and(|(f, _)| f.repo != a.repo) {
+            return Err(ApiError::bad(format!("{} works in another project: one pull request is about one project", a.name)));
+        }
+        if !Path::new(&a.cwd).is_dir() {
+            missing.push(format!("{}'s worktree is gone, so its part is left out.", a.name));
+            continue;
+        }
+        let p = part(sup, &a, &mut missing)?;
+        parts.push((a, p));
+    }
+    let (first, _) = parts.first().cloned().ok_or_else(|| ApiError::conflict("no branch of these agents can be read"))?;
+    let titles: Vec<String> = parts.iter().map(|(_, p)| p["title"].as_str().unwrap_or("").trim_end_matches('.').to_string()).collect();
+    let title = if titles.len() == 1 { titles[0].clone() } else { clip_words(&titles.join("; "), 120) };
+    let onto = parts.iter().find_map(|(_, p)| p["blast"]["landing"]["onto"].as_str().map(str::to_string)).unwrap_or_else(|| "main".into());
+    let branches: Vec<String> = parts.iter().filter_map(|(a, _)| a.branch.clone()).collect();
+    let mut body = String::from("## Summary\n\n");
+    if parts.len() > 1 {
+        body += &format!("{} changes, merged in this order: {}.\n\n", parts.len(), branches.iter().map(|b| format!("`{b}`")).collect::<Vec<_>>().join(", then "));
+    }
+    for (i, (a, p)) in parts.iter().enumerate() {
+        if parts.len() > 1 {
+            body += &format!("### {}. {} (`{}`)\n\n", i + 1, titles[i], a.branch.as_deref().unwrap_or(&a.name));
+        }
+        body += &summary_lines(p);
+        let ds = p["decisions"].as_array().cloned().unwrap_or_default();
+        if !live_decisions(&ds).is_empty() {
+            body += "\nDecided:\n\n";
+            body += &decision_lines(&ds);
+        }
+        let t = &p["blast"]["totals"];
+        body += &format!("\n{}, +{} −{}. {}\n\n", plural(t["files"].as_u64().unwrap_or(0) as usize, "file"), t["added"].as_u64().unwrap_or(0), t["removed"].as_u64().unwrap_or(0), p["blast"]["risk"]["line"].as_str().unwrap_or(""));
+    }
+    body += "## Tests run\n\n";
+    for (a, p) in &parts {
+        if parts.len() > 1 {
+            body += &format!("On `{}`:\n\n", a.branch.as_deref().unwrap_or(&a.name));
+        }
+        body += &test_lines(p);
+        body += "\n";
+    }
+    let body_file = sup.session_dir(&first.id).join("pr-combined.md");
+    if let Err(e) = std::fs::create_dir_all(sup.session_dir(&first.id)).and_then(|_| std::fs::write(&body_file, &body)) {
+        missing.push(format!("The body could not be saved to {}: {e}", body_file.display()));
+    }
+    let head = if branches.len() == 1 { branches[0].clone() } else { format!("wb/together-{}", parts.iter().map(|(a, _)| a.name.as_str()).collect::<Vec<_>>().join("-")) };
+    let make = if branches.len() > 1 { format!("git branch {head} {onto} && git checkout {head} && git merge --no-ff {} && git push -u origin {head}", branches.join(" ")) } else { format!("git push -u origin {head}") };
+    Ok(json!({
+        "title": title, "body": body, "body_file": body_file.to_string_lossy(), "onto": onto, "head": head, "branches": branches,
+        "make": make, "gh": format!("gh pr create --base {onto} --head {head} --title {} --body-file {}", shell_q(&title), body_file.display()),
+        "parts": parts.iter().map(|(a, p)| json!({ "agent": trail::agent_json(sup, a), "branch": a.branch, "title": p["title"], "title_from": p["title_from"] })).collect::<Vec<_>>(),
+        "missing": missing,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentences_end_at_a_space_and_words_are_never_cut() {
+        assert_eq!(first_sentence("The page is running at http://127.0.0.1:8761 and Pay works. More", 200), "The page is running at http://127.0.0.1:8761 and Pay works");
+        assert_eq!(first_sentence("Tax is 2.5 cents in money.py now", 200), "Tax is 2.5 cents in money.py now");
+        assert_eq!(clip_words("I added the docstring to `to_cents` in `money.py` and a test", 42), "I added the docstring to `to_cents` in…");
+        assert!(!clip_words("finance asked for banker's rounding in money.py to match the ledger exactly", 60).contains("ledger e…"));
+        assert_eq!(plain_words("The agent centoff said: Cart.tax rounds half up."), "Cart.tax rounds half up.");
+        assert_eq!(plain_words("The user decided: My decision: keep every existing test."), "Keep every existing test.");
+        assert_eq!(plain_words("The agent a said: to_cents keeps half-even."), "to_cents keeps half-even.");
+        assert_eq!(task_title("On the checkout page (web/index.html) the Pay button does nothing. Make Pay show a confirmation with the total. Done when pytest passes.", 72), "Make Pay show a confirmation with the total");
+        assert_eq!(task_title("Fix the rounding in money.py", 72), "Fix the rounding in money.py");
+        assert!(by_user("The user decided: x", "", "") && by_user("x", "stated", "") && by_user("x", "", "By: user") && !by_user("The agent a said: x", "", "By: assistant"));
+    }
 
     #[test]
     fn reads_record_ids_from_an_answer() {

@@ -82,11 +82,11 @@ export function mount(root, ctx) {
     const run = () => ctx.api("/api/chloectx").then((s) => draw(s), (e) => draw({ ok: false, problem: e.message }));
     const draw = (s) => {
       if (!alive) return;
-      body.replaceChildren(
+      body.replaceChildren(...[
         s.ok || s.required === false ? stateDot("working", "Ready: ChloeCtx, Claude Code and git are set up.") : stateDot("failed", s.problem || "ChloeCtx is not set up"),
         s.fix ? [h("p", {}, "Run this once, from a checkout of ChloeDB, then check again:"), h("pre", { class: "qc-cmd" }, s.fix)] : null,
         s.version ? h("p", { class: "g-dim" }, `ChloeCtx ${s.version}`) : null,
-        h("div", { class: "g-row" }, btn("Check again", { onclick: () => { body.firstChild.replaceWith(h("p", { class: "g-dim" }, "Checking…")); run(); } })));
+        h("div", { class: "g-row" }, btn("Check again", { onclick: () => { body.firstChild.replaceWith(h("p", { class: "g-dim" }, "Checking…")); run(); } }))].flat().filter((k) => k != null && k !== false));
     };
     el.append(page({ kicker: "More", title: "Setup check", sub: "Workbench gives each session it starts ChloeCtx's hooks and memory tools. Without ChloeCtx, agents do not start." },
       h("div", { class: "gp-sec" }, pane("ChloeCtx, Claude Code and git", null, body))));

@@ -1153,9 +1153,9 @@ failed run be recorded as it ends rather than at `Stop`.
 - `GET /api/agents/:id/pr` answers `{agent, title, branch, base_branch,
   base, body, body_file, gh, push, sections: {summary, commits, decisions,
   blast, tests}, capsule, missing}`:
-  - `title`: the outcome's title, else the task's first sentence.
+  - `title`: see "The pull request says what was done" below.
   - `body` (Markdown) has these sections: Summary, Decisions behind it
-    (`- ◆ \`id\` kind: text`; the agent's own session's records from
+    (`- text (whose)`, in plain words, never an id nor a fact; the agent's own session's records from
     `chloectx sql` first, then those about its lines), Blast radius,
     Tests run (the agent's Bash test commands and their outcome, from its
     events), and Ask why (the `claude mcp add … -- chloectx mount <dir>`
@@ -2326,15 +2326,21 @@ below names what changed, the test that holds it, and what is left out.
   1. the outcome the agent worked on;
   2. the goal it leads;
   3. its only commit;
-  4. what it said when it finished (the Stop event's last message);
+  4. its task: the sentence that says what to do ("Make Pay show a
+     confirmation with the total"), not the one that describes the bug
+     nor "Done when …";
   5. its last commit;
-  6. its task;
-  7. its name.
+  6. its name.
+
+  What the agent said in the chat is never used, for the title or the
+  summary (it names URLs, commit ids and "I haven't committed").
 
   Workbench's own brief to a lead is never used. `title_from` says which
   one it was, and the tab shows it.
-- The summary is built from the commits' subjects and the agent's last
-  summary.
+- The summary is built from the commits' subjects and from what changed:
+  per file, the functions it adds, changes and removes, and the tests by
+  name. Cut text ends at a word, never inside a URL, a number or a code
+  span.
 - Decisions are only those of the branch's agents' sessions: the agent, a
   restart in the same worktree, and the children whose work is in the
   branch. A superseded decision names what replaced it ("superseded by
@@ -3094,3 +3100,50 @@ Left out, and why:
   it stays true whatever A changes.
 - Run it N times keeps its progress in memory. A restart forgets the
   progress, not the recorded runs.
+
+## Sixth build: Review tells the truth
+
+Simulated users (Maya, Lee, Sam, Priya, Dev) reviewed and merged branches
+with Review (`ui/goals/review.js`, `src/review.rs`). What changed:
+
+- **One source for decisions.** `decisions_of` in `src/review.rs` is the
+  list for Review, Ship and the PR: the ChloeCtx records of the branch's
+  sessions (no facts, no superseded entries), the active rules that name a
+  changed file, and the user's own decisions ("My decision: …", signed
+  "yours", never struck through). Each item has `by` (you, agent), `why`
+  (replaces, yours, new rule, rule) and `confirmed` (from **Still
+  right**). A decision that replaces another is never routine; routine
+  ones open from "Decisions N".
+- **The headline is what changed** ("Changes cartTotal(); …"), not the
+  chat reply cut at its first period.
+- **Merge-ability is computed one way**, on the worktree including its
+  uncommitted changes (`worktree_commit`: a temporary index, `add -A`,
+  `write-tree`, `commit-tree`), in the list and on the branch page;
+  `merge.main.with_uncommitted` says when it was. Exceptions skip branches
+  already merged.
+- **Merged.** When the last merge stands and nothing changed since, the
+  branch page answers `state: "Merged"`, `merged {commit, onto}` and
+  `merged_commits`, and shows them with Undo; `/api/repos` counts the
+  agent `finished` and adds `merged {id: {commit, onto, ts}}`, which the
+  top bar ("1 agent · 1 done") and Continue ("X was merged into main")
+  read.
+- **One pull request for several branches**: `POST /api/review/pr
+  {agents}` → `{title, body, body_file, branches, head, onto, make, gh,
+  missing}`. The title joins the parts' titles with "; ", the body says
+  "N changes, merged in this order: …" and has each part's summary,
+  decisions and tests; `make` builds `wb/together-<names>` from the onto
+  branch with them merged, and `gh` opens it. Nothing is run. An empty
+  list, or agents of different repositories, is 400.
+- **Tests check**: a failing test named in an active rule (a known flaky
+  test) does not hold the merge and is listed as ignored; the failing
+  output opens under "Why it fails".
+- **UI**: the embedded Ship page no longer overlaps Review; one merge
+  action per state (inspector on desktop, the bar on a phone); the gate
+  (Still right / Change it) at the top; Enter in Merge anyway and
+  Ctrl/Cmd-Enter in Send back submit, with a confirmation; Tell stays on
+  ready agents; the preview's URL box is focused only when setting it;
+  no "null" text where a part is missing.
+- Test: `review_drafts_from_what_changed_counts_every_decision_and_says_merged`.
+
+Left out: a preview of main after a merge, and the Changes tab's diff
+wrapping on a phone.
