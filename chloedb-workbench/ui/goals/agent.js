@@ -109,5 +109,5 @@ const CSS = `
 .ag-head .ag-task.open{display:block;-webkit-line-clamp:unset;white-space:pre-wrap;overflow-wrap:anywhere}
 .ag-more{font-size:var(--fs-sm)}
 .ag-tabs .narrow-tab{display:none}
-@media (max-width:640px){.ag-tabs .narrow-tab{display:inline-flex}.ag-head>.lv-av{display:none}.ag-head .ag-act{width:100%}.ag-head .ag-act>.btn{flex:1}.ag-mlist{width:min(300px,calc(100vw - 32px))}}
+@media (max-width:640px){.ag-tabs .narrow-tab{display:inline-flex}.ag-head>.lv-av{display:none}.ag-head .ag-act{width:100%;flex-wrap:wrap}.ag-head .ag-act>.btn{flex:1 1 0;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.ag-head .ag-act>.btn.primary{flex-basis:100%}.ag-mlist{width:min(300px,calc(100vw - 32px))}}
 `;
