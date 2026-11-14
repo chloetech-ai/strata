@@ -595,7 +595,7 @@ struct Args {
     /// The cluster's environment ("production", "staging"...): the
     /// command center treats one starting with "prod" as production, and
     /// none too, except opened on this machine (localhost), where it is a
-    /// sandbox whose writes need no second ask.
+    /// sandbox whose writes are on without a reason asked.
     #[arg(long, env = "CHLOEDB_ENVIRONMENT")]
     environment: Option<String>,
     /// Where people reach this server's command center
