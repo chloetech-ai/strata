@@ -31,10 +31,12 @@ const SYSTEM_TABLES = {
   // What people do in an app, one row per thing done: the kind (open, leave,
   // action, abandon, insert, update, delete, call, error), where (the browser
   // tab's session, the screen) and what (the table and row written, the fields
-  // changed, the words searched for and how many rows they found, how long).
+  // changed, the words searched for and how many rows they found, how long),
+  // and whose it was: src "owner" for the app's owner trying it in the studio
+  // or the command center, which Usage leaves out of its people by default.
   sa_events: `CREATE TABLE sa_events (id KEYWORD PRIMARY KEY, app KEYWORD NOT NULL, kind KEYWORD, cap KEYWORD,
     detail TEXT, person KEYWORD, v INT, session KEYWORD, screen KEYWORD, tbl KEYWORD, rid KEYWORD, fields KEYWORD,
-    q KEYWORD, results INT, ms INT, label TEXT, taps INT, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
+    q KEYWORD, results INT, ms INT, label TEXT, taps INT, src KEYWORD, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
   // A suggestion from use names the pattern of use it answers (signal) and
   // what should change in people's use if it works (measure, JSON).
   sa_suggestions: `CREATE TABLE sa_suggestions (id KEYWORD PRIMARY KEY, app KEYWORD NOT NULL, text TEXT, why TEXT,
@@ -81,7 +83,7 @@ export function briefOf(app) {
 const ADDED_COLUMNS = {
   // The UX brief, as JSON: who, job, often, device, first, glance.
   sa_apps: ['ux TEXT'],
-  sa_events: ['person KEYWORD', 'v INT', 'session KEYWORD', 'screen KEYWORD', 'tbl KEYWORD', 'rid KEYWORD', 'fields KEYWORD', 'q KEYWORD', 'results INT', 'ms INT', 'label TEXT', 'taps INT'],
+  sa_events: ['person KEYWORD', 'v INT', 'session KEYWORD', 'screen KEYWORD', 'tbl KEYWORD', 'rid KEYWORD', 'fields KEYWORD', 'q KEYWORD', 'results INT', 'ms INT', 'label TEXT', 'taps INT', 'src KEYWORD'],
   sa_suggestions: ['signal KEYWORD', 'measure TEXT'],
   // What a piece is and does, embedded, so that pieces are found by meaning
   // as well as by their words (searchCapabilities). A store whose Strata
@@ -845,7 +847,7 @@ export class Store {
   // label: the name of the row written ("Monstera"), kept with the event so
   // that a removed row is still told by its name. taps: on a write or a run,
   // the taps in the app since the one before it (engine/measures.mjs).
-  async track(app, kind, cap, detail, { person = null, v = null, session = null, screen = null, tbl = null, rid = null, fields = null, q = null, results = null, ms = null, label = null, taps = null } = {}) {
+  async track(app, kind, cap, detail, { person = null, v = null, session = null, screen = null, tbl = null, rid = null, fields = null, q = null, results = null, ms = null, label = null, taps = null, src = null } = {}) {
     const doc = { id: newId(12), app, kind, cap: cap || '', detail: detail ? String(detail).slice(0, 500) : '' };
     const word = (x, n) => { const t = String(x ?? '').trim(); return t ? t.slice(0, n) : null; };
     const num = (x) => (x === null || x === undefined || x === '' || !Number.isFinite(Number(x)) ? null : Math.max(0, Math.round(Number(x))));
@@ -854,6 +856,7 @@ export class Store {
       // The fields changed, sorted: the same change on row after row is the same value.
       fields: word(Array.isArray(fields) ? [...fields].sort().join(',') : fields, 200),
       q: word(q === null || q === undefined ? null : String(q).toLowerCase().replace(/\s+/g, ' '), 120), results: num(results), ms: num(ms), label: word(label, 120), taps: num(taps),
+      src: src === 'owner' ? 'owner' : null,
     };
     for (const [k, x] of Object.entries(more)) if (x !== null) doc[k] = x;
     await this.db.write([{ op: 'insert', table: 'sa_events', doc }]);
@@ -862,7 +865,7 @@ export class Store {
   // The events since a time (ISO; all of them without one), newest first.
   async events(app, { since = null, limit = 5000 } = {}) {
     const n = Math.max(1, Math.min(10000, Math.floor(limit)));
-    return this.db.query(`SELECT kind, cap, detail, person, v, session, screen, tbl, rid, fields, q, results, ms, label, taps, ts FROM sa_events WHERE app = :a${since ? ' AND ts >= :since' : ''} ORDER BY ts DESC LIMIT ${n}`, since ? { a: app, since } : { a: app });
+    return this.db.query(`SELECT kind, cap, detail, person, v, session, screen, tbl, rid, fields, q, results, ms, label, taps, src, ts FROM sa_events WHERE app = :a${since ? ' AND ts >= :since' : ''} ORDER BY ts DESC LIMIT ${n}`, since ? { a: app, since } : { a: app });
   }
 
   async recentEvents(app, limit = 200) {

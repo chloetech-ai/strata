@@ -119,7 +119,10 @@ export async function activity(engine, appId, { days = 30 } = {}) {
       return out;
     }),
     screens,
-    ux: uxMeasures(events, { screens, brief: briefOf(view.app) }),
+    // How easy it is, by people's use: the owner's own tries (src "owner",
+    // the studio and the command center) are measured apart.
+    ux: uxMeasures(events.filter((e) => e.src !== 'owner'), { screens, brief: briefOf(view.app) }),
+    uxAll: uxMeasures(events, { screens, brief: briefOf(view.app) }),
     tables: view.tables.map((t) => ({ name: t.spec.name, noun: singular(t.spec.name), rows: counts[t.spec.name] })),
     functions: view.functions.map((f) => ({ id: f.id, slug: f.slug, title: f.title || f.slug })),
   };

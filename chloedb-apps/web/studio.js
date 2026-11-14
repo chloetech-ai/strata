@@ -44,7 +44,7 @@ const unanswered = () => Object.assign(new Error('No answer from the app (the co
 // every call so rows scoped by :company_id are that company's.
 const companyHeader = () => (S.company ? { 'x-sa-company': S.company } : {});
 async function api(method, url, body, more) {
-  const headers = { 'x-sa-session': SESSION, ...AS_STRANGER, ...companyHeader(), ...(more || {}) };
+  const headers = { 'x-sa-session': SESSION, ...OWNER, ...AS_STRANGER, ...companyHeader(), ...(more || {}) };
   if (body) headers['content-type'] = 'application/json';
   let res;
   try { res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined }); } catch { throw unanswered(); }
@@ -85,6 +85,9 @@ if (BARE) document.body.classList.add('bare');
 // owner is weighing, whatever this browser's studio session.
 const STRANGER = BARE ? (new URLSearchParams(location.search).get('stranger') || null) : null;
 const AS_STRANGER = STRANGER ? { 'x-sa-as': 'visitor', 'x-sa-access': STRANGER } : {};
+// The studio is its apps' owner trying them: what it does is not counted as
+// people's use (Usage, src "owner"); an app on its own page (BARE) is.
+const OWNER = BARE ? {} : { 'x-sa-owner': '1' };
 if (STRANGER) {
   addEventListener('DOMContentLoaded', () => {
     const said = { look: 'visitors can only look', add: 'visitors can look and add, and change only what they added', change: 'anyone can change anything' }[STRANGER] || '';
@@ -932,7 +935,7 @@ function leaveView(beacon) {
   S.viewSince = 0;
   if (!S.appId || !slug || !at) return;
   const prev = S.app?.views.find((x) => x.slug === slug);
-  const body = { kind: 'leave', detail: slug, cap: prev?.id || '', ms: Date.now() - at, session: SESSION };
+  const body = { kind: 'leave', detail: slug, cap: prev?.id || '', ms: Date.now() - at, session: SESSION, ...(BARE ? {} : { owner: true }) };
   if (beacon) { try { navigator.sendBeacon(`/api/apps/${S.appId}/track${atV()}`, new Blob([JSON.stringify(body)], { type: 'application/json' })); } catch {} }
   else {
     api('POST', `/api/apps/${S.appId}/track${atV()}`, body).catch(() => {});

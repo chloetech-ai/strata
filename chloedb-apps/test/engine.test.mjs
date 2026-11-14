@@ -3465,3 +3465,66 @@ test('the chosen chip of a native screen stands out in dark mode (APC-18)', asyn
     else assert.ok(ratio >= 1.4, `${scheme}: the chosen chip ${got.on} on its track ${got.track} is ${ratio.toFixed(2)}:1`);
   }
 });
+
+// Against a real chloedb-server and the engine's own server (skipped without one).
+test('the owner\'s own tries of an app are told apart from people\'s, and Usage leaves them out (APC-15)', async (t) => {
+  const { findServerBinary, startServer } = await import('../engine/strata.mjs');
+  const { Store } = await import('../engine/store.mjs');
+  const { spawn } = await import('node:child_process');
+  const bin = findServerBinary(join(import.meta.dirname, '..', '..'));
+  if (!bin) return noServer(t);
+  const free = () => new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
+  const dir = mkdtempSync(join(tmpdir(), 'sa-owner-'));
+  const port = await free();
+  const { child, client } = await startServer({ bin, db: join(dir, 'apps.strata'), listen: `127.0.0.1:${port}`, log: () => {} });
+  let engineProc = null;
+  try {
+    const store = new Store(client, () => {});
+    await store.init();
+    const app = await store.createApp({ name: 'Plants' });
+    const spec = { name: 'plants', columns: [{ name: 'name', type: 'text' }] };
+    await store.ensureTable(app, spec, new Set(await store.tableNames()));
+    const caps = [await store.putCapability({ app, slug: 'plants', kind: 'table', title: 'plants', spec, code: '' }),
+      await store.putCapability({ app, slug: 'list', kind: 'view', title: 'List', spec: { order: 1 }, code: '{"body": []}' })];
+    await store.writeComposition(app, caps, 'first', 'plants');
+    await store.putSetting(app, 'publish', JSON.stringify({ on: true, name: 'plants', access: 'add' }));
+    const TOKEN = 'owner-test-token';
+    const ePort = await free();
+    engineProc = spawn(process.execPath, [join(import.meta.dirname, '..', 'engine', 'server.mjs'), '--port', String(ePort), '--strata', `http://127.0.0.1:${port}`, '--data', join(dir, 'engine')],
+      { env: { ...process.env, STRATA_APP_TOKEN: TOKEN, STRATA_APPS_SCHEDULES: 'off', STRATA_APPS_AUTOREPAIR: '0', STRATA_APPS_TILES: 'off', STRATA_APPS_GEOCODER: 'off', STRATA_APPS_CLAUDE: '/bin/false' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    engineProc.stdout.on('data', (d) => { out += d; });
+    engineProc.stderr.on('data', (d) => { out += d; });
+    const base = `http://127.0.0.1:${ePort}`;
+    for (let i = 0; ; i++) {
+      try { if ((await fetch(`${base}/healthz`)).ok) break; } catch { /* starting */ }
+      if (i > 600 || engineProc.exitCode !== null) throw new Error(`the engine did not start:\n${out.slice(-2000)}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const call = async (path, body, headers = {}) => {
+      const res = await fetch(`${base}/api/apps/${app}${path}`, { method: body === undefined ? 'GET' : 'POST', headers: { 'content-type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { status: res.status, body: await res.json().catch(() => ({})) };
+    };
+    const studio = { authorization: `Bearer ${TOKEN}` };
+    // The owner, from the command center (through chloedb-server) and the
+    // studio's leave beacon; a visitor of the published app, who cannot
+    // say they are the owner.
+    assert.equal((await call('/track', { kind: 'open', detail: 'list' }, studio)).status, 200);
+    assert.equal((await call('/insert', { table: 'plants', row: { name: 'Fern' } }, studio)).status, 200);
+    assert.equal((await call('/track', { kind: 'leave', detail: 'list', ms: 4000, session: 'tab1', owner: true }, studio)).status, 200);
+    assert.equal((await call('/track', { kind: 'open', detail: 'list', session: 'v1' }, { 'x-sa-session': 'v1', 'x-sa-owner': '1' })).status, 200);
+    assert.equal((await call('/insert', { table: 'plants', row: { name: 'Pothos' } }, { 'x-sa-session': 'v1', 'x-sa-owner': '1' })).status, 200);
+    assert.equal((await call('/track', { kind: 'leave', detail: 'list', ms: 3000, session: 'v1', owner: true })).status, 200);
+    await new Promise((r) => setTimeout(r, 300));
+    const act = (await call('/activity?days=0', undefined, studio)).body;
+    const owners = act.events.filter((e) => e.src === 'owner').map((e) => e.kind).sort();
+    const people = act.events.filter((e) => e.src !== 'owner').map((e) => e.kind).sort();
+    assert.deepEqual(owners, ['insert', 'leave', 'open'], JSON.stringify(act.events));
+    assert.deepEqual(people, ['insert', 'leave', 'open'], 'a visitor\'s say-so is not the owner\'s');
+    assert.equal(act.ux.sittings, 1, 'how easy it is, by people\'s visits');
+    assert.ok(act.uxAll.sittings >= 2, 'and with the owner\'s');
+  } finally {
+    engineProc?.kill();
+    child.kill();
+  }
+});
