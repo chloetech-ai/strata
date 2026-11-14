@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Memory for an agent · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="An agent that works over many sessions needs to remember: what was said, what was decided, and facts that change. This recipe keeps an agent&#x27;s memory in one ChloeDB file: every turn as a row, facts under keys that…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/guide/agent-memory.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html" aria-current="page">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Cookbook</span>
+      <h1>Memory for an agent</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-store">The store</a></li><li><a href="#remember-then-recall">Remember, then recall</a></li><li><a href="#make-it-better">Make it better</a></li></ol></details>
+    <div class="doc-body">
+
+<p>An agent that works over many sessions needs to remember: what was said, what was decided, and facts that change. This recipe keeps an agent's memory in one ChloeDB file: every turn as a row, facts under keys that new values replace, and a recall query that finds what matters to a new message by words and meaning, favours what is recent, and spreads its picks across sessions.</p>
+<p><a href="chloectx.html">ChloeCtx</a> is this idea built out for Claude Code, with hooks that record every session and a daemon that decides when to bring history back. Use this recipe for your own agent.</p>
+<p>You need Python with the <code>chloedb</code> package and <code>chloedb-server</code> on your <code>PATH</code> (<a href="quickstart.html">quickstart</a>), and the embedding model the tables below name. Fetch it once (about 130 MB, into <code>~/.local/share/chloedb/models</code>, or <code>$CHLOEDB_MODELS</code>; a machine that already has it, from the <a href="rag.html">RAG recipe</a> say, checks it and downloads nothing):</p>
+<pre data-lang="sh">chloedb-server fetch-model potion-retrieval-32M    # once: about 130 MB</pre>
+<h2 id="the-store">The store<a class="anchor" href="#the-store" aria-label="Link to this section">#</a></h2>
+<p>Two tables in one file. <code>turns</code> holds what was said, keyed by session and position; <code>facts</code> holds what the agent knows now, one row per key:</p>
+<pre data-lang="python" data-title="memory.py">import datetime as dt
+import chloedb
+
+EMBED = {&quot;model&quot;: &quot;potion-retrieval-32M&quot;}
+SCHEMA = {
+    &quot;table&quot;: &quot;turns&quot;,
+    &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;session&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;role&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;text&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;at&quot;, &quot;type&quot;: &quot;timestamp&quot;},
+        {&quot;name&quot;: &quot;emb&quot;, &quot;type&quot;: &quot;vector&quot;, &quot;embed&quot;: {&quot;from&quot;: [&quot;text&quot;], **EMBED}},
+    ],
+}
+FACTS = &quot;&quot;&quot;
+CREATE TABLE IF NOT EXISTS facts (
+  id KEYWORD PRIMARY KEY,
+  value TEXT,
+  at TIMESTAMP,
+  emb VECTOR OPTIONS(embed = &#x27;id, value&#x27;, model = &#x27;potion-retrieval-32M&#x27;)
+)
+&quot;&quot;&quot;
+
+
+class Memory:
+    def __init__(self, path):
+        self.db = chloedb.open(path, schema=SCHEMA)
+        self.db.sql(FACTS)
+
+    def remember(self, session, n, role, text, at):
+        &quot;&quot;&quot;Store one turn of a session.&quot;&quot;&quot;
+        self.db.upsert({&quot;id&quot;: f&quot;{session}/{n:04d}&quot;, &quot;session&quot;: session, &quot;role&quot;: role, &quot;text&quot;: text, &quot;at&quot;: at})
+
+    def learn(self, key, value, at):
+        &quot;&quot;&quot;Store a fact; a newer value of the same key replaces the old one.&quot;&quot;&quot;
+        self.db.upsert({&quot;id&quot;: key, &quot;value&quot;: value, &quot;at&quot;: at}, table=&quot;facts&quot;)
+
+    def recall(self, message, now, k=4):
+        &quot;&quot;&quot;The turns that matter to a new message: by words and meaning, newer first among equals,
+        at most two from any session.&quot;&quot;&quot;
+        return list(self.db.query(&quot;&quot;&quot;
+            SELECT id, session, role, text FROM turns
+            ORDER BY rrf(bm25(text, :q), similarity(emb, :v))
+                     * decay(at, :now, 2592000) DESC  -- halves every 30 days
+            MAX 2 PER session
+            LIMIT :k
+        &quot;&quot;&quot;, q=message, v={&quot;embed&quot;: message}, now=now, k=k))
+
+    def facts(self, message, k=3):
+        &quot;&quot;&quot;The facts closest to a message.&quot;&quot;&quot;
+        return list(self.db.query(&quot;&quot;&quot;
+            SELECT id, value FROM facts
+            ORDER BY rrf(bm25(value, :q), similarity(emb, :v)) DESC LIMIT :k
+        &quot;&quot;&quot;, q=message, v={&quot;embed&quot;: message}, k=k))
+
+    def close(self):
+        self.db.close()</pre>
+<p><code>recall</code> ranks turns by a fusion of BM25 and vector similarity, multiplies it by <a href="sql.html#decayfield-origin-scale--closeness-to-a-value"><code>decay</code></a>, which halves a turn's weight for every 30 days of age (2,592,000 seconds), and keeps at most two turns of a session with <code>MAX 2 PER session</code>, so one long session does not crowd out the others. Facts need no history: <code>upsert</code> replaces a key's row, so a fact is always its latest value.</p>
+<h2 id="remember-then-recall">Remember, then recall<a class="anchor" href="#remember-then-recall" aria-label="Link to this section">#</a></h2>
+<p>Two past sessions, a few weeks apart, and a fact that changed between them:</p>
+<pre data-lang="python" data-title="sessions.py">import datetime as dt
+from memory import Memory
+
+T = lambda s: dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
+mem = Memory(&quot;agent.chloedb&quot;)
+
+mem.remember(&quot;s1&quot;, 1, &quot;user&quot;, &quot;Let&#x27;s store the invoices in Postgres, the team knows it.&quot;, T(&quot;2026-09-01T10:00&quot;))
+mem.remember(&quot;s1&quot;, 2, &quot;agent&quot;, &quot;Done: invoices go to Postgres, table invoices, keyed by number.&quot;, T(&quot;2026-09-01T10:01&quot;))
+mem.remember(&quot;s1&quot;, 3, &quot;user&quot;, &quot;The receipt printer only takes 58 mm paper, keep lines short.&quot;, T(&quot;2026-09-01T10:05&quot;))
+mem.learn(&quot;deploy.target&quot;, &quot;a single VM on Hetzner&quot;, T(&quot;2026-09-01T10:10&quot;))
+
+mem.remember(&quot;s2&quot;, 1, &quot;user&quot;, &quot;Customers complain the PDF invoice is hard to read on phones.&quot;, T(&quot;2026-10-20T09:00&quot;))
+mem.remember(&quot;s2&quot;, 2, &quot;agent&quot;, &quot;Switched the invoice PDF to one column and a larger font.&quot;, T(&quot;2026-10-20T09:02&quot;))
+mem.learn(&quot;deploy.target&quot;, &quot;Kubernetes on DigitalOcean, since October&quot;, T(&quot;2026-10-20T09:30&quot;))
+mem.close()
+print(&quot;stored&quot;)</pre>
+<pre data-lang="sh">python3 sessions.py</pre>
+<pre data-lang="text" data-title="Output" class="output">stored</pre>
+<p>A new message arrives. Before answering, the agent recalls the turns and facts that bear on it and puts them in front of the model:</p>
+<pre data-lang="python" data-title="new_message.py">import datetime as dt
+from memory import Memory
+
+mem = Memory(&quot;agent.chloedb&quot;)
+message = &quot;Can we print the invoice on the receipt printer and where do we deploy it?&quot;
+now = dt.datetime(2026, 11, 12, tzinfo=dt.timezone.utc)
+
+print(&quot;turns:&quot;)
+for t in mem.recall(message, now):
+    print(f&quot;  [{t[&#x27;session&#x27;]}] {t[&#x27;role&#x27;]}: {t[&#x27;text&#x27;]}&quot;)
+print(&quot;facts:&quot;)
+for f in mem.facts(message):
+    print(f&quot;  {f[&#x27;id&#x27;]} = {f[&#x27;value&#x27;]}&quot;)
+mem.close()</pre>
+<pre data-lang="sh">python3 new_message.py</pre>
+<pre data-lang="text" data-title="Output" class="output">turns:
+  [s2] agent: Switched the invoice PDF to one column and a larger font.
+  [s2] user: Customers complain the PDF invoice is hard to read on phones.
+  [s1] user: The receipt printer only takes 58 mm paper, keep lines short.
+  [s1] agent: Done: invoices go to Postgres, table invoices, keyed by number.
+facts:
+  deploy.target = Kubernetes on DigitalOcean, since October</pre>
+<p>The printer's paper width comes back though the new message never says <em>58 mm</em>, and the deploy target is its current value, not the one from September. What goes into the model's context is a few lines, not two sessions of transcript.</p>
+<h2 id="make-it-better">Make it better<a class="anchor" href="#make-it-better" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><strong>Leave out what the model can still see.</strong> Give each turn the conversation it came from and filter it out of recall while that conversation is open: <code>WHERE session != :current</code>.</li>
+<li><strong>Forget on a schedule.</strong> <code>OPTIONS(retain = '400 days')</code> on a table, or an <code>expire_by</code> column per row, drops old turns in the background (<a href="sql.html#tables">tables</a>).</li>
+<li><strong>Let the model search too.</strong> Give the agent a tool that runs a read-only <code>SELECT</code> over its memory; ChloeCtx's <code>memory_sql</code> does exactly that.</li>
+<li><strong>Distil.</strong> After each session, ask a small model for the decisions and rules it contained and <code>learn</code> them as facts; ChloeCtx's distiller does this with <code>claude -p</code>.</li>
+<li><strong>Share it.</strong> On chloedb-server the same class works through <code>chloedb.connect(url)</code>, so several agents read and write one memory.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/guide/agent-memory.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="rag.html">← Retrieval for RAG</a><a href="crawl-to-search.html">Crawl a site into search →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

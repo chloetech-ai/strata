@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Concepts · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeDB is a search engine and a database in one library. This page names the parts you meet when you use it: the file, tables and their fields, the three kinds of index every row gets, scores, the planner, and the…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/guide/concepts.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html" aria-current="page">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Start</span>
+      <h1>Concepts</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#one-database-one-file">One database, one file</a></li><li><a href="#tables-fields-and-keys">Tables, fields and keys</a></li><li><a href="#every-row-indexed-three-ways">Every row, indexed three ways</a></li><li><a href="#queries-scores-and-the-planner">Queries, scores and the planner</a></li><li><a href="#from-a-file-to-a-cluster">From a file to a cluster</a></li><li><a href="#apps-on-a-cluster">Apps on a cluster</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeDB is a search engine and a database in one library. This page names the parts you meet when you use it: the file, tables and their fields, the three kinds of index every row gets, scores, the planner, and the server that serves the same database to many clients or many machines. <a href="design.html">How ChloeDB works</a> goes deeper into each.</p>
+<h2 id="one-database-one-file">One database, one file<a class="anchor" href="#one-database-one-file" aria-label="Link to this section">#</a></h2>
+<p>A database is one file plus a write-ahead log beside it (<code>books.chloedb</code> and <code>books.chloedb-wal</code>), the way SQLite keeps one in WAL mode, and a small directory (<code>-readers</code>) where processes that read it keep their place. Your program opens it as a library, from Rust, <a href="python.html">Python</a>, <a href="javascript.html">JavaScript</a> or <a href="java.html">Java</a>, with no server and no configuration. The same file can be served by <a href="server.html">chloedb-server</a> when many clients, or many machines, need it.</p>
+<pre data-lang="python">import os
+import chloedb
+
+db = chloedb.open(&quot;notes.chloedb&quot;, schema={
+    &quot;table&quot;: &quot;notes&quot;, &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [{&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;}, {&quot;name&quot;: &quot;body&quot;, &quot;type&quot;: &quot;text&quot;}],
+})
+db.insert({&quot;id&quot;: &quot;n1&quot;, &quot;body&quot;: &quot;Water the tomatoes before nine.&quot;})
+print(sorted(f for f in os.listdir(&quot;.&quot;) if f.startswith(&quot;notes&quot;)))
+db.close()
+print(sorted(f for f in os.listdir(&quot;.&quot;) if f.startswith(&quot;notes&quot;)))</pre>
+<pre data-lang="text" data-title="Output" class="output">[&#x27;notes.chloedb&#x27;, &#x27;notes.chloedb-readers&#x27;, &#x27;notes.chloedb-wal&#x27;]
+[&#x27;notes.chloedb&#x27;, &#x27;notes.chloedb-readers&#x27;, &#x27;notes.chloedb-wal&#x27;]</pre>
+<p>Writes are transactions with snapshot isolation: a query sees the database as it was when it started, readers never wait for the writer, and a crash leaves the last committed state. One process writes a database at a time; other processes can open it read-only and follow its commits. Back up a database that is in use with <code>checkpoint</code>, not by copying its files (<a href="python.html#backing-up-and-damaged-files">backups</a>).</p>
+<h2 id="tables-fields-and-keys">Tables, fields and keys<a class="anchor" href="#tables-fields-and-keys" aria-label="Link to this section">#</a></h2>
+<p>A database holds tables, and a table has typed fields and, usually, a primary key. A table is created from a schema, a JSON object as above or SQL:</p>
+<pre data-lang="sql">CREATE TABLE books (
+  id KEYWORD PRIMARY KEY,
+  title TEXT,
+  author KEYWORD,
+  genres KEYWORD[],
+  year INT,
+  rating FLOAT,
+  emb VECTOR OPTIONS(embed = &#x27;title&#x27;, model = &#x27;potion-retrieval-32M&#x27;)
+);</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>type</th>
+<th>holds</th>
+<th>searched with</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TEXT</code></td>
+<td>words, analysed (lowercased, stemmed, stopwords dropped)</td>
+<td><code>MATCH</code>, <code>bm25</code></td>
+</tr>
+<tr>
+<td><code>KEYWORD</code>, <code>KEYWORD[]</code></td>
+<td>exact values: ids, tags, names</td>
+<td><code>=</code>, <code>IN</code>, <code>LIKE 'p%'</code>, <code>GROUP BY</code></td>
+</tr>
+<tr>
+<td><code>INT</code>, <code>FLOAT</code>, <code>BOOL</code>, <code>TIMESTAMP</code></td>
+<td>numbers, flags and times</td>
+<td>ranges, <code>ORDER BY</code>, aggregates</td>
+</tr>
+<tr>
+<td><code>JSON</code></td>
+<td>documents whose keys no schema names</td>
+<td><code>attrs.color = 'red'</code></td>
+</tr>
+<tr>
+<td><code>VECTOR</code></td>
+<td>embeddings, given or computed by a model</td>
+<td><code>similarity</code>, <code>distance</code></td>
+</tr>
+<tr>
+<td><code>SPARSE</code></td>
+<td>learned term weights (SPLADE and the like)</td>
+<td><code>similarity</code></td>
+</tr>
+<tr>
+<td><code>EDGES</code></td>
+<td>typed, weighted links to other rows</td>
+<td><code>REACHABLE</code>, <code>PATH</code>, <code>ppr</code></td>
+</tr>
+<tr>
+<td><code>MEDIA</code></td>
+<td>images and sounds, by URI</td>
+<td>the vectors and text made from them</td>
+</tr>
+</tbody>
+</table></div>
+<p>A vector field with <code>embed</code> is filled by an embedding model from other fields when a row is written, so you insert text and search by meaning. The model runs inside ChloeDB (<code>potion-retrieval-32M</code>, a fast static model, or BERT models when built with them) or behind an API (OpenAI, Cohere, Voyage, Gemini, Ollama). The <a href="sql.html#columns-and-types">SQL reference</a> lists every type and option.</p>
+<h2 id="every-row-indexed-three-ways">Every row, indexed three ways<a class="anchor" href="#every-row-indexed-three-ways" aria-label="Link to this section">#</a></h2>
+<p>Each row is indexed by every kind of index its fields call for, in the same place, so one query can use them all:</p>
+<ul>
+<li><strong>Full text</strong>: posting lists of each word's rows, compressed, and scored with BM25.</li>
+<li><strong>Columns</strong>: each field's values stored by column, for filters, sorting, facets and aggregates.</li>
+<li><strong>Vectors</strong>: an HNSW graph (or a flat or IVF index) over each vector field, for nearest neighbours.</li>
+</ul>
+<p>Rows can also hold <strong>edges</strong> to other rows, which turn a table into a graph that the same queries walk (<a href="graphs.html">graphs</a>).</p>
+<p>Rows are written into immutable <strong>segments</strong>. A new row goes to the write-ahead log and a memory table first; full memory tables are written as segments, and segments are merged in the background, as Lucene and SQLite's FTS5 do. You do not manage segments, but <code>EXPLAIN</code> shows a plan for each.</p>
+<h2 id="queries-scores-and-the-planner">Queries, scores and the planner<a class="anchor" href="#queries-scores-and-the-planner" aria-label="Link to this section">#</a></h2>
+<p>Everything is SQL. Search is a set of functions inside it: <code>MATCH</code> selects rows with words, <code>bm25</code>, <code>similarity</code> and others score them, <code>rrf</code> and weighted sums blend scores, and <code>score()</code> is the score a row was ranked by. A ranking can multiply in a column (<code>* (1 + 0.1 * rating)</code>), decay with age, run a learned model, or rerank its top rows with a cross-encoder. The <a href="search.html">search guide</a> shows each in use.</p>
+<p>A cost-based <strong>planner</strong> decides, for each segment and from exact statistics, how to run each part of a statement: which condition to read from an index, which to test row by row, whether to search vectors before a filter or within it. You write what you want, and <code>EXPLAIN</code> says what it chose.</p>
+<h2 id="from-a-file-to-a-cluster">From a file to a cluster<a class="anchor" href="#from-a-file-to-a-cluster" aria-label="Link to this section">#</a></h2>
+<p>The same database, and the same SQL, run three ways:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th>how</th>
+<th>when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>In your process</strong></td>
+<td><code>chloedb.open("books.chloedb")</code></td>
+<td>one program owns the data: an app, a notebook, an agent</td>
+</tr>
+<tr>
+<td><strong>One server</strong></td>
+<td><code>chloedb-server --db books.chloedb</code></td>
+<td>many clients, other languages, a browser UI</td>
+</tr>
+<tr>
+<td><strong>A cluster</strong></td>
+<td>a coordinator over shards, each with replicas</td>
+<td>more data or traffic than one machine holds</td>
+</tr>
+</tbody>
+</table></div>
+<p><a href="server.html">chloedb-server</a> serves a database over HTTP JSON and gRPC, with a command center in the browser for queries, health and performance, and an agent that answers questions by writing SQL. Several servers run as shards behind a coordinator that answers like one database, and a primary ships its writes to replicas. The Python, JavaScript and Java clients have the same methods for a file and a server, so code moves from one to the other unchanged.</p>
+<h2 id="apps-on-a-cluster">Apps on a cluster<a class="anchor" href="#apps-on-a-cluster" aria-label="Link to this section">#</a></h2>
+<p>Some programs built on ChloeDB run beside a server and appear in its command center: the <a href="crawler.html">crawler</a>, which turns a site into a table, <a href="sheets.html">Sheets</a>, spreadsheets whose cells are rows, and <a href="chloectx.html">ChloeCtx</a>, long-term memory for Claude Code. <a href="apps.html">Apps on a cluster</a> says how they attach.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/guide/concepts.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="quickstart.html">← Quickstart</a><a href="build-an-app.html">Build an app on the HTTP API →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

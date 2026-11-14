@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Following Postgres · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloedb-server follow-postgres keeps ChloeDB in step with a Postgres database by logical replication: it copies the tables of a publication, then applies every insert, update, delete, TRUNCATE and new column a moment…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/postgres.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html" aria-current="page">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Server and cluster</span>
+      <h1>Following Postgres</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/postgres.md">docs/chloedb/postgres.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#set-up-postgres">Set up Postgres</a></li><li><a href="#run-it">Run it</a></li><li><a href="#what-it-applies">What it applies</a></li><li><a href="#how-a-restart-resumes">How a restart resumes</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloedb-server follow-postgres</code> keeps ChloeDB in step with a Postgres database by logical replication: it copies the tables of a publication, then applies every insert, update, delete, <code>TRUNCATE</code> and new column a moment after Postgres commits it, so ChloeDB serves search over the rows Postgres holds without a nightly job or a Debezium and Kafka pipeline in between. It speaks Postgres's own protocol (<code>pgoutput</code>, the plugin Postgres ships, from version 10), and keeps what it applied in ChloeDB's <code>_sources</code>, in the same transactions as the rows, so a follower stopped and started again goes on from there and applies each change once.</p>
+<h2 id="set-up-postgres">Set up Postgres<a class="anchor" href="#set-up-postgres" aria-label="Link to this section">#</a></h2>
+<p>Postgres writes what logical replication needs once <code>wal_level</code> is <code>logical</code> (a restart takes it):</p>
+<pre data-lang="sql">ALTER SYSTEM SET wal_level = logical;   -- then restart Postgres
+CREATE PUBLICATION strata FOR TABLE products, reviews;   -- or FOR ALL TABLES
+CREATE ROLE chloedb LOGIN REPLICATION PASSWORD &#x27;...&#x27;;
+GRANT SELECT ON products, reviews TO chloedb;</pre>
+<p>The role signs in by SCRAM-SHA-256 (Postgres's default), MD5 or a password, and needs <code>REPLICATION</code> and <code>SELECT</code> on the tables. On managed Postgres, logical replication is a setting (<code>rds.logical_replication</code> on RDS and Aurora, <code>cloudsql.logical_decoding</code> on Cloud SQL; Supabase and Neon have it on). Since Postgres 15 a publication can leave columns out (<code>FOR TABLE users (id, name, bio)</code>) and rows (<code>WHERE (published)</code>); the follower copies and follows what it publishes.</p>
+<p>Each table needs a key: its primary key, or a unique index named as its replica identity (<code>ALTER TABLE t REPLICA IDENTITY USING INDEX t_code_key</code>). A key of several columns becomes one <code>KEYWORD</code> column <code>_key</code> in ChloeDB, their values joined by <code>:</code> (<code>42:en</code>), beside the columns themselves.</p>
+<h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloedb-server follow-postgres \
+  --source &#x27;postgres://chloedb:...@db.example:5432/shop?sslmode=verify-full&#x27; \
+  --target http://localhost:7700 --name shop</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>option</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--source</code></td>
+<td>the database's URL (or <code>CHLOEDB_POSTGRES_URL</code>); <code>PGPASSWORD</code> gives a password it leaves out; <code>sslmode</code> is <code>disable</code>, <code>prefer</code>, <code>require</code>, <code>verify-ca</code> or <code>verify-full</code>; without one, <code>require</code> for a database on another machine (a connection that could fall back to plain text would send the password's proof and every row in the clear) and <code>prefer</code> for one on <code>localhost</code> or a loopback address, and <code>sslrootcert</code> (or <code>--source-ca</code>) a CA certificate to check the server's by; with <code>verify-*</code> and no CA given, the public CAs are trusted</td>
+</tr>
+<tr>
+<td><code>--target</code></td>
+<td>ChloeDB's HTTP URL: a server, or a cluster's coordinator (<code>--target-token</code> or <code>CHLOEDB_CLUSTER_TOKEN</code>, <code>--target-ca</code>)</td>
+</tr>
+<tr>
+<td><code>--name</code></td>
+<td>the name ChloeDB knows the database by, which its marks in <code>_sources</code> name</td>
+</tr>
+<tr>
+<td><code>--publication</code></td>
+<td>the publication (<code>strata</code>)</td>
+</tr>
+<tr>
+<td><code>--slot</code></td>
+<td>the replication slot it makes and reads (<code>strata_&lt;name&gt;</code>)</td>
+</tr>
+<tr>
+<td><code>--batch</code></td>
+<td>the most rows of one write while copying, and of the transactions written together (1,000)</td>
+</tr>
+<tr>
+<td><code>--copy-workers</code></td>
+<td>how many tables are copied at once (4)</td>
+</tr>
+<tr>
+<td><code>--copy</code></td>
+<td>copy everything again, with a new slot</td>
+</tr>
+<tr>
+<td><code>--drop-slot</code></td>
+<td>drop the slot and exit</td>
+</tr>
+</tbody>
+</table></div>
+<p>The first run makes the replication slot, which holds a snapshot of the database, and copies each table as of that snapshot while Postgres goes on taking writes; it then streams the slot's changes from the snapshot's position, so no change between the two is missed or applied twice. A ChloeDB table it lacks is made from the Postgres table; one that exists keeps its schema (see <a href="#choosing-chloedb-types">below</a>). It logs how far it is every 30 seconds (<code>applied</code>, the server's WAL position, <code>behind_bytes</code>), and <code>GET /v1/sources</code> on ChloeDB shows the last LSN it applied (<code>postgres/&lt;name&gt;/&lt;copy&gt;</code>), with when.</p>
+<p>Stop it whenever: started again it resumes from what ChloeDB applied. While it is stopped, <strong>Postgres keeps the WAL the slot has not consumed</strong>, which can fill its disk over days; when you stop following for good, drop the slot (<code>--drop-slot</code>, or <code>SELECT pg_drop_replication_slot('strata_shop')</code>). Postgres 13 and later can cap what a slot keeps (<code>max_slot_wal_keep_size</code>); a slot that lost WAL it needed is copied afresh on the next start.</p>
+<h2 id="what-it-applies">What it applies<a class="anchor" href="#what-it-applies" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><strong>Inserts and updates</strong> are upserts of the whole row by key; an update that changes the key deletes the old row. A large value an update leaves unchanged, which Postgres does not send (TOAST), is kept: taken from the old row with <code>REPLICA IDENTITY FULL</code>, or else read from ChloeDB's row.</li>
+<li><strong>Deletes</strong> are by key. <strong><code>TRUNCATE</code></strong> deletes every row of the table.</li>
+<li><strong>Columns added</strong> in Postgres are added to the ChloeDB table (<code>ALTER TABLE ... ADD COLUMN</code>), and a column renamed while the follower runs is renamed. A column dropped in Postgres stays in ChloeDB, <code>NULL</code> in rows written since. A changed type keeps the ChloeDB column's, and the values are read as it reads them.</li>
+<li><strong>Tables joining the publication</strong> (<code>ALTER PUBLICATION ... ADD TABLE</code>, or a table created under <code>FOR ALL TABLES</code>) are copied when the follower sees them, within 30 seconds, then followed. A table leaving it is no longer followed; its ChloeDB rows stay. A table renamed in Postgres goes on into the ChloeDB table of its old name.</li>
+<li>ChloeDB's tables the follower writes take no other writes: a transaction applied again after a restart writes what it wrote before.</li>
+</ul>
+<p>Transactions are applied whole, each in one write (several at once while Postgres sends faster than they are written), but one of more than 1,000 changes, more than 16 MB of values, or with a <code>TRUNCATE</code>, is written in steps: a reader can see part of it, as it can see part of any write across a cluster's shards.</p>
+<h3 id="how-postgres-columns-become-fields">How Postgres columns become fields<a class="anchor" href="#how-postgres-columns-become-fields" aria-label="Link to this section">#</a></h3>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>Postgres</th>
+<th>ChloeDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>boolean</code></td>
+<td><code>BOOL</code></td>
+</tr>
+<tr>
+<td><code>smallint</code>, <code>integer</code>, <code>bigint</code>, <code>oid</code></td>
+<td><code>INT</code></td>
+</tr>
+<tr>
+<td><code>real</code>, <code>double precision</code>, <code>numeric</code></td>
+<td><code>FLOAT</code></td>
+</tr>
+<tr>
+<td><code>text</code>, <code>varchar</code>, <code>name</code>, <code>citext</code>, <code>xml</code></td>
+<td><code>TEXT</code> (<code>KEYWORD</code> as the key)</td>
+</tr>
+<tr>
+<td><code>char(n)</code>, <code>uuid</code>, enums, and other types (<code>inet</code>, <code>interval</code>, ...)</td>
+<td><code>KEYWORD</code>, their text</td>
+</tr>
+<tr>
+<td><code>date</code>, <code>timestamp</code>, <code>timestamptz</code></td>
+<td><code>TIMESTAMP</code> (UTC; <code>infinity</code> is <code>NULL</code>)</td>
+</tr>
+<tr>
+<td><code>json</code>, <code>jsonb</code></td>
+<td><code>JSON</code> (a value that is not an object becomes <code>{"value": ...}</code>)</td>
+</tr>
+<tr>
+<td>arrays of text types, <code>uuid</code> or enums</td>
+<td><code>KEYWORD[]</code></td>
+</tr>
+<tr>
+<td>arrays of integers</td>
+<td><code>INT[]</code></td>
+</tr>
+<tr>
+<td>pgvector's <code>vector(n)</code>, <code>halfvec(n)</code></td>
+<td><code>VECTOR(n)</code></td>
+</tr>
+<tr>
+<td>pgvector's <code>sparsevec</code></td>
+<td><code>SPARSE</code></td>
+</tr>
+<tr>
+<td><code>bytea</code>, <code>tsvector</code>, other arrays, <code>vector</code> without a dimension</td>
+<td>left out</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="choosing-chloedb-types">Choosing ChloeDB types<a class="anchor" href="#choosing-chloedb-types" aria-label="Link to this section">#</a></h3>
+<p>To choose the types, analyzers, an embedded vector or fields of ChloeDB's own, make the table in ChloeDB before the first run, with the Postgres key as its key and the columns of the names Postgres has:</p>
+<pre data-lang="sql">CREATE TABLE products (
+  id INT PRIMARY KEY,
+  title TEXT,
+  sku KEYWORD,
+  description TEXT OPTIONS(analyzer = &#x27;english&#x27;),
+  price FLOAT,
+  emb VECTOR OPTIONS(embed = &#x27;title, description&#x27;, model = &#x27;potion-retrieval-32M&#x27;)
+);</pre>
+<p>The follower writes each Postgres column into the field of its name as that field reads it (an <code>integer</code> into a <code>KEYWORD</code>, a <code>real[]</code> into a <code>VECTOR(n)</code>), adds the published columns the table lacks, and leaves the other fields to ChloeDB: here <code>emb</code> is embedded from each row as it arrives. A value a field cannot read (text in an <code>INT</code>) stops the follower with the table, column and value; fix the table and start it again.</p>
+<h2 id="how-a-restart-resumes">How a restart resumes<a class="anchor" href="#how-a-restart-resumes" aria-label="Link to this section">#</a></h2>
+<p>What the follower applied is in ChloeDB's <code>_sources</code>, written in the same transaction as the rows it covers:</p>
+<ul>
+<li><code>postgres/&lt;name&gt;/copy</code> is when the copy it follows from began; a copy made again names every other mark afresh, under <code>postgres/&lt;name&gt;/&lt;copy&gt;/</code>.</li>
+<li><code>postgres/&lt;name&gt;/&lt;copy&gt;</code> is the LSN where the last applied Postgres transaction ends. Every operation of a transaction carries it as its stream offset, so a shard that applied the transaction skips it when it comes again, and a follower started again streams from the least over the shards (<a href="server.html#streams">streams</a>).</li>
+<li>A transaction written in steps numbers them (<code>.../step</code>, carried by each step's operations), and its last step writes how many steps such transactions took so far (<code>.../base</code>): replayed, it numbers its steps as before, each shard skips the steps it applied, and a <code>TRUNCATE</code> already done is not done again.</li>
+<li><code>.../copied</code> says the copy finished, and <code>.../t/&lt;oid&gt;/&lt;table&gt;</code> which Postgres table each ChloeDB table follows.</li>
+</ul>
+<p>The follower tells Postgres how far it applied, so that the slot lets go of the WAL before it. A copy cut short is made again, from a new slot.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/postgres.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="parquet.html">← Parquet and S3</a><a href="connectors.html">Connectors →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

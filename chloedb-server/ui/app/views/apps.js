@@ -95,7 +95,7 @@ function render(page, route) {
     if (!name) {
       page.append(h("div", { class: "page-head" }, h("h1", {}, "Apps")),
         list.length ? h("div", { class: "grid g3" }, list.map((a) => h("a", { class: "card", href: "#/app/" + a.name, style: { padding: "16px", display: "flex", gap: "12px", alignItems: "flex-start" } },
-          appIcon(a, "lg"), h("div", {}, h("b", {}, a.title), h("div", { class: "small dim" }, a.up ? a.description || "" : `not answering: ${a.error}`),
+          appIcon(a, "lg"), h("div", {}, h("b", {}, a.title, a.maturity === "demo" ? [" ", core.demo(a.title)] : null), h("div", { class: "small dim" }, a.up ? a.description || "" : `not answering: ${a.error}`),
             core.limited() && !a.checks_callers ? h("div", { class: "small muted" }, "takes a key of every table") : null))))
           : appsError ? empty("warn", "Can't list the apps", core.cannotSee(appsError, "the apps")) : empty("box", "No apps", "An app is a program of its own that this server forwards to. The server starts the crawler (chloedb-crawl), Sheets (chloedb-sheets) and ChloeCtx (chloectx) itself when they are installed beside it (--start-apps); others it reaches with --app name=url."));
       return;
@@ -132,6 +132,8 @@ function render(page, route) {
           watching.push(l);
         },
       };
+      // A demo says so above its page (its manifest's "maturity": "demo").
+      if (a.maturity === "demo") page.append(h("p", { class: "small dim", style: { margin: "0 0 8px" } }, core.demo(a.title), ` ${a.title} is a demo of what ChloeDB can do, tested on a train of its own and with no compatibility promise.`));
       const r = view.render(page, ctx);
       stop = typeof r === "function" ? r : r && typeof r.stop === "function" ? () => r.stop() : null;
     }).catch((e) => {

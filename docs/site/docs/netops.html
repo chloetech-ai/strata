@@ -89,6 +89,9 @@
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#the-pages">The pages</a></li><li><a href="#the-map">The map</a></li><li><a href="#where-is-it-broken">Where is it broken</a></li><li><a href="#an-incidents-board">An incident's board</a></li><li><a href="#the-agents">The agents</a></li><li><a href="#the-six-faults">The six faults</a></li><li><a href="#your-own-network">Your own network</a></li><li><a href="#the-tables">The tables</a></li><li><a href="#what-it-is-not">What it is not</a></li><li><a href="#test-it">Test it</a></li></ol></details>
     <div class="doc-body">
 
+<blockquote>
+<p><strong>A demo.</strong> chloedb-netops shows what ChloeDB can do; it is not part of ChloeDB's releases or their promises. It is tested on a train of its own (the <code>Demos</code> workflow, <code>.github/workflows/demos.yml</code>), outside CI's required check, so a fault in it does not hold a ChloeDB release, and the command center marks it as a demo (<a href="compatibility.html#demos">compatibility</a>).</p>
+</blockquote>
 <p><code>chloedb-netops</code> is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an incident and say what they looked at. It comes with a simulated carrier network, <em>Meridian</em> (10 sites, 64 devices, 120 links, 12 services), and a simulator that writes each minute of it and breaks it in six ways, so the whole app can be used, and its agents checked, without a network of your own.</p>
 <p>It is there to show what one database does for an operations team when search, SQL, graphs and time all live in it:</p>
 <ul>

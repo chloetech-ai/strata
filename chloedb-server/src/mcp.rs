@@ -807,7 +807,7 @@ fn check_own_statement(sql: &str, tables: &[std::sync::Arc<chloedb::Schema>]) ->
                 })
             }
             rollup::Statement::Drop { name, if_exists } => json!({"statement": "drop rollup", "rollup": name, "if_exists": if_exists, "needs": "an admin key not limited to tables"}),
-            rollup::Statement::Refresh { name, full } => json!({"statement": "refresh rollup", "rollup": name, "full": full, "needs": "an admin key not limited to tables"}),
+            rollup::Statement::Refresh { name, mode } => json!({"statement": "refresh rollup", "rollup": name, "full": mode != rollup::Refresh::Recent, "rebuild": mode == rollup::Refresh::Rebuild, "needs": "an admin key not limited to tables"}),
         }));
     }
     if let Some(st) = classify::parse_statement(sql).map_err(|e| e.to_string())? {

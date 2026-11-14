@@ -226,6 +226,21 @@ async fn agents_find_routes_tools_jobs_events_and_runbooks() {
     let (_, c) = call(&base, "GET", "/v1/catalog?q=contain", &read, &[], None).await;
     assert!(c["routes"].as_array().unwrap().iter().all(|r| r["path"].as_str().unwrap().contains("contain")), "{c}");
 
+    // Experimental features: marked in the catalog, and their answers say so.
+    let oncall = routes.iter().find(|r| r["method"] == "GET" && r["path"] == "/v1/admin/oncall").unwrap();
+    assert_eq!(oncall["experimental"], "oncall", "{oncall}");
+    assert!(contain.get("experimental").is_none(), "{contain}");
+    let marked = |path: &'static str| {
+        let base = base.clone();
+        async move {
+            let r = chloedb_server::http_client().build().unwrap().get(format!("{base}{path}")).bearer_auth(ROOT).send().await.unwrap();
+            r.headers().get("x-chloedb-experimental").map(|v| v.to_str().unwrap().to_string())
+        }
+    };
+    assert_eq!(marked("/v1/admin/oncall").await.as_deref(), Some("oncall"));
+    assert_eq!(marked("/v1/admin/hub").await.as_deref(), Some("hub"));
+    assert_eq!(marked("/v1/health").await, None);
+
     // The operations tools are listed to a role key, not to a read key.
     let list = |auth: String| {
         let base = base.clone();

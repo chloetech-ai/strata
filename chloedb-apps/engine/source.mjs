@@ -35,7 +35,7 @@ function wrap(head, language, body) {
 }
 const WRAPPED = /^\s*(?:--[^\n]*\n\s*)*CREATE\s+(?:OR\s+REPLACE\s+)?(SCREEN|RULE|FUNCTION|COMPONENT|HELPER|PATTERN)\s+[\s\S]*?\bLANGUAGE\s+(javascript|json)\s+AS\s+(\$[A-Za-z0-9_]*\$)\n([\s\S]*)\n\3\s*;?\s*$/;
 
-const events = (on, every = null) => `${on && on.table ? ` AFTER ${[].concat(on.event || 'insert').map((e) => String(e).toUpperCase()).join(' OR ')} ON ${on.table}` : ''}${every ? ` ${everyText(every)}` : ''}`;
+const events = (on, every = null, as = null) => `${on && on.table ? ` AFTER ${[].concat(on.event || 'insert').map((e) => String(e).toUpperCase()).join(' OR ')} ON ${on.table}${as === 'app' ? ' RUNS AS APP' : ''}` : ''}${every ? ` ${everyText(every)}` : ''}`;
 const titled = (slug, title) => `${slug}${title && title !== slug ? ` TITLE ${sqlText(title)}` : ''}`;
 
 // A table as the CREATE TABLE that makes it (with the app's own name for it;
@@ -128,11 +128,11 @@ export function toSource({ kind, slug, title, code, spec = {} }) {
   if (kind === 'function' && spec.rule) {
     const rule = parse(body);
     if (typeof spec.statement === 'string' && rule) {
-      try { const back = compileRule(spec.statement); if (same(back.rule, rule) && same(back.on, onOf(spec.on)) && same(back.every || null, spec.every || null)) return spec.statement.trim(); } catch { /* stale */ }
+      try { const back = compileRule(spec.statement); if (same(back.rule, rule) && same(back.on, onOf(spec.on)) && same(back.every || null, spec.every || null) && (back.as || null) === (spec.as || null)) return spec.statement.trim(); } catch { /* stale */ }
     }
-    return (rule && ruleStatement(slug, rule, spec.on, spec.every, spec.source)) || wrap(`CREATE RULE ${slug}${events(spec.on, spec.every)}`, 'json', body);
+    return (rule && ruleStatement(slug, rule, spec.on, spec.every, spec.source, spec.as)) || wrap(`CREATE RULE ${slug}${events(spec.on, spec.every, spec.as)}`, 'json', body);
   }
-  if (kind === 'function') return wrap(`CREATE FUNCTION ${slug}${events(spec.on, spec.every)}`, 'javascript', body);
+  if (kind === 'function') return wrap(`CREATE FUNCTION ${slug}${events(spec.on, spec.every, spec.as)}`, 'javascript', body);
   if (kind === 'component') return wrap(`CREATE COMPONENT ${slug}`, 'javascript', body);
   if (kind === 'helper') return wrap(`CREATE HELPER ${slug}`, 'javascript', body);
   if (kind === 'pattern') return wrap(`CREATE PATTERN ${slug}`, 'json', body);

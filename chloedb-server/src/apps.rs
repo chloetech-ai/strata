@@ -2,7 +2,9 @@
 //! (`--app crawler=http://127.0.0.1:7800`). An app answers
 //!
 //! - `GET /app.json`: its name, title, icon (`icon_svg`, the inside of a
-//!   24-unit outline icon), and `view`, the path of its view module;
+//!   24-unit outline icon), `view`, the path of its view module, and
+//!   optionally `maturity` (`"demo"`: the command center marks the app as
+//!   a demo, on a release train of its own);
 //! - its view module: JavaScript the command center loads and runs with
 //!   its own helpers (the app's code is trusted as the server's is: an
 //!   admin names it on the server's command line);
@@ -177,6 +179,9 @@ impl Apps {
                     "name": a.name, "url": a.url, "up": true,
                     "title": m["title"].as_str().unwrap_or(&a.name), "description": m["description"], "icon_svg": m["icon_svg"],
                     "view": m["view"].as_str().map(|v| format!("/v1/apps/{}/{}", a.name, v.trim_start_matches('/'))), "version": m["version"],
+                    // "demo" for an app on the demo train (netops, the
+                    // feature store, the swarm): the command center marks it.
+                    "maturity": m["maturity"],
                     "checks_callers": m["checks_callers"] == json!(true) || m["limited_keys"] == json!(true),
                 }),
                 Err(e) => json!({"name": a.name, "url": a.url, "up": false, "title": a.name, "error": e}),

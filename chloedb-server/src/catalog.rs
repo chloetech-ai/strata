@@ -154,6 +154,33 @@ pub const PLANS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/admin/cloud/clusters", "POST /v1/admin/aws/plan or /v1/admin/digitalocean/plan"),
 ];
 
+/// The experimental features: routes by the start of their path, the
+/// feature's name and what it is. Their API, settings and stored state
+/// carry no compatibility promise yet and may change in any release
+/// (docs/compatibility.md, "Experimental features"). Each answer of one
+/// of these routes says so in [`EXPERIMENTAL_HEADER`], and the catalog
+/// marks the route. A prefix ends where a path segment does (`/v1/admin/hub`
+/// is `/v1/admin/hub` and `/v1/admin/hub/...`, not `/v1/admin/hubs`).
+pub const EXPERIMENTAL: &[(&str, &str, &str)] = &[
+    ("/v1/admin/cloud", "cloud", "clusters made on AWS or DigitalOcean from the command center"),
+    ("/v1/admin/aws", "cloud", "clusters made on AWS or DigitalOcean from the command center"),
+    ("/v1/admin/digitalocean", "cloud", "clusters made on AWS or DigitalOcean from the command center"),
+    ("/v1/admin/hub", "hub", "the hub: a book of other clusters, and calls forwarded to them"),
+    ("/c", "hub", "the hub: a book of other clusters, and calls forwarded to them"),
+    ("/v1/admin/kube/autoscale", "autoscale", "the operator's autoscaler and its rules"),
+    ("/v1/admin/autoscale", "autoscale", "the operator's autoscaler and its rules"),
+    ("/v1/admin/oncall", "oncall", "the on-call agent: a model that looks into an alert and proposes actions"),
+];
+
+/// The header that names the experimental feature an answer comes from.
+pub const EXPERIMENTAL_HEADER: &str = "x-chloedb-experimental";
+
+/// The experimental feature a path (or a route's pattern) belongs to.
+pub fn experimental(path: &str) -> Option<&'static str> {
+    let path = path.split('?').next().unwrap_or(path);
+    EXPERIMENTAL.iter().find(|(p, _, _)| path.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))).map(|e| e.1)
+}
+
 /// The catalog's entries, of routes whose path holds `q` when given.
 pub fn entries(q: Option<&str>) -> Vec<Json> {
     let q = q.map(str::to_ascii_lowercase).filter(|q| !q.is_empty());
@@ -184,6 +211,9 @@ pub fn entries(q: Option<&str>) -> Vec<Json> {
             if let Some(t) = tool {
                 j["tool"] = json!(t);
             }
+            if let Some(f) = experimental(r.path) {
+                j["experimental"] = json!(f);
+            }
             out.push(j);
         }
     }
@@ -204,6 +234,13 @@ pub fn answer(q: Option<&str>) -> Json {
             "3": "loses data or costs money: as tier 2, and an agent never does it alone through MCP or with an agent key",
         },
         "agents": "send x-chloedb-reason with every change (tier 1 and up), and x-chloedb-agent-model, -session and -run to be named in the audit log",
+        "experimental": {
+            "about": "a route marked `experimental` belongs to a feature with no compatibility promise yet: its API, settings and stored state may change in any release; its answers carry the x-chloedb-experimental header",
+            "features": EXPERIMENTAL.iter().fold(serde_json::Map::new(), |mut m, (_, f, what)| {
+                m.entry(f.to_string()).or_insert_with(|| json!(what));
+                m
+            }),
+        },
     })
 }
 
@@ -222,6 +259,31 @@ mod tests {
         for (m, p, t) in TOOLS {
             assert!(all.iter().any(|r| r.path == *p && r.methods.iter().any(|x| x.as_str() == *m)), "{t}: no route {m} {p}");
         }
+    }
+
+    #[test]
+    fn experimental_features_are_marked() {
+        assert_eq!(experimental("/v1/admin/hub"), Some("hub"));
+        assert_eq!(experimental("/v1/admin/hub/connections/x"), Some("hub"));
+        assert_eq!(experimental("/c/:name/*rest"), Some("hub"));
+        assert_eq!(experimental("/c/prod/v1/sql"), Some("hub"));
+        assert_eq!(experimental("/classic"), None);
+        assert_eq!(experimental("/v1/admin/hubs"), None);
+        assert_eq!(experimental("/v1/admin/aws/plan?x=1"), Some("cloud"));
+        assert_eq!(experimental("/v1/admin/kube/autoscale/dismiss"), Some("autoscale"));
+        assert_eq!(experimental("/v1/admin/kube/plan"), None);
+        assert_eq!(experimental("/v1/admin/oncall/runs/7"), Some("oncall"));
+        assert_eq!(experimental("/v1/sql"), None);
+        // Every prefix is a route the server has, so none is a stale mark.
+        for (p, f, _) in EXPERIMENTAL {
+            assert!(routes().iter().any(|r| experimental(r.path) == Some(f) && r.path.starts_with(p)), "{p}: no route");
+        }
+        let all = entries(None);
+        let marked = all.iter().filter(|e| e["experimental"].is_string()).count();
+        assert!(marked >= 20, "{marked}");
+        assert!(all.iter().any(|e| e["path"] == "/v1/admin/oncall" && e["experimental"] == "oncall"));
+        assert!(all.iter().all(|e| e["path"] != "/v1/sql" || e.get("experimental").is_none()));
+        assert_eq!(answer(None)["experimental"]["features"].as_object().unwrap().len(), 4);
     }
 
     #[test]
