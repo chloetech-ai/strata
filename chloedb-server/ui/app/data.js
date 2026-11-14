@@ -8,7 +8,7 @@
 // longer or older windows read `/v1/timeseries?from=&to=` (per-minute points
 // from the server's `load` table). While paused nothing redraws.
 
-import { api, bus, every, store, provide, provideRoutes, roleOf, connection, fmt, span } from "./core.js";
+import { api, bus, every, store, provide, provideRoutes, roleOf, connection, fmt, span, can, isIdle, IDLE_SLOW } from "./core.js";
 
 /** The ranges the picker offers: [key, minutes]. */
 export const RANGES = [["15m", 15], ["1h", 60], ["6h", 360], ["24h", 1440], ["7d", 10080]];
@@ -28,6 +28,8 @@ export const state = {
   /** Where the points come from: "memory" (2 s points) or "load" (per-minute); `partial` when the server lacks part of the window. */
   series: { source: "memory", interval_ms: 2000, from: null, to: null, partial: false, loaded_ms: null },
   health: null, system: null, alerts: null, cluster: null, whoami: null,
+  /** GET /v1/kube, once a view asked (kubeInfo()): whether an operator manages the cluster. */
+  kube: null,
   /** GET /v1/health/fleet, or the same shape worked out here from the cluster when the server lacks it (`derived: true`). */
   fleet: null,
   /** Why the key may not see the fleet's health (a key limited to tables), or null. */
@@ -174,7 +176,8 @@ export function fresh(name) {
   const f = fr[name];
   if (!f) return { ok: !state.paused, age_ms: null, error: null, since_ms: null, loading: true };
   const age = f.ok_ms ? Date.now() - f.ok_ms : null;
-  const per = (name === "series" && state.series.source === "load") ? 60000 : PERIOD[name] || 5000;
+  // Nobody at the page, the polls run IDLE_SLOW times less often (core.every): not stale for that.
+  const per = ((name === "series" && state.series.source === "load") ? 60000 : PERIOD[name] || 5000) * (isIdle() ? IDLE_SLOW : 1);
   const down = !connection().ok;
   const ok = !down && (f.misses || 0) < 2 && (state.paused || age == null || age < per * 3 + 4000);
   return { ok, age_ms: age, error: f.error || (down ? connection().message : null), since_ms: f.since_ms || (down ? connection().since_ms : null), loading: false };
@@ -378,6 +381,38 @@ export function firesOn(x) {
 /** The alerts firing now that nobody silenced nor a cause holds back (alerts2): the one count the bell, Alerts and Home show. */
 export const firingNow = () => firingAlerts().filter((a) => !a.silenced && !a.held_by);
 
+/**
+ * The fleet's problems as Home, its banner and the navigation show them
+ * (LIV-9): the server's last answer, and the alerts firing now (the bell's
+ * count) when that answer did not count them yet, as the server would: an
+ * info alert tells but is no problem. Worst first.
+ */
+export function homeProblems(f = state.fleet) {
+  const probs = [...(f?.problems || [])];
+  const told = firingNow().filter((a) => a.severity !== "info");
+  if (told.length && !probs.some((p) => p.id === "alerts" || String(p.id || "").startsWith("alert-"))) {
+    const crit = told.filter((a) => a.severity === "critical").length;
+    const on = (a) => (a.on ? ` on ${a.on}` : a.where?.length === 1 ? ` on ${a.where[0].short || a.where[0].copy || a.where[0]}` : a.where?.length > 1 ? ` on ${a.where.length} copies` : "");
+    const since = told.map((a) => a.since_ms).filter(Boolean);
+    probs.push({
+      id: "alerts", severity: crit ? "critical" : "warning",
+      title: `${told.length} ${told.length === 1 ? "alert is" : "alerts are"} firing${crit ? `, ${crit} critical` : ""}: ${told.slice(0, 2).map((a) => a.name + on(a)).join("; ")}${told.length > 2 ? ` and ${told.length - 2} more` : ""}`,
+      where: [], since_ms: since.length ? Math.min(...since) : null,
+      impact: told.slice(0, 4).map((a) => `${a.name} (${a.severity})`).join(", ") + (told.length > 4 ? ` and ${told.length - 4} more` : ""),
+      next: told.length === 1 ? { text: "Open the alert", view: "alert/" + encodeURIComponent(told[0].id), params: {} } : { text: "Open Alerts", view: "alerts", params: {} },
+    });
+    probs.sort((a, b) => (a.severity === "critical" ? 0 : 1) - (b.severity === "critical" ? 0 : 1));
+  }
+  return probs;
+}
+/** The status Home shows: the server's, or worse when an alert fires that its last answer did not count. */
+export function homeStatus(f = state.fleet) {
+  const probs = homeProblems(f);
+  const st = f?.status || "ok";
+  if (probs.some((p) => p.severity === "critical")) return "critical";
+  return st === "ok" && probs.length ? "warning" : st;
+}
+
 // ---------------------------------------------------------------- the cluster's identity
 const idOf = () => state.cluster?.cluster || state.whoami?.cluster || state.health?.cluster || null;
 /** The cluster's name ("prod/search"), or null when the server does not say. */
@@ -498,19 +533,58 @@ export function deriveFleet() {
   };
 }
 
+// ---------------------------------------------------------------- how the cluster is run
+// LIV-10: an operator-managed cluster takes its settings from its
+// StrataCluster's spec, not from flags: advice names what to change where
+// it is changed. GET /v1/kube, asked once (a minute at most) by a view
+// that gives advice; "kube" says it changed.
+let kubeAt = 0;
+export function kubeInfo() {
+  if (Date.now() - kubeAt > 60e3) { kubeAt = Date.now(); api("/v1/kube", T).then((k) => { state.kube = k; bus.emit("kube"); }, () => { state.kube = state.kube || { managed: false }; }); }
+  return state.kube || null;
+}
+/** Whether an operator manages this cluster (its spec holds its settings). */
+export const managed = () => !!kubeInfo()?.managed;
+/** The StrataCluster, as people name it: "ns/name". */
+export const specName = () => (state.kube?.managed ? `${state.kube.namespace}/${state.kube.name}` : null);
+/**
+ * How to set something: with the operator, the spec field
+ * ("spec.environment"), else the server's flag ("--environment"). Returns
+ * text: "set spec.environment: production (or staging) in the StrataCluster
+ * ns/name" or "start the server with --environment production (or staging)".
+ */
+export function howToSet({ flag, field, value = "", or = "" }) {
+  const alt = or ? ` (or ${or})` : "";
+  if (managed() && field) return `set ${field}${value ? ": " + value : ""}${alt} in the StrataCluster ${specName()}`;
+  return `start the server with ${flag}${value ? " " + value : ""}${alt}`;
+}
+
+// ---------------------------------------------------------------- proposals waiting
+// The on-call agent's proposals and change requests that wait for an admin:
+// the navigation counts them, whichever view is open.
+let pendingN = 0;
+export const pendingProposals = () => pendingN;
+export function setPendingProposals(n) { pendingN = n || 0; bus.emit("pending"); }
+async function pollPending() {
+  if (!can("admin", "GET /v1/admin/oncall/proposals")) { pendingN = 0; return; }
+  try { setPendingProposals((await api("/v1/admin/oncall/proposals?state=pending", T)).proposals?.length); } catch { /* an older server, or no key */ }
+}
+bus.on("whoami", () => { pendingN = 0; pollPending(); });
+
 // ---------------------------------------------------------------- start
 let stops = [];
 export function start() {
   stops.forEach((f) => f());
   stops = [
     every(2000, pollSeries),
-    every(5000, pollHealth, true, { always: true }),
+    every(5000, pollHealth, true, { always: true, idle: "slow" }),
     every(5000, pollCluster),
     every(5000, pollAlerts),
     every(5000, pollFleet),
     every(30000, refreshSystem),
+    every(20000, pollPending, false),
   ];
-  refreshWho();
+  return refreshWho();
 }
 provide({ rangeParams: () => rangeParams() });
 bus.on("token", () => { state.points = []; seriesLoadedKey = null; start(); });

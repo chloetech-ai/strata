@@ -127,6 +127,17 @@ pub struct Spec {
     /// only, so that every rollout forgets it (LIV-2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coordinator_storage: Option<CoordinatorStorage>,
+    /// Whether a shard's copies must run on different nodes: required of
+    /// the scheduler rather than preferred. A copy then waits, unscheduled,
+    /// for a node that runs none of its shard's other copies, and a
+    /// rollout's extra copy ([`RolloutSpec::extra_copies`]) for one more
+    /// node than the shard has copies. Turning it on or off restarts the
+    /// copies one at a time, as other settings do, each placed by the new
+    /// rule. Off (the default), the spread is preferred, so that a cluster
+    /// of fewer nodes than copies still runs them all, and the cluster's
+    /// objects, settings and version are as before.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_copies_apart: bool,
     /// How changes are made: paused, or held by gates on the cluster's
     /// live numbers.
     pub rollout: RolloutSpec,
@@ -419,6 +430,7 @@ impl Default for Spec {
             args: Vec::new(),
             coordinator_args: Vec::new(),
             coordinator_storage: None,
+            require_copies_apart: false,
             rollout: RolloutSpec::default(),
             autoscale: autoscale::Autoscale::default(),
             upgrade: upgrade::Upgrade::default(),
@@ -436,11 +448,18 @@ impl Spec {
     /// The settings every server starts with, as a short hash: a copy
     /// started with another hash runs older settings, and is restarted.
     pub fn server_config(&self) -> String {
-        short_hash(&self.with_secret_env(json!({
+        let mut j = self.with_secret_env(json!({
             "image": self.image, "imagePullPolicy": self.image_pull_policy, "args": self.args, "resources": self.resources,
             "failoverAfterMs": self.failover_after_ms, "writeAcks": self.write_acks,
             "tokenSecret": self.token_secret, "clusterTokenSecret": self.cluster_token_secret,
-        })))
+        }));
+        // Only when given, so that a cluster without it keeps its hash (and
+        // its copies) across the operator's upgrade. Given, the copies
+        // restart one at a time, each placed by the rule it now requires.
+        if self.require_copies_apart {
+            j["copiesApart"] = json!("required");
+        }
+        short_hash(&j)
     }
 
     /// The settings every coordinator starts with, as a short hash.
@@ -1579,7 +1598,10 @@ async fn roll<P: Platform>(
         if let Some(step) = &restarted {
             if now.saturating_sub(step.since_ms) > deadline * 1000 {
                 let what = match (&no_room, step.name.strip_prefix("add ")) {
-                    (Some(why), _) => format!("{why} for more than {deadline} s: add a node or lower spec.resources, or set rollout.extraCopies false to restart a shard's copies without one (the shard then serves no reads and takes no writes for the seconds each restart takes)"),
+                    (Some(why), _) => format!(
+                        "{why} for more than {deadline} s: add a node{} or lower spec.resources, or set rollout.extraCopies false to restart a shard's copies without one (the shard then serves no reads and takes no writes for the seconds each restart takes)",
+                        if spec.require_copies_apart { " (with requireCopiesApart, one that runs none of the shard's copies)" } else { "" }
+                    ),
                     (None, Some(urls)) => format!("{urls} started with the new settings more than {deadline} s ago, and {} not back and caught up", unsettled.join(", ")),
                     (None, None) => format!("{} restarted with the new settings more than {deadline} s ago, and {} not back and caught up", step.name.trim_start_matches("restart "), unsettled.join(", ")),
                 };
@@ -2193,6 +2215,7 @@ pub fn crd() -> Json {
                 "size": {"type": "string", "description": "Each coordinator's volume (default 2Gi; its log store takes up to 1 GiB, --log-store-mb)."},
                 "storageClassName": {"type": "string"},
             }},
+            "requireCopiesApart": {"type": "boolean", "description": "A shard's copies must run on different nodes (required of the scheduler, not preferred): a copy waits for a node that runs none of its shard's other copies, and a rollout's extra copy for one more node than the shard has copies (or set rollout.extraCopies false). Default false: preferred, so that fewer nodes than copies still run them all."},
             "rollout": {"type": "object", "description": "How changes are made: paused, or held by gates on the cluster's live numbers.", "properties": {
                 "paused": {"type": "boolean", "description": "While true the operator takes no step toward the spec (a copy that lost its data still joins again)."},
                 "gates": {"type": "object", "description": "Limits on live numbers: one over its limit for holdAfterSeconds holds the change until it is resumed.", "properties": {

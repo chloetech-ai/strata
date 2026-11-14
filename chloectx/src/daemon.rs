@@ -392,6 +392,7 @@ impl Daemon {
             "sql" => self.op_sql(req).map(|r| (r, None)),
             "remember" => self.op_remember(req).map(|r| (r, None)),
             "forget" => self.op_forget(req).map(|r| (r, None)),
+            "find" => self.op_find(req).map(|r| (r, None)),
             "receipts_switch" => self.op_receipts_switch(req).map(|r| (r, None)),
             "redact" => self.op_redact(req).map(|r| (r, None)),
             "append" => self.op_append(req).map(|r| (r, None)),
@@ -1870,16 +1871,101 @@ impl Daemon {
                 replaced.as_ref().map(|o| format!(", replacing {o}")).unwrap_or_default(), place.display())}))
     }
 
+    /// `{"op": "forget", "id": ID}`, or `{"op": "forget", "ids": [...]}` for
+    /// several at once: each record is deleted and scrubbed from the
+    /// receipts, and the automatic snapshots are dropped and the store
+    /// compacted once for all of them. Answers `deleted` and `missing`.
     fn op_forget(&self, req: &Json) -> Result<Json> {
-        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let rec = self.store.get(&[id.to_string()])?.pop();
-        let found = self.store.delete(id)?;
-        if !found {
-            return Ok(json!({"text": format!("No record {id}.")}));
+        let ids: Vec<String> = match req.get("ids").and_then(|v| v.as_array()) {
+            Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            None => vec![req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()],
+        };
+        let (mut deleted, mut missing, mut forgotten) = (Vec::new(), Vec::new(), Vec::new());
+        for id in &ids {
+            let rec = self.store.get(&[id.clone()])?.pop();
+            if !self.store.delete(id)? {
+                missing.push(id.clone());
+                continue;
+            }
+            deleted.push(id.clone());
+            forgotten.push(crate::receipt::Forgotten { id: id.clone(), prompt: rec.filter(|r| r.kind == Kind::Prompt).map(|r| r.text) });
         }
-        let forgotten = crate::receipt::Forgotten { id: id.to_string(), prompt: rec.filter(|r| r.kind == Kind::Prompt).map(|r| r.text) };
-        let scrubbed = self.scrub_history(Some(&forgotten));
-        Ok(json!({"text": if scrubbed.is_empty() { format!("Deleted {id}.") } else { format!("Deleted {id}; {scrubbed}.") }}))
+        // The receipts are scrubbed of each record; the automatic snapshots
+        // are dropped and the store compacted once, after the last.
+        let mut scrubbed = Vec::new();
+        if let Some((last, rest)) = forgotten.split_last() {
+            if !rest.is_empty() {
+                self.save_receipts();
+                if let Some(b) = self.receipts.get() {
+                    let mut n = 0;
+                    for f in rest {
+                        match b.scrub(Some(f)) {
+                            Ok(k) => n += k,
+                            Err(e) => scrubbed.push(format!("scrubbing the receipts failed: {e}")),
+                        }
+                    }
+                    if n > 0 {
+                        scrubbed.push(format!("{n} receipt{} scrubbed of the others", if n == 1 { "" } else { "s" }));
+                    }
+                }
+            }
+            scrubbed.push(self.scrub_history(Some(last)));
+        }
+        let scrubbed: Vec<String> = scrubbed.into_iter().filter(|s| !s.is_empty()).collect();
+        let text = match (deleted.as_slice(), missing.as_slice()) {
+            ([], [m]) => format!("No record {m}."),
+            ([], ms) => format!("No records {}.", ms.join(", ")),
+            (ds, ms) => {
+                let mut t = if ds.len() == 1 { format!("Deleted {}", ds[0]) } else { format!("Deleted {} records", ds.len()) };
+                if !scrubbed.is_empty() {
+                    t += &format!("; {}", scrubbed.join("; "));
+                }
+                if !ms.is_empty() {
+                    t += &format!("; no record {}", ms.join(", "));
+                }
+                t + "."
+            }
+        };
+        Ok(json!({"text": text, "deleted": deleted, "missing": missing}))
+    }
+
+    /// `{"op": "find", "text": TEXT}`: the records whose text or context
+    /// holds TEXT (whatever its case), and `{"op": "find", "ids": [...]}`:
+    /// those of the ids that exist; each with a snippet around the match,
+    /// for `chloectx forget --everywhere` to show before it forgets them.
+    fn op_find(&self, req: &Json) -> Result<Json> {
+        let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(1000) as usize;
+        let row = |r: &Record, at: Option<(&str, usize)>| {
+            let (field, snippet) = match at {
+                Some((f, i)) => (f, snippet_at(if f == "ctx" { &r.ctx } else { &r.text }, i, 160)),
+                None => ("text", snippet_at(&r.text, 0, 160)),
+            };
+            json!({"id": r.id, "kind": r.kind.as_str(), "session": r.session, "ts": r.ts, "field": field, "snippet": snippet})
+        };
+        if let Some(ids) = req.get("ids").and_then(|v| v.as_array()) {
+            let ids: Vec<String> = ids.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            let found: Vec<Json> = self.store.get(&ids)?.iter().map(|r| row(r, None)).collect();
+            return Ok(json!({"matches": found, "total": found.len()}));
+        }
+        let needle = req.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+        if needle.chars().count() < 3 {
+            return Err(err("give at least 3 characters to look for"));
+        }
+        let rs = self.store.query(&format!("SELECT id FROM memory LIMIT {}", self.store.len() + 1000))?;
+        let ids: Vec<String> = rs.rows.iter().filter_map(|r| r.first().and_then(|v| v.as_str()).map(String::from)).collect();
+        let (mut out, mut total) = (Vec::new(), 0usize);
+        for chunk in ids.chunks(500) {
+            for r in self.store.get(chunk)? {
+                let hit = find_ci(&r.text, &needle).map(|i| ("text", i)).or_else(|| find_ci(&r.ctx, &needle).map(|i| ("ctx", i)));
+                if let Some(at) = hit {
+                    total += 1;
+                    if out.len() < limit {
+                        out.push(row(&r, Some(at)));
+                    }
+                }
+            }
+        }
+        Ok(json!({"matches": out, "total": total}))
     }
 
     /// `{"op": "redact", "dry_run": bool}`, for a store written before
@@ -2166,6 +2252,42 @@ impl Daemon {
     }
 }
 
+/// The byte offset in `hay` where `needle` (already lowercase) starts,
+/// whatever the case of `hay`.
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    if hay.is_ascii() {
+        return hay.to_ascii_lowercase().find(needle);
+    }
+    // Lowercasing can change a character's length: each lowercase
+    // character keeps the offset of the one it came from.
+    let mut low = String::with_capacity(hay.len());
+    let mut from = Vec::with_capacity(hay.len());
+    for (i, c) in hay.char_indices() {
+        for l in c.to_lowercase() {
+            from.push((low.len(), i));
+            low.push(l);
+        }
+    }
+    let at = low.find(needle)?;
+    from.iter().rev().find(|(lo, _)| *lo <= at).map(|(_, i)| *i)
+}
+
+/// About `width` characters of `text` around byte offset `at`, on one line.
+fn snippet_at(text: &str, at: usize, width: usize) -> String {
+    let at = (0..=at.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+    let before: Vec<char> = text[..at].chars().rev().take(width / 3).collect();
+    let start = at - before.iter().map(|c| c.len_utf8()).sum::<usize>();
+    let body: String = text[start..].chars().take(width).collect();
+    let mut s = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if start > 0 {
+        s = format!("…{s}");
+    }
+    if start + body.len() < text.len() {
+        s.push('…');
+    }
+    s
+}
+
 /// One hybrid search of `store`, as `memory_search` shows it: the first
 /// `limit` hits with a snippet each, their ids, and the search's evidence.
 /// The stored note that replaces `old`: one of `stored` that links to it
@@ -2414,11 +2536,46 @@ pub fn request_running(dir: &Path, req: &Json, timeout: Duration) -> Result<Json
 /// merges the whole table. The pages the old segments were on are free but
 /// keep their bytes until a later write reuses them; `chloectx redact`
 /// rewrites the whole file for that.
+///
+/// The store's background merger is woken by the flush and may claim the
+/// segment that held the record; a merge here leaves the segments another
+/// one holds alone, and until that merge is installed the old segment,
+/// record and all, is the one a checkpoint copies. So this returns only
+/// once no merge is running and none is left to do: a merge claimed after
+/// the delete rebuilds the segment from its live rows, without the record.
 pub fn compact_deleted(db: &chloedb::db::Db) -> Result<chloedb::storage::MergeStats> {
-    db.storage().flush()?;
+    let wait = Duration::from_secs(60);
+    let s = db.storage();
+    s.flush()?;
     let policy = chloedb::storage::MergePolicy { merge_factor: 1 << 40, max_deleted_ratio: 0.0, ..Default::default() };
-    let stats = db.storage().merge(&policy)?;
-    db.storage().vacuum()?;
+    let deadline = Instant::now() + wait;
+    let idle = || -> Result<()> {
+        while s.merge_status().running > 0 {
+            if Instant::now() >= deadline {
+                return Err(err(format!("a background merge still holds the store's segments after {} s", wait.as_secs())));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    };
+    let mut stats = chloedb::storage::MergeStats::default();
+    loop {
+        idle()?;
+        let m = s.merge(&policy)?;
+        let done = m.merges == 0;
+        stats.merges += m.merges;
+        stats.segments_in += m.segments_in;
+        stats.docs_merged += m.docs_merged;
+        stats.docs_dropped += m.docs_dropped;
+        stats.bytes_written += m.bytes_written;
+        stats.seconds += m.seconds;
+        // Nothing left to merge, and no merge started meanwhile on a
+        // segment this one then skipped.
+        if done && s.merge_status().running == 0 {
+            break;
+        }
+    }
+    s.vacuum()?;
     Ok(stats)
 }
 

@@ -12,6 +12,7 @@
 #   ctx      chloectx, ChloeCtx: long-term memory for Claude Code (then
 #            `chloectx install --project DIR`; see docs/chloectx/setup.md)
 #   all      the three
+#   netops   chloedb-netops, the network operations app (releases after 0.3.2; not in all)
 #
 # It downloads the newest chloedb-server release for this machine from
 # GitHub (Linux x86_64 and aarch64 with glibc 2.35 or later, macOS arm64 and
@@ -61,7 +62,8 @@ Install ChloeDB's server, prebuilt (no Rust, no C compiler), into ~/.local/bin:
 Options:
   --with LIST   programs of the same release to install beside the server:
                 crawl (chloedb-crawl), sheets (chloedb-sheets),
-                ctx (chloectx, memory for Claude Code), or all
+                ctx (chloectx, memory for Claude Code), or all (the three);
+                netops (chloedb-netops, network operations) by name
   -h, --help    this text
 
 Settings (after the pipe: curl ... | CHLOEDB_VERSION=0.3.3 sh):
@@ -91,8 +93,9 @@ for w in $(printf '%s' "$WITH" | tr ',' ' '); do
     crawl | chloedb-crawl) EXTRA="$EXTRA chloedb-crawl" ;;
     sheets | chloedb-sheets) EXTRA="$EXTRA chloedb-sheets" ;;
     ctx | chloectx) EXTRA="$EXTRA chloectx" ;;
+    netops | chloedb-netops) EXTRA="$EXTRA chloedb-netops" ;;
     all) EXTRA="$EXTRA chloedb-crawl chloedb-sheets chloectx" ;;
-    *) fail "--with $w: the programs are crawl, sheets, ctx (or all)" ;;
+    *) fail "--with $w: the programs are crawl, sheets, ctx (or all), and netops" ;;
   esac
 done
 
@@ -190,7 +193,7 @@ install_program() {
   url="$RELEASES_URL/chloedb-server-v$VERSION/$name.tar.gz"
   say "Installing $prog $VERSION for $platform"
   say "  from $url"
-  fetch "$url" "$tmp/$name.tar.gz" || fail "could not download $url (is $VERSION a released version, and does it have $prog? see https://github.com/$REPO/releases)"
+  fetch "$url" "$tmp/$name.tar.gz" || fail "could not download $url (is $VERSION a released version, and does it have $prog? Releases have chloedb-crawl, chloedb-sheets and chloectx from 0.3.2, chloedb-netops in releases after 0.3.2; see https://github.com/$REPO/releases, or build it from source: https://github.com/$REPO#quick-start)"
   fetch "$url.sha256" "$tmp/$name.tar.gz.sha256" || fail "could not download $url.sha256"
   want=$(cut -d' ' -f1 < "$tmp/$name.tar.gz.sha256")
   got=$(sha256 "$tmp/$name.tar.gz")

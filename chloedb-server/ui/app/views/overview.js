@@ -9,17 +9,12 @@ import { can, h, icon, clear, fmt, card, every, api, empty, bus, seg, store, tip
 import { tables as catalogTables } from "../catalog.js";
 import { isMine } from "../owners.js";
 import { timeChart, sparkline, SERIES } from "../charts.js";
-import { state, visible, domain, setZoom, isCoordinator, timeRange, fresh, staleText, firingNow, clusterName, environment, rangeParams, rangeSince, isPast, shardState } from "../data.js";
+import { state, visible, domain, setZoom, isCoordinator, timeRange, fresh, staleText, firingNow, clusterName, environment, rangeParams, rangeSince, isPast, shardState, homeProblems, homeStatus, kubeInfo, managed, specName, howToSet } from "../data.js";
 
-export default { id: "home", title: "Home", icon: "overview", group: "Operate", keywords: "overview home fleet health status incident banner problems slo where capacity coordinators affected dashboard morning check", render, badge };
+export default { id: "home", title: "Home", icon: "overview", group: "Operate", keywords: "overview home fleet health status incident banner problems slo where capacity coordinators affected dashboard morning check", render };
+// Its count in the navigation is the shell's (main.js), from homeProblems() as here.
 
-/** Problems on Home, for the navigation. */
-function badge() {
-  const f = state.fleet; if (!f) return null;
-  const n = (f.problems || []).length;
-  return n ? { n, tone: f.status === "critical" ? "crit" : "warn", title: `${fmt.plural(n, "problem")}, worst first on Home` } : null;
-}
-
+const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
 const SLO_ERR = 0.01, SLO_P99 = 250;
 const check = (id) => (state.fleet?.checks || []).find((c) => c.id === id) || null;
 const sloErr = () => check("error_ratio")?.slo ?? SLO_ERR;
@@ -136,8 +131,16 @@ function render(page, r0) {
   // Home shows its tables instead (rows, disk, reads and writes), from
   // /v1/index/tables, read every 30 s.
   const one = () => !isCoordinator() && !(state.cluster?.shards || []).some((x) => (x.replicas || []).length > 1) && (state.cluster?.shards || []).length <= 1;
-  let tix = null;
-  const loadTix = () => one() ? api("/v1/index/tables", { timeout: 5000 }).then((j) => { tix = j.tables || []; drawWhere(); drawKpis(); }).catch(() => {}) : null;
+  let tixRaw = null;
+  const loadTix = () => one() ? api("/v1/index/tables", { timeout: 5000 }).then((j) => { tixRaw = j.tables || []; drawWhere(); drawKpis(); }).catch(() => {}) : null;
+  // ONB-11: the sizes are kept a while by the server; a table its health
+  // counts that they do not list yet (made since) shows with its rows.
+  const tixNow = () => {
+    if (!tixRaw) return null;
+    const have = new Set(tixRaw.map((x) => x.table));
+    const more = Object.entries(state.health?.tables || {}).filter(([t]) => !have.has(t) && !t.startsWith("_")).map(([t, n]) => ({ table: t, docs: n, bytes: null }));
+    return more.length ? [...tixRaw, ...more] : tixRaw;
+  };
   const probBody = h("div", { class: "stack home-probs" });
   const probTitle = h("h3", {}, "Problems");
   const probSub = h("span", { class: "sub" });
@@ -236,15 +239,17 @@ function render(page, r0) {
     }
     if (!f) { banner.className = "banner home-banner"; clear(banner, h("div", { class: "bic" }, h("span", { class: "spin" })), h("div", { class: "grow" }, h("div", { class: "big" }, "Checking the fleet…"))); return; }
     const tones = cardTones();
-    let kind = f.status === "critical" ? "bad" : f.status === "warning" ? "warn" : "ok";
+    // LIV-9: the banner, the Problems card and the bell read one list: an alert firing now is a problem here.
+    const status = homeStatus(f);
+    let kind = status === "critical" ? "bad" : status === "warning" ? "warn" : "ok";
     if (tones.includes("bad")) kind = "bad"; else if (kind === "ok" && tones.includes("warn")) kind = "warn";
     if (!answering) kind = "unknown";
     banner.className = "banner home-banner " + kind;
-    const probs = f.problems || [];
+    const probs = homeProblems(f);
     const top = probs[0];
-    let headline = f.headline || (top ? top.title : "Every check is within its limit");
+    let headline = (probs.length === (f.problems || []).length ? f.headline : null) || (top ? top.title : "Every check is within its limit");
     // The fleet said ok, a card says otherwise: say what the card says.
-    if (f.status === "ok" && kind !== "ok" && kind !== "unknown") headline = kpiDefs().filter((d) => d.tone === kind).map((d) => d.why).filter(Boolean)[0] || "A headline number is over its limit";
+    if (status === "ok" && kind !== "ok" && kind !== "unknown") headline = kpiDefs().filter((d) => d.tone === kind).map((d) => d.why).filter(Boolean)[0] || "A headline number is over its limit";
     if (!answering) headline = "Not known: the server does not answer";
     // The headline problem's own since and first signal (NEW-shell-monitor-1); how long the
     // fleet has not been all right is said apart, when it began earlier.
@@ -261,7 +266,7 @@ function render(page, r0) {
       sub.push([m.shards.length ? `${m.shards.filter((s) => s.st === "ok").length} of ${m.shards.length} shards serve reads and writes` : null, m.total ? `${m.up} of ${m.total} copies answer` : null,
         check("error_ratio")?.value != null ? `error ratio ${pctTxt(check("error_ratio").value)} (SLO ${pctTxt(sloErr())})` : null,
         p99Shown() != null ? `p99 ${fmt.ms(p99Shown())}${check("p99")?.recent?.value_ms != null ? " last minute" : ""} (SLO ${fmt.ms(sloP99())})` : null,
-        firingNow().length ? null : "nothing firing", `checked ${when(f.at_ms)}`].filter(Boolean).join(" · "));
+        firingNow().length ? fmt.plural(firingNow().length, "info alert") + " firing" : "nothing firing", `checked ${when(f.at_ms)}`].filter(Boolean).join(" · "));
     } else {
       if (rec) sub.push(`failed ${when(rec.from_ms)}–${when(rec.to_ms)}; answering again since ${when(rec.to_ms)} (${durTxt(rec.to_ms)})`);
       else if (since) sub.push(`since ${when(since)} (${durTxt(since)})`);
@@ -335,14 +340,17 @@ function render(page, r0) {
     out.push({ key: "copies", label: "Copies answering", icon: "db", val: tot ? [String(upN), h("small", {}, "/" + tot)] : ["–"], tone: cp ? tone(cp.status) : upN < tot ? "warn" : "", sub: downNames.length ? `${downNames.slice(0, 3).join(", ")}${downNames.length > 3 ? ` +${downNames.length - 3}` : ""} down` : tot ? "every copy answers" : "no copies listed", why: downNames.length ? `${fmt.plural(downNames.length, "copy", "copies")} do not answer` : null, link: link("cluster") });
     const lagV = lg?.max_txn ?? null;
     out.push({ key: "lag", label: "Replication lag, max", icon: "layers", val: lagV == null ? ["–"] : [fmt.si(lagV), h("small", {}, "txn")], tone: lg ? tone(lg.status) : "", sub: lagV == null ? "no replica reports one" : lagV === 0 ? "every replica in step" : `${lg.where || ""}${lg.max_s != null ? ` · reads up to ${fmt.dur(lg.max_s)} old` : ""}`, why: lagV ? `${lg.where} is ${fmt.si(lagV)} transactions behind` : null, link: link("cluster", { lens: "lag" }) });
+    const tix = tixNow();
     if (one() && tix) {
       // One server: copies and replicas say nothing; its rows and writes do.
-      const rows = tix.reduce((a, x) => a + (x.docs || 0), 0), bytes = tix.reduce((a, x) => a + (x.bytes || 0), 0);
+      // Rows of your own tables; the apps' (ChloeCtx, Sheets beside it) are said apart (ONB-11).
+      const mine = tix.filter((x) => isMine(x.table)), apps = tix.length - mine.length;
+      const rows = (mine.length ? mine : tix).reduce((a, x) => a + (x.docs || 0), 0), bytes = tix.reduce((a, x) => a + (x.bytes || 0), 0);
       const wr = tix.reduce((a, x) => a + (x.writes_per_min || 0), 0), rd = tix.reduce((a, x) => a + (x.reads_per_min || 0), 0);
       const lastW = Math.max(0, ...tix.map((x) => x.last_write_ms || 0));
       const i = out.findIndex((d) => d.key === "copies");
       out.splice(i, 2,
-        { key: "rows", label: "Rows", icon: "table", val: [fmt.si(rows)], sub: `${fmt.plural(tix.length, "table")} · ${fmt.bytes(bytes)} on disk`, link: "#/table" },
+        { key: "rows", label: "Rows", icon: "table", val: [fmt.si(rows)], sub: `${fmt.plural(mine.length, mine.length && apps ? "table of yours" : "table", mine.length && apps ? "tables of yours" : "tables")}${apps ? `, ${apps} of apps` : ""} · ${fmt.bytes(bytes)} on disk`, link: "#/table" },
         { key: "rw", label: "Reads and writes", icon: "db", val: [fmt.si(rd), h("small", {}, "/min")], sub: `${fmt.si(wr)} writes/min${lastW ? ` · last write ${fmt.ago(lastW)}` : ""}`, link: "#/table" });
     }
     const dkV = dk?.max ?? null;
@@ -365,6 +373,7 @@ function render(page, r0) {
   function drawTables() {
     whereTitle.textContent = "Tables";
     whereTools.style.display = "none";
+    const tix = tixNow();
     if (!tix) { clear(whereBody, empty("table", "Reading the tables…")); whereSub.textContent = ""; return; }
     const list = tix.slice().sort((a, b) => (b.reads_per_min || 0) - (a.reads_per_min || 0) || (b.docs || 0) - (a.docs || 0));
     const mine = list.filter((x) => isMine(x.table));
@@ -378,7 +387,7 @@ function render(page, r0) {
       h("div", { class: "row small", style: { marginTop: "8px" } }, h("a", { href: "#/table" }, "Every table", icon("right")), h("span", { class: "sep" }), h("span", { class: "muted" }, "One server: its health is the numbers above."))] : empty("table", "No tables yet", "Import a file to make one.", h("a", { class: "btn", href: "#/start" }, icon("rocket"), "Start here")));
   }
   function drawWhere() {
-    if (one()) { if (!tix) loadTix(); return drawTables(); }
+    if (one()) { if (!tixRaw) loadTix(); return drawTables(); }
     whereTitle.textContent = "Where";
     whereTools.style.display = "";
     const m = lastModel = model();
@@ -468,7 +477,7 @@ function render(page, r0) {
     const f = state.fleet;
     probCard.classList.toggle("stale", !fresh("fleet").ok && !fresh("fleet").loading);
     if (!f) { clear(probBody, h("div", { class: "muted small" }, "Checking…")); return; }
-    const probs = f.problems || [];
+    const probs = homeProblems(f);
     const restore = probs[0]?.severity === "critical" && /majority|dark|does not answer|no reads/i.test(probs[0].title);
     probTitle.textContent = restore ? "What would restore service" : "Problems";
     probSub.textContent = probs.length ? `${probs.length}, worst first · where, since when, next step${isPast() ? " · now, not the window shown" : ""}` : "";
@@ -481,10 +490,12 @@ function render(page, r0) {
         p99Shown() != null ? `p99 ${fmt.ms(p99Shown())}${check("p99")?.recent?.value_ms != null ? " last minute" : ""} (SLO ${fmt.ms(sloP99())})` : null,
         check("lag") ? `replication lag at most ${fmt.si(check("lag").max_txn || 0)} transactions` : null,
         check("disk")?.max != null ? `fullest disk ${fmt.pct(check("disk").max, 0)}` : null,
-        `${firingNow().length ? fmt.plural(firingNow().length, "alert") + " firing" : "no alert firing"}`,
-      ].filter(Boolean);
+      ].filter(Boolean).map((t) => [icon("check"), t]);
+      // What fires here is info only (a warning or worse is a problem above): told, not checked off.
+      const info = firingNow();
+      okRows.push(info.length ? [icon("info"), h("a", { href: link("alerts") }, `${fmt.plural(info.length, "info alert")} firing`), " (it tells, it is no problem)"] : [icon("check"), "no alert firing"]);
       clear(probBody, h("div", { class: "row nw", style: { gap: "10px" } }, h("span", { style: { color: "var(--good)" } }, icon("okc", "lg")), h("b", {}, "No problems")),
-        h("ul", { class: "home-oklist" }, okRows.map((t) => h("li", {}, icon("check"), t))),
+        h("ul", { class: "home-oklist" }, okRows.map((t) => h("li", {}, t))),
         h("div", { class: "small muted" }, `As of ${when(f.at_ms)}. What changed recently is on the `, h("a", { href: link("timeline") }, "Timeline"), "."));
       return;
     }
@@ -680,6 +691,7 @@ function render(page, r0) {
   }
   function drawReady() {
     const w = state.whoami, a = state.alerts, env = environment();
+    kubeInfo();
     const rules = (a?.rules || []).filter((r) => r.enabled !== false);
     // CCW-13: a rule shipped with the server has its runbook compiled in
     // (runbook_docs); `webhook` is true when there are routes, not one more.
@@ -688,11 +700,11 @@ function render(page, r0) {
     const shards = state.cluster?.shards || [];
     const single = !isCoordinator();
     const items = [
-      { ok: env != null, title: env != null ? `Environment named: ${env}` : "No environment named", fix: "Start the server with --environment production (or staging): the command center then asks before writes and drops.", href: "#/system" },
-      { ok: w ? !w.auth?.open : null, title: w?.auth?.open ? "Open: anyone who reaches it can read and change everything" : "Closed: every call needs a key", fix: "Start it with --token, then give each person, app and agent its own key, limited to its tables.", href: "#/access?tab=keys" },
+      { ok: env != null, title: env != null ? `Environment named: ${env}` : "No environment named", fix: `${cap(howToSet({ flag: "--environment", field: "spec.environment", value: "production", or: "staging" }))}: the command center then asks before writes and drops.`, href: "#/system" },
+      { ok: w ? !w.auth?.open : null, title: w?.auth?.open ? "Open: anyone who reaches it can read and change everything" : "Closed: every call needs a key", fix: `${managed() ? `Set spec.tokenSecret in the StrataCluster ${specName()}` : "Start it with --token"}, then give each person, app and agent its own key, limited to its tables.`, href: "#/access?tab=keys" },
       { ok: routes > 0, title: routes ? `Alerts go somewhere: ${fmt.plural(routes, "route")}` : "Alerts go nowhere: no route (Slack, PagerDuty, a webhook)", fix: "Add a route in Alerts, so that a firing alert reaches a person.", href: "#/alerts?routes=1" },
       { ok: rules.length ? told === rules.length : null, title: rules.length ? `${told} of ${rules.length} alert rules say who owns them and what to do` : "No alert rules", fix: "Give each rule an owner and a runbook URL: the person paged knows it is theirs and where to start.", href: "#/alerts" },
-      { ok: auditKnown ? !!auditFile : null, title: !auditKnown ? "Audit log: needs an admin key to tell" : auditFile ? `Audit log kept on disk (${auditFile})` : "Audit log kept in memory only: a restart loses who changed what", fix: "Start the server with --audit-log FILE (the operator: spec.coordinatorStorage, a volume for each coordinator's audit log, events and alerts).", href: "#/access" },
+      { ok: auditKnown ? !!auditFile : null, title: !auditKnown ? "Audit log: needs an admin key to tell" : auditFile ? `Audit log kept on disk (${auditFile})` : "Audit log kept in memory only: a restart loses who changed what", fix: managed() ? `Give each coordinator a volume: spec.coordinatorStorage in the StrataCluster ${specName()} keeps its audit log, events and alerts on it.` : "Start the server with --audit-log FILE.", href: "#/access" },
       single ? { ok: null, title: "One server: its disk holds the only copy of the data", fix: "Run a cluster with two or more copies a shard (or back the file up) before the data matters.", href: "#/cluster" }
         : { ok: shards.length ? shards.every((sh) => (sh.replicas || []).length >= 2) : null, title: shards.every((sh) => (sh.replicas || []).length >= 2) ? "Every shard has two copies or more" : (() => { const n = shards.filter((sh) => (sh.replicas || []).length < 2).length; return `${fmt.plural(n, "shard")} ${n === 1 ? "has" : "have"} one copy`; })(), fix: "Add a replica to each shard: a lost disk then loses nothing.", href: "#/cluster" },
     ];
@@ -722,12 +734,14 @@ function render(page, r0) {
   function drawCluster() { drawHead(); drawWhere(); drawCapacity(); drawKpis(); drawBanner(); }
   drawFleet(); drawCluster(); drawCharts(); drawEvents(); drawWho(); drawReady(); drawStart();
   const offs = [
-    bus.on("alerts", drawReady), bus.on("whoami", () => { drawReady(); loadAudit(); }), bus.on("cluster", drawReady), every(60000, loadAudit),
-    bus.on("fleet", drawFleet), bus.on("cluster", drawCluster), bus.on("alerts", drawBanner),
+    bus.on("alerts", drawReady), bus.on("kube", drawReady), bus.on("whoami", () => { drawReady(); loadAudit(); }), bus.on("cluster", drawReady), every(60000, loadAudit),
+    bus.on("fleet", drawFleet), bus.on("cluster", drawCluster), bus.on("alerts", () => { drawBanner(); drawProblems(); }),
     bus.on("points", () => { drawCharts(); drawKpis(); }), bus.on("range", () => { drawCharts(); drawHead(); loadEvents(); loadStats(); }),
     bus.on("fresh", () => { drawHead(); drawKpis(); drawWhere(); drawProblems(); chartsCard.classList.toggle("stale", !fresh("series").ok && !fresh("series").loading); }),
     bus.on("answering", () => { drawBanner(); drawHead(); }), bus.on("theme", drawCharts), bus.on("narrow", () => { drawWhere(); drawCharts(); }),
     every(15000, loadEvents), every(30000, loadStats), every(30000, loadTix),
+    // A table the health counts and the sizes do not list yet (ONB-11): drawn when the health says it.
+    bus.on("health", () => { const k = Object.keys(state.health?.tables || {}).join(); if (one() && tixRaw && k !== drawWhere.tables) { drawWhere.tables = k; drawWhere(); drawKpis(); } }),
   ];
   return () => offs.forEach((f) => f());
 }

@@ -95,16 +95,17 @@ fn folds() -> &'static Folds {
             }
             f.later.extend(lower);
         }
-        // A capital sigma that ends a word is lowercased to the final
-        // sigma, which no character's own lowercase is.
-        f.sources.entry('ς').or_default().push('Σ');
+        // ILIKE folds a final sigma as the other sigma
+        // ([`crate::query::ir::eval::fold_case`]): a pattern's `σ` is a
+        // value's `ς` too.
+        f.sources.entry('σ').or_default().push('ς');
         f
     })
 }
 
 impl Like {
     pub fn new(pattern: &str, ci: bool) -> Like {
-        let folded = if ci { pattern.to_lowercase() } else { pattern.to_string() };
+        let folded = if ci { crate::query::ir::eval::fold_case(pattern) } else { pattern.to_string() };
         let chars: Vec<char> = folded.chars().collect();
         let mut toks: Vec<Tok> = Vec::new();
         for &c in &chars {
@@ -138,7 +139,7 @@ impl Like {
         let lower;
         let (value, shape) = match self.ci {
             true => {
-                lower = if value.is_ascii() { value.to_ascii_lowercase() } else { value.to_lowercase() };
+                lower = if value.is_ascii() { value.to_ascii_lowercase() } else { crate::query::ir::eval::fold_case(value) };
                 (lower.as_str(), &self.folded)
             }
             false => (value, &self.simple),

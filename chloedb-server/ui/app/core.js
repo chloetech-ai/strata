@@ -287,7 +287,19 @@ function noServerViews(path) {
   return `${routeOf(path)} is one of the server's views: it needs an admin key (or an ops or propose key), and "${w.name || "this key"}" has ${w.scope}`;
 }
 
-export async function api(path, opts = {}) {
+export function api(path, opts = {}) {
+  // LIV-14: cards that ask the same thing at once share one request; each
+  // gets its own copy of the answer.
+  if (opts.method || opts.body !== undefined || opts.blob || opts.signal || opts.reason) return answer(path, opts);
+  const key = `${opts.hub ? "hub " : ""}${opts.text ? "text " : ""}${token || ""} ${path}`;
+  const was = inflight.get(key);
+  if (was) return was.then((j) => (j && typeof j === "object" ? structuredClone(j) : j));
+  const p = answer(path, opts).finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+const inflight = new Map();
+async function answer(path, opts) {
   try { return await request(path, opts); }
   catch (e) {
     // An agent's key says why it changes the server (the audit log keeps
@@ -918,22 +930,54 @@ export function dropzone({ label, sub, accept, multiple = true, onFiles }) {
   return z;
 }
 
+// ---------------------------------------------------------------- attention
+/**
+ * LIV-14: whether anybody is at the page. A tab nobody touched (no pointer,
+ * key, wheel or scroll) for IDLE_MS polls IDLE_SLOW times less often; a
+ * touch, a key or the tab shown again asks at once what is due, and polls at
+ * the full rate again. A hidden tab polls nothing.
+ */
+export const IDLE_MS = 30e3, IDLE_SLOW = 5;
+let lastInput = Date.now(), dozing = false;
+const wakers = new Set();
+/** True once nobody touched the page for IDLE_MS. */
+export function isIdle() {
+  if (!dozing && Date.now() - lastInput > IDLE_MS) { dozing = true; bus.emit("idle", true); }
+  return dozing;
+}
+function wake(shown) {
+  lastInput = Date.now();
+  if (!dozing && !shown) return;
+  if (dozing) { dozing = false; bus.emit("idle", false); }
+  for (const f of [...wakers]) f();
+}
+for (const ev of ["pointerdown", "pointermove", "keydown", "wheel", "scroll", "touchstart"]) document.addEventListener(ev, () => wake(false), { capture: true, passive: true });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(true); });
+
 /**
  * Repeats `f` every `ms` while the page is visible; returns a stopper. While
  * the command center is paused (`isPaused()`), ticks after the first are
  * skipped, so a view does not redraw; `{always: true}` keeps polling (for a
- * change under way the person is waiting on).
+ * change under way the person is waiting on), at the full rate even while
+ * nobody is at the page unless `{idle: "slow"}`. Other polls run
+ * IDLE_SLOW times less often then (isIdle()), and at once when someone is
+ * back and they are due.
  */
 export function every(ms, f, now = true, opts = {}) {
-  let stopped = false, timer = null, running = false, first = true;
+  let stopped = false, timer = null, running = false, first = true, ran = 0;
+  const slows = !opts.always || opts.idle === "slow";
   const tick = async () => {
     if (stopped) return;
+    const resting = slows && isIdle() && Date.now() - ran < ms * IDLE_SLOW - ms / 2;
     // Paused, or without a valid key, a poll runs once (a view learns why it is empty) and then waits.
-    if (!document.hidden && !running && (first || opts.always || (!ctx.paused && !signInNeeded()))) { first = false; running = true; try { await f(); } catch (e) { console.warn(e); } running = false; }
+    if (!document.hidden && !running && !resting && (first || opts.always || (!ctx.paused && !signInNeeded()))) { first = false; running = true; ran = Date.now(); try { await f(); } catch (e) { console.warn(e); } running = false; }
     if (!stopped) timer = setTimeout(tick, ms);
   };
+  // Someone is back (or the tab shown again): what is due is asked now.
+  const waker = () => { if (stopped || running || first || Date.now() - ran < ms) return; clearTimeout(timer); tick(); };
+  wakers.add(waker);
   if (now) tick(); else timer = setTimeout(tick, ms);
-  return () => { stopped = true; clearTimeout(timer); };
+  return () => { stopped = true; clearTimeout(timer); wakers.delete(waker); };
 }
 
 /** What an error says, for a view that could not load. */

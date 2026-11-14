@@ -9,12 +9,14 @@ name: Docs URLs
 # page that pins a version before its release exists: GitHub Pages
 # publishes main's docs/ at once.
 #
-# It runs on a push to main that changes the docs, after each release
-# workflow and the image's, every night (a failed scheduled run opens an
-# issue, nightly-report.yml), by hand, and on a pull request that changes
-# the check. It is not part of `CI result`: the version's pull request
-# moves the docs' pins before the release that publishes them, and a
-# release's own runs are what make this pass.
+# It runs on a push to main that changes the docs, after a release is
+# published (release-publish.yml, which runs the same check on the drafts
+# before it publishes them) and after the image's release runs, every night
+# (a failed scheduled run opens an issue, nightly-report.yml), by hand, and
+# on a pull request that changes the check. It is not part of `CI result`:
+# the version's pull request moves the docs' pins before the release that
+# publishes them, and a release's own runs are what make this pass. It sees
+# what everybody sees: a draft release is missing here.
 on:
   schedule:
     - cron: "47 5 * * *"
@@ -32,7 +34,7 @@ on:
       - scripts/check-doc-urls.py
       - .github/workflows/docs-urls.yml
   workflow_run:
-    workflows: [chloedb-server release, chloedb-py release, chloedb-js release, Image]
+    workflows: [Release publish, Image]
     types: [completed]
   workflow_dispatch:
 
@@ -46,10 +48,12 @@ concurrency:
 jobs:
   check:
     name: what the docs install exists
-    # After a release workflow: only a tag's run published anything.
+    # After a publish that passed, or the image's run for a tag: those
+    # published something.
     if: >-
       github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
+      (github.event.workflow_run.conclusion == 'success' &&
+        (github.event.workflow_run.name == 'Release publish' || github.event.workflow_run.event == 'push'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

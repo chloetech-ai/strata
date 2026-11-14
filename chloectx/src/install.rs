@@ -461,7 +461,7 @@ pub fn project_has_hooks(project: &Path) -> bool {
     })
 }
 
-/// Whether the user settings install ChloeCtx's (user-level) hooks.
+/// Whether the user settings hold the hooks of `chloectx install --user`.
 pub fn user_has_hooks() -> bool {
     let settings = read_json(&crate::paths::user_settings());
     let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else { return false };

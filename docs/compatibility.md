@@ -62,6 +62,11 @@ definition carries the option `needs_chloedb_0_3_3`, which 0.3.2 refuses
 by name ("no option needs_chloedb_0_3_3"): a refresh by 0.3.2 fails with
 that message rather than leaving the rollup's newest buckets stale. Open a
 database whose rollups 0.3.3 made with 0.3.3 or later.
+A rollup made by 0.3.4 or later that counts a field's values (`COUNT(f)`,
+or `AVG(f)`, which keeps `count_f` so that its mean skips NULLs) has a
+column 0.3.3 does not write; its definition carries `needs_chloedb_0_3_4`,
+which 0.3.3 refuses by name in the same way. 0.3.4 refreshes a rollup made
+before with `AVG(f)` as it was made, without `count_f`.
 
 **Databases from before field ids.** A database written before field ids
 (format 1, 2, or 3 without `field_ids`) no longer opens for use. `upgrade()`

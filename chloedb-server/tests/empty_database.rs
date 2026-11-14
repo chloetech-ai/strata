@@ -66,6 +66,9 @@ fn listed(j: &Json) -> Vec<String> {
 async fn starts_empty_then_serves_its_first_table(url: &str) {
     let (s, j) = call(url, "GET", "/v1/tables", None).await;
     assert_eq!((s, listed(&j)), (200, Vec::<String>::new()), "{j}");
+    // ONB-11: the sizes of every table, kept 30 s, list none yet...
+    let (s, j) = call(url, "GET", "/v1/index/tables", None).await;
+    assert_eq!((s, listed(&j)), (200, Vec::<String>::new()), "{j}");
     let (s, j) = call(url, "POST", "/v1/write", Some(json!({"ops": [{"op": "upsert", "doc": {"id": "x"}}]}))).await;
     assert_eq!(s, 400, "{j}");
     assert!(j["error"].as_str().unwrap().contains("no tables yet"), "{j}");
@@ -84,6 +87,9 @@ async fn starts_empty_then_serves_its_first_table(url: &str) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(names, ["snapshots"]);
+    // ...and a table made since is listed at once, not after 30 s.
+    let (s, j) = call(url, "GET", "/v1/index/tables", None).await;
+    assert_eq!((s, listed(&j)), (200, vec!["snapshots".to_string()]), "{j}");
     let (s, j) = call(url, "GET", "/v1/schema", None).await;
     assert_eq!((s, j["table"].as_str()), (200, Some("snapshots")), "{j}");
 

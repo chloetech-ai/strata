@@ -500,6 +500,10 @@
                     "minimum": 1,
                     "type": "integer"
                   },
+                  "requireCopiesApart": {
+                    "description": "A shard's copies must run on different nodes (required of the scheduler, not preferred): a copy waits for a node that runs none of its shard's other copies, and a rollout's extra copy for one more node than the shard has copies (or set rollout.extraCopies false). Default false: preferred, so that fewer nodes than copies still run them all.",
+                    "type": "boolean"
+                  },
                   "resources": {
                     "description": "Resources of each server's container.",
                     "type": "object",

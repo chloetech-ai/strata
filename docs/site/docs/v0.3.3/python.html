@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChloeDB from Python · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="The chloedb package runs a ChloeDB database inside a Python process, the way sqlite3 runs SQLite, or talks to a running chloedb-server. Both have the same methods, so a script written against a local file works…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/python.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html" aria-current="page">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Clients</span>
+      <h1>ChloeDB from Python</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/python.md">docs/chloedb/python.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#install">Install</a></li><li><a href="#a-database-in-your-process">A database in your process</a></li><li><a href="#writing">Writing</a></li><li><a href="#querying">Querying</a></li><li><a href="#queries-built-in-python">Queries built in Python</a></li><li><a href="#the-rank-log">The rank log</a></li><li><a href="#semantic-id-codebooks">Semantic-ID codebooks</a></li><li><a href="#next-items">Next items</a></li><li><a href="#sequence-models">Sequence models</a></li><li><a href="#a-server-from-python">A server from Python</a></li><li><a href="#search-on-the-device">Search on the device</a></li></ol></details>
+    <div class="doc-body">
+
+<p>The <code>chloedb</code> package runs a ChloeDB database inside a Python process, the way <code>sqlite3</code> runs SQLite, or talks to a running <a href="server.html">chloedb-server</a>. Both have the same methods, so a script written against a local file works against a server.</p>
+<p>LangChain, LangGraph and LlamaIndex take ChloeDB as a vector store, a checkpointer and a memory store, and <code>chloedb.dbapi</code> is a DB-API 2.0 driver: see <a href="frameworks-reference.html">frameworks</a>.</p>
+<p>For dataframe work, <code>db["table"]</code> is a lazy frame written as Polars writes one, run where the data is, with the answer as Arrow: see <a href="frames.html">DataFrames</a>.</p>
+<h2 id="install">Install<a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
+<p>The package is in <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb-py"><code>chloedb-py/</code></a>: a Rust extension built with <a href="https://www.maturin.rs">maturin</a>, for CPython 3.10 and later.</p>
+<h3 id="prebuilt">Prebuilt<a class="anchor" href="#prebuilt" aria-label="Link to this section">#</a></h3>
+<p>Each <code>chloedb-py-v&lt;version&gt;</code> release on <a href="https://github.com/chloetech-ai/chloedb/releases">GitHub</a> has a wheel per platform, for Python 3.10 and later, that installs with no Rust and no compiler. The same wheels are on <a href="https://pypi.org/project/chloedb/">PyPI</a>, so pip picks the one for your machine:</p>
+<pre data-lang="sh">pip install chloedb</pre>
+<p>If <code>import chloedb</code> raises an <code>ImportError</code> that calls it a placeholder, pip installed <code>chloedb</code> 0.0.x, which only held the name before 0.3.0 was published: <code>pip install --upgrade chloedb</code> replaces it. pip also falls back to it when no release has a wheel for your machine (an older glibc, say): <code>chloedb-server doctor</code> says which you have.</p>
+<p>The old name, <code>import strata</code>, still works for a release, with a <code>DeprecationWarning</code>; release 0.1.0 was published as <code>strata-db</code> and imports as <code>strata</code> only.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>platform</th>
+<th>wheel</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>macOS 11+ on Apple silicon</td>
+<td><code>chloedb-&lt;version&gt;-cp310-abi3-macosx_11_0_arm64.whl</code></td>
+</tr>
+<tr>
+<td>macOS 11+ on Intel</td>
+<td><code>chloedb-&lt;version&gt;-cp310-abi3-macosx_11_0_x86_64.whl</code></td>
+</tr>
+<tr>
+<td>Linux x86-64, glibc 2.28+ (RHEL 8, Amazon Linux 2023, Debian 10, Ubuntu 20.04 and later)</td>
+<td><code>chloedb-&lt;version&gt;-cp310-abi3-manylinux_2_28_x86_64.whl</code></td>
+</tr>
+<tr>
+<td>Linux aarch64, glibc 2.28+</td>
+<td><code>chloedb-&lt;version&gt;-cp310-abi3-manylinux_2_28_aarch64.whl</code></td>
+</tr>
+<tr>
+<td>Linux x86-64 and aarch64, glibc 2.35+ (Ubuntu 22.04, Debian 12 and later), release 0.2.0</td>
+<td><code>chloedb-0.2.0-cp310-abi3-manylinux_2_35_x86_64.whl</code>, <code>..._aarch64.whl</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The workflow <a href="https://github.com/chloetech-ai/chloedb/blob/main/.github/workflows/py-release.yml"><code>py-release.yml</code></a> builds them on a tag <code>chloedb-py-v&lt;version&gt;</code> (or <code>strata-py-v&lt;version&gt;</code>; the version in <code>chloedb-py/pyproject.toml</code>), installs each one into an empty virtualenv and runs the embedded tests against it, then attaches them to the release. The Linux wheels are built in the manylinux_2_28 container (AlmaLinux 8). The same tag publishes them to PyPI, from 0.3.0 on; <code>pip install chloedb -f https://github.com/chloetech-ai/chloedb/releases/expanded_assets/chloedb-py-v&lt;version&gt;</code> installs a release from GitHub instead. Windows and Alpine (musl) have no wheel: build from source there (Windows through WSL 2).</p>
+<h3 id="only-the-client-with-no-build">Only the client, with no build<a class="anchor" href="#only-the-client-with-no-build" aria-label="Link to this section">#</a></h3>
+<p><a href="#a-server-from-python"><code>chloedb.connect</code></a>, the client of a running chloedb-server, needs only Python's standard library. Without the extension, from a checkout of the repository, put <code>chloedb-py/python</code> on the path and import it:</p>
+<pre data-lang="sh">PYTHONPATH=chloedb-py/python python3 -c &#x27;import chloedb; print(chloedb.connect(&quot;http://127.0.0.1:7700&quot;).health())&#x27;</pre>
+<p>The package imports without the extension, and <code>chloedb.Client</code>, <code>chloedb.connect</code>, <code>chloedb.ChloeDBError</code>, <code>Result</code> and the query builder work. A database in the process (<code>chloedb.open</code>, <code>chloedb.Database</code>, <code>from_sqlite</code>, the codebook training) raises <code>ImportError</code> saying what to install.</p>
+<h3 id="from-source">From source<a class="anchor" href="#from-source" aria-label="Link to this section">#</a></h3>
+<p>It needs Rust (stable) and a C compiler; the build takes about 12 minutes on 4 cores.</p>
+<pre data-lang="sh">pip install ./chloedb-py                    # from the repository&#x27;s root: builds and installs a wheel</pre>
+<p>or, while working on it:</p>
+<pre data-lang="sh">cd chloedb-py
+python3 -m venv .venv &amp;&amp; . .venv/bin/activate
+pip install maturin pytest
+maturin develop --release                  # builds the extension into the virtualenv
+pytest tests                               # the client tests also need chloedb-server built</pre>
+<p>The package includes <a href="sql.html#subqueries-with-and-joins">DataFusion</a>, which runs joins, groups and sorts over many joined rows (<code>--no-default-features</code> leaves it out). Model2Vec embedding models need nothing more. For the BERT models, build with <code>--features bert</code> (<code>--features accelerate</code> on a Mac): <code>maturin develop --release --features bert</code>, or <code>MATURIN_PEP517_ARGS="--features bert" pip install ./chloedb-py</code>. The extension runs on any CPU of its architecture: ChloeDB picks its SIMD kernels (AVX2, AVX-512, the aarch64 dot product instructions) at run time. <code>RUSTFLAGS="-C target-cpu=native"</code> builds one for the building machine only.</p>
+<h2 id="a-database-in-your-process">A database in your process<a class="anchor" href="#a-database-in-your-process" aria-label="Link to this section">#</a></h2>
+<pre data-lang="python">import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, schema={
+    &quot;table&quot;: &quot;books&quot;,
+    &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;title&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;description&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;genres&quot;, &quot;type&quot;: &quot;keyword&quot;, &quot;multi&quot;: True},
+        {&quot;name&quot;: &quot;year&quot;, &quot;type&quot;: &quot;int&quot;},
+        {&quot;name&quot;: &quot;embedding&quot;, &quot;type&quot;: &quot;vector&quot;,
+         &quot;embed&quot;: {&quot;from&quot;: [&quot;title&quot;, &quot;description&quot;], &quot;model&quot;: &quot;potion-retrieval-32M&quot;}},
+    ],
+})
+
+db.insert([
+    {&quot;id&quot;: &quot;b1&quot;, &quot;title&quot;: &quot;The river and the dragon&quot;, &quot;description&quot;: &quot;A fantasy of rivers.&quot;, &quot;genres&quot;: [&quot;fantasy&quot;], &quot;year&quot;: 1999},
+    {&quot;id&quot;: &quot;b2&quot;, &quot;title&quot;: &quot;Winter garden&quot;, &quot;description&quot;: &quot;A quiet mystery.&quot;, &quot;genres&quot;: [&quot;mystery&quot;], &quot;year&quot;: 2005},
+])
+
+for row in db.search(&quot;dragon&quot;, limit=5):
+    print(row[&quot;id&quot;], row[&quot;title&quot;])
+
+db.query(&quot;SELECT year, COUNT(*) FROM books WHERE genres = :g GROUP BY year&quot;, g=&quot;fantasy&quot;).rows
+db.close()</pre>
+<p><code>chloedb.open(path, schema)</code> opens the database at <code>path</code>, or creates it with <code>schema</code> if it does not exist. The schema is a dict, JSON text or the path of a JSON file, in the <a href="server.html#schemas">form the server takes</a>. <code>Database.create(path, schema)</code> and <code>Database.open(path)</code> do one or the other. <code>models=</code> says where embedding and <a href="sql.html#ranking-models-gbdtmodel-features">ranking</a> models, and the captioners of <a href="server.html#text-from-media">text made from media</a>, are (default <code>$CHLOEDB_MODELS</code>, else <code>~/.local/share/chloedb/models</code> (or <code>~/.local/share/strata/models</code>, on a machine that has that folder from before the rename; before 0.3.2, always); <code>chloedb-server fetch-model NAME</code> downloads one there), and <code>directory=True</code> creates the database as a directory of segment files.</p>
+<p>A database written by a version of ChloeDB from before <a href="design.html#wal-memtable-and-snapshots">field ids</a> does not open: <code>chloedb.upgrade(path)</code> copies it into this version's format in its place, keeps the old one as <code>&lt;path&gt;.before-field-ids</code>, and returns <code>(old_path, tables, rows)</code>, or <code>None</code> when the database needs no upgrade. Nothing may have it open meanwhile.</p>
+<p>One process at a time can have a database open to write it. Others can open it with <code>chloedb.open(path, read_only=True)</code> (or <code>Database.open(path, read_only=True)</code>) to read it while it is written, the other workers of a web server under gunicorn or uwsgi, say: each query sees the writer's commits so far, every write raises <code>ChloeDBError</code>, and <code>refresh()</code> looks for new commits at once (<a href="design.html#readers-in-other-processes">how readers follow the writer</a>). Within a process, threads can query at once: every call releases the GIL while it runs. Threads can write at once too: a write waits while another holds the writer, and the writes that wait share the next commit (one disk flush for all of them), so none fails as busy. For writes from several processes, serve the database with <code>chloedb-server</code> and use the client below. Segments are merged in the background as writes add them, one merge at a time, as a server merges them, so a table written to for weeks stays in a few segments without the rows its updates replaced. A <code>with</code> block, or <code>close()</code>, writes the rows still in memory into the file (so that the file alone holds the database, <a href="#backing-up-and-damaged-files">backups</a>), merges the small segments that writes left, gives the file system back the space merges freed when it is an eighth of the file or more, and closes the file. <code>optimize()</code> goes further, for a table that is done changing: one segment, up to 2,000,000 rows.</p>
+<h3 id="backing-up-and-damaged-files">Backing up, and damaged files<a class="anchor" href="#backing-up-and-damaged-files" aria-label="Link to this section">#</a></h3>
+<p>A database is its file plus <code>&lt;path&gt;-wal</code>, the write-ahead log, which holds the rows written since the last flush; copying the file alone while the database is open loses them. To back up a database:</p>
+<ul>
+<li>while it is open and in use: <code>db.checkpoint("backup.chloedb")</code> writes a consistent copy (the destination must not exist), checks every segment against its checksum first, so that a damaged database fails the checkpoint instead of being copied, checks the copy, and only then gives it its name. Restore by opening the copy, or renaming it into place while nothing has the database open;</li>
+<li>after <code>close()</code> (or a <code>with</code> block): <code>close()</code> writes the rows still in memory into the file and leaves the log empty, so the file alone is then a complete copy; <code>db.flush()</code> does the same at any moment, until the next write.</li>
+</ul>
+<p>Copying a database's files while it is written is not a backup, even with its <code>-wal</code>.</p>
+<p>When the newest version of a database or its log is damaged so that opening it would lose acknowledged writes (bit rot, a copy cut short, a log deleted while it held transactions), <code>chloedb.open</code> raises <code>ChloeDBError</code> naming the file, what is damaged and how to recover, and changes nothing: restore a backup, or open with <code>recover=True</code> to accept the loss. That keeps copies of the damaged files first (<code>&lt;path&gt;.damaged-&lt;time&gt;</code>, <code>&lt;path&gt;-wal.damaged</code>), opens what is left, issues a <code>RuntimeWarning</code>, and <code>db.damaged</code> says what was lost (it is <code>None</code> for a database that opened whole).</p>
+<h2 id="writing">Writing<a class="anchor" href="#writing" aria-label="Link to this section">#</a></h2>
+<p>Rows are dicts of field name to value: <code>str</code>, <code>int</code>, <code>float</code>, <code>None</code>, <code>bool</code> for a <code>bool</code> field, a <code>datetime</code> or <code>date</code> (or ISO 8601 text) for a <code>timestamp</code> field, a list for a <code>multi</code> field, a list of floats or a numpy array for a vector, a dict of term weights for a <code>sparse</code> field, a URI or a dict for a <code>media</code> field (in-process, the whole value or <code>{"uri": …, "data": &lt;base64&gt;}</code>: nothing is fetched, see <a href="server.html#media-fields">media fields</a>). A naive <code>datetime</code> is taken as UTC. A field the schema does not have is an error. Results give a <code>bool</code> field's values as <code>bool</code> and a <code>timestamp</code> field's as ISO 8601 text in UTC (<code>"2026-10-01T12:30:00Z"</code>), in-process and from the client alike; <code>datetime.fromisoformat</code> reads them.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>method</th>
+<th>what it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>insert(rows)</code></td>
+<td>adds a row (a dict) or rows (any iterable of dicts) whose keys must be new; all or none are written. Fewer than 10,000 rows go through the write-ahead log into memory, which gathers the rows of many inserts into one segment once it holds 10,000; from 10,000 rows on, they are bulk-loaded straight into segments. A vector may be a numpy array of float32 or float64, which is read from its bytes rather than a Python float at a time.</td>
+</tr>
+<tr>
+<td><code>upsert(rows)</code></td>
+<td>adds rows, replacing the rows with their keys, in transactions of 10,000</td>
+</tr>
+<tr>
+<td><code>delete(keys)</code></td>
+<td>deletes the rows with a key or keys; returns how many there were</td>
+</tr>
+<tr>
+<td><code>get(key)</code>, <code>get_many(keys)</code></td>
+<td>the row with a primary key (a dict of the columns <code>SELECT *</code> gives), or <code>None</code>, read without SQL (<a href="server.html#rows-by-key">rows by key</a>); <code>get_many</code> answers a list in the keys' order. Each takes <code>table=</code></td>
+</tr>
+<tr>
+<td><code>expire()</code></td>
+<td>deletes the rows whose <a href="sql.html#tables"><code>expire_by</code></a> time has passed, which reads leave out already; returns how many</td>
+</tr>
+<tr>
+<td><code>sql("UPDATE ...")</code></td>
+<td><code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> statements; returns the rows written. It also runs <code>CREATE TABLE</code>, <code>ALTER TABLE</code> and <code>DROP TABLE</code> (<a href="sql.html#tables">tables</a>) and <code>CREATE</code> and <code>DROP RANK PROFILE</code> (<a href="sql.html#rank-profiles-a-ranking-kept-with-its-table">rank profiles</a>), which return 0, and writes any table</td>
+</tr>
+<tr>
+<td><code>add_column(name, type, **options)</code>, <code>drop_column(name)</code>, <code>rename_column(old, new)</code></td>
+<td>change a table's columns while it holds rows, as <a href="sql.html#changing-a-tables-columns"><code>ALTER TABLE</code></a> does: <code>options</code> are the field's, in the short form of a schema (<code>db.add_column("price", "float", default=0.0)</code>, <code>db.add_column("emb", "vector", embed=["title"], model="potion-retrieval-32M")</code>); rows written before a column was added read its default, or <code>None</code>. Each takes <code>table=</code>. In-process only: through the client, send <code>ALTER TABLE</code> with <code>sql</code></td>
+</tr>
+<tr>
+<td><code>import_file(path, format=None)</code></td>
+<td>loads a JSON Lines, JSON, CSV or TSV file (<a href="server.html#loading-rows">how files are read</a>); returns <code>{rows, bulk, skipped_fields}</code></td>
+</tr>
+<tr>
+<td><code>write(ops)</code></td>
+<td>applies write operations in one transaction, as the server's <code>/v1/write</code> takes them: <code>insert</code>, <code>upsert</code> and <code>delete</code>, <code>set</code> of a field (<code>{"op": "set", "key": k, "field": "status", "value": "SOLD"}</code>: a number in place, another by writing the row again with the value), and <code>add</code> to a number in place (<code>{"op": "add", "key": k, "field": "n", "value": 1}</code>; with a <code>doc</code> instead of a <code>key</code>, an <code>add</code> inserts the row when no row has its key); each names its <code>table</code> or writes the first; returns the rows written</td>
+</tr>
+<tr>
+<td><code>import_sqlite(path, tables=None, schemas=None)</code></td>
+<td>imports a SQLite database's tables, each into the table of its name, created when missing (<a href="sqlite.html">SQLite in and out</a>); returns what it did and what did not carry over</td>
+</tr>
+<tr>
+<td><code>export_sqlite(path, tables=None, fts=True, indexes=True)</code></td>
+<td>writes the tables to a new SQLite file, with indexes, an FTS5 index over the text and the ChloeDB schemas</td>
+</tr>
+<tr>
+<td><code>import_parquet(path, table=None, schema=None, key=None)</code></td>
+<td>imports a Parquet file or a directory of them (Spark's part files, Hive partitions) into one table, created from the columns when missing (<a href="parquet.html">Parquet and S3</a>); returns what it did</td>
+</tr>
+<tr>
+<td><code>export_parquet(path, tables=None)</code></td>
+<td>writes the tables to Parquet: a <code>.parquet</code> file for one table, else a directory of them, each keeping its ChloeDB schema</td>
+</tr>
+<tr>
+<td><code>import_arrow(data, table=None)</code></td>
+<td>writes the rows of a pyarrow Table or RecordBatchReader, a polars DataFrame, a DuckDB relation or anything with <code>__arrow_c_stream__</code>, columns into the fields of their names; bulk-loaded into an empty table, else upserted</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>chloedb.from_sqlite("shop.sqlite", "shop.chloedb")</code> creates a database from a SQLite file's tables, and <code>chloedb.plan_sqlite("shop.sqlite")</code> says what it would make of them without writing; edit the plan and pass it to either as <code>schemas</code>. <code>chloedb.from_parquet("events.parquet", "lake.chloedb")</code> and <code>chloedb.plan_parquet(...)</code> do the same for Parquet. Any of these paths, and <code>import_file</code>'s, may be an <code>s3://</code> URL, read with the <code>AWS_*</code> variables (<a href="parquet.html#s3-and-s3-compatible-stores">S3</a>).</p>
+<p><code>insert</code>, <code>upsert</code>, <code>delete</code> and <code>import_file</code> write the database's first table, the one <code>schema</code> describes, or the one <code>table=</code> names (<code>db.insert(rows, table="events")</code>); <code>sql</code> names the table it writes, and <code>tables()</code> lists every table's schema. Through a coordinator, <code>delete</code> on a table placed by a column takes that column's value as <code>routing=</code> (<a href="server.html#tables-on-shards">tables on shards</a>). A key a row leaves out gets its field's <code>default</code>, and a field with <code>not_null</code> refuses a row without a value (<a href="server.html#schemas">schema options</a>); a <code>timestamp</code> defaulting to <code>"now"</code> takes one time for all the rows of a call.</p>
+<p>Vectors of embedded fields that a row leaves out are computed by the field's model when it is open, here or behind an API: a field naming <code>openai/text-embedding-3-small</code>, <code>cohere/embed-v4.0</code>, <code>voyage/voyage-3.5</code>, <code>gemini/gemini-embedding-001</code>, <code>ollama/nomic-embed-text</code> or another <a href="server.html#hosted-models">hosted model</a> gets its vectors from the provider, with the key in the process's environment (<code>OPENAI_API_KEY</code>, ...), so inserting plain text is enough. A write whose vectors the provider will not give (after its retries) raises <code>ChloeDBError</code> and writes nothing. <code>db.embed_errors</code> lists the embedded fields whose model did not open (a hosted model without its key says which variable to set), whose vectors rows must then bring: a write that leaves one to a model ChloeDB could run but has not open fails, and says so, unless <code>db.set_embed_later()</code> lets it store the row without its vector, to be filled in once the model opens (a server does it itself; from Rust, <code>Db::embed_backfill</code>) (before, such a row was stored without a vector, and no error said so; a server still does that, and fills them in itself). A table records the fingerprint of its model's weights (the SHA-256 of its weights file) when it is created with the model in its models directory, and a model of the same name with other weights does not open for it: it is listed in <code>db.embed_errors</code>, with what to do. It also lists the <a href="#semantic-id-codebooks">semantic-ID fields</a> whose codebook did not open.</p>
+<h2 id="querying">Querying<a class="anchor" href="#querying" aria-label="Link to this section">#</a></h2>
+<p><code>query(sql, params)</code> runs a <code>SELECT</code> in <a href="sql.html">ChloeDB's SQL</a>. Parameters bind <code>:name</code> placeholders, from a dict, keyword arguments, or both:</p>
+<pre data-lang="python">db.query(&quot;SELECT id, title FROM books WHERE year &gt;= :y ORDER BY bm25(title, :q) DESC LIMIT 10&quot;, {&quot;y&quot;: 2000}, q=&quot;dragon&quot;)
+db.query(&quot;SELECT id FROM books ORDER BY similarity(embedding, :v) DESC LIMIT 10&quot;, v={&quot;embed&quot;: &quot;a quiet mystery&quot;})
+db.query(&quot;SELECT id FROM books ORDER BY similarity(embedding, :v) DESC LIMIT 10&quot;, v={&quot;vector_of&quot;: &quot;b1&quot;})</pre>
+<p>A parameter is a number, a string, <code>None</code>, a list of numbers or a numpy array (a vector), a list, a dict of term weights, <code>{"embed": text}</code> (the text's vector by an embedded field's model; add <code>"field"</code> to pick one) or <code>{"vector_of": key}</code> (a stored row's vector). Either reads the table the statement's <code>FROM</code> names <span class="since">since 0.3.2</span>, unless it names another with <code>"table"</code> (before 0.3.2, the first table).</p>
+<p>The answer is a <code>Result</code>:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>for row in result</code>, <code>result[i]</code></td>
+<td>rows as dicts of column to value</td>
+</tr>
+<tr>
+<td><code>result.rows</code>, <code>result.columns</code></td>
+<td>rows as lists, in column order</td>
+</tr>
+<tr>
+<td><code>result.keys</code>, <code>result.scores</code></td>
+<td>each row's primary key and the score it was ranked by</td>
+</tr>
+<tr>
+<td><code>result.column("title")</code>, <code>result.scalar()</code></td>
+<td>one column; the first value (a count, a sum)</td>
+</tr>
+<tr>
+<td><code>result.stats</code></td>
+<td>what the engine did</td>
+</tr>
+<tr>
+<td><code>result.to_pandas()</code></td>
+<td>a DataFrame (with pandas installed)</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>query_arrow(sql, params)</code> runs a <code>SELECT</code> as <code>query</code> does and answers with its columns as Arrow arrays, an <code>ArrowResult</code>, without making a Python object of each value; a query of one table that neither groups nor counts reads its columns from the database's segments straight into the arrays. pyarrow, polars, pandas and DuckDB read the arrays where the database wrote them, without copying them, through the <a href="https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html">Arrow PyCapsule interface</a>:</p>
+<pre data-lang="python">r = db.query_arrow(&quot;SELECT id, year, rating FROM books WHERE year &gt;= :y&quot;, y=1950)
+r.to_pyarrow()            # a pyarrow Table
+r.to_polars()             # a polars DataFrame (without pyarrow)
+r.to_pandas()             # a pandas DataFrame of the Arrow columns (pandas.ArrowDtype); arrow_dtypes=False copies them into numpy
+pyarrow.table(r)          # any library that reads Arrow streams reads r
+duckdb.sql(&quot;SELECT avg(rating) FROM r&quot;)</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>ChloeDB</th>
+<th>Arrow</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int</code></td>
+<td><code>int64</code></td>
+</tr>
+<tr>
+<td><code>float</code></td>
+<td><code>float64</code></td>
+</tr>
+<tr>
+<td><code>keyword</code>, <code>text</code>, <code>json</code></td>
+<td><code>string</code> (a JSON value as its text)</td>
+</tr>
+<tr>
+<td><code>bool</code></td>
+<td><code>bool</code></td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td><code>timestamp[us, tz=UTC]</code></td>
+</tr>
+<tr>
+<td><code>vector</code></td>
+<td><code>list&lt;float32&gt;</code></td>
+</tr>
+<tr>
+<td>a <code>multi</code> field</td>
+<td><code>list&lt;int64&gt;</code> or <code>list&lt;string&gt;</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>A computed column has the type of its values: a column of only NULLs (or of no rows) is <code>null</code>, and one of integers and floats <code>float64</code>. Values of other types mixed in one column (a <code>CASE</code> that answers a number in some rows and text in others) are not one Arrow array: <code>query_arrow</code> raises <code>ChloeDBError</code> naming the column, and <code>query</code> answers it. <code>r.columns</code>, <code>len(r)</code> and <code>r.stats</code> are as a <code>Result</code>'s. <code>query_arrow</code> comes with the package's default feature <code>datafusion</code>. A <code>Client</code>'s <code>query_arrow</code> asks the server for an Arrow answer (<code>"format": "arrow"</code>) and returns a pyarrow Table with the same column types; it needs pyarrow, and a server too old for Arrow answers JSON, which it types from the values.</p>
+<p><code>search(text, table=None, limit=10, where=None, columns="*", mode="auto")</code> writes the query for the common case, on the first table or on <code>table</code> <span class="since">since 0.3.2</span> (which reads that table alone: a client with a key limited to other tables than the first can search its own). It ranks by BM25 over the text fields (the generated ones if the table has any, such as a combined <code>body</code>, else every indexed text field) fused by reciprocal rank with the similarity of the first embedded vector field whose model is open; <code>mode="text"</code> or <code>"vector"</code> uses one side only. <code>where</code> adds a condition, <a href="#queries-built-in-python">built in Python</a> or in SQL with <code>params</code> for its placeholders:</p>
+<pre data-lang="python">db.search(&quot;dragon&quot;, where=col(&quot;year&quot;) &gt;= 1990, columns=[&quot;id&quot;, &quot;title&quot;])
+db.search(&quot;dragon&quot;, where=&quot;year &gt;= :y&quot;, params={&quot;y&quot;: 1990})</pre>
+<p><code>embed(text, field=None)</code> returns the query vector of a text (<code>embed(image=data, field="emb")</code> of an image file's bytes, by a <a href="server.html#vectors-of-images">model of images</a>, with the package built with <code>--features vision</code>, and <code>embed(audio=data)</code> of a sound file's, by a <a href="server.html#vectors-of-sound">model of sound</a>, built with <code>--features audio</code>), <code>embed_tokens(text, field)</code> the vectors of a query's tokens by the ColBERT model of a <a href="server.html#a-vector-a-token">multi-vector field</a>, as <code>maxsim</code> takes them (<code>{"embed": text, "field": "tok"}</code> as a parameter gives the same), and <code>len(db)</code> the number of rows.</p>
+<p><code>plan(sql, params)</code> returns a statement's <a href="sql.html#explain">plan</a> as a dict without running it, and <code>run(plan)</code> runs a plan: a read's <code>Result</code>, or the number of rows a write wrote.</p>
+<pre data-lang="python">p = db.plan(&quot;SELECT id FROM books WHERE year &gt;= :y LIMIT 3&quot;, y=2000)
+db.run(p)</pre>
+<h3 id="limits-memory-deadlines-interrupting">Limits: memory, deadlines, interrupting<a class="anchor" href="#limits-memory-deadlines-interrupting" aria-label="Link to this section">#</a></h3>
+<p>A query runs in your process, so what it builds up (its groups, the rows it orders and returns, a percentile's values, a join's tables) is held by your program. The queries of every database a process opens share a memory budget, by default a quarter of the machine's memory (the cgroup's limit in a container, else RAM), or <code>CHLOEDB_QUERY_MEMORY_MB</code> MiB when that is set when the first database opens (<code>0</code>: no budget). A query that would hold more stops and raises <code>ChloeDBError</code> with code <code>memory</code>, naming the budget and how to raise it, and gives back what it held; the program and its other queries go on. <code>SELECT * FROM big</code> on a table larger than the budget, a <code>GROUP BY</code> over a column with a value per row or a percentile over every row fail this way rather than taking the machine's memory. The counts are estimates of what a query grows, not of every allocation, and the index a query reads is mapped from the file and not counted.</p>
+<p>A query has no deadline unless it is given one. <code>timeout_ms</code> (to <code>query</code>, <code>query_arrow</code>, <code>scroll</code>, <code>sql</code>, <code>search</code> and <code>run</code>, as a <code>Client</code>'s query takes it) stops it once it has run that long: it raises <code>DeadlineError</code>, naming the <code>timeout_ms</code>. <code>memory=</code> gives a query a budget of its own, in bytes (<code>memory=0</code>: none). A database's own limits, for every query that does not give its own, are set when it opens or later:</p>
+<pre data-lang="python">db = chloedb.open(&quot;books.chloedb&quot;, timeout_ms=5_000, memory=512 &lt;&lt; 20)  # 5 s, and 512 MiB its queries share
+db.query(&quot;SELECT genres, COUNT(*) FROM books GROUP BY genres&quot;, timeout_ms=200)
+db.query(&quot;SELECT * FROM books&quot;, memory=0)                               # this one counts nothing
+db.set_limits(timeout_ms=None, memory=None)                             # back to the defaults
+db.timeout_ms, db.memory                                                # the limits now (None: none)</pre>
+<p><code>db.interrupt()</code>, from any thread, stops the queries of the database running now, as <code>sqlite3.Connection.interrupt</code> does: each raises <code>DeadlineError</code> within a few thousand rows, and queries that start after it run. Calls release the GIL while they run, so another thread (a watchdog, a web server's request that was cancelled) can call it:</p>
+<pre data-lang="python">threading.Timer(2.0, db.interrupt).start()
+try:
+    db.query(&quot;SELECT a.id, b.id FROM books a JOIN books b ON a.year = b.year&quot;)
+except chloedb.DeadlineError:
+    ...</pre>
+<p>A query checks its deadline and <code>interrupt</code> between segments and every 1,024 rows it groups, orders, walks or joins. A write is not cut short: <code>sql</code>'s limits apply to a <code>SELECT</code>. Ctrl-C reaches Python only when a call returns, so a notebook stops a runaway query with <code>timeout_ms</code> or <code>interrupt()</code> from another thread.</p>
+<h2 id="queries-built-in-python">Queries built in Python<a class="anchor" href="#queries-built-in-python" aria-label="Link to this section">#</a></h2>
+<p><code>table()</code> starts a query of the table built from Python values instead of SQL text, so nothing is quoted or escaped: fields are named as the schema names them (<code>col("order")</code>, <code>col("doc no")</code>), and values keep their types (a <code>str</code> is text whatever quotes it holds, a <code>date</code> or <code>datetime</code> a timestamp, UTC unless it says otherwise). Each method returns a new query; iterating one, or <code>run()</code>, runs it and gives its <code>Result</code>:</p>
+<pre data-lang="python">from chloedb import col, match, bm25, similarity, rrf, count, score
+
+q = (db.table()
+     .select(&quot;id&quot;, &quot;title&quot;, score())
+     .where((col(&quot;year&quot;) &gt;= 2019) &amp; match(&quot;body&quot;, &quot;graph neural&quot;) &amp; ~col(&quot;tags&quot;).isin([&quot;draft&quot;]))
+     .order_by(bm25(&quot;body&quot;, &quot;graph neural&quot;))
+     .limit(10))
+for row in q:
+    print(row[&quot;id&quot;], row[&quot;score()&quot;])
+
+db.table().select(&quot;genre&quot;, count().alias(&quot;n&quot;), col(&quot;rating&quot;).avg().alias(&quot;avg&quot;)).group_by(&quot;genre&quot;).having(count() &gt; 10).order_by(col(&quot;genre&quot;))
+db.table().order_by(rrf(bm25(&quot;title&quot;, text), similarity(&quot;emb&quot;, db.embed(text)))).limit(10)
+# each video&#x27;s best clip, the 10 best videos
+db.table().select(&quot;video&quot;, &quot;id&quot;, score()).distinct_on(&quot;video&quot;).order_by(bm25(&quot;transcript&quot;, text)).limit(10)</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>col(name)</code>, <code>lit(value)</code></td>
+<td>a field; a value where an expression is wanted</td>
+</tr>
+<tr>
+<td><code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td>
+<td>comparisons with a value or another expression</td>
+</tr>
+<tr>
+<td><code>&amp;</code>, <code>\|</code>, <code>~</code></td>
+<td>and, or, not (Python's <code>and</code>, <code>or</code>, <code>not</code> and chained comparisons such as <code>1 &lt; col("x") &lt; 5</code> raise <code>TypeError</code>)</td>
+</tr>
+<tr>
+<td><code>.isin(values)</code>, <code>.between(lo, hi)</code>, <code>.is_null()</code>, <code>.is_not_null()</code></td>
+<td>as SQL's <code>IN</code>, <code>BETWEEN</code> (a bound of <code>None</code> is open), <code>IS NULL</code></td>
+</tr>
+<tr>
+<td><code>match(field, query, min=None, min_rows=None, max_rows=None)</code></td>
+<td>the full-text condition, in <a href="sql.html#full-text-match">MATCH's syntax</a>; <code>min=2</code> or <code>min="75%"</code> asks for that many of its items, and with <code>max_rows</code> (or <code>min_rows</code>) for <a href="sql.html#as-many-as-fit-min_rows-and-max_rows">as many as fit</a></td>
+</tr>
+<tr>
+<td><code>at_least(n, *conds, min_rows=None, max_rows=None)</code>, <code>count_true(*conds)</code></td>
+<td>at least <code>n</code> of the conditions hold (<code>n</code> a count, or a percentage such as <code>"75%"</code>), as SQL's <a href="sql.html#some-of-the-conditions-at_least"><code>AT_LEAST</code></a>, or with <code>max_rows</code> (or <code>min_rows</code>) <a href="sql.html#as-many-as-fit-min_rows-and-max_rows">as many as fit</a>; how many hold, a number to rank by</td>
+</tr>
+<tr>
+<td><code>bm25(field, text, syntax=None, min=None, min_rows=None, max_rows=None)</code>, <code>similarity(field, vector)</code>, <code>rrf(*scores, k=60, depth=100)</code>, <code>ranked(keys)</code></td>
+<td>scores; <code>bm25</code> reads <a href="sql.html#weights-required-and-excluded-words">weights, required and excluded words</a> (<code>"+mrna vaccine^2 -animal"</code>) unless <code>syntax="plain"</code>, and in <code>order_by</code> with <code>max_rows</code> ranks the rows with <a href="sql.html#as-many-as-fit-min_rows-and-max_rows">as many of its words as fit</a>; <code>similarity</code> takes a vector (<code>embed(text)</code> gives a text's), or <code>{term: weight}</code> for a SPARSE field; <code>ranked</code> is a <a href="sql.html#rankedkeys-a-ranking-from-elsewhere">ranking from elsewhere</a>, primary keys best first</td>
+</tr>
+<tr>
+<td><code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>%</code>, <code>**</code>, <code>abs()</code>, <code>round()</code>, <code>ln</code>, <code>log</code>, <code>exp</code>, <code>sqrt</code>, <code>sigmoid</code>, <code>clamp</code>, <code>least</code>, <code>greatest</code>, <code>coalesce</code>, <code>tmm(x, lo=None, hi=None)</code>, <code>minmax</code>, <code>zscore</code>, <code>rank</code>, <code>case((cond, value), ..., otherwise=None)</code></td>
+<td>a <a href="sql.html#ranking-expressions">ranking expression</a> of scores, fields and numbers: <code>bm25("body", q) * (1 + 0.2 * coalesce(col("rating"), 0))</code>. <code>+</code> adds raw values; <code>0.3 * tmm(bm25(...)) + 0.7 * tmm(similarity(...))</code> is weighted fusion</td>
+</tr>
+<tr>
+<td><code>gbdt(model, *features)</code></td>
+<td>a <a href="sql.html#ranking-models-gbdtmodel-features">ranking model</a>'s score of a row from its features: <code>gbdt("docs_ltr", bm25("body", q), col("rating"))</code>, the LightGBM or XGBoost model <code>&lt;models&gt;/docs_ltr/gbdt.json</code></td>
+</tr>
+<tr>
+<td><code>reachable(field, seeds, hops=1, ...)</code>, <code>path(field, seeds, to, ...)</code>, <code>ppr(field, seeds, ...)</code></td>
+<td><a href="graphs.html">graph</a> conditions and PageRank as a score, with the SQL functions' options as keyword arguments</td>
+</tr>
+<tr>
+<td><code>score()</code>, <code>hops()</code></td>
+<td>the score a row was ranked by; its hops from a traversal's seeds</td>
+</tr>
+<tr>
+<td><code>features()</code></td>
+<td>in <code>select</code>, a column for each input of the ranking (<a href="sql.html#features-the-values-a-ranking-read">features</a>), named as Python writes it; any expression of scores that scores a row by itself is a column too</td>
+</tr>
+<tr>
+<td><code>count()</code>, <code>col(f).count(distinct=True)</code>, <code>.sum()</code>, <code>.avg()</code>, <code>.min()</code>, <code>.max()</code></td>
+<td>aggregates, for <code>select</code>, <code>having</code> and <code>order_by</code> over groups</td>
+</tr>
+<tr>
+<td><code>.alias(name)</code>, <code>.asc()</code>, <code>.desc(nulls_first=False)</code></td>
+<td>a column's name; an <code>order_by</code> direction</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>select(...)</code> names the columns (without it, the stored fields but vectors, as <code>SELECT *</code>), <code>where(...)</code> keeps rows, <code>order_by(...)</code> ranks by a score best first or orders by fields ascending, <code>rerank(expr, count)</code> ranks its top <code>count</code> rows again (<a href="sql.html#rerank-phases">rerank phases</a>), <code>group_by(...)</code> and <code>having(...)</code> group, <code>distinct_on(...)</code> keeps the <a href="sql.html#the-first-row-of-each-group-distinct-on">first row of each group</a> in the query's order, <code>max_per(k, field)</code> keeps <a href="sql.html#at-most-k-rows-of-a-value-max-k-per">at most k rows of each value</a>, and <code>limit(n)</code> and <code>offset(n)</code> page (groups, after <code>distinct_on</code>). A query is a <a href="sql.html#explain">plan</a>, the same JSON that <code>plan(sql)</code> gives: <code>q.plan()</code> shows it, and a <code>Client</code> runs it on a server the same way.</p>
+<h2 id="the-rank-log">The rank log<a class="anchor" href="#the-rank-log" aria-label="Link to this section">#</a></h2>
+<p><code>query_logged(sql, params, context=..., variant=..., candidates=...)</code> runs a ranked query and writes what it served to a <a href="sql.html#the-rank-log-what-each-query-served">rank log</a>: a row per row answered, with its position, its score and the values its ranking read, as they were computed. <code>candidates</code> logs that many rows from the query's <code>OFFSET</code>, those past its <code>LIMIT</code> as not shown, and <code>ts</code> (a <code>datetime</code> or microseconds) says when it was served, now by default. The <code>Result</code> is the query's, with <code>result.request</code>, the id its log rows carry, for labelling them later. <code>export_rank_log(...)</code> reads the log back as a list of dicts for training, each with its context's history and its label as of the row's time, from a table of events:</p>
+<pre data-lang="python">r = db.query_logged(&quot;SELECT id, title FROM books ORDER BY bm25(title, :q) DESC LIMIT 10&quot;,
+                    {&quot;q&quot;: &quot;dragon&quot;}, context=&quot;u42&quot;, variant=&quot;b&quot;, candidates=50)
+db.sql(&quot;UPDATE rank_log SET label = 3 WHERE request = :r AND row_key = :k&quot;, {&quot;r&quot;: r.request, &quot;k&quot;: r.keys[0]})
+
+rows = db.export_rank_log(events={&quot;table&quot;: &quot;events&quot;, &quot;user&quot;: &quot;usr&quot;, &quot;item&quot;: &quot;item&quot;, &quot;time&quot;: &quot;ts&quot;, &quot;action&quot;: &quot;action&quot;},
+                          history=20, window=&quot;30 minutes&quot;, grades={&quot;click&quot;: 1, &quot;buy&quot;: 3})
+rows[0][&quot;features&quot;], rows[0][&quot;label&quot;], rows[0][&quot;history_items&quot;]</pre>
+<h2 id="semantic-id-codebooks">Semantic-ID codebooks<a class="anchor" href="#semantic-id-codebooks" aria-label="Link to this section">#</a></h2>
+<p>A <a href="server.html#semantic-ids">semantic-ID field</a> gives each row a code from its vector by a codebook, which <code>chloedb.train.codebook</code> trains and saves in the models directory before a table names it:</p>
+<pre data-lang="python">h = chloedb.train.codebook(db, &quot;items-rq&quot;, field=&quot;emb&quot;)       # a table&#x27;s vectors
+h = chloedb.train.codebook(vectors, &quot;items-rq&quot;)               # a list of lists, or a 2-D numpy array
+
+items = chloedb.open(&quot;items.chloedb&quot;, schema={
+    &quot;table&quot;: &quot;items&quot;, &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;emb&quot;, &quot;type&quot;: &quot;vector&quot;, &quot;dim&quot;: 384},
+        {&quot;name&quot;: &quot;sid&quot;, &quot;type&quot;: &quot;keyword&quot;, &quot;multi&quot;: True,
+         &quot;semantic_id&quot;: {&quot;from&quot;: &quot;emb&quot;, &quot;codebook&quot;: &quot;items-rq&quot;}},
+    ],
+})
+items.upsert(rows)                                            # each row gets its sid
+items.query(&quot;SELECT id FROM items WHERE sid = &#x27;12.7&#x27;&quot;)</pre>
+<p>It returns the SHA-256 of the file, which the table records. The options are <code>levels</code> (1 to 4, default 3), <code>k</code> centroids a level (up to 256), <code>iterations</code> of k-means a level (25), <code>sample</code>, the vectors it trains on (100 a centroid by default, drawn at random), <code>seed</code> (the same vectors and options give the same codebook), <code>balanced</code>, <code>table</code> (a database's first by default) and <code>models</code> (the default models directory, as for <code>Database.create</code>). Pass the same <code>models=</code> to <code>Database.create</code> and <code>Database.open</code>: a codebook that does not open is listed in <code>db.embed_errors</code>, and writes that need a code then fail.</p>
+<p><code>chloedb.train.codebook_report(db, "items-rq", field="emb")</code> (or of vectors, as above) says what a codebook makes of a set of vectors, before a field names it for good:</p>
+<pre data-lang="python">r = chloedb.train.codebook_report(vectors, &quot;items-rq&quot;)
+r[&quot;rows&quot;], r[&quot;codes&quot;], r[&quot;shared_rows&quot;], r[&quot;largest_group&quot;]   # 12101, 10126, 3288, 12
+r[&quot;levels&quot;][2]   # {&quot;used&quot;: 256, &quot;fullest&quot;: 630, &quot;perplexity&quot;: 56.7, &quot;residual&quot;: 0.135}</pre>
+<p><code>shared_rows</code> are the rows whose code another row has too: only the tie number tells them apart, so a decoder that writes codes cannot. A level's <code>perplexity</code> is how many of its numbers the rows are spread over when weighed by use (<code>k</code> when every number has as many rows as any other), and <code>residual</code> the share of the vectors' squared length the code so far leaves unsaid.</p>
+<p>Plain k-means uses the later levels' numbers unevenly, as above: what a level leaves of the vectors points every way alike, and there most centroids end on one far vector each while a few near the middle take the rest. <code>balanced=True</code> trains each level with every centroid given the same number of the training vectors. On the 12,101 items of Amazon Beauty (text vectors of 384 dimensions, 3 levels of 256) the third level's perplexity goes from 57 to 251 and the rows sharing a code from 3,288 to 2,601; training takes 17 s, not 6 (<a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb/results/generative#balanced-codebooks">results</a>). It holds a distance for every training vector and centroid (8 bytes each: 52 MB at the default <code>sample</code>). Rows are coded by their nearest centroid either way.</p>
+<h2 id="next-items">Next items<a class="anchor" href="#next-items" aria-label="Link to this section">#</a></h2>
+<p><code>chloedb.ngrams</code> keeps counts of what came after the last one or two items in a table, and <code>chloedb.next_items(db, history, k=10)</code> reads them with backoff (<a href="next-items.html">Next items</a>):</p>
+<pre data-lang="python">from chloedb import ngrams
+
+db = chloedb.open(&quot;next.chloedb&quot;, ngrams.schema())
+db.write(ngrams.ops([&quot;a&quot;, &quot;b&quot;], &quot;c&quot;))       # after each event: &quot;c&quot; after [..., &quot;a&quot;, &quot;b&quot;]
+chloedb.next_items(db, [&quot;a&quot;, &quot;b&quot;], k=10)     # [(&quot;c&quot;, 1.0), ...]</pre>
+<h2 id="sequence-models">Sequence models<a class="anchor" href="#sequence-models" aria-label="Link to this section">#</a></h2>
+<p><a href="sql.html#sequence-models-encodemodel-history"><code>encode('model', history)</code></a> turns a user's events into a vector of an item field, by a model that <code>chloedb.train.sequence</code> trains with PyTorch (<code>pip install torch</code>) and saves in the models directory:</p>
+<pre data-lang="python">import chloedb.train
+db = chloedb.Database.open(&quot;shop.chloedb&quot;, models=&quot;models&quot;)
+out = chloedb.train.sequence(db, &quot;next&quot;, table=&quot;items&quot;, field=&quot;emb&quot;,
+                            events={&quot;table&quot;: &quot;events&quot;, &quot;user&quot;: &quot;usr&quot;, &quot;item&quot;: &quot;item&quot;, &quot;action&quot;: &quot;action&quot;, &quot;time&quot;: &quot;ts&quot;},
+                            learn_items=True, negatives=&quot;all&quot;, holdout=True, models=&quot;models&quot;)
+chloedb.train.write_vectors(db, &quot;next&quot;, models=&quot;models&quot;)      # the learned item vectors, into items.emb
+db.query(&quot;&quot;&quot;SELECT id FROM items ORDER BY similarity(emb, encode(&#x27;next&#x27;,
+            (SELECT item, action, ts FROM events WHERE usr = :u ORDER BY ts DESC LIMIT 200))) DESC LIMIT 10&quot;&quot;&quot;, {&quot;u&quot;: &quot;u42&quot;})</pre>
+<ul>
+<li><strong>The histories</strong> come from one of <code>events</code> (a table of the database: its columns of users, items, and optionally actions, times, and <code>order</code> for events with equal times), <code>sequences</code> (a dict from user to a list of <code>(item, action, time in seconds)</code>, oldest first) or <code>records</code> (the <a href="#the-rank-log">rank log's export</a> with <code>history</code>: each record's history is a training example, and its row the target when its label is positive or missing). The item vectors are the field's, or <code>vectors</code> (a dict from key to vector).</li>
+<li><strong>What it learns</strong>: every event is the target of the events before it. Each item is scored as <code>similarity</code> scores it, the dot product of the model's unit vector with the item's vector, over <code>temperature</code> (0.05), and the loss is cross-entropy against the other targets of the batch (<code>negatives="in_batch"</code>, the default) or every item (<code>"all"</code>, for catalogs that fit). In a batch, an item that is often a target is a negative as often, which teaches the model to rank what is popular low: <code>logq=True</code> takes from each negative's score the log of the chance that the batch holds it, worked out from how often each item is a target (the target of its own row keeps its score), and <code>uniform_negatives=n</code> adds <code>n</code> items drawn evenly from all of them to every batch, so items that are seldom or never targets are negatives too. Use both for a catalog too large for <code>"all"</code>: on Yambda-50M's 629,298 tracks they took Recall@10 on held-out events from 0.0229 to 0.0334 after four epochs (<a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb/results/recsys#in-batch-negatives-corrected">results</a>). With <code>learn_items=True</code> the item vectors are trained too, starting from the field's, and returned normalized in <code>out["vectors"]</code>; without it the field keeps its vectors and the model learns to map histories into their space, so a new item is found as soon as it has a vector.</li>
+<li><strong>The item vectors go with the model</strong>: it is saved with the vectors it was trained with (<code>items.safetensors</code>, part of its hash), and <code>encode</code> refuses a history whose items have other vectors in the field. <code>chloedb.train.write_vectors(db, name, models=None)</code> writes them into the field the model's config names, by an <code>UPDATE</code> of that field alone for each item (a <code>Database</code> or a <code>Client</code>); returns the rows written. <code>chloedb._sequence.read_items(path)</code> reads them back.</li>
+<li><strong>Options</strong>: <code>width</code> (64), <code>layers</code> (2), <code>heads</code> (1), <code>ffn</code> (4 × width), <code>max_len</code> (200 events), <code>gap_buckets</code> (32), <code>actions</code> (the actions seen by default; others count as one more), <code>epochs</code> (50), <code>batch</code> (128), <code>lr</code> (1e-3), <code>dropout</code> (0.2), <code>seed</code>. With <code>holdout=True</code> each user's last event is kept out of training, and training stops when NDCG@10 on those has not risen for <code>patience</code> epochs (5), keeping the best epoch. <code>max_seconds</code> stops it after the first epoch that ends past that many seconds. <code>log=print</code> prints each epoch's loss and metrics, which <code>out["history"]</code> also holds.</li>
+<li>It returns <code>{"path", "history", "vectors"}</code>. Pass the same <code>models=</code> to <code>Database.open</code>, or start the server with <code>--models</code>: a coordinator needs the model, its shards don't.</li>
+</ul>
+<h2 id="a-server-from-python">A server from Python<a class="anchor" href="#a-server-from-python" aria-label="Link to this section">#</a></h2>
+<p><code>chloedb.connect(url, token=None, timeout=30, retry_for=10)</code> returns a <code>Client</code> of a running chloedb-server, using only the standard library. A method given <code>table=</code>, and <code>table(name)</code>, read that table alone, never the first one, so a <a href="server.html#security">key limited to tables</a> works with them <span class="since">since 0.3.2</span>. It has <code>schema</code>, <code>tables</code>, <code>query</code>, <code>sql</code>, <code>search</code>, <code>insert</code>, <code>upsert</code>, <code>delete</code>, <code>import_file</code> (an upload to <a href="server.html#loading-rows"><code>/v1/import</code></a>, up to the server's <code>--max-body-mb</code>, 256 MiB unless set), <code>import_sqlite(path, tables=None)</code> and <code>plan_sqlite(path)</code> (a SQLite file's tables, uploaded the same way; <a href="sqlite.html#over-http-and-in-the-ui">SQLite in and out</a>), <code>export_sqlite(path, tables=None)</code> (the server's tables downloaded as a SQLite file), <code>import_parquet(path, table=None, key=None)</code>, <code>plan_parquet(path)</code> and <code>export_parquet(path, table=None)</code> (<a href="parquet.html#over-http-and-in-the-ui">Parquet over HTTP</a>) and <code>len()</code>, as above, plus <code>get(key)</code>, <code>get_many(keys)</code> and <code>put(key, row, if_seq_no=None)</code> for <a href="server.html#rows-by-key">rows by key</a>, <code>write(ops)</code> for raw <a href="server.html#http-api">write operations</a>, <code>explain</code>, <code>run(plan)</code> (a plan from <code>explain(...)["ir"]</code> or a <code>table()</code> query, run by <a href="server.html#http-api"><code>/v1/plan</code></a>), <code>table()</code> (<a href="#queries-built-in-python">queries built in Python</a>), <code>embed(text, field=None)</code> (a text's vector by the server's model, from <a href="server.html#http-api"><code>/v1/embed</code></a>, or <code>embed(image=data)</code> an image's and <code>embed(audio=data)</code> a sound's), <code>embed_tokens(text, field)</code> (a query's vectors a token, for a multi-vector field), <code>query_logged</code> and <code>export_rank_log</code> (<a href="#the-rank-log">the rank log</a>), <code>health</code>, <code>stats</code> and <code>ask(question)</code> for the <a href="server.html#the-agent">agent</a>.</p>
+<pre data-lang="python">client = chloedb.connect(&quot;http://127.0.0.1:7700&quot;)   # token= or $CHLOEDB_TOKEN for a server with --token
+client.upsert({&quot;id&quot;: &quot;b3&quot;, &quot;title&quot;: &quot;Star letters&quot;, &quot;year&quot;: 2024})
+client.search(&quot;letters&quot;, limit=3).dicts()</pre>
+<p>A server answers at most <code>--max-result-window</code> rows a query (10,000 by default). <code>scroll(sql, params, page_size=10_000, arrow=False, keep_alive_ms=None)</code> reads past it: it yields the answer a page at a time, <code>Result</code>s or with <code>arrow=True</code> pyarrow Tables, each page at most <code>page_size</code> rows and at most the window, every page from the version of the database the first read (<a href="server.html#reading-past-the-window-scrolls">scrolls</a>). Leaving the loop early ends the scroll on the server. A <code>Database</code> has <code>scroll</code> too, whose pages are slices of one answer, since a database in your process has no window.</p>
+<pre data-lang="python">for page in client.scroll(&quot;SELECT id, title FROM books WHERE year &gt;= :y&quot;, y=1950, page_size=5000):
+    handle(page.dicts())</pre>
+<p>The server embeds <code>{"embed": text}</code> parameters and the rows it is sent with its own models. Errors the server reports raise <code>chloedb.ChloeDBError</code> (or a subclass of it, <a href="#errors">below</a>), with the HTTP status as <code>.status</code>, the JSON answer as <code>.answer</code> and a stable <code>.code</code>; a server that cannot be reached raises <code>urllib.error.URLError</code>. Each thread keeps one connection to the server open between its requests (a new one after 4 seconds idle, or when the server closed it), so a checkpointer's steps over <code>https</code> do not pay a TLS handshake each; through a proxy (<code>$HTTPS_PROXY</code>, <code>$HTTP_PROXY</code>) each request goes by <code>urllib</code> as before. A float that is not a number (NaN, infinity) is sent as <code>null</code>, as a database in your process stores it. A request the server refuses for its load (429: <a href="server.html#streams">behind on flushing</a> its writes, its write queue full, too many queries running) did nothing, so the client sends it again after the <code>Retry-After</code> the server gives, for up to <code>retry_for</code> seconds (10; 0 sends each request once), and raises the 429 after that. A write that failed partway on a cluster (an error with <code>"partial": true</code>) is not sent again, since the shards that took it keep it, unless it has an idempotency key.</p>
+<p><code>write(ops, idempotency_key=k)</code> and <code>sql(statement, idempotency_key=k)</code> send a write with an <a href="server.html#when-a-write-fails">idempotency key</a>, so that sending it again does not apply it twice. A write that failed partway through a coordinator, after some shards took their part, says so in its error's answer and names its key:</p>
+<pre data-lang="python">try:
+    client.write(ops)
+except chloedb.ChloeDBError as e:
+    if not (e.answer or {}).get(&quot;partial&quot;):
+        raise
+    client.write(ops, idempotency_key=e.answer[&quot;idempotency_key&quot;])   # the rest, once</pre>
+<h3 id="from-asyncio">From asyncio<a class="anchor" href="#from-asyncio" aria-label="Link to this section">#</a></h3>
+<p><span class="since">since 0.3.2</span> <code>chloedb.AsyncClient(url, token=None, timeout=30, retry_for=10)</code> is the client for asyncio (FastAPI, aiohttp): the same methods, each a coroutine, whose request runs in a thread of the event loop's default executor, so the package still needs nothing beyond the standard library and the loop is never blocked. What reads the server and is a property or <code>len()</code> on <code>Client</code> is a coroutine here: <code>await db.schema()</code>, <code>await db.count()</code>. <code>scroll</code> is an async iterator, <code>session()</code> gives an <code>AsyncSession</code>, and <code>client</code> is the <code>Client</code> underneath.</p>
+<pre data-lang="python">async with chloedb.AsyncClient(&quot;http://127.0.0.1:7700&quot;, token=key) as db:
+    hits = await db.search(&quot;letters&quot;, table=&quot;books&quot;, limit=3)
+    async for page in db.scroll(&quot;SELECT id FROM books&quot;):
+        handle(page.dicts())
+    q = (await db.table(&quot;books&quot;)).where(col(&quot;year&quot;) &gt;= 2000).limit(5)
+    rows = await db.run(q)            # q.run() would block the loop</pre>
+<h3 id="reading-your-own-writes">Reading your own writes<a class="anchor" href="#reading-your-own-writes" aria-label="Link to this section">#</a></h3>
+<p>A read from a <a href="server.html#replication-a-primary-and-its-replicas">replica</a>, or through a coordinator whose shards have replicas, can be answered by a copy that has not applied a write yet. The servers fix that with sequence numbers (<a href="server.html#reads-that-see-a-write">reads that see a write</a>), when they number their writes (<code>--seq-no</code>):</p>
+<ul>
+<li>A write's count is a <code>chloedb.Written</code>: an <code>int</code> (it compares, adds, prints and serialises as one, so code that used the number goes on working) with the write's <code>seq_no</code> from a server, or <code>seq_nos</code>, one per shard, from a coordinator; both are None from a server without <code>--seq-no</code>. <code>write</code>, <code>insert</code>, <code>upsert</code>, <code>delete</code>, <code>put</code>, a write by <code>sql</code> and a write plan by <code>run</code> answer one; <code>insert</code> and the others that send several requests answer the latest numbers of all of them.</li>
+<li><code>query</code>, <code>query_arrow</code>, <code>search</code>, <code>get</code>, <code>get_many</code>, <code>scroll</code>, a read by <code>sql</code>, a read plan by <code>run</code> and <code>sid_next</code> take <code>min_seq_no=</code> and <code>min_seq_nos=</code>: the copy that answers holds those writes. A replica that has not applied them waits up to a second, then answers 503, and a coordinator passes the read to the shard's primary; a server refuses a number past its last write (409).</li>
+<li><code>client.session()</code> (or <code>chloedb.Session(url, ...)</code>) is a client that does this itself: it keeps the latest numbers its own writes answered and sends them with each of its reads, so reading your own writes through a coordinator or from a replica is one line. A session is safe to share between threads; <code>session.observe(written)</code> adds a write made by another client. Numbers given to a read explicitly are sent with the session's, the later of each.</li>
+</ul>
+<pre data-lang="python">s = chloedb.connect(&quot;http://coordinator:7700&quot;).session()
+s.upsert({&quot;id&quot;: &quot;u1&quot;, &quot;name&quot;: &quot;Ada&quot;})
+s.get(&quot;u1&quot;)                                  # sees the upsert, whichever copy answers
+
+w = client.upsert({&quot;id&quot;: &quot;u2&quot;, &quot;name&quot;: &quot;Grace&quot;})     # or explicitly, by its numbers
+client.get(&quot;u2&quot;, min_seq_no=w.seq_no, min_seq_nos=w.seq_nos)</pre>
+<p>The numbers go with reads only: a server refuses them on a write (a write sees every write before it), so a session leaves them off an <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> by <code>sql</code>, judging a statement by its first word. A <code>Database</code> takes <code>min_seq_no</code> and <code>min_seq_nos</code> and ignores them: a database in your process reads every write it committed.</p>
+<h3 id="errors">Errors<a class="anchor" href="#errors" aria-label="Link to this section">#</a></h3>
+<p>Every error ChloeDB raises is a <code>chloedb.ChloeDBError</code> (<code>except chloedb.ChloeDBError</code> catches them all) with a stable <code>.code</code>, the same in your process and from a server: the server's JSON <code>code</code> when it gives one, else the kind the engine's message starts with (<code>busy: ...</code>), else the HTTP status. The common codes are raised as subclasses:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>code</th>
+<th>class</th>
+<th>when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bad_request</code></td>
+<td><code>BadRequestError</code></td>
+<td>a bad schema, query, value or request (HTTP 400, 413, 422); sending it again fails again</td>
+</tr>
+<tr>
+<td><code>unauthorized</code></td>
+<td><code>UnauthorizedError</code></td>
+<td>no token, or one without the rights the request needs (401, 403)</td>
+</tr>
+<tr>
+<td><code>not_found</code></td>
+<td><code>NotFoundError</code></td>
+<td>no such route, table or cursor (404); <code>get</code> of a missing key answers None instead</td>
+</tr>
+<tr>
+<td><code>conflict</code></td>
+<td><code>ConflictError</code></td>
+<td>refused by the state it met (409): an <code>if_seq_no</code> that no longer holds, an idempotency key still running, a <code>min_seq_no</code> past the server's last write</td>
+</tr>
+<tr>
+<td><code>conflict</code></td>
+<td><code>DuplicateKeyError</code></td>
+<td><span class="since">since 0.3.2</span> an <code>INSERT</code> of a key the table already holds; a <code>ConflictError</code> and a <code>BadRequestError</code> both (it was a <code>BadRequestError</code> alone before), with <code>.table</code>, <code>.field</code> (the key field), <code>.key</code> and <code>.row</code> (the row's place in the write, from 1) where the message names them</td>
+</tr>
+<tr>
+<td><code>partial_write</code></td>
+<td><code>PartialWriteError</code></td>
+<td>a coordinator wrote some shards and not others (<code>answer["partial"]</code>): send it again with the same <code>idempotency_key</code></td>
+</tr>
+<tr>
+<td><code>busy</code></td>
+<td><code>BusyError</code></td>
+<td>the database is open in another process, or another writer holds it</td>
+</tr>
+<tr>
+<td><code>overloaded</code></td>
+<td><code>OverloadedError</code></td>
+<td>refused for the server's load before any work (429), after the client's retries</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>DeadlineError</code></td>
+<td>a deadline passed: a query's <code>timeout_ms</code>, a coordinator's wait for a shard (504), the engine's own</td>
+</tr>
+<tr>
+<td><code>unavailable</code></td>
+<td><code>UnavailableError</code></td>
+<td>no copy can serve it now (503): a replica behind, a primary replaced, a hosted model down</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>chloedb.__version__</code> is the package's version <span class="since">since 0.3.2</span>, and the package ships <code>py.typed</code>, so type checkers read its annotations.</p>
+<p>Other codes have no subclass: <code>memory</code> (a query past its memory budget, <a href="#limits-memory-deadlines-interrupting">limits</a>), <code>corrupt</code>, <code>io</code>, <code>internal</code> (another 5xx) and <code>error</code>. <code>chloedb.error_code(message, status, answer)</code> gives the code of any message. A server that cannot be reached still raises <code>urllib.error.URLError</code>, and a client's own timeout <code>TimeoutError</code>, as before.</p>
+<h3 id="database-and-client-what-differs">Database and Client: what differs<a class="anchor" href="#database-and-client-what-differs" aria-label="Link to this section">#</a></h3>
+<p>A script moves between <code>chloedb.open</code> and <code>chloedb.connect</code> unchanged as long as it keeps to what both have. <code>timeout_ms</code> means the same on both: a query's deadline (<a href="#limits-memory-deadlines-interrupting">limits</a>). Options that only a server can honour raise <code>TypeError</code> on a <code>Database</code> rather than being taken as query parameters: <code>idempotency_key</code> (to <code>sql</code>, <code>write</code>), <code>keep_alive_ms</code> (to <code>scroll</code>), and <code>timeout_ms</code> to a method that runs no query (<code>plan</code>); a query parameter of one of those names goes in the <code>params</code> dict. The rest of the differences:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th><code>Database</code> (in your process)</th>
+<th><code>Client</code> (a server)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a write's count</td>
+<td><code>int</code></td>
+<td><code>Written</code>, an <code>int</code> with <code>seq_no</code> / <code>seq_nos</code></td>
+</tr>
+<tr>
+<td><code>min_seq_no</code>, <code>min_seq_nos</code></td>
+<td>taken and ignored</td>
+<td>sent: the answering copy holds those writes</td>
+</tr>
+<tr>
+<td><code>timeout_ms</code></td>
+<td>the query's deadline, none by default</td>
+<td>sent: the query's deadline, the server's <code>--timeout-ms</code> (5 s) by default</td>
+</tr>
+<tr>
+<td><code>memory</code>, <code>interrupt()</code></td>
+<td>a query's budget; stops the running queries</td>
+<td>the server's <code>--query-memory-mb</code></td>
+</tr>
+<tr>
+<td><code>idempotency_key</code>, <code>keep_alive_ms</code></td>
+<td><code>TypeError</code></td>
+<td>sent</td>
+</tr>
+<tr>
+<td><code>scroll</code></td>
+<td>slices of one answer</td>
+<td>pages of a server-side scroll, past <code>--max-result-window</code></td>
+</tr>
+<tr>
+<td><code>export_sqlite</code></td>
+<td>returns a dict</td>
+<td>returns the tables' names</td>
+</tr>
+<tr>
+<td><code>export_parquet</code></td>
+<td><code>tables=</code>, returns a dict</td>
+<td><code>table=</code>, returns the table's name</td>
+</tr>
+<tr>
+<td><code>import_sqlite</code>, <code>import_parquet</code></td>
+<td>take <code>schemas=</code> / <code>schema=</code></td>
+<td>the server's schemas</td>
+</tr>
+<tr>
+<td>a plan</td>
+<td><code>plan(sql)</code></td>
+<td><code>explain(sql)["ir"]</code></td>
+</tr>
+<tr>
+<td>only here</td>
+<td><code>optimize</code>, <code>vacuum</code>, <code>expire</code>, <code>refresh</code>, <code>add_column</code>, <code>drop_column</code>, <code>rename_column</code>, <code>import_arrow</code>, <code>embed_errors</code></td>
+<td><code>put</code>, <code>stream</code>, <code>source</code>, <code>sources</code>, <code>plan_sqlite</code>, <code>plan_parquet</code>, <code>health</code>, <code>stats</code>, <code>ask</code>, <code>session</code></td>
+</tr>
+<tr>
+<td>errors</td>
+<td><code>ChloeDBError</code> subclasses, <code>status</code> None</td>
+<td>the same classes and codes, with <code>status</code> and <code>answer</code></td>
+</tr>
+<tr>
+<td>unreachable</td>
+<td></td>
+<td><code>urllib.error.URLError</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="streams-and-kafka">Streams and Kafka<a class="anchor" href="#streams-and-kafka" aria-label="Link to this section">#</a></h3>
+<p><code>client.stream(events)</code> writes an iterable of <a href="server.html#streams">stream lines</a> through <code>/v1/stream</code> as it is read, each an operation or one event's operations as <code>{"ops": [...], "source": {"name", "offset", "ts"}}</code>, and returns the stream's last answer (<code>lines</code>, <code>written</code>, <code>skipped</code>). <code>client.source(name)</code> is the offset of the last event a source wrote (None for none), and <code>client.sources()</code> lists them all. A server skips the operations of an offset it has reached, so a stream resumed from <code>source(name) + 1</code>, or from anywhere before it, writes each event once.</p>
+<p><code>chloedb.ingest.kafka</code> is a Kafka (or Redpanda) consumer built on it, which needs <code>confluent-kafka</code> (<code>pip install confluent-kafka</code>, or <code>pip install "./chloedb-py[kafka]"</code>). Each partition is a source named <code>&lt;topic&gt;/&lt;partition&gt;</code> (after <code>prefix=</code>), and a partition given to the consumer is read from after the offset the server has, not from what the consumer group committed to Kafka, so each event is written once across consumer restarts, server restarts and rebalances. Within a partition the events are written in order.</p>
+<pre data-lang="python">import json
+import chloedb
+from chloedb import ingest
+
+def click(e):                                   # an ingest.Event: topic, partition, offset, timestamp, key, value
+    c = json.loads(e.value)
+    return [
+        {&quot;op&quot;: &quot;insert&quot;, &quot;table&quot;: &quot;events&quot;, &quot;doc&quot;: {&quot;id&quot;: c[&quot;id&quot;], &quot;usr&quot;: c[&quot;usr&quot;], &quot;item&quot;: c[&quot;item&quot;]}},
+        {&quot;op&quot;: &quot;add&quot;, &quot;table&quot;: &quot;users&quot;, &quot;key&quot;: c[&quot;usr&quot;], &quot;field&quot;: &quot;n_events&quot;, &quot;value&quot;: 1},
+    ]
+
+ingest.kafka(chloedb.connect(&quot;http://127.0.0.1:7700&quot;), &quot;clicks&quot;, click, brokers=&quot;127.0.0.1:9092&quot;, group=&quot;chloedb&quot;)</pre>
+<p>The function gives an event's operations, which commit together with its offset; None writes the offset alone (for events to leave out). Without one, each value is JSON: an operation, or <code>{"ops": [...]}</code>. The consumer runs until interrupted, or until <code>max_events=</code> events were read or none came for <code>idle=</code> seconds, and returns counts (<code>events</code>, <code>written</code>, <code>skipped</code>, <code>streams</code>, <code>retries</code>). It keeps a stream open for <code>seconds_per_stream=</code> (1 by default), then commits the stream's offsets to Kafka for Kafka's own lag tools and opens the next. When the server cannot be reached, or answers 429 or 5xx, it waits and reads every partition again from the server's offsets, for up to <code>retry_for=</code> seconds (60). An event the function fails on stops it after the events before it are written, so a restart begins with that event. <code>config=</code> adds librdkafka settings, and consumers of one <code>group</code> share the partitions. <code>ingest.consume(client, log, to_ops)</code> runs the same loop over another log, through the small <code>ingest.Log</code> interface.</p>
+<h2 id="search-on-the-device">Search on the device<a class="anchor" href="#search-on-the-device" aria-label="Link to this section">#</a></h2>
+<p><code>chloedb.nearby(url, table, dir)</code> holds a <a href="slices.html">slice</a> of a chloedb-server's table near a user: the rows of the tiles around them in a database in <code>dir</code>, searched with the server's statistics. <code>move_to(lat, lon)</code> fetches the tiles it lacks, and <code>search(q, k=10, d0=1000)</code> answers on the device when it can prove the answer is the server's, and asks the server otherwise; the result's <code>where</code> is <code>"device"</code> or <code>"server"</code> and <code>why</code> the reason. For a <a href="slices.html#vector-slices-more-like-this-on-the-device">vector slice</a>, <code>focus(taste, rows=20_000)</code> holds the clusters nearest a taste vector and <code>similar(vector, k=10)</code> answers a similarity search the same way, fetching the few clusters its codes name when that proves the answer.</p>
+<pre data-lang="python">near = chloedb.nearby(&quot;http://127.0.0.1:7700&quot;, &quot;places&quot;, &quot;./slice&quot;)
+near.move_to(40.7484, -73.9857)
+r = near.search(&quot;pizza&quot;, k=10)
+r.where, r.why            # (&quot;device&quot;, &quot;proved&quot;)</pre>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/python.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="logs.html">← Search your logs</a><a href="frames.html">DataFrames →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

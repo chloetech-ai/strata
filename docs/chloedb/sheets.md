@@ -12,7 +12,14 @@ Like [the crawler](crawler.md), it is a program of its own, in Rust, that talks 
 
 ## Run it
 
-Build both programs, then start chloedb-sheets with a cluster of its own:
+Install both programs, then start chloedb-sheets with a cluster of its own. <!-- since 0.3.2 --> The installer puts both in `~/.local/bin` prebuilt, and chloedb-sheets finds the server beside it:
+
+```bash
+curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with sheets
+~/.local/bin/chloedb-sheets serve --local ./sheets-cluster
+```
+
+Or build both from a checkout (any platform with Rust; the only way before release 0.3.2):
 
 ```bash
 (cd chloedb-server && cargo build --release)

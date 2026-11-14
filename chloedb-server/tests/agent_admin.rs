@@ -85,6 +85,8 @@ async fn role_keys_act_by_tier_with_reasons_and_caps() {
     assert_eq!(s, 200, "{j}");
     let (s, j) = call(&base, "POST", "/v1/write", &ops, &[], Some(json!({"rows": [{"id": "x"}]}))).await;
     assert_eq!((s, j["error_code"].as_str()), (403, Some("scope_refused")), "{j}");
+    // Beyond what ops reaches: the scope the route needs, and the change request.
+    assert!(j["error"].as_str().unwrap().contains("needs a key with the write scope") && j["error"].as_str().unwrap().contains("is ops"), "{j}");
     assert!(j["hint"].as_str().unwrap().contains("change request"), "{j}");
     assert!(j["docs"].as_str().unwrap().starts_with("https://"), "{j}");
 
@@ -92,6 +94,9 @@ async fn role_keys_act_by_tier_with_reasons_and_caps() {
     let rule = json!({"match": {"fingerprint": "ab12"}, "action": "refuse", "expires_s": 600});
     let (s, j) = call(&base, "POST", "/v1/admin/contain", &propose, &[("x-chloedb-reason", "x")], Some(rule.clone())).await;
     assert_eq!((s, j["error_code"].as_str()), (403, Some("scope_refused")), "{j}");
+    // CCW-11: it names the least key that would do (ops, not admin), and the change request.
+    let said = j["error"].as_str().unwrap();
+    assert!(said.contains("needs an ops key") && said.contains("is propose") && said.contains("POST /v1/admin/changes") && !said.contains("admin scope"), "{j}");
     let (s, j) = call(&base, "POST", "/v1/admin/contain", &ops, &[], Some(rule.clone())).await;
     assert_eq!((s, j["error_code"].as_str()), (400, Some("reason_required")), "{j}");
     let mut long = rule.clone();

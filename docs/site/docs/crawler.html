@@ -91,7 +91,10 @@
 
 <p><code>chloedb-crawl</code> takes a URL, reads the site's pages, finds their fields, makes a table from them and fills it, and adds shards to the cluster as the table grows. It is a program of its own, in Rust, that talks to chloedb-server over HTTP only, so it runs on the machine next to the cluster or on another one; the command center shows it as an app.</p>
 <h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
-<p>On one machine, build both programs, then start the crawler with a cluster of its own (on Kubernetes, one field of the cluster's resource starts it: <a href="#on-kubernetes">below</a>):</p>
+<p>On one machine, install both programs, then start the crawler with a cluster of its own (on Kubernetes, one field of the cluster's resource starts it: <a href="#on-kubernetes">below</a>). <span class="since">since 0.3.2</span> The installer puts both in <code>~/.local/bin</code> prebuilt, and the crawler finds the server beside it:</p>
+<pre data-lang="sh">curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with crawl
+~/.local/bin/chloedb-crawl serve --local ./crawl-cluster</pre>
+<p>Or build both from a checkout (any platform with Rust; the only way before release 0.3.2):</p>
 <pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
 cd chloedb-crawl &amp;&amp; cargo build --release
 target/release/chloedb-crawl serve --local ./crawl-cluster --server-bin ../chloedb-server/target/release/chloedb-server</pre>

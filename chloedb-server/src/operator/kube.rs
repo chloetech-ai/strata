@@ -392,15 +392,28 @@ impl Cluster {
     /// `spec.replicas`, the label Kubernetes 1.28 and later give a
     /// StatefulSet's pods) weigh twice as much as any copy of the set, which
     /// alone counts where the label is not given.
+    ///
+    /// With `spec.requireCopiesApart` the shard's own copies' term is
+    /// required instead: no two of them on one node, and a copy waits for
+    /// a node without one. The term counts every copy of the set where the
+    /// label is not given, a rollout's extra copy too. The extra copy
+    /// itself prefers a node apart, as before.
     fn copies_apart(&self, labels: &Json) -> Json {
         let own: Vec<String> = (0..self.spec.replicas).map(|k| k.to_string()).collect();
         let mut indexed = json!({"matchLabels": labels, "matchExpressions": [{"key": "apps.kubernetes.io/pod-index", "operator": "In", "values": own}]});
         if self.spec.replicas == 0 {
             indexed = json!({"matchLabels": labels});
         }
+        let any = json!({"weight": 50, "podAffinityTerm": {"topologyKey": "kubernetes.io/hostname", "labelSelector": {"matchLabels": labels}}});
+        if self.spec.require_copies_apart {
+            return json!({"podAntiAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": [{"topologyKey": "kubernetes.io/hostname", "labelSelector": indexed}],
+                "preferredDuringSchedulingIgnoredDuringExecution": [any],
+            }});
+        }
         json!({"podAntiAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [
             {"weight": 100, "podAffinityTerm": {"topologyKey": "kubernetes.io/hostname", "labelSelector": indexed}},
-            {"weight": 50, "podAffinityTerm": {"topologyKey": "kubernetes.io/hostname", "labelSelector": {"matchLabels": labels}}},
+            any,
         ]}})
     }
 
@@ -1502,7 +1515,7 @@ impl Platform for Cluster {
             let path = self.credentials_path(app);
             let Some(have) = self.kube.get(&path).await? else { continue };
             if let Some(id) = have["metadata"]["annotations"][cr::KEY_ID].as_str() {
-                admin.call(reqwest::Method::DELETE, &format!("/v1/admin/keys/{id}"), None).await.or_else(|e| if e.contains("404") { Ok(Json::Null) } else { Err(e) })?;
+                cr::revoke_own(admin, app, id).await?;
             }
             match self.kube.delete(&path).await {
                 Err(e) if forbidden(&e) => tracing::warn!(cluster = %self.name, app, error = %e, "{OLD_ROLE}: the Secret of an app taken out of the spec is left (its key is revoked)"),
@@ -1576,7 +1589,7 @@ impl Platform for Cluster {
                 // The crawler that grows the cluster: the admin token is
                 // its key, and the one it had is revoked.
                 if let Some(i) = &old_id {
-                    admin.call(reqwest::Method::DELETE, &format!("/v1/admin/keys/{i}"), None).await.or_else(|e| if e.contains("404") { Ok(Json::Null) } else { Err(e) })?;
+                    cr::revoke_own(admin, app, i).await?;
                 }
                 (id, key) = (None, None);
             }
@@ -2693,6 +2706,37 @@ mod tests {
         assert_eq!(own["podAffinityTerm"]["labelSelector"]["matchExpressions"], json!([{"key": "apps.kubernetes.io/pod-index", "operator": "In", "values": ["0", "1"]}]), "copies 0 and 1, not the extra copy 2");
         assert_eq!(own["podAffinityTerm"]["labelSelector"]["matchLabels"]["strata.chloetech.ai/set"], "0");
         assert_eq!((terms[1]["weight"].as_u64(), terms[1]["podAffinityTerm"]["labelSelector"]["matchExpressions"].is_null()), (Some(50), true));
+    }
+
+    /// `spec.requireCopiesApart`: the shard's own copies' term is required
+    /// of the scheduler, the set's other term still preferred. Off, the
+    /// set and the servers' settings are what they were before the option.
+    #[test]
+    fn copies_apart_can_be_required() {
+        let off = cluster(json!({"demo": 10, "replicas": 2}));
+        let on = cluster(json!({"demo": 10, "replicas": 2, "requireCopiesApart": true}));
+        let (a, b) = (off.statefulset(0, 3, None), on.statefulset(0, 3, None));
+        let anti = &b["spec"]["template"]["spec"]["affinity"]["podAntiAffinity"];
+        let required = anti["requiredDuringSchedulingIgnoredDuringExecution"].as_array().unwrap();
+        assert_eq!(required.len(), 1, "{anti}");
+        assert_eq!(required[0]["topologyKey"], "kubernetes.io/hostname");
+        assert_eq!(required[0]["labelSelector"]["matchExpressions"], json!([{"key": "apps.kubernetes.io/pod-index", "operator": "In", "values": ["0", "1"]}]), "the shard's own copies, not the extra copy");
+        let preferred = anti["preferredDuringSchedulingIgnoredDuringExecution"].as_array().unwrap();
+        assert_eq!((preferred.len(), preferred[0]["weight"].as_u64()), (1, Some(50)));
+        // Off: as before the option, in the objects and in the version.
+        let before = json!({"podAntiAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [
+            {"weight": 100, "podAffinityTerm": {"topologyKey": "kubernetes.io/hostname", "labelSelector": {"matchLabels": off.set_labels(0), "matchExpressions": [{"key": "apps.kubernetes.io/pod-index", "operator": "In", "values": ["0", "1"]}]}}},
+            {"weight": 50, "podAffinityTerm": {"topologyKey": "kubernetes.io/hostname", "labelSelector": {"matchLabels": off.set_labels(0)}}},
+        ]}});
+        assert_eq!(a["spec"]["template"]["spec"]["affinity"], before);
+        assert!(serde_json::to_value(&off.spec).unwrap().get("requireCopiesApart").is_none());
+        assert_ne!(on.spec.version(), off.spec.version());
+        assert_ne!(on.spec.server_config(), off.spec.server_config(), "turned on, the copies restart one at a time, each placed by the rule");
+        assert_eq!(b["spec"]["template"]["metadata"]["annotations"][CONFIG], json!(on.spec.server_config()));
+        let mut j = json!({"image": off.spec.image, "imagePullPolicy": null, "args": [], "resources": null, "failoverAfterMs": off.spec.failover_after_ms, "writeAcks": off.spec.write_acks, "tokenSecret": null, "clusterTokenSecret": null});
+        assert_eq!(off.spec.server_config(), super::super::short_hash(&j), "off: the servers' settings hash as before the option");
+        j["copiesApart"] = json!("required");
+        assert_eq!(on.spec.server_config(), super::super::short_hash(&j));
     }
 
     #[test]

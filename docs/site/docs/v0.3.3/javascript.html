@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChloeDB from JavaScript · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="The chloedb package opens a ChloeDB file inside a Node, Bun or Deno process, the way better-sqlite3 opens a SQLite file: no server, no configuration. It can also talk to a running chloedb-server from any JavaScript…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/javascript.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html" aria-current="page">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Clients</span>
+      <h1>ChloeDB from JavaScript</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/javascript.md">docs/chloedb/javascript.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#install">Install</a></li><li><a href="#a-database-in-the-process">A database in the process</a></li><li><a href="#a-server-from-javascript">A server from JavaScript</a></li><li><a href="#search-on-the-device">Search on the device</a></li><li><a href="#bun-and-deno">Bun and Deno</a></li><li><a href="#tests">Tests</a></li></ol></details>
+    <div class="doc-body">
+
+<p>The <code>chloedb</code> package opens a ChloeDB file inside a Node, Bun or Deno process, the way better-sqlite3 opens a SQLite file: no server, no configuration. It can also talk to a running <a href="server.html">chloedb-server</a> from any JavaScript runtime with <code>fetch</code> (a browser, a worker, Node, Bun, Deno). Both have the same methods, so code written against a local file works against a server.</p>
+<h2 id="install">Install<a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
+<p>The package is in <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb-js"><code>chloedb-js/</code></a>: a Node-API addon written in Rust (<a href="https://napi.rs">napi-rs</a>) and the JavaScript around it, an ES module, for Node 18 or later, Bun and Deno.</p>
+<h3 id="prebuilt">Prebuilt<a class="anchor" href="#prebuilt" aria-label="Link to this section">#</a></h3>
+<p>Each <code>chloedb-js-v&lt;version&gt;</code> release on <a href="https://github.com/chloetech-ai/chloedb/releases">GitHub</a> has a tarball per platform with the addon built in, which installs with no Rust and no compiler. Install the tarball for your platform:</p>
+<pre data-lang="sh">npm install https://github.com/chloetech-ai/chloedb/releases/download/chloedb-js-v0.3.3/chloedb-0.3.3-darwin-arm64.tgz</pre>
+<p>It imports as <code>"chloedb"</code>. Windows and Alpine (musl) have no tarball: build from source there (Windows through WSL 2). Release 0.1.0, from before the rename, was published as <code>strata-db</code> and imports as <code>"strata-db"</code>.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>platform</th>
+<th>tarball</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>macOS 11+ on Apple silicon</td>
+<td><code>chloedb-&lt;version&gt;-darwin-arm64.tgz</code></td>
+</tr>
+<tr>
+<td>macOS 11+ on Intel</td>
+<td><code>chloedb-&lt;version&gt;-darwin-x64.tgz</code></td>
+</tr>
+<tr>
+<td>Linux x86-64, glibc 2.35+ (Ubuntu 22.04, Debian 12 and later)</td>
+<td><code>chloedb-&lt;version&gt;-linux-x64-gnu.tgz</code></td>
+</tr>
+<tr>
+<td>Linux arm64, glibc 2.35+</td>
+<td><code>chloedb-&lt;version&gt;-linux-arm64-gnu.tgz</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The workflow <a href="https://github.com/chloetech-ai/chloedb/blob/main/.github/workflows/js-release.yml"><code>js-release.yml</code></a> builds the tarballs on a <code>chloedb-js-v&lt;version&gt;</code> tag and runs each one in an empty app before attaching it to the release; <code>node scripts/pack.mjs &lt;platform&gt;</code> packs one by hand.</p>
+<p><code>chloedb</code> on npm is a placeholder (0.0.x) that holds the name until the releases are published there: a bare <code>npm install chloedb</code> installs it, and importing it throws an error that says how to install ChloeDB. From 0.3.3 the same workflow can publish to npm the way napi-rs packages are: <code>chloedb</code>, the JavaScript, with a package per platform holding its addon (<code>@chloedb/linux-x64-gnu</code>, <code>@chloedb/darwin-arm64</code>, ...) as optional dependencies, of which npm installs the one of your machine. Once it has (the workflow's header says what that needs), <code>npm install chloedb</code> is all it takes. <code>node scripts/pack.mjs --npm &lt;platform&gt;</code> and <code>--npm-main</code> pack those packages by hand.</p>
+<h3 id="from-source">From source<a class="anchor" href="#from-source" aria-label="Link to this section">#</a></h3>
+<p>It needs Rust (stable) and a C compiler.</p>
+<pre data-lang="sh">cd chloedb-js
+npm run build                    # cargo build --release, then copies the addon to chloedb.node
+cd /path/to/my-app
+npm install /path/to/chloedb/chloedb-js  # or &quot;chloedb&quot;: &quot;file:/path/to/chloedb/chloedb-js&quot; in package.json</pre>
+<p><code>npm install</code> of the directory builds the addon itself when <code>chloedb.node</code> is missing. <code>npm run build -- --features bert</code> builds more of ChloeDB's features in (<code>bert</code>, <code>onnx</code>, <code>vision</code>, <code>audio</code>; <code>datafusion</code>, <code>parquet</code> and <code>s3</code> are on by default). <code>$CHLOEDB_NODE_ADDON</code> (or <code>$STRATA_NODE_ADDON</code>) loads an addon from another place.</p>
+<p>The client alone (<code>chloedb/client</code>) is plain JavaScript with no addon: a bundler takes it into a page, and the package's <code>browser</code> and <code>workerd</code> conditions give it for <code>chloedb</code> too.</p>
+<h2 id="a-database-in-the-process">A database in the process<a class="anchor" href="#a-database-in-the-process" aria-label="Link to this section">#</a></h2>
+<pre data-lang="js" data-title="JavaScript">import { open } from &quot;chloedb&quot;;
+
+const db = await open(&quot;books.chloedb&quot;, {
+  schema: {
+    table: &quot;books&quot;,
+    key: &quot;id&quot;,
+    fields: [
+      { name: &quot;id&quot;, type: &quot;keyword&quot; },
+      { name: &quot;title&quot;, type: &quot;text&quot; },
+      { name: &quot;year&quot;, type: &quot;int&quot; },
+      { name: &quot;emb&quot;, type: &quot;vector&quot;, embed: { from: [&quot;title&quot;], model: &quot;potion-retrieval-32M&quot; } },
+    ],
+  },
+});
+
+await db.upsert([{ id: &quot;b1&quot;, title: &quot;The river and the dragon&quot;, year: 1999 }]);
+for (const row of await db.search(&quot;dragon&quot;)) console.log(row.id, row.title);
+const r = await db.query(&quot;SELECT year, COUNT(*) FROM books GROUP BY year&quot;);
+r.rows;          // [[1999, 1]]
+await db.close();</pre>
+<p><code>open(path, {schema})</code> opens the file, or creates it with the schema when it does not exist; <code>Database.create(path, schema)</code> and <code>Database.open(path)</code> do one or the other. A schema is an object, JSON text or the path of a JSON file, in the <a href="server.html#schemas">short form or the long one</a>. <code>directory: true</code> keeps a database as a directory of segment files, <code>models</code> is where embedded fields' models are (<code>$CHLOEDB_MODELS</code>, else <code>~/.local/share/chloedb/models</code> (or <code>~/.local/share/strata/models</code>, on a machine that has that folder from before the rename; before 0.3.2, always); <code>chloedb-server fetch-model</code> fetches them), and <code>threads</code> how many cores index builds and each query use (every core by default).</p>
+<p>Every call answers a promise and runs on a worker thread of Node's pool, so queries and writes leave the event loop free and many run at once. Writes made at once wait for each other and share commits (one disk flush for all those waiting), so none fails as busy. One process at a time may have a database open to write it (a second one gets "busy: the database is open elsewhere"). Others can open it with <code>Database.open(path, { readOnly: true })</code> to read it while it is written, the workers of a cluster, say: each query sees the writer's commits so far, every write fails, and <code>refresh()</code> looks for new commits at once (<a href="design.html#readers-in-other-processes">how readers follow the writer</a>). For writes from several processes, serve it with chloedb-server.</p>
+<h3 id="querying">Querying<a class="anchor" href="#querying" aria-label="Link to this section">#</a></h3>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>call</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>db.query(sql, params, {timeoutMs, memory, signal})</code></td>
+<td>a SELECT: a <code>Result</code> (<a href="#limits-memory-deadlines-aborting">limits</a>)</td>
+</tr>
+<tr>
+<td><code>db.sql(sql, params, {timeoutMs, memory, signal})</code></td>
+<td>any statement: a SELECT's <code>Result</code>, or the rows an INSERT, UPDATE or DELETE wrote; <code>CREATE TABLE</code>, <code>ALTER TABLE</code> and <code>DROP TABLE</code> too</td>
+</tr>
+<tr>
+<td><code>db.search(text, {limit, where, columns, mode, textFields, vectorField, params, table})</code></td>
+<td>the rows that best match a text: BM25 over the text fields (<code>mode: "text"</code>), the similarity of an embedded vector field (<code>"vector"</code>), or both fused by reciprocal rank (<code>"hybrid"</code>, what <code>"auto"</code> picks when a model is open)</td>
+</tr>
+<tr>
+<td><code>db.plan(sql, params)</code>, <code>db.run(plan)</code></td>
+<td>a statement's <a href="sql.html">plan</a> as JSON, without running it; running a plan</td>
+</tr>
+<tr>
+<td><code>db.embed(text, {field, image, audio})</code>, <code>db.embedTokens(text, field)</code></td>
+<td>a query vector by an embedded field's model (of an image's or a sound's bytes too), a multi-vector field's token vectors</td>
+</tr>
+<tr>
+<td><code>db.queryLogged(sql, params, {context, variant, ...})</code>, <code>db.exportRankLog({...})</code></td>
+<td>the <a href="sql.html#the-rank-log-what-each-query-served">rank log</a>: a ranked query that logs what it served, and the log as records for training</td>
+</tr>
+<tr>
+<td><code>db.sidNext(prefixes, {field, where})</code>, <code>db.trainCodebook(field, name, {balanced})</code></td>
+<td>semantic IDs: the codes that can follow prefixes, and training a codebook (<code>balanced: true</code> uses every level's numbers evenly)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Parameters are <code>:name</code> in the SQL and an object of values: numbers, strings, booleans, null, <code>Date</code>s, arrays (an array of numbers or a <code>Float32Array</code> is a vector), an object of numbers (sparse term weights), <code>{embed: "some text"}</code> (the text's vector by an embedded field's model) or <code>{vector_of: key}</code> (a stored row's vector).</p>
+<p>A <code>Result</code> has <code>columns</code>, <code>rows</code> (arrays in column order), <code>keys</code> (each row's primary key), <code>scores</code> (what it was ranked by) and <code>stats</code> (what the engine did). Iterating it gives each row as an object; <code>r.at(i)</code>, <code>r.objects()</code>, <code>r.column(name)</code> and <code>r.scalar()</code> (a count, a sum) read it other ways.</p>
+<h3 id="limits-memory-deadlines-aborting">Limits: memory, deadlines, aborting<a class="anchor" href="#limits-memory-deadlines-aborting" aria-label="Link to this section">#</a></h3>
+<p>A query runs in your process, so what it builds up (its groups, the rows it orders and returns, a join's tables) is held by your program. The queries of every database a process opens share a memory budget, by default a quarter of the machine's memory (the cgroup's limit in a container, else RAM), or <code>CHLOEDB_QUERY_MEMORY_MB</code> MiB when that is set when the first database opens (<code>0</code>: no budget). A query that would hold more rejects with a <code>ChloeDBError</code> of code <code>memory</code>, naming the budget and how to raise it, and gives back what it held, instead of the process running out of memory.</p>
+<p>A query has no deadline unless it is given one. <code>db.query</code>, <code>db.sql</code>, <code>db.run</code> and <code>db.search</code> take a last argument of options: <code>timeoutMs</code> (its deadline, as a <code>Client</code>'s <code>query</code> takes it: it rejects with <code>DeadlineError</code> naming it), <code>memory</code> (a budget of its own in bytes; <code>0</code>: none) and <code>signal</code>, an <code>AbortSignal</code> that stops it when it aborts (it rejects with the signal's reason, as an aborted <code>fetch</code> does). A database's own limits, for every query that does not give its own, are set when it opens or later; <code>db.interrupt()</code> stops every query of the database running now, and returns how many there were:</p>
+<pre data-lang="js" data-title="JavaScript">const db = await open(&quot;books.chloedb&quot;, { timeoutMs: 5000, memory: 512 * 2 ** 20 });  // 5 s, and 512 MiB its queries share
+await db.query(&quot;SELECT genres, COUNT(*) FROM books GROUP BY genres&quot;, null, { timeoutMs: 200 });
+await db.query(&quot;SELECT * FROM books&quot;, null, { memory: 0, signal: AbortSignal.timeout(1000) });
+db.setLimits({});                 // back to the defaults: no deadline, the process&#x27;s budget
+db.timeoutMs, db.memory;          // the limits now (null: none)</pre>
+<p>A query checks its deadline and its signal between segments and every 1,024 rows it groups, orders, walks or joins, so it stops within milliseconds; it holds a thread of libuv's pool (<code>UV_THREADPOOL_SIZE</code>, 4 by default, which <code>fs</code> and <code>dns</code> share) until then. A write is not cut short: <code>sql</code>'s limits apply to a SELECT.</p>
+<h3 id="writing">Writing<a class="anchor" href="#writing" aria-label="Link to this section">#</a></h3>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>call</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>db.insert(rows, {table})</code></td>
+<td>rows whose keys are new; all or none are written. 10,000 rows or more are bulk-loaded into new segments in one commit</td>
+</tr>
+<tr>
+<td><code>db.upsert(rows, {table})</code></td>
+<td>rows, replacing the rows with their keys, in transactions of 10,000</td>
+</tr>
+<tr>
+<td><code>db.delete(keys, {table})</code></td>
+<td>the rows with these keys</td>
+</tr>
+<tr>
+<td><code>db.write(ops)</code></td>
+<td><a href="server.html#http-api">write operations</a> in one transaction: insert, upsert, delete, <code>set</code> of a field (a number in place, another by writing the row again) and <code>add</code> to a number in place</td>
+</tr>
+<tr>
+<td><code>db.get(key)</code>, <code>db.getMany(keys)</code></td>
+<td>rows by key without SQL, or null</td>
+</tr>
+<tr>
+<td><code>db.addColumn(name, type, options)</code>, <code>dropColumn</code>, <code>renameColumn</code></td>
+<td><code>ALTER TABLE</code></td>
+</tr>
+<tr>
+<td><code>db.expire()</code>, <code>db.optimize()</code>, <code>db.vacuum()</code>, <code>db.close()</code></td>
+<td>rows past their <code>expire_by</code>; a table that is done changing readied for queries (its segments merged into as few as can be, deleted rows dropped, the file shrunk); the space merges freed returned to the file system; the database closed, after merging small segments and returning the space merges freed when it is an eighth of the file or more (<code>await using db = ...</code> closes it too). Segments merge in the background as writes add them, one merge at a time</td>
+</tr>
+</tbody>
+</table></div>
+<p>A row is an object of field name to value. A vector may be a <code>Float32Array</code> (read from its bytes, without a number per element in between), a <code>Float64Array</code> or an array; a TIMESTAMP a <code>Date</code> or ISO 8601 text; a list field an array or a <code>Set</code>. Values come back as chloedb-server answers them: TIMESTAMPs as ISO 8601 text in UTC, vectors as arrays of numbers.</p>
+<p>An INT past 2^53 (a 64-bit key, a hash) comes back as a <code>BigInt</code>, and a <code>BigInt</code> may be written or passed as a parameter anywhere a number may; every other integer is a number. (Reading them whole takes a runtime whose <code>JSON.parse</code> gives a reviver the number's text: Node 21 and later, Deno, recent browsers.)</p>
+<h3 id="files">Files<a class="anchor" href="#files" aria-label="Link to this section">#</a></h3>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>call</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>db.importFile(path, {format, table})</code></td>
+<td>a JSON Lines, JSON, CSV or TSV file: bulk-loaded into an empty table, else upserted; returns <code>{rows, bulk, skippedFields}</code></td>
+</tr>
+<tr>
+<td><code>fromSqlite(sqlitePath, path)</code>, <code>planSqlite</code>, <code>db.importSqlite</code>, <code>db.exportSqlite</code></td>
+<td><a href="sqlite.html">SQLite</a> in and out</td>
+</tr>
+<tr>
+<td><code>fromParquet(parquetPath, path)</code>, <code>planParquet</code>, <code>db.importParquet</code>, <code>db.exportParquet</code></td>
+<td><a href="parquet.html">Parquet</a> files and directories in and out, and <code>s3://</code> URLs</td>
+</tr>
+<tr>
+<td><code>upgrade(path)</code></td>
+<td>a database from before field ids, copied into this version's format</td>
+</tr>
+</tbody>
+</table></div>
+<p>Errors reject with a <code>ChloeDBError</code>, whose message is the database's (<code>StrataError</code>, its name before the rename, is the same class), and whose <code>code</code> is stable, the same here, from a server and in Python: the server's JSON <code>code</code> when it gives one, else the kind the message starts with (<code>busy: ...</code>), else the HTTP status. The common codes reject as subclasses of <code>ChloeDBError</code>, so <code>instanceof ChloeDBError</code> still holds for every one:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>code</th>
+<th>class</th>
+<th>when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bad_request</code></td>
+<td><code>BadRequestError</code></td>
+<td>a bad schema, query, value or request (400, 413, 422)</td>
+</tr>
+<tr>
+<td><code>unauthorized</code></td>
+<td><code>UnauthorizedError</code></td>
+<td>no token, or one without the rights needed (401, 403)</td>
+</tr>
+<tr>
+<td><code>not_found</code></td>
+<td><code>NotFoundError</code></td>
+<td>no such route, table or cursor (404)</td>
+</tr>
+<tr>
+<td><code>conflict</code></td>
+<td><code>ConflictError</code></td>
+<td>refused by the state it met (409): an <code>ifSeqNo</code> that no longer holds, an idempotency key still running, a <code>minSeqNo</code> past the server's last write</td>
+</tr>
+<tr>
+<td><code>partial_write</code></td>
+<td><code>PartialWriteError</code></td>
+<td>a coordinator wrote some shards and not others: send it again with the same idempotency key</td>
+</tr>
+<tr>
+<td><code>busy</code></td>
+<td><code>BusyError</code></td>
+<td>the database is open in another process, or another writer holds it</td>
+</tr>
+<tr>
+<td><code>overloaded</code></td>
+<td><code>OverloadedError</code></td>
+<td>refused for the server's load (429), after the client's retries</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>DeadlineError</code></td>
+<td>a deadline passed: <code>timeoutMs</code>, a coordinator's wait for a shard (504)</td>
+</tr>
+<tr>
+<td><code>unavailable</code></td>
+<td><code>UnavailableError</code></td>
+<td>no copy can serve it now (503)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Other codes are <code>memory</code> (a query past its memory budget), <code>corrupt</code>, <code>io</code>, <code>internal</code> and <code>error</code>; <code>errorCode(message, status, answer)</code> gives the code of any message.</p>
+<h2 id="a-server-from-javascript">A server from JavaScript<a class="anchor" href="#a-server-from-javascript" aria-label="Link to this section">#</a></h2>
+<pre data-lang="js" data-title="JavaScript">import { connect } from &quot;chloedb/client&quot;;   // or from &quot;chloedb&quot;
+
+const client = connect(&quot;http://127.0.0.1:7700&quot;, { token: process.env.CHLOEDB_TOKEN });
+await client.upsert([{ id: &quot;b2&quot;, title: &quot;A second book&quot;, year: 2001 }]);
+const r = await client.search(&quot;book&quot;, { limit: 5 });</pre>
+<p><code>Client</code> has the methods of <code>Database</code> that a server offers, over its <a href="server.html#http-api">HTTP API</a>, and more of the server's own: <code>health()</code>, <code>stats()</code>, <code>explain(sql)</code>, <code>put(key, row, {ifSeqNo})</code>, <code>stream(events)</code> (an iterable or async iterable of <a href="server.html#streams">stream events</a>, applied once), <code>source(name)</code> and <code>sources()</code>, <code>ask(question)</code> (the server's agent), and the file calls, which upload a path's bytes (Node, Bun, Deno) or bytes given (a <code>Uint8Array</code>, a <code>Blob</code>). <code>exportSqlite(null)</code> and <code>exportParquet(null)</code> give the file's bytes instead of writing it. Rows are written 1,000 a request, keys read 10,000 a request. An error the server answers rejects with a <code>ChloeDBError</code> whose <code>status</code> is the HTTP status and <code>answer</code> its JSON; one where the server cannot be reached rejects with <code>fetch</code>'s error. <code>timeout</code> (milliseconds, 30 seconds by default) bounds each request, and <code>fetch</code> takes another fetch. A request the server refuses for its load (429: <a href="server.html#streams">behind on flushing</a> its writes, its write queue full, too many queries running) did nothing, so the client sends it again after the <code>Retry-After</code> the server gives, for up to <code>retryFor</code> milliseconds (10 seconds; 0 sends each request once), and rejects with the 429 after that. A write that failed partway on a cluster (an error with <code>"partial": true</code>) is not sent again, since the shards that took it keep it, unless it has an idempotency key.</p>
+<p><code>write(ops, {idempotencyKey})</code> and <code>sql(sql, params, {idempotencyKey})</code> send a write with an <a href="server.html#when-a-write-fails">idempotency key</a>, so that sending it again does not apply it twice. A write that failed partway through a coordinator rejects with a <code>ChloeDBError</code> whose <code>answer</code> says so (<code>partial: true</code>) and names its key: <code>await client.write(ops, { idempotencyKey: e.answer.idempotency_key })</code> writes the rest.</p>
+<h3 id="reading-your-own-writes">Reading your own writes<a class="anchor" href="#reading-your-own-writes" aria-label="Link to this section">#</a></h3>
+<p>A read from a <a href="server.html#replication-a-primary-and-its-replicas">replica</a>, or through a coordinator whose shards have replicas, can be answered by a copy that has not applied a write yet. Servers that number their writes (<code>--seq-no</code>) fix that with sequence numbers (<a href="server.html#reads-that-see-a-write">reads that see a write</a>):</p>
+<ul>
+<li><code>writeResult(ops, {idempotencyKey})</code> is <code>write</code> answering <code>{written, seqNo, seqNos, skipped}</code>: <code>seqNo</code> from a server, <code>seqNos</code> (one per shard) from a coordinator, neither from a server without <code>--seq-no</code>. <code>write</code>, <code>insert</code>, <code>upsert</code>, <code>delete</code>, <code>put</code> and <code>sql</code> still answer the number of rows.</li>
+<li><code>query(sql, params, {minSeqNo, minSeqNos})</code>, <code>search(text, {minSeqNo, minSeqNos})</code>, <code>get(key, {minSeqNo, minSeqNos})</code>, <code>getMany</code>, <code>sql</code> (a SELECT), <code>run</code> (a read plan) and <code>sidNext</code> take them: the copy that answers holds those writes (a replica waits up to a second; a server refuses a number past its last write, 409).</li>
+<li><code>client.session()</code> (or <code>new Session(url, options)</code>) is a client that does this itself: it keeps the latest numbers its own writes answered (<code>session.seqNo</code>, <code>session.seqNos</code>) and sends them with each of its reads, so reading your own writes is one line. <code>session.observe(answer)</code> adds another client's write.</li>
+</ul>
+<pre data-lang="js" data-title="JavaScript">const s = connect(&quot;http://coordinator:7700&quot;).session();
+await s.upsert({ id: &quot;u1&quot;, name: &quot;Ada&quot; });
+await s.get(&quot;u1&quot;); // sees the upsert, whichever copy answers
+
+const w = await client.writeResult([{ op: &quot;upsert&quot;, doc: { id: &quot;u2&quot;, name: &quot;Grace&quot; } }]);
+await client.get(&quot;u2&quot;, { minSeqNo: w.seqNo, minSeqNos: w.seqNos });</pre>
+<p>The numbers go with reads only: a server refuses them on a write, so a session leaves them off an <code>INSERT</code>, <code>UPDATE</code> or <code>DELETE</code> by <code>sql</code>, judging a statement by its first word. A <code>Database</code> in the process ignores them: it reads every write it committed.</p>
+<p>In a browser, the client works from pages of the server's own origin (a page it serves, or behind the same reverse proxy): chloedb-server sends no CORS headers, and refuses writes from pages of other sites (<a href="server.html#security">security</a>).</p>
+<h2 id="search-on-the-device">Search on the device<a class="anchor" href="#search-on-the-device" aria-label="Link to this section">#</a></h2>
+<p><code>openNearby(url, table, dir)</code> holds a <a href="slices.html">slice</a> of a chloedb-server's table near a user: the rows of the tiles around them in a database in <code>dir</code>, searched with the server's statistics. <code>moveTo(lat, lon)</code> fetches the tiles it lacks, and <code>search(q, { k, d0 })</code> answers on the device when it can prove the answer is the server's, and asks the server otherwise; the result's <code>where</code> is <code>"device"</code> or <code>"server"</code> and <code>why</code> the reason. For a <a href="slices.html#vector-slices-more-like-this-on-the-device">vector slice</a>, <code>focus(taste, { rows })</code> holds the clusters nearest a taste vector and <code>similar(vector, { k })</code> answers a similarity search the same way, fetching the few clusters its codes name when that proves the answer.</p>
+<pre data-lang="js" data-title="JavaScript">import { openNearby } from &quot;chloedb&quot;;
+
+const near = await openNearby(&quot;http://127.0.0.1:7700&quot;, &quot;places&quot;, &quot;./slice&quot;);
+await near.moveTo(40.7484, -73.9857);
+const r = await near.search(&quot;pizza&quot;, { k: 10 });
+console.log(r.where, r.why);   // device proved</pre>
+<h2 id="bun-and-deno">Bun and Deno<a class="anchor" href="#bun-and-deno" aria-label="Link to this section">#</a></h2>
+<p>Bun loads the addon as Node does: <code>bun run app.js</code>. Deno loads it through its Node compatibility with <code>--allow-ffi</code> (and <code>--allow-read</code>, <code>--allow-write</code>, <code>--allow-env</code> for the files and <code>$CHLOEDB_MODELS</code>); the client needs only <code>--allow-net</code>.</p>
+<h2 id="tests">Tests<a class="anchor" href="#tests" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">cd chloedb-js
+npm run build -- --profile ci             # optimised, built faster than release
+npm test                                  # node --test</pre>
+<p>The client's tests start <code>chloedb-server/target/release/chloedb-server</code> (or <code>$CHLOEDB_SERVER</code>) and are skipped when it is not built.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/javascript.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="frames.html">← DataFrames</a><a href="java.html">Java and JDBC →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

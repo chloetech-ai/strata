@@ -1247,7 +1247,9 @@ impl Follow {
     /// A replica started with `--replica`, as [`Self::open`]: on a database
     /// that had no part in replication yet, it is one of its shard's first
     /// copies, which count among the copies a majority is counted of from
-    /// the start, as Raft's first members do ([`shard::Replica::open`]).
+    /// the start, as Raft's first members do, but vote only for a copy that
+    /// heard from no primary either until one calls them: a replica whose
+    /// volume was lost starts so too ([`shard::Replica::open`], N-E2).
     pub fn open_first(db: Arc<Db>, file: Option<&Path>) -> Result<Follow, String> {
         Follow::open_as(db, file, true)
     }
@@ -1575,8 +1577,8 @@ impl Follow {
     /// What it does with a call from `primary` of `term` before it applies
     /// anything ([`shard::Replica::take`]): `Some` answer to give at once,
     /// or `None` once it follows that primary (kept beside the database).
-    fn take(&self, term: u64, primary: &str, member: bool, config: (u64, u32), n: &Numbering) -> Result<Option<pb::ReplicateResponse>, ApiError> {
-        let take = self.core().take(term, primary, member, config, n)?;
+    fn take(&self, term: u64, primary: &str, config: (u64, u32), n: &Numbering) -> Result<Option<pb::ReplicateResponse>, ApiError> {
+        let take = self.core().take(term, primary, config, n)?;
         match take {
             Take::Answer(a) => Ok(Some(a)),
             Take::Apply { kept } => {
@@ -1593,7 +1595,7 @@ impl Follow {
     pub async fn replicate(&self, r: pb::ReplicateRequest) -> Result<pb::ReplicateResponse, ApiError> {
         let _one = self.one.lock().await;
         let n = self.numbering()?;
-        if let Some(a) = self.take(r.term, &r.primary, r.member, (r.config, r.copies), &n)? {
+        if let Some(a) = self.take(r.term, &r.primary, (r.config, r.copies), &n)? {
             return Ok(a);
         }
         // Nothing else writes here: the transaction the call follows, when
@@ -1629,7 +1631,14 @@ impl Follow {
             self.applied.fetch_add(count, Ordering::Relaxed);
         }
         let db_term = self.db.storage().numbering().map_or(0, |n| n.term);
-        self.core().applied(r.term, r.behind, r.global_checkpoint, applied, db_term)
+        let a = self.core().applied(r.term, r.behind, r.global_checkpoint, applied, db_term)?;
+        // A member from the first call that finds it caught up (N-E2).
+        let joined = self.core().joined(r.member);
+        if let Some(k) = joined {
+            save_kept(&k, self.file.as_deref()).map_err(|e| ApiError::internal(format!("keep that this replica counts among its shard's copies: {e}")))?;
+            self.core().took(Some(k), Instant::now());
+        }
+        Ok(a)
     }
 
     /// Its digests at the version a call from its primary pinned
@@ -1675,7 +1684,7 @@ impl Follow {
         let first = chunks.message().await.map_err(cut)?.ok_or_else(|| ApiError::bad("the copy is empty"))?;
         let one = self.one.clone().lock_owned().await;
         let n = self.numbering()?;
-        if let Some(a) = self.take(first.term, &first.primary, false, (first.config, 0), &n)? {
+        if let Some(a) = self.take(first.term, &first.primary, (first.config, 0), &n)? {
             return Ok(a);
         }
         // Its rows are behind its primary's log, or differ: no reads

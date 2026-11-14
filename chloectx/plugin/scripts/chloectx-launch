@@ -1,0 +1,400 @@
+#!/bin/sh
+# ChloeCtx's launcher, which the plugin's hooks and MCP server run: it runs
+# the chloectx program with the arguments it was given.
+#
+# It runs the first chloectx it finds:
+#   1. $CHLOECTX_BIN, when it is set;
+#   2. chloectx on PATH;
+#   3. $CHLOECTX_PREFIX/bin/chloectx (default ~/.local/bin/chloectx), where
+#      the repository's install.sh, the website's installer and this script
+#      put it.
+# With none, it sets ChloeCtx up once, in the background:
+#   - downloads the prebuilt chloectx of the release that matches the plugin's
+#     version (the archive chloectx-<platform>.tar.gz of the release
+#     chloedb-server-v<version>, or of the newest release when that one has
+#     none), checks its SHA-256 against the release's and installs it into
+#     ~/.local/bin;
+#   - only where there is no prebuilt one (or the download failed), builds it
+#     from a checkout with cargo: $CHLOECTX_SOURCE, or the clone of the
+#     marketplace this plugin came from (CHLOECTX_BUILD=0: never);
+#   - fetches the embedding model (`chloectx fetch-model`, 129 MB, once).
+# Until that is done the hooks record nothing (the first session start says
+# so) and the MCP server waits for it up to $CHLOECTX_PLUGIN_WAIT seconds
+# (default 25). What it did is in setup.log in the plugin's data folder.
+#
+# By hand:
+#   chloectx-launch setup     set up in the foreground, saying what it does
+#   chloectx-launch where     print the chloectx it runs, or why there is none
+#   chloectx-launch ARGS...   run chloectx ARGS (setting it up first if need be)
+#
+# It sets CHLOECTX_PLUGIN=1, so that chloectx knows the plugin called it (its
+# hooks then step aside where `chloectx install` hooks run too), and
+# CHLOECTX_DISTILL_MODEL=haiku when the session has not set one.
+# Needs: sh, curl or wget, tar, and sha256sum or shasum.
+
+set -u
+
+REPO=${CHLOECTX_REPO:-chloetech-ai/chloedb}
+RELEASES_URL=${CHLOECTX_RELEASES_URL:-https://github.com/$REPO/releases/download}
+API_URL=${CHLOECTX_RELEASES_API:-https://api.github.com/repos/$REPO/releases?per_page=100}
+here=$(cd "$(dirname "$0")" && pwd)
+root=${CLAUDE_PLUGIN_ROOT:-$(dirname "$here")}
+self="$here/$(basename "$0")"
+data=${CLAUDE_PLUGIN_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/chloectx/plugin}
+prefix=${CHLOECTX_PREFIX:-$HOME/.local}
+log="$data/setup.log"
+
+export CHLOECTX_PLUGIN=1
+if [ -z "${CHLOECTX_DISTILL_MODEL:-}" ]; then
+  CHLOECTX_DISTILL_MODEL=haiku
+  export CHLOECTX_DISTILL_MODEL
+fi
+
+# The plugin's version: the release whose chloectx it downloads.
+plugin_version() {
+  sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$root/.claude-plugin/plugin.json" 2> /dev/null | head -n 1
+}
+
+# The chloectx to run, or nothing.
+find_bin() {
+  if [ -n "${CHLOECTX_BIN:-}" ]; then
+    [ -x "$CHLOECTX_BIN" ] && echo "$CHLOECTX_BIN"
+    return
+  fi
+  b=$(command -v chloectx 2> /dev/null) || b=
+  if [ -n "$b" ] && [ -x "$b" ]; then echo "$b"; return; fi
+  [ -x "$prefix/bin/chloectx" ] && echo "$prefix/bin/chloectx"
+}
+
+# A message as a JSON string's contents.
+json_text() {
+  printf '%s' "$1" | tr '\n\t' '  ' | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Whether the background setup is running.
+setup_running() {
+  [ -d "$data/setup.lock" ] || return 1
+  pid=$(cat "$data/setup.lock/pid" 2> /dev/null) || pid=
+  [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null
+}
+
+# Starts the setup in the background, unless it runs already.
+start_setup() {
+  mkdir -p "$data" 2> /dev/null || return 1
+  setup_running && return 0
+  # A lock whose setup died (a machine that slept, a kill) is taken over.
+  rm -rf "$data/setup.lock"
+  if command -v setsid > /dev/null 2>&1; then
+    setsid "$self" __setup >> "$log" 2>&1 < /dev/null &
+  else
+    nohup "$self" __setup >> "$log" 2>&1 < /dev/null &
+  fi
+}
+
+# Waits up to $1 seconds for the setup to finish; ready or not.
+wait_ready() {
+  n=0
+  while [ "$n" -lt "$(($1 * 2))" ]; do
+    [ -f "$data/ready" ] && return 0
+    [ -f "$data/failed" ] && ! setup_running && return 1
+    sleep 0.5 2> /dev/null || sleep 1
+    n=$((n + 1))
+  done
+  [ -f "$data/ready" ]
+}
+
+# ---------------------------------------------------------------- the setup
+
+say() { printf '%s\n' "chloectx-launch: $*" >&2; }
+fail() {
+  printf '%s\n' "$*" > "$data/failed"
+  say "$*"
+  exit 1
+}
+
+fetch() {
+  case "$1" in
+    /*) if [ $# -gt 1 ]; then cp "$1" "$2"; else cat "$1"; fi; return ;;
+    file://*) p=${1#file://}; if [ $# -gt 1 ]; then cp "$p" "$2"; else cat "$p"; fi; return ;;
+  esac
+  if command -v curl > /dev/null 2>&1; then
+    if [ $# -gt 1 ]; then curl -fsSL --retry 2 --connect-timeout 10 -o "$2" "$1"; else curl -fsSL --retry 2 --connect-timeout 10 "$1"; fi
+  elif command -v wget > /dev/null 2>&1; then
+    if [ $# -gt 1 ]; then wget -q -T 10 -O "$2" "$1"; else wget -q -T 10 -O - "$1"; fi
+  else
+    say "needs curl or wget to download chloectx"
+    return 1
+  fi
+}
+
+sha256() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
+# This machine's archive name (linux-x86_64, macos-arm64, ...), or a reason
+# there is none on stderr.
+platform() {
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "$os" in
+    Linux) os=linux ;;
+    Darwin) os=macos ;;
+    *) say "no prebuilt chloectx for $os (on Windows, run Claude Code inside WSL 2)"; return 1 ;;
+  esac
+  case "$arch" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) if [ "$os" = macos ]; then arch=arm64; else arch=aarch64; fi ;;
+    *) say "no prebuilt chloectx for $os on $arch"; return 1 ;;
+  esac
+  if [ "$os" = macos ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n sysctl.proc_translated 2> /dev/null || echo 0)" = 1 ]; then
+    arch=arm64
+  fi
+  if [ "$os" = linux ]; then
+    glibc=$( (getconf GNU_LIBC_VERSION 2> /dev/null || true) | sed -n 's/^glibc \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+    if [ -z "$glibc" ]; then say "the prebuilt chloectx needs glibc, and this Linux has none (Alpine and other musl systems)"; return 1; fi
+    major=${glibc%%.*}
+    minor=${glibc#*.}
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 35 ]; }; then
+      say "the prebuilt chloectx needs glibc 2.35 or later, and this machine has $glibc"
+      return 1
+    fi
+  fi
+  echo "$os-$arch"
+}
+
+# The newest chloedb-server release's version.
+latest_version() {
+  case "$RELEASES_URL" in https://github.com/*) ;; *) return 1 ;; esac
+  fetch "$API_URL" | sed -n 's/.*"tag_name": *"chloedb-server-v\([0-9][0-9.]*\)".*/\1/p' | head -n 1
+}
+
+# Downloads release $1's chloectx for platform $2 into $prefix/bin, after
+# checking its SHA-256. Fails, with the reason on stderr, when it cannot.
+download() {
+  ver=$1 plat=$2
+  name="chloectx-$plat"
+  url="$RELEASES_URL/chloedb-server-v$ver/$name.tar.gz"
+  tmp=$(mktemp -d 2> /dev/null || mktemp -d -t chloectx) || return 1
+  say "downloading $url"
+  if ! fetch "$url" "$tmp/$name.tar.gz"; then say "could not download $url"; rm -rf "$tmp"; return 2; fi
+  if ! fetch "$url.sha256" "$tmp/$name.tar.gz.sha256"; then say "could not download $url.sha256"; rm -rf "$tmp"; return 1; fi
+  sum_want=$(cut -d' ' -f1 < "$tmp/$name.tar.gz.sha256" | tr 'A-F' 'a-f')
+  sum_got=$(sha256 "$tmp/$name.tar.gz") || { say "needs sha256sum or shasum to check the download"; rm -rf "$tmp"; return 1; }
+  if [ -z "$sum_want" ] || [ "$sum_want" != "$sum_got" ]; then
+    say "the download's SHA-256 is $sum_got, and the release says $sum_want: not installing it"
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! tar -xzf "$tmp/$name.tar.gz" -C "$tmp" || [ ! -f "$tmp/$name/chloectx" ]; then
+    say "the archive has no $name/chloectx"
+    rm -rf "$tmp"
+    return 1
+  fi
+  mkdir -p "$prefix/bin" || { rm -rf "$tmp"; return 1; }
+  # Into a temporary name and renamed, so that a daemon running the old file
+  # keeps running and a failed copy leaves the old one in place.
+  cp "$tmp/$name/chloectx" "$prefix/bin/.chloectx.new" && chmod 755 "$prefix/bin/.chloectx.new" \
+    && mv -f "$prefix/bin/.chloectx.new" "$prefix/bin/chloectx" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  if ! "$prefix/bin/chloectx" --version > /dev/null 2>&1; then
+    say "installed $prefix/bin/chloectx, but it does not start on this machine: run it to see why"
+    return 1
+  fi
+  say "installed $prefix/bin/chloectx ($("$prefix/bin/chloectx" --version 2>&1 | head -n 1))"
+}
+
+# A checkout to build chloectx from: $CHLOECTX_SOURCE, the checkout this
+# plugin is in (a marketplace added from a local folder), or the clone of a
+# marketplace added from GitHub.
+checkout() {
+  plugins=${CLAUDE_CODE_PLUGIN_CACHE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins}
+  {
+    printf '%s\n' "${CHLOECTX_SOURCE:-}" "$root/../.."
+    # Where Claude Code keeps each marketplace: a clone, or the folder added.
+    sed -n 's/.*"installLocation": *"\([^"]*\)".*/\1/p' "$plugins/known_marketplaces.json" 2> /dev/null
+    for d in "$plugins"/marketplaces/*; do printf '%s\n' "$d"; done
+  } | while IFS= read -r d; do
+    if [ -n "$d" ] && [ -f "$d/chloectx/Cargo.toml" ] && [ -f "$d/install.sh" ]; then
+      (cd "$d" && pwd)
+      exit 0
+    fi
+  done
+}
+
+# Builds chloectx from a checkout into $prefix/bin (minutes, the first time).
+build() {
+  [ "${CHLOECTX_BUILD:-1}" = 0 ] && { say "not building chloectx from source (CHLOECTX_BUILD=0)"; return 1; }
+  src=$(checkout)
+  [ -n "$src" ] || { say "no checkout of chloetech-ai/chloedb to build chloectx from (set CHLOECTX_SOURCE to one)"; return 1; }
+  command -v cargo > /dev/null 2>&1 || { say "building chloectx from $src needs Rust (cargo, from https://rustup.rs) and a C compiler"; return 1; }
+  say "building chloectx from $src (a release build: several minutes the first time)"
+  (cd "$src" && sh ./install.sh --no-wire --prefix "$prefix") >&2 || { say "the build in $src failed (above)"; return 1; }
+  [ -x "$prefix/bin/chloectx" ]
+}
+
+setup() {
+  mkdir -p "$data" || exit 1
+  mkdir "$data/setup.lock" 2> /dev/null || { say "another setup is running (see $log)"; exit 3; }
+  echo $$ > "$data/setup.lock/pid"
+  trap 'rm -rf "$data/setup.lock"' EXIT
+  trap 'exit 1' INT TERM
+  rm -f "$data/failed"
+  say "setup started $(date 2> /dev/null)"
+
+  want=${CHLOECTX_VERSION:-$(plugin_version)}
+  want=${want#v}
+  bin=$(find_bin)
+  # A chloectx this script downloaded is replaced when the plugin moves to
+  # another version; one installed otherwise is the person's own to upgrade.
+  ours=
+  if [ -f "$data/ready" ]; then
+    read -r kind had _ path < "$data/ready" || true
+    [ "${kind:-}" = downloaded ] && [ "${path:-}" = "$bin" ] && [ "${had:-}" != "$want" ] && ours=1
+  fi
+  got=
+  if [ -z "$bin" ] || [ -n "$ours" ]; then
+    reason=
+    if plat=$(platform); then
+      if [ -n "$want" ]; then
+        download "$want" "$plat"
+        st=$?
+        got=$want
+      else
+        st=2
+      fi
+      # The plugin's version may not be released yet: the newest release.
+      if [ "$st" = 2 ] && [ -z "${CHLOECTX_VERSION:-}" ]; then
+        latest=$(latest_version) || latest=
+        if [ -n "$latest" ] && [ "$latest" != "$want" ]; then
+          say "no chloectx in release $want; trying the newest release, $latest"
+          download "$latest" "$plat"
+          st=$?
+          got=$latest
+        fi
+      fi
+      [ "$st" = 0 ] || reason="no prebuilt chloectx $want could be installed"
+    else
+      reason="no prebuilt chloectx for this machine"
+    fi
+    if [ -n "$reason" ]; then
+      if [ -n "$bin" ]; then
+        say "$reason; keeping $bin"
+        got=kept
+      elif build; then
+        got=built
+      else
+        fail "$reason, and building it did not work either (the log says why); install chloectx another way: https://chloetech-ai.github.io/chloedb/site/docs/chloectx-setup.html"
+      fi
+    fi
+    bin=$(find_bin)
+    [ -n "$bin" ] || fail "chloectx was installed into $prefix/bin, but it is not found there"
+    # Daemons of the old program keep serving until they stop.
+    if [ -n "$ours" ] && [ "$got" != kept ]; then "$bin" stop --all > /dev/null 2>&1; fi
+  fi
+
+  say "fetching the embedding model with $bin fetch-model"
+  "$bin" fetch-model >&2 || fail "$bin fetch-model failed (above); run it again by hand to see why"
+  if [ "$got" = built ] || [ -z "$got" ]; then
+    echo "found - - $bin" > "$data/ready.new"
+  else
+    echo "downloaded $want $got $bin" > "$data/ready.new"
+  fi
+  mv -f "$data/ready.new" "$data/ready"
+  say "ready: $bin"
+}
+
+# ---------------------------------------------------------------- the launch
+
+case "${1:-}" in
+  __setup)
+    setup
+    exit 0
+    ;;
+  setup)
+    mkdir -p "$data"
+    "$self" __setup
+    st=$?
+    [ "$st" = 3 ] && wait_ready 3600
+    [ -f "$data/ready" ] || exit 1
+    echo "ChloeCtx is set up: $(find_bin)"
+    exit 0
+    ;;
+  where)
+    b=$(find_bin)
+    if [ -n "$b" ]; then echo "$b"; exit 0; fi
+    echo "no chloectx: not \$CHLOECTX_BIN, not on PATH, not in $prefix/bin; \`$self setup\` installs it" >&2
+    exit 1
+    ;;
+esac
+
+# The hook's event: its last argument.
+event=
+if [ "${1:-}" = hook ]; then
+  for a in "$@"; do event=$a; done
+fi
+
+bin=$(find_bin)
+if [ -n "$bin" ] && [ -f "$data/ready" ]; then
+  # A downloaded chloectx of another version than the plugin's is replaced
+  # in the background (tried again at a session's start after a failure);
+  # this one runs meanwhile.
+  read -r kind had _ path < "$data/ready" || true
+  if [ "${kind:-}" = downloaded ] && [ "${path:-}" = "$bin" ] && [ "${had:-}" != "${CHLOECTX_VERSION:-$(plugin_version)}" ]; then
+    if [ "$event" = SessionStart ] || [ ! -f "$data/failed" ]; then
+      rm -f "$data/failed"
+      start_setup
+    fi
+  fi
+  exec "$bin" "$@"
+fi
+
+case "${1:-}" in
+  hook)
+    # A failed setup is tried again at a session's start, not at every hook.
+    if [ "$event" = SessionStart ] || [ ! -f "$data/failed" ]; then
+      [ "$event" = SessionStart ] && rm -f "$data/failed"
+      start_setup
+    fi
+    # The start of a session waits a little: a setup that only checks the
+    # model is done in a second.
+    if [ "$event" = SessionStart ] && wait_ready 8; then
+      bin=$(find_bin)
+      [ -n "$bin" ] && exec "$bin" "$@"
+    fi
+    cat > /dev/null
+    if [ "$event" = SessionStart ]; then
+      if [ -f "$data/failed" ] && ! setup_running; then
+        msg="ChloeCtx could not set itself up, so this session is not recorded: $(head -c 600 "$data/failed"). Details: $log"
+      else
+        msg="ChloeCtx is setting itself up (downloading chloectx and its 129 MB embedding model, once), so memory is not recorded yet; it starts with a later prompt or the next session. Progress: $log"
+      fi
+      printf '{"systemMessage": "%s"}\n' "$(json_text "$msg")"
+    fi
+    exit 0
+    ;;
+  mcp)
+    start_setup
+    if wait_ready "${CHLOECTX_PLUGIN_WAIT:-25}"; then
+      bin=$(find_bin)
+      [ -n "$bin" ] && exec "$bin" "$@"
+    fi
+    if [ -f "$data/failed" ]; then
+      say "ChloeCtx could not set itself up: $(cat "$data/failed")"
+    else
+      say "ChloeCtx is still setting itself up (see $log); its tools come with the next session"
+    fi
+    exit 1
+    ;;
+  *)
+    "$self" setup >&2 || exit 1
+    bin=$(find_bin)
+    [ -n "$bin" ] || exit 1
+    exec "$bin" "$@"
+    ;;
+esac

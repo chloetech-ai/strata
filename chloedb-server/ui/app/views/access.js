@@ -9,7 +9,7 @@
 
 import * as core from "../core.js";
 import { h, icon, clear, fmt, card, api, every, toast, modal, seg, empty, table, copy, failure, bus, setToken, menu } from "../core.js";
-import { state, refreshWho, isProduction } from "../data.js";
+import { state, refreshWho, isProduction, managed, specName } from "../data.js";
 import { tables as catalogTables } from "../catalog.js";
 
 export default {
@@ -502,7 +502,7 @@ function render(page, r) {
       cs.length > 1 ? (missing.length
         ? h("b", { style: { color: "var(--warn)" } }, `${cs.length - missing.length} of ${cs.length} coordinators answered: ${missing.map((c) => c.name || c.url).join(", ")} did not, so what went through ${missing.length === 1 ? "it" : "them"} is missing here · `)
         : `Every coordinator's log (${cs.length}) · `) : null,
-      audit.file ? `Written to ${audit.file} on the server` : "Kept in memory only: start the server with --audit-log FILE to keep it",
+      audit.file ? `Written to ${audit.file} on the server` : managed() ? `Kept in memory only: give each coordinator a volume (spec.coordinatorStorage in the StrataCluster ${specName()}) to keep it` : "Kept in memory only: start the server with --audit-log FILE to keep it",
       audit.kinds ? " · the latest 20,000 changes here" : ` · this server keeps its latest 2,000 requests here, reads among them`,
       win.from || win.to ? [" · only ", core.span ? core.span(win.from || 0, win.to || now()) : `${at(win.from)} – ${at(win.to)}`, " · ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); win = { from: null, to: null }; setParams(); load(); } }, "show all")] : null,
     ]);

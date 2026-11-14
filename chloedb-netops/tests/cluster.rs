@@ -167,6 +167,14 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     assert_eq!(m["name"], "netops");
     let view = api.http.get(format!("{}/ui/view.js", api.url)).bearer_auth(TOKEN).send().await.unwrap().text().await.unwrap();
     assert!(view.contains("export default { render }"), "the view is a module the command center can load");
+    // A client that has the view asks again with its ETag and is told it is the same, with no body.
+    let r = api.http.get(format!("{}/ui/view.js", api.url)).bearer_auth(TOKEN).send().await.unwrap();
+    let tag = r.headers().get("etag").expect("the view has an ETag").to_str().unwrap().to_string();
+    let again = api.http.get(format!("{}/ui/view.js", api.url)).bearer_auth(TOKEN).header("if-none-match", &tag).send().await.unwrap();
+    assert_eq!(again.status(), 304, "the view is not sent again");
+    assert!(again.bytes().await.unwrap().is_empty());
+    let other = api.http.get(format!("{}/ui/view.js", api.url)).bearer_auth(TOKEN).header("if-none-match", "\"0\"").send().await.unwrap();
+    assert_eq!(other.status(), 200, "another version is sent whole");
 
     // The network it built, read the way the page reads it.
     let st = api.get("/v1/status").await;
@@ -210,6 +218,9 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     assert!(len(&node["upstream"]) >= 1 && node["upstream"][0]["hop"] == 1, "what it hangs from: {}", node["upstream"]);
     assert!(node["history"].as_array().unwrap().iter().any(|h| h["node"] == fid && h["event"] == "fault" && h["relation"] == "this object"), "its own fault is in its history");
     assert!(node["queries"].as_array().unwrap().iter().any(|q| q["sql"].as_str().unwrap().contains("REACHABLE(netops_estate_edges")), "walked over the edge table");
+    // How such faults ended counts only the faults that read like this one, so its own cause comes first.
+    let own = node["history"].as_array().unwrap().iter().find(|h| h["node"] == fid && h["event"] == "fault").unwrap()["cause"].clone();
+    assert!(node["before"]["matched"].as_i64().unwrap_or(0) > 0 && node["before"]["ended"][0]["cause"] == own, "{fid} ({own}, {:?}) ended like: {}", node["before"]["words"], node["before"]["ended"]);
     if f["layer"] == "access" && f["state"] == "down" {
         // What is behind a dead access node says where its trouble comes from.
         let behind = api.get(&format!("/v1/map/view?x0={}&y0={}&x1={}&y1={}&t=4", x - r, y - r, x + r, y + r)).await;
@@ -519,6 +530,9 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     let lead = api.get("/v1/leadership?days=30").await;
     ran_sql(&lead, "leadership");
     assert!(len(&lead["services"]) == 12 && lead["incidents"]["count"].as_i64().unwrap() >= 6 && len(&lead["carriers"]) > 3 && lead["report"].as_str().unwrap().contains("Incidents."), "leadership: {}", lead["incidents"]);
+    // A rate measured over the telemetry kept and incident minutes over the period are said with their windows.
+    let objectives = lead["report"].as_str().unwrap().lines().find(|l| l.starts_with("Objectives.")).unwrap_or("").to_string();
+    assert!(objectives.contains(" h of telemetry") && objectives.contains("Over the 30 days of incidents"), "{objectives}");
 
     // Stop, start on the same folder: nothing is built again, and the
     // incidents, the judgments and the simulator's place are all still there.

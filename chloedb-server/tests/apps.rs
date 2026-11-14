@@ -38,7 +38,11 @@ async fn fake_app() -> (String, Seen) {
                 let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 s.lock().unwrap().push((method.to_string(), uri.to_string(), auth, String::from_utf8_lossy(&body).into_owned()));
                 if uri.path() == "/ui/view.js" {
-                    return ([("content-type", "text/javascript")], "export default { render() {} };").into_response();
+                    // Tagged, and not sent again to a browser that holds it.
+                    if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some("\"v1\"") {
+                        return (axum::http::StatusCode::NOT_MODIFIED, [("etag", "\"v1\"")]).into_response();
+                    }
+                    return ([("content-type", "text/javascript"), ("etag", "\"v1\"")], "export default { render() {} };").into_response();
                 }
                 ([("content-type", "application/json")], json!({"ok": true, "path": uri.path()}).to_string()).into_response()
             }
@@ -346,4 +350,28 @@ async fn the_server_starts_its_apps_and_keeps_them_running() {
         assert!(t0.elapsed() < Duration::from_secs(15), "the app outlived the server: {}", logs());
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+// NET-19: the proxy passed only Content-Type and Accept, so an app's view
+// (326 KB for netops) was fetched whole on every visit: it passes the
+// browser's If-None-Match and If-Modified-Since on, and the app's ETag and
+// a 304 back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apps_tags_reach_the_browser_and_a_304_comes_back() {
+    let (app_url, _seen) = fake_app().await;
+    let (base, _dir) = serve_apps(Apps::new(parse(&[format!("crawler={app_url}/")]).unwrap(), Some("app-secret".into()))).await;
+    let c = chloedb_server::http_client().build().unwrap();
+    let url = format!("{base}/v1/apps/crawler/ui/view.js");
+    let r = c.get(&url).bearer_auth("root-token").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.headers().get("etag").and_then(|v| v.to_str().ok()), Some("\"v1\""));
+    assert_eq!(r.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some("no-cache"), "asked again each time, with the tag");
+    assert!(r.text().await.unwrap().contains("render"));
+    let r = c.get(&url).bearer_auth("root-token").header("if-none-match", "\"v1\"").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 304);
+    assert_eq!(r.headers().get("etag").and_then(|v| v.to_str().ok()), Some("\"v1\""));
+    assert!(r.bytes().await.unwrap().is_empty());
+    // Another tag: the view again.
+    let r = c.get(&url).bearer_auth("root-token").header("if-none-match", "\"v0\"").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
 }

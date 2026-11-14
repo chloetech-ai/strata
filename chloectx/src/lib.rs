@@ -32,6 +32,7 @@ pub mod llm;
 pub mod mcp;
 pub mod next_files;
 pub mod paths;
+pub mod plugin;
 pub mod recall;
 pub mod receipt;
 pub mod record;

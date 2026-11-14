@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Build an app on chloedb-server · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="A shop in one page: search, stock that never oversells, holds that expire, and click events counted exactly once. Each part is a few lines of SQL or JSON over HTTP, with links to the reference for the rest.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/build-an-app.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html" aria-current="page">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Start</span>
+      <h1>Build an app on chloedb-server</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/build-an-app.md">docs/chloedb/build-an-app.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-a-server">Run a server</a></li><li><a href="#make-the-tables">Make the tables</a></li><li><a href="#write-rows">Write rows</a></li><li><a href="#search">Search</a></li><li><a href="#read-one-row-by-its-key">Read one row by its key</a></li><li><a href="#sell-stock-without-overselling">Sell stock without overselling</a></li><li><a href="#hold-an-item-for-ten-minutes">Hold an item for ten minutes</a></li><li><a href="#count-events-exactly-once">Count events exactly once</a></li><li><a href="#when-a-write-fails">When a write fails</a></li><li><a href="#grow-to-a-cluster">Grow to a cluster</a></li></ol></details>
+    <div class="doc-body">
+
+<p>A shop in one page: search, stock that never oversells, holds that expire, and click events counted exactly once. Each part is a few lines of SQL or JSON over HTTP, with links to the reference for the rest.</p>
+<h2 id="run-a-server">Run a server<a class="anchor" href="#run-a-server" aria-label="Link to this section">#</a></h2>
+<p>Download the server for your machine (no Rust or build needed), and start it on a new database:</p>
+<pre data-lang="sh">v=0.3.3 p=linux-x86_64   # or linux-aarch64, macos-arm64, macos-x86_64
+curl -LO https://github.com/chloetech-ai/chloedb/releases/download/chloedb-server-v$v/chloedb-server-$p.tar.gz
+tar xzf chloedb-server-$p.tar.gz &amp;&amp; cp chloedb-server-$p/chloedb-server ./chloedb-server
+./chloedb-server --db shop.chloedb --seq-no</pre>
+<p>The server listens on <code>http://127.0.0.1:7700</code> (HTTP JSON, and the command center in a browser) and on 7701 (gRPC). A new <code>--db</code> starts with no tables. <code>--seq-no</code> numbers every write, which the stock below needs. <a href="server.html#run-it">Run it</a> has the options, the source build (<code>cd chloedb-server &amp;&amp; cargo build --release</code>) and the image.</p>
+<h2 id="make-the-tables">Make the tables<a class="anchor" href="#make-the-tables" aria-label="Link to this section">#</a></h2>
+<p><code>POST /v1/sql</code> takes one statement:</p>
+<pre data-lang="sh">sql() { curl -s localhost:7700/v1/sql -H &#x27;content-type: application/json&#x27; -d &quot;$(jq -n --arg s &quot;$1&quot; &#x27;{sql: $s}&#x27;)&quot;; echo; }
+
+sql &quot;CREATE TABLE listings (id KEYWORD PRIMARY KEY, title TEXT, body TEXT, category KEYWORD,
+     price FLOAT, stock INT DEFAULT 0,
+     emb VECTOR OPTIONS(embed = &#x27;title, body&#x27;, model = &#x27;potion-base-8M&#x27;))&quot;
+sql &quot;CREATE TABLE holds (id KEYWORD PRIMARY KEY, listing KEYWORD NOT NULL, buyer KEYWORD NOT NULL,
+     until TIMESTAMP) OPTIONS(expire_by = &#x27;until&#x27;)&quot;
+sql &quot;CREATE TABLE buyers (id KEYWORD PRIMARY KEY, views INT DEFAULT 0)&quot;
+sql &quot;CREATE TABLE events (id INT PRIMARY KEY, buyer KEYWORD NOT NULL, listing KEYWORD, kind KEYWORD,
+     ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP) OPTIONS(shard_by = &#x27;buyer&#x27;)&quot;</pre>
+<ul>
+<li><code>TEXT</code> is searched by words, <code>KEYWORD</code> is matched whole (filters, facets), and every column is indexed.</li>
+<li><code>emb</code> is computed by the server from the title and body when a row is written, by a small model (potion-base-8M, 30 MB) that it downloads from Hugging Face when the table is created. Rows written before the model is ready get their vectors once it is; <code>GET /v1/schema</code> shows it <code>"loaded": true</code>.</li>
+<li><code>expire_by</code> makes a hold vanish at its <code>until</code>. <code>shard_by</code> keeps a buyer's events on one shard <a href="#grow-to-a-cluster">once there are several</a>.</li>
+</ul>
+<p>The <a href="sql.html#tables">query language</a> has every type and option.</p>
+<h2 id="write-rows">Write rows<a class="anchor" href="#write-rows" aria-label="Link to this section">#</a></h2>
+<p><code>POST /v1/write</code> applies a list of operations in one transaction:</p>
+<pre data-lang="sh">curl -s localhost:7700/v1/write -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;ops&quot;: [
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;listings&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;l1&quot;, &quot;title&quot;: &quot;Red camping tent&quot;, &quot;body&quot;: &quot;Two-person tent, light and waterproof&quot;, &quot;category&quot;: &quot;outdoor&quot;, &quot;price&quot;: 89.0, &quot;stock&quot;: 3}},
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;listings&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;l2&quot;, &quot;title&quot;: &quot;Blue desk lamp&quot;, &quot;body&quot;: &quot;LED lamp with a dimmer&quot;, &quot;category&quot;: &quot;home&quot;, &quot;price&quot;: 24.5, &quot;stock&quot;: 10}},
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;listings&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;l3&quot;, &quot;title&quot;: &quot;Trail running shoes&quot;, &quot;body&quot;: &quot;Light shoes for wet trails&quot;, &quot;category&quot;: &quot;outdoor&quot;, &quot;price&quot;: 120.0, &quot;stock&quot;: 0}}
+]}&#x27;
+# {&quot;written&quot;:3,&quot;seq_no&quot;:5,...}</pre>
+<p><code>insert</code> fails when the key exists, <code>upsert</code> replaces the row, <code>set</code> changes one column, <code>add</code> adds to a number (and creates the row with <code>doc</code> when it is missing), and <code>delete</code> removes a row by <code>key</code>. A 200 answer means the rows are durable. Files load through <a href="server.html#loading-rows"><code>/v1/import</code></a> (JSONL, CSV, Parquet, SQLite).</p>
+<h2 id="search">Search<a class="anchor" href="#search" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">q() { curl -s localhost:7700/v1/query -H &#x27;content-type: application/json&#x27; -d &quot;$1&quot;; echo; }
+
+# words, ranked by BM25, in stock, cheapest first among equals
+q &#x27;{&quot;sql&quot;: &quot;SELECT id, title, price FROM listings WHERE MATCH(title, :q) AND stock &gt; 0 ORDER BY bm25(title, :q) DESC, price LIMIT 10&quot;,
+    &quot;params&quot;: {&quot;q&quot;: &quot;tent&quot;}, &quot;objects&quot;: true}&#x27;
+# {&quot;columns&quot;:[&quot;id&quot;,&quot;title&quot;,&quot;price&quot;],&quot;rows&quot;:[{&quot;id&quot;:&quot;l1&quot;,&quot;price&quot;:89.0,&quot;title&quot;:&quot;Red camping tent&quot;}],...}
+
+# meaning, not words: the vector of the query text by the field&#x27;s model, fused with BM25
+q &#x27;{&quot;sql&quot;: &quot;SELECT id, title FROM listings ORDER BY rrf(bm25(body, :t), similarity(emb, :v)) DESC LIMIT 10&quot;,
+    &quot;params&quot;: {&quot;t&quot;: &quot;shelter for two&quot;, &quot;v&quot;: {&quot;embed&quot;: &quot;shelter for two&quot;}}, &quot;objects&quot;: true}&#x27;
+
+# facets: how many listings per category
+q &#x27;{&quot;sql&quot;: &quot;SELECT category, COUNT(*) FROM listings GROUP BY category&quot;, &quot;objects&quot;: true}&#x27;</pre>
+<p>Rows come as lists in the order of <code>columns</code>, or as objects with <code>"objects": true</code>. Typo tolerance, synonyms, phrase and prefix search, geographic and time decay, and reranking by a model are in the <a href="sql.html">query language</a>.</p>
+<h2 id="read-one-row-by-its-key">Read one row by its key<a class="anchor" href="#read-one-row-by-its-key" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">curl -s localhost:7700/v1/kv/listings/l1
+# {&quot;found&quot;:true,&quot;key&quot;:&quot;l1&quot;,&quot;row&quot;:{&quot;id&quot;:&quot;l1&quot;,...,&quot;stock&quot;:3},&quot;seq_no&quot;:5,&quot;table&quot;:&quot;listings&quot;,...}</pre>
+<p>No SQL is parsed: a read by key costs about what a key-value store's does (<a href="server.html#rows-by-key">rows by key</a>).</p>
+<h2 id="sell-stock-without-overselling">Sell stock without overselling<a class="anchor" href="#sell-stock-without-overselling" aria-label="Link to this section">#</a></h2>
+<p>Read the row with its <code>seq_no</code>, then write it back only if nobody wrote it since (<code>if_seq_no</code>). Of several buyers racing for the last item, exactly one write applies; the others get 409 and read again.</p>
+<pre data-lang="python">import json, urllib.request, urllib.error
+
+def call(method, path, body=None):
+    req = urllib.request.Request(&quot;http://127.0.0.1:7700&quot; + path, method=method,
+        data=None if body is None else json.dumps(body).encode(), headers={&quot;content-type&quot;: &quot;application/json&quot;})
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+def buy(listing):
+    while True:
+        got = call(&quot;GET&quot;, f&quot;/v1/kv/listings/{listing}&quot;)
+        if got[&quot;row&quot;][&quot;stock&quot;] &lt;= 0:
+            return False                                   # sold out
+        op = {&quot;op&quot;: &quot;set&quot;, &quot;table&quot;: &quot;listings&quot;, &quot;key&quot;: listing, &quot;field&quot;: &quot;stock&quot;,
+              &quot;value&quot;: got[&quot;row&quot;][&quot;stock&quot;] - 1, &quot;if_seq_no&quot;: got[&quot;seq_no&quot;]}
+        try:
+            call(&quot;POST&quot;, &quot;/v1/write&quot;, {&quot;ops&quot;: [op]})
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code != 409:                              # 409: someone bought meanwhile
+                raise</pre>
+<p>The Python package's client has the same calls (<code>chloedb.connect(url).get("l1", table="listings")</code>, <code>.write(ops)</code>); it needs only the standard library (<a href="python.html#a-server-from-python">Python</a>). More in <a href="server.html#conditional-writes">conditional writes</a>.</p>
+<h2 id="hold-an-item-for-ten-minutes">Hold an item for ten minutes<a class="anchor" href="#hold-an-item-for-ten-minutes" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">until=$(python3 -c &#x27;import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(minutes=10)).isoformat())&#x27;)
+curl -s localhost:7700/v1/write -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;ops&quot;: [{&quot;op&quot;: &quot;insert&quot;, &quot;table&quot;: &quot;holds&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;h1&quot;, &quot;listing&quot;: &quot;l1&quot;, &quot;buyer&quot;: &quot;b7&quot;, &quot;until&quot;: &quot;&#x27;&quot;$until&quot;&#x27;&quot;}}]}&#x27;</pre>
+<p>From <code>until</code> on, the hold is gone from every query, count and read by key, with nothing to clean up. <code>SELECT COUNT(*) FROM holds WHERE listing = 'l1'</code> is the number of live holds.</p>
+<h2 id="count-events-exactly-once">Count events exactly once<a class="anchor" href="#count-events-exactly-once" aria-label="Link to this section">#</a></h2>
+<p>Clicks and views come from a log (Kafka, a queue, a file). Send them to <code>POST /v1/stream</code> as NDJSON, each with its place in the log (<code>source</code>): the server keeps each source's last offset in the same transaction as the rows, so an event sent twice, after a crash or a retry, is skipped rather than counted again.</p>
+<pre data-lang="sh">printf &#x27;%s\n&#x27; \
+  &#x27;{&quot;source&quot;: {&quot;name&quot;: &quot;clicks/0&quot;, &quot;offset&quot;: 0}, &quot;ops&quot;: [{&quot;op&quot;: &quot;insert&quot;, &quot;table&quot;: &quot;events&quot;, &quot;doc&quot;: {&quot;id&quot;: 1, &quot;buyer&quot;: &quot;b7&quot;, &quot;listing&quot;: &quot;l1&quot;, &quot;kind&quot;: &quot;view&quot;}}, {&quot;op&quot;: &quot;add&quot;, &quot;table&quot;: &quot;buyers&quot;, &quot;key&quot;: &quot;b7&quot;, &quot;field&quot;: &quot;views&quot;, &quot;value&quot;: 1, &quot;doc&quot;: {&quot;id&quot;: &quot;b7&quot;}}]}&#x27; \
+  &#x27;{&quot;source&quot;: {&quot;name&quot;: &quot;clicks/0&quot;, &quot;offset&quot;: 1}, &quot;ops&quot;: [{&quot;op&quot;: &quot;insert&quot;, &quot;table&quot;: &quot;events&quot;, &quot;doc&quot;: {&quot;id&quot;: 2, &quot;buyer&quot;: &quot;b8&quot;, &quot;listing&quot;: &quot;l2&quot;, &quot;kind&quot;: &quot;view&quot;}}, {&quot;op&quot;: &quot;add&quot;, &quot;table&quot;: &quot;buyers&quot;, &quot;key&quot;: &quot;b8&quot;, &quot;field&quot;: &quot;views&quot;, &quot;value&quot;: 1, &quot;doc&quot;: {&quot;id&quot;: &quot;b8&quot;}}]}&#x27; |
+curl -s localhost:7700/v1/stream -H &#x27;content-type: application/x-ndjson&#x27; --data-binary @-
+# {&quot;batch&quot;:1,...,&quot;written&quot;:4,&quot;skipped&quot;:0,...}
+
+curl -s localhost:7700/v1/sources/clicks/0
+# {&quot;name&quot;:&quot;clicks/0&quot;,&quot;offset&quot;:1,...}: resume from offset 2</pre>
+<p>Send the same lines again and the answer says <code>"written":0,"skipped":4</code>. <a href="server.html#streams">Streams</a> has Kafka consumers and the change feed.</p>
+<h2 id="when-a-write-fails">When a write fails<a class="anchor" href="#when-a-write-fails" aria-label="Link to this section">#</a></h2>
+<p>An error means nothing of the write was applied, with one exception on a cluster (the last below):</p>
+<ul>
+<li><strong>429</strong>: the server refused the request for its load before doing anything (it is behind on flushing writes to disk, or its write queue is full). The <a href="python.html#a-server-from-python">Python</a> and <a href="javascript.html#a-server-from-javascript">JavaScript</a> clients send it again after the answer's <code>Retry-After</code>, for up to 10 seconds, and so does a coordinator for its shards; from <code>curl</code>, wait a second and send it again.</li>
+<li><strong>A lost answer</strong> (a timeout, a dropped connection): send the request again with the same <code>"idempotency_key"</code>. A server that applied it answers its first answer instead of applying it twice. Keys are kept for an hour.</li>
+<li><strong>409 with <code>if_seq_no</code></strong>: the row changed; read it again.</li>
+<li><strong><code>"partial": true</code></strong>, on a cluster: some shards took their part of the write and keep it, and the others did not. The answer names each shard's part and an <code>idempotency_key</code> (yours, or one the coordinator made): send the same request again with that key, and only the shards that did not take their part apply it. <a href="server.html#when-a-write-fails">When a write fails</a> has the details.</li>
+</ul>
+<h2 id="grow-to-a-cluster">Grow to a cluster<a class="anchor" href="#grow-to-a-cluster" aria-label="Link to this section">#</a></h2>
+<p>Several servers as shards, and one more as a coordinator, answer like one database: the same tables, SQL and HTTP API. Stop the server above, then:</p>
+<pre data-lang="sh">./chloedb-server --db s0.chloedb --seq-no --listen 127.0.0.1:7710 --grpc 127.0.0.1:7711 &amp;
+./chloedb-server --db s1.chloedb --seq-no --listen 127.0.0.1:7720 --grpc 127.0.0.1:7721 &amp;
+./chloedb-server --shards http://127.0.0.1:7711,http://127.0.0.1:7721 --listen 127.0.0.1:7700 &amp;</pre>
+<ul>
+<li>Rows go to shards by their key, or by the <code>shard_by</code> column, so a buyer's events sit on one shard.</li>
+<li>A shard added later starts as the first ones did: here on a new database with no <code>--schema</code>, since this cluster began with no tables. The coordinator gives it the cluster's tables, and a rebalance <a href="server.html#moving-slots">moves slots</a> onto it while rows keep being written:</li>
+</ul>
+<pre data-lang="sh">./chloedb-server --db s2.chloedb --seq-no --listen 127.0.0.1:7730 --grpc 127.0.0.1:7731 &amp;
+curl -s localhost:7700/v1/admin/shards -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;servers&quot;: [&quot;http://127.0.0.1:7731&quot;]}&#x27;
+curl -s localhost:7700/v1/admin/rebalance -X POST</pre>
+<ul>
+<li><a href="server.html#replication-a-primary-and-its-replicas">Replicas</a> of each shard take over when its primary fails.</li>
+</ul>
+<p>Through a coordinator, a few things work differently:</p>
+<ul>
+<li><strong>Graph queries</strong> (<code>REACHABLE</code>, <code>PATH</code>, <code>ppr</code>) run on one database only (<a href="graphs.html#on-a-cluster">graphs on a cluster</a>).</li>
+<li><strong><code>INSERT ... ON CONFLICT DO NOTHING</code></strong> and <strong><code>DO UPDATE</code></strong>, and <code>UPDATE</code> or <code>DELETE</code> with a <code>LIMIT</code>, are refused. <code>INSERT OR REPLACE</code> works.</li>
+<li><strong>A write across shards</strong> can fail on one shard after others took their part: send it again with the key its error gives (<a href="#when-a-write-fails">above</a>).</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/build-an-app.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="concepts.html">← Concepts</a><a href="search.html">Search guide →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

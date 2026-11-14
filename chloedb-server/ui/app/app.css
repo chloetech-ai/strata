@@ -3741,3 +3741,7 @@ pre.code.diff > .del { background: color-mix(in srgb, var(--crit) 14%, transpare
   .card > .hd { flex-wrap: wrap; row-gap: 6px; }
   .card > .hd .tools { flex-wrap: wrap; max-width: 100%; margin-left: 0; }
 }
+
+/* CCW-10: a view whose code is still loading says so, after a moment (a quick load shows nothing). */
+.view-loading { padding: 24px 0; animation: view-loading-in 0s 0.2s both; }
+@keyframes view-loading-in { from { visibility: hidden; } to { visibility: visible; } }

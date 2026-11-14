@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Slices: search on the device, the server as fallback · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="A slice is a copy of the rows of a table near a device&#x27;s user, which the device searches itself: near in space (a geo slice, for &quot;near me&quot; search) or near in meaning (a vector slice, for recommendations and &quot;more…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/slices.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html" aria-current="page">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Search and SQL</span>
+      <h1>Slices: search on the device, the server as fallback</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/slices.md">docs/chloedb/slices.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#when-an-answer-comes-from-the-device">When an answer comes from the device</a></li><li><a href="#turn-it-on">Turn it on</a></li><li><a href="#fresh-or-stale">Fresh or stale</a></li><li><a href="#from-python">From Python</a></li><li><a href="#from-javascript">From JavaScript</a></li><li><a href="#vector-slices-more-like-this-on-the-device">Vector slices: "more like this" on the device</a></li><li><a href="#what-the-server-sees">What the server sees</a></li></ol></details>
+    <div class="doc-body">
+
+<p>A slice is a copy of the rows of a table near a device's user, which the device searches itself: near in space (a geo slice, for "near me" search) or near in meaning (<a href="#vector-slices-more-like-this-on-the-device">a vector slice</a>, for recommendations and "more like this"). chloedb-server builds a geo slice from a table with a text field and a latitude and longitude: a manifest (the schema, a grid of square tiles, the text field's statistics) and one file of rows per tile. An app fetches the manifest and the tiles around its user, and searches them with the server's statistics, so every place it holds scores exactly as on the server. When it can prove that its answer is the server's, nothing leaves the device; otherwise it sends the same query to the server. Each answer says where it was answered and why.</p>
+<h2 id="when-an-answer-comes-from-the-device">When an answer comes from the device<a class="anchor" href="#when-an-answer-comes-from-the-device" aria-label="Link to this section">#</a></h2>
+<p>The server ranks by <code>bm25(text, q) / (1 + d² / d0²)</code>, where <code>d</code> is the distance to the user and <code>d0</code> the distance at which a place counts half. A place the device does not hold is at least <code>e</code> away, the distance to the nearest tile it lacks, so it scores at most the sum of the query words' best scores (in the manifest) divided by <code>1 + e² / d0²</code>. When the k-th score on the device reaches that, the device's top k is the server's. Each answer's <code>why</code> is one of:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>why</th>
+<th>where</th>
+<th>what it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>proved</code></td>
+<td>device</td>
+<td>the k-th local score beats the most a place not held could score</td>
+</tr>
+<tr>
+<td><code>no_match</code></td>
+<td>device</td>
+<td>no place in the table has a word of the search</td>
+</tr>
+<tr>
+<td><code>short</code></td>
+<td>server</td>
+<td>the device holds fewer than k matching places</td>
+</tr>
+<tr>
+<td><code>bound</code></td>
+<td>server</td>
+<td>a place beyond the tiles held could have scored higher</td>
+</tr>
+<tr>
+<td><code>stale</code></td>
+<td>server</td>
+<td>the table changed since the slice was built</td>
+</tr>
+</tbody>
+</table></div>
+<p>So a device answers short searches for common things near its user (pizza, a pharmacy) itself, and asks the server for rare things, for large k, and for wide <code>d0</code>.</p>
+<h2 id="turn-it-on">Turn it on<a class="anchor" href="#turn-it-on" aria-label="Link to this section">#</a></h2>
+<p>Slices exist only on a server started with <code>--slices DIR</code>. Build one from the command center (<strong>Data → Slices → Build a slice</strong>) or over HTTP:</p>
+<pre data-lang="sh">chloedb-server --db places.chloedb --slices ./slices --slices-rebuild-s 300 &amp;
+curl -X POST localhost:7700/v1/admin/slices -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;text&quot;: &quot;body&quot;, &quot;lat&quot;: &quot;lat&quot;, &quot;lon&quot;: &quot;lon&quot;, &quot;lat0&quot;: 40.7, &quot;lon0&quot;: -73.98, &quot;tile_m&quot;: 1000}&#x27;</pre>
+<p><code>lat0</code>, <code>lon0</code> are the grid's origin (the middle of the area, usually), <code>tile_m</code> the side of a tile in metres. <code>POST /v1/admin/slices</code> with <code>{"table": "places"}</code> alone rebuilds a slice as it was built, and <code>--slices-rebuild-s N</code> rebuilds every stale slice each N seconds. Without a slice the helpers below fail to open, and an app sends its searches to the server as it would without them.</p>
+<h2 id="fresh-or-stale">Fresh or stale<a class="anchor" href="#fresh-or-stale" aria-label="Link to this section">#</a></h2>
+<p>Before a device trusts its slice it asks <code>GET /v1/slices/&lt;table&gt;/status</code> (every 30 seconds by default), which answers the slice's version and whether the table changed since the build. A device fetches a slice of another version, and while the table has changed it sends every search to the server (<code>max_lag</code> lets it keep answering for a while). A slice is a snapshot: a row written after the build is not on any device until the next build.</p>
+<h2 id="from-python">From Python<a class="anchor" href="#from-python" aria-label="Link to this section">#</a></h2>
+<pre data-lang="python">import chloedb
+
+near = chloedb.nearby(&quot;http://127.0.0.1:7700&quot;, &quot;places&quot;, &quot;./slice&quot;)
+near.move_to(40.7484, -73.9857)       # fetches the tiles around the user
+r = near.search(&quot;pizza&quot;, k=10, d0=1000)
+print(r.where, r.why)                 # &quot;device&quot; or &quot;server&quot;, and why
+for row in r:
+    print(row[&quot;name&quot;])
+near.close()</pre>
+<p><code>chloedb.nearby(url, table, dir, token=None, reach=2, status_every=30, max_lag=0, report_every=20)</code>: <code>reach</code> is how many tiles each way it holds (2 is a 5 by 5 square), <code>dir</code> a cache it may delete. The result is a <code>Result</code> with <code>where</code>, <code>why</code>, <code>bound</code>, <code>edge_m</code>, <code>device_ms</code>, <code>server_ms</code>, and <code>ask</code>, the request that asks the server.</p>
+<h2 id="from-javascript">From JavaScript<a class="anchor" href="#from-javascript" aria-label="Link to this section">#</a></h2>
+<pre data-lang="js" data-title="JavaScript">import { openNearby } from &quot;chloedb&quot;;
+
+const near = await openNearby(&quot;http://127.0.0.1:7700&quot;, &quot;places&quot;, &quot;./slice&quot;);
+await near.moveTo(40.7484, -73.9857);
+const r = await near.search(&quot;pizza&quot;, { k: 10, d0: 1000 });
+console.log(r.where, r.why);
+for (const row of r) console.log(row.name);
+await near.close();</pre>
+<p>It runs where the native addon does (Node, Bun, Deno), with the same options as Python's in camel case (<code>statusEvery</code> and <code>maxLag</code> in milliseconds).</p>
+<h2 id="vector-slices-more-like-this-on-the-device">Vector slices: "more like this" on the device<a class="anchor" href="#vector-slices-more-like-this-on-the-device" aria-label="Link to this section">#</a></h2>
+<p>A slice can also cut a table by meaning: its VECTOR field into k-means clusters, each a file of rows. A device holds the clusters nearest its user's taste (a vector, such as the user's history summed) and answers <code>similarity</code> searches itself (recommendations for the user, tracks like the one playing) when it can prove that no row it lacks could beat its k-th.</p>
+<pre data-lang="sh">curl -X POST localhost:7700/v1/admin/slices -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;table&quot;: &quot;tracks&quot;, &quot;vector&quot;: &quot;emb&quot;}&#x27;</pre>
+<p><code>clusters</code> sets their number (about the square root of the rows by default, at most 4,096 then). The server's search is exact (<code>similarity(emb, :v, strategy =&gt; 'flat', rerank =&gt; &lt;rows&gt;)</code> re-scores every row), so a device's proved answer is the server's to the last bit.</p>
+<p>The manifest holds each cluster's centre, radius, angular radius and longest and shortest vector, from which a device bounds the most a row of a cluster it lacks could score. In many dimensions that bound is loose (a cluster's rows point every way from its centre, so none comes near the worst case), and on its own it proves few answers. So the slice also holds <code>codes.bin.gz</code>: every row's vector as one byte a dimension (64 bytes a row for 64 dimensions, a sixteenth of the rows' JSON), which bounds each row within half a step a dimension. A device that fetched the codes proves most searches near its user's taste, and when it cannot, the answer names the few clusters (<code>need</code>) whose rows could still beat its k-th. Once it holds them its answer is proved, so the helpers fetch them when they come to at most <code>refine</code> bytes (2 MB by default) and answer on the device.</p>
+<pre data-lang="python">tracks = chloedb.nearby(&quot;http://127.0.0.1:7700&quot;, &quot;tracks&quot;, &quot;./tracks&quot;)
+tracks.focus(taste, rows=20_000)      # the clusters nearest the taste, up to 20,000 rows
+r = tracks.similar(taste, k=10)       # or any vector
+print(r.where, r.why, r.fetched)      # &quot;device&quot;, &quot;proved&quot;, clusters it fetched to prove it</pre>
+<pre data-lang="js" data-title="JavaScript">const tracks = await openNearby(&quot;http://127.0.0.1:7700&quot;, &quot;tracks&quot;, &quot;./tracks&quot;);
+await tracks.focus(taste, { rows: 20000 });
+const r = await tracks.similar(taste, { k: 10 });</pre>
+<p><code>focus</code> keeps the clusters that fit in <code>rows</code> rows and drops those that fall beyond half as many again, so a taste that drifts does not fetch and drop the same clusters over and over. <code>codes=False</code> (<code>codes: false</code>) skips the codes; <code>{"codes": false}</code> builds a slice without them.</p>
+<p>On Yambda's 629,298 tracks (64-dimension vectors, 4,599 users, measured in a cloud container; <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb/results/slices#vector-slices-on-yambda-proving-similarity-search-on-the-device">the replay</a> has every number), with 4,096 clusters and 20,000 tracks on the device:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>search</th>
+<th style="text-align: right;">proved by the clusters' centres</th>
+<th style="text-align: right;">proved with the codes</th>
+<th style="text-align: right;">proved after fetching what the codes name</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>recommend for me, top 10</td>
+<td style="text-align: right;">4.5%</td>
+<td style="text-align: right;">94.9%</td>
+<td style="text-align: right;">100%, a median 64 KB when it fetches</td>
+</tr>
+<tr>
+<td>recommend for me, top 100</td>
+<td style="text-align: right;">2.1%</td>
+<td style="text-align: right;">61.3%</td>
+<td style="text-align: right;">100%, a median 157 KB</td>
+</tr>
+<tr>
+<td>more like the last track, top 10</td>
+<td style="text-align: right;">4.6%</td>
+<td style="text-align: right;">54.6%</td>
+<td style="text-align: right;">100%, a median 340 KB</td>
+</tr>
+</tbody>
+</table></div>
+<p>The codes are 30 bytes a track gzipped (19 MB for the catalogue). No proved answer was wrong. More clusters (smaller ones) make each fetch smaller and the manifest larger: 4,096 clusters of this catalogue make a 3.6 MB manifest, the default 793 a 0.7 MB one with fetches about seven times as large.</p>
+<h2 id="what-the-server-sees">What the server sees<a class="anchor" href="#what-the-server-sees" aria-label="Link to this section">#</a></h2>
+<p>Each helper reports its counts every 20 searches (<code>POST /v1/slices/&lt;table&gt;/usage</code>: searches, why, time on the device and on the server), and the server counts the manifests and tiles it serves. The command center's <strong>Slices</strong> view shows them since the server started: the share answered on the device, the devices, a map of the tiles by rows, size or downloads, the reasons searches went to the server, the last hour by minute, the busiest tiles, and the slice's version with Rebuild and Delete.</p>
+<p><img loading="lazy" decoding="async" alt="The Slices view: eight devices around New York, 65% of their searches answered on the device, the tiles they downloaded on the map, and why the rest went to the server" src="../../../assets/img/slices-view.png" /></p>
+<p>For a vector slice the map is a grid of its clusters, busiest first:</p>
+<p><img loading="lazy" decoding="async" alt="The Slices view of a vector slice: 629,298 Yambda tracks in 1,024 clusters, eight listeners answering 77% of their searches on the device, and the clusters they downloaded" src="../../../assets/img/slices-vector-view.png" /></p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>route</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /v1/admin/slices</code></td>
+<td>builds a geo slice (<code>text</code>, <code>lat</code>, <code>lon</code>, <code>lat0</code>, <code>lon0</code>) or a vector slice (<code>vector</code>, <code>clusters</code>, <code>codes</code>), or with <code>{table}</code> alone rebuilds one as it was built</td>
+</tr>
+<tr>
+<td><code>GET /v1/admin/slices</code></td>
+<td>every slice, with its counts, and the tables that could have one</td>
+</tr>
+<tr>
+<td><code>GET</code>, <code>DELETE /v1/admin/slices/&lt;table&gt;</code></td>
+<td>a slice's tiles and last hour; deletes it</td>
+</tr>
+<tr>
+<td><code>GET /v1/slices/&lt;table&gt;/manifest.json</code>, <code>/tiles/&lt;x&gt;_&lt;y&gt;.jsonl.gz</code>, <code>/codes.bin.gz</code></td>
+<td>the files a device fetches (read scope); a vector slice's tile <code>x</code> is its cluster</td>
+</tr>
+<tr>
+<td><code>GET /v1/slices/&lt;table&gt;/status</code></td>
+<td>version, built, fresh, changed</td>
+</tr>
+<tr>
+<td><code>POST /v1/slices/&lt;table&gt;/usage</code></td>
+<td>a device's counts</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>chloedb-slice</code> (in the chloedb crate) writes the same files from a database file without a server, for any web server or CDN to serve. <code>chloedb-server/demo/nearby</code> is a demo over New York's places.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/slices.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="next-items.html">← Next items</a><a href="design.html">How ChloeDB works →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

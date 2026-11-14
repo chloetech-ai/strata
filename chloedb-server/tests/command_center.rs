@@ -520,6 +520,12 @@ async fn a_write_through_a_coordinator_says_what_each_shard_did() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let t: Json = client().get(format!("{other}/v1/tables")).send().await.unwrap().json().await.unwrap();
     assert!(t["tables"].as_array().unwrap().iter().any(|t| t["table"] == "notes"), "{t}");
+    // LIV-13: a coordinator's health counts the rows of every table, over
+    // its shards, beside the first table's `docs`.
+    let r = ui(client().post(format!("{base}/v1/sql"))).json(&json!({"sql": "INSERT INTO notes (id, body) VALUES (1, 'a'), (2, 'b'), (3, 'c')"})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let h: Json = client().get(format!("{base}/v1/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!((&h["docs"], &h["rows"], &h["tables"]), (&json!(45), &json!(48), &json!({"products": 45, "notes": 3})), "{h}");
 
     // Shard 1 goes down after the cluster was last seen whole: the write
     // goes, shard 0 takes it, and the answer says so, by short name.

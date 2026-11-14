@@ -153,11 +153,28 @@ impl Sim {
     }
 
     fn become_replica(&mut self, i: usize, kept: Kept, flags: bool) {
-        let (r, save) = Replica::open(kept, self.clock(i), flags);
+        let (mut r, mut save) = Replica::open(kept, self.clock(i), flags);
+        // As before N-E2: a first copy votes for any copy holding what it
+        // holds. A membership of version 0 is no membership a primary
+        // numbered, and makes it no first copy that waits for a call.
+        if self.cfg.bugs.contains(&Bug::VotesWithALostVolume) && r.kept.first_only() {
+            r.kept.config = Some((0, 0));
+            save = Some(r.kept.clone());
+        }
         if let Some(k) = save {
             self.keep(i, &k);
         }
         self.copies[i].role = Role::Replica(r);
+    }
+
+    /// Copy `i`, crashed, lost its volume: it starts again on an empty
+    /// database with nothing kept beside it ([`Config::lost_volumes`]).
+    pub(crate) fn lose_volume(&mut self, i: usize) {
+        let c = &mut self.copies[i];
+        c.kept = None;
+        c.db = ModelDb::new(self.cfg.sync, self.cfg.ship_max).refusing_older_terms(self.cfg.bugs.contains(&Bug::RefusesOlderTerms));
+        self.history.lost_memory(i);
+        self.history.stats.lost_volumes += 1;
     }
 
     fn become_primary(&mut self, i: usize, core: Primary) {
@@ -293,10 +310,17 @@ impl Sim {
             }
             Req::Replicate(r) => {
                 let a = match &mut self.copies[i].role {
-                    Role::Replica(rep) => match rep.take(r.term, &r.primary, r.member, (r.config, r.copies), &n) {
+                    Role::Replica(rep) => match rep.take(r.term, &r.primary, (r.config, r.copies), &n) {
                         Err(e) => Err(e),
                         Ok(Take::Answer(a)) => Ok(a),
-                        Ok(Take::Apply { kept }) => {
+                        Ok(Take::Apply { mut kept }) => {
+                            // As before N-E2: a member at the first call
+                            // that says so, caught up or not.
+                            if self.cfg.bugs.contains(&Bug::VotesWithALostVolume) && r.member && !kept.as_ref().unwrap_or(&rep.kept).member {
+                                let mut k = kept.unwrap_or_else(|| rep.kept.clone());
+                                k.member = true;
+                                kept = Some(k);
+                            }
                             if let Some(k) = &kept {
                                 self.copies[i].kept = Some(k.clone());
                             }
@@ -332,7 +356,16 @@ impl Sim {
                                     }
                                     let db_term = self.copies[i].db.numbering.term;
                                     let Role::Replica(rep) = &mut self.copies[i].role else { unreachable!() };
-                                    rep.applied(r.term, r.behind, r.global_checkpoint, applied, db_term)
+                                    let a = rep.applied(r.term, r.behind, r.global_checkpoint, applied, db_term);
+                                    let joined = match self.cfg.bugs.contains(&Bug::VotesWithALostVolume) {
+                                        true => None,
+                                        false => rep.joined(r.member),
+                                    };
+                                    if let Some(k) = joined {
+                                        rep.took(Some(k.clone()), now);
+                                        self.copies[i].kept = Some(k);
+                                    }
+                                    a
                                 }
                             }
                         }
@@ -351,7 +384,7 @@ impl Sim {
             }
             Req::Restore { term, primary, config, copy } => {
                 let a = match &mut self.copies[i].role {
-                    Role::Replica(rep) => match rep.take(term, &primary, false, (config, 0), &n) {
+                    Role::Replica(rep) => match rep.take(term, &primary, (config, 0), &n) {
                         Err(e) => Err(e),
                         Ok(Take::Answer(a)) => Ok(a),
                         Ok(Take::Apply { kept }) => {

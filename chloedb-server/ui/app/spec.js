@@ -200,8 +200,19 @@ export const SETTINGS = [
     },
     warn: (v, x) => (v && x.A.cpu != null && x.A.cpu > cores(v) * 0.8 ? `each copy would need about ${fmt.si(x.A.cpu)} cores of the ${v} it is given` : null), takes: "servers" },
   { g: "Capacity", label: "Memory per server", at: "spec:resources.requests.memory", also: ["spec:resources.limits.memory"], type: "step", list: [undefined, "512Mi", "1Gi", "2Gi", "4Gi", "8Gi", "16Gi", "32Gi", "64Gi", "128Gi"], show: (v) => qty(v, "no request"),
-    effect: (v, x) => (v ? `Kept for each server and its limit: one that uses more is restarted by Kubernetes.` : "No request or limit: a server may use its node's memory.") + (x.L.rss != null ? ` Each copy holds about ${fmt.bytes(x.L.rss)} now, for a database of ${fmt.bytes(x.L.file)}.` : ""),
-    warn: (v, x) => (v && x.L.rss != null && quantity(v) < x.L.rss * 1.2 ? `a copy holds about ${fmt.bytes(x.L.rss)} now: ${v} would restart it` : null), takes: "servers" },
+    // LIV-11: the request is what the scheduler keeps; only a limit restarts a server that uses more. A change here sets both.
+    effect: (v, x) => {
+      const limit = getPath(x.d || {}, "resources.limits.memory");
+      const kept = !v ? "No request: the scheduler keeps no memory for the servers." : limit ? `Kept for each server${same(limit, v) ? ", and its limit" : `; its limit is ${limit}`}: one that uses more than ${limit} is restarted by Kubernetes.` : `Kept for each server by the scheduler. No limit is set, so one that uses more is not restarted, but may run its node short.`;
+      return kept + (x.L.rss != null ? ` Each copy holds about ${fmt.bytes(x.L.rss)} now, for a database of ${fmt.bytes(x.L.file)}.` : "");
+    },
+    warn: (v, x) => {
+      if (x.L.rss == null) return null;
+      const limit = getPath(x.d || {}, "resources.limits.memory");
+      if (limit && quantity(limit) < x.L.rss * 1.2) return `a copy holds about ${fmt.bytes(x.L.rss)} now: a limit of ${limit} would restart it`;
+      if (v && quantity(v) < x.L.rss) return `a copy holds about ${fmt.bytes(x.L.rss)} now, more than the ${v} requested: the scheduler may put more on a node than it holds`;
+      return null;
+    }, takes: "servers" },
   { g: "Capacity", label: "Volume per copy", at: "spec:storage.size", type: "step", list: ["1Gi", "2Gi", "5Gi", "10Gi", "20Gi", "50Gi", "100Gi", "200Gi", "500Gi", "1Ti", "2Ti", "4Ti"], grows: true, show: String,
     effect: (v, x) => {
       const used = x.A.file ?? x.A.diskUsed;
@@ -221,7 +232,7 @@ export const SETTINGS = [
   { g: "Coordinators", label: "Cores per coordinator", at: "spec:coordinatorResources.requests.cpu", type: "step", list: [undefined, "250m", "500m", "1", "2", "4", "8"], show: (v) => qty(v, "no request"),
     effect: (v) => (v ? `Kubernetes keeps ${v} cores for each coordinator.` : "Kubernetes keeps no cores for the coordinators."), takes: "coordinators" },
   { g: "Coordinators", label: "Memory per coordinator", at: "spec:coordinatorResources.requests.memory", also: ["spec:coordinatorResources.limits.memory"], type: "step", list: [undefined, "256Mi", "512Mi", "1Gi", "2Gi", "4Gi", "8Gi"], show: (v) => qty(v, "no request"),
-    effect: (v) => (v ? "Kept for each coordinator and its limit: it merges the shards' answers." : "No request or limit."), takes: "coordinators" },
+    effect: (v, x) => { const limit = getPath(x.d || {}, "coordinatorResources.limits.memory"); return !v ? "No request: the scheduler keeps no memory for the coordinators." : limit ? `Kept for each coordinator${same(limit, v) ? ", and its limit" : `; its limit is ${limit}`}: it merges the shards' answers.` : "Kept for each coordinator by the scheduler; no limit is set."; }, takes: "coordinators" },
 
   { g: "Access", label: "Client token", at: "spec:tokenSecret", type: "text", placeholder: "a Secret with key token",
     effect: (v) => (v ? `Clients and admins send the token in Secret ${v}, or an API key, to the coordinators.` : "No token: anything that reaches the Service may read, write and change the cluster."),

@@ -923,6 +923,29 @@ struct NodeQ {
 
 const SEEN: &str = "id, kind, layer, name, state, reason, since, x, y, latency_ms";
 
+/// How many of the faults that read most like one are counted in how such
+/// faults ended.
+const ENDED_LIKE: usize = 100;
+
+/// Cleared faults grouped by cause, the most frequent first: how many, how
+/// long on average and at the longest.
+fn ended_by_cause(rows: &[Row]) -> Vec<Value> {
+    let mut by: Vec<(String, usize, f64, f64)> = Vec::new();
+    for r in rows {
+        let (cause, m) = (r.s("cause"), r.f("minutes"));
+        match by.iter_mut().find(|b| b.0 == cause) {
+            Some(b) => {
+                b.1 += 1;
+                b.2 += m;
+                b.3 = b.3.max(m);
+            }
+            None => by.push((cause, 1, m, m)),
+        }
+    }
+    by.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    by.into_iter().take(8).map(|(cause, n, sum, longest)| json!({"cause": cause, "n": n, "minutes": round(sum / n as f64, 1), "longest": longest})).collect()
+}
+
 /// One object: what is wrong with it, what it hangs from and where that
 /// chain is broken, what depends on it, what else near it is in trouble,
 /// what was changed on it and around it, and how this ended before.
@@ -1048,7 +1071,11 @@ async fn node(State(svc): State<Shared>, Query(a): Query<NodeQ>) -> Answer {
     if let Some(w) = &words {
         let p = json!({"q": w, "kind": kind, "id": cause["id"].as_str().unwrap_or(&id)});
         before["like"] = json!(q.soft("Faults that read like this one, on the same kind of object (BM25)", &format!("SELECT ts, node, cause, text, metro, hub, x, y FROM {EVENTS}\nWHERE event = 'fault' AND kind = :kind AND node != :id\nORDER BY bm25(text, :q) DESC LIMIT 5"), p.clone()).await);
-        before["ended"] = json!(q.soft("How long such faults lasted, by cause", &format!("SELECT cause, COUNT(*) AS n, AVG(minutes) AS minutes, MAX(minutes) AS longest FROM {EVENTS}\nWHERE event = 'clear' AND kind = :kind\nGROUP BY cause ORDER BY n DESC LIMIT 8"), p).await);
+        // Only the faults that read like this one: the clearings whose text
+        // holds at least half of its words, the closest hundred, by cause.
+        let cleared = q.soft("How the faults that read like this one ended (BM25, at least half of its words)", &format!("SELECT cause, minutes FROM {EVENTS}\nWHERE event = 'clear' AND kind = :kind\nORDER BY bm25(text, :q, min => '50%') DESC LIMIT {ENDED_LIKE}"), p).await;
+        before["matched"] = json!(cleared.len());
+        before["ended"] = json!(ended_by_cause(&cleared));
     }
     let mut total = 0;
     let mut not_ok = 0;
