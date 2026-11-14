@@ -542,6 +542,85 @@ at `#/dense/rules`.
 13. **Show the top 3, then "N more".** Show deltas ("+31 tests since
     yesterday"), not totals.
 
+## Shared pieces
+
+The goal pages are built from one set of pieces in `ui/levels/common.js`,
+so Start, Continue, the drawer, the agent page, Review and Debug look and
+behave the same. Import them from `/levels/common.js`. Their styles use the
+tokens below only; a page's own `useStyle` CSS does too.
+
+### Page frame and controls
+
+| piece | what |
+|---|---|
+| `page({ kicker, title, sub, aside, steps, wide, cls, inspector }, ...body)` | A goal page: a mono kicker, a 28px title, one sentence, an aside on the right, then the body. `inspector` (a node or array) is the frosted side panel, `--insp-w` wide; at 1024px and below it moves under the body. `wide` drops the `--page-w` cap. |
+| `stepper({ list: [{label, href, state: "done"\|"now"\|"next"}], after: {label, href} })` | The steps of a goal, `01 / 02 / 03` in mono; on a phone "Step 2 of 4 · What to build" over a bar of segments. |
+| `btn(text, { primary, ghost, danger, sm, lg, href, onclick, kbd, icon, cls, disabled, title })` | A button (or a link when `href`) with its key shown as a keycap. **One `primary` per page: the page's goal.** Answer options are never primary. |
+| `icon(name, cls = "i")` | A line icon: search, bell, more, chev, down, term, check, plus, folder, spark, rewind, branch, ship, why, new, map, stop, warn, pause, play, eye, x, back, home, grid, kbd, bug, clock, book, gear, send, agents. `"i sm"` is 13px. |
+| `kc(key)` | A keycap (`<kbd class="kc">`). |
+| `label(text, ...aside)` | A small-caps mono label (`.lbl`), with links or counts on the right. |
+| `pane(title, aside, ...kids)` | A flat pane on a hairline with a label header; put padded content in `h("div", { class: "bd" }, …)`. |
+| `bank(cols, ...tiles)` | Tiles separated by 1px hairlines (`.bank`); one column on a phone unless it has the class `keep`. |
+| `stateDot(group, text)`, `GROUP_WORDS` | The dot and word of an agent's group: `needs`, `working`, `ready`, `finished`, `failed`. The same words everywhere. |
+| `since(t)` | "now", "4 min", "2 h", "3 d". |
+| `.field` | A text input or textarea (16px on a phone and on a coarse pointer). |
+| `.tbl` | A table: mono small-caps heads, 44px rows, hairlines. |
+| `.chip` | A mono chip (`.chip.add`, `.chip.del`). |
+
+### The question card
+
+`questionCard(q, { agent, onAnswer(i, option), onGrant(i, option), onText(words), big, agentLink })`
+is the only way a question is shown: on Start, Continue, the drawer, the
+agent page and the phone. `q` is a row of `/api/questions` or the
+`question` of a `/api/needs` item. It shows:
+
+- the command in full (over 25 lines: the first 25 and "Show all N lines",
+  and the options are disabled, with the reason, until it is shown);
+- "Claude's summary, not checked:" with the model's description, under the
+  command, never instead of it;
+- Claude Code's options in Claude Code's order, with its own labels and
+  numbers (`optionsOf(q)`), all equal weight and none filled;
+- an option that grants more than one call (the server's `grants`) on its
+  own, apart from the others, with what it grants on a second line. It
+  calls `onGrant`, which opens the grant sheet (the exact rule from
+  `grantOf(q, option, agent)`, the file it is written to, what else it
+  would allow, and the narrower choice) before anything is typed;
+- keys while the card has the focus: a digit picks that option, `Enter`
+  sends it, `Esc` drops the pick. Digits outside a card do nothing.
+
+### Dense pieces (the scale rules)
+
+| piece | rule | what |
+|---|---|---|
+| `churnBar(add, del, max = 600)` | 6 | +/− as one short bar, the numbers printed beside it (never hover-only). |
+| `churnSquares(add, del)` | 6 | Five squares, the added share green and the removed red (Review's pieces table). |
+| `riskLabel(risk)` | 5 | `HIGH` / `MED` / `LOW` in mono small caps. |
+| `blastCompact({ verdict, tone, rings: [{n, label, names, code, of, unit, onMore}], exceptions: [{tone, text, sub}], tests, actions, title })` | 2, 3 | The verdict sentence in a pane, the actions, a bank of gauges (a big mono number, a scale of ticks, the top 3 names and "+N more"), then only the exceptions (`tone`: `crit`, `warn`, `ctx`, `info`; a failing test is `crit`). |
+| `turnStrip(turns, phases, marks, notes, { href, onPick })` | 9 | One tick per turn (`read`, `edit`, `run`, `fail`, `you`, `ctx`), told apart by height as well as colour, under named phases `[{name, from, to}]`; a tap names the turn; `href(n)` links it. |
+| `meter(pct, text)` | 12 | "41% full" and a bar (warn from 85%). |
+| `testStrip("pppfp")` | 7 | The last runs as squares: `p` pass, `f` fail, `s` none. |
+
+### Tokens
+
+Every colour, font, size, radius, border and shadow is a custom property
+on `:root` in `ui/style.css`, set again for dark mode. The default is
+direction C, "Instrument": Geist and Geist Mono (`ui/fonts/`), hairlines,
+a frosted toolbar and inspector, one indigo accent.
+
+| group | tokens |
+|---|---|
+| type | `--sans`, `--mono`, `--sans-features`; sizes `--fs-xs` 11, `--fs-sm` 12, `--fs-body` 13 (15 on a phone), `--fs-md` 15, `--fs-lg` 20, `--fs-xl` 28, each with its `--lh-*`; `--track-xl`, `--track-md`, `--track-label`; weights `--w-text`, `--w-mid`, `--w-title` |
+| space and size | `--s-1` 4 … `--s-7` 40; `--ctl-h` 30 (44 on a phone), `--ctl-h-lg` 36, `--touch` 44, `--kc-h`; `--top` (the bar), `--tabh` (the phone's tab bar), `--insp-w` 360, `--page-w`, `--sheet-w` |
+| radius and line | `--r` 10 (panes), `--r-sm` 6 (controls), `--r-xs` 4 (chips, keycaps), `--r-pill`; `--hair` |
+| surfaces | `--bg` (the canvas), `--surface` (a pane), `--surface-2`, `--surface-3`, `--sunken`, `--well` (a command), `--glass`, `--glass-in`, `--glass-blur`, `--scrim` |
+| text and lines | `--text`, `--text-2`, `--muted`, `--text-3` (all at least 4.5:1 on `--surface` and `--bg`), `--line`, `--line-2` |
+| accent | `--accent`, `--accent-2`, `--accent-ink`, `--accent-text`, `--accent-soft`, `--accent-line`, `--focus` |
+| meaning | `--good`, `--good-ink`, `--good-soft`; `--warn`, `--warn-ink`, `--warn-soft`, `--warn-line`, `--on-warn`; `--crit`, `--crit-ink`, `--crit-soft`; `--ctx` (ChloeCtx) |
+| diffs and terminal | `--add-bg`, `--add-gut`, `--add-ink`, `--del-bg`, `--del-gut`, `--del-ink`; `--term-bg`, `--term-fg`, `--term-line` |
+| agents and lanes | `--lane-1` … `--lane-5`, `--lane-x`, `--av-ink` |
+| depth | `--shadow-1` (none), `--shadow-2` (cards, the drawer), `--shadow-3` (sheets) |
+
+
 ## Phone
 
 Every page works on a phone. The mocks are shot at 390x844, which is an
