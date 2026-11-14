@@ -1,4 +1,9 @@
-# ChloeDB
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/chloedb-wordmark-on-dark.svg">
+    <img src="docs/assets/brand/chloedb-wordmark-on-light.svg" alt="ChloeDB" height="64">
+  </picture>
+</h1>
 
 **Search, data and recommendations in one embedded database.**
 

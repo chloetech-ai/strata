@@ -816,6 +816,24 @@ export function pill(state, text) {
   return h("span", { class: "pill " + state }, icon(ic), text ?? state);
 }
 
+/**
+ * The mark of a feature with no compatibility promise yet (the server's
+ * x-chloedb-experimental header, GET /v1/catalog's `experimental`): its
+ * routes, settings and stored state may change or go in a minor release.
+ */
+export function experimental(what) {
+  const el = pill("warn", "Experimental");
+  el.title = `${what} is experimental: its API, its settings and what it stores may change in any release, with no upgrade path promised (docs/compatibility.md, "Experimental features").`;
+  return el;
+}
+
+/** The mark of a demo app: on a release train of its own, outside the engine's checks and promises. */
+export function demo(what) {
+  const el = pill("info", "Demo");
+  el.title = `${what} is a demo: it shows what ChloeDB can do, is tested on a train of its own (the Demos workflow), and makes no compatibility promise. A fault in it does not hold a ChloeDB release.`;
+  return el;
+}
+
 export function empty(ic, title, sub, action) {
   return h("div", { class: "empty" }, icon(ic), h("b", {}, title), sub ? h("div", { class: "small" }, sub) : null, action || null);
 }

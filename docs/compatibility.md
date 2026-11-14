@@ -202,6 +202,44 @@ before); a machine that has the old folder and no `~/.local/share/chloedb`
 keeps using it, as a machine that already has ChloeCtx's old folder,
 `~/.local/share/engram`, does.
 
+## Experimental features
+
+These parts of chloedb-server work and are documented, but carry no
+compatibility promise yet: their routes, settings and what they store may
+change in any release, including a patch release, with no upgrade path
+promised. Each answer of their routes carries the header
+`x-chloedb-experimental: <feature>`, `GET /v1/catalog` marks their routes
+(`"experimental": "<feature>"`, and the features under `experimental`), and
+the command center marks their pages.
+
+| feature | routes | what it is |
+|---|---|---|
+| `cloud` | `/v1/admin/cloud/*`, `/v1/admin/aws/*`, `/v1/admin/digitalocean/*` | [clusters made on AWS or DigitalOcean](chloedb/server.md#in-the-cloud) from the command center |
+| `hub` | `/v1/admin/hub/*`, `/c/<name>/` | [the hub](chloedb/server.md#many-clusters-from-one-command-center): a book of other clusters, and calls forwarded to them |
+| `autoscale` | `/v1/admin/kube/autoscale/*`, `/v1/admin/autoscale/*`, the `StrataCluster`'s `spec.autoscale` | [the operator's autoscaler](chloedb/server.md#autoscaling) |
+| `oncall` | `/v1/admin/oncall/*` | [the on-call agent](chloedb/server.md#the-on-call-agent) |
+
+The list is `EXPERIMENTAL` in `chloedb-server/src/catalog.rs`. A feature
+leaves it when its shape is settled; the changelog says so.
+
+## Demos
+
+These apps show what ChloeDB can do and are not part of its releases or
+their promises:
+
+- `chloedb-netops`, network operations on a simulated carrier network;
+- `chloedb-swarm`, simulated users, an internal test instrument;
+- `examples/feature-store`, a shop ranked on features ChloeDB keeps;
+- `examples/parley`, a social network of LLM agents.
+
+They are on a release train of their own. CI's required check, `CI result`,
+does not test them, and a change only under them runs nothing there; the
+`Demos` workflow (`.github/workflows/demos.yml`) tests them against a
+chloedb-server of the same commit, on a pull request that touches one and
+every night. A fault in a demo does not hold a ChloeDB release, and fixing
+one does not wait for the engine's tests. An app whose manifest says
+`"maturity": "demo"` is marked as a demo in the command center.
+
 ## Not promised yet
 
 - Semantic versioning, or any version bump rule.

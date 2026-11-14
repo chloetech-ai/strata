@@ -28,11 +28,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => bus.
 const brandName = h("b", {}, location.host);
 const brandSub = h("small", {}, "connecting…");
 const brand = h("button", { class: "brand", title: "Which cluster this is, and the others you used", "aria-haspopup": "menu" },
-  document.createElementNS("http://www.w3.org/2000/svg", "svg"),
+  h("span", { class: "mark" },
+    h("img", { class: "on-light", src: new URL("brand/chloedb-mark-on-light.svg", import.meta.url).href, alt: "" }),
+    h("img", { class: "on-dark", src: new URL("brand/chloedb-mark.svg", import.meta.url).href, alt: "" })),
   h("div", { class: "clu" }, h("span", { class: "row nw", style: { gap: "4px" } }, brandName, icon("down", "chev")), brandSub));
-const markSvg = brand.querySelector("svg");
-for (const [k, v] of Object.entries({ class: "mark", viewBox: "0 0 32 32", "aria-hidden": "true" })) markSvg.setAttribute(k, v);
-markSvg.innerHTML = '<defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="var(--s1)"/><stop offset="1" stop-color="var(--s7)"/></linearGradient></defs><rect x="2" y="2" width="28" height="28" rx="8" fill="url(#lg)"/><path d="M8 11.5 16 8l8 3.5-8 3.5z" fill="#fff" opacity=".95"/><path d="m8 16 8 3.5 8-3.5" stroke="#fff" stroke-width="2" fill="none" stroke-linejoin="round" opacity=".8"/><path d="m8 20.5 8 3.5 8-3.5" stroke="#fff" stroke-width="2" fill="none" stroke-linejoin="round" opacity=".6"/>';
 
 // Coordinators used from this browser, newest first. Each address keeps its
 // own list (storage is per address), so switching records both ends.
