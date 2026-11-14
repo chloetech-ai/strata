@@ -70,6 +70,15 @@ fn sessions_tools_compaction_and_memory_tools() {
     let new_id = r["id"].as_str().unwrap().to_string();
     let r = call(&d, json!({"op": "sql", "sql": format!("SELECT tag FROM memory WHERE id = '{id}' LIMIT 1")}));
     assert!(r["text"].as_str().unwrap().contains("superseded"), "{r}");
+    // CTX-14: a kind that is not one, and an id to supersede that is not
+    // in memory, are refused, and nothing is stored.
+    let notes = || call(&d, json!({"op": "sql", "sql": "SELECT COUNT(*) FROM memory WHERE kind IN ('decision', 'note', 'fact') LIMIT 1"}))["text"].clone();
+    let before = notes();
+    let r = call(&d, json!({"op": "remember", "kind": "bogus", "text": "Balances are u64 cents."}));
+    assert!(r["error"].as_str().is_some_and(|e| e.contains("no kind \"bogus\"")), "{r}");
+    let r = call(&d, json!({"op": "remember", "kind": "decision", "text": "Balances are u64 cents.", "supersedes": "nope:9"}));
+    assert!(r["error"].as_str().is_some_and(|e| e.contains("no record nope:9")), "{r}");
+    assert_eq!(notes(), before);
     // memory_ask answers by search alone: the note in its current version,
     // with what it replaced, and no model call.
     let r = call(&d, json!({"op": "ask", "question": "What type are balances stored as?", "include_current": true}));

@@ -1593,7 +1593,11 @@ impl Daemon {
     }
 
     fn op_remember(&self, req: &Json) -> Result<Json> {
-        let kind = req.get("kind").and_then(|v| v.as_str()).and_then(Kind::parse).unwrap_or(Kind::Note);
+        // A kind that is not one is refused rather than stored as a note.
+        let kind = match req.get("kind").and_then(|v| v.as_str()).filter(|k| !k.is_empty()) {
+            None => Kind::Note,
+            Some(k) => Kind::parse(k).filter(|k| k.is_knowledge()).ok_or_else(|| err(format!("no kind {k:?}: a record to remember is a decision, preference, fact, todo or note")))?,
+        };
         let text = crate::redact::redact(req.get("text").and_then(|v| v.as_str()).unwrap_or("").trim());
         if text.is_empty() {
             return Err(err("text is empty"));
@@ -1603,13 +1607,13 @@ impl Daemon {
         let sid = if sid.is_empty() { "manual".to_string() } else { sid };
         let turn = self.with_session(&sid, |s| s.turn);
         let mut replaced = None;
-        if let Some(old) = req.get("supersedes").and_then(|v| v.as_str()) {
-            if let Some(mut r) = self.store.get(&[old.to_string()])?.pop() {
-                r.tag = "superseded".into();
-                r.importance *= 0.3;
-                self.store.insert(&[r])?;
-                replaced = Some(old.to_string());
-            }
+        if let Some(old) = req.get("supersedes").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+            // An id that is not in memory replaces nothing: said, and nothing stored.
+            let mut r = self.store.get(&[old.to_string()])?.pop().ok_or_else(|| err(format!("no record {old} to supersede: nothing was stored")))?;
+            r.tag = "superseded".into();
+            r.importance *= 0.3;
+            self.store.insert(&[r])?;
+            replaced = Some(old.to_string());
         }
         let a = anchor::make(Path::new(&self.project), &text, &files, &[]);
         let mut d = Draft::new(kind, text).files(files).tag("remembered");
