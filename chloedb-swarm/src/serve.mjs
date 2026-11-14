@@ -27,7 +27,7 @@ const SCENARIOS = resolve(HERE, '../scenarios');
 export const ICON = '<circle cx="7" cy="8" r="2.5"/><circle cx="17" cy="8" r="2.5"/><circle cx="12" cy="15" r="2.5"/><path d="M3 20c.5-2.5 2-4 4-4M21 20c-.5-2.5-2-4-4-4M8.5 21c.7-1.5 2-2.5 3.5-2.5s2.8 1 3.5 2.5"/>';
 
 export function manifest() {
-  return { name: 'swarm', title: 'Swarm', description: 'Simulated users with a persona and a task try ChloeDB in sandboxes; see what worked and what did not', icon_svg: ICON, view: 'ui/view.js', version: '0.1.0' };
+  return { name: 'swarm', title: 'Swarm', description: 'Simulated users with a persona and a task try ChloeDB in sandboxes; see what worked and what did not', icon_svg: ICON, view: 'ui/view.js', version: '0.1.0', maturity: 'demo' };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

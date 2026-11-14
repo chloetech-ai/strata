@@ -11,6 +11,26 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
+- **Experimental marks.** The cloud provisioners, the hub, the autoscaler
+  and the on-call agent are marked experimental: no compatibility promise
+  yet. Their answers carry `x-chloedb-experimental: <feature>`,
+  `GET /v1/catalog` marks their routes (`experimental`) and lists the
+  features, and their command-center pages say so
+  ([compatibility](docs/compatibility.md#experimental-features)).
+- **Demos on a train of their own.** chloedb-netops, chloedb-swarm,
+  examples/feature-store and examples/parley are tested by the new `Demos`
+  workflow (on a pull request that touches one, and every night), not by
+  `CI result`; a fault in one no longer holds a release. An app's manifest
+  may say `"maturity": "demo"`, and the command center marks it
+  ([compatibility](docs/compatibility.md#demos)).
+- **One-way doors checked.** `.github/CODEOWNERS` names each door in a
+  `# door:` section and adds the paths audit 4 found missing (rollup
+  layouts, the substring index, analyzers, archives, tenants, the app
+  engine's keys and access, the install scripts and the Dockerfiles). The
+  new check `One-way doors` fails a pull request whose template box says
+  "No one-way door" (or nothing) while its diff touches one, and writes a
+  receipt of the doors touched into the run's summary.
+
 ### Statement budgets (audit 4: X-B3, X-B12, proposal 1)
 
 - **Statement budgets**, checked on what a statement becomes rather than
@@ -40,6 +60,49 @@ changes collect under "Unreleased".
 - Auth: a key carries a budget in the keys file, merged across a cluster to
   the tighter of two copies. A server from before budgets admits the key
   without its budget.
+
+### Rollups (experimental): correctness fixes (audit 4, X-A1 to X-A3, X-B4 to X-B8)
+
+Rollups are marked experimental in the docs: their options, columns and
+refresh may change in a later release.
+
+- **One broken rollup no longer stops the others.** A server refreshes each
+  rollup on its own, logs a failure by the rollup's name (again only when its
+  error changes, and once when it works again), and goes on with the rest; it
+  used to stop at the first failure, so every rollup listed after it went
+  stale. A definition that does not read is reported the same way.
+  `GET /v1/tables` gives a rollup's table a `rollup` entry: the table it reads,
+  its last good refresh, its last error and the failures in a row
+  (`Db::rollup_health`, `Db::refresh_rollups` in Rust).
+- **What would break a rollup is refused.** `DROP TABLE` of a table a rollup
+  reads (`DROP ROLLUP` first, or `DROP TABLE logs, logs_5m`), `ALTER TABLE`
+  that drops or renames a column a rollup reads, and any `ALTER TABLE` of a
+  rollup's own table. `DROP TABLE` of a rollup's own table drops its
+  definition too.
+- **The refresh window follows the clock.** A plain refresh compares the
+  buckets from now less the lateness, not from the newest row: one row dated
+  in the future (a device's clock) used to move the window there, so the
+  present was folded only by the sweep every five minutes. Only buckets that
+  hold rows are compared, and a span without rows is stepped over in one
+  query: a row at 1970 or 2099 used to make every sweep walk every empty
+  bucket between (27,000 count queries for a 5-minute rollup).
+- **A bucket's integer key no longer wraps.** A bucket too far from 1970 for
+  its key to fit (a nanosecond time stored as microseconds) is left out and
+  logged instead of overwriting another bucket's row.
+- **`AVG(f)` skips NULLs.** It keeps `count_f` beside `sum_f`, and its mean is
+  `SUM(sum_f) / SUM(count_f)`; `COUNT(f)` is a rollup aggregate too. Its mean
+  used to divide by every row, NULLs included. A rollup made before keeps its
+  columns and its old mean; `DROP ROLLUP` and `CREATE ROLLUP` again for the
+  new one. Such a rollup is marked `needs_chloedb_0_3_4`, which 0.3.3 refuses
+  by name.
+- **One refresh of a rollup at a time.** Two at once (the server's refresher
+  and a `REFRESH ROLLUP`, say) could leave a group doubled and another lost,
+  with counts that agreed so that no later refresh mended it.
+- **`REFRESH ROLLUP name REBUILD`** folds every bucket again, whatever its
+  count: an `UPDATE` keeps a bucket's count, so no plain or `FULL` refresh
+  ever sees it (the docs said "when the bucket is next folded").
+- `buckets_checked` in a refresh's answer counts the buckets that hold rows,
+  no longer every bucket of the span.
 
 ## 0.3.3
 
@@ -184,6 +247,7 @@ variables with a prefix. These change by default:
 - `timeout_ms`, `snapshot` and the other whole-number fields of a request refuse a value of the wrong type (`"100"`, `-1`, `1e15`) with a 400. Before, they were read as missing. `POST /v1/query` answers `warnings` naming any field it does not know, such as a misspelt `timeout_ms` (audit PRF-8).
 - `GET /v1/schema?table=` of a table that does not exist answers 404. `GET /v1/kv/TABLE/KEY` with text for an `INT` key says the key is not a number, rather than `query_invalid`. A vector element past a 32-bit float's range says so, rather than that the vector does not fit its field (audit PRF-9, in part).
 - A non-ASCII `Idempotency-Key` header is refused with a sentence saying the header must be visible ASCII, not "is not text" (audit PRF-13).
+- A client's own deadline that passes while its query is still being planned counts as the client's (`client_deadline`), as it does once the query runs, and no longer as the server's `timeout`. (A slow runner planned past a 1 ms deadline.)
 
 ### Command center
 
@@ -206,6 +270,7 @@ variables with a prefix. These change by default:
 - Command center: the demo's test model is labelled "test vectors" and its tables search by words by default, not presented as search by meaning (CCB-11).
 - Command center: the palette finds saved searches, and speaks to a single server as one rather than as a cluster (CCB-13).
 - Command center: an app's page says it is loading, a failed view load has "Ask again", the list of apps is asked again every minute, and the nav's "!" for an app that stopped answering now shows (CCW-9).
+- The website, the command center and the README show the ChloeDB logo.
 
 ### Spreadsheets
 

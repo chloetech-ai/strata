@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quickstart: a first search in five minutes · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="This page takes you from nothing to a full-text search with SQL in about five minutes, with nothing to compile. You install ChloeDB&#x27;s server, make a table, put a few rows in it, search them, and open the command…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/quickstart.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html" aria-current="page">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Start</span>
+      <h1>Quickstart: a first search in five minutes</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#1-install-the-server">Install the server</a></li><li><a href="#2-start-it">Start it</a></li><li><a href="#3-make-a-table-and-fill-it">Make a table and fill it</a></li><li><a href="#4-search">Search</a></li><li><a href="#5-open-the-command-center">Open the command center</a></li><li><a href="#chloedb-from-python-with-no-server">ChloeDB from Python, with no server</a></li><li><a href="#chloedb-in-docker">ChloeDB in Docker</a></li><li><a href="#next">Next</a></li></ol></details>
+    <div class="doc-body">
+
+<p>This page takes you from nothing to a full-text search with SQL in about five minutes, with nothing to compile. You install ChloeDB's server, make a table, put a few rows in it, search them, and open the command center in a browser. The last section does the same from Python, with the database inside your process and no server at all.</p>
+<p>You need macOS 11 or later (Apple silicon or Intel), or Linux on x86-64 or aarch64 with glibc 2.35 or later (Ubuntu 22.04, Debian 12 and newer), and <code>curl</code>. On Windows, use WSL 2 or Docker.</p>
+<h2 id="1-install-the-server">1. Install the server<a class="anchor" href="#1-install-the-server" aria-label="Link to this section">#</a></h2>
+<p>Pick one. Each gives you a <code>chloedb-server</code> program, prebuilt (a download of about 50 MB), in under a minute.</p>
+<p><strong>The install script</strong> puts it in <code>~/.local/bin</code> (it says what to add to your <code>PATH</code> if that folder is not on it yet). It checks the download against the release's SHA-256 and changes nothing else. <a href="../../../install.sh">Read it</a> first if you like.</p>
+<pre data-lang="sh">curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh</pre>
+<p><strong>Homebrew</strong> is not available yet: there is no tap to install from. Use the install script above, which works on the same Macs and Linux machines.</p>
+<p><strong>Docker</strong>: skip to <a href="#chloedb-in-docker">ChloeDB in Docker</a> below, which runs the same steps against the image.</p>
+<p><strong>By hand</strong>: each <code>chloedb-server-v&lt;version&gt;</code> <a href="https://github.com/chloetech-ai/chloedb/releases">release</a> has an archive per platform (<code>linux-x86_64</code>, <code>linux-aarch64</code>, <code>macos-arm64</code>, <code>macos-x86_64</code>) with a <code>.sha256</code> beside it:</p>
+<pre data-lang="sh">v=0.3.3 p=macos-arm64
+curl -fLO https://github.com/chloetech-ai/chloedb/releases/download/chloedb-server-v$v/chloedb-server-$p.tar.gz
+tar xzf chloedb-server-$p.tar.gz &amp;&amp; mkdir -p ~/.local/bin &amp;&amp; mv chloedb-server-$p/chloedb-server ~/.local/bin/</pre>
+<p>Check that it runs:</p>
+<pre data-lang="sh">chloedb-server --version</pre>
+<h2 id="2-start-it">2. Start it<a class="anchor" href="#2-start-it" aria-label="Link to this section">#</a></h2>
+<p>A database is a file, with its write-ahead log and the server's own logs beside it (<code>quickstart.chloedb-wal</code>, <code>quickstart.chloedb.logs</code>). Give the server a path that does not exist yet and it creates an empty database there; it listens on <code>127.0.0.1:7700</code>, which only this machine can reach.</p>
+<pre data-lang="sh">mkdir -p chloedb-quickstart &amp;&amp; cd chloedb-quickstart
+chloedb-server --db quickstart.chloedb &gt; server.log 2&gt;&amp;1 &amp;
+server=$!
+until curl -sf http://127.0.0.1:7700/livez &gt; /dev/null; do sleep 0.2; done</pre>
+<p>Everything below talks to it over HTTP with JSON. To keep the commands short, <code>sql</code> sends the statement it reads from its input to <code>POST /v1/sql</code>, which runs any statement:</p>
+<pre data-lang="sh">sql() { curl -sS http://127.0.0.1:7700/v1/sql -H &#x27;content-type: application/json&#x27; --data-binary @-; echo; }</pre>
+<h2 id="3-make-a-table-and-fill-it">3. Make a table and fill it<a class="anchor" href="#3-make-a-table-and-fill-it" aria-label="Link to this section">#</a></h2>
+<p>Every column is indexed for what its type is for: <code>TEXT</code> for full-text search (words stemmed, so "jackets" finds "jacket"), <code>KEYWORD</code> for exact values and facets, numbers for ranges and sorting.</p>
+<pre data-lang="sh">sql &lt;&lt;&#x27;EOF&#x27;
+{&quot;sql&quot;: &quot;CREATE TABLE products (id KEYWORD PRIMARY KEY, title TEXT, body TEXT, category KEYWORD, price FLOAT)&quot;}
+EOF</pre>
+<p>Rows go in with SQL (<code>INSERT INTO products VALUES (...)</code>), from files (<code>chloedb-server import</code>), or as JSON documents to <code>POST /v1/write</code>:</p>
+<pre data-lang="sh">curl -sS http://127.0.0.1:7700/v1/write -H &#x27;content-type: application/json&#x27; --data-binary @- &lt;&lt;&#x27;EOF&#x27;
+{&quot;ops&quot;: [
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;products&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;p1&quot;, &quot;title&quot;: &quot;Waterproof hiking jacket&quot;, &quot;body&quot;: &quot;A light shell that keeps rain out on long hikes.&quot;, &quot;category&quot;: &quot;outdoor&quot;, &quot;price&quot;: 129.0}},
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;products&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;p2&quot;, &quot;title&quot;: &quot;Insulated winter jacket&quot;, &quot;body&quot;: &quot;Warm down jacket for cold city winters.&quot;, &quot;category&quot;: &quot;outdoor&quot;, &quot;price&quot;: 189.0}},
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;products&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;p3&quot;, &quot;title&quot;: &quot;Trail running shoes&quot;, &quot;body&quot;: &quot;Grippy, waterproof shoes for muddy trails.&quot;, &quot;category&quot;: &quot;footwear&quot;, &quot;price&quot;: 99.0}},
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;products&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;p4&quot;, &quot;title&quot;: &quot;Leather office shoes&quot;, &quot;body&quot;: &quot;Classic shoes for the office.&quot;, &quot;category&quot;: &quot;footwear&quot;, &quot;price&quot;: 149.0}},
+  {&quot;op&quot;: &quot;upsert&quot;, &quot;table&quot;: &quot;products&quot;, &quot;doc&quot;: {&quot;id&quot;: &quot;p5&quot;, &quot;title&quot;: &quot;Rain cover for backpacks&quot;, &quot;body&quot;: &quot;Waterproof cover that fits 20 to 40 litre packs.&quot;, &quot;category&quot;: &quot;outdoor&quot;, &quot;price&quot;: 19.0}}
+]}
+EOF
+echo
+sql &lt;&lt;&#x27;EOF&#x27;
+{&quot;sql&quot;: &quot;INSERT INTO products (id, title, body, category, price) VALUES (&#x27;p6&#x27;, &#x27;Wool hiking socks&#x27;, &#x27;Warm socks that dry fast on wet hikes.&#x27;, &#x27;footwear&#x27;, 15.0)&quot;}
+EOF</pre>
+<p>Each answer says how many rows it wrote (<code>"written"</code>), and the rows are durable once it returns.</p>
+<h2 id="4-search">4. Search<a class="anchor" href="#4-search" aria-label="Link to this section">#</a></h2>
+<p>The rows that mention "waterproof", best match first. <code>MATCH</code> finds them, <code>bm25</code> ranks them:</p>
+<pre data-lang="sh">sql &lt;&lt;&#x27;EOF&#x27;
+{&quot;sql&quot;: &quot;SELECT id, title, score() FROM products WHERE MATCH(body, &#x27;waterproof&#x27;) ORDER BY bm25(body, &#x27;waterproof&#x27;) DESC LIMIT 5&quot;}
+EOF</pre>
+<p>The answer's <code>rows</code> are the matches, in the order of its <code>columns</code> (<code>"objects": true</code> beside <code>"sql"</code> gives each row as an object instead); <code>stats</code> says how the planner ran the statement, step by step.</p>
+<p>Full text and structured filters in one statement, which the planner runs together: waterproof things under 100 that are not shoes.</p>
+<pre data-lang="sh">sql &lt;&lt;&#x27;EOF&#x27;
+{&quot;sql&quot;: &quot;SELECT id, title, price FROM products WHERE MATCH(body, &#x27;waterproof&#x27;) AND price &lt; 100 AND category &lt;&gt; &#x27;footwear&#x27;&quot;}
+EOF</pre>
+<p>Typos are forgiven when you ask: <code>fuzzy =&gt; 1</code> lets each word be one edit away, so "jaket" finds the jackets.</p>
+<pre data-lang="sh">sql &lt;&lt;&#x27;EOF&#x27;
+{&quot;sql&quot;: &quot;SELECT id, title FROM products ORDER BY bm25(title, &#x27;jaket&#x27;, fuzzy =&gt; 1) DESC LIMIT 3&quot;}
+EOF</pre>
+<p>Facets are a <code>GROUP BY</code> over the matches:</p>
+<pre data-lang="sh">sql &lt;&lt;&#x27;EOF&#x27;
+{&quot;sql&quot;: &quot;SELECT category, COUNT(*), AVG(price) FROM products WHERE MATCH(body, &#x27;waterproof OR warm&#x27;) GROUP BY category ORDER BY 2 DESC&quot;}
+EOF</pre>
+<h2 id="5-open-the-command-center">5. Open the command center<a class="anchor" href="#5-open-the-command-center" aria-label="Link to this section">#</a></h2>
+<p>Open <a href="http://127.0.0.1:7700">http://127.0.0.1:7700</a> in a browser. In the command center, <strong>Start here</strong> walks through the first steps and ticks each one off once it is done. <strong>Tables</strong> lists <code>products</code>: its page searches it from one box (by words, by meaning, or both), shows its rows, how full each field is, and what uses it, and <strong>Save as a saved search</strong> keeps the query as a stored function that SQL, HTTP, Python, JavaScript and agents (over MCP) all call. The <strong>SQL workbench</strong> runs any SQL you type and shows the plan the planner chose; <strong>Ask</strong> (Ctrl+J) answers a question in words by querying the tables, with an Anthropic API key (the server's, or one you give the tab). The older query console is still at <a href="http://127.0.0.1:7700/classic">/classic</a>. With <code>--demo 20000</code>, a new database starts with a catalogue of 20,000 products to try it on; here a second server, on port 7710, so that both run at once:</p>
+<pre data-lang="sh">chloedb-server --db demo.chloedb --demo 20000 --listen 127.0.0.1:7710 --grpc off &gt; demo.log 2&gt;&amp;1 &amp;
+demo=$!
+until curl -sf http://127.0.0.1:7710/livez &gt; /dev/null; do sleep 0.2; done
+curl -sS http://127.0.0.1:7710/v1/sql -H &#x27;content-type: application/json&#x27; \
+  -d &quot;{\&quot;sql\&quot;: \&quot;SELECT title, price FROM products WHERE MATCH(body, &#x27;waterproof jacket&#x27;) ORDER BY bm25(body, &#x27;waterproof jacket&#x27;) DESC LIMIT 5\&quot;}&quot;; echo</pre>
+<p>When you are done, stop the servers (the databases stay in their files, and the next start opens them as they were):</p>
+<pre data-lang="sh">kill $server $demo</pre>
+<h2 id="chloedb-from-python-with-no-server">ChloeDB from Python, with no server<a class="anchor" href="#chloedb-from-python-with-no-server" aria-label="Link to this section">#</a></h2>
+<p>The Python package runs a database inside your process, the way <code>sqlite3</code> runs SQLite. It is a prebuilt wheel for CPython 3.10 and later on the same platforms as the server: macOS 11 or later, and Linux with glibc 2.28 or later (release 0.2.0's wheels need 2.35). Install it from PyPI:</p>
+<pre data-lang="sh">python3 -m venv .venv &amp;&amp; . .venv/bin/activate
+pip install chloedb</pre>
+<pre data-lang="sh">python3 - &lt;&lt;&#x27;EOF&#x27;
+import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, schema={
+    &quot;table&quot;: &quot;books&quot;, &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;title&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;year&quot;, &quot;type&quot;: &quot;int&quot;},
+    ],
+})
+db.upsert([
+    {&quot;id&quot;: &quot;b1&quot;, &quot;title&quot;: &quot;The river and the dragon&quot;, &quot;year&quot;: 1999},
+    {&quot;id&quot;: &quot;b2&quot;, &quot;title&quot;: &quot;Winter garden&quot;, &quot;year&quot;: 2005},
+    {&quot;id&quot;: &quot;b3&quot;, &quot;title&quot;: &quot;Dragons of the northern rivers&quot;, &quot;year&quot;: 2011},
+])
+print(db.query(&quot;SELECT id, title FROM books WHERE MATCH(title, &#x27;dragon&#x27;) AND year &gt; 2000&quot;).rows)
+db.close()
+EOF</pre>
+<p>The same methods talk to a server: <code>chloedb.connect("http://127.0.0.1:7700")</code> in place of <code>chloedb.open(...)</code>.</p>
+<h2 id="chloedb-in-docker">ChloeDB in Docker<a class="anchor" href="#chloedb-in-docker" aria-label="Link to this section">#</a></h2>
+<p>The image <code>ghcr.io/chloetech-ai/chloedb-server</code> (Linux, x86-64 and arm64) keeps its database in <code>/data</code>: mount a volume there to keep it. Inside a container the server listens on all of the container's interfaces, which it allows only with a token, so pick one. Publishing the port on <code>127.0.0.1</code> keeps it to this machine.</p>
+<pre data-lang="sh">docker run -d --name chloedb --user 10001:10001 -p 127.0.0.1:7700:7700 -e CHLOEDB_TOKEN=pick-a-secret -v chloedb:/data \
+  ghcr.io/chloetech-ai/chloedb-server:0.3.3</pre>
+<p>Then every request sends the token, and the console asks for it once:</p>
+<pre data-lang="sh">sql() { curl -sS http://127.0.0.1:7700/v1/sql -H &#x27;content-type: application/json&#x27; -H &#x27;authorization: Bearer pick-a-secret&#x27; --data-binary @-; echo; }</pre>
+<p>and steps 3 to 5 run as written (the <code>/v1/write</code> call needs the same <code>authorization</code> header). Arguments after the image replace its default ones (<code>--db /data/chloedb.chloedb --listen 0.0.0.0:7700 --grpc 0.0.0.0:7701</code>): add <code>--demo 20000</code> by passing <code>--db /data/demo.chloedb --listen 0.0.0.0:7700 --demo 20000</code>. <code>docker rm -f chloedb</code> stops it; the volume keeps the database.</p>
+<h2 id="next">Next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><a href="sql.html">The query language</a>: every function, with vectors (<code>similarity</code>), hybrid ranking, graph traversal, joins and aggregates.</li>
+<li><a href="server.html">The server</a>: loading files (<code>chloedb-server import</code>), schemas, embedded vector fields, API keys, replication and shards.</li>
+<li><a href="python.html">Python</a>, <a href="javascript.html">JavaScript</a> and <a href="java.html">Java</a>: the database in your process.</li>
+<li><a href="sqlite.html">SQLite</a>, <a href="parquet.html">Parquet and S3</a> and <a href="postgres.html">Postgres</a>: bring your data in.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/quickstart.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="index.html">← Overview</a><a href="concepts.html">Concepts →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

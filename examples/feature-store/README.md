@@ -1,5 +1,7 @@
 # Feature store demo
 
+> **A demo.** The feature store shows what ChloeDB can do; it is not part of ChloeDB's releases or their promises. It is tested on a train of its own (the `Demos` workflow, `.github/workflows/demos.yml`), outside CI's required check, so a fault in it does not hold a ChloeDB release, and the command center marks it as a demo ([compatibility](../../docs/compatibility.md#demos)).
+
 A shop that ranks its 240 products for each of 300 shoppers by a model, fed
 by features ChloeDB keeps, shown live in the command center (**Apps → Feature
 store**). One chloedb-server holds every part: the events, the feature tables,

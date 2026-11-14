@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Capsules: handing work to the next agent · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="A capsule is a slice of a project&#x27;s memory packed into one read-only ChloeDB file, which one agent hands to another. The receiving agent does not read it: Claude Code mounts it as MCP tools, and the agent asks it…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/capsules.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html" aria-current="page">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>Capsules: handing work to the next agent</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/capsules.md">docs/chloectx/capsules.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    
+    <div class="doc-body">
+
+<p>A capsule is a slice of a project's memory packed into one read-only ChloeDB file, which one agent hands to another. The receiving agent does not read it: Claude Code mounts it as MCP tools, and the agent asks it questions, under its own budget, when it needs to.</p>
+<p><strong>What we measured.</strong> A handoff note alone is enough when it is long and complete. A capsule pays off when the note is short and loses things, as a sub-agent's report usually does. With a short note (about 2,000 characters), the next agent solved 72% of follow-up tasks. With the same note plus a capsule, it solved 89%, about 20,000 more input tokens and $0.0013 more per run. A capsule answers in 8 to 9 ms and mounts in about 65 ms. Making one takes 0.2 s and no model calls.</p>
+<h2 id="use-it">Use it<a class="anchor" href="#use-it" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh"># On the machine (or in the session) that did the work, where ChloeCtx recorded it:
+chloectx pack ./billing.capsule                       # distilled notes, entities and the conversation
+chloectx pack ./billing.capsule --since-days 7 --kinds decision,preference,fact,todo,note,entity
+
+# In the next agent&#x27;s Claude Code (one session, or `claude mcp add` for a project):
+claude --mcp-config &#x27;{&quot;mcpServers&quot;:{&quot;capsule&quot;:{&quot;command&quot;:&quot;chloectx&quot;,&quot;args&quot;:[&quot;mount&quot;,&quot;/path/to/billing.capsule&quot;]}}}&#x27;</pre>
+<p><code>pack</code> writes a directory with two files:</p>
+<ul>
+<li><code>memory.strata</code>: the chosen records with their vectors, links and indexes, in one file. By default it holds decisions, rules (<code>preference</code>), facts, open tasks, notes, the entities they link to, and the conversation (prompts, replies, episodes, summaries, errors). Raw tool calls and their results stay behind, because they are bulky and where secrets pass. Every record is redacted again on the way out.</li>
+<li><code>manifest.json</code>: what it holds (counts by kind, the entities it is about), the embedder its vectors need, the source store's last sequence number, and the file's SHA-256.</li>
+</ul>
+<p><code>mount</code> serves one or more capsules over stdio as <code>capsule_ask</code> (the question answered from the capsule, packed to a token budget, with no model call), <code>capsule_search</code>, <code>capsule_timeline</code> and <code>capsule_sql</code>, the same code as ChloeCtx's <code>memory_*</code> tools. It copies the file into a private temporary directory, checks the copy against the manifest's hash and opens it, so mounting never changes the capsule. A capsule can come from someone else, so <code>mount</code> treats it as data: a file that carries stored functions or rank profiles (which <code>pack</code> never writes, and which could call a model with your API key from inside <code>capsule_sql</code>) is refused, the embedder must be the one the manifest names (or one given with <code>--embedder</code>), and the manifest's title and topics are cut to one line of bounded length and shown as the packer's words, not instructions. With ChloeCtx installed in the receiving project, the capsule tools' calls and answers are not recorded into that project's memory, whatever the MCP server is named. A record that redaction changed while packing gets a vector of its redacted text, <code>--max-records</code> keeps the newest records, and the manifest names the project's folder, not its path. Its MCP instructions say what the capsule holds, so the agent knows when to ask. <code>--log FILE</code> (or <code>CHLOECTX_CAPSULE_LOG</code>) writes one JSON line per call with its time.</p>
+<p>Not yet done: signatures (the hash names the file but does not say who made it), the receipts' named snapshots, and peer queries against another agent's live memory.</p>
+<h2 id="results">Results<a class="anchor" href="#results" aria-label="Link to this section">#</a></h2>
+<p><strong>Method.</strong> The four held-out projects of the <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#memory-systems-compared">memory benchmark</a> (stockroom, slotwise, bakehouse, kestrel; 52 follow-up tasks) were used. ChloeCtx recorded each project's history once. Every handoff lane then ran on that same history and repository, with ChloeCtx turned off for the run (no hooks, no memory tools), and handed the next agent one of the following:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>lane</th>
+<th>what the next agent gets</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nothing</td>
+<td>nothing</td>
+</tr>
+<tr>
+<td>long note</td>
+<td>a handoff note in its system prompt. Haiku wrote it from the transcripts of every history session, with no length limit (5,800 to 12,100 characters)</td>
+</tr>
+<tr>
+<td>short note</td>
+<td>a note Haiku was asked to keep under 1,500 characters (it wrote 1,900 to 2,300), about the size of a sub-agent's final report</td>
+</tr>
+<tr>
+<td>capsule</td>
+<td>the capsule, mounted as MCP tools</td>
+</tr>
+<tr>
+<td>long note + capsule, short note + capsule</td>
+<td>both</td>
+</tr>
+<tr>
+<td>ChloeCtx</td>
+<td>ChloeCtx itself: briefing, recall and memory tools</td>
+</tr>
+<tr>
+<td>whole history</td>
+<td>a fork of one session that holds the whole history, as an upper bound</td>
+</tr>
+</tbody>
+</table></div>
+<p>Each task ran four times per lane, for 1,664 runs. Haiku did all the work. The harness is <a href="https://github.com/chloetech-ai/chloedb/blob/main/chloectx/scripts/memory_bench.py"><code>chloectx/scripts/memory_bench.py</code></a> (its <code>BENCH_HANDOFF</code> variants), the pooling is <a href="https://github.com/chloetech-ai/chloedb/blob/main/chloectx/scripts/capsule_report.py"><code>capsule_report.py</code></a>, and every run, note and history is in <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloectx/results/capsules"><code>chloectx/results/capsules/</code></a>. The runs were measured on 12 November 2026 in a 4-core cloud container, with four projects running side by side, and that load is in the wall times.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>lane</th>
+<th>solved</th>
+<th>needs an earlier session: solved</th>
+<th>$ per run</th>
+<th>input tokens per run, p50</th>
+<th>wall s, p50 / p95</th>
+<th>runs that asked the capsule or memory</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nothing</td>
+<td>94/208 (45%)</td>
+<td>42/156</td>
+<td>0.0047</td>
+<td>131,037</td>
+<td>15 / 31</td>
+<td>0</td>
+</tr>
+<tr>
+<td>short note</td>
+<td>149/208 (72%)</td>
+<td>97/156</td>
+<td>0.0048</td>
+<td>132,284</td>
+<td>17 / 35</td>
+<td>0</td>
+</tr>
+<tr>
+<td>capsule</td>
+<td>189/208 (91%)</td>
+<td>137/156</td>
+<td>0.0063</td>
+<td>160,170</td>
+<td>18 / 37</td>
+<td>154</td>
+</tr>
+<tr>
+<td>short note + capsule</td>
+<td>186/208 (89%)</td>
+<td>134/156</td>
+<td>0.0061</td>
+<td>147,227</td>
+<td>18 / 39</td>
+<td>147</td>
+</tr>
+<tr>
+<td>long note</td>
+<td>198/208 (95%)</td>
+<td>146/156</td>
+<td>0.0049</td>
+<td>139,422</td>
+<td>17 / 39</td>
+<td>0</td>
+</tr>
+<tr>
+<td>long note + capsule</td>
+<td>198/208 (95%)</td>
+<td>146/156</td>
+<td>0.0061</td>
+<td>150,554</td>
+<td>18 / 39</td>
+<td>125</td>
+</tr>
+<tr>
+<td>ChloeCtx</td>
+<td>197/208 (95%)</td>
+<td>145/156</td>
+<td>0.0071 + 0.0019 (its query engine)</td>
+<td>165,094</td>
+<td>20 / 37</td>
+<td>50</td>
+</tr>
+<tr>
+<td>whole history</td>
+<td>198/208 (95%)</td>
+<td>146/156</td>
+<td>0.0117</td>
+<td>194,426</td>
+<td>11 / 32</td>
+<td>0</td>
+</tr>
+</tbody>
+</table></div>
+<p>Paired comparisons (labels shuffled within each task, 20,000 times):</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>comparison</th>
+<th>solved</th>
+<th>p</th>
+<th>input tokens per run</th>
+<th>wall s per run</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>short note + capsule against short note</td>
+<td>+17.8 points</td>
+<td>&lt; 0.0001</td>
+<td>+20,340</td>
+<td>+1.7</td>
+</tr>
+<tr>
+<td>long note + capsule against long note</td>
+<td>0 points</td>
+<td>1.0</td>
+<td>+21,646</td>
+<td>+1.2</td>
+</tr>
+<tr>
+<td>capsule alone against long note</td>
+<td>−4.3 points</td>
+<td>0.011</td>
+<td>+30,998</td>
+<td>+0.7</td>
+</tr>
+<tr>
+<td>capsule alone against nothing</td>
+<td>+45.7 points</td>
+<td>&lt; 0.0001</td>
+<td>+24,753</td>
+<td>+3.3</td>
+</tr>
+</tbody>
+</table></div>
+<p>What this shows:</p>
+<ul>
+<li><strong>A complete note is as good as anything here.</strong> A long note did as well as ChloeCtx and as the whole history in context, at 42% of the whole history's cost per run. Adding a capsule to it bought nothing and added about 22,000 input tokens per run.</li>
+<li><strong>A capsule recovers what a short note drops.</strong> The short note lost facts on two of the four projects (slotwise 28/40, bakehouse 34/72). Adding the capsule brought them to 38/40 and 60/72. On the other two projects the short note was already enough.</li>
+<li><strong>Agents do use it.</strong> With a capsule mounted, the agent asked it in 60 to 74% of runs, almost always through <code>capsule_ask</code>.</li>
+<li><strong>The cost is the answer's size, not the engine.</strong> Each <code>capsule_ask</code> returned about 16,000 characters (about 4,000 tokens, the default budget), which accounts for most of the extra input. A smaller default budget is the next thing to try.</li>
+</ul>
+<p>The capsule's own numbers:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>measure</th>
+<th>value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>records and size</td>
+<td>273 to 770 records; 0.95 to 2.5 MB (3.3 to 3.5 KB a record, vectors and indexes included)</td>
+</tr>
+<tr>
+<td><code>chloectx pack</code>, backup and cut included</td>
+<td>161 to 223 ms</td>
+</tr>
+<tr>
+<td>model calls to pack or to query</td>
+<td>none (its notes were distilled while ChloeCtx recorded the history, which cost $0.03 to $0.12 per project)</td>
+</tr>
+<tr>
+<td>mount ready, hash check and copy included</td>
+<td>61 to 67 ms p50, 82 to 87 ms p95</td>
+</tr>
+<tr>
+<td>one call</td>
+<td>8 to 9 ms p50, 11 to 14 ms p95, 18 ms at most, over 433 calls</td>
+</tr>
+</tbody>
+</table></div>
+<p>A handoff note cost $0.007 to $0.019 to write. Both are made once per handoff.</p>
+<p><strong>Limits.</strong> Four small projects, one history each, and one small model. The tasks were written alongside the histories and aim at facts the histories state. The long note was written from complete transcripts by a model asked for completeness, which is the best case for a note. A sub-agent writing from its own context, under its own budget, is closer to the short note.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloectx/capsules.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="chloectx-app.html">← ChloeCtx on a cluster</a><a href="chloectx-receipts.html">Blame and receipts →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

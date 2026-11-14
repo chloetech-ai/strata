@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChloeCtx: how it works · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeCtx, an application built on ChloeDB, gives a coding agent (Claude Code first) a memory that outlives its context window. It records every prompt, answer, tool call and compaction summary of a project into one…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/index.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html" aria-current="page">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>ChloeCtx: how it works</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/index.md">docs/chloectx/index.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-problem">The problem</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#the-data-model">The data model</a></li><li><a href="#when-to-store-always">When to store: always</a></li><li><a href="#when-to-load">When to load</a></li><li><a href="#answering-a-question">Answering a question</a></li><li><a href="#query-understanding">Query understanding</a></li><li><a href="#cost-and-latency-targets">Cost and latency targets</a></li><li><a href="#install-and-use">Install and use</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeCtx, an application built on <a href="design.html">ChloeDB</a>, gives a coding agent (Claude Code first) a memory that outlives its context window. It records every prompt, answer, tool call and compaction summary of a project into one ChloeDB file, brings the relevant pieces back at the moments they matter without the model having to ask, and gives the model tools to search its own history when it decides to.</p>
+<h2 id="the-problem">The problem<a class="anchor" href="#the-problem" aria-label="Link to this section">#</a></h2>
+<p>A long session on a complex project outgrows any context window. Claude Code then compacts it into a summary of about 15,000 characters. Summaries keep the plan and lose the particulars:</p>
+<ul>
+<li>exact numbers, error messages and file paths;</li>
+<li>the reason an approach was rejected;</li>
+<li>a preference the user stated once, three hours earlier.</li>
+</ul>
+<p>A new session starts with only <code>CLAUDE.md</code> and the auto-memory index. The session that built ChloeDB ran for 32 hours and wrote 43.7 MB of transcript across two compactions; its summaries hold under 0.1% of that text.</p>
+<p>Three requirements follow:</p>
+<ol>
+<li><strong>Store without being asked.</strong> Capture must not depend on the model remembering to save.</li>
+<li><strong>Load without being asked, but only when it helps.</strong> Injected context costs tokens and attention, and irrelevant context hurts accuracy. Injection must be gated, budgeted, and must skip what the model can already see.</li>
+<li><strong>Let the model ask precisely.</strong> When the model knows it needs history, it gets search, timeline and SQL tools over the same store.</li>
+</ol>
+<h2 id="architecture">Architecture<a class="anchor" href="#architecture" aria-label="Link to this section">#</a></h2>
+<p><img loading="lazy" decoding="async" alt="ChloeCtx's architecture: hooks and the MCP server talk to one daemon per project, which owns the ChloeDB file" src="../../../assets/img/engram-architecture.png" /></p>
+<p>Only one process at a time may write a ChloeDB file, and hooks are short-lived processes that run concurrently with the MCP server. So one daemon per project owns the database, and hooks and the MCP server are its clients over a Unix socket.</p>
+<ul>
+<li><strong>Lazy start.</strong> The first client to find no socket spawns the daemon under a spawn lock; the daemon exits after 30 idle minutes. Its first hook takes 50–72 ms, because the 129 MB embedding table is memory-mapped rather than read.</li>
+<li><strong>Warm state.</strong> The embedder, segment readers and the memtable stay in memory between hooks.</li>
+<li><strong>Reads in parallel, one writer.</strong> Reads run on each client's own thread against a snapshot, any number at once, and the searches behind one prompt share that snapshot and run side by side while cores are free. Every write goes to one writer thread, which commits whatever is queued in one transaction and builds the new version before the write returns, so a reader never waits for a write or for the index build after it. In-memory chunks hold 256 records and scan their vectors instead of building an HNSW graph, so that build stays cheap. A full memtable becomes a segment, and segments merge, on ChloeDB's background threads, not on the writer's: with 150,000 appends back to back in the cloud container (4-core Xeon), the longest took 0.2–0.4 s, against 12–15 s when the writer flushed and merged itself (<a href="https://github.com/chloetech-ai/chloedb/tree/main/chloectx/results/writes">results</a>).</li>
+<li><strong>Never in the way.</strong> A client that cannot reach the daemon within its deadline prints nothing and exits 0. A memory failure never blocks a prompt or a tool call.</li>
+</ul>
+<p>The store lives outside the repository, in <code>${CHLOECTX_HOME:-~/.local/share/chloectx}/&lt;project-slug&gt;/</code> (in <code>~/.local/share/engram</code> on a machine that has it from before the rename), because transcripts can contain secrets. A redaction pass replaces keys, tokens, private keys, passwords in URLs and headers, and values assigned to names such as <code>DB_PASSWORD</code> with markers before anything is stored or synced; <code>chloectx redact</code> applies it to a store written before (<a href="chloectx-setup.html#secrets-and-chloectx-redact">what is redacted</a>).</p>
+<h2 id="the-data-model">The data model<a class="anchor" href="#the-data-model" aria-label="Link to this section">#</a></h2>
+<p>One ChloeDB table, <code>memory</code>. Each record is one key–value pair with attributes.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>field</th>
+<th>type</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>KEYWORD, primary key</td>
+<td><code>&lt;session-prefix&gt;:&lt;seq&gt;</code></td>
+</tr>
+<tr>
+<td><code>session</code></td>
+<td>KEYWORD</td>
+<td>Claude Code session id</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td>KEYWORD</td>
+<td><code>prompt</code>, <code>answer</code>, <code>tool_call</code>, <code>tool_result</code>, <code>error</code>, <code>episode</code>, <code>summary</code>, <code>decision</code>, <code>preference</code>, <code>fact</code>, <code>todo</code>, <code>note</code></td>
+</tr>
+<tr>
+<td><code>tag</code></td>
+<td>KEYWORD</td>
+<td>tool name, summary section, <code>distilled</code>, <code>planned</code>, <code>superseded</code>, …</td>
+</tr>
+<tr>
+<td><code>turn</code>, <code>seq</code>, <code>ts</code></td>
+<td>INT</td>
+<td>user turn, project-wide sequence number, Unix seconds</td>
+</tr>
+<tr>
+<td><code>importance</code></td>
+<td>FLOAT</td>
+<td>salience prior in [0, 1]; for an entity, how many records link to it</td>
+</tr>
+<tr>
+<td><code>files</code></td>
+<td>TEXT</td>
+<td>paths the record touches (path components are terms)</td>
+</tr>
+<tr>
+<td><code>text</code></td>
+<td>TEXT, stored</td>
+<td>the value: one chunk of at most 400 bytes, injected as is</td>
+</tr>
+<tr>
+<td><code>ctx</code></td>
+<td>TEXT, stored</td>
+<td>the turn's request (≤ 200 characters); for notes also the situations they matter in (<code>When:</code>) and the code they were written against (<code>Anchor:</code>); part of the lexical key, never shown</td>
+</tr>
+<tr>
+<td><code>body</code></td>
+<td>TEXT, generated from <code>text</code> + <code>ctx</code></td>
+<td>the lexical key that <code>bm25</code> and <code>MATCH</code> search</td>
+</tr>
+<tr>
+<td><code>emb</code></td>
+<td>VECTOR(d), HNSW</td>
+<td>the dense key: an embedding of <code>text</code> alone (for notes, <code>text</code> and its <code>When:</code> situations)</td>
+</tr>
+<tr>
+<td><code>links</code></td>
+<td>EDGES</td>
+<td>edges to the turn a record came from, the files it touches (<code>f:path</code>) and the entities it is about (<code>e:name</code>), which are records of kind <code>entity</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><img loading="lazy" decoding="async" alt="One record: a captured event is redacted, trimmed and cut into 400-byte records" src="../../../assets/img/engram-record.png" /></p>
+<p>Keys are small and precise. A 400-byte window matches a question better than a 1,500-byte chunk in which the answer is one fact among many, and a context budget holds about ten such windows instead of five snippets. The turn's request joins the lexical key, so that a terse tool result ("test result: ok") is found by the words of the task it served; it stays out of the vector, where it would pull every response towards its request. The study behind these choices is in <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#what-a-record-should-be">the results</a>.</p>
+<p>Records come in three levels:</p>
+<pre class="mermaid">flowchart LR
+    L0[&quot;&lt;b&gt;L0 · events&lt;/b&gt;&lt;br/&gt;prompts, answers,&lt;br/&gt;tool calls and results, errors&lt;br/&gt;(400-byte records)&quot;] --&gt; L1[&quot;&lt;b&gt;L1 · episodes&lt;/b&gt;&lt;br/&gt;one card per user turn:&lt;br/&gt;prompt, files, commands,&lt;br/&gt;errors, outcome&quot;]
+    L1 --&gt; L2[&quot;&lt;b&gt;L2 · knowledge&lt;/b&gt;&lt;br/&gt;decisions, rules, facts,&lt;br/&gt;planned work, compaction&lt;br/&gt;summary sections&quot;]
+</pre>
+<p>The kind sets a salience prior ι: preference 1.0, decision 0.9, summary 0.8, prompt 0.7, error and episode 0.6, answer 0.5, tool call and result 0.3.</p>
+<h2 id="when-to-store-always">When to store: always<a class="anchor" href="#when-to-store-always" aria-label="Link to this section">#</a></h2>
+<p>Storage is cheap (a durable commit costs about 4 ms on a Mac, where it flushes the drive's write cache, and runs off the hook's path) and a missed record cannot be recovered later.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>hook</th>
+<th>stored</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SessionStart</code></td>
+<td>session registered; live window opened</td>
+</tr>
+<tr>
+<td><code>UserPromptSubmit</code></td>
+<td><code>prompt</code>, plus <code>preference</code> records for cue sentences ("always", "never", "from now on", …)</td>
+</tr>
+<tr>
+<td><code>PostToolUse</code></td>
+<td><code>tool_call</code> and <code>tool_result</code> (or <code>error</code>), asynchronously</td>
+</tr>
+<tr>
+<td><code>Stop</code></td>
+<td>the answer, the commentary written between tool calls, the turn's <code>episode</code>, then distilled knowledge</td>
+</tr>
+<tr>
+<td><code>PreCompact</code></td>
+<td>commentary not yet captured</td>
+</tr>
+<tr>
+<td><code>PostCompact</code></td>
+<td>the summary, by section; the live window restarts here</td>
+</tr>
+<tr>
+<td><code>SessionEnd</code></td>
+<td>flush</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>chloectx ingest-transcript</code> back-fills old sessions from Claude Code's JSONL transcripts.</p>
+<h3 id="distilled-knowledge">Distilled knowledge<a class="anchor" href="#distilled-knowledge" aria-label="Link to this section">#</a></h3>
+<p>Raw records hold what was <em>said</em>; a later session needs what was <em>agreed</em>: a decision and its reason, a client's rule, the requirements of work announced for later. Much of it never reaches the code, and a request that depends on it rarely sounds like earlier work, so search alone misses it.</p>
+<p><img loading="lazy" decoding="async" alt="Knowledge records: a small model writes down what each turn agreed" src="../../../assets/img/engram-knowledge-records.png" /></p>
+<p>After each <code>Stop</code>, off the prompt's path, the daemon gives the turn (request, commands, reply) to a small model through <code>claude -p</code>, with up to 40 live notes for context: the ones most related to the turn wherever they are in the history, then the newest. Seeing the related ones is what lets the model update a note written weeks ago instead of adding a near-copy next to it. The prompt names the day the turn took place, so a relative date in it ("tomorrow", "next Tuesday") is counted from that day even when the turn is distilled later (<code>chloectx distill</code>, a backlog). The model returns JSON lines:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>item</th>
+<th>stored as</th>
+<th>tag</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>decision, with the reason</td>
+<td><code>decision</code></td>
+<td><code>distilled</code></td>
+</tr>
+<tr>
+<td>rule, constraint, convention</td>
+<td><code>preference</code></td>
+<td><code>distilled</code></td>
+</tr>
+<tr>
+<td>requirement of work planned but not done</td>
+<td><code>todo</code></td>
+<td><code>planned</code></td>
+</tr>
+<tr>
+<td>fact about the project or its environment, failed approaches</td>
+<td><code>fact</code></td>
+<td><code>distilled</code></td>
+</tr>
+<tr>
+<td><code>replaces: id</code></td>
+<td>the old item is retagged</td>
+<td><code>superseded</code></td>
+</tr>
+<tr>
+<td><code>done: id</code></td>
+<td>the planned item is retagged</td>
+<td><code>done</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>A new item whose analysed terms overlap an existing one by a Jaccard index J ≥ 0.6 is dropped. Distillation costs about <strong>$0.0013 a turn</strong> and 8 s with a small model, and never delays a prompt.</p>
+<p>Each note also carries <strong>the situations it will matter in</strong> (<code>when</code>), written at the same time: "choosing a library or standard-library module", "parsing a config file" for a note that the client machines run Python 3.8. A later request rarely uses the words of the note it needs; it uses the words of the task. The situations join the note's lexical key and its embedding, so "add a settings.toml loader" finds the Python 3.8 note although they share no word. This is document expansion (doc2query) done once, when the note is written.</p>
+<h3 id="consolidation">Consolidation<a class="anchor" href="#consolidation" aria-label="Link to this section">#</a></h3>
+<p>Notes accumulate. Every eight distilled turns (or on <code>chloectx consolidate</code>), the daemon groups live notes that say related things: pairs whose embeddings have a cosine of at least 0.80, or 0.55 when they share an entity, joined strongest first into groups of at most ten. A small model rewrites each group as the smallest set of notes that keeps every detail, number, name and reason that still holds: a later change replaces the earlier version ("30 days, changed from 14"), duplicates merge, notes on different subjects stay apart, and rules, requirements and reasons are never dropped. Each merged note links to the notes it replaces (<code>supersedes</code>), which are retagged <code>superseded</code> and leave the briefing and recall, and is dated by the newest of them, not by when it was merged; a note the model would only reword is kept as it is.</p>
+<h3 id="notes-tied-to-the-code">Notes tied to the code<a class="anchor" href="#notes-tied-to-the-code" aria-label="Link to this section">#</a></h3>
+<p>A note about code goes stale when the code changes. Each note records what it was written against: the commit and branch, a content hash of the files it names or the turn changed (up to six), and the identifiers it mentions (<code>ROUND_HALF_UP</code>, <code>load_config</code>). When a note is shown (briefing, recall, file notes, the query engine), ChloeCtx checks those files in the working tree, reading each once:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>what changed</th>
+<th>decision or fact</th>
+<th>rule or requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nothing</td>
+<td>shown as is</td>
+<td>shown as is</td>
+</tr>
+<tr>
+<td>a file it names, its identifiers still there</td>
+<td>"app/billing.py changed since this note; check the current code"</td>
+<td>the same</td>
+</tr>
+<tr>
+<td>the file is gone, or an identifier it names no longer occurs</td>
+<td><strong>may be out of date</strong>: moved to its own briefing section</td>
+<td><strong>the code may now break it</strong>: stays with the rules, with "the code changed since this was stated; check that it still follows it"</td>
+</tr>
+</tbody>
+</table></div>
+<p>A rule does not go stale because the code moved away from it: a teammate who switched invoices to banker's rounding did not cancel the client's requirement, so the rule stays where the model will see it, with a warning that the code may now break it.</p>
+<h2 id="when-to-load">When to load<a class="anchor" href="#when-to-load" aria-label="Link to this section">#</a></h2>
+<p>Records still inside the model's context are never injected. For each session <em>s</em> the daemon keeps the window start w<sub>s</sub>, the sequence number at session start or at the last compaction, and every query excludes</p>
+<p>$$
+{\, r : r.\text{session} = s \;\wedge\; r.\text{seq} \ge w_s \,} \;\cup\; \text{injected}_s
+$$</p>
+<p>where injected<sub>s</sub> is the set of records already injected since w<sub>s</sub>.</p>
+<p><img loading="lazy" decoding="async" alt="The live window: what the model can still see is never repeated" src="../../../assets/img/engram-live-window.png" /></p>
+<p>There are three push points and one pull path:</p>
+<pre class="mermaid">sequenceDiagram
+    autonumber
+    participant U as User
+    participant C as Claude Code
+    participant E as ChloeCtx daemon
+    participant S as ChloeDB
+    C-&gt;&gt;E: SessionStart
+    E-&gt;&gt;S: planned work, rules, decisions, facts, last checkpoint
+    E--&gt;&gt;C: briefing (≤ 6,000 chars)
+    U-&gt;&gt;C: prompt
+    C-&gt;&gt;E: UserPromptSubmit
+    E-&gt;&gt;S: knowledge query (kind IN decision, preference, fact, …)
+    E-&gt;&gt;S: BM25 top 50 + vector top 50, live window excluded
+    E-&gt;&gt;E: priors, gate G, pack
+    E--&gt;&gt;C: knowledge block + full / brief / no recall
+    E-&gt;&gt;E: query engine: plan, search, rank (background)
+    C-&gt;&gt;E: PreToolUse Edit(path)
+    E--&gt;&gt;C: up to 2 earlier errors or decisions about path
+    C-&gt;&gt;E: PostToolUse
+    E--&gt;&gt;C: the query engine&#x27;s picks, once ready
+    C-&gt;&gt;E: memory_ask / memory_search / memory_timeline / memory_sql (pull)
+    E--&gt;&gt;C: results
+    C-&gt;&gt;E: Stop
+    E--&gt;&gt;C: picks not delivered yet: reconsider once
+    E-&gt;&gt;S: answer, commentary, episode
+    E-&gt;&gt;E: distill the turn, check notes against code, consolidate every 8 turns (background)
+</pre>
+<ol>
+<li><strong><code>SessionStart</code>: a briefing</strong>, always, at most 6,000 characters: planned work with its requirements, rules, decisions, facts, open tasks, and where the previous session stopped, each note checked against the current code. It opens with an instruction to search memory before a design decision. After a compaction it also recalls the records most relevant to the last two prompts.</li>
+<li><strong><code>UserPromptSubmit</code>: knowledge, then gated recall.</strong> Up to four knowledge records not yet shown that match the prompt on their own text, bypassing the gate:</li>
+</ol>
+<p>$$
+   \cos\bigl(\phi(q), \phi(r)\bigr) \ge 0.40 \;\lor\; \mathrm{cov}(q, r) \ge 0.30,
+   \qquad \mathrm{cov}(q, r) = \frac{\sum_{t \in q \cap r} \mathrm{idf}(t)}{\sum_{t \in q} \mathrm{idf}(t)}
+   $$</p>
+<p>Then the main search and a three-way gate: strong evidence injects the top records up to 4,000 characters; weak evidence injects three records up to 1,200, marked as a weak match; otherwise nothing.
+3. <strong><code>PreToolUse</code> on <code>Edit</code>/<code>Write</code>: file notes.</strong> Up to two older errors, decisions or rules anchored to that path, once per file per window. With <code>CHLOECTX_NEXT_FILES=1</code> (an experiment, off by default) the hook also names the files earlier sessions usually edited next: B follows A when an edit of B came within three edits after one of A (consecutive edits of one file count once), weighted by one over the gap and summed over sessions, and files above 1 are shown, at most two, each with its newest note. The daemon counts these from the edits the store holds as tool calls, reading only what was stored since it last looked, so nothing new is written. On the memory bench it changed neither how many tasks were solved nor which files were edited (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#next-files">results</a>), so it stays off.
+4. <strong><code>PostToolUse</code> and <code>PostToolUseFailure</code> on <code>Bash</code>: error to fix.</strong> A command that fails and then passes, with edits or other commands between, is written down as a fix: an <code>error</code> record tagged <code>fix</code> holding the error's line, the steps (the last eight edits and commands that change something; <code>ls</code>, <code>grep</code>, <code>git status</code> and the like do not count) and what showed it fixed (the same command passed, or failed with another error). The same command means the same after <code>cd</code>, pipes, redirections, <code>timeout</code> and variable assignments are taken off (<code>cd x &amp;&amp; cargo test 2&gt;&amp;1 | tail</code> is <code>cargo test</code>); a failure is followed for 60 tool calls, and one that passes with nothing between is not a fix. When a command later fails with the same error, in any session of the project, its fixes come with the failure, at most two, once a session. Errors are matched by their signature: the telling line (a compiler's <code>error:</code>, a panic, the last line of a Python traceback, <code>fatal:</code>, ...) with numbers, hashes, temporary paths and the project's path masked, or one sharing four in five of its words. The fix links to the prompt of the turn that fixed it.
+5. <strong>Pull: MCP tools.</strong> <code>memory_ask</code> (by search alone, <a href="#answering-a-question">below</a>; with <code>deep</code>, the query engine), <code>memory_search</code>, <code>memory_timeline</code> (the neighbourhood of a hit), <code>memory_sql</code> (one read-only SELECT over <code>memory</code>, with no model calls, a 2-second deadline and a 1,000-row cap), <code>memory_remember</code> and <code>memory_forget</code> (<code>chloectx forget ID</code> from a shell).</p>
+<p>The briefing also ends with a one-line index of the notes it had no room for ("31 older notes are not shown here, about: …"), so the model knows what to ask for.</p>
+<h3 id="ranking">Ranking<a class="anchor" href="#ranking" aria-label="Link to this section">#</a></h3>
+<p>BM25 and vector search each return their top <em>n</em> = 50 under the exclusion filter. Scores are min-max normalised over the union <em>C</em>, a missing score counting as 0:</p>
+<p>$$
+\mathrm{rel}(r) = w\,\widehat{\mathrm{bm25}}(r) + (1 - w)\,\widehat{\cos}(r)
+$$</p>
+<p>Priors then break near-ties without overriding relevance, with ι the salience prior and τ a recency scale:</p>
+<p>$$
+S(r) = \mathrm{rel}(r)\,\bigl(1 + \lambda_\iota\,\iota(r)\bigr) + \lambda_t\, e^{-(\mathrm{seq}_{\max} - \mathrm{seq}(r))/\tau}
+$$</p>
+<p>Answers that admitted not knowing and repeats of the same question are excluded, because they would only replay a failure. Packing is greedy by <em>S</em>: at most twelve records, at most eight per user turn. Every injected line carries its provenance (kind, session, turn, relative time and id), and up to five further candidates follow as one line each for the model to open with <code>memory_timeline</code>.</p>
+<p><strong>Session context (off by default).</strong> With <code>CHLOECTX_SESSION_CONTEXT=1</code> the prompt's search also uses what the session was just doing. Its last 20 records give a BM25 query (the files they name and the first line of their errors, at most 24 words) and the vectors of the newest four prompts, answers, tool calls and errors, which rank records by <code>maxsim</code>. A record's best normalised score in those two lists is added to <em>rel</em> with weight 0.5, and records about one of the session's files score 15% more. The gate still reads the prompt's own evidence, so the session reorders what is injected but not whether anything is. On the memory bench it made no measurable difference (198 of 208 runs against 199) and it adds 5.8 ms to a prompt's searches at a million records (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#the-session-tail">results</a>), so it stays off.</p>
+<h3 id="the-gate">The gate<a class="anchor" href="#the-gate" aria-label="Link to this section">#</a></h3>
+<p>Min-max scores cannot gate, since the best candidate always scores 1. The gate uses absolute evidence about the best candidates: the highest cosine and term coverage among the top five, how far the best BM25 and cosine scores stand above the tenth, whether BM25 and vectors agree on the top record, and whether the prompt refers back ("earlier", "we decided", "last time", …):</p>
+<p>$$
+G = a\,\cos_{\max} + b\,\mathrm{cov}<em>{\max} + c\,\mathbb{1}</em>{\text{cue}} + d\,\mathbb{1}<em>{\text{agree}} + e\,(\cos_1 - \cos</em>{10}) + f\,\Bigl(1 - \frac{\mathrm{bm25}_{10}}{\mathrm{bm25}_1}\Bigr)
+$$</p>
+<p><img loading="lazy" decoding="async" alt="Three tiers: no injection, a brief injection of three records, or the full budget" src="../../../assets/img/engram-gate-tiers.png" /></p>
+<p>The weights come from a logistic fit on LongMemEval-S (<code>chloectx/scripts/fit_gate.py</code>): positives are questions whose evidence the packed injection contains; negatives are questions asked against another conversation's store, abstentions and misses. θ<sub>hi</sub> holds precision 0.9 on the fit and θ<sub>lo</sub> precision 0.7. The gate is the weakest part of the design; <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#the-gate">the results</a> say why.</p>
+<p><img loading="lazy" decoding="async" alt="The query path: the exclusion predicate runs inside both searches" src="../../../assets/img/engram-query-path.png" /></p>
+<h2 id="answering-a-question">Answering a question<a class="anchor" href="#answering-a-question" aria-label="Link to this section">#</a></h2>
+<p><code>memory_ask</code> (and <code>chloectx ask</code>) answers by search alone: no model call runs between the question and the answer, because the work was done when memory was written (the messages, the notes the distiller wrote, the user's rules). Four searches run side by side on one snapshot of the store (<a href="https://github.com/chloetech-ai/chloedb/blob/main/chloectx/src/context.rs"><code>context.rs</code></a>), each with the live-window exclusion:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>search</th>
+<th>over</th>
+<th>what the context shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>rules</td>
+<td>preferences, by vector, cosine at least 0.3</td>
+<td>at most four, first, in at most a fifth of the budget</td>
+</tr>
+<tr>
+<td>notes</td>
+<td>decisions, rules, facts, plans (hybrid)</td>
+<td>current versions only, each with the note it replaced ("changed DATE; was: …"), dated and ordered by the message each came from (a merged note by its newest source)</td>
+</tr>
+<tr>
+<td>replies</td>
+<td>the assistant's answers (hybrid)</td>
+<td>the three exchanges these hits rank first: the start of the user's message (200 characters) and the part of the reply closest to the question (1,000)</td>
+</tr>
+<tr>
+<td>excerpts</td>
+<td>prompts and answers (hybrid)</td>
+<td>the 400 characters of each closest to the question</td>
+</tr>
+</tbody>
+</table></div>
+<p>Notes take 40% of the 12,000-character budget the rules leave, excerpts 25%, and both then fill the rest in rank order; the replies come on top, so a context is about 15,500 characters (about 3,900 tokens). A question about order or a summary ("in what order", "summarize", "a timeline of") has its answer spread over many exchanges, which a search for its words misses: it gets one and a half times the budget, the replies of eight exchanges (500 characters each), and every live note in place of the searched ones, oldest first (at most 50,000 characters, the newest kept), about 43,000 characters in all on BEAM. It takes about 6 ms a question on BEAM's stores, 11 ms for a summary.</p>
+<p>On BEAM 100K (20 conversations, 400 questions; <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#search-alone-against-observational-memory">results</a>) this context scores 62.9, against 55.0 for the query engine's picks and 63.4 for an observational memory that hands the reader its whole log of observations, about 153,000 characters, with the same reader and judge. Both sides move when their notes are written again: over two runs each, search alone averages 61.6 and observational memory 62.1. With <code>deep: true</code> (<code>chloectx ask --deep</code>, or a <code>model</code>) <code>memory_ask</code> runs the query engine below instead.</p>
+<h2 id="query-understanding">Query understanding<a class="anchor" href="#query-understanding" aria-label="Link to this section">#</a></h2>
+<p>One search, however good its ranking, cannot answer "where does an unknown product code get caught, and why do we raise instead of skipping the line?". The answer is spread over a file, a decision and the error that led to it, and each is found by different words. The query engine turns a request into several searches, runs them all, and has a model pick what answers it.</p>
+<pre class="mermaid">flowchart LR
+    R[&quot;request&lt;br/&gt;(+ the session&#x27;s last prompts)&quot;] --&gt; P[&quot;&lt;b&gt;planner&lt;/b&gt;&lt;br/&gt;small model:&lt;br/&gt;1–8 typed searches&quot;]
+    P --&gt; Q1[&quot;text&quot;] &amp; Q2[&quot;keywords&quot;] &amp; Q3[&quot;semantic&quot;] &amp; Q4[&quot;notes&quot;] &amp; Q5[&quot;entity&quot;] &amp; Q6[&quot;file&quot;] &amp; Q7[&quot;sql&quot;]
+    R --&gt; B[&quot;the request itself:&lt;br/&gt;text + notes&quot;]
+    Q1 &amp; Q2 &amp; Q3 &amp; Q4 &amp; Q5 &amp; Q6 &amp; Q7 &amp; B --&gt; F[&quot;reciprocal-rank fusion&lt;br/&gt;30 candidates&quot;]
+    F --&gt; K[&quot;&lt;b&gt;ranker&lt;/b&gt;&lt;br/&gt;small model, or a stronger&lt;br/&gt;one for hard requests&quot;]
+    K --&gt; O[&quot;picked records, why each matters,&lt;br/&gt;a short reading, confidence&quot;]
+</pre>
+<ol>
+<li><strong>Plan.</strong> The planner sees the request, the session's two previous prompts, the store's size and time span, and the names of the entities and files notes are about. It writes up to eight searches, several of one type if that helps, covering each part of a question and the constraints a task touches without naming them (the machines it runs on, file formats, earlier failed attempts). It also says whether memory can matter at all, and whether the request is hard.</li>
+<li><strong>Search.</strong> Every search runs in parallel, plus two on the request itself, each with the live-window exclusion:</li>
+</ol>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>type</th>
+<th>runs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>text</code></td>
+<td>the hybrid search above (BM25 and vectors)</td>
+</tr>
+<tr>
+<td><code>keywords</code></td>
+<td>BM25 alone: identifiers, error text</td>
+</tr>
+<tr>
+<td><code>semantic</code></td>
+<td>vectors alone, with a sentence phrased like the record hoped for</td>
+</tr>
+<tr>
+<td><code>notes</code></td>
+<td>decisions, rules, requirements and facts only</td>
+</tr>
+<tr>
+<td><code>entity</code></td>
+<td>records linked to named entities (matched by id, stem or embedding), two hops through the graph</td>
+</tr>
+<tr>
+<td><code>file</code></td>
+<td>records about a path (<code>MATCH(files, …)</code>)</td>
+</tr>
+<tr>
+<td><code>sql</code></td>
+<td>a <code>WHERE</code> and <code>ORDER BY</code> over <code>memory</code>, checked to be a single condition</td>
+</tr>
+</tbody>
+</table></div>
+<ol start="3">
+<li><strong>Fuse.</strong> Lists are merged by reciprocal rank, Σ 1/(61 + rank), so a record found by several searches comes first; the best 30 go on.</li>
+<li><strong>Rank.</strong> The ranker reads the 30 (600 characters each, with kind, date and any staleness label) and picks at most eight, each with why it matters, plus a one-to-three sentence reading that cites ids, and a confidence. Only picks the session has not seen are shown.</li>
+</ol>
+<p>It runs in one of four modes (<code>"deep": {"mode": …}</code> in the store's <code>config.json</code>, or <code>CHLOECTX_DEEP</code>):</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>mode</th>
+<th>when it runs</th>
+<th>how its result arrives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>off</code></td>
+<td>never</td>
+<td></td>
+</tr>
+<tr>
+<td><code>tool</code></td>
+<td>only when the model calls <code>memory_ask</code> with <code>deep</code> (or <code>chloectx ask --deep</code>)</td>
+<td>the tool's result</td>
+</tr>
+<tr>
+<td><code>async</code> (default)</td>
+<td>after every prompt of four words or more, once the store holds 20 records, in the background</td>
+<td>with the next tool result; if the turn ends first, with the next prompt, when the picks are still new and the ranker's confidence is high or medium. The end of a turn does not wait for it. With <code>"stop_recheck": true</code> the end of the turn waits up to <code>stop_wait_secs</code> (at most 3 s) and, when the picks are new, asks the model once to check its answer against them (Claude Code runs the model again for that, and it says only what changed)</td>
+</tr>
+<tr>
+<td><code>sync</code></td>
+<td>the same prompts, before the model starts</td>
+<td>in the prompt's context, after a wait (12 s at the median and 16 s at p90 in the cloud container, six requests at a time)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Both model calls go through <code>claude -p</code> with no tools and no prompt caching (each prompt is new, so a cache write would cost more than it saves), like distillation, and together read about 5,800 tokens and write 1,150: $0.0012 a request with a small model ($0.58 for 500 LongMemEval questions).</p>
+<p>Two settings make it cheaper. <code>"planner": "none"</code> (<code>CHLOECTX_DEEP_PLAN=none</code>) skips the planning call: the ranker reads the best 30 of the request's own two searches, taken deeper. <code>"ranker": "local"</code> (<code>CHLOECTX_DEEP_RANK=local</code>) replaces the ranking call with a logistic model over twelve features of each candidate (fused rank, similarity, term coverage, kind, length, recency) and keeps the top 5, with no model call; with <code>planner</code> also <code>none</code> the engine is free. On LongMemEval the default answers best: ranker only loses temporal questions, and the local ranker keeps about a quarter of the gain (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/results.md#the-query-engine">results</a>). The models are parameters: <code>planner_model</code> and <code>ranker_model</code> (default <code>haiku</code>, or <code>CHLOECTX_DEEP_MODEL</code> for both), and <code>hard_model</code>, a stronger ranker used only when the planner calls a request hard (<code>CHLOECTX_DEEP_HARD_MODEL</code>). <code>memory_ask</code> also takes a <code>model</code> for one question, so a user who allows a more expensive model can have it for the questions that need it.</p>
+<h2 id="cost-and-latency-targets">Cost and latency targets<a class="anchor" href="#cost-and-latency-targets" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>path</th>
+<th>target</th>
+<th>measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PostToolUse</code>, <code>Stop</code> client</td>
+<td>&lt; 10 ms</td>
+<td>queued; embedded and committed in the background</td>
+</tr>
+<tr>
+<td><code>UserPromptSubmit</code></td>
+<td>&lt; 100 ms p99 at 1M records</td>
+<td>24.9 ms p50, 38.6 ms p99 as a hook process</td>
+</tr>
+<tr>
+<td><code>SessionStart</code></td>
+<td>&lt; 150 ms (daemon up), &lt; 1 s with spawn</td>
+<td>50–72 ms including daemon start</td>
+</tr>
+<tr>
+<td>ingest</td>
+<td>&gt; 1,000 records/s</td>
+<td>48,000–52,000 records/s with the static embedder</td>
+</tr>
+<tr>
+<td><code>memory_ask</code> (search alone)</td>
+<td>&lt; 100 ms</td>
+<td>6.9 ms a question on BEAM 100K's stores, one thread (11 ms for a summary)</td>
+</tr>
+<tr>
+<td>query engine (planner and ranker)</td>
+<td>off the prompt's path unless <code>sync</code></td>
+<td>12 s p50, 16 s p90, $0.0012 per request with Haiku</td>
+</tr>
+</tbody>
+</table></div>
+<p>The default embedder is static (Model2Vec potion-retrieval-32M: token lookup and mean, 512 dimensions, microseconds per record). BGE-small (384 dimensions) is optional (<code>--features bert</code>) and costs about 50 ms per record on a CPU.</p>
+<h2 id="install-and-use">Install and use<a class="anchor" href="#install-and-use" aria-label="Link to this section">#</a></h2>
+<p><a href="chloectx-setup.html">Install on your machine</a> has the whole procedure, remote machines and dev containers included. In short:</p>
+<pre data-lang="sh">git clone https://github.com/chloetech-ai/chloedb &amp;&amp; cd chloedb &amp;&amp; ./install.sh   # every Claude Code session
+./install.sh --project /path/to/your/project                              # or one project
+chloectx doctor                                                             # check the setup
+chloectx ui                                                                 # browse what it stored</pre>
+<pre data-lang="sh">chloectx ask &quot;where do invoice totals get rounded, and why that rounding mode?&quot;   # the query engine
+chloectx ask --model sonnet &quot;...&quot;                                                  # with a stronger model
+chloectx search &quot;why did the planner pick post-filtering&quot;
+chloectx sql &quot;SELECT ts, text FROM memory WHERE kind = &#x27;error&#x27; AND MATCH(files, &#x27;exec&#x27;) ORDER BY ts DESC LIMIT 5&quot;
+chloectx remember decision &quot;Prices are integer cents&quot;
+chloectx ingest-transcript ~/.claude/projects/&lt;project&gt;/&lt;session&gt;.jsonl   # back-fill old sessions
+chloectx distill                                                          # distill turns stored before distillation existed
+chloectx consolidate                                                      # merge overlapping notes now
+chloectx backup ~/backups/chloectx-2026-10-28                             # a consistent copy of this project&#x27;s store
+chloectx redact [--all] [--dry-run]                                       # redact secrets a store recorded before redaction caught them
+chloectx stats | briefing | stop
+chloectx pack ./work.capsule                                              # a capsule another agent mounts
+chloectx mount ./work.capsule                                             # serve it as MCP tools (stdio)</pre>
+<p>A capsule hands a slice of this memory to another agent as one read-only file it queries: <a href="chloectx-capsules.html">capsules</a>.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>variable</th>
+<th>effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHLOECTX_DISABLE=1</code></td>
+<td>turns the hooks off</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_HOME</code>, <code>CHLOECTX_MODELS</code></td>
+<td>relocate the store and the models</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DISTILL=0</code></td>
+<td>turns distillation off (or <code>"distill": {"enabled": false}</code> in the store's <code>config.json</code>)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DISTILL_MODEL</code></td>
+<td>the model the distiller and consolidation use</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DEEP</code></td>
+<td>query engine mode: <code>off</code>, <code>tool</code>, <code>async</code> (default), <code>sync</code></td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DEEP_MODEL</code>, <code>CHLOECTX_DEEP_PLANNER_MODEL</code>, <code>CHLOECTX_DEEP_RANKER_MODEL</code>, <code>CHLOECTX_DEEP_HARD_MODEL</code></td>
+<td>the query engine's models (default <code>haiku</code>; the hard model is unset)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DEEP_PLAN</code>, <code>CHLOECTX_DEEP_RANK</code></td>
+<td><code>none</code> skips the planner; <code>local</code> ranks without a model call (defaults: <code>model</code>, <code>model</code>)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_CONSOLIDATE=0</code></td>
+<td>turns consolidation off</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_SESSION_CONTEXT=1</code></td>
+<td>recall also searches with the session's last records (<a href="#ranking">session context</a>; or <code>"rank": {"tail": {"enabled": true}}</code> in the store's <code>config.json</code>)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_NEXT_FILES=1</code></td>
+<td>before an edit, also the files usually edited next, with a note on each (<a href="#when-to-load">when to load</a>; or <code>"next_files": true</code> in the store's <code>config.json</code>)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_ERROR_FIXES=0</code></td>
+<td>turns error to fix off (<a href="#when-to-load">when to load</a>; or <code>"error_fixes": false</code> in the store's <code>config.json</code>)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_EMBEDDER</code></td>
+<td><code>static</code> (default), <code>bert</code>, or <code>hash:&lt;dim&gt;</code> for a model-free hash embedder</td>
+</tr>
+</tbody>
+</table></div>
+<p>The full design, including the evaluation plan, is in <a href="https://github.com/chloetech-ai/chloedb/blob/main/chloectx/DESIGN.md"><code>chloectx/DESIGN.md</code></a>.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloectx/index.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="netops.html">← Network operations</a><a href="chloectx-setup.html">Install ChloeCtx →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: true, theme: dark ? "dark" : "neutral", securityLevel: "strict" });
+</script>
+</body>
+</html>

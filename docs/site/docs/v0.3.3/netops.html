@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>chloedb-netops: network operations on ChloeDB · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloedb-netops is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/netops.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html" aria-current="page">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>chloedb-netops: network operations on ChloeDB</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/netops.md">docs/chloedb/netops.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#the-pages">The pages</a></li><li><a href="#the-map">The map</a></li><li><a href="#where-is-it-broken">Where is it broken</a></li><li><a href="#an-incidents-board">An incident's board</a></li><li><a href="#the-agents">The agents</a></li><li><a href="#the-six-faults">The six faults</a></li><li><a href="#your-own-network">Your own network</a></li><li><a href="#the-tables">The tables</a></li><li><a href="#what-it-is-not">What it is not</a></li><li><a href="#test-it">Test it</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloedb-netops</code> is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an incident and say what they looked at. It comes with a simulated carrier network, <em>Meridian</em> (10 sites, 64 devices, 120 links, 12 services), and a simulator that writes each minute of it and breaks it in six ways, so the whole app can be used, and its agents checked, without a network of your own.</p>
+<p>It is there to show what one database does for an operations team when search, SQL, graphs and time all live in it:</p>
+<ul>
+<li><strong>An incident is a query, not a pile of alerts.</strong> Alert rules are SQL over the telemetry tables. The alerts they raise are grouped into one incident by walking the topology (<code>REACHABLE</code> over the links table), so a fibre cut is one incident with eight alerts, not eight pages.</li>
+<li><strong>The root-cause agent shows its work.</strong> It ranks the alerting devices over the graph (personalised PageRank), reads the logs, changes, optics and flows around them, tests six causes, and names one with a confidence and the evidence for it. Every step keeps the SQL it ran, the rows it read and the time it took. What it packed into its context, and what it left out, is kept as a receipt (<code>PACK … TOKENS WITH RECEIPT</code>).</li>
+<li><strong>Nothing runs without an approval.</strong> The agent proposes actions (reroute a span, roll a change back, restart a process, open a ticket with the circuit's provider) with their risk and the exact commands. A person approves or rejects each one; autopilot, off by default, lets the low-risk ones through.</li>
+<li><strong>The topology is found from the logs.</strong> LLDP neighbour and routing-adjacency lines in syslog imply links; the app builds them and compares them with the inventory: links the logs confirm, links nobody documented, and documented links nothing has spoken on.</li>
+<li><strong>Logs are searched three ways in one place</strong>: by words (BM25), by any substring (<code>LIKE</code> answered from an FM-index, for an interface name or half an address), and runbooks and past incidents by meaning (a static embedding model on the server, no API call).</li>
+<li><strong>Most of a shift is not an incident.</strong> The home page is the shift: a handover written from the tables, and one list of what waits (approvals, unowned alerts, changes due, carrier notices that collide). A box at the top takes whatever a ticket says (an address, a circuit id, a customer, an interface) and answers what it is and how it is doing.</li>
+<li><strong>Every incident has a room that its people shape.</strong> The room opens with a board of panels chosen for the suspected cause. Anyone on the call adds a panel by asking for it in a sentence, removes what is noise, and everyone sees the same board. A panel is one read-only query kept as a row.</li>
+<li><strong>Engineers and leadership read the same tables.</strong> A switch at the top turns the shift's pages into objectives, incident cost, risk, carriers and a written weekly report, and each number opens the rows behind it.</li>
+<li><strong>The past is a table.</strong> Every version of each device's configuration is a row, so the change behind an incident is a diff, and "who put this line here" is a query. Which runbook closed which incident is kept as a grade the ranking can learn from.</li>
+</ul>
+<p>Like <a href="crawler.html">the crawler</a> and <a href="sheets.html">the spreadsheets</a>, it is a program of its own, in Rust, that talks to chloedb-server over HTTP only, and the command center shows it as an app.</p>
+<p><img loading="lazy" decoding="async" alt="My shift: the handover written from the tables, what waits most urgent first, the changes and carrier windows coming up, and notes for the next shift" src="../../../assets/img/netops-shift.png" /></p>
+<h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
+<p>Build both programs, then start chloedb-netops with a server of its own:</p>
+<pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
+cd chloedb-netops &amp;&amp; cargo build --release
+target/release/chloedb-netops serve --local ./netops-data --server-bin ../chloedb-server/target/release/chloedb-server</pre>
+<p>Open <code>http://127.0.0.1:7700</code> and go to <strong>Apps → Network operations</strong>. The first start makes the tables and writes six hours of history (<code>--history-hours</code>), which takes some seconds; the page shows its progress. From then on the simulator writes a minute of telemetry every minute, evaluates the alert rules, and injects a fault every 45 minutes (<code>--fault-every</code>; <code>0</code>: only when you press <strong>Inject a fault</strong>).</p>
+<p><code>--local DIR</code> starts a chloedb-server on <code>127.0.0.1:7700</code> (<code>--local-listen</code>) with its database in <code>DIR</code>, lists chloedb-netops on it as the app <code>netops</code>, and stops it when chloedb-netops stops; the same <code>DIR</code> again is the same network, with its incidents.</p>
+<p>Against a server or a cluster that runs elsewhere, give chloedb-netops the server (a coordinator or one server) and a key, and give the server the app:</p>
+<pre data-lang="sh">chloedb-netops serve --strata http://coordinator:7700 --key &quot;$CHLOEDB_KEY&quot; --token &quot;$NETOPS_TOKEN&quot; --listen 0.0.0.0:7840
+chloedb-server ... --app netops=http://netops-host:7840   # with CHLOEDB_APP_TOKEN=$NETOPS_TOKEN</pre>
+<p>The key needs admin scope on the tables <code>netops_*</code> (a key <a href="server.html#security">limited to tables</a>, <code>netops_*=admin</code>, is enough: the app touches no other table). <code>--token</code> (or <code>CHLOEDB_NETOPS_TOKEN</code>) is the bearer token its API requires; the server sends its <code>CHLOEDB_APP_TOKEN</code> (<a href="server.html#apps">apps</a>). Requests that carry an <code>Origin</code> header are refused, so a page on another site cannot reach the app even from inside the network.</p>
+<p>On a coordinator over shards the graph steps (<code>REACHABLE</code>, <code>ppr</code>, <code>PATH</code>), which a coordinator does not answer yet, are walked by the app over the same links table; every page says which of the two it used.</p>
+<p><code>--no-simulate</code> turns the simulator off: the app reads its network from the inventory tables and writes no telemetry of its own (<a href="#your-own-network">your own network</a>).</p>
+<h3 id="on-kubernetes">On Kubernetes<a class="anchor" href="#on-kubernetes" aria-label="Link to this section">#</a></h3>
+<p>A cluster the <a href="server.html#on-kubernetes">operator</a> runs gets the app from its <code>StrataCluster</code>, with nothing to start by hand:</p>
+<pre data-lang="sh">kubectl -n strata patch strata demo --type merge -p &#x27;{&quot;spec&quot;: {&quot;netops&quot;: {}}}&#x27;</pre>
+<p>The operator runs <code>chloedb-netops serve</code> from the cluster's own image as a Deployment of one pod, <code>&lt;cluster&gt;-netops</code>, behind a Service of that name (port 7840), and restarts the coordinators so that they list it: <strong>Apps → Network operations</strong> appears in the command center. It holds a key limited to <code>netops_*</code> and a token of its own (the Secret <code>&lt;cluster&gt;-netops-credentials</code>), or the cluster's admin token until the coordinators make such keys. Its network is rows of the cluster's tables, so a pod started again goes on from them.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th><code>spec.netops</code></th>
+<th>default</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>paused</code></td>
+<td><code>false</code></td>
+<td>no pod for now (the coordinators still list it, as an app that does not answer; the tables stay and nothing is written to them)</td>
+</tr>
+<tr>
+<td><code>tables</code></td>
+<td><code>netops_*=admin</code></td>
+<td>the tables its key may touch</td>
+</tr>
+<tr>
+<td><code>args</code>, <code>resources</code></td>
+<td></td>
+<td>more arguments of <code>chloedb-netops serve</code> (<code>--fault-every 0</code>, <code>--history-hours 2</code>, <code>--no-simulate</code>), and its container's resources (50m CPU and 96 MiB asked, 1 GiB at most)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Removing <code>spec.netops</code> deletes its Deployment and Service and restarts the coordinators without it; the tables <code>netops_*</code> stay.</p>
+<h2 id="the-pages">The pages<a class="anchor" href="#the-pages" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>page</th>
+<th>what it is for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>My shift</strong></td>
+<td>the home page: a handover of the last twelve hours written from the tables, what waits for you most urgent first (approvals, alerts nobody owns, changes due, carrier notices that collide, open tickets), the changes and carrier windows of the next day and a half, and notes left by the shift before</td>
+</tr>
+<tr>
+<td><strong>Diagnose</strong></td>
+<td><a href="#where-is-it-broken">where it is broken</a>: the stack by place, the lowest broken layer named as where to start, one broken thing investigated five ways, and a trace between two points hop by hop</td>
+</tr>
+<tr>
+<td><strong>Network</strong></td>
+<td>the open incident, the network's map with each link's load, traffic and loss, services against their objectives, time to detect and to resolve by cause</td>
+</tr>
+<tr>
+<td><strong>Incidents</strong></td>
+<td>every incident; an incident's room has the likely cause with its confidence and evidence, the proposed actions, <a href="#an-incidents-board">its board</a>, a map of where it is that replays it minute by minute, the agent's steps with their SQL, the receipt of what it was shown, the timeline, the blast radius and similar incidents</td>
+</tr>
+<tr>
+<td><strong>Alerts</strong></td>
+<td>what fires and who owns it (acknowledge, hand back, silence), the silences in force, and the rules: each is a SQL query you can read, test against the last hours and save</td>
+</tr>
+<tr>
+<td><strong>Changes</strong></td>
+<td>the change calendar by day, the collisions (two changes whose devices overlap in a window, <code>&amp;&amp;</code> over <code>INT[]</code>), the change-risk agent's score, and carrying a change out: start it (its devices are silenced for the window), verify it against the network as it was before, complete it or roll it back</td>
+</tr>
+<tr>
+<td><strong>Customers</strong></td>
+<td>every customer with where they attach and whether anything is wrong on their path; a customer's page answers "is it the network?" with what was checked along the path from their port to the backbone, and a reply ready to send</td>
+</tr>
+<tr>
+<td><strong>Carriers</strong></td>
+<td>carriers' maintenance notices, each matched to the circuit it names and checked for what it collides with: the other plane's maintenance in the same window, a change on the router that carries the other plane, and whether the surviving plane has the capacity; a notice can be pasted as it arrived</td>
+</tr>
+<tr>
+<td><strong>Topology</strong></td>
+<td>the network as the inventory has it, as the logs say it is, and the difference; the path between two devices; the lines of syslog a link was read from</td>
+</tr>
+<tr>
+<td><strong>Services</strong></td>
+<td>each service's success rate and latency against its objective, the devices it rides on and the customers on it</td>
+</tr>
+<tr>
+<td><strong>Explore</strong></td>
+<td>logs by words or by substring, flows (who talks to whom), and one search box over runbooks, incidents, configurations and tickets</td>
+</tr>
+<tr>
+<td><strong>Devices</strong></td>
+<td>the inventory with each device's metrics, what happened on it in the last day, logs, configuration history and blame</td>
+</tr>
+<tr>
+<td><strong>Agents</strong></td>
+<td>the six agents, their runs and what each cost in queries, rows and tokens; capacity, advisories and configuration drift; autopilot</td>
+</tr>
+<tr>
+<td><strong>Map</strong></td>
+<td>the whole network on one plane, from regions down to one customer's router: zoom in and detail appears, what is broken colours the place that holds it at every zoom, a click on an object says what is wrong and what it has to do with everything around it, and a search box takes a sentence (<a href="#the-map">below</a>)</td>
+</tr>
+<tr>
+<td><strong>Dashboards</strong></td>
+<td>the backbone's busiest links (utilisation, loss, received optical power), the busiest devices and the slowest services over three hours, what is not ok by metro and by kind, faults a day by cause over two weeks, and incidents by cause; the estate's panels follow the place in view on the map</td>
+</tr>
+<tr>
+<td><strong>Data</strong></td>
+<td>the 39 tables with their definitions and row counts, where each one's rows come from and whether they are arriving, and the simulator's settings</td>
+</tr>
+<tr>
+<td><strong>Leadership</strong></td>
+<td>the switch at the top: services against what was sold, incidents with their cost in customer-minutes and revenue exposed, time to detect and resolve, what caused them and which followed a change, the risk register (spans that cannot fail over at their measured peak, software with open advisories, contracts ending), carriers by cost and downtime, and the week written as a report</td>
+</tr>
+</tbody>
+</table></div>
+<p>The box above every page searches, and completes as it is typed (<a href="#the-box-above-every-page-and-the-assistant">below</a>). An id, a site or a circuit opens on the map; a sentence becomes the map's query; anything else is looked up: an address (matched to the customer whose prefix holds it), a circuit id, a customer, a device, an interface, an AS number, with what the thing is and whether it is healthy.</p>
+<p>Each page has a <strong>SQL</strong> button that lists the queries behind what it shows, with their times.</p>
+<p><img loading="lazy" decoding="async" alt="An incident's room: the cause the agent named with its evidence, the actions it proposed, and the room's board" src="../../../assets/img/netops-incident.png" /></p>
+<h2 id="the-map">The map<a class="anchor" href="#the-map" aria-label="Link to this section">#</a></h2>
+<p><img loading="lazy" decoding="async" alt="The whole network: regions and metros, coloured by what is broken inside them" src="../../../assets/img/netops-map.png" /></p>
+<p>The backbone of 64 devices is what a carrier's core is. What it carries is far more: metro hubs with their routers and power plants, street cabinets, cell sites and business parks, and the ONTs, radios and customer routers behind them. The simulator makes that estate too (<code>--estate N</code>, about 200,000 objects by default, <code>0</code> for none): 18 kinds of object in <code>netops_estate_nodes</code>, what feeds what in <code>netops_estate_edges</code> (an edge table, upstream to downstream), and two months of faults and changes on every object in <code>netops_estate_events</code>. A few dozen faults are kept going, some of them caused by a change a few minutes before. Two alert rules watch it (<code>estate-outage</code> and <code>estate-degraded</code>, SQL over the two tables like the others): an access node, a hub router or a hub's power plant that is down or degraded with objects behind it raises an alert, grouped by its hub; a down one with 20 or more behind it is major and opens an incident, which the estate's agent works (what it reported, how far it reaches and which customers, a change before it, who is on call) and proposes sending field services. The degraded ones wait on <strong>My shift</strong>, and <strong>Diagnose</strong> lists them under the backbone's layers. Pasting an object's id into the search opens it.</p>
+<p>The Map page draws all of it without ever asking for all of it. Places are boxes, one inside the other: a region holds its metros, a metro its core devices and its hubs, a hub its routers, its power plant and its sites, and a site its access node and what is behind it. A box shows a name and a count until there is room for what is inside it, and then it is divided by layer: the backbone in a band along a metro's top, aggregation and power along a hub's, the premises under a site's access node. Shapes say what a thing is: a cell site is a circle with its sectors around the tower, a business park a box with its corners cut, a router a diamond, a power plant or a tower a triangle.</p>
+<ul>
+<li><strong>Zoom is a query.</strong> Every object has a place on a plane and a level of detail from which it is worth drawing. Regions, metros and hubs are read once; from there on the page asks for the objects and links in its window at its level of detail, two range queries, and draws what comes back.</li>
+<li><strong>Red is a <code>GROUP BY</code>.</strong> The objects that are down or degraded, and a count by place of what is behind them, are two queries every ten seconds; the page adds them up through site, hub, metro and region, with the backbone's open incidents. A place is coloured by how much the broken things inside it carry: a hub's router weighs more than a cabinet, a cabinet more than one home.</li>
+<li><strong>A click is a walk.</strong> For one object: what it hangs from (<code>REACHABLE</code> against the edges) and the nearest of those that is broken, which is where its trouble comes from; what depends on it, counted by kind and state (<code>REACHABLE</code> along the edges, grouped); what else is in trouble within three hops; the changes and faults of thirty days on it and on everything around it, with the change made just before the trouble began; and how faults that read like this one ended before (BM25 over the events).</li>
+</ul>
+<p><img loading="lazy" decoding="async" alt="One object: where its trouble starts, what it hangs from, what depends on it, and the trouble around it" src="../../../assets/img/netops-map-object.png" /></p>
+<p>A click on an object also lights what it hangs from and what depends on it, and fades the rest; the panel beside the map has tabs for the object: <strong>Overview</strong> (the walk above), <strong>Metrics</strong> (a minute's series for the backbone's devices and their links; for the estate, its latest reading and its faults and changes a day over sixty days), <strong>Events</strong>, <strong>Logs</strong> (syslog for the backbone; the estate's events as lines), <strong>Related</strong> (the chain it hangs from, what depends on it by kind, the customers behind it, the trouble around it), <strong>Incidents</strong> and <strong>Config</strong> (its properties, and for the backbone the latest configuration). They are read by <code>/v1/map/detail</code>.</p>
+<h3 id="the-box-above-every-page-and-the-assistant">The box above every page, and the assistant<a class="anchor" href="#the-box-above-every-page-and-the-assistant" aria-label="Link to this section">#</a></h3>
+<p>The box has two modes, <strong>Search</strong> and <strong>Ask</strong> (Tab switches them when the box is empty), and a chip that says where it looks: the object picked, the place the map shows, or everywhere (a click on the chip searches everywhere). As it is typed, <code>/v1/suggest</code> completes it from the tables, from what was typed before the word, and from where the person is:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>typed</th>
+<th>completed with</th>
+<th>how</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>the start of an id ("swi", "hr1-h3")</td>
+<td>objects, the broken ones first, in the place in view</td>
+<td><code>PREFIX(id, :w)</code> over the column's dictionary; with <code>fuzzy =&gt; 'auto'</code> when nothing matches exactly</td>
+</tr>
+<tr>
+<td>a word of a name ("park 7", "insur", "Lon")</td>
+<td>sites, hubs and metros, customers</td>
+<td><code>ILIKE</code> from the substring index, at the start of a word</td>
+</tr>
+<tr>
+<td>the start of a circuit ("LUM-A")</td>
+<td>circuits, with their carrier and plane</td>
+<td><code>PREFIX(circuit, :w)</code></td>
+</tr>
+<tr>
+<td><code>kind:</code>, <code>state:</code>, <code>vendor:</code>, <code>in:</code></td>
+<td>the values in the place in view, with counts</td>
+<td>a <code>GROUP BY</code></td>
+</tr>
+<tr>
+<td>the start of a sentence ("OLTs in London ")</td>
+<td>what the map's reader has not been told yet: a state (with how many it would find), what happened, by whom, a reading, a place in the graph</td>
+<td>the reader's plan of the words so far, and one <code>GROUP BY state</code></td>
+</tr>
+<tr>
+<td>a word that asks for the next ("that is not", "changed in", "about", "by")</td>
+<td>the words that can follow it</td>
+<td></td>
+</tr>
+<tr>
+<td>words of an earlier question</td>
+<td>questions asked before</td>
+<td>BM25 over <code>netops_searches</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>In Ask mode it offers questions about the object picked, and after a question the ones that usually follow it (after "what is wrong", what changed before it started, who is affected, what to do). The assistant, on the right of every page, answers them from the app's own API: what is wrong and where the trouble starts, the change made before it, what depends on it and the customers behind it, what to do (the change to check, how such faults ended before, runbooks by BM25), how it went before, what depends on it lit on the map, and a watch that reads the object every 30 seconds and says when it changes. Each answer lists the queries it ran. Anything else becomes the map's sentence search. The answers are written from the query results by fixed rules, not by a model; the command center's own Ask (Ctrl+J) is the server's agent over any table.</p>
+<p>Each completion is one to four queries of 1 to 3 ms on one server with 170,000 objects (a name matched at a word's start takes up to 70 ms the first time). ChloeDB has no next-word model: the sentence's next words come from the reader's vocabulary, and earlier questions from BM25.</p>
+<h3 id="asking-in-a-sentence">Asking in a sentence<a class="anchor" href="#asking-in-a-sentence" aria-label="Link to this section">#</a></h3>
+<p>The search box takes a question such as "everything changed in the last week about a firmware upgrade by m.rossi with latency above 15 ms", or "customer routers in Frankfurt behind hr1-h03-fra that are not ok". It names up to five kinds of condition, and ChloeDB answers them in one statement:</p>
+<pre data-lang="sql">SELECT id, kind, name, state, latency_ms, ... FROM netops_estate_nodes
+WHERE layer != &#x27;container&#x27;
+  AND latency_ms &gt; :latency_ms                      -- its latest reading
+  AND id IN (                                       -- what happened to it
+    SELECT node FROM netops_estate_events
+    WHERE event = &#x27;change&#x27; AND ts &gt;= :since AND author = :author AND MATCH(text, :about))
+  AND REACHABLE(netops_estate_edges, &#x27;ag1-fra&#x27;,     -- where it sits in the graph
+        hops =&gt; 6, dir =&gt; &#x27;out&#x27;, through =&gt; layer != &#x27;core&#x27;)
+ORDER BY latency_ms DESC LIMIT 300</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>in the sentence</th>
+<th>becomes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a kind, a vendor, a version, a place, a state ("degraded Nokia OLTs in Frankfurt")</td>
+<td>comparisons on keyword columns</td>
+</tr>
+<tr>
+<td>a customer's name</td>
+<td><code>ILIKE</code> from the substring index</td>
+</tr>
+<tr>
+<td>a reading ("latency above 40 ms", "high latency", "loss over 1%")</td>
+<td>a comparison on the object's latest reading, or of two of its columns (<code>latency_ms &gt; base_ms * 2</code>)</td>
+</tr>
+<tr>
+<td>what happened, when, about what, by whom ("changed last week about QoS by a.khan", "went down in the last 3 days because of power", "not changed in the last month")</td>
+<td>a subquery over the events table: time, author, cause, and <code>MATCH</code> on the words; <code>NOT IN</code> for what did not happen</td>
+</tr>
+<tr>
+<td>where it sits ("behind ag1-fra", "upstream of ...", "within 2 hops of ...")</td>
+<td><code>REACHABLE</code> over the edge table</td>
+</tr>
+</tbody>
+</table></div>
+<p>The same conditions run a second time grouped by place, so the map shows the matches at every zoom: a count on each region, metro, hub and site that holds some, and a ring on each object once it is drawn.</p>
+<p><img loading="lazy" decoding="async" alt="A sentence read into conditions, the one statement it became, and the matches by place" src="../../../assets/img/netops-map-search.png" /></p>
+<p>A sentence becomes a plan, and only a plan becomes SQL: every value in it is one the estate has or a parameter. Two readers make plans. With <code>--rewrite-model</code> (default <code>anthropic/claude-haiku-5-5</code>, empty for none) the app asks the server's own <a href="sql.html#language-models-llm"><code>llm()</code></a> to rewrite the question, over the row it was saved as in <code>netops_searches</code>; the model is told the plan's shape and what it may name, and its answer is checked field by field. When the server has no model (no key, no network), a reader of fixed vocabulary answers instead, and the page says which of them read the sentence. The fixed reader lists the words it took nothing from beside the count, which is then the answer to the rest of the question; an id, a place or a name the estate does not have refuses the question rather than being dropped from it ("ag9-zzz is not an object of the estate", "Did you mean London?"), and a place one letter off is read and said. A customer is matched by its whole name when the question gives it ("Northwind Energy"), and "this week", "this month" and "this year" start on their first day. The model's path is covered by a unit test of the checking, not by a run against a model: this build was only run where the server had none.</p>
+<p>Measured on one server in a 4-vCPU cloud container, with 170,337 objects, 173,133 links and about 470,000 events: the estate is written in about 25 seconds; a window is read in 10 to 75 ms depending on how much is in it; the eight queries behind one object take about 17 ms together; the statement above takes 5 to 10 ms, a walk of the 20,000 objects behind one aggregation router with a condition 22 to 30 ms, and "not changed in the last month" about 290 ms.</p>
+<p>On a cluster of shards the range queries, the grouping and the subquery run through the coordinator as they are. A coordinator does not walk graphs yet, so the walks are done by the app over the estate it made, and the page says so.</p>
+<h2 id="where-is-it-broken">Where is it broken<a class="anchor" href="#where-is-it-broken" aria-label="Link to this section">#</a></h2>
+<p>A list of alerts says that things are wrong, not where the trouble begins. The Diagnose page answers that, and then asks about the broken thing in the ways that only one database holding the topology, the logs, the history and the readings can.</p>
+<p><img loading="lazy" decoding="async" alt="Diagnose: the stack by place with the lowest broken layer outlined, a trace that marks the broken hop, and the start of an investigation" src="../../../assets/img/netops-diagnose.png" /></p>
+<ul>
+<li><strong>The stack, by place.</strong> A grid with a row per layer (power and reachability, optics, links, capacity, routing, device health, services, customers) and a column per site, plus one for the backbone between sites. Each cell is read from the last three minutes of the tables. A fault shows on its own layer and on every layer above it, so the lowest layer with something broken is named as where to start, and what shows above it is marked as likely following from it.</li>
+<li><strong>Investigate</strong> takes one link, device or service and asks five things, each card saying which of ChloeDB's abilities answered it, with how many queries and in what time:</li>
+<li><em>Graph queries in SQL</em>: <code>ppr()</code> over the links table ranks the devices closest to everything that alerts now, and <code>REACHABLE()</code> with array overlap lists the services and customers it takes down.</li>
+<li><em>Substring search</em>: every log line that names its interface, on any device, by <code>LIKE '%…%'</code> answered from the FM-index, so the neighbours' view of it is there too.</li>
+<li><em>History as rows</em>: the changes whose devices overlap it (<code>&amp;&amp;</code> over <code>INT[]</code>) and the configuration versions written on it; when there are none, a change is ruled out.</li>
+<li><em>Hybrid search</em>: past incidents and runbooks like it, by BM25 and an embedding fused with <code>rrf()</code> in the <code>ORDER BY</code>.</li>
+<li><em>Time series</em>: its last hour, a point a minute.</li>
+<li><strong>Trace a path</strong> walks from a customer, a device or a site to another (<code>PATH()</code> over the links table) and shows each hop and the link it was reached over with what they read now, marking the hop where it goes wrong.</li>
+</ul>
+<p>On the simulated network an investigation is 13 queries; in a 4-vCPU cloud container (one chloedb-server on local disk, the 64-device network with six hours of telemetry) they took about 12 ms together. The page's SQL button lists each.</p>
+<h2 id="an-incidents-board">An incident's board<a class="anchor" href="#an-incidents-board" aria-label="Link to this section">#</a></h2>
+<p>Most incidents fall into a few kinds, and the first minutes of each kind look alike; what differs is the question someone needs answered at minute twenty. So an incident's room is not built from nothing, and it is not fixed either.</p>
+<ul>
+<li><strong>It starts from its cause's template.</strong> When the room opens it has the panels every incident needs (loss on the links involved, error log lines by kind, the customers at its sites). When the root-cause agent names a cause, that cause's panels join: receive power and input errors for a failing optic, link state, the surviving plane's load and latency for a fibre cut, BGP sessions and configuration versions for a bad change, traffic in and top talkers for a DDoS, CPU and BGP updates for a software defect, reachability and temperature for a power fault.</li>
+<li><strong>People add to it by asking.</strong> <code>loss on LON-NYC last 2 hours</code>, <code>cpu on cr1-fra</code>, <code>logs "LINK-3-UPDOWN"</code>, <code>who sends the most</code>, <code>customers on ag1-ams</code>. A small reader that knows the readings, the tables and the network's names (devices, links, circuits, sites) turns the sentence into a query and says what it understood; it refuses what it cannot read rather than guess. A <code>SELECT</code> can be pasted instead. No model writes code here.</li>
+<li><strong>It is shared and kept.</strong> A panel is a row of <code>netops_panels</code> holding one read-only query, so everyone in the room sees the same board, a removed panel stays removed, who added what is on the timeline, and the board is still there for the postmortem.</li>
+<li><strong>It learns in the plainest way.</strong> What people added by hand to other incidents of the same kind is offered, one click each, on the next one.</li>
+</ul>
+<p><img loading="lazy" decoding="async" alt="The board of a fibre cut: loss, link state, the other plane's load and latency from its template, and panels people asked for" src="../../../assets/img/netops-board.png" /></p>
+<p><img loading="lazy" decoding="async" alt="Leadership: services against their objectives, what incidents cost, risk, and the week written as a report" src="../../../assets/img/netops-leadership.png" /></p>
+<h2 id="the-agents">The agents<a class="anchor" href="#the-agents" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>agent</th>
+<th>what it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Triage</td>
+<td>sizes a new incident: the alerts, the devices around them, the services and customers that ride on those, and who is on call</td>
+</tr>
+<tr>
+<td>Root cause</td>
+<td>ranks the alerting devices over the topology, reads the logs, changes, optics and flows around them, tests six causes, finds similar incidents and the runbook, and proposes actions</td>
+</tr>
+<tr>
+<td>Change risk</td>
+<td>scores a planned change: its blast radius, other changes on the same or neighbouring devices in its window, open incidents nearby</td>
+</tr>
+<tr>
+<td>Capacity</td>
+<td>finds the links whose 95th percentile runs hot, and the pairs that cannot carry each other's traffic if one fails</td>
+</tr>
+<tr>
+<td>Advisories and drift</td>
+<td>joins vendor advisories with the inventory's software versions, and searches every configuration for what should not be there</td>
+</tr>
+<tr>
+<td>Topology from logs</td>
+<td>reads LLDP and routing-adjacency lines out of syslog, builds the links they imply, and compares them with the inventory</td>
+</tr>
+</tbody>
+</table></div>
+<p>The agents are code that queries ChloeDB, not calls to a language model: each conclusion comes from rows a query returned, and a hypothesis is kept only when the incident's own alerts and fresh evidence near them support it. That is what makes a run cheap enough to start on every incident, and what lets the page show every step.</p>
+<p>The simulator keeps an answer key for each fault it injects (<code>netops_faults</code>), which the agents never read. An incident's room can check the agent's answer against it, and the Agents page counts how many were right.</p>
+<h2 id="the-six-faults">The six faults<a class="anchor" href="#the-six-faults" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>fault</th>
+<th>what happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fibre cut on a backbone circuit</td>
+<td>a backbone circuit loses light; its traffic lands on the other plane, which runs hot</td>
+</tr>
+<tr>
+<td>A change breaks BGP on a border router</td>
+<td>a routing-policy change is committed on a border router and its sessions drop</td>
+</tr>
+<tr>
+<td>An optic slowly fails</td>
+<td>receive power on a link decays, errors climb, and the link starts to flap</td>
+</tr>
+<tr>
+<td>Volumetric DDoS on a customer prefix</td>
+<td>an amplification attack floods a site's borders and its firewalls</td>
+</tr>
+<tr>
+<td>Routing daemon pegs a core router's CPU</td>
+<td>a software defect named in a vendor advisory makes the routing process spin</td>
+</tr>
+<tr>
+<td>A site loses one power feed</td>
+<td>feed A at a small site fails; the devices on it go dark together</td>
+</tr>
+</tbody>
+</table></div>
+<p>A fault mitigates when its action is approved (or after some minutes on its own) and its incident resolves when the alerts clear.</p>
+<h2 id="your-own-network">Your own network<a class="anchor" href="#your-own-network" aria-label="Link to this section">#</a></h2>
+<p>The app only reads tables, with the SQL its pages show. The simulator is one writer of them; anything that writes to ChloeDB can be another.</p>
+<p><code>chloedb-netops serve --no-simulate</code> is the app on a real network:</p>
+<ul>
+<li><strong>The network is the inventory tables.</strong> At start the app reads <code>netops_sites</code>, <code>netops_devices</code>, <code>netops_links</code>, <code>netops_services</code>, <code>netops_customers</code> and <code>netops_bgp</code> and works from those: the topology graph, an incident's scope, a customer's path, a notice's circuit. With no devices it creates the tables, says which to fill, and stops. The inventory is read at start, so restart the app after it changes.</li>
+<li><strong>It writes no telemetry.</strong> Each minute, once that minute has had a minute to arrive, the alert rules run over whatever is in <code>netops_link_metrics</code>, <code>netops_device_metrics</code>, <code>netops_service_metrics</code>, <code>netops_flows</code> and <code>netops_syslog</code>; alerts are grouped into incidents over the topology and the agents work them, exactly as on the simulated network. What the app writes is what it derives: alerts, incidents, timelines, agent runs, proposed actions, panels, silences.</li>
+<li><strong>An approved action is recorded, not pushed.</strong> The app does not log in to devices. Approval, who gave it and the commands proposed are kept; carrying them out stays with the people and tools that do that today.</li>
+<li><strong>The Data page says what is arriving.</strong> Each source shows <code>live</code> when rows landed in the last five minutes (or, for records, when the table holds any), <code>silent</code> or <code>empty</code> otherwise, with its rate and lag. With the simulator on, sources read <code>simulated</code>.</li>
+</ul>
+<p>What usually feeds each table:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>table</th>
+<th>from</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>netops_devices</code>, <code>netops_links</code>, <code>netops_sites</code>, <code>netops_circuits</code></td>
+<td>the inventory (NetBox, or its database followed with <code>follow-postgres</code>)</td>
+</tr>
+<tr>
+<td><code>netops_link_metrics</code>, <code>netops_device_metrics</code>, <code>netops_service_metrics</code></td>
+<td>a rollup a minute from the metrics store (Prometheus), one row per link, device or service</td>
+</tr>
+<tr>
+<td><code>netops_syslog</code></td>
+<td>chloedb-server's <a href="server.html">OTLP logs endpoint</a>, from an OpenTelemetry Collector with a syslog receiver</td>
+</tr>
+<tr>
+<td><code>netops_flows</code></td>
+<td>flow summaries a minute (top talkers), not raw flows</td>
+</tr>
+<tr>
+<td><code>netops_changes</code>, <code>netops_tickets</code></td>
+<td>the ITSM tool</td>
+</tr>
+<tr>
+<td><code>netops_configs</code></td>
+<td>a configuration backup tool, a row per version</td>
+</tr>
+<tr>
+<td><code>netops_maintenance</code></td>
+<td>carriers' mail: <code>POST /v1/maintenance/parse {"text": "..."}</code> reads a notice as it arrived into its circuit and window; a row written with only <code>raw</code> and <code>status</code> <code>new</code> is read the same way within a minute</td>
+</tr>
+<tr>
+<td><code>netops_alerts</code></td>
+<td>the rules here, and <code>POST /v1/alerts/webhook</code> in Alertmanager's format (<code>{"alerts": [{"status": "firing", "labels": {...}, "annotations": {...}}]}</code>), which join incidents the same way</td>
+</tr>
+</tbody>
+</table></div>
+<p>A metrics row carries the link's or device's <code>id</code> as the inventory has it and a <code>ts</code>; the Data page shows each table's columns. The simulator's data is marked as synthetic on every page, and the mark is gone with the simulator off.</p>
+<h2 id="the-tables">The tables<a class="anchor" href="#the-tables" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>table</th>
+<th>what it holds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>netops_sites</code></td>
+<td>sites: points of presence and data centres</td>
+</tr>
+<tr>
+<td><code>netops_devices</code></td>
+<td>devices, as the inventory records them</td>
+</tr>
+<tr>
+<td><code>netops_links</code></td>
+<td>the inventory's links: an edge table, so graph queries walk the topology</td>
+</tr>
+<tr>
+<td><code>netops_seen_links</code></td>
+<td>links read from the logs (LLDP neighbours, routing adjacencies), compared with the inventory</td>
+</tr>
+<tr>
+<td><code>netops_circuits</code></td>
+<td>leased circuits and who provides them</td>
+</tr>
+<tr>
+<td><code>netops_bgp</code></td>
+<td>BGP sessions with transit providers and peers</td>
+</tr>
+<tr>
+<td><code>netops_services</code></td>
+<td>services sold, their objectives and the devices they ride on</td>
+</tr>
+<tr>
+<td><code>netops_customers</code></td>
+<td>customers, where they attach and what they are known by (prefix, port, circuit)</td>
+</tr>
+<tr>
+<td><code>netops_link_metrics</code></td>
+<td>a point a minute per link: the rollup an incident needs, not a metrics store</td>
+</tr>
+<tr>
+<td><code>netops_device_metrics</code></td>
+<td>a point a minute per device</td>
+</tr>
+<tr>
+<td><code>netops_service_metrics</code></td>
+<td>a point a minute per service: requests, errors, latency</td>
+</tr>
+<tr>
+<td><code>netops_flows</code></td>
+<td>flow summaries a minute: who talks to whom</td>
+</tr>
+<tr>
+<td><code>netops_syslog</code></td>
+<td>device logs, searched by words (BM25) and by any substring (an FM-index)</td>
+</tr>
+<tr>
+<td><code>netops_alert_rules</code></td>
+<td>alert rules: each one is a SQL query over these tables</td>
+</tr>
+<tr>
+<td><code>netops_alerts</code></td>
+<td>alerts the rules raised</td>
+</tr>
+<tr>
+<td><code>netops_incidents</code></td>
+<td>incidents: alerts correlated over the topology, with the cause the agent named</td>
+</tr>
+<tr>
+<td><code>netops_timeline</code></td>
+<td>what happened in each incident, in order</td>
+</tr>
+<tr>
+<td><code>netops_changes</code></td>
+<td>changes, planned and done, with the devices each touches (<code>INT[]</code>, so scopes overlap with <code>&amp;&amp;</code>)</td>
+</tr>
+<tr>
+<td><code>netops_configs</code></td>
+<td>every version of each device's configuration, for blame and search</td>
+</tr>
+<tr>
+<td><code>netops_tickets</code></td>
+<td>tickets, open and closed</td>
+</tr>
+<tr>
+<td><code>netops_runbooks</code></td>
+<td>runbooks, found by words and by meaning</td>
+</tr>
+<tr>
+<td><code>netops_judgments</code></td>
+<td>which runbook closed which incident: grades the ranking can learn from</td>
+</tr>
+<tr>
+<td><code>netops_oncall</code></td>
+<td>who is on call, by team and shift</td>
+</tr>
+<tr>
+<td><code>netops_advisories</code></td>
+<td>vendor advisories, joined with the inventory's software versions</td>
+</tr>
+<tr>
+<td><code>netops_agent_runs</code></td>
+<td>each run of an agent</td>
+</tr>
+<tr>
+<td><code>netops_agent_steps</code></td>
+<td>every step of every run, with the SQL it ran</td>
+</tr>
+<tr>
+<td><code>netops_receipts</code></td>
+<td>what each agent was shown and what was left out</td>
+</tr>
+<tr>
+<td><code>netops_actions</code></td>
+<td>actions agents proposed, and who decided them</td>
+</tr>
+<tr>
+<td><code>netops_silences</code></td>
+<td>what is kept from paging, by whom, why and until when</td>
+</tr>
+<tr>
+<td><code>netops_maintenance</code></td>
+<td>carriers' maintenance notices, each matched to a circuit and a window</td>
+</tr>
+<tr>
+<td><code>netops_handovers</code></td>
+<td>notes left from one shift to the next</td>
+</tr>
+<tr>
+<td><code>netops_panels</code></td>
+<td>each incident's board: one read-only query a panel</td>
+</tr>
+<tr>
+<td><code>netops_estate_nodes</code></td>
+<td>everything the network is made of, from regions down to a customer's router: its place on the map, its level of detail, its state and its latest readings</td>
+</tr>
+<tr>
+<td><code>netops_estate_edges</code></td>
+<td>what feeds what, upstream to downstream (an edge table)</td>
+</tr>
+<tr>
+<td><code>netops_estate_events</code></td>
+<td>faults, their clearing and changes on every object, with their words, cause and author</td>
+</tr>
+<tr>
+<td><code>netops_searches</code></td>
+<td>the questions asked in a sentence: who read each, the plan and the SQL it became</td>
+</tr>
+<tr>
+<td><code>netops_faults</code></td>
+<td>the simulator's answer key (agents never read it)</td>
+</tr>
+<tr>
+<td><code>netops_sources</code></td>
+<td>where each table's rows come from</td>
+</tr>
+<tr>
+<td><code>netops_state</code></td>
+<td>the app's own bookkeeping</td>
+</tr>
+</tbody>
+</table></div>
+<p>The Data page shows each table's <code>CREATE TABLE</code>, and they can be queried in the SQL workbench like any other:</p>
+<pre data-lang="sql">-- the links that lost the most packets since a given minute, worst first
+SELECT link, MAX(loss) AS worst FROM netops_link_metrics
+WHERE ts &gt;= &#x27;2026-11-13T03:00:00Z&#x27; GROUP BY link ORDER BY worst DESC LIMIT 5;</pre>
+<h2 id="what-it-is-not">What it is not<a class="anchor" href="#what-it-is-not" aria-label="Link to this section">#</a></h2>
+<p>Out of the box it is a demonstration on synthetic data, and it has been run on real feeds only in its own test (readings written to the server from outside, with the simulator off). The telemetry is a point a minute per link, device and service, which is what an incident needs; ChloeDB is not a metrics store, and a real deployment keeps its high-resolution metrics where they are and writes rollups here. Approving an action changes the simulated network, or is only recorded with the simulator off: nothing is ever sent to a device. The reader behind "add a panel" knows a fixed set of readings and tables; it is not a language model. The inventory is read once at start, and at most 10,000 rows a table.</p>
+<h2 id="test-it">Test it<a class="anchor" href="#test-it" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">cd chloedb-netops &amp;&amp; cargo test --release</pre>
+<p><code>tests/cluster.rs</code> starts the app on a real chloedb-server (built in <code>../chloedb-server/target</code>, or <code>CHLOEDB_SERVER_BIN</code>) and checks the tables, the topology found from logs, each of the six faults against its answer key, an approval, the webhook, where it is broken during a fibre cut (the stack by place, an investigation, a trace), the shift's pages (handover, lookup, a customer's check, acknowledging and silencing, a change carried out and verified, carriers' notices and their collisions), an incident's board, the leadership numbers, a restart on the same folder, and then the simulator off: readings written to the server from outside open an incident that the agent diagnoses.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/netops.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="sheets.html">← Sheets</a><a href="chloectx.html">ChloeCtx →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

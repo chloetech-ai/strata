@@ -1080,7 +1080,7 @@ ICON = '<path d="M4 6h16M4 12h10M4 18h6"/><circle cx="18" cy="15" r="3"/><path d
 
 def manifest():
     return {"name": "features", "title": "Feature store", "description": "A shop ranked by a model on live features: streaming and batch transforms, point-in-time training sets, models as rows, serving by key",
-            "icon_svg": ICON, "view": "ui/view.js", "version": VERSION}
+            "icon_svg": ICON, "view": "ui/view.js", "version": VERSION, "maturity": "demo"}
 
 
 def handler(app, token):

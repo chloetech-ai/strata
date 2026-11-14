@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChloeDB from Java · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="The ai.chloetech.chloedb package runs a ChloeDB database inside a Java process, the way sqlite-jdbc runs SQLite: the database is a file the JVM opens, read and written by ChloeDB&#x27;s native library over JNI, with no…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/java.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html" aria-current="page">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Clients</span>
+      <h1>ChloeDB from Java</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/java.md">docs/chloedb/java.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#build-it">Build it</a></li><li><a href="#a-database-in-your-process">A database in your process</a></li><li><a href="#rows-and-values">Rows and values</a></li><li><a href="#queries">Queries</a></li><li><a href="#tables">Tables</a></li><li><a href="#files">Files</a></li><li><a href="#jdbc">JDBC</a></li><li><a href="#errors">Errors</a></li><li><a href="#how-it-works">How it works</a></li></ol></details>
+    <div class="doc-body">
+
+<p>The <code>ai.chloetech.chloedb</code> package runs a ChloeDB database inside a Java process, the way sqlite-jdbc runs SQLite: the database is a file the JVM opens, read and written by ChloeDB's native library over JNI, with no server and nothing to configure. It has a JDBC driver too (<code>jdbc:chloedb:books.chloedb</code>), for code and tools that speak JDBC. It works on Java 11 and later.</p>
+<p>Before ChloeDB was renamed, the package was <code>ai.chloetech.strata</code> and its jar <code>ai.chloetech:strata</code>: change the imports and the dependency when you rebuild (<code>StrataException</code> is <code>ChloeDBException</code>, and the driver's <code>Strata*</code> classes are <code>ChloeDB*</code>). URLs that begin <code>jdbc:strata:</code> still open a database.</p>
+<h2 id="build-it">Build it<a class="anchor" href="#build-it" aria-label="Link to this section">#</a></h2>
+<p>The package is in <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb-java"><code>chloedb-java/</code></a>: Java classes (<code>src/main/java</code>) and the Rust crate of their native library (<code>src/*.rs</code>). Building it needs Rust (stable), a C compiler, a JDK (11 or later) and Maven.</p>
+<pre data-lang="sh">cd chloedb-java
+mvn package          # cargo builds the library, Maven the classes; tests run against both
+mvn install          # and into ~/.m2, as ai.chloetech:chloedb:0.3.3</pre>
+<p>The jar (<code>target/java/chloedb-0.3.3.jar</code>) carries the native library for the platform it was built on (Linux or macOS, x86-64 or ARM), and needs nothing else at run time: no dependency, no server. A project uses it from the local repository:</p>
+<pre data-lang="xml">&lt;dependency&gt;
+  &lt;groupId&gt;ai.chloetech&lt;/groupId&gt;
+  &lt;artifactId&gt;chloedb&lt;/artifactId&gt;
+  &lt;version&gt;0.3.3&lt;/version&gt;
+&lt;/dependency&gt;</pre>
+<p>or, with Gradle, <code>implementation("ai.chloetech:chloedb:0.3.3")</code> with <code>mavenLocal()</code> among the repositories.</p>
+<p><code>-Dcargo.profile=ci</code> builds the library without link-time optimisation, much faster, for a build that only runs the tests. <code>-Dcargo.features=bert</code> (comma-separated) turns on Cargo features as the Python package has them: <code>bert</code> for BERT embedding models (<code>accelerate</code> on a Mac), <code>onnx</code>, <code>vision</code>, <code>audio</code>. The library already includes DataFusion, Parquet and <code>s3://</code> URLs. <code>-Dcargo.skip=true</code> packages the library cargo built before.</p>
+<h2 id="a-database-in-your-process">A database in your process<a class="anchor" href="#a-database-in-your-process" aria-label="Link to this section">#</a></h2>
+<pre data-lang="java" data-title="Java">import ai.chloetech.chloedb.Database;
+import ai.chloetech.chloedb.Result;
+import java.util.List;
+import java.util.Map;
+
+Map&lt;String, Object&gt; schema = Map.of(&quot;table&quot;, &quot;books&quot;, &quot;key&quot;, &quot;id&quot;, &quot;fields&quot;, List.of(
+    Map.of(&quot;name&quot;, &quot;id&quot;, &quot;type&quot;, &quot;keyword&quot;),
+    Map.of(&quot;name&quot;, &quot;title&quot;, &quot;type&quot;, &quot;text&quot;),
+    Map.of(&quot;name&quot;, &quot;year&quot;, &quot;type&quot;, &quot;int&quot;),
+    Map.of(&quot;name&quot;, &quot;emb&quot;, &quot;type&quot;, &quot;vector&quot;, &quot;embed&quot;, Map.of(&quot;from&quot;, &quot;title&quot;, &quot;model&quot;, &quot;hash:32&quot;))));
+
+try (Database db = Database.create(&quot;books.chloedb&quot;, schema)) {
+    db.insert(List.of(
+        Map.of(&quot;id&quot;, &quot;b1&quot;, &quot;title&quot;, &quot;The river and the dragon&quot;, &quot;year&quot;, 1999),
+        Map.of(&quot;id&quot;, &quot;b2&quot;, &quot;title&quot;, &quot;A mountain in winter&quot;, &quot;year&quot;, 2004)));
+    for (Map&lt;String, Object&gt; row : db.search(&quot;dragon&quot;)) {
+        System.out.println(row.get(&quot;id&quot;) + &quot; &quot; + row.get(&quot;title&quot;));
+    }
+    Result r = db.query(&quot;SELECT year, COUNT(*) AS n FROM books WHERE year &gt;= :y GROUP BY year&quot;, Map.of(&quot;y&quot;, 2000));
+    r.rows();                                  // [[2004, 1]]
+    db.execute(&quot;UPDATE books SET year = 2000 WHERE id = :k&quot;, Map.of(&quot;k&quot;, &quot;b1&quot;));   // 1
+}
+
+try (Database db = Database.open(&quot;books.chloedb&quot;)) {
+    db.get(&quot;b1&quot;);                              // {id=b1, title=The river and the dragon, year=2000}
+}</pre>
+<p><code>Database.create</code> takes the schema as a map (the <a href="server.html#schemas">short form</a> or the long one), JSON text, or the path of a JSON file. <code>Database.open</code> opens a database the file already holds. Both take <code>new Database.Options()</code>: <code>.directory(true)</code> keeps a new database as a directory of segment files, <code>.models(dir)</code> says where embedding models are, <code>.threads(n)</code> how many cores queries and index builds use (the machine's by default).</p>
+<p>Only one process may have a database open to write it at a time; another gets a <code>ChloeDBException</code> saying the database is busy. Other processes can open it with <code>Database.open(path, new Database.Options().readOnly(true))</code> to read it while it is written: each query sees the writer's commits so far, every write fails, and <code>refresh()</code> looks for new commits at once (<a href="design.html#readers-in-other-processes">how readers follow the writer</a>). For writes from several processes, serve it with <a href="server.html">chloedb-server</a>. Within the process, one <code>Database</code> is safe to use from many threads at once: queries run in parallel, writes made at once wait for each other and share commits (one disk flush for all those waiting, none failing as busy), and a call into the library does not hold the JVM. Segments merge in the background as writes add them, one merge at a time. Close the database when done, with <code>close()</code> or try-with-resources, which also merges small segments and gives the file system back the space merges freed when it is an eighth of the file or more; one left open is closed when the garbage collector finds it.</p>
+<h2 id="rows-and-values">Rows and values<a class="anchor" href="#rows-and-values" aria-label="Link to this section">#</a></h2>
+<p>A row is a map of field name to value, and a query's answer gives values back as Java types:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>ChloeDB</th>
+<th>written as</th>
+<th>read as</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KEYWORD, TEXT</td>
+<td><code>String</code></td>
+<td><code>String</code></td>
+</tr>
+<tr>
+<td>INT</td>
+<td><code>Integer</code>, <code>Long</code> (any integer type, <code>BigInteger</code> within 64 bits)</td>
+<td><code>Long</code></td>
+</tr>
+<tr>
+<td>FLOAT</td>
+<td><code>Double</code>, <code>Float</code>, <code>BigDecimal</code></td>
+<td><code>Double</code></td>
+</tr>
+<tr>
+<td>BOOL</td>
+<td><code>Boolean</code></td>
+<td><code>Boolean</code></td>
+</tr>
+<tr>
+<td>TIMESTAMP</td>
+<td><code>Instant</code>, <code>OffsetDateTime</code>, <code>ZonedDateTime</code>, <code>Date</code>; <code>LocalDateTime</code> and <code>LocalDate</code> as UTC; ISO 8601 text</td>
+<td><code>Instant</code></td>
+</tr>
+<tr>
+<td>VECTOR</td>
+<td><code>float[]</code> (kept as float32), <code>double[]</code>, a <code>List</code> of numbers</td>
+<td><code>float[]</code></td>
+</tr>
+<tr>
+<td>a multi-valued field</td>
+<td>a <code>List</code></td>
+<td>a <code>List</code></td>
+</tr>
+<tr>
+<td>SPARSE</td>
+<td>a map of term to weight</td>
+<td>a <code>String</code> of JSON</td>
+</tr>
+<tr>
+<td>JSON</td>
+<td>a <code>Map</code>, or JSON text</td>
+<td>its JSON text</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>null</code> is NULL. Maps keep their order where it matters (<code>LinkedHashMap</code>); <code>Map.of</code> takes no null, so a row with a NULL field is a <code>HashMap</code> or a <code>LinkedHashMap</code>. A value of another type throws <code>IllegalArgumentException</code> before anything is written.</p>
+<p><code>insert</code> writes rows whose keys must be new, all or none: 10,000 rows or more are bulk-loaded into new segments in one commit, fewer go through the write-ahead log. <code>upsert</code> inserts or replaces rows by key, <code>delete</code> takes a key or a collection of them, and <code>get</code> and <code>getMany</code> read rows by key without SQL (<code>null</code> for a key no row has). <code>write</code> takes the operations chloedb-server's <code>/v1/write</code> takes (<code>insert</code>, <code>upsert</code>, <code>delete</code>, <code>set</code> of a field, a number in place and another by writing the row again, and <code>add</code> to a number in place) and applies them in one transaction.</p>
+<h2 id="queries">Queries<a class="anchor" href="#queries" aria-label="Link to this section">#</a></h2>
+<p><code>query</code> runs a SELECT (or an EXPLAIN) and gives a <code>Result</code>; <code>execute</code> runs any other statement (INSERT, UPDATE, DELETE, CREATE TABLE, ALTER TABLE) and gives the rows it wrote. Parameters (<code>:name</code> in the SQL) are a map:</p>
+<pre data-lang="java" data-title="Java">float[] v = db.embed(&quot;dragon river&quot;);      // the text&#x27;s vector by an embedded field&#x27;s model
+db.query(&quot;SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 5&quot;, Map.of(&quot;v&quot;, v));
+db.query(&quot;SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 5&quot;, Map.of(&quot;v&quot;, Map.of(&quot;embed&quot;, &quot;dragon river&quot;)));
+db.query(&quot;SELECT id FROM books ORDER BY similarity(emb, :v) DESC LIMIT 5&quot;, Map.of(&quot;v&quot;, Map.of(&quot;vector_of&quot;, &quot;b1&quot;)));</pre>
+<p>A <code>Result</code> has <code>columns()</code>, <code>rows()</code> (lists in column order), <code>keys()</code> (each row's primary key), <code>scores()</code> (what each row was ranked by) and <code>stats()</code> (what the engine did, as JSON text). Iterating it gives each row as a map of column to value; <code>row(i)</code>, <code>column(name)</code> and <code>scalar()</code> (the first value of the first row: a count) read parts of it. <code>plan(sql)</code> gives a statement's plan as a map without running it.</p>
+<p><code>search(text)</code> gives the rows that best match a text, as the Python package's <code>search</code> does: BM25 over the text fields, the similarity of an embedded vector field to the text's embedding, or both fused by reciprocal rank, which it picks when the table has an embedded field whose model is open.</p>
+<pre data-lang="java" data-title="Java">db.search(&quot;dragon&quot;, new SearchOptions().limit(5).where(&quot;year &gt;= :y&quot;).param(&quot;y&quot;, 1950).columns(&quot;id&quot;, &quot;year&quot;));
+db.search(&quot;dragon&quot;, new SearchOptions().mode(&quot;text&quot;).textFields(&quot;title&quot;));</pre>
+<p><code>queryLogged</code> and <code>exportRankLog</code> keep and export a <a href="sql.html#the-rank-log-what-each-query-served">rank log</a> for training a ranking, with the options chloedb-server takes for them.</p>
+<h3 id="limits-memory-deadlines-interrupting">Limits: memory, deadlines, interrupting<a class="anchor" href="#limits-memory-deadlines-interrupting" aria-label="Link to this section">#</a></h3>
+<p>A query runs in your process, so what it builds up (its groups, the rows it orders and returns, a join's tables) is held by the JVM's process, outside its heap. The queries of every database a process opens share a memory budget, by default a quarter of the machine's memory (the cgroup's limit in a container, else RAM), or <code>CHLOEDB_QUERY_MEMORY_MB</code> MiB when that is set when the first database opens (<code>0</code>: no budget). A query that would hold more throws a <code>ChloeDBException</code> whose message starts <code>memory:</code>, naming the budget and how to raise it, instead of the process running out of memory.</p>
+<p>A query has no deadline unless it is given one. <code>query(sql, params, options)</code>, <code>execute(sql, params, options)</code> and <code>SearchOptions.limits(options)</code> take a <code>QueryOptions</code>: <code>timeoutMs</code> (past it the query stops and throws a <code>ChloeDBException</code> whose message starts <code>timeout:</code>, naming it) and <code>memory</code> (a budget of its own in bytes; <code>0</code>: none). A database's own limits, for every query that does not give its own, come with <code>Database.Options</code> or <code>setLimits</code>; <code>interrupt()</code>, from any thread, stops the queries of the database running now and returns how many there were:</p>
+<pre data-lang="java" data-title="Java">Database db = Database.open(&quot;books.chloedb&quot;, new Database.Options().timeoutMs(5_000).memory(512L &lt;&lt; 20));
+db.query(&quot;SELECT genres, COUNT(*) FROM books GROUP BY genres&quot;, null, new QueryOptions().timeoutMs(200));
+db.query(&quot;SELECT * FROM books&quot;, null, new QueryOptions().memory(0));   // counts nothing
+db.setLimits(null, null);                                              // back to the defaults</pre>
+<p>A query checks its deadline and <code>interrupt</code> between segments and every 1,024 rows it groups, orders, walks or joins, so it stops within milliseconds. A write is not cut short. Through JDBC, <code>Statement.setQueryTimeout(seconds)</code> is each query's deadline (past it, a <code>SQLTimeoutException</code>, state <code>HYT00</code>) and <code>Statement.cancel()</code>, from another thread, stops the statement's query (a <code>SQLException</code>, state <code>HY008</code>).</p>
+<h2 id="tables">Tables<a class="anchor" href="#tables" aria-label="Link to this section">#</a></h2>
+<p>The methods that act on a table (<code>insert</code>, <code>upsert</code>, <code>delete</code>, <code>get</code>, <code>getMany</code>, <code>search</code>, <code>schema</code>, <code>importFile</code>, <code>addColumn</code>, <code>dropColumn</code>, <code>renameColumn</code>, <code>embed</code>) act on the database's first table. <code>db.table("events")</code> gives another, with the same methods:</p>
+<pre data-lang="java" data-title="Java">db.execute(&quot;CREATE TABLE events (id INT PRIMARY KEY, usr KEYWORD, book KEYWORD REFERENCES books, ts TIMESTAMP)&quot;);
+Table events = db.table(&quot;events&quot;);
+events.insert(Map.of(&quot;id&quot;, 1, &quot;usr&quot;, &quot;u1&quot;, &quot;book&quot;, &quot;b1&quot;, &quot;ts&quot;, Instant.now()));
+db.query(&quot;SELECT b.title FROM events e JOIN books b ON e.book = b.id WHERE e.usr = &#x27;u1&#x27;&quot;);</pre>
+<p><code>tables()</code> gives every table's schema. <code>addColumn("price", "float", Map.of("default", 1.5))</code>, <code>dropColumn</code> and <code>renameColumn</code> change a table's columns, as <code>ALTER TABLE</code> does.</p>
+<h2 id="files">Files<a class="anchor" href="#files" aria-label="Link to this section">#</a></h2>
+<pre data-lang="java" data-title="Java">db.importFile(&quot;rows.jsonl&quot;);                           // JSON Lines, JSON, CSV or TSV, by its name
+db.importSqlite(&quot;notes.sqlite&quot;);                       // a SQLite file&#x27;s tables
+db.exportSqlite(&quot;out.sqlite&quot;, Map.of(&quot;fts&quot;, false));   // and the database out to one
+db.importParquet(&quot;s3://bucket/events/&quot;);               // Parquet files, from S3 too
+db.exportParquet(&quot;out/&quot;);
+Database copy = Database.fromSqlite(&quot;notes.sqlite&quot;, &quot;notes.chloedb&quot;);  // a new database from a SQLite file</pre>
+<p>Their options are maps, with the names the <a href="sqlite.html">SQLite</a> and <a href="parquet.html">Parquet</a> pages give (<code>tables</code>, <code>schemas</code>, <code>blobsBase64</code>, <code>fts</code>, <code>indexes</code>, <code>table</code>, <code>schema</code>, <code>key</code>). An option a method does not take throws <code>IllegalArgumentException</code> naming those it takes, before anything is read or written. <code>Database.planSqlite</code> and <code>Database.planParquet</code> say what an import would do without doing it, and <code>lastImport()</code> what the import that made a database did.</p>
+<h2 id="jdbc">JDBC<a class="anchor" href="#jdbc" aria-label="Link to this section">#</a></h2>
+<p>The jar is also a JDBC driver: <code>jdbc:chloedb:PATH</code> (or <code>jdbc:strata:PATH</code>, by the old name) opens the database at <code>PATH</code> in the process, as <code>jdbc:sqlite:PATH</code> does a SQLite file. <code>DriverManager</code> finds it by itself (the jar lists it under <code>META-INF/services</code>).</p>
+<pre data-lang="java" data-title="Java">import java.sql.*;
+
+try (Connection c = DriverManager.getConnection(&quot;jdbc:chloedb:books.chloedb&quot;);
+     PreparedStatement ps = c.prepareStatement(&quot;SELECT id, title, year FROM books WHERE year &gt;= ? ORDER BY year LIMIT ?&quot;)) {
+    ps.setInt(1, 2000);
+    ps.setInt(2, 10);
+    try (ResultSet rs = ps.executeQuery()) {
+        while (rs.next()) {
+            System.out.println(rs.getString(&quot;id&quot;) + &quot; &quot; + rs.getString(&quot;title&quot;) + &quot; &quot; + rs.getInt(&quot;year&quot;));
+        }
+    }
+}</pre>
+<p>Options follow a <code>?</code> in the URL or come as connection properties: <code>schema</code> (the path of a schema's JSON file, with which a database that does not exist yet is created: <code>jdbc:chloedb:books.chloedb?schema=books.json</code>), <code>models</code>, <code>threads</code>, and <code>readonly=true</code>, which refuses statements that write. A URL may also name the path as <code>jdbc:chloedb:file:books.chloedb</code>.</p>
+<ul>
+<li><strong>Statements</strong> are ChloeDB's SQL (<a href="sql.html">the query language</a>), with <code>?</code> parameters numbered from 1. <code>setObject</code> takes the values the rest of the package takes: a <code>float[]</code> is a vector (<code>ORDER BY similarity(v, ?)</code>), a <code>List</code> a list. Batches (<code>addBatch</code>, <code>executeBatch</code>) run one statement after another; one that fails stops the batch with a <code>BatchUpdateException</code> that counts the ones before it, which stay written.</li>
+<li><strong>Results</strong> come back whole, so a result set can scroll if the statement is made with <code>ResultSet.TYPE_SCROLL_INSENSITIVE</code>; result sets are read-only. <code>getObject</code> gives an INT as <code>Long</code>, a FLOAT as <code>Double</code>, a TIMESTAMP as <code>java.sql.Timestamp</code>, a vector as <code>float[]</code> and a list as <code>List</code>; the getters convert (<code>getInt</code>, <code>getString</code>, <code>getObject(i, Instant.class)</code>, <code>getArray</code> for vectors). Times are in UTC.</li>
+<li><strong>Transactions</strong>: each statement commits as it runs, as it does through the rest of the package. Auto-commit is always on: <code>setAutoCommit(false)</code> throws <code>SQLFeatureNotSupportedException</code> rather than pretending a rollback could undo anything, and <code>commit()</code> and <code>rollback()</code> throw too. A tool or framework that needs transactions across statements cannot use ChloeDB through JDBC yet.</li>
+<li><strong>Connections share the database.</strong> A process may have a database open once, so the connections to one file (a pool's, say) share one <code>Database</code>, which the last of them to close closes. <code>connection.unwrap(Database.class)</code> gives it, for what SQL does not do: <code>search</code>, <code>importParquet</code>, <code>embed</code>.</li>
+<li><strong>Metadata</strong> (<code>getMetaData()</code>) lists tables, columns with their types (KEYWORD and TEXT as <code>VARCHAR</code>, INT as <code>BIGINT</code>, FLOAT as <code>DOUBLE</code>, BOOL, TIMESTAMP, vectors and lists as <code>ARRAY</code>), keys, references and the SQL types: what database browsers ask a driver. Tables have no catalog or schema, and table and column patterns match regardless of case, as ChloeDB's SQL names do.</li>
+<li><strong>Errors</strong> are <code>SQLException</code>s: a statement ChloeDB cannot parse or plan a <code>SQLSyntaxErrorException</code>, a query past <code>setQueryTimeout</code> a <code>SQLTimeoutException</code> and one stopped by <code>cancel()</code> state <code>HY008</code> (<a href="#limits-memory-deadlines-interrupting">limits</a>), what the driver does not do a <code>SQLFeatureNotSupportedException</code>.</li>
+</ul>
+<h2 id="errors">Errors<a class="anchor" href="#errors" aria-label="Link to this section">#</a></h2>
+<p>The database's errors (a bad schema, query, value or file, a database open elsewhere) are <code>ChloeDBException</code>s, with the message the HTTP API and the Python package give. An argument of the wrong kind is an <code>IllegalArgumentException</code>, and a call on a closed database an <code>IllegalStateException</code>.</p>
+<h2 id="how-it-works">How it works<a class="anchor" href="#how-it-works" aria-label="Link to this section">#</a></h2>
+<p>The JNI boundary is two functions: <code>call(handle, method, args)</code> runs one of the library's methods with its arguments as one value and gives its answer as another, both in a small tagged binary form (<a href="https://github.com/chloetech-ai/chloedb/blob/main/chloedb-java/src/codec.rs"><code>codec.rs</code></a>, and <code>Codec.java</code> on the Java side), and <code>free(handle)</code> drops a database once Java no longer holds it. So no JNI call is made per value, and what a method does lives in one place (<a href="https://github.com/chloetech-ai/chloedb/blob/main/chloedb-java/src/calls.rs"><code>calls.rs</code></a>), as the Python package does it: rows, schemas and options are read by the code that reads files and the HTTP API. JNI rather than the Foreign Function and Memory API (Panama) because Panama is final only from Java 22, and JNI runs on every Java from 11.</p>
+<p>The library is loaded from the path in the system property <code>chloedb.library</code> (or <code>CHLOEDB_JNI_LIBRARY</code>; the old names <code>strata.library</code> and <code>STRATA_JNI_LIBRARY</code> work too) if set, else from the jar, unpacked to a temporary file that is removed once loaded, else from <code>java.library.path</code>. A jar and a library built from different checkouts refuse each other. Java 22 and later warn when a library is loaded without <code>--enable-native-access=ALL-UNNAMED</code> (the jar's manifest says so for an executable jar); pass it to the JVM.</p>
+<p>The Python package's query builder (<code>chloedb.Query</code>), Arrow answers, client of chloedb-server and training helpers have no Java counterpart yet: queries are SQL.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/java.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="javascript.html">← JavaScript</a><a href="frameworks.html">LangChain, LangGraph, LlamaIndex →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

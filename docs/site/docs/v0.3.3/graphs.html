@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Graphs in ChloeDB · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="Rows can link to other rows. A traversal, a shortest path or personalized PageRank runs in the same SQL statement as BM25, filters and vector search, and can start from any of them. On arXiv, the papers cited by a…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/graphs.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html" aria-current="page">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Search and SQL</span>
+      <h1>Graphs in ChloeDB</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/graphs.md">docs/chloedb/graphs.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#rows-are-nodes">Rows are nodes</a></li><li><a href="#storing-edges">Storing edges</a></li><li><a href="#the-sql">The SQL</a></li><li><a href="#planning-and-traversal">Planning and traversal</a></li><li><a href="#speed">Speed</a></li><li><a href="#does-the-graph-help-search">Does the graph help search?</a></li><li><a href="#edge-tables">Edge tables</a></li><li><a href="#on-a-cluster">On a cluster</a></li><li><a href="#limits-and-next-steps">Limits and next steps</a></li></ol></details>
+    <div class="doc-body">
+
+<p>Rows can link to other rows. A traversal, a shortest path or personalized PageRank runs in the same SQL statement as BM25, filters and vector search, and can start from any of them. On arXiv, the papers cited by a new paper's two nearest neighbours find twice as many of its references as vector search alone. A graph built from the vectors themselves does not help.</p>
+<h2 id="rows-are-nodes">Rows are nodes<a class="anchor" href="#rows-are-nodes" aria-label="Link to this section">#</a></h2>
+<p>Graph databases keep nodes and edges in stores of their own. ChloeDB keeps them in a table: a row is a node, and an <code>EDGES</code> field holds the row's outgoing edges as a JSON array of targets, each a primary key of the same table, optionally with a label and a positive weight.</p>
+<pre data-lang="sql">-- id KEYWORD PRIMARY KEY, title TEXT, body TEXT, year INT, emb VECTOR(512), cites EDGES
+INSERT ... (&#x27;p1&#x27;, &#x27;Attention is all you need&#x27;, ..., 2017, [...],
+            &#x27;[&quot;p7&quot;, [&quot;extends&quot;, &quot;p9&quot;], [&quot;refutes&quot;, &quot;p11&quot;, 0.5]]&#x27;)</pre>
+<p>Formally, a snapshot <em>S</em> holds rows <em>V</em> with keys κ : <em>V</em> → <em>K</em>, and edges</p>
+<p>$$
+E \subseteq V \times K \times L \times \mathbb{R}_{&gt;0},
+\qquad (u, k, \ell, w):\ \text{row } u \text{ points at key } k \text{ with label } \ell \text{ and weight } w
+$$</p>
+<p>An edge is resolved when a query follows it:</p>
+<p>$$
+\rho_S(k) = \text{the live row } v \in V \text{ with } \kappa(v) = k, \text{ if there is one}
+$$</p>
+<p>A key has at most one live row in a snapshot, so ρ<sub>S</sub> is a function. When it has none (the target was deleted, or never existed), the edge dangles and traversals skip it, as a foreign key without a constraint would.</p>
+<p>Edges belong to their source row and point at keys, not storage positions. They are written, logged, updated, deleted, merged and snapshotted with the row, and nothing else in the engine had to change. A merge rewrites every docID and an update moves a row to a newer segment, but neither changes a key, so no edge is ever rewritten. The price is a lookup per hop, and most of the engineering below goes into making it cheap.</p>
+<h2 id="storing-edges">Storing edges<a class="anchor" href="#storing-edges" aria-label="Link to this section">#</a></h2>
+<p><img loading="lazy" decoding="async" alt="One segment's graph section: out-edges as a CSR over local docIDs, a reverse index grouped by target key, and same-segment hints" src="../../../assets/img/strata-graph-section.png" /></p>
+<p>Every segment, on disk or built from the memtable, gets one section per indexed <code>EDGES</code> field, read in place through <code>mmap</code>:</p>
+<ul>
+<li><strong>Out-edges.</strong> A CSR over local docIDs: offsets, then per edge its source, its target key (an <code>i64</code>, or offsets and bytes for string keys), a label code and a weight. Labels and weights are stored only when some edge has one.</li>
+<li><strong>Reverse index.</strong> Edges grouped by target key, the groups ordered by the key's 64-bit hash under the radix directory of the primary-key index, with each edge's source stored in group order. "Which rows point at key <em>k</em>" is one directory read and one key comparison per group, then a sequential read. Integer hashes are a bijection and need no comparison; colliding string keys form separate groups.</li>
+<li><strong>Same-segment hints.</strong> Per edge, the docID its target had in this segment when the segment was built. Since ρ<sub>S</sub> has one answer, a hinted row that is still live is that answer, and the hop needs no lookup.</li>
+</ul>
+<p>A hop from <em>u</em> along its edges therefore costs, per edge,</p>
+<p>$$
+c_{\text{out}} = p_{\text{hint}}\,c_{\text{live}} + (1 - p_{\text{hint}})\Bigl(p_{\text{memo}}\,c_{\text{memo}} + (1 - p_{\text{memo}}) \sum_{i \le j^*} c_{\text{probe},i}\Bigr)
+$$</p>
+<p>where <em>p</em><sub>hint</sub> is the share of targets built into the same segment and still live, <em>p</em><sub>memo</sub> the share already resolved earlier in the query, and <em>j</em>* the segment where the key is found. A hop against the edges costs one reverse-index probe per segment for <em>u</em>'s key, then a liveness check per source. The section takes about</p>
+<p>$$
+b \approx \underbrace{8}<em>{\text{target}} + \underbrace{4}</em>{\text{source}} + \underbrace{4 + 4}<em>{\text{reverse}} + \underbrace{4}</em>{\text{hint}} + \frac{8\,\lvert V \rvert + 16\,\lvert K_E \rvert}{\lvert E \rvert}\ \text{bytes per edge}
+$$</p>
+<p>with <em>K</em><sub>E</sub> the distinct targets. That comes to 27 bytes per edge on arXiv, where the graph is under 5% of the file:</p>
+<p><img loading="lazy" decoding="async" alt="Sizes of the arXiv table: vectors 453.3 MB, doc store 129.4 MB, graph section 31.1 MB at 27.0 bytes per edge, full-text index 20.1 MB, file 639.0 MB" src="../../../assets/img/table-graph-size.png" /></p>
+<h2 id="the-sql">The SQL<a class="anchor" href="#the-sql" aria-label="Link to this section">#</a></h2>
+<p>Two predicates, a column and a score join the existing functions. Each takes seeds: a key, a parameter, a tuple of keys, or any subquery over the same table, so a vector search, a BM25 query or a facet filter can be the way into the graph.</p>
+<pre data-lang="sql">-- papers within two citations of p1, either way, nearest first
+SELECT id, title, hops() FROM papers
+WHERE REACHABLE(cites, &#x27;p1&#x27;, hops =&gt; 2, dir =&gt; &#x27;both&#x27;) ORDER BY hops(), id LIMIT 20;
+
+-- one shortest path, only through surveys
+SELECT id, hops() FROM papers
+WHERE PATH(cites, &#x27;p1&#x27;, &#x27;p9&#x27;, max_hops =&gt; 6, through =&gt; kind = &#x27;survey&#x27;) ORDER BY hops();
+
+-- the way in is a vector search: the papers its two best hits cite, by similarity
+SELECT id FROM papers
+WHERE REACHABLE(cites, (SELECT id FROM papers ORDER BY similarity(emb, :q) DESC LIMIT 2))
+ORDER BY similarity(emb, :q) DESC LIMIT 20;
+
+-- personalized PageRank from hybrid hits, fused with both rankings
+SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q),
+  ppr(cites, (SELECT id FROM papers ORDER BY rrf(bm25(body, :t), similarity(emb, :q)) DESC LIMIT 2), weighted =&gt; 1)) DESC LIMIT 20;</pre>
+<p>The functions and their options are listed in the <a href="sql.html#graphs">query language reference</a>.</p>
+<h2 id="planning-and-traversal">Planning and traversal<a class="anchor" href="#planning-and-traversal" aria-label="Link to this section">#</a></h2>
+<p><img loading="lazy" decoding="async" alt="Graph first, then the usual plan: seeds and options feed a traversal over the whole snapshot, whose result becomes an exact document set per segment" src="../../../assets/img/strata-graph-plan.png" /></p>
+<p>A traversal does not respect segment boundaries, so graph computations run first, over the whole snapshot. Seeds are resolved (a seed subquery runs as a query of its own on the same snapshot), and the traversal runs. Its result becomes, per segment, a materialised document set with exact cardinality, plus each row's distance and PageRank score. The planner then sees a graph predicate as a filter whose size it knows exactly: a vector search over a neighbourhood of a few hundred rows becomes an exact scan of those rows.</p>
+<pre class="mermaid">flowchart LR
+    SD[&quot;seeds&lt;br/&gt;keys, a tuple or a subquery&quot;] --&gt; TR[&quot;traversal over the snapshot&lt;br/&gt;BFS · bidirectional path · PageRank push&quot;]
+    TR --&gt; PS[&quot;per segment&lt;br/&gt;exact document set&lt;br/&gt;hops() and ppr() by row&quot;]
+    PS --&gt; PL[&quot;usual plan&lt;br/&gt;probe or materialise filters&lt;br/&gt;vector, BM25, fusion, facets&quot;]
+</pre>
+<p>The traversals:</p>
+<ul>
+<li><strong>Reachability:</strong> breadth-first search, frontier by frontier; a search that would meet more than <code>max_nodes</code> rows besides its seeds is an error rather than an answer that depends on the order of the edges.</li>
+<li><strong>Shortest paths:</strong> bidirectional breadth-first search, always expanding the smaller frontier, forward along the edges or backward against them.</li>
+<li><strong>Personalized PageRank:</strong> forward push (Andersen, Chung and Lang, 2006). The vector π solves</li>
+</ul>
+<p>$$
+\pi = \alpha\, e_S + (1 - \alpha)\, \pi W, \qquad W_{uv} = \frac{w_{uv}}{\sum_{x} w_{ux}}
+$$</p>
+<p>where <em>e</em><sub>S</sub> is the restart distribution over the seeds. Every row has an estimate <em>p</em> and a residual <em>r</em>, with <em>r</em> = <em>e</em><sub>S</sub> at the start, and pushing a row <em>u</em> does</p>
+<p>$$
+p(u) \mathrel{+}= \alpha\, r(u), \qquad r(v) \mathrel{+}= (1 - \alpha)\, r(u)\, W_{uv}\ \ \forall v, \qquad r(u) \leftarrow 0
+$$</p>
+<p>while some <em>r</em>(<em>u</em>) ≥ ε·deg(<em>u</em>). Each estimate is then within ε·deg(<em>u</em>) of π(<em>u</em>), and the work is bounded by 1/(αε) pushes whatever the graph's size. A row is queued only once its residual reaches ε, the least any threshold can be. Rows that merely received a little mass are never resolved, and resolving them had been most of the original cost.</p>
+<h2 id="speed">Speed<a class="anchor" href="#speed" aria-label="Link to this section">#</a></h2>
+<p>Two graphs, each queried from 200 random seeds on a warm cache, on one thread of an Apple M2 MacBook Air, through SQL (parsing and planning included; <code>COUNT(*)</code>, so that no rows are fetched):</p>
+<ul>
+<li><strong>arXiv:</strong> 168,343 papers (ogbn-arxiv, less 1,000 held out) with 1,148,979 citations, in two segments.</li>
+<li><strong>Synthetic:</strong> a power-law graph of 1,000,000 rows and 9,998,469 edges, in four segments. Row <em>i</em> links to 10 earlier rows, each the target of a random earlier edge with probability ½ and a uniform earlier row otherwise.</li>
+</ul>
+<p>The baselines answer the same queries, and the benchmark checks that every count and path length agrees:</p>
+<ul>
+<li><strong>SQLite:</strong> an edge table <code>(src, dst)</code> as a <code>WITHOUT ROWID</code> primary key, an index on <code>(dst, src)</code>, and recursive CTEs.</li>
+<li><strong>CSR:</strong> the same traversal code on two in-memory arrays. This is the lower bound: no keys, no segments, no SQL.</li>
+</ul>
+<p><img loading="lazy" decoding="async" alt="Graph query latency on arXiv: ChloeDB, SQLite and an in-memory CSR, p50 and p95, for REACHABLE, PATH, ppr and vector-seeded queries" src="../../../assets/img/table-graph-speed.png" /></p>
+<p><em>arXiv, 200 seeds per query. Source: <code>chloedb/results/graph/latency_arxiv.json</code>.</em></p>
+<p>On the million-row graph (<code>chloedb/results/graph/synthetic_1000000.json</code>; loaded in 2.7 s into a 307 MB file, 27 bytes per edge):</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>query (200 seeds)</th>
+<th>result</th>
+<th>ChloeDB p50 / p95 ms</th>
+<th>SQLite p50 / p95 ms</th>
+<th>CSR p50 / p95 ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>REACHABLE</code>, 1 hop out</td>
+<td>10 rows</td>
+<td>0.017 / 0.022</td>
+<td>0.012 / 0.013</td>
+<td>0.001 / 0.001</td>
+</tr>
+<tr>
+<td><code>REACHABLE</code>, 2 hops out</td>
+<td>108 rows</td>
+<td>0.032 / 0.045</td>
+<td>0.061 / 0.066</td>
+<td>0.004 / 0.005</td>
+</tr>
+<tr>
+<td><code>REACHABLE</code>, 3 hops out</td>
+<td>890 rows</td>
+<td>0.098 / 0.153</td>
+<td>0.597 / 0.680</td>
+<td>0.030 / 0.037</td>
+</tr>
+<tr>
+<td><code>REACHABLE</code>, 1 hop in</td>
+<td>8 rows</td>
+<td>0.014 / 0.019</td>
+<td>0.010 / 0.017</td>
+<td>0.001 / 0.001</td>
+</tr>
+<tr>
+<td><code>REACHABLE</code>, 2 hops both ways</td>
+<td>1,586 rows</td>
+<td>0.104 / 0.468</td>
+<td>0.471 / 3.26</td>
+<td>0.019 / 0.110</td>
+</tr>
+<tr>
+<td><code>PATH</code> either way</td>
+<td>200 of 200 found</td>
+<td>0.079 / 0.145</td>
+<td>—</td>
+<td>0.025 / 0.071</td>
+</tr>
+<tr>
+<td><code>ppr</code>, ε = 10<sup>−4</sup></td>
+<td>133 pushes</td>
+<td>3.49 / 4.13</td>
+<td>—</td>
+<td>0.66 / 0.80</td>
+</tr>
+<tr>
+<td><code>ppr</code>, ε = 10<sup>−5</sup></td>
+<td>1,020 pushes</td>
+<td>25.6 / 30.1</td>
+<td>—</td>
+<td>5.47 / 6.32</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Against SQLite</strong>, one-hop queries cost about the same, roughly 10–15 µs, mostly parsing and planning on both sides. From two hops on, the gap opens, and the tail is where it shows most: two hops both ways on arXiv touch 3,790 rows on average and up to tens of thousands, and their p95 is 1.6 ms in ChloeDB against 14.8 ms in SQLite. The recursive CTE re-expands rows reached at several depths and joins through a B-tree per row, where ChloeDB reads a CSR slice. Shortest paths and PageRank have no practical CTE form.</p>
+<p><strong>Against the CSR</strong>, ChloeDB pays two costs. About 10 µs of SQL per query dominates small traversals. Key resolution dominates large ones: PageRank takes 2.4 times the CSR's time on arXiv and 5.3 times on the million-row graph, because a target outside its own segment is a hash probe into each segment's primary-key index until found, a cache miss each. Three changes found by profiling on the Xeon VM that first ran these benchmarks cut PageRank on the million-row graph from 21.4 to 5.8 ms there (3.5 ms on the M2):</p>
+<ol>
+<li>reverse groups by key, with the sources stored inline;</li>
+<li>same-segment hints and a per-query memo;</li>
+<li>queueing only rows that can pass the push threshold.</li>
+</ol>
+<h2 id="does-the-graph-help-search">Does the graph help search?<a class="anchor" href="#does-the-graph-help-search" aria-label="Link to this section">#</a></h2>
+<p>The rows here are nodes with text, vectors and edges at once. The question the engine cannot answer by itself is whether the edges add anything to a search that already has the text and the vectors, and whether edges made from the vectors (each row linked to its nearest rows) add anything.</p>
+<p><strong>The task:</strong> for a new paper, find the papers it cites from its title and abstract. This is citation recommendation, and the same shape as finding the records a new question depends on.</p>
+<ul>
+<li>1,000 papers of OGB's test split (809 from 2019, 191 from 2020, each citing at least five papers) are held out of the table.</li>
+<li>Each held-out paper's title and abstract is the query. Its references in the table (15.3 on average) are the relevant rows.</li>
+<li>Vectors come from a static embedder (Model2Vec potion-retrieval-32M, 512 dimensions), the same one ChloeCtx uses.</li>
+<li>Each method returns 20 papers. Methods that start from vector seeds have one parameter, the number of seeds <em>S</em>, swept from 1 to 50. Papers with even ids choose <em>S</em> by nDCG@20 (516 queries) and papers with odd ids report it (484 queries), so no reported number was tuned on its own queries.</li>
+<li>Comparisons are paired over the same queries, with a 95% bootstrap interval and a two-sided sign-flip test.</li>
+</ul>
+<p>$$
+\mathrm{recall@}k = \frac{\lvert R_k \cap T \rvert}{\lvert T \rvert},
+\qquad
+\mathrm{nDCG@}k = \frac{\sum_{i \le k} \mathbb{1}[r_i \in T] / \log_2(i + 1)}{\sum_{i \le \min(k, \lvert T \rvert)} 1 / \log_2(i + 1)}
+$$</p>
+<p><img loading="lazy" decoding="async" alt="Finding a paper's references on the 484 report papers: following the citations of the two nearest papers reaches nDCG@20 0.253, against 0.123 for vector search, 0.161 for BM25 and 0.160 for hybrid search" src="../../../assets/img/table-graph-quality.png" /></p>
+<p><em>Source: <code>chloedb/results/graph/quality_stats.json</code>. Times are from the quality runs on the M2, after one untimed pass per method.</em></p>
+<p><strong>The graph doubles what vector search finds.</strong> The best method is also the simplest: take the two papers nearest the query, follow their citations, and rank what they cite by similarity to the query. It reaches nDCG@20 0.253 against 0.123 for vector search (+0.130, 95% interval 0.111–0.149, p &lt; 0.0001), 0.161 for BM25 and 0.160 for hybrid search, in 0.2 ms. Papers on the same topic cite the same work, and the nearest papers' reference lists are a better candidate set than the nearest papers themselves.</p>
+<p>PageRank from the same seeds reaches 0.211 at its best (from one seed), below the plain one-hop expansion: on this graph the papers two or three hops away dilute the direct citations. Fusing PageRank with the vector ranking lowers it to 0.179, because the vector ranking's own top results are mostly not references. Fusing BM25, vectors and PageRank from hybrid seeds also reaches 0.211, at the cost of BM25 over long queries (48 ms).</p>
+<p><img loading="lazy" decoding="async" alt="nDCG@20 by number of vector seeds: the citation expansion peaks at two or three seeds and falls below vector search beyond 20" src="../../../assets/img/chart-graph-seeds.png" /></p>
+<p><strong>Fewer seeds are better.</strong> With more seeds, the citations of papers less similar to the query crowd out those of the nearest ones. In a first version of the experiment the seeds themselves stayed in the candidate set; ranked by similarity they took the top places, and from 20 seeds on the "graph" method returned exactly the vector search's results. Every graph method above removes the seeds with <code>NOT REACHABLE(cites, seeds, hops =&gt; 0, min_hops =&gt; 0)</code>.</p>
+<p><strong>A graph made of vectors adds nothing.</strong> A <code>VECTOR</code> field can be traversed as a graph, each row's 10 most similar rows being its neighbours. On this task it returns what vector search already found when the seeds are kept (recall@20 0.112 against 0.111 at 10 seeds, on all queries), and is worse when they are removed (nDCG@20 0.079). A similarity graph only re-expresses the vector space, while citations carry information the text does not. Rows with vectors are useful as the way into a graph of real relations, not as a replacement for one. The implicit similarity graph stays in ChloeDB for exploratory queries, at 0.12 ms per hop of 10 neighbours.</p>
+<h2 id="edge-tables">Edge tables<a class="anchor" href="#edge-tables" aria-label="Link to this section">#</a></h2>
+<p>An <a href="sql.html#edge-tables">edge table</a> keeps a graph whose edges change one at a time, such as items seen together, apart from the rows it links: each of its rows is an edge, and adding one, changing its weight or deleting it writes that row alone. Each of its segments indexes its rows by the keys they link, in a section of its own (<code>edge_table</code>):</p>
+<ul>
+<li>the distinct keys its rows name, numbered in the order of their hashes, with the same radix directory as the primary-key index;</li>
+<li>each row's source and target as key numbers, and its weight when the segment was built;</li>
+<li>for each key, the rows that leave it and the rows that reach it, in row order.</li>
+</ul>
+<p>A hop from row <em>u</em> looks up <em>u</em>'s key in each segment of the edge table, then reads the rows that leave it (or reach it, or both, by direction). For each row it checks that the row is live and reads its weight as it is now, in-place writes included, so a decayed or zeroed weight counts at once. The neighbour is the row's other end, a key number, which the walk resolves to a row of the walked table once per segment. Two shortcuts keep a long walk cheap without costing a short one anything. A segment's key numbers get a dense memo once the walk has resolved a thirty-second of them. A segment whose weights were written in place gets a flat copy of its weights once the walk has read a sixteenth as many as its in-place layers hold.</p>
+<p>The section is smaller than an <code>EDGES</code> field's graph for the same edges, because a key is stored once per segment rather than once per edge. A hop costs more, because an <code>EDGES</code> field's out-edges sit with their row and most targets resolve through a same-segment hint. <code>chloedb-edges-bench</code> (in <code>chloedb-server</code>) measures both:</p>
+<ul>
+<li><strong>Writes.</strong> It streams 300,000 click events of 10,000 users on 50,000 items (Zipf 1.0) through <code>/v1/stream</code>. Each event adds 1 to the weight of the edges between its item and the user's last five items, both ways, with <code>add</code> operations whose <code>doc</code> creates an edge's row on its first event. That is 9.0 edge operations per event and 1,896,100 edges in the end.</li>
+<li><strong>Walks.</strong> <code>ppr</code> is seeded with a user's last 20 items, for 1,000 users, over the edge table and over an <code>EDGES</code> field of <code>items</code> holding the same edges and weights. Each query runs once to warm up, then once timed.</li>
+</ul>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th>edge table</th>
+<th><code>EDGES</code> field</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bytes per edge (index)</td>
+<td>20.6</td>
+<td>33.2</td>
+</tr>
+<tr>
+<td><code>ppr</code> p50 ms</td>
+<td>21.9</td>
+<td>15.3</td>
+</tr>
+<tr>
+<td><code>ppr</code> p90 ms</td>
+<td>30.1</td>
+<td>26.6</td>
+</tr>
+<tr>
+<td><code>ppr</code> p99 ms</td>
+<td>38.7</td>
+<td>37.4</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><strong>Walks cost about 1.4 times as much at the median, and about the same at p99.</strong> Both rank the same 200 rows in the same order in all 1,000 walks. The edge table had 10 segments here. In a first run whose merges had left it 15, its p50 was 28.5 ms against 17.6, since a hop looks up its key in every segment.</li>
+<li><strong>Writes.</strong> The events alone take 14.1 µs each (71,155 per second). With the edges, they take 190.2 µs (5,257 per second): 19.6 µs per edge operation, most of which create a row.</li>
+<li><strong>Weights as counts.</strong> 54 of the 1,000 walks found nothing over either graph, when <code>ppr</code> pushed a row only once its residual reached <code>eps</code> times its weighted degree: at the default <code>eps</code> of 10⁻⁴, a seed whose edges' weights added up to more than 500 was never pushed. It now compares the residual with <code>eps</code> times the row's number of edges, so that scaling every weight alike (counts against frequencies) changes nothing; the weights still divide what a push spreads. Those numbers were measured before the change. A walk that stops at <code>max_pushes</code> says so in its plan line (<code>stopped at max_pushes</code>) and in the stats (<code>max_pushes_reached: true</code>).</li>
+</ul>
+<p><em>Cloud VM: 4 cores of an Intel Xeon at 2.10 GHz, 16.9 GB, Linux 6.18. Source: <code>chloedb-server/results/edges/vm.json</code>.</em></p>
+<h2 id="on-a-cluster">On a cluster<a class="anchor" href="#on-a-cluster" aria-label="Link to this section">#</a></h2>
+<p>Graph queries run on one database, not through a <a href="server.html#sharding-one-coordinator-many-shards">coordinator</a>. A walk reads every row it meets in one snapshot, and on a sharded cluster a row's edges point at rows that other shards hold, so a shard cannot walk its part alone and the coordinator has no edges to walk. A coordinator therefore refuses <code>REACHABLE</code>, <code>PATH</code>, <code>hops()</code> and <code>ppr</code> with an error saying so, before it asks any shard, as does a shard asked for its part of one. The other queries of the table, and writes to its <code>EDGES</code> field or edge table, work through the coordinator as usual. Until a coordinator walks the graph itself:</p>
+<ul>
+<li><strong>Keep the graph where it is whole.</strong> A server of its own (<code>chloedb-server --db</code>), or an embedded database in the application (<a href="python.html">Python</a>, <a href="javascript.html">JavaScript</a>, <a href="java.html">Java</a>), runs every graph query of this page. A <a href="server.html#replication-a-primary-and-its-replicas">primary and its replicas</a>, without a coordinator, keep it available.</li>
+<li><strong>Walk from the application.</strong> Each hop is one read of the frontier's rows through the coordinator: <code>SELECT id, cites FROM papers WHERE id IN (:frontier)</code> gives each row's out-edges (the field's JSON text), and over an <a href="#edge-tables">edge table</a> <code>SELECT dst, w FROM cooc WHERE src IN (:frontier)</code> gives them too, while <code>WHERE dst IN (...)</code> reaches back along them. A breadth-first walk of <em>h</em> hops is <em>h</em> such reads. The tests walk two hops this way on three shards and find the rows <code>REACHABLE(..., hops =&gt; 2)</code> finds on one database. Personalized PageRank is harder this way, since its pushes go round by round over a growing set of rows; run it on a whole database.</li>
+</ul>
+<h2 id="limits-and-next-steps">Limits and next steps<a class="anchor" href="#limits-and-next-steps" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><strong>One quality task, one embedder.</strong> With a stronger embedder, vector search would score above 0.123 and the relative gain over it would likely shrink. The gains over BM25 (+57%) and hybrid search (+58%) are the more robust numbers.</li>
+<li><strong>Cross-segment hops cost lookups</strong>, two to five times the in-memory CSR on these graphs. A snapshot-wide resolved CSR, rebuilt when the segment set changes, would close the gap for read-mostly tables; merging into fewer segments narrows it today.</li>
+<li><strong>No patterns.</strong> There is no multi-hop pattern matching with a predicate per step; <code>through</code> and labels cover one constraint per traversal. SQL/PGQ's <code>MATCH</code> would be the standard syntax for more.</li>
+<li><strong>Unweighted paths.</strong> Weights are used by PageRank only.</li>
+<li><strong>Walks across shards.</strong> A coordinator refuses graph queries (<a href="#on-a-cluster">above</a>). It could run them itself, asking the shards for the edges of each frontier and sending them the rows it reached with their distances and PageRank scores, at a round trip per hop. That needs a call to read edges by key and a plan that carries the rows' values, so it is a change of the shard protocol.</li>
+<li><strong>ChloeCtx.</strong> Its records have natural edges the store does not keep yet: a distilled note to the turn it came from, a superseded decision to its replacement, an error to the edit that fixed it. The arXiv result suggests the pattern to try (recall's best hits as seeds, then the records linked to them), but ChloeCtx's earlier study found that widening a hit to its neighbouring records gained little, so this needs its own measurement first.</li>
+</ul>
+<p>The full report, with every table, is <a href="https://chloetech-ai.github.io/chloedb/reports/graph.html">ChloeDB graphs</a>. <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md#chloedb-graphs">Reproducing the results</a> has the commands.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/graphs.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="sql.html">← SQL reference</a><a href="next-items.html">Next items →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: true, theme: dark ? "dark" : "neutral", securityLevel: "strict" });
+</script>
+</body>
+</html>
