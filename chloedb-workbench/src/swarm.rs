@@ -646,13 +646,18 @@ pub fn stop(sup: &Supervisor, id: &str) -> Result<Json, ApiError> {
         }
         None => {}
     }
-    let mut r = get_run(sup, id)?;
-    if r.live() {
-        r.state = "stopped".into();
-        r.outcome = Some("stopped".into());
+    // Read and write under the lock: the runner may end meanwhile, and a
+    // copy read before its end would write the end away.
+    let r = {
         let _w = RUN_WRITE.lock().unwrap();
-        r.put(sup).map_err(ApiError::internal)?;
-    }
+        let mut r = get_run(sup, id)?;
+        if r.live() {
+            r.state = "stopped".into();
+            r.outcome = Some("stopped".into());
+            r.put(sup).map_err(ApiError::internal)?;
+        }
+        r
+    };
     Ok(json!({ "run": r.to_json(sup, true) }))
 }
 
