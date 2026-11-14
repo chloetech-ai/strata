@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>chloedb-crawl: a site into a table · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloedb-crawl takes a URL, reads the site&#x27;s pages, finds their fields, makes a table from them and fills it, and adds shards to the cluster as the table grows. It is a program of its own, in Rust, that talks to…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/crawler.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html" aria-current="page">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>chloedb-crawl: a site into a table</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/crawler.md">docs/chloedb/crawler.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#what-it-does-with-a-page">What it does with a page</a></li><li><a href="#the-command-centers-view">The command center's view</a></li><li><a href="#options">Options</a></li><li><a href="#api">API</a></li><li><a href="#limits">Limits</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloedb-crawl</code> takes a URL, reads the site's pages, finds their fields, makes a table from them and fills it, and adds shards to the cluster as the table grows. It is a program of its own, in Rust, that talks to chloedb-server over HTTP only, so it runs on the machine next to the cluster or on another one; the command center shows it as an app.</p>
+<h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
+<p>On one machine, build both programs, then start the crawler with a cluster of its own (on Kubernetes, one field of the cluster's resource starts it: <a href="#on-kubernetes">below</a>):</p>
+<pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
+cd chloedb-crawl &amp;&amp; cargo build --release
+target/release/chloedb-crawl serve --local ./crawl-cluster --server-bin ../chloedb-server/target/release/chloedb-server</pre>
+<p>Open <code>http://127.0.0.1:7700</code> and go to <strong>Apps → Crawler</strong>. Type the site's address under <strong>New crawl</strong> and press <strong>Crawl</strong>, or <strong>Preview</strong> first to see the table it would make; <strong>Options</strong> holds the rest of the settings below. Each crawl gets its own page, where you watch it fill the table and grow the cluster, and pause or stop it.</p>
+<p><img loading="lazy" decoding="async" alt="The Crawler in the command center: the New crawl form, the crawls, and the cluster's shards" src="../../../assets/img/strata-crawler-new-crawl.png" /></p>
+<p><code>--local DIR</code> starts one shard server and a coordinator on <code>127.0.0.1:7700</code> with their databases and logs in <code>DIR</code>, and adds a shard each time one holds more than <code>--split-rows</code> rows of a crawl's table (100,000 by default, at most <code>--max-shards</code>, 8). The same <code>DIR</code> again serves the same cluster, with the shards it grew.</p>
+<h3 id="from-the-command-line">From the command line<a class="anchor" href="#from-the-command-line" aria-label="Link to this section">#</a></h3>
+<p>The same crawl runs without the command center too. <code>crawl</code> takes the address, prints its progress every two seconds, then what it did (the table it made and why, the columns it added, the shards it added) and the <code>CREATE TABLE</code> it ran; add <code>--stay</code> to keep the cluster serving after the crawl. <code>preview</code> prints what the form's <strong>Preview</strong> shows, without ChloeDB:</p>
+<pre data-lang="sh">target/release/chloedb-crawl crawl https://books.toscrape.com/ --local ./crawl-cluster \
+  --server-bin ../chloedb-server/target/release/chloedb-server --max-pages 600
+target/release/chloedb-crawl preview https://books.toscrape.com/ --pages 10</pre>
+<p>At the default pace, a page a second for one site (<a href="#what-it-does-with-a-page">below</a>), 600 pages take about ten minutes. books.toscrape.com is a sandbox made for crawlers, so <code>--per-host 4 --delay-ms 100</code> is fine there; keep the defaults for sites you don't run.</p>
+<h3 id="against-a-cluster-that-runs-elsewhere">Against a cluster that runs elsewhere<a class="anchor" href="#against-a-cluster-that-runs-elsewhere" aria-label="Link to this section">#</a></h3>
+<p>The crawler writes to any chloedb-server, one server or a coordinator, with a key that can write (and an admin key to grow a cluster):</p>
+<pre data-lang="sh">chloedb-crawl serve --server http://coordinator:7700 --key &quot;$CHLOEDB_KEY&quot; --token &quot;$CRAWL_TOKEN&quot; \
+  --listen 0.0.0.0:7800 --grow kube --split-rows 5000000</pre>
+<p><code>--server</code> was <code>--strata</code> before 0.3.2; the old name still works.</p>
+<p>and the coordinator shows it as an app when told where it is, with the crawler's token:</p>
+<pre data-lang="sh">CHLOEDB_APP_TOKEN=&quot;$CRAWL_TOKEN&quot; chloedb-server --shards ... --app crawler=http://crawler-host:7800</pre>
+<p><code>--grow</code> says how the cluster gets a shard: <code>kube</code> asks the Kubernetes operator for one more (<code>POST /v1/admin/kube</code>, the coordinator must run under the operator), <code>servers=URL,URL</code> adds empty servers started for it, by their gRPC URLs, one at a time, and <code>off</code> never grows. Each new shard gets its share of the slots by a rebalance (<code>POST /v1/admin/rebalance</code>) while the crawl keeps writing.</p>
+<h3 id="on-kubernetes">On Kubernetes<a class="anchor" href="#on-kubernetes" aria-label="Link to this section">#</a></h3>
+<p>A cluster the <a href="server.html#on-kubernetes">operator</a> runs gets a crawler of its own from its <code>StrataCluster</code>, with nothing to start by hand:</p>
+<pre data-lang="sh">kubectl -n strata patch strata demo --type merge -p &#x27;{&quot;spec&quot;: {&quot;crawler&quot;: {}}}&#x27;</pre>
+<p>The operator runs <code>chloedb-crawl serve</code> from the cluster's own image (it carries both programs) as a Deployment of one pod, <code>&lt;cluster&gt;-crawler</code>, behind a Service of that name, and restarts the coordinators so that they list it: <strong>Apps → Crawler</strong> appears in the command center, and a crawl starts from its form. The crawler writes with the cluster's admin token (<code>tokenSecret</code>), which its API requires too, so the coordinators send it that token and nothing else reaches it. It grows the cluster through the operator, a shard at a time:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th><code>spec.crawler</code></th>
+<th>default</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>grow</code></td>
+<td><code>true</code></td>
+<td>add a shard (one more in <code>spec.shards</code>) when a crawl's table holds more than <code>splitRows</code> rows on one</td>
+</tr>
+<tr>
+<td><code>splitRows</code></td>
+<td>100,000</td>
+<td></td>
+</tr>
+<tr>
+<td><code>maxShards</code></td>
+<td>8</td>
+<td>the most shards it grows the cluster to</td>
+</tr>
+<tr>
+<td><code>paused</code></td>
+<td><code>false</code></td>
+<td>no crawler pod for now (the coordinators still list it, as an app that does not answer)</td>
+</tr>
+<tr>
+<td><code>args</code>, <code>resources</code></td>
+<td></td>
+<td>more arguments of <code>chloedb-crawl serve</code> (as <code>["--contact", "ops@example.com"]</code>, whom site owners reach), and its container's resources (50m CPU and 64 MiB asked, 1 GiB at most)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The upgrader moves the crawler with the servers, since it runs their image. Removing <code>spec.crawler</code> deletes its Deployment and Service and restarts the coordinators without it; the tables it filled stay. Its crawls live in its pod, so a pod started again (a new image, a node replaced) starts with none.</p>
+<h2 id="what-it-does-with-a-page">What it does with a page<a class="anchor" href="#what-it-does-with-a-page" aria-label="Link to this section">#</a></h2>
+<p><strong>Fetching.</strong> One queue per host, read breadth first. robots.txt is read before a site's first page and again once a day (RFC 9309: the longest rule wins, <code>*</code> and <code>$</code> in paths, its own groups, <code>chloedb-crawl</code> and <code>strata-crawl</code> (its old name), or else <code>*</code>); a 4xx answer for it allows everything, and a 5xx, a 429 or no answer keeps the crawler off the site until it reads it again, a minute later (or when its <code>Retry-After</code> says, up to 10 minutes). Sitemaps named there, or at <code>/sitemap.xml</code>, add their pages as seeds. Only HTML is kept, at most <code>max_bytes</code> a page; a URL is normalised once (no fragment, no tracking parameters, the query's parameters sorted) and fetched once, redirects included; a redirect (5 at most) is followed only to a page the crawl would follow as a link (its scope, <code>include</code> and <code>exclude</code>) and its site's robots.txt allows; robots.txt is read to 500 KB and a sitemap to 50 MB; a page whose text another page already had is counted as a duplicate and not written. Links are queued in turn from each shape of link on the page (<code>/catalogue/*/index.html</code>, <code>/catalogue/category/...</code>), so the first pages read are a site's items as well as its lists. <code>rel="nofollow"</code> links and pages with <code>noindex</code> or <code>nofollow</code> robots meta tags are honoured.</p>
+<p><strong>Reach.</strong> The crawler fetches the public internet only: an address on its machine (<code>localhost</code>, <code>127.0.0.1</code>), a private network (<code>10.x</code>, <code>192.168.x</code>, <code>fd00::/8</code>), a link-local one (<code>169.254.169.254</code>, cloud metadata) or another reserved range is refused, whether a page links to it, redirects to it or its name resolves to it (checked again as each connection is made). An intranet crawl says so when the crawler starts: <code>--allow-host HOST[:PORT]</code> (repeatable) for one site, <code>--allow-private</code> (or <code>CHLOEDB_CRAWL_ALLOW_PRIVATE=1</code>) for everything. A proxy named by <code>HTTPS_PROXY</code> is reachable whatever its address, and resolves the names it is asked for itself.</p>
+<p><strong>Politeness.</strong> A site gets at most <code>per_host</code> requests at once (1), and between the starts of two the longest of <code>delay_ms</code> (1 s), its robots.txt's <code>Crawl-delay</code> (up to 10 minutes; every site the crawl reaches, not only the seeds') and twice the time it has been taking to answer (up to 30 s), so a site that slows down is asked less often. A site that pushes back waits before its next request: a 429, 502, 503 or 504 as long as its <code>Retry-After</code> says, else 5 s, doubled at each refusal in a row up to 5 minutes, and the page is asked again later (4 times at most); a 403 or no answer waits the same, and the page is not asked again. After 10 refusals in a row, or when a site asks to wait more than 10 minutes, the crawl gives up on that site and drops its queued pages; the crawl's events say when a site was made to wait and when it was given up. The user agent names the crawler and links to <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/crawler-bot.md">the page for site owners</a>, with the crawl's <code>contact</code>; a crawl's own <code>user_agent</code> keeps the crawler's name after it. Answers are asked compressed (gzip, Brotli).</p>
+<p><strong>Fields.</strong> Each page gives:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>from</th>
+<th>as</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>the fetch</td>
+<td><code>url</code> (the key), <code>host</code>, <code>depth</code>, <code>status</code>, <code>fetched</code>, <code>bytes</code>, <code>fetch_ms</code></td>
+</tr>
+<tr>
+<td>the page</td>
+<td><code>title</code>, <code>body</code> (the main text: <code>&lt;main&gt;</code>, <code>&lt;article&gt;</code> or <code>[role=main]</code>, else the body without navigation, headers and footers), <code>words</code>, <code>links</code>, and when the page has them <code>description</code>, <code>headings</code>, <code>lang</code>, <code>canonical</code>, <code>published</code>, <code>modified</code>, <code>author</code>, <code>image</code>, <code>site_name</code>, <code>kind</code>, <code>keywords</code></td>
+</tr>
+<tr>
+<td>JSON-LD</td>
+<td><code>ld.*</code>: the page's main entity (<code>Product</code>, <code>Article</code>, <code>Recipe</code> ...), <code>@type</code> as <code>type</code></td>
+</tr>
+<tr>
+<td>Open Graph and other meta tags</td>
+<td><code>og.*</code> (<code>og:price:amount</code> is <code>og.price_amount</code>)</td>
+</tr>
+<tr>
+<td>microdata</td>
+<td><code>md.*</code></td>
+</tr>
+<tr>
+<td>tables and lists of terms</td>
+<td><code>specs.*</code>: rows of a key and a value (<code>&lt;th&gt;UPC&lt;/th&gt;&lt;td&gt;a897...&lt;/td&gt;</code>, <code>&lt;dt&gt;</code>/<code>&lt;dd&gt;</code>)</td>
+</tr>
+<tr>
+<td>the site's template</td>
+<td><code>page.*</code>: learned from the first pages (below)</td>
+</tr>
+<tr>
+<td>your selectors</td>
+<td><code>rule.*</code>: <code>name=selector</code>, <code>name=selector@attr</code>, <code>name[]=selector</code> for every match</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>The template.</strong> On the first pages (<code>sample</code>, 30), the crawler looks for an element of one tag and classes (<code>p.price_color</code>) that most pages have at most three times, whose text changes from page to page and is not the title. Those are the site's own fields, named from their classes (<code>price_color</code>, <code>stock_level</code>), and read from every page after.</p>
+<p><strong>The table.</strong> It is made from the first pages: the fetch's and the page's columns above, a column for each other field that at least <code>promote_at</code> (0.3) of the pages have, typed by its values (a type fits when 90% of the values read as it: <code>BOOL</code>, <code>INT</code>, <code>FLOAT</code> with currencies and thousands separators read, <code>TIMESTAMP</code>, <code>KEYWORD</code> for short values, else <code>TEXT</code>, and lists), and <code>data JSON</code> holding every field of the page, so a field that is not a column is still a <a href="sql.html#json-fields-keys-no-schema-names">path</a> to query (<code>WHERE data.specs.isbn = '...'</code>). An existing table is used as it is, with the columns it lacks added. With <code>embed</code>, a vector field <code>emb</code> is embedded from the title and body by that model.</p>
+<p><strong>As it grows.</strong> Every 100 pages the crawler looks again at the fields the pages since the start have had: one that has reached <code>promote_at</code> (over 50 pages at least) gets a column (<code>ALTER TABLE ... ADD COLUMN IF NOT EXISTS</code>), and the rows written before it get its value from their <code>data</code> (a <code>set</code> by key for each). Rows are written in batches of <code>batch</code> (200) through <code>POST /v1/write</code>, each under an idempotency key, so a batch sent again after a lost answer writes once; a 429 waits as the server asks, a partial write is sent again with the key it returns, and rows a server refuses are found by halves and listed as problems.</p>
+<h2 id="the-command-centers-view">The command center's view<a class="anchor" href="#the-command-centers-view" aria-label="Link to this section">#</a></h2>
+<p><strong>Apps → Crawler</strong> lists the crawls and the cluster's shards, each a bar of its rows against the split threshold, with the shards it added and the rebalances. <strong>New crawl</strong> takes a URL and the options above. <strong>Preview</strong> reads the URL and up to nine pages it links to and shows the table they would make: its columns with their types and where each comes from, the <code>CREATE TABLE</code>, the pages read, the template learned, every field found with the share of pages that had it, and three rows as they would be written. <strong>Crawl</strong> starts it.</p>
+<p>A crawl's page shows pages fetched and rows written a second, with the moments the table was made and shards were added; the shards filling and splitting; the table's columns, with when each was added, and the fields found so far with the column each went to; a search of the table through ChloeDB (<code>MATCH</code> and <code>bm25</code> over the body, or the latest rows); what it did, with the SQL it ran; the last pages read; and problems (robots.txt, timeouts, answers that were not HTML, refused rows). Pause, Resume and Stop act at once; a stopped crawl writes the pages it has read.</p>
+<p>The view is a module the crawler serves (<code>chloedb-crawl/ui/view.js</code>, compiled in; <code>CHLOEDB_CRAWL_UI_DIR=chloedb-crawl/ui</code> reads it from disk), loaded and run by the command center as the <a href="server.html#apps">apps</a> section describes.</p>
+<h2 id="options">Options<a class="anchor" href="#options" aria-label="Link to this section">#</a></h2>
+<p>The same names are the JSON fields of <code>POST /v1/crawls</code> and <code>POST /v1/preview</code>, and the command line's options (<code>--max-pages</code>, <code>--no-robots</code>, <code>--rule</code>, ...).</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>option</th>
+<th>default</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>seeds</code></td>
+<td></td>
+<td>the URLs to start from</td>
+</tr>
+<tr>
+<td><code>table</code></td>
+<td>from the first seed's host (<code>books_toscrape_com</code>)</td>
+<td>the table to fill</td>
+</tr>
+<tr>
+<td><code>scope</code></td>
+<td><code>host</code></td>
+<td>which links to follow: <code>host</code> (the seeds' hosts), <code>domain</code> (their sites, subdomains included), <code>prefix</code> (under the seeds' paths), <code>any</code></td>
+</tr>
+<tr>
+<td><code>include</code>, <code>exclude</code></td>
+<td></td>
+<td>regular expressions on URLs: follow only links that match one of <code>include</code>, never those that match <code>exclude</code></td>
+</tr>
+<tr>
+<td><code>keep</code></td>
+<td></td>
+<td>regular expressions: write rows only for pages that match (the others are read for their links)</td>
+</tr>
+<tr>
+<td><code>max_pages</code></td>
+<td>1,000</td>
+<td>URLs to fetch at most</td>
+</tr>
+<tr>
+<td><code>max_depth</code></td>
+<td>5</td>
+<td>links from a seed; a list's next page (a link with <code>rel="next"</code>, or named "Next", "Next page", "Older posts" or an arrow) is as deep as the list, so a long list is read to its end. A crawl that ends says why: its page limit, its depth (with the links it left out, also in the status's <code>beyond_depth</code>), or no links left</td>
+</tr>
+<tr>
+<td><code>concurrency</code>, <code>per_host</code></td>
+<td>16, 1</td>
+<td>requests at once, and to one host</td>
+</tr>
+<tr>
+<td><code>delay_ms</code></td>
+<td>1,000</td>
+<td>between the starts of two requests to a host (longer when its robots.txt asks, or when it is slow to answer)</td>
+</tr>
+<tr>
+<td><code>robots</code>, <code>sitemaps</code></td>
+<td>on</td>
+<td>obey robots.txt; read sitemaps</td>
+</tr>
+<tr>
+<td><code>sample</code></td>
+<td>30</td>
+<td>pages the table is made from</td>
+</tr>
+<tr>
+<td><code>promote_at</code></td>
+<td>0.3</td>
+<td>the share of pages a field needs to be a column</td>
+</tr>
+<tr>
+<td><code>rules</code></td>
+<td></td>
+<td>fields from CSS selectors, as above</td>
+</tr>
+<tr>
+<td><code>learn</code></td>
+<td>on</td>
+<td>learn the site's template</td>
+</tr>
+<tr>
+<td><code>embed</code></td>
+<td></td>
+<td>a model to embed the title and body with, into <code>emb</code></td>
+</tr>
+<tr>
+<td><code>user_agent</code></td>
+<td><code>chloedb-crawl/0.3.3 (+https://chloetech-ai.github.io/chloedb/chloedb/crawler-bot.html)</code></td>
+<td>a crawl's own is sent with that after it, unless it names <code>chloedb-crawl</code> (or <code>strata-crawl</code>, its old name)</td>
+</tr>
+<tr>
+<td><code>contact</code></td>
+<td><code>--contact</code> of <code>chloedb-crawl serve</code> (or <code>CHLOEDB_CRAWL_CONTACT</code>)</td>
+<td>whom a site's owner reaches about the crawl, an email address or a URL, sent in the user agent: <code>chloedb-crawl/&lt;version&gt; (+https://...; ops@example.com)</code></td>
+</tr>
+<tr>
+<td><code>timeout_ms</code>, <code>max_bytes</code>, <code>batch</code></td>
+<td>20,000, 5 MB, 200</td>
+<td></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="api">API<a class="anchor" href="#api" aria-label="Link to this section">#</a></h2>
+<p><code>chloedb-crawl serve</code> answers on <code>--listen</code> (<code>127.0.0.1:7800</code>). It takes no request that carries an <code>Origin</code> header, so no web page can drive it from a browser, and with <code>--token</code> (or <code>CHLOEDB_CRAWL_TOKEN</code>) none without <code>Authorization: Bearer &lt;token&gt;</code>; with <code>--local</code> and no token it makes one and gives it to the coordinator it starts.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>request</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /v1/info</code></td>
+<td>the crawler's version, the ChloeDB it writes to and what it is, the growth policy and the default options</td>
+</tr>
+<tr>
+<td><code>POST /v1/crawls</code></td>
+<td>starts a crawl from the options: <code>{id, table}</code>; two crawls may not fill one table at once</td>
+</tr>
+<tr>
+<td><code>GET /v1/crawls</code></td>
+<td>the crawls, newest first</td>
+</tr>
+<tr>
+<td><code>GET /v1/crawls/:id</code></td>
+<td>one crawl: its phase, counts, rates and a second-by-second series, the table's plan and SQL, the fields found, the last pages and problems, what it did, and the cluster's growth</td>
+</tr>
+<tr>
+<td><code>POST /v1/crawls/:id/pause</code>, <code>/resume</code>, <code>/stop</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>DELETE /v1/crawls/:id</code></td>
+<td>forgets a crawl that has ended (its table stays)</td>
+</tr>
+<tr>
+<td><code>POST /v1/preview</code></td>
+<td>the options and <code>pages</code> (6, at most 20): the preview, nothing written</td>
+</tr>
+<tr>
+<td><code>GET /v1/grow</code></td>
+<td>the shards' rows of the crawls' tables, slots moving, and the shards added</td>
+</tr>
+<tr>
+<td><code>GET /app.json</code>, <code>GET /ui/view.js</code></td>
+<td>the manifest and view the command center reads</td>
+</tr>
+</tbody>
+</table></div>
+<p>Through chloedb-server the crawler checks its callers (<code>"checks_callers": true</code> in its manifest): a key that may write starts crawls, which are its own, and pauses, resumes, stops and forgets only those (an admin of every table steers any); a key limited to tables lists only its own crawls. A crawl writes its table as the key that started it: the crawler sends its token narrowed to that key's grants (<code>x-chloedb-as-tables</code>, <a href="server.html#apps">server</a>), so a key limited to <code>crawl_*</code> crawls into <code>crawl_*</code> tables only, and a table it may not write is the server's 403. Called directly with its token, it answers as before.</p>
+<h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Link to this section">#</a></h2>
+<ul>
+<li>Pages are read as their HTML arrives: a page built by JavaScript in the browser shows only what its HTML holds (JSON-LD and meta tags often carry its fields anyway).</li>
+<li>A crawl lives in the process: its queue and seen set are in memory, and a restarted crawler starts again (rows are written by URL, so a page written twice is one row).</li>
+<li>A site's scope (<code>domain</code>) takes the last two labels of a host, or three when the second last is short (<code>example.co.uk</code>), without the public suffix list.</li>
+<li>The growth policy counts the rows of the crawls' tables on each shard, not their bytes, and adds a shard at a time; it does not remove shards.</li>
+<li>A list column added during the crawl is filled from the rows written after it only (a <code>set</code> by key takes one value).</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/crawler.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="apps.html">← Apps on a cluster</a><a href="sheets.html">Sheets →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

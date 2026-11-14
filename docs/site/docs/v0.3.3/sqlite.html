@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SQLite in and out · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeDB imports the tables of a SQLite database, making a ChloeDB table of each with a schema read from SQLite&#x27;s declarations and the values the columns hold, and exports a ChloeDB database to a new SQLite file that…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/sqlite.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html" aria-current="page">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Server and cluster</span>
+      <h1>SQLite in and out</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/sqlite.md">docs/chloedb/sqlite.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#import">Import</a></li><li><a href="#over-http-and-in-the-ui">Over HTTP and in the UI</a></li><li><a href="#export">Export</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeDB imports the tables of a SQLite database, making a ChloeDB table of each with a schema read from SQLite's declarations and the values the columns hold, and exports a ChloeDB database to a new SQLite file that any SQLite program can read: rows, keys, references, indexes and an FTS5 index over the text. An export keeps each table's ChloeDB schema in the file, so importing it back gives the same schemas and rows.</p>
+<p>Parquet files go in and out the same way, and a SQLite file may be an <code>s3://</code> URL too: <a href="parquet.html">Parquet and S3</a>.</p>
+<h2 id="import">Import<a class="anchor" href="#import" aria-label="Link to this section">#</a></h2>
+<p>From the command line, into a database no server has open:</p>
+<pre data-lang="sh">chloedb-server import --db shop.chloedb shop.sqlite             # a new database from every table
+chloedb-server import --db shop.chloedb --tables orders,customers shop.sqlite
+chloedb-server import --db shop.chloedb --plan shop.sqlite &gt; plan.json  # what it would do; writes nothing
+chloedb-server import --db shop.chloedb --schema plan.json shop.sqlite  # with the plan, edited</pre>
+<p>A SQLite file is recognised by its first bytes (or <code>--format sqlite</code>), and can be mixed with JSON and CSV files in one command (<code>--table</code> names the table of those files' rows). A database that does not exist is created from the first SQLite file's tables. Each SQLite table goes into the ChloeDB table of its name, spelled as a ChloeDB identifier (<code>Order Details</code> becomes <code>Order_Details</code>, and column names likewise; a name that is already an identifier keeps it, and a respelled one that meets another takes a suffix, so <code>x-y</code> beside <code>x_y</code> is <code>x_y_2</code>):</p>
+<ul>
+<li><strong>A table ChloeDB has</strong> keeps its schema: each column fills the field of its name, the others are left out and listed. The rows are upserted by key (inserted, in a table without one), 10,000 a transaction, or bulk-loaded when the table is empty.</li>
+<li><strong>A table ChloeDB lacks</strong> is created, with the schema <code>--schema</code> gives for it, or the one an <a href="#export">export</a> kept for it, or else one made from the SQLite table, and its rows are bulk-loaded in one commit: a value that does not fit is reported with its table and row, and nothing of that table is written.</li>
+</ul>
+<p>Tables are created referenced tables first. In Python, <code>chloedb.from_sqlite("shop.sqlite", "shop.chloedb")</code> creates a database, <code>db.import_sqlite("shop.sqlite", tables=["orders"])</code> imports into an open one, and <code>chloedb.plan_sqlite("shop.sqlite")</code> returns the plan (<a href="python.html">Python</a>). From Rust it is <code>chloedb::sqlite</code> (feature <code>sqlite</code>): <code>import_new</code>, <code>import</code>, <code>plan</code> and <code>Source</code> for each step.</p>
+<h3 id="how-sqlite-columns-become-fields">How SQLite columns become fields<a class="anchor" href="#how-sqlite-columns-become-fields" aria-label="Link to this section">#</a></h3>
+<p>SQLite has five storage classes and lets any column hold any of them, so the importer reads every row once before it loads them, to see what each column holds, and decides by its declared type and its values:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>SQLite column</th>
+<th>ChloeDB field</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a type naming <code>INT</code> (SQLite's integer affinity)</td>
+<td><code>INT</code></td>
+</tr>
+<tr>
+<td><code>REAL</code>, <code>FLOAT</code>, <code>DOUBLE</code>, <code>DECIMAL</code>, <code>NUMERIC</code></td>
+<td><code>FLOAT</code> (SQLite keeps <code>12.00</code> in a <code>DECIMAL</code> column as the integer 12; it stays a float)</td>
+</tr>
+<tr>
+<td><code>BOOL</code>, <code>BOOLEAN</code> holding 0, 1, <code>true</code> or <code>false</code></td>
+<td><code>BOOL</code></td>
+</tr>
+<tr>
+<td><code>DATE</code>, <code>DATETIME</code>, <code>TIMESTAMP</code> holding ISO 8601 text, Unix time or Julian days</td>
+<td><code>TIMESTAMP</code></td>
+</tr>
+<tr>
+<td>text in a column an FTS3, FTS4 or FTS5 table indexes</td>
+<td><code>TEXT</code>, analysed <code>english</code> for a <code>porter</code> tokenizer and <code>simple</code> otherwise</td>
+</tr>
+<tr>
+<td>other text: a primary key, a foreign key, a column of an index, or labels rather than prose (none over 256 bytes, and 2.5 words or fewer on average, or at least 100 values repeating each value ten times on average); a word holds a letter, so phone numbers have none</td>
+<td><code>KEYWORD</code></td>
+</tr>
+<tr>
+<td>other text</td>
+<td><code>TEXT</code></td>
+</tr>
+<tr>
+<td><code>F32_BLOB(n)</code>, <code>FLOAT32(n)</code> or <code>VECTOR(n)</code> holding little-endian float32 blobs (as libSQL and sqlite-vec write them) or JSON arrays</td>
+<td><code>VECTOR(n)</code></td>
+</tr>
+<tr>
+<td><code>JSON</code> holding arrays of strings or integers</td>
+<td>a multi-valued <code>KEYWORD</code> or <code>INT</code></td>
+</tr>
+<tr>
+<td>no declared type</td>
+<td>from the values: <code>INT</code>, <code>FLOAT</code>, or text as above</td>
+</tr>
+<tr>
+<td>other <code>BLOB</code></td>
+<td>left out (ChloeDB keeps no bytes), or base64 text in a stored, unindexed <code>KEYWORD</code> with <code>--blobs-base64</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>A column whose values break its declared type, such as <code>'n/a'</code> in an <code>INTEGER</code> column, becomes text, its numbers with it. Integers in a date column are Unix time in seconds, milliseconds or microseconds, chosen by the largest one (up to 10^11 seconds, the year 5138; up to 10^14 milliseconds); reals under 10^7 are Julian days. In a <code>FLOAT</code> column, an integer past 2^53 rounds to the nearest double (9223372036854775807 reads as 9223372036854775808), and an infinite real is <code>NULL</code> (a <code>NOT NULL</code> column holding one may hold <code>NULL</code>); the plan's notes say when either happens.</p>
+<p>Constraints carry over where ChloeDB has them:</p>
+<ul>
+<li><strong>Keys.</strong> A single-column <code>INTEGER</code> or text primary key is the table's key. A composite key, a key on another type, or one holding NULLs (SQLite allows them outside <code>INTEGER PRIMARY KEY</code>) leaves the table without a key.</li>
+<li><strong>References.</strong> A single-column foreign key to an imported table's key is a reference (<a href="sql.html#tables">tables</a>); integer codes referencing a text key become text to match it.</li>
+<li><strong><code>NOT NULL</code> and <code>DEFAULT</code>.</strong> Both carry over. A default is kept when it is a constant of the field's type, or <code>CURRENT_TIMESTAMP</code> (and <code>CURRENT_DATE</code>, <code>datetime('now')</code>) on a timestamp, which becomes <code>"now"</code>.</li>
+<li><strong>Indexes</strong> only steer the choice of <code>KEYWORD</code> over <code>TEXT</code>: ChloeDB indexes every field.</li>
+</ul>
+<p>Left out, and listed in the plan's notes: <code>UNIQUE</code> constraints other than the key (not enforced), <code>CHECK</code> constraints, triggers, collations, views, composite foreign keys, and virtual tables other than FTS tables that hold their own text (an FTS table over another table's text marks those columns <code>TEXT</code>; a contentless one holds no text). Vector tables of sqlite-vec (<code>vec0</code>) need its extension, which the importer does not load.</p>
+<h3 id="the-plan">The plan<a class="anchor" href="#the-plan" aria-label="Link to this section">#</a></h3>
+<p><code>--plan</code> (<code>chloedb.plan_sqlite</code> in Python, <code>chloedb::sqlite::plan</code> in Rust) prints what an import would do without writing anything:</p>
+<pre data-lang="json">{
+  &quot;tables&quot;: [
+    {
+      &quot;source&quot;: &quot;Order Details&quot;,
+      &quot;table&quot;: &quot;Order_Details&quot;,
+      &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;OrderID&quot;, &quot;type&quot;: &quot;int&quot;, &quot;references&quot;: &quot;Orders&quot;},
+        {&quot;name&quot;: &quot;ProductID&quot;, &quot;type&quot;: &quot;int&quot;, &quot;references&quot;: &quot;Products&quot;},
+        {&quot;name&quot;: &quot;UnitPrice&quot;, &quot;type&quot;: &quot;float&quot;, &quot;not_null&quot;: true, &quot;default&quot;: 0}
+      ],
+      &quot;exists&quot;: false,
+      &quot;columns&quot;: {&quot;OrderID&quot;: &quot;OrderID&quot;, &quot;ProductID&quot;: &quot;ProductID&quot;, &quot;UnitPrice&quot;: &quot;UnitPrice&quot;},
+      &quot;notes&quot;: [&quot;table \&quot;Order Details\&quot; is Order_Details&quot;,
+                &quot;composite primary key (OrderID, ProductID): a key is one field, so the table has none&quot;]
+    }
+  ],
+  &quot;skipped&quot;: {&quot;Alphabetical list of products&quot;: &quot;a view (ChloeDB has no views)&quot;}
+}</pre>
+<p>Each table is a <a href="server.html#schemas">short-form schema</a> with its <code>source</code> table, the <code>columns</code> read (SQLite column: field) and <code>notes</code> on what did not carry over. Edit it (a field's type, analyzer, <code>multi</code>, a vector's index, the table's name) and give it back with <code>--schema</code>: a schema applies to the SQLite table its <code>source</code> names, or else to the one of its name, and the columns fill the fields of their names. <code>--schema</code> also takes one schema or an array of them.</p>
+<h2 id="over-http-and-in-the-ui">Over HTTP and in the UI<a class="anchor" href="#over-http-and-in-the-ui" aria-label="Link to this section">#</a></h2>
+<p>A running server imports a SQLite file sent to <code>POST /v1/import</code> as <code>?format=sqlite</code> (or with the content type <code>application/vnd.sqlite3</code>, or no format at all: the server knows the file by its first bytes), up to <code>--max-body-mb</code> (256 MiB):</p>
+<pre data-lang="sh">curl -s -X POST &#x27;localhost:7700/v1/import?format=sqlite&amp;plan=true&#x27; -H &#x27;content-type: application/vnd.sqlite3&#x27; --data-binary @shop.sqlite
+curl -s -X POST &#x27;localhost:7700/v1/import?format=sqlite&amp;tables=orders,customers&#x27; -H &#x27;content-type: application/vnd.sqlite3&#x27; --data-binary @shop.sqlite
+# {&quot;tables&quot;: [{&quot;source&quot;: &quot;customers&quot;, &quot;table&quot;: &quot;customers&quot;, &quot;rows&quot;: 91, &quot;created&quot;: true, &quot;bulk&quot;: false, &quot;notes&quot;: []}, ...], &quot;skipped&quot;: {...}, &quot;written&quot;: 921, &quot;took_ms&quot;: 48.2}</pre>
+<p><code>?plan=true</code> answers the plan and writes nothing, <code>?tables=</code> picks tables and <code>?blobs_base64=true</code> keeps BLOB columns. The server makes the plan and reads every row once before it writes, so that a value that does not fit writes nothing; then it creates each table it lacks, as <code>CREATE TABLE</code> does, and upserts the rows through its writer 1,000 at a time, as an import of rows does (the rows before a failed write stay written). A table the server has keeps its schema, so to import with schemas of your own, create the tables first with <code>CREATE TABLE</code> and import into them. A coordinator creates a table it lacks on every shard, as <code>CREATE TABLE</code> through it does, and imports into it; a primary of <a href="server.html#replication-a-primary-and-its-replicas">replicas</a> ships the tables it creates to them with the rows.</p>
+<p><code>GET /v1/export</code> sends the database as a new SQLite file, written from one snapshot to a temporary file and streamed from it: <code>?tables=a,b</code> for some tables, <code>?fts=false</code>, <code>?indexes=false</code> and <code>?schemas=false</code> as <code>--no-fts</code>, <code>--no-indexes</code> and <code>--no-schemas</code> below. A coordinator holds no files, so it exports no SQLite file; it exports one table's rows as JSON lines, CSV, Arrow or Parquet (<code>?format=jsonl</code>, <code>csv</code>, <code>arrow</code>, <code>parquet</code> with <code>?tables=T</code>, read by a scroll over its shards, with read on the table: <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/cluster-limits.md">cluster limits</a>).</p>
+<pre data-lang="sh">curl -s &#x27;localhost:7700/v1/export?tables=orders&#x27; -o orders.sqlite</pre>
+<p>In the query console (<code>/classic</code>), the <strong>Schema and import</strong> tab has both: a SQLite file to preview (the plan, table by table) and import, and a button that downloads the database as SQLite. The Python <code>Client</code> has <code>import_sqlite</code>, <code>plan_sqlite</code> and <code>export_sqlite</code> (<a href="python.html#a-server-from-python">Python</a>).</p>
+<h2 id="export">Export<a class="anchor" href="#export" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloedb-server export --db shop.chloedb shop.sqlite                 # every table
+chloedb-server export --db shop.chloedb --tables orders --no-fts orders.sqlite</pre>
+<p>In Python, <code>db.export_sqlite("shop.sqlite")</code>; in Rust, <code>chloedb::sqlite::export</code>. The rows of every table come from one snapshot, and the file is written under another name and renamed into place when complete; an existing file is not overwritten. Each table becomes a SQLite table of the same name:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>ChloeDB field</th>
+<th>SQLite column</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KEYWORD</code>, <code>TEXT</code></td>
+<td><code>TEXT</code>; the key is <code>TEXT PRIMARY KEY NOT NULL</code></td>
+</tr>
+<tr>
+<td><code>INT</code></td>
+<td><code>INTEGER</code>; the key is <code>INTEGER PRIMARY KEY</code>, the rowid</td>
+</tr>
+<tr>
+<td><code>FLOAT</code></td>
+<td><code>REAL</code></td>
+</tr>
+<tr>
+<td><code>BOOL</code></td>
+<td><code>BOOLEAN</code>, 0 or 1</td>
+</tr>
+<tr>
+<td><code>TIMESTAMP</code></td>
+<td><code>TIMESTAMP</code>, UTC text the way SQLite's date functions write it: <code>2026-10-01 12:30:05.250</code></td>
+</tr>
+<tr>
+<td><code>VECTOR(n)</code></td>
+<td><code>F32_BLOB(n)</code>: n little-endian float32 values, which libSQL's vector functions and sqlite-vec read as they are</td>
+</tr>
+<tr>
+<td>multi-valued <code>KEYWORD</code> or <code>INT</code></td>
+<td><code>JSON</code>, an array (<code>json_each</code> lists its values)</td>
+</tr>
+<tr>
+<td><code>MEDIA</code></td>
+<td><code>JSON</code>, the file's description (<code>uri</code>, <code>sha256</code>, <code>mime</code>, ...); the files stay where their URIs point</td>
+</tr>
+<tr>
+<td><code>EDGES</code></td>
+<td><code>JSON</code>, an array of keys</td>
+</tr>
+<tr>
+<td><code>SPARSE</code></td>
+<td><code>JSON</code>, an object of term weights</td>
+</tr>
+</tbody>
+</table></div>
+<p>With them:</p>
+<ul>
+<li><strong>References</strong> become <code>REFERENCES</code> clauses, and <code>NOT NULL</code> and <code>DEFAULT</code> carry over (<code>"now"</code> is <code>CURRENT_TIMESTAMP</code>). ChloeDB does not enforce references, so a row may name a key that is gone; SQLite checks foreign keys only when a connection turns them on (<code>PRAGMA foreign_keys = ON</code>), and then only on later writes.</li>
+<li><strong>B-tree indexes</strong> on each indexed single-valued <code>KEYWORD</code>, <code>INT</code>, <code>FLOAT</code>, <code>BOOL</code> and <code>TIMESTAMP</code> field other than the key, named <code>&lt;table&gt;_&lt;field&gt;_idx</code>, and on a <code>MEDIA</code> field's <code>json_extract(field, '$.sha256')</code>, as ChloeDB indexes it (<code>--no-indexes</code> leaves them out).</li>
+<li><strong>An FTS5 index</strong> over each table's <code>TEXT</code> fields, <code>&lt;table&gt;_fts</code>, with its text in the table itself (<code>content=</code>) and triggers that keep it in step with inserts, updates and deletes (<code>--no-fts</code> leaves it out). Search it as FTS5 is searched: <code>SELECT t.* FROM t_fts JOIN t ON t.rowid = t_fts.rowid WHERE t_fts MATCH 'wizard' ORDER BY rank</code>.</li>
+<li><strong>The ChloeDB schemas</strong> in a table <code>_strata_tables</code> (<code>name</code>, <code>position</code>, <code>schema</code> in the short JSON form), which an import of the file reads to restore them (<code>--no-schemas</code> leaves it out; an import then makes schemas from the SQLite tables).</li>
+</ul>
+<h3 id="what-sqlite-does-not-hold">What SQLite does not hold<a class="anchor" href="#what-sqlite-does-not-hold" aria-label="Link to this section">#</a></h3>
+<p>The data round-trips; ChloeDB's indexes and search do not, since SQLite has no counterpart:</p>
+<ul>
+<li><strong>Vector indexes.</strong> HNSW and IVF indexes and the compressed codes stay behind; the vectors are exported. SQLite searches them with an extension (sqlite-vec, libSQL's vector index) or by a scan. An embedded field's model is recorded in the kept schema only.</li>
+<li><strong>Text analysis and ranking.</strong> FTS5 tokenizes on its own: <code>porter unicode61</code> stands in for the <code>english</code> analyzer (ChloeDB stems with Snowball English and drops stopwords; Porter stems a little differently and keeps them), <code>unicode61</code> for <code>simple</code>, and a table has one tokenizer for all its text fields. FTS5's <code>bm25()</code> is not ChloeDB's BM25, and fused, decayed and boosted scores, typo tolerance and synonyms have no SQLite form.</li>
+<li><strong>Graphs.</strong> <code>EDGES</code> are JSON arrays of keys; walks and PageRank over them are queries SQLite cannot run without recursive SQL of your own.</li>
+<li><strong>Generated fields</strong> export their text as a plain column, not as a SQLite generated column; an import with the kept schema recomputes it.</li>
+<li><strong>Fields that are not stored</strong> hold what the indexes give back, often NULL.</li>
+<li><strong>ChloeDB's file features</strong>: segments, snapshots, the write-ahead log, replication and sequence numbers.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/sqlite.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="runbooks.html">← Runbooks</a><a href="parquet.html">Parquet and S3 →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

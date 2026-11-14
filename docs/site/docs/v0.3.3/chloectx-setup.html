@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Install ChloeCtx on your machine · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeCtx runs next to your own Claude Code: hooks record each session into a local ChloeDB file per project, and a small MCP server lets the model search that history. This page takes a fresh macOS or Linux machine…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/setup.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html" aria-current="page">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>Install ChloeCtx on your machine</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/setup.md">docs/chloectx/setup.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#what-you-need">What you need</a></li><li><a href="#prebuilt">Prebuilt</a></li><li><a href="#install-in-one-command-from-source">Install in one command, from source</a></li><li><a href="#or-let-your-agent-do-it">Or let your agent do it</a></li><li><a href="#or-step-by-step">Or step by step</a></li><li><a href="#check-it">Check it</a></li><li><a href="#try-it-for-real">Try it for real</a></li><li><a href="#explore-your-stores-chloectx-ui">Explore your stores: chloectx ui</a></li><li><a href="#where-everything-lives">Where everything lives</a></li><li><a href="#other-environments">Other environments</a></li><li><a href="#upgrade-and-remove">Upgrade and remove</a></li><li><a href="#keep-the-stores-tidy-chloectx-stores-and-chloectx-prune">Keep the stores tidy: chloectx stores and chloectx prune</a></li><li><a href="#chloectx-was-called-engram">ChloeCtx was called Engram</a></li><li><a href="#troubleshooting">Troubleshooting</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeCtx runs next to your own Claude Code: hooks record each session into a local ChloeDB file per project, and a small MCP server lets the model search that history. This page takes a fresh macOS or Linux machine to a working install in a few minutes, shows how to check it, and covers remote boxes, dev containers and upgrades.</p>
+<h2 id="what-you-need">What you need<a class="anchor" href="#what-you-need" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th>why</th>
+<th>check</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>macOS or Linux (Windows through WSL 2)</td>
+<td>the daemon talks to the hooks over a Unix socket</td>
+<td><code>uname -s</code></td>
+</tr>
+<tr>
+<td>Rust, stable</td>
+<td>to build ChloeCtx from source (not for <a href="#prebuilt">the prebuilt binary</a>)</td>
+<td><code>cargo --version</code> (install from <a href="https://rustup.rs">rustup.rs</a>)</td>
+</tr>
+<tr>
+<td>a C compiler</td>
+<td>to build from source: the tokenizer's regex library is C</td>
+<td><code>cc --version</code> (<code>xcode-select --install</code> on macOS, <code>build-essential</code> on Debian/Ubuntu)</td>
+</tr>
+<tr>
+<td><code>curl</code></td>
+<td>downloads the 129 MB embedding model once</td>
+<td><code>curl --version</code></td>
+</tr>
+<tr>
+<td><a href="https://claude.com/claude-code">Claude Code</a> CLI, <strong>logged in</strong></td>
+<td>the hooks and the MCP server plug into it, and the distiller calls <code>claude -p</code> after each turn</td>
+<td><code>claude auth status</code> shows <code>"loggedIn": true</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Python 3 is only needed for the scripted demo and the evaluation harnesses, not for ChloeCtx itself.</p>
+<p>The CLI login matters more than it looks. The distiller runs <code>claude -p</code> in the background, so an expired CLI login breaks it even while interactive sessions (or the desktop app) keep working. Recording and recall still work in that state, but nothing new is written down. <code>chloectx doctor</code> checks for it.</p>
+<p>ChloeCtx makes model calls of its own, through <code>claude -p</code> with a small model (<code>haiku</code> by default), billed to the CLI's login: one after each turn to write down decisions and rules (about $0.001), and, once a project's store holds 20 records, two more after each prompt of four words or more, in the background, to search memory for it (<a href="chloectx.html#query-understanding">query understanding</a>, about $0.001 a prompt). Neither holds up a turn: what the search finds comes with the turn's next tool result, or at the next prompt. <code>CHLOECTX_DISTILL=0</code> turns the first off, <code>CHLOECTX_DEEP=off</code> (or <code>tool</code>, only when the model asks) the second.</p>
+<p>The daemon that makes these calls finds the <code>claude</code> CLI where Claude Code's hooks found it, on its own <code>PATH</code>, or in the usual install places (<code>~/.local/bin</code>, <code>~/.claude/local</code>, <code>/opt/homebrew/bin</code>, <code>/usr/local/bin</code>); <code>CHLOECTX_CLAUDE</code> names it outright. <code>chloectx doctor</code> shows which one the running daemon uses.</p>
+<h2 id="prebuilt">Prebuilt<a class="anchor" href="#prebuilt" aria-label="Link to this section">#</a></h2>
+<p><span class="since">since 0.3.2</span> From release 0.3.2, the ChloeDB installer fetches <code>chloectx</code> prebuilt (macOS 11 or later, Linux with glibc 2.35 or later), with no Rust and no clone; then fetch the model, wire it into Claude Code and check:</p>
+<pre data-lang="sh">curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with ctx    # ~/.local/bin/chloectx
+~/.local/bin/chloectx fetch-model                    # potion-retrieval-32M, 129 MB, SHA-256 checked
+~/.local/bin/chloectx install --project /absolute/path/to/project    # or: install --user, every session
+~/.local/bin/chloectx doctor</pre>
+<p>Release 0.3.0 and earlier have no prebuilt <code>chloectx</code>: build it from source, below. This installer (the website's <code>install.sh</code>) is not the repository's <code>./install.sh</code>, which builds ChloeCtx from a checkout.</p>
+<h2 id="install-in-one-command-from-source">Install in one command, from source<a class="anchor" href="#install-in-one-command-from-source" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">git clone https://github.com/chloetech-ai/chloedb &amp;&amp; cd chloedb &amp;&amp; ./install.sh</pre>
+<p><code>install.sh</code> does five things and can be run again at any time:</p>
+<ol>
+<li>builds <code>chloectx</code> in release mode (a few minutes the first time);</li>
+<li>copies it to <code>~/.local/bin/chloectx</code>, the path the hooks call;</li>
+<li>stops any running ChloeCtx daemons, so they restart on the new binary;</li>
+<li>downloads the embedding model (potion-retrieval-32M) unless it is already there;</li>
+<li>runs <code>chloectx install --user --distill-model haiku</code> and then <code>chloectx doctor</code>.</li>
+</ol>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>option</th>
+<th>effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--project DIR</code></td>
+<td>install into one project's <code>.claude/settings.local.json</code> and <code>.mcp.json</code> instead of every session</td>
+</tr>
+<tr>
+<td><code>--distill-model NAME</code></td>
+<td>the model that writes down decisions and rules after each turn (default <code>haiku</code>; <code>--distill-model ""</code> uses the CLI's default model)</td>
+</tr>
+<tr>
+<td><code>--prefix DIR</code></td>
+<td>install the binary to <code>DIR/bin</code> (default <code>~/.local</code>)</td>
+</tr>
+<tr>
+<td><code>--no-wire</code></td>
+<td>build and install the binary only, and leave Claude Code's settings alone</td>
+</tr>
+</tbody>
+</table></div>
+<p>Sessions that were already open pick ChloeCtx up when they restart.</p>
+<h2 id="or-let-your-agent-do-it">Or let your agent do it<a class="anchor" href="#or-let-your-agent-do-it" aria-label="Link to this section">#</a></h2>
+<p>Tell Claude Code (or another coding agent) in any session:</p>
+<blockquote>
+<p>Clone https://github.com/chloetech-ai/chloedb and set ChloeCtx up for my Claude Code by following its AGENTS.md.</p>
+</blockquote>
+<p><a href="https://github.com/chloetech-ai/chloedb/blob/main/AGENTS.md"><code>AGENTS.md</code></a> tells the agent to check the prerequisites without installing anything unasked, to ask you whether to install for every session or one project, to run <code>install.sh</code> and <code>chloectx doctor</code>, and to report what failed. Two things stay with you: <code>claude auth login</code> if the CLI is logged out (it is interactive), and starting a new session afterwards, because the session that ran the install started before the hooks existed.</p>
+<h2 id="or-step-by-step">Or step by step<a class="anchor" href="#or-step-by-step" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">git clone https://github.com/chloetech-ai/chloedb &amp;&amp; cd chloedb/chloectx
+cargo build --release --bin chloectx
+cargo install --path . --bin chloectx --root ~/.local       # a stable path for the hooks: ~/.local/bin/chloectx
+chloectx fetch-model                                        # potion-retrieval-32M, 129 MB, at a pinned revision, SHA-256 checked
+chloectx install --user --distill-model haiku               # or: chloectx install --project /path/to/project
+chloectx doctor</pre>
+<p><code>chloectx install --user</code> merges nine hooks and a permission for the memory tools into <code>~/.claude/settings.json</code> (saving the previous file next to it as <code>settings.json.chloectx-&lt;time&gt;.bak</code>) and registers the MCP server at user scope with <code>claude mcp add-json</code>. A project install backs up the project's <code>.claude/settings.local.json</code> and <code>.mcp.json</code> the same way before it changes them (delete the <code>.bak</code> files once you are happy, and do not commit them). Every settings file is written to a file beside it and renamed into place, so an interrupted install leaves the old file whole, and its keys stay in the order they were. A project with its own <code>chloectx install</code> keeps using that one; the user-level hooks step aside there, so nothing is recorded twice.</p>
+<h2 id="check-it">Check it<a class="anchor" href="#check-it" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">$ chloectx doctor
+ChloeCtx 0.3.3 for /home/you/code/app
+  ok    binary: /home/you/.local/bin/chloectx
+  ok    Claude Code CLI: 2.1.299 (Claude Code)
+  ok    user hooks: /home/you/.claude/settings.json (9 events, /home/you/.local/bin/chloectx)
+  ok    MCP server: user scope in /home/you/.claude.json (/home/you/.local/bin/chloectx mcp)
+  ok    embedding model: /home/you/.local/share/chloectx/models/potion-retrieval-32M
+  ok    distillation: model haiku (from the user settings)
+  ok    Claude Code login: logged in
+  ok    daemon: a scratch store opened and answered in 368 ms; this project&#x27;s store will be /home/you/.local/share/chloectx/projects/app-251a5186 once a session runs here
+ChloeCtx is ready. Start `claude` in a project; `chloectx ui` shows what it stores.</pre>
+<p><code>doctor</code> checks the current directory's project. Once a session has run there, the last line becomes the store itself (records, sessions, daemon round trip), and a <code>last distillation</code> line reports whether the most recent distillation worked. Every failed line says how to fix it, and the command exits non-zero when anything failed.</p>
+<h2 id="try-it-for-real">Try it for real<a class="anchor" href="#try-it-for-real" aria-label="Link to this section">#</a></h2>
+<p>A two-minute check that memory carries across sessions. In any project:</p>
+<ol>
+<li>Start <code>claude</code> and state something only a conversation would know, for example: <em>"Rule from the client: all amounts are integer cents, never floats, because their ledger rejects fractional cents. The server runs Python 3.8, so no match statements."</em> Let it answer, then exit.</li>
+<li>Start a <strong>new</strong> session in the same directory and ask: <em>"Write billing.py with total(items), following every rule the client gave us."</em></li>
+</ol>
+<p>The new session starts with ChloeCtx's briefing, which lists the rules the distiller wrote down after the first session, and the code should use integer cents and avoid <code>match</code>. Then look at what happened:</p>
+<pre data-lang="sh">chloectx ui                                         # the inspector over every store on this machine
+chloectx search &quot;integer cents&quot;                     # hybrid search from the shell
+chloectx sql &quot;SELECT kind, tag, text FROM memory WHERE kind IN (&#x27;decision&#x27;, &#x27;preference&#x27;) ORDER BY seq DESC LIMIT 10&quot;</pre>
+<h2 id="explore-your-stores-chloectx-ui">Explore your stores: <code>chloectx ui</code><a class="anchor" href="#explore-your-stores-chloectx-ui" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloectx ui                      # opens the inspector at http://127.0.0.1:8765/?token=...
+chloectx ui --no-open --port 9000
+chloectx ui --home ~/chloectx-demo/chloectx  # stores kept elsewhere (here: the scripted demo&#x27;s)</pre>
+<p><img loading="lazy" decoding="async" alt="chloectx ui: a session rebuilt from its records on the left, with the briefing, recall decisions and what the distiller kept; the store's knowledge on the right" src="../../../assets/img/inspector-ui-conversation.png" /></p>
+<p><code>chloectx ui</code> is the <a href="chloectx-inspector.html">live inspector</a> pointed at your own data. The left column picks a store (one per project directory, newest first) and a session, and replays that session from its records: prompts, answers, tool calls (open one to see its stored result), the briefing at session start, every recall decision with its gate score and the records it injected, and the notes the distiller kept, superseded or closed. A session that is still running grows as it goes. The right side has every panel of the inspector, scoped to the chosen store: the live feed of records and daemon events, knowledge, the table, the graph, the vectors, an SQL console and the storage layout.</p>
+<p>It is built into the binary (no Python, no checkout needed) and only reads: each store is opened through its project's daemon, as the hooks do, so it is safe to keep open while sessions write. It listens on 127.0.0.1, and every request must carry the random token in the URL it prints, because stores hold transcripts. Links keep the store, session and tab in the address (<code>?store=…&amp;session=…&amp;tab=knowledge</code>), so a view can be reopened later.</p>
+<p>It is also the quickest way to debug an install. A <code>DISTILL</code> event with an error in the live feed means the distiller cannot run <code>claude -p</code>; a <code>RECALL · SKIP</code> on every prompt with few candidates means the store is still small; no records at all for a session means its hooks did not run.</p>
+<h2 id="where-everything-lives">Where everything lives<a class="anchor" href="#where-everything-lives" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>what</th>
+<th>where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>binary</td>
+<td><code>~/.local/bin/chloectx</code> (from <code>install.sh</code> or <code>cargo install --root ~/.local</code>)</td>
+</tr>
+<tr>
+<td>hooks</td>
+<td><code>~/.claude/settings.json</code> (user install) or the project's <code>.claude/settings.local.json</code></td>
+</tr>
+<tr>
+<td>MCP server</td>
+<td><code>~/.claude.json</code> at user scope, or the project's <code>.mcp.json</code></td>
+</tr>
+<tr>
+<td>stores</td>
+<td><code>~/.local/share/chloectx/projects/&lt;folder&gt;-&lt;hash&gt;/</code>, one per project directory: <code>memory.strata</code> and its WAL, <code>state.json</code>, <code>events.log</code> (recall and distill decisions), <code>daemon.log</code>, <code>project.txt</code>. A machine that has <code>~/.local/share/engram</code> from before the rename, and no <code>~/.local/share/chloectx</code>, keeps using the old folder</td>
+</tr>
+<tr>
+<td>embedding model</td>
+<td><code>~/.local/share/chloectx/models/potion-retrieval-32M/</code> (or in the old folder, as the stores)</td>
+</tr>
+<tr>
+<td>daemon socket</td>
+<td><code>engram.sock</code> in the store, or, when that path is too long, <code>$XDG_RUNTIME_DIR</code>, <code>/tmp/engram-&lt;uid&gt;/</code> or <code>~/.cache/chloectx/</code>: the first that is a directory of yours alone (a <code>/tmp/engram-&lt;uid&gt;</code> another user made, or a link, is skipped)</td>
+</tr>
+<tr>
+<td>model calls' working directory</td>
+<td><code>distill/</code> in the stores' folder, private to you (the distiller's <code>claude -p</code> reads project settings from where it runs)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Store directories are created readable by their owner only. ChloeCtx redacts secrets before it stores anything (<a href="#secrets-and-chloectx-redact">below</a>), but a store is still a transcript of your sessions: treat it like your shell history.</p>
+<h3 id="secrets-and-chloectx-redact">Secrets and <code>chloectx redact</code><a class="anchor" href="#secrets-and-chloectx-redact" aria-label="Link to this section">#</a></h3>
+<p>Every record is redacted as it is stored, whatever wrote it (the hooks, <code>ingest-transcript</code>, <code>remember</code>, the distiller, compaction summaries), and again as <code>chloectx sync</code> sends or pulls it. So are the prompts kept in <code>state.json</code> and the lines of <code>events.log</code>. A secret is replaced by a marker that names its kind, and the text around it stays, so <code>DB_PASSWORD=hunter2</code> is stored as <code>DB_PASSWORD=[REDACTED:password]</code>. What is caught:</p>
+<ul>
+<li>keys and tokens by their shape: Anthropic (<code>sk-ant-</code>), OpenAI (<code>sk-</code>, <code>sk-proj-</code>), GitHub (<code>ghp_</code>, <code>gho_</code>, <code>ghu_</code>, <code>ghs_</code>, <code>ghr_</code>, <code>github_pat_</code>), GitLab (<code>glpat-</code>), npm (<code>npm_</code>), AWS access key ids (<code>AKIA</code>, <code>ASIA</code>), Google API keys (<code>AIza</code>) and OAuth tokens (<code>ya29.</code>), Slack tokens (<code>xoxb-</code> and the like) and webhooks, Discord webhooks, Stripe (<code>sk_live_</code>, <code>rk_live_</code>, <code>whsec_</code>), DigitalOcean (<code>dop_v1_</code>), Hugging Face (<code>hf_</code>), SendGrid, ChloeDB API keys (<code>sk_&lt;id&gt;_&lt;secret&gt;</code>) and JWTs;</li>
+<li>PEM private key blocks, also one cut off before its <code>END</code> line;</li>
+<li><code>Authorization:</code> headers (<code>Bearer</code>, <code>Basic</code> and others), <code>Bearer</code> tokens, <code>curl -u user:password</code>, and the password in a URL (<code>postgres://app:…@db</code>);</li>
+<li>values assigned to a name that ends in a word for a secret (token, secret, password, passwd, passphrase, credential, or a key such as <code>api_key</code>, <code>AWS_SECRET_ACCESS_KEY</code>, <code>apiKey</code>): <code>NAME=value</code> in an environment dump or a <code>.env</code> file, <code>name: value</code> in YAML, <code>"name": "value"</code> in JSON, <code>name = "value"</code> in code.</li>
+</ul>
+<p>It is pattern-based, so it is best effort: a password written in prose, or a random string under an unremarkable name, is stored as it is. It leaves alone what only looks random (git hashes, digests, UUIDs) and code that names a secret without holding one (<code>token = get_token()</code>, <code>password: string</code>, <code>primary_key</code>).</p>
+<p>A store written before this redaction can hold secrets it would now catch. <code>chloectx redact</code>, in the project directory, rewrites them:</p>
+<pre data-lang="sh">chloectx redact --dry-run   # count what would change; change nothing
+chloectx redact             # this project&#x27;s store
+chloectx redact --all       # every store on this machine</pre>
+<p>The project's daemon rewrites each record whose text redaction changes, redacts <code>state.json</code> and <code>events.log</code> the same way, and, when a sync is set up, sends the rewritten records to the server again so they replace its copies. Then the daemon is stopped and the store's file replaced by a fresh copy of its live rows, because the pages the old versions were on would otherwise stay in the file until later writes reuse them; a hook that comes in those few seconds records nothing. It prints how many records, session states and log lines changed and which kinds of secret it found, never the secrets. What it cannot reach is up to you: backups made with <code>chloectx backup</code>, a <code>memory.strata.before-field-ids</code> copy left by a format upgrade (it names it), and the server's own backups.</p>
+<p>To back a store up, run <code>chloectx backup DEST</code> in the project directory. It copies the store while sessions go on: a consistent checkpoint of <code>memory.strata</code> (copying the file itself while the daemon writes can catch it half way through a commit), <code>state.json</code>, the config and <code>events.log</code>, into a new directory <code>DEST</code>. To restore, run <code>chloectx stop</code> and copy those files back into the store's directory. A backup is as private as the store.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>variable</th>
+<th>effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHLOECTX_DISABLE=1</code></td>
+<td>the hooks do nothing in this session</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_HOME</code></td>
+<td>where stores (and, by default, models) live; default <code>$XDG_DATA_HOME/chloectx</code> or <code>~/.local/share/chloectx</code> (<code>engram</code> in place of <code>chloectx</code> when only that folder exists)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_MODELS</code></td>
+<td>where the embedding models live</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DISTILL_MODEL</code></td>
+<td>the distiller's model (<code>install --distill-model</code> sets it in the settings' <code>env</code>)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DISTILL=0</code></td>
+<td>no distillation (read from Claude Code's environment too, whichever process started the daemon)</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_DEEP</code></td>
+<td>query understanding: <code>async</code> (default), <code>sync</code>, <code>tool</code> or <code>off</code></td>
+</tr>
+<tr>
+<td><code>CHLOECTX_CLAUDE</code></td>
+<td>the <code>claude</code> CLI the model calls run, when it is in none of the places the daemon looks</td>
+</tr>
+<tr>
+<td><code>CHLOECTX_EMBEDDER</code></td>
+<td><code>static</code> (default), <code>bert</code>, or <code>hash:&lt;dim&gt;</code> for a model-free hash embedder</td>
+</tr>
+</tbody>
+</table></div>
+<p>Each of them is still read under its name from before the rename, <code>ENGRAM_*</code> (<code>ENGRAM_DISABLE=1</code>), when the new one is not set.</p>
+<h2 id="other-environments">Other environments<a class="anchor" href="#other-environments" aria-label="Link to this section">#</a></h2>
+<h3 id="a-remote-machine-over-ssh">A remote machine over SSH<a class="anchor" href="#a-remote-machine-over-ssh" aria-label="Link to this section">#</a></h3>
+<p>Install on the remote machine as above; the hooks run wherever <code>claude</code> runs. To browse its stores from your laptop, forward the port and open the URL <code>chloectx ui</code> prints:</p>
+<pre data-lang="sh">ssh -L 8765:127.0.0.1:8765 you@devbox
+chloectx ui --no-open        # on the devbox; open the printed URL in your laptop&#x27;s browser</pre>
+<p><code>chloectx ui</code> does not try to open a browser inside an SSH session.</p>
+<h3 id="dev-containers-and-codespaces">Dev containers and Codespaces<a class="anchor" href="#dev-containers-and-codespaces" aria-label="Link to this section">#</a></h3>
+<p>Run the installer when the container is created, for example in <code>.devcontainer/devcontainer.json</code>:</p>
+<pre data-lang="json">{
+  &quot;postCreateCommand&quot;: &quot;git clone https://github.com/chloetech-ai/chloedb /tmp/chloedb &amp;&amp; /tmp/chloedb/install.sh&quot;,
+  &quot;containerEnv&quot;: { &quot;CHLOECTX_HOME&quot;: &quot;/workspaces/.chloectx&quot; },
+  &quot;forwardPorts&quot;: [8765]
+}</pre>
+<p>The image needs Rust and a C compiler (the <code>ghcr.io/devcontainers/features/rust</code> feature provides both), and Claude Code must be logged in inside the container. A container's home directory is usually thrown away on rebuild, so point <code>CHLOECTX_HOME</code> at a mounted or persistent path (as above) if memory should survive rebuilds. Inside a container, start the inspector with <code>chloectx ui --no-open</code> and open the printed URL through the forwarded port.</p>
+<h3 id="windows">Windows<a class="anchor" href="#windows" aria-label="Link to this section">#</a></h3>
+<p>Use WSL 2 and run everything, including Claude Code, inside the Linux distribution. Native Windows is not supported: the daemon uses Unix sockets and <code>flock</code>.</p>
+<h3 id="claude-code-on-the-web">Claude Code on the web<a class="anchor" href="#claude-code-on-the-web" aria-label="Link to this section">#</a></h3>
+<p>Cloud sessions run in a fresh container each time, so a ChloeCtx store there starts empty and is lost when the container is reclaimed. To keep memory across them, sync it with a ChloeDB server (<a href="#keep-the-memory-on-a-chloedb-server">below</a>): the environment's setup script installs ChloeCtx and names the server, the environment holds the server's key in a variable, and each session pulls the project's memory when its daemon starts.</p>
+<h3 id="keep-the-memory-on-a-chloedb-server">Keep the memory on a ChloeDB server<a class="anchor" href="#keep-the-memory-on-a-chloedb-server" aria-label="Link to this section">#</a></h3>
+<p><code>chloectx sync</code> copies each project's memory to a table, <code>chloectx_memory</code>, on a ChloeDB server or a cluster's coordinator, and back. The store stays a local file, so hooks and recall never wait on the network:</p>
+<ul>
+<li>the daemon pushes what it recorded every 30 seconds and as it exits, and when it starts it pulls the project's records the store lacks (written on another machine, or by a container that is gone) and embeds them here;</li>
+<li>records are keyed by project and record id, so several projects share the table, and the server can search them too; a project is its git repository (<code>owner/name</code> of <code>origin</code>), so checkouts in different folders share one memory, and <code>--rename owner/old=owner/new</code> lets a checkout of a renamed repository join the new name's (<code>SELECT content FROM chloectx_memory WHERE project = '/path' ORDER BY bm25(content, '...') DESC LIMIT 10</code>).</li>
+</ul>
+<pre data-lang="sh"># the key from stdin, kept owner-only in ChloeCtx&#x27;s home (sync.token)
+printf %s &quot;$KEY&quot; | chloectx sync setup --url https://chloedb.example.com --token-stdin
+# or: read it, whenever the daemon syncs, from a variable (a cloud environment&#x27;s, say)
+chloectx sync setup --url https://chloedb.example.com --token-env CHLOEDB_KEY
+chloectx sync status        # what was sent and received, what the server holds
+chloectx sync push          # now, rather than within 30 s
+chloectx sync pull</pre>
+<p><code>setup</code> creates the table, which needs a key with the <code>admin</code> scope (<code>--no-create</code> skips it; the first push creates it when the key can); after that an API key with the <code>write</code> scope is enough. <code>CHLOECTX_SYNC_URL</code> and <code>CHLOECTX_SYNC_TOKEN</code> override the settings. What is sent is what the store holds, transcripts of your sessions included, redacted again on the way (<a href="#secrets-and-chloectx-redact">secrets</a>): use a server you control, over HTTPS, with a key (plain <code>http://</code> is refused except to this machine, <code>127.0.0.1</code> or <code>localhost</code>; <code>CHLOECTX_SYNC_ALLOW_HTTP=1</code> allows it). Sync only adds records: one retagged or forgotten after it was pushed is not sent again, and a record forgotten here comes back with the next pull while the server holds it (delete its row there too, <code>DELETE FROM chloectx_memory WHERE id = '&lt;project&gt;:&lt;record id&gt;'</code>). Two machines writing the same project at once can, rarely, give two records one id (<code>manual:&lt;seq&gt;</code> from <code>chloectx remember</code>); the server keeps the last one sent.</p>
+<h2 id="upgrade-and-remove">Upgrade and remove<a class="anchor" href="#upgrade-and-remove" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloectx upgrade --check     # is there a newer version? (fetches the checkout&#x27;s main branch)
+chloectx upgrade             # git pull --ff-only in the checkout it was built from, rebuild, reinstall, doctor
+chloectx stop --all          # restart daemons by hand (they start again on demand)
+chloectx uninstall --user    # or `chloectx uninstall` in a project; stores are kept</pre>
+<p>The binary knows the commit and the checkout it was built from (<code>chloectx --version</code> names the commit). <code>chloectx doctor</code> fetches that checkout's upstream branch (waiting at most 3 s; <code>upgrade --check</code> waits 20 s) and says how many commits on it change ChloeCtx or ChloeDB since the build, or, when the fetch failed, that it could not check and what the last fetch said (<code>upgrade --check</code> then exits 1), and a session that starts while the binary is behind says so once a day, from what the checkout last fetched. <code>chloectx upgrade</code> pulls the checkout (fast forward only: it stops when local commits or changes are in the way, and <code>--no-pull</code> builds the checkout as it is), stops the daemons of the old build, runs <code>install.sh --no-wire</code> into the binary's own prefix, writes the user-level install again (a version may add hook events; the distillation model you chose is kept), and ends with <code>doctor</code>. A prebuilt binary, or one built outside a checkout (no <code>.git</code>), cannot upgrade itself: <code>chloectx upgrade</code> and <code>doctor</code> say to run the installer again (<code>curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with ctx</code>, which replaces the binary and keeps the stores), or run <code>git pull &amp;&amp; ./install.sh</code> in a checkout, or point <code>CHLOECTX_SOURCE</code> at one.</p>
+<h2 id="keep-the-stores-tidy-chloectx-stores-and-chloectx-prune">Keep the stores tidy: <code>chloectx stores</code> and <code>chloectx prune</code><a class="anchor" href="#keep-the-stores-tidy-chloectx-stores-and-chloectx-prune" aria-label="Link to this section">#</a></h2>
+<p>Every directory a session runs in gets its own store, including the throwaway folders tools make under the system's temporary directory, so stores pile up over months. <code>chloectx stores</code> lists them all, most recently used first, with the project each records, its size on disk and when it was last used, and marks the ones <code>prune</code> would remove:</p>
+<ul>
+<li>the project folder no longer exists, and the store was not used for a week (a folder missing for less, or on a drive that is not mounted, such as <code>/Volumes/…</code> or <code>/media/…</code>, may have moved and is only marked; <code>chloectx move OLD NEW</code> attaches the store to the folder's new place);</li>
+<li>the project is in a temporary folder (<code>/tmp</code>, <code>/var/folders</code> on macOS) and the store was not used for a day;</li>
+<li>the store names no project (one from before the daemon wrote <code>project.txt</code>, whose <code>daemon.log</code> does not name it either) and was not used for a month.</li>
+</ul>
+<p><code>chloectx prune</code> lists those and asks before it removes them (<code>--yes</code> skips the question, <code>--dry-run</code> only lists, <code>--older-than DAYS</code> adds every store not used for that long). A store whose daemon is running is never removed. Removing a store deletes that project's memory for good. <code>chloectx doctor</code> counts the stores and says when ten or more could go.</p>
+<p>The repository was called <code>rkonow/engram</code> until October 2026. A checkout made before then keeps working, because GitHub redirects the old address: upgrade it with <code>git pull &amp;&amp; ./install.sh</code> in its folder (still named <code>engram</code>), and <code>git remote set-url origin https://github.com/chloetech-ai/chloedb</code> points it at the new name.</p>
+<h2 id="chloectx-was-called-engram">ChloeCtx was called Engram<a class="anchor" href="#chloectx-was-called-engram" aria-label="Link to this section">#</a></h2>
+<p>ChloeCtx was called Engram until November 2026. <code>git pull &amp;&amp; ./install.sh</code> moves an install to the new names, and leaves what it stored where it is:</p>
+<ul>
+<li>The program is <code>~/.local/bin/chloectx</code>, and <code>~/.local/bin/engram</code> is a link to it for a release, so whatever still calls the old name keeps working.</li>
+<li><code>chloectx install</code> (which <code>install.sh</code> runs) replaces the entries the old install wrote into Claude Code's settings: the hooks that called <code>engram</code>, the MCP server <code>engram</code> and its permission <code>mcp__engram</code> (the server is <code>chloectx</code> now, and its tools <code>mcp__chloectx__*</code>), and <code>ENGRAM_DISTILL_MODEL</code>, which becomes <code>CHLOECTX_DISTILL_MODEL</code> with the same model. An <code>engram</code> server or permission is taken for ChloeCtx's only when the same settings hold the old hooks of the program it runs, since another tool may be called engram. <code>chloectx uninstall</code> removes both the old and the new entries. Until you run it again, <code>chloectx doctor</code> warns about the old ones.</li>
+<li>The settings are <code>CHLOECTX_*</code>, and each <code>ENGRAM_*</code> one is still read when the new one is not set.</li>
+<li>The stores and the embedding model stay in <code>~/.local/share/engram</code> on a machine that has that folder and no <code>~/.local/share/chloectx</code>: <code>install.sh</code> moves nothing, and <code>chloectx doctor</code> warns which folder is in use. <code>chloectx upgrade</code> moves it: with the daemons stopped, it renames <code>~/.local/share/engram</code> to <code>~/.local/share/chloectx</code> and leaves <code>engram</code> as a link to it (not when <code>CHLOECTX_HOME</code> is set). A new install uses <code>~/.local/share/chloectx</code>. A store's files keep their names (<code>memory.strata</code>, <code>engram.sock</code>), and a daemon started by the old program keeps serving until it stops, which <code>install.sh</code> asks it to do.</li>
+</ul>
+<p>Sessions that were already running keep the old tool names until they restart.</p>
+<h2 id="troubleshooting">Troubleshooting<a class="anchor" href="#troubleshooting" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>symptom</th>
+<th>cause and fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>doctor</code>: <strong>Claude Code login</strong> fails, a session starts with <em>ChloeCtx is not writing down decisions or rules</em>, or <code>DISTILL</code> events show <em>OAuth session expired</em></td>
+<td>the CLI's own login expired; run <code>claude auth login</code>. Recording and recall keep working meanwhile, but turns from that period are not distilled again later. Until a distillation works again, each session's start says so, to you and to the model</td>
+</tr>
+<tr>
+<td>recalled records or rules that are a harness's markup (<code>&lt;system-reminder&gt;</code>, <code>&lt;wake&gt;</code>, <code>&lt;coordinator-relay&gt;</code>)</td>
+<td>stored by an earlier version, which kept the envelopes some harnesses wrap prompts in. Prompts are now stored without them, recall and the briefing pass the old ones over, and a daemon retires the rules it had picked out of them once, when it first starts on the store</td>
+</tr>
+<tr>
+<td>no records for a session</td>
+<td>the session started before ChloeCtx was installed (restart it), <code>CHLOECTX_DISABLE=1</code> was set, or the project has its own install that points at a binary that moved (<code>chloectx doctor</code> in that directory says which)</td>
+</tr>
+<tr>
+<td>the model has no <code>memory_*</code> tools</td>
+<td>the MCP server is not registered or the session predates it: <code>claude mcp get chloectx</code>, then restart the session</td>
+</tr>
+<tr>
+<td><code>daemon did not answer in time</code></td>
+<td>read the store's <code>daemon.log</code>; a missing embedding model is the usual cause (<code>chloectx fetch-model</code>)</td>
+</tr>
+<tr>
+<td>distillation costs</td>
+<td>about $0.001 and 8 s per turn with a small model; <code>CHLOECTX_DISTILL=0</code> turns it off</td>
+</tr>
+<tr>
+<td><code>doctor</code>: <strong>last distillation</strong> failed with something other than the login</td>
+<td>the line shows what the CLI wrote on stderr and its exit status (an old CLI that does not know a flag, a crash, a proxy), and doctor makes one small model call to say whether it still fails</td>
+</tr>
+<tr>
+<td><code>doctor</code>: <strong>daemon's Claude Code CLI</strong> fails</td>
+<td>the running daemon was started by a process that has no <code>claude</code> on its <code>PATH</code>, and it is not in the usual places either: set <code>CHLOECTX_CLAUDE</code> to its path, or <code>chloectx stop</code> so that the next Claude Code hook starts the daemon</td>
+</tr>
+<tr>
+<td>a project folder was moved or renamed, and its sessions start with an empty memory</td>
+<td>stores are kept by the folder's path: <code>chloectx move OLD NEW</code> attaches the old store to the new folder. <code>stores</code> marks a store whose folder went missing in the last week, or is on a drive that is not mounted, and <code>prune</code> leaves it alone. A <code>git worktree</code> is a folder of its own, with a store of its own</td>
+</tr>
+<tr>
+<td>a project should not be recorded</td>
+<td>add <code>"env": {"CHLOECTX_DISABLE": "1"}</code> to that project's <code>.claude/settings.local.json</code>, or set <code>CHLOECTX_DISABLE=1</code> in the shell you start <code>claude</code> from</td>
+</tr>
+</tbody>
+</table></div>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloectx/setup.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="chloectx.html">← ChloeCtx</a><a href="chloectx-inspector.html">ChloeCtx inspector →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

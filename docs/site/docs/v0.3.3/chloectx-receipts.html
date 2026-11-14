@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Receipts and chloectx blame · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeCtx puts records from earlier work into an agent&#x27;s context: on every prompt, after a compaction, and when the agent calls memorysearch. Each of those recalls now writes a receipt, and the store is kept as a…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/receipts.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html" aria-current="page">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>Receipts and chloectx blame</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/receipts.md">docs/chloectx/receipts.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#what-a-receipt-holds">What a receipt holds</a></li><li><a href="#kept-snapshots">Kept snapshots</a></li><li><a href="#commands">Commands</a></li><li><a href="#in-the-command-center">In the command center</a></li><li><a href="#how-blame-finds-the-edit">How blame finds the edit</a></li><li><a href="#forgetting-and-redaction">Forgetting and redaction</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeCtx puts records from earlier work into an agent's context: on every
+prompt, after a compaction, and when the agent calls <code>memory_search</code>. Each
+of those recalls now writes a <strong>receipt</strong>, and the store is <strong>kept as a
+snapshot</strong> after a recall that showed something, so any recall can be
+replayed later on exactly the data it read. <code>chloectx blame</code> starts from a
+line of code and walks back to the edit that wrote it, the prompt behind
+the edit, and the receipts of what memory had put in the agent's context
+before it.</p>
+<pre data-lang="text" data-title="Output">$ chloectx blame src/payments/retry.rs:88
+line        sleep(backoff_delay(attempt));
+commit      3f9a2c1b0e 2026-11-10 14:05 UTC · Retry with the new backoff
+edit        2026-11-10 14:02 UTC · session 7f3a91c2 turn 4 · 7f3a91c2-…:212 (the newest recorded edit whose new text holds the line)
+prompt      use the new backoff policy for payment retries
+before it   3 tool calls in the turn:
+              Read src/payments/retry.rs (120 lines)
+              $ rg backoff src/payments
+              Read src/payments/policy.rs (40 lines)
+
+recalled in the edit&#x27;s turn: receipt rc-19a6… · prompt · Inject · store commit 48211
+    #  kind        record                      score    cos   tok  decision
+    k  decision    1c2e…:31                    0.812  0.812    35  knowledge  ← superseded since, by 1c2e…:58
+    2  preference  1c2e…:12                    0.640  0.700    15  take
+    3  tool_result 88aa…:90                    0.520  0.610   310  excerpt  ← untrusted source: the web
+
+replay of rc-19a6…:
+  on the snapshot kept at commit 48211 (auto-48211): identical: the same rows, scores and decisions
+  on today&#x27;s store (commit 49007): different
+      1c2e…:31 (decision, knowledge) is no longer returned
+      1c2e…:58 (decision) is new: knowledge
+
+worth a look:
+  - 1c2e…:31 (decision) was in context before the edit and is superseded since, by 1c2e…:58
+  - 88aa…:90 (tool_result) was in context before the edit and is untrusted source: the web
+  - the same request today recalls different records</pre>
+<p>(The values above are made up to show the layout.)</p>
+<h2 id="what-a-receipt-holds">What a receipt holds<a class="anchor" href="#what-a-receipt-holds" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>field</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code>, <code>ts</code>, <code>session</code>, <code>turn</code>, <code>source</code></td>
+<td>which recall: <code>prompt</code>, <code>compact</code> or <code>search</code></td>
+</tr>
+<tr>
+<td><code>snapshot</code></td>
+<td>the store's commit the recall read (<code>txn</code>, and <code>seq_no</code> in a store that numbers its writes), the newest record's number (recency is measured from it) and the record count</td>
+</tr>
+<tr>
+<td><code>inputs</code></td>
+<td>everything else the result depends on: the query, the session's live window, the records already shown to the session, and the ranking, gate, packing and knowledge parameters as they were</td>
+</tr>
+<tr>
+<td><code>decision</code>, <code>gate</code>, <code>evidence</code></td>
+<td>the gate's score and what it decided (<code>Inject</code>, <code>Brief</code>, <code>Skip</code>)</td>
+</tr>
+<tr>
+<td><code>rows</code></td>
+<td>each candidate (up to 40): its rank, final score, raw BM25 and cosine, importance, distance from the newest record, the tokens it took or would have taken, a hash of its text, and the decision</td>
+</tr>
+<tr>
+<td><code>text</code>, <code>text_sha</code>, <code>tokens</code></td>
+<td>the context the agent was given, as given</td>
+</tr>
+</tbody>
+</table></div>
+<p>A row's decision is one of <code>knowledge</code> (a decision, rule or fact shown on its
+own text, ahead of the gate), <code>take</code>, <code>excerpt</code> (taken as a snippet),
+<code>listed</code> (named by id under "Further candidates", or a <code>memory_search</code>
+result), or <code>skip:</code> with the reason: <code>shown before</code>, <code>over budget</code>,
+<code>per-turn cap</code>, <code>record cap</code>, <code>uncertain</code>, <code>same question</code>, <code>shown as
+knowledge</code>, <code>the gate held back</code>, <code>below the limit</code>. The words are those of
+ChloeDB's <code>PACK</code> receipts, so a ChloeCtx receipt and a <code>PACK ... WITH
+RECEIPT</code> answer read alike, and tokens are counted as <code>PACK</code> counts them
+(<code>chloedb::query::pack::count_tokens</code>).</p>
+<p>Receipts live in their own ChloeDB file beside the store,
+<code>receipts.strata</code> (table <code>receipts</code>). The store's file and its format are
+unchanged. A receipt is written once the hook has answered, so it adds no
+write to the prompt's critical path. The file is flushed every 256
+receipts and when the daemon stops, so its write-ahead log (replayed when
+a daemon starts) stays small, and receipts older than 90 days, or past the
+newest 20,000, are dropped when the daemon starts.</p>
+<h2 id="kept-snapshots">Kept snapshots<a class="anchor" href="#kept-snapshots" aria-label="Link to this section">#</a></h2>
+<p>After a recall that showed records, once the hook has answered and before
+anything else is written, the daemon keeps a snapshot of the store, at most
+once an hour (<code>min_interval_secs</code>, 3600 by default):
+<code>snapshots/auto-&lt;commit&gt;/</code> in the store's directory, a checkpoint in
+ChloeDB's directory layout. It is not taken when the store has not changed
+since the last one.</p>
+<p>What a snapshot costs:</p>
+<ul>
+<li><strong>Time.</strong> The checkpoint flushes the store's memtable, then reads every
+  segment whole and checks its checksums, and checks the copy: a few
+  passes over the store, whether or not a segment is linked. Tenths of a
+  second for a store of tens of MB; seconds for one of a GB. This runs
+  after the hook has answered; when it runs, the prompt's own record is
+  stored after it, and <code>chloectx stop</code> waits for both.</li>
+<li><strong>Space.</strong> Each snapshot hard-links the segment files of the one before
+  it that no merge has replaced since, and writes the rest. The live store
+  is a single file, which a directory snapshot cannot share bytes with, so
+  the first snapshot is a full copy, and every segment a merge writes is
+  copied again by the next snapshot while older ones keep its inputs.
+  Taken after every turn (<code>min_interval_secs: 0</code>), each flush also makes a
+  small segment the store's merges rewrite several times more; a week of
+  daily use then takes several times the store's size. <code>chloectx stats</code>
+  shows the bytes of receipts and snapshots (<code>receipts</code>, <code>snapshots</code>,
+  <code>total_bytes</code>).</li>
+</ul>
+<p>Automatic snapshots older than <code>keep_days</code>, or past the newest <code>max_auto</code>,
+are dropped when the daemon starts and before each new one, whatever the
+settings say now. Anything under <code>snapshots/</code> that no snapshot owns (a
+checkpoint a stopped daemon left half written) is removed when the daemon
+starts.</p>
+<p>A receipt replays exactly on the snapshot kept at its commit: the replay
+runs the same retrieval code (<code>receipt::retrieve</code>, which the recall itself
+runs) with the receipt's inputs, and must give the same rows, scores and
+decisions. When no snapshot was kept at that commit (a recall that showed
+nothing, or one inside <code>min_interval_secs</code>), it replays on the nearest
+later one and says so. It is also replayed on today's store, which shows
+what has changed since: a record superseded, deleted or outranked.</p>
+<p><code>chloectx snapshot keep NAME</code> keeps one by name, until <code>chloectx snapshot
+drop NAME</code>; <code>chloectx snapshot list</code> lists them.</p>
+<p>Settings, in the store's <code>config.json</code>:</p>
+<pre data-lang="json">{&quot;receipts&quot;: {&quot;enabled&quot;: true,
+              &quot;snapshots&quot;: {&quot;after_recall&quot;: true, &quot;min_interval_secs&quot;: 3600, &quot;keep_days&quot;: 30, &quot;max_auto&quot;: 2000},
+              &quot;retention&quot;: {&quot;keep_days&quot;: 90, &quot;max_receipts&quot;: 20000}}}</pre>
+<p><code>chloectx receipts off</code> turns receipts and automatic snapshots off for the
+project's store (it writes <code>receipts.enabled</code> in its <code>config.json</code>), and
+<code>chloectx receipts off --purge</code> also removes the receipts and automatic
+snapshots kept so far; <code>chloectx receipts on</code> turns them back on. Without
+<code>receipts.enabled</code> in <code>config.json</code>, <code>CHLOECTX_RECEIPTS=0</code> in Claude Code's
+environment turns them off: each hook sends it to the daemon, whichever
+process started the daemon. With receipts off, <code>memory_forget</code> and
+<code>chloectx redact</code> still scrub the receipts kept before.</p>
+<h2 id="commands">Commands<a class="anchor" href="#commands" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloectx blame src/retry.rs:88       # or a whole file: chloectx blame src/retry.rs
+chloectx blame src/retry.rs:88 --json --no-replay
+chloectx receipts [--session S] [--limit N]
+chloectx receipts off [--purge] | on
+chloectx receipt rc-19a6… [--text] [--no-replay] [--json]
+chloectx snapshot keep before-release | list | drop before-release</pre>
+<p><code>blame path:line</code> reads the line from a regular file inside the project,
+after links and <code>..</code> are resolved, of at most 8 MiB; any other path is
+refused, so neither the command center's Blame tab nor the daemon's socket
+can be used to read a file elsewhere.</p>
+<p>Every <code>memory_search</code> answer ends with its receipt's id, so an agent (or
+the person reading its transcript) can ask why a record ranked where it did.</p>
+<h2 id="in-the-command-center">In the command center<a class="anchor" href="#in-the-command-center" aria-label="Link to this section">#</a></h2>
+<p>ChloeCtx's page in ChloeDB's command center (<code>chloedb-server --app
+chloectx=URL</code>, then Apps → ChloeCtx) lists every space it can read; a
+Claude Code store of the machine the app runs on opens with three more
+tabs (Receipts, Blame, Snapshots and capsules) beside Overview, Ask, Memories, Sessions, Graph and Connect
+(<code>#/app/chloectx/store/&lt;store&gt;/receipts</code>, <code>…/blame/&lt;path:line&gt;</code>):</p>
+<ul>
+<li><strong>Receipts</strong>: the store's newest receipts (when, which recall, what it
+  was for, records and tokens shown, the gate's decision, the session and
+  turn). Open one for its candidates (rank, score with a bar,
+  BM25, cosine, tokens, decision), the query and the gate, the text the
+  agent was shown, and the replay on the kept snapshot and on today's
+  store. The kept snapshots are under <strong>Snapshots and capsules</strong>: keep one
+  by name, drop a named one, or cut a capsule (pick the kinds of record)
+  with the <code>claude mcp add</code> line that mounts it.</li>
+<li><strong>Blame</strong>: type <code>path:line</code>. It shows the line, its commit, the edit, the
+  prompt and the tool calls before it, the notes from the turn, each
+  receipt of what memory had recalled before the edit (with what has become
+  of each record since), the replay, and a "worth a look" list. Each
+  receipt links to its page under Receipts.</li>
+</ul>
+<p>They read the Claude Code stores of the machine <code>chloectx app</code> runs on, so
+they are off unless it is started with <code>--local-stores</code> (or
+<code>CHLOECTX_APP_LOCAL=1</code>): a store is a transcript of its sessions, and every
+user of the command center could read it. Without it the tabs say how to
+turn it on. A store whose daemon is stopped is started when read. The API
+behind them, under the app's prefix (<code>/v1/apps/chloectx</code>):</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>request</th>
+<th>answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /v1/local</code></td>
+<td>this machine's stores</td>
+</tr>
+<tr>
+<td><code>GET /v1/local/:store/receipts?session=&amp;limit=</code></td>
+<td>the newest receipts</td>
+</tr>
+<tr>
+<td><code>GET /v1/local/:store/receipts/:id?replay=0</code></td>
+<td>one receipt, replayed unless <code>replay=0</code></td>
+</tr>
+<tr>
+<td><code>GET /v1/local/:store/blame?target=path:line</code></td>
+<td>blame, as <code>chloectx blame --json</code></td>
+</tr>
+<tr>
+<td><code>GET</code>, <code>POST {name}</code> <code>/v1/local/:store/snapshots</code>, <code>DELETE /v1/local/:store/snapshots/:name</code></td>
+<td>the kept snapshots; keep one; drop one</td>
+</tr>
+<tr>
+<td><code>GET</code>, <code>POST {title?, kinds?, since_days?}</code> <code>/v1/local/:store/capsules</code></td>
+<td>the capsules cut from the store, newest first; one cut, its manifest and folder</td>
+</tr>
+<tr>
+<td><code>GET /v1/local/:store/overview</code>, <code>/sessions</code>, <code>/records</code>, <code>/notes[/:id]</code>, <code>/graph</code>, <code>POST /v1/local/:store/ask</code></td>
+<td>what the other tabs read, as a team space's calls of the same names answer (<a href="chloectx-app.html#spaces-and-what-each-shows">the app</a>)</td>
+</tr>
+<tr>
+<td><code>GET /v1/local/:store/stats</code></td>
+<td><code>chloectx stats --json</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="how-blame-finds-the-edit">How blame finds the edit<a class="anchor" href="#how-blame-finds-the-edit" aria-label="Link to this section">#</a></h2>
+<p>Blame reads the line from the file and looks among the stored tool calls
+(<code>Edit</code>, <code>MultiEdit</code>, <code>Write</code>, <code>NotebookEdit</code>) of that file for the newest
+that added it: the line is a whole line of the edit's new text and not of
+the text it replaced (an edit that only kept the line around its change
+did not write it). A relative path is taken from where <code>chloectx blame</code>
+runs; in a request to the daemon, from the project. When none does (the line was written outside a
+recorded session, or changed by hand since), it takes the newest edit of
+the file before the line's commit (from <code>git blame</code>), and says which it
+did. Stored edits keep up to 1,100 characters of their new text, so a line
+deep inside a long <code>Write</code> may only be found this second way.</p>
+<p>The edit's turn gives the prompt, the tool calls before the edit and the
+notes distilled from the turn. The receipts of that turn, and of up to
+three earlier turns of the session that showed records, give what memory
+had put in context. Each record shown is checked against the store as it
+is now: deleted, superseded (and by what), or from an untrusted source (a
+tool's output; the web for <code>WebFetch</code> and <code>WebSearch</code>).</p>
+<h2 id="forgetting-and-redaction">Forgetting and redaction<a class="anchor" href="#forgetting-and-redaction" aria-label="Link to this section">#</a></h2>
+<p>A receipt and a snapshot hold copies of what was recalled. So <code>memory_forget</code>
+(and the <code>forget</code> request) scrubs the text of the receipts that showed the
+forgotten record (their rows keep ids and scores, and lose the record's
+text hash), removes a forgotten prompt from the query of the receipts it
+was asked as, rewrites the store's segments that held the record without
+it, and only then drops every automatic snapshot, with no snapshot taken
+meanwhile, so no snapshot taken afterwards holds its bytes. Named
+snapshots are kept and listed, for you to drop. The rewritten segments'
+old pages are free in the store's file until later writes reuse them;
+<code>chloectx redact</code> rewrites the whole file.
+<code>chloectx redact</code> redacts the receipts as it does the records, and drops
+the automatic snapshots too. Replays of the receipts before then can no
+longer be exact.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloectx/receipts.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="chloectx-capsules.html">← Context capsules</a><a href="app-engine.html">App engine (prototype) →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

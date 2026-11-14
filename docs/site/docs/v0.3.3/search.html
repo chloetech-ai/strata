@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Search guide · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="This page builds a small catalogue of books and searches it every way ChloeDB can: words, phrases and typos, filters and facets, meaning, a blend of the two, and results spread across authors. Each query is SQL, and…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/guide/search.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html" aria-current="page">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Search and SQL</span>
+      <h1>Search guide</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-catalogue">The catalogue</a></li><li><a href="#words-match-and-bm25">Words: MATCH and bm25</a></li><li><a href="#typos">Typos</a></li><li><a href="#filters-and-facets">Filters and facets</a></li><li><a href="#meaning-vectors">Meaning: vectors</a></li><li><a href="#both-hybrid-ranking">Both: hybrid ranking</a></li><li><a href="#spread-results-out-max-k-per">Spread results out: MAX k PER</a></li><li><a href="#what-the-planner-did">What the planner did</a></li><li><a href="#next">Next</a></li></ol></details>
+    <div class="doc-body">
+
+<p>This page builds a small catalogue of books and searches it every way ChloeDB can: words, phrases and typos, filters and facets, meaning, a blend of the two, and results spread across authors. Each query is SQL, and every block runs, in order, against the code it documents. The <a href="sql.html">SQL reference</a> has every function and option; this page shows which to reach for.</p>
+<p>You need Python with the <code>chloedb</code> package and <code>chloedb-server</code> on your <code>PATH</code> (<a href="quickstart.html">quickstart</a>).</p>
+<h2 id="the-catalogue">The catalogue<a class="anchor" href="#the-catalogue" aria-label="Link to this section">#</a></h2>
+<p>Twelve books, one JSON object a line:</p>
+<pre data-lang="json" data-title="books.jsonl">{&quot;id&quot;: &quot;b01&quot;, &quot;title&quot;: &quot;The River and the Dragon&quot;, &quot;author&quot;: &quot;Ana Ruiz&quot;, &quot;genres&quot;: [&quot;fantasy&quot;], &quot;year&quot;: 1999, &quot;rating&quot;: 4.1, &quot;description&quot;: &quot;A girl follows a river north to find the dragon that drowned her village.&quot;}
+{&quot;id&quot;: &quot;b02&quot;, &quot;title&quot;: &quot;Winter Garden&quot;, &quot;author&quot;: &quot;Tomas Berg&quot;, &quot;genres&quot;: [&quot;mystery&quot;], &quot;year&quot;: 2005, &quot;rating&quot;: 3.8, &quot;description&quot;: &quot;A gardener finds a letter buried under the frozen roses and a quiet village mystery begins.&quot;}
+{&quot;id&quot;: &quot;b03&quot;, &quot;title&quot;: &quot;Dragons of the Salt Coast&quot;, &quot;author&quot;: &quot;Ana Ruiz&quot;, &quot;genres&quot;: [&quot;fantasy&quot;, &quot;adventure&quot;], &quot;year&quot;: 2003, &quot;rating&quot;: 4.4, &quot;description&quot;: &quot;Sea dragons guard the salt flats, and a smuggler crew sails into their storm.&quot;}
+{&quot;id&quot;: &quot;b04&quot;, &quot;title&quot;: &quot;The Last Lighthouse&quot;, &quot;author&quot;: &quot;Mei Chen&quot;, &quot;genres&quot;: [&quot;literary&quot;], &quot;year&quot;: 2018, &quot;rating&quot;: 4.6, &quot;description&quot;: &quot;An old keeper writes letters to the ships that no longer pass her lighthouse.&quot;}
+{&quot;id&quot;: &quot;b05&quot;, &quot;title&quot;: &quot;Machine Hearts&quot;, &quot;author&quot;: &quot;Jonas Abara&quot;, &quot;genres&quot;: [&quot;science fiction&quot;], &quot;year&quot;: 2021, &quot;rating&quot;: 4.0, &quot;description&quot;: &quot;A repair robot learns to grieve after its owner dies on a mining station.&quot;}
+{&quot;id&quot;: &quot;b06&quot;, &quot;title&quot;: &quot;Stars Over Lagos&quot;, &quot;author&quot;: &quot;Jonas Abara&quot;, &quot;genres&quot;: [&quot;science fiction&quot;, &quot;adventure&quot;], &quot;year&quot;: 2016, &quot;rating&quot;: 4.2, &quot;description&quot;: &quot;Engineers in Lagos build a launch site and race a rival company to orbit.&quot;}
+{&quot;id&quot;: &quot;b07&quot;, &quot;title&quot;: &quot;The Cartographer&#x27;s Daughter&quot;, &quot;author&quot;: &quot;Mei Chen&quot;, &quot;genres&quot;: [&quot;historical&quot;, &quot;adventure&quot;], &quot;year&quot;: 2012, &quot;rating&quot;: 4.3, &quot;description&quot;: &quot;A mapmaker&#x27;s daughter crosses the mountains with her father&#x27;s unfinished maps.&quot;}
+{&quot;id&quot;: &quot;b08&quot;, &quot;title&quot;: &quot;Murder at the Observatory&quot;, &quot;author&quot;: &quot;Tomas Berg&quot;, &quot;genres&quot;: [&quot;mystery&quot;], &quot;year&quot;: 2019, &quot;rating&quot;: 3.9, &quot;description&quot;: &quot;An astronomer is found dead beneath the telescope, and every guest saw the stars.&quot;}
+{&quot;id&quot;: &quot;b09&quot;, &quot;title&quot;: &quot;Bread and Salt&quot;, &quot;author&quot;: &quot;Lena Novak&quot;, &quot;genres&quot;: [&quot;literary&quot;, &quot;historical&quot;], &quot;year&quot;: 2008, &quot;rating&quot;: 4.5, &quot;description&quot;: &quot;Three generations of bakers keep a village alive through war and famine.&quot;}
+{&quot;id&quot;: &quot;b10&quot;, &quot;title&quot;: &quot;The Dragon Accords&quot;, &quot;author&quot;: &quot;Lena Novak&quot;, &quot;genres&quot;: [&quot;fantasy&quot;], &quot;year&quot;: 2022, &quot;rating&quot;: 3.7, &quot;description&quot;: &quot;Diplomats negotiate a treaty between kingdoms and the last of the dragons.&quot;}
+{&quot;id&quot;: &quot;b11&quot;, &quot;title&quot;: &quot;Quiet Machines&quot;, &quot;author&quot;: &quot;Mei Chen&quot;, &quot;genres&quot;: [&quot;science fiction&quot;, &quot;literary&quot;], &quot;year&quot;: 2024, &quot;rating&quot;: 4.7, &quot;description&quot;: &quot;Household robots begin to write poems, and a lonely engineer reads every one.&quot;}
+{&quot;id&quot;: &quot;b12&quot;, &quot;title&quot;: &quot;Tides of Glass&quot;, &quot;author&quot;: &quot;Ana Ruiz&quot;, &quot;genres&quot;: [&quot;fantasy&quot;, &quot;romance&quot;], &quot;year&quot;: 2011, &quot;rating&quot;: 4.0, &quot;description&quot;: &quot;A glassblower falls for a sea witch who trades storms for memories.&quot;}</pre>
+<p>A table with a primary key, text to search, keywords and numbers to filter on, and a vector that ChloeDB computes from the title and description with a small embedding model. Fetch the model once (it is about 130 MB, kept in <code>~/.local/share/chloedb/models</code>, or wherever <code>CHLOEDB_MODELS</code> says; a machine with <code>~/.local/share/strata/models</code> from before the rename keeps using that):</p>
+<pre data-lang="sh">chloedb-server fetch-model potion-retrieval-32M</pre>
+<pre data-lang="python" data-title="load.py">import json
+import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, schema={
+    &quot;table&quot;: &quot;books&quot;,
+    &quot;key&quot;: &quot;id&quot;,
+    &quot;fields&quot;: [
+        {&quot;name&quot;: &quot;id&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;title&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;description&quot;, &quot;type&quot;: &quot;text&quot;},
+        {&quot;name&quot;: &quot;author&quot;, &quot;type&quot;: &quot;keyword&quot;},
+        {&quot;name&quot;: &quot;genres&quot;, &quot;type&quot;: &quot;keyword&quot;, &quot;multi&quot;: True},
+        {&quot;name&quot;: &quot;year&quot;, &quot;type&quot;: &quot;int&quot;},
+        {&quot;name&quot;: &quot;rating&quot;, &quot;type&quot;: &quot;float&quot;},
+        {&quot;name&quot;: &quot;emb&quot;, &quot;type&quot;: &quot;vector&quot;,
+         &quot;embed&quot;: {&quot;from&quot;: [&quot;title&quot;, &quot;description&quot;], &quot;model&quot;: &quot;potion-retrieval-32M&quot;}},
+    ],
+})
+with open(&quot;books.jsonl&quot;) as f:
+    db.insert(json.loads(line) for line in f)
+print(len(db), &quot;books&quot;)
+db.close()</pre>
+<pre data-lang="sh">python3 load.py</pre>
+<pre data-lang="text" data-title="Output" class="output">12 books</pre>
+<p>The same table in SQL, for a server or the <code>chloedb</code> shell, is <code>CREATE TABLE books (id KEYWORD PRIMARY KEY, title TEXT, description TEXT, author KEYWORD, genres KEYWORD[], year INT, rating FLOAT, emb VECTOR OPTIONS(embed = 'title, description', model = 'potion-retrieval-32M'))</code>.</p>
+<h2 id="words-match-and-bm25">Words: <code>MATCH</code> and <code>bm25</code><a class="anchor" href="#words-match-and-bm25" aria-label="Link to this section">#</a></h2>
+<p><code>MATCH</code> says whether a row has the words; <code>bm25</code> scores how well, and <code>score()</code> is the score a row was ranked by. Both take the field to search:</p>
+<pre data-lang="sql">SELECT id, title, score() FROM books
+WHERE MATCH(description, &#x27;village&#x27;)
+ORDER BY bm25(description, &#x27;village&#x27;) DESC LIMIT 5</pre>
+<pre data-lang="text" data-title="Output" class="output">id  | title                    | score()
+----+--------------------------+--------
+b01 | The River and the Dragon | 1.322
+b09 | Bread and Salt           | 1.322
+b02 | Winter Garden            | 1.213</pre>
+<p>Words are stemmed, so <code>dragon</code> finds <em>dragons</em>. <code>MATCH</code> reads a small query language: words side by side must all be there, <code>OR</code> and <code>-</code> (not) combine them, quotes ask for a phrase, <code>*</code> for a prefix:</p>
+<pre data-lang="sql">SELECT id, title FROM books WHERE MATCH(description, &#x27;(dragon OR robot) -sea&#x27;) ORDER BY id</pre>
+<pre data-lang="text" data-title="Output" class="output">id  | title
+----+-------------------------
+b01 | The River and the Dragon
+b05 | Machine Hearts
+b10 | The Dragon Accords
+b11 | Quiet Machines</pre>
+<pre data-lang="sql">SELECT id, title FROM books WHERE MATCH(description, &#x27;&quot;salt flats&quot;&#x27;) OR MATCH(title, &#x27;mach*&#x27;) ORDER BY id</pre>
+<pre data-lang="text" data-title="Output" class="output">id  | title
+----+--------------------------
+b03 | Dragons of the Salt Coast
+b05 | Machine Hearts
+b11 | Quiet Machines</pre>
+<h2 id="typos">Typos<a class="anchor" href="#typos" aria-label="Link to this section">#</a></h2>
+<p><code>fuzzy =&gt; 'auto'</code> lets a word be an edit or two away, more for longer words; ranked, it corrects a typo rather than widening every word:</p>
+<pre data-lang="sql">SELECT id, title FROM books ORDER BY bm25(description, &#x27;lighthuose keeper&#x27;, fuzzy =&gt; &#x27;auto&#x27;) DESC LIMIT 1</pre>
+<pre data-lang="text" data-title="Output" class="output">id  | title
+----+--------------------
+b04 | The Last Lighthouse</pre>
+<h2 id="filters-and-facets">Filters and facets<a class="anchor" href="#filters-and-facets" aria-label="Link to this section">#</a></h2>
+<p>Text, keyword, number and list conditions mix freely in <code>WHERE</code>, and the planner picks the order. A multi-valued keyword such as <code>genres</code> matches a row when any of its values does:</p>
+<pre data-lang="sql">SELECT id, title, year FROM books
+WHERE genres = &#x27;adventure&#x27; AND year &gt;= 2010
+ORDER BY rating DESC</pre>
+<pre data-lang="text" data-title="Output" class="output">id  | title                       | year
+----+-----------------------------+-----
+b07 | The Cartographer&#x27;s Daughter | 2012
+b06 | Stars Over Lagos            | 2016</pre>
+<p>Facets, the counts beside a search box, are a <code>GROUP BY</code> over the rows that match:</p>
+<pre data-lang="sql">SELECT author, COUNT(*) AS books, AVG(rating) AS avg_rating FROM books
+WHERE MATCH(description, &#x27;dragon OR dragons OR sea OR robot&#x27;)
+GROUP BY author ORDER BY books DESC, author</pre>
+<pre data-lang="text" data-title="Output" class="output">author      | books | avg_rating
+------------+-------+-----------
+Ana Ruiz    | 3     | 4.167
+Jonas Abara | 1     | 4
+Lena Novak  | 1     | 3.7
+Mei Chen    | 1     | 4.7</pre>
+<h2 id="meaning-vectors">Meaning: vectors<a class="anchor" href="#meaning-vectors" aria-label="Link to this section">#</a></h2>
+<p><code>similarity(emb, :v)</code> scores rows by how close their vector is to a query's. In Python a parameter <code>{"embed": text}</code> is the text's vector by the field's own model, so a question finds books that share none of its words:</p>
+<pre data-lang="python">import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, read_only=True)
+r = db.query(&quot;SELECT id, title FROM books ORDER BY similarity(emb, :v) DESC LIMIT 3&quot;,
+             v={&quot;embed&quot;: &quot;artificial intelligence and feelings&quot;})
+for row in r:
+    print(row[&quot;id&quot;], row[&quot;title&quot;])</pre>
+<pre data-lang="text" data-title="Output" class="output">b05 Machine Hearts
+b11 Quiet Machines
+b06 Stars Over Lagos</pre>
+<h2 id="both-hybrid-ranking">Both: hybrid ranking<a class="anchor" href="#both-hybrid-ranking" aria-label="Link to this section">#</a></h2>
+<p>Words find exact names and rare terms; vectors find paraphrases. <code>rrf</code> fuses the two rankings by reciprocal rank, and needs no tuning:</p>
+<pre data-lang="python">import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, read_only=True)
+q = &quot;a story about the sea and storms&quot;
+r = db.query(&quot;&quot;&quot;
+    SELECT id, title, score() FROM books
+    ORDER BY rrf(bm25(description, :q), similarity(emb, :v)) DESC LIMIT 3
+&quot;&quot;&quot;, q=q, v={&quot;embed&quot;: q})
+for row in r:
+    print(row[&quot;id&quot;], row[&quot;title&quot;])</pre>
+<pre data-lang="text" data-title="Output" class="output">b03 Dragons of the Salt Coast
+b12 Tides of Glass
+b04 The Last Lighthouse</pre>
+<p>When one side should count more, normalise each score to 0..1 and weigh them: <code>ORDER BY 0.3 * minmax(bm25(description, :q)) + 0.7 * minmax(similarity(emb, :v)) DESC</code>. The same blend can boost by a column, <code>* (1 + 0.1 * rating)</code>; <a href="sql.html#ranking-expressions">ranking expressions</a> has the rest.</p>
+<p>For the common case, <code>db.search(text)</code> writes this query itself: BM25 over the text fields fused with the vector field's similarity.</p>
+<pre data-lang="python">import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, read_only=True)
+for row in db.search(&quot;lonely robots&quot;, limit=2, columns=[&quot;id&quot;, &quot;title&quot;]):
+    print(row[&quot;id&quot;], row[&quot;title&quot;])</pre>
+<pre data-lang="text" data-title="Output" class="output">b11 Quiet Machines
+b05 Machine Hearts</pre>
+<h2 id="spread-results-out-max-k-per">Spread results out: <code>MAX k PER</code><a class="anchor" href="#spread-results-out-max-k-per" aria-label="Link to this section">#</a></h2>
+<p>A ranking where one author fills the page reads badly. <code>MAX 1 PER author</code> keeps each author's best row and the order of the rest:</p>
+<pre data-lang="sql">SELECT id, author, title FROM books ORDER BY rating DESC MAX 1 PER author</pre>
+<pre data-lang="text" data-title="Output" class="output">id  | author      | title
+----+-------------+--------------------------
+b11 | Mei Chen    | Quiet Machines
+b09 | Lena Novak  | Bread and Salt
+b03 | Ana Ruiz    | Dragons of the Salt Coast
+b06 | Jonas Abara | Stars Over Lagos
+b08 | Tomas Berg  | Murder at the Observatory</pre>
+<h2 id="what-the-planner-did">What the planner did<a class="anchor" href="#what-the-planner-did" aria-label="Link to this section">#</a></h2>
+<p>Each answer says how it was found. In Python, <code>stats["plan"]</code> holds a line for each segment the query read: which conditions came from an index, which were tested row by row, and how the rows were ranked. <a href="sql.html#reading-a-plan">Reading a plan</a> explains the lines; the <code>chloedb</code> shell prints them with <code>--plan</code>, and a server's <code>POST /v1/explain</code> takes the same <code>SELECT</code>.</p>
+<pre data-lang="python">import chloedb
+
+db = chloedb.open(&quot;books.chloedb&quot;, read_only=True)
+r = db.query(&quot;SELECT id FROM books WHERE MATCH(description, &#x27;dragon&#x27;) AND year &gt; 2000 &quot;
+             &quot;ORDER BY bm25(description, &#x27;dragon&#x27;) DESC LIMIT 3&quot;)
+print(r.keys)
+for line in r.stats[&quot;plan&quot;]:
+    print(line)</pre>
+<pre data-lang="text" data-title="Output" class="output">[&#x27;b10&#x27;, &#x27;b03&#x27;]
+seg 0: bm25 MaxScore, filter Probe</pre>
+<h2 id="next">Next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><a href="rag.html">Retrieval for RAG</a>: the hybrid query above, feeding passages to a model.</li>
+<li><a href="sql.html">The SQL reference</a>: joins, window functions, graphs, rank profiles, rerankers.</li>
+<li><a href="python.html">Python</a>: queries built in Python rather than SQL text, Arrow results, writes.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/guide/search.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="build-an-app.html">← Build an app on the HTTP API</a><a href="sql.html">SQL reference →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

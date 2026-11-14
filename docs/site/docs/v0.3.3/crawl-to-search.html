@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Crawl a site into search · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloedb-crawl reads a site, finds the fields its pages carry (JSON-LD, meta tags, spec tables, the site&#x27;s own template), makes a table from them and fills it. This recipe crawls a small shop, served on your machine…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/guide/crawl-to-search.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html" aria-current="page">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Cookbook</span>
+      <h1>Crawl a site into search</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#a-site-to-crawl">A site to crawl</a></li><li><a href="#look-before-you-crawl">Look before you crawl</a></li><li><a href="#crawl">Crawl</a></li><li><a href="#search-it">Search it</a></li><li><a href="#next">Next</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloedb-crawl</code> reads a site, finds the fields its pages carry (JSON-LD, meta tags, spec tables, the site's own template), makes a table from them and fills it. This recipe crawls a small shop, served on your machine so that it runs anywhere, and searches the table it made with SQL.</p>
+<p>You need <code>chloedb-server</code> and <code>chloedb-crawl</code> on your <code>PATH</code>. <span class="since">since 0.3.2</span> From release 0.3.2, the installer puts both there prebuilt, with nothing to compile:</p>
+<pre data-lang="sh">curl -fsSL https://chloetech-ai.github.io/chloedb/install.sh | sh -s -- --with crawl</pre>
+<p>Release 0.3.0 and earlier have no prebuilt crawler. With those, or to build from source, use a checkout of the repository (Rust and a C compiler, several minutes): <code>(cd chloedb-server &amp;&amp; cargo build --release) &amp;&amp; (cd chloedb-crawl &amp;&amp; cargo build --release)</code>, then add both <code>target/release</code> directories to <code>PATH</code>.</p>
+<h2 id="a-site-to-crawl">A site to crawl<a class="anchor" href="#a-site-to-crawl" aria-label="Link to this section">#</a></h2>
+<p>A shop with a home page that links to six products. Each product page has its fields in JSON-LD, as most shops do. This script writes the site's pages into <code>shop/</code>:</p>
+<pre data-lang="python" data-title="make_shop.py">import json
+import pathlib
+
+PRODUCTS = [
+    (&quot;trail-runner&quot;, &quot;Trail Runner 2&quot;, &quot;Running shoe with a grippy sole for muddy trails.&quot;, 89.0, &quot;Shoes&quot;, &quot;InStock&quot;),
+    (&quot;city-walker&quot;, &quot;City Walker&quot;, &quot;Light everyday shoe with a breathable mesh upper.&quot;, 59.0, &quot;Shoes&quot;, &quot;InStock&quot;),
+    (&quot;rain-shell&quot;, &quot;Rain Shell Jacket&quot;, &quot;Waterproof jacket that packs into its own pocket.&quot;, 120.0, &quot;Jackets&quot;, &quot;OutOfStock&quot;),
+    (&quot;down-parka&quot;, &quot;Down Parka&quot;, &quot;Warm winter parka with a waterproof outer layer.&quot;, 240.0, &quot;Jackets&quot;, &quot;InStock&quot;),
+    (&quot;wool-socks&quot;, &quot;Merino Wool Socks&quot;, &quot;Soft socks that stay warm when wet.&quot;, 18.0, &quot;Accessories&quot;, &quot;InStock&quot;),
+    (&quot;dry-bag&quot;, &quot;Dry Bag 20L&quot;, &quot;Roll-top waterproof bag for kayaking and rain.&quot;, 32.0, &quot;Accessories&quot;, &quot;InStock&quot;),
+]
+
+site = pathlib.Path(&quot;shop&quot;)
+(site / &quot;p&quot;).mkdir(parents=True, exist_ok=True)
+links = &quot;&quot;.join(f&#x27;&lt;li&gt;&lt;a href=&quot;/p/{slug}.html&quot;&gt;{name}&lt;/a&gt;&lt;/li&gt;&#x27; for slug, name, *_ in PRODUCTS)
+(site / &quot;index.html&quot;).write_text(
+    f&quot;&lt;!doctype html&gt;&lt;html&gt;&lt;head&gt;&lt;title&gt;Northwind Outdoor&lt;/title&gt;&lt;/head&gt;&quot;
+    f&quot;&lt;body&gt;&lt;h1&gt;Northwind Outdoor&lt;/h1&gt;&lt;ul&gt;{links}&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;&quot;)
+for slug, name, text, price, category, stock in PRODUCTS:
+    ld = {&quot;@context&quot;: &quot;https://schema.org&quot;, &quot;@type&quot;: &quot;Product&quot;, &quot;name&quot;: name, &quot;category&quot;: category,
+          &quot;description&quot;: text,
+          &quot;offers&quot;: {&quot;@type&quot;: &quot;Offer&quot;, &quot;price&quot;: f&quot;{price:.2f}&quot;, &quot;priceCurrency&quot;: &quot;EUR&quot;,
+                     &quot;availability&quot;: f&quot;https://schema.org/{stock}&quot;}}
+    (site / &quot;p&quot; / f&quot;{slug}.html&quot;).write_text(
+        f&quot;&lt;!doctype html&gt;&lt;html&gt;&lt;head&gt;&lt;title&gt;{name} | Northwind Outdoor&lt;/title&gt;&quot;
+        f&#x27;&lt;script type=&quot;application/ld+json&quot;&gt;{json.dumps(ld)}&lt;/script&gt;&lt;/head&gt;&#x27;
+        f&#x27;&lt;body&gt;&lt;nav&gt;&lt;a href=&quot;/&quot;&gt;Home&lt;/a&gt;&lt;/nav&gt;&#x27;
+        f&#x27;&lt;main&gt;&lt;h1&gt;{name}&lt;/h1&gt;&lt;p&gt;{text}&lt;/p&gt;&lt;p class=&quot;price&quot;&gt;EUR {price:.2f}&lt;/p&gt;&lt;/main&gt;&lt;/body&gt;&lt;/html&gt;&#x27;)
+print(len(list(site.rglob(&quot;*.html&quot;))), &quot;pages&quot;)</pre>
+<pre data-lang="sh">python3 make_shop.py</pre>
+<pre data-lang="text" data-title="Output" class="output">7 pages</pre>
+<p>Serve it on port 8099:</p>
+<pre data-lang="sh">python3 -m http.server 8099 --bind 127.0.0.1 --directory shop &gt; shop.log 2&gt;&amp;1 &amp;
+until curl -sf http://127.0.0.1:8099/ &gt; /dev/null; do sleep 0.2; done</pre>
+<h2 id="look-before-you-crawl">Look before you crawl<a class="anchor" href="#look-before-you-crawl" aria-label="Link to this section">#</a></h2>
+<p><code>preview</code> reads a few pages and prints, as JSON, the table it would make and why, writing nothing. Its <code>sql</code> is the table. The crawler fetches the public internet only, so a site on your own machine or network has to be named with <code>--allow-host</code> (<a href="crawler.html#what-it-does-with-a-page">reach</a>):</p>
+<pre data-lang="sh">chloedb-crawl preview http://127.0.0.1:8099/ --pages 7 --allow-host 127.0.0.1:8099 &gt; preview.json
+python3 -c &#x27;import json; p = json.load(open(&quot;preview.json&quot;)); print(len(p[&quot;pages&quot;]), &quot;pages read&quot;); print(p[&quot;sql&quot;])&#x27;</pre>
+<pre data-lang="text" data-title="Output" class="output">7 pages read
+CREATE TABLE IF NOT EXISTS site_127_0_0_1 (
+  url KEYWORD PRIMARY KEY,
+  host KEYWORD,
+  depth INT,
+  status INT,
+  fetched TIMESTAMP,
+  bytes INT,
+  fetch_ms INT,
+  title TEXT,
+  body TEXT,
+  words INT,
+  links INT,
+  description TEXT,
+  headings TEXT,
+  kind KEYWORD,
+  category KEYWORD,
+  name KEYWORD,
+  offers_availability KEYWORD,
+  offers_price FLOAT,
+  offers_pricecurrency KEYWORD,
+  offers_type KEYWORD,
+  price FLOAT,
+  data JSON
+)</pre>
+<h2 id="crawl">Crawl<a class="anchor" href="#crawl" aria-label="Link to this section">#</a></h2>
+<p><code>crawl --local DIR</code> starts a cluster of its own in <code>DIR</code> (a coordinator on <code>127.0.0.1:7700</code> and a shard), crawls into it, prints its progress and then the table it made, and stops the cluster. <code>--table</code> names the table, which is otherwise named after the site's host. On a site you don't run, keep the defaults, which space the requests out and obey robots.txt; this one is ours, so it can go faster:</p>
+<pre data-lang="sh">chloedb-crawl crawl http://127.0.0.1:8099/ --local ./crawl-cluster --allow-host 127.0.0.1:8099 \
+  --table shop --per-host 4 --delay-ms 0 --max-pages 50</pre>
+<pre data-lang="text" data-title="Output" class="output">...
+CREATE TABLE IF NOT EXISTS shop (
+  url KEYWORD PRIMARY KEY,
+  host KEYWORD,
+  depth INT,
+  status INT,
+  fetched TIMESTAMP,
+  bytes INT,
+  fetch_ms INT,
+  title TEXT,
+  body TEXT,
+  words INT,
+  links INT,
+  description TEXT,
+  headings TEXT,
+  kind KEYWORD,
+  category KEYWORD,
+  name KEYWORD,
+  offers_availability KEYWORD,
+  offers_price FLOAT,
+  offers_pricecurrency KEYWORD,
+  offers_type KEYWORD,
+  price FLOAT,
+  data JSON
+)
+
+{&quot;table&quot;:&quot;shop&quot;,&quot;phase&quot;:&quot;done&quot;,&quot;counts&quot;:{&quot;fetched&quot;:7,&quot;pages&quot;:7,&quot;written&quot;:7,...</pre>
+<h2 id="search-it">Search it<a class="anchor" href="#search-it" aria-label="Link to this section">#</a></h2>
+<p>The same directory serves the same cluster again. <code>serve</code> starts it with the crawler's API beside it, which the command center at <code>http://127.0.0.1:7700</code> shows under <strong>Apps → Crawler</strong>:</p>
+<pre data-lang="sh">chloedb-crawl serve --local ./crawl-cluster &gt; serve.log 2&gt;&amp;1 &amp;
+until curl -sf http://127.0.0.1:7700/v1/health &gt; /dev/null; do sleep 0.2; done</pre>
+<p>The table has a column for each field most pages had: the page's own (<code>url</code>, <code>title</code>, <code>body</code>, ...), those of the JSON-LD, such as <code>offers_price</code>, and <code>price</code>, which it learned from the site's own template (the <code>&lt;p class="price"&gt;</code> every product page has). Ask the server which:</p>
+<pre data-lang="sh">curl -s http://127.0.0.1:7700/v1/query -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;sql&quot;: &quot;SELECT * FROM shop LIMIT 1&quot;}&#x27; | python3 -c &#x27;import json, sys; print(json.load(sys.stdin)[&quot;columns&quot;])&#x27;</pre>
+<pre data-lang="text" data-title="Output" class="output">[&#x27;url&#x27;, &#x27;host&#x27;, &#x27;depth&#x27;, &#x27;status&#x27;, &#x27;fetched&#x27;, &#x27;bytes&#x27;, &#x27;fetch_ms&#x27;, &#x27;title&#x27;, &#x27;body&#x27;, &#x27;words&#x27;, &#x27;links&#x27;, &#x27;description&#x27;, &#x27;headings&#x27;, &#x27;kind&#x27;, &#x27;category&#x27;, &#x27;name&#x27;, &#x27;offers_availability&#x27;, &#x27;offers_price&#x27;, &#x27;offers_pricecurrency&#x27;, &#x27;offers_type&#x27;, &#x27;price&#x27;, &#x27;data&#x27;]</pre>
+<p>Then search it like any table: full text over the pages' text, filtered and ranked by the fields the crawler found.</p>
+<pre data-lang="sh">curl -s http://127.0.0.1:7700/v1/query -H &#x27;content-type: application/json&#x27; -d @- &lt;&lt;&#x27;JSON&#x27; | python3 -c &#x27;import json, sys; [print(*r, sep=&quot; | &quot;) for r in json.load(sys.stdin)[&quot;rows&quot;]]&#x27;
+{&quot;sql&quot;: &quot;SELECT title, offers_price, offers_availability FROM shop WHERE MATCH(body, &#x27;waterproof&#x27;) ORDER BY bm25(body, &#x27;waterproof&#x27;) DESC LIMIT 5&quot;}
+JSON</pre>
+<pre data-lang="text" data-title="Output" class="output">Down Parka | Northwind Outdoor | 240.0 | https://schema.org/InStock
+Dry Bag 20L | Northwind Outdoor | 32.0 | https://schema.org/InStock
+Rain Shell Jacket | Northwind Outdoor | 120.0 | https://schema.org/OutOfStock</pre>
+<h2 id="next">Next<a class="anchor" href="#next" aria-label="Link to this section">#</a></h2>
+<ul>
+<li><a href="crawler.html">The crawler</a>: every option, the fields it finds, how it grows a cluster, and its API.</li>
+<li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/crawler-bot.md">The page for site owners</a>: what the crawler sends and how to keep it off a site.</li>
+<li><code>--embed potion-base-8M</code> embeds each page's title and body into a vector field, <code>emb</code>, for the <a href="search.html#both-hybrid-ranking">hybrid search</a> the search guide shows.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/guide/crawl-to-search.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="agent-memory.html">← Memory for an agent</a><a href="logs.html">Search your logs →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

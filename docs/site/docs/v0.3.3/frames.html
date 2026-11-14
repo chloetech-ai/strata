@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DataFrames in Python · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="store[&quot;table&quot;] is a chloedb.Frame: a lazy dataframe written the way Polars writes one. Nothing is read until you ask for rows. Then the whole chain compiles to one SQL statement, which runs where the data is (a file…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/frames.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html" aria-current="page">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Clients</span>
+      <h1>DataFrames in Python</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/frames.md">docs/chloedb/frames.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#install">Install</a></li><li><a href="#a-first-frame">A first frame</a></li><li><a href="#making-tables">Making tables</a></li><li><a href="#building-a-frame">Building a frame</a></li><li><a href="#expressions">Expressions</a></li><li><a href="#search-and-ranking">Search and ranking</a></li><li><a href="#samples-and-splits">Samples and splits</a></li><li><a href="#getting-the-rows">Getting the rows</a></li><li><a href="#writing">Writing</a></li><li><a href="#what-runs-where">What runs where</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>store["table"]</code> is a <code>chloedb.Frame</code>: a lazy dataframe written the way Polars writes one. Nothing is read until you ask for rows. Then the whole chain compiles to one SQL statement, which runs where the data is (a file in your process, or a chloedb-server), and the answer comes back as an Arrow table, which pandas, Polars, NumPy, DuckDB and PyTorch read without a copy. The same code runs on a file and on a server.</p>
+<h2 id="install">Install<a class="anchor" href="#install" aria-label="Link to this section">#</a></h2>
+<p>Frames are part of the <code>chloedb</code> package (<a href="python.html#install">Python</a>) and need pyarrow 14 or later; pandas and Polars are optional, for <code>to_pandas()</code> and <code>to_polars()</code>:</p>
+<pre data-lang="sh">pip install &quot;./chloedb-py[frame]&quot; polars pandas    # from the repository&#x27;s root; needs Rust</pre>
+<p>Frames came in release 0.2.0: release 0.1.0's wheel (<code>strata-db</code>, from before the rename) has no frames and no <code>frame</code> extra.</p>
+<h2 id="a-first-frame">A first frame<a class="anchor" href="#a-first-frame" aria-label="Link to this section">#</a></h2>
+<pre data-lang="python">import polars as pl
+import chloedb as cdb
+from chloedb import col
+
+shop = cdb.connect(&quot;shop.chloedb&quot;)             # a file; cdb.connect(&quot;https://...&quot;) for a server
+orders = shop.create_table(&quot;orders&quot;, pl.read_parquet(&quot;orders.parquet&quot;), key=&quot;id&quot;, text=[&quot;note&quot;])
+# or, once the table exists: orders = shop[&quot;orders&quot;]
+
+top = (orders
+       .filter(col(&quot;status&quot;) == &quot;paid&quot;, country=&quot;cl&quot;)
+       .group_by(month=col(&quot;ts&quot;).dt.truncate(&quot;month&quot;))
+       .agg(revenue=col(&quot;amount&quot;).sum(), p90=col(&quot;amount&quot;).quantile(0.9), n=cdb.len())
+       .sort(&quot;month&quot;))
+
+top.to_polars()     # or .to_pandas(), .to_arrow(), .to_numpy(), .to_dicts()
+print(top.sql())    # the statement it runs; its values are parameters, top.params()</pre>
+<p><code>cdb.connect(path)</code> opens a database file, or makes it with its first <code>create_table</code>; <code>cdb.connect(url)</code> is a <a href="python.html#a-server-from-python"><code>Client</code></a> of a server or a coordinator of shards, with <code>token=</code> when the server asks for one. Both give frames and <code>create_table</code> the same way.</p>
+<h2 id="making-tables">Making tables<a class="anchor" href="#making-tables" aria-label="Link to this section">#</a></h2>
+<p><code>create_table(name, data, ...)</code> makes a table from rows and returns its frame. <code>data</code> is anything that streams Arrow (a pyarrow Table, a Polars DataFrame, a DuckDB relation, another frame), a pandas DataFrame, or a list of dicts. The schema comes from the Arrow types as the <a href="parquet.html">Parquet import</a> makes one: strings are KEYWORD (or TEXT when they read as prose), lists of numbers of one length are vectors, timestamps are TIMESTAMP.</p>
+<pre data-lang="python">shop.create_table(&quot;users&quot;, users_df)                                  # key: the column named id
+shop.create_table(&quot;docs&quot;, rows, key=&quot;doc_id&quot;, text=[&quot;title&quot;, &quot;body&quot;],  # TEXT: indexed for BM25
+                  embed={&quot;emb&quot;: {&quot;from&quot;: [&quot;title&quot;, &quot;body&quot;], &quot;model&quot;: &quot;potion-retrieval-32M&quot;}})
+shop.create_table(&quot;scores&quot;, preds, key=&quot;user&quot;, if_exists=&quot;append&quot;)    # upsert into it if it exists</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>argument</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>key</code></td>
+<td>the primary key column (default a column named <code>id</code>; <code>""</code> for none)</td>
+</tr>
+<tr>
+<td><code>text</code>, <code>keyword</code></td>
+<td>columns to make TEXT (indexed for <code>search</code>) or KEYWORD</td>
+</tr>
+<tr>
+<td><code>embed</code></td>
+<td>vector fields a model fills from other fields, where the rows are written</td>
+</tr>
+<tr>
+<td><code>schema</code></td>
+<td>the whole <a href="python.html#a-database-in-your-process">schema</a> instead</td>
+</tr>
+<tr>
+<td><code>if_exists</code></td>
+<td><code>"fail"</code> (the default), <code>"append"</code> (upsert by key) or <code>"replace"</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><code>frame.write_to(store, "table")</code> runs a frame and writes its answer to a table of any store: a server's rows to a local file for a notebook, or features computed on a file to a server. The key is the source table's when the answer has its column.</p>
+<h2 id="building-a-frame">Building a frame<a class="anchor" href="#building-a-frame" aria-label="Link to this section">#</a></h2>
+<p>Each method returns a new frame, and none of them runs anything.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>method</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>filter(cond, ..., name=value)</code></td>
+<td>the rows where every condition holds; conditions on indexed fields are answered by the indexes</td>
+</tr>
+<tr>
+<td><code>select(*cols, name=expr)</code>, <code>with_columns(...)</code></td>
+<td>the answer's columns; every column with these added or replaced. Aggregates alone give one row: <code>select(n=cdb.len(), total=col("x").sum())</code></td>
+</tr>
+<tr>
+<td><code>drop(*cols)</code>, <code>rename({old: new})</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>sort(by, ..., descending=False, nulls_last=True)</code></td>
+<td>rows without a value come last</td>
+</tr>
+<tr>
+<td><code>head(n=5)</code>, <code>slice(offset, length)</code></td>
+<td>the first rows; an unsorted, unranked frame's are any rows, as in SQL</td>
+</tr>
+<tr>
+<td><code>group_by(*keys, name=expr).agg(...)</code>, <code>.len()</code></td>
+<td>a row per group; a key may be an expression (<code>month=col("ts").dt.truncate("month")</code>). A <code>filter</code> after it is <code>HAVING</code></td>
+</tr>
+<tr>
+<td><code>join(other, on=, left_on=, right_on=, how="inner", suffix="_right")</code></td>
+<td><code>how</code> is <code>"inner"</code> or <code>"left"</code>, and both frames are of one store</td>
+</tr>
+<tr>
+<td><code>unique()</code>, <code>unique(subset, keep="first")</code></td>
+<td>each row once; the first row of each value in the frame's order (<code>DISTINCT ON</code>)</td>
+</tr>
+<tr>
+<td><code>union(*frames)</code>, <code>cdb.concat(frames)</code></td>
+<td>the rows of each (<code>UNION ALL</code>; <code>distinct=True</code> for <code>UNION</code>)</td>
+</tr>
+<tr>
+<td><code>sample(fraction=, seed=)</code>, <code>sample(n, seed=)</code>, <code>split(fraction, seed=)</code>, <code>shuffle(seed=)</code></td>
+<td>a seeded sample, train/test split or order (<a href="#samples-and-splits">below</a>)</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="expressions">Expressions<a class="anchor" href="#expressions" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>col(name)</code>, <code>cdb.lit(value)</code>, <code>+ - * / % **</code>, <code>== != &lt; &lt;= &gt; &gt;=</code>, <code>&amp; \| ~</code></td>
+<td>columns, values, arithmetic, comparisons, and, or, not</td>
+</tr>
+<tr>
+<td><code>.is_in(values)</code>, <code>.is_between(lo, hi)</code>, <code>.is_null()</code>, <code>.is_not_null()</code>, <code>.fill_null(value)</code>, <code>.cast("int")</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>cdb.when(cond).then(a).when(...).then(b).otherwise(c)</code></td>
+<td><code>CASE WHEN</code></td>
+</tr>
+<tr>
+<td><code>.str.lower()</code>, <code>.upper()</code>, <code>.len_chars()</code>, <code>.contains(s)</code>, <code>.starts_with(s)</code>, <code>.ends_with(s)</code>, <code>.like(p)</code>, <code>.ilike(p)</code></td>
+<td>strings</td>
+</tr>
+<tr>
+<td><code>.dt.truncate("month")</code>, <code>.year()</code>, <code>.quarter()</code>, <code>.month()</code>, <code>.week()</code>, <code>.day()</code>, <code>.weekday()</code>, <code>.hour()</code>, <code>.epoch()</code>, <code>.strftime("%Y-%m")</code></td>
+<td>timestamps</td>
+</tr>
+<tr>
+<td><code>.sum()</code>, <code>.mean()</code>, <code>.median()</code>, <code>.quantile(q, interpolation="linear")</code>, <code>.min()</code>, <code>.max()</code>, <code>.count()</code>, <code>.n_unique()</code>, <code>cdb.len()</code></td>
+<td>aggregates, for <code>agg</code> or a <code>select</code> of totals</td>
+</tr>
+<tr>
+<td><code>.over(*partition_by, order_by=, descending=)</code> with <code>.rank(method="min")</code>, <code>.cum_sum()</code>, <code>.shift(n)</code> or an aggregate</td>
+<td>windows: <code>col("amount").rank(descending=True).over("user")</code>, <code>col("x").shift(1).over("user", order_by="ts")</code></td>
+</tr>
+<tr>
+<td><code>.hash(seed=0)</code></td>
+<td>an int from 0 to 2<sup>63</sup> - 1 of the value and the seed, the same everywhere (<a href="sql.html#samples-splits-and-shuffles-hash">SQL's <code>hash</code></a>); <code>col("item").hash(col("user").hash(7))</code> hashes two columns</td>
+</tr>
+</tbody>
+</table></div>
+<p>Every function of <a href="python.html#queries-built-in-python">queries built in Python</a> is an expression of a frame too: <code>cdb.bm25</code>, <code>cdb.similarity</code>, <code>cdb.rrf</code>, <code>cdb.minmax</code>, <code>cdb.zscore</code>, <code>cdb.gbdt</code>, <code>cdb.coalesce</code>, and the rest.</p>
+<h2 id="search-and-ranking">Search and ranking<a class="anchor" href="#search-and-ranking" aria-label="Link to this section">#</a></h2>
+<p>Search is a verb of the frame. Each of these keeps the <code>k</code> best rows (100 by default), best first, and adds a <code>score</code> column:</p>
+<pre data-lang="python">docs = shop[&quot;docs&quot;]
+docs.search(&quot;refund damaged&quot;, on=&quot;body&quot;, k=20)                  # BM25 over a TEXT field
+docs.near(&quot;parcel arrived broken&quot;, on=&quot;emb&quot;, k=20)              # a text the field&#x27;s model embeds, or a vector
+docs.rank_by(0.6 * cdb.minmax(cdb.bm25(&quot;body&quot;, q))                # any ranking expression
+             + 0.4 * cdb.minmax(cdb.similarity(&quot;emb&quot;, q)), k=100)
+
+(docs.filter(col(&quot;lang&quot;) == &quot;en&quot;)                               # filters first narrow what is ranked
+     .search(q, on=&quot;body&quot;, k=200)
+     .rerank(cdb.gbdt(&quot;docs_ltr&quot;, cdb.bm25(&quot;body&quot;, q), col(&quot;rating&quot;)), k=20)   # rank the 200 again
+     .max_per(2, &quot;site&quot;)                                         # at most two rows of a site
+     .filter(col(&quot;rating&quot;) &gt; 3))                                 # filters after narrow the hits</pre>
+<p><code>search</code> reads <a href="sql.html#weights-required-and-excluded-words">weights, required and excluded words</a> (<code>"+mrna vaccine^2 -animal"</code>) unless <code>syntax="plain"</code>. <code>rerank</code> is a <a href="sql.html#rerank-phases">rerank phase</a>, for a costlier score over the rows of the search before it.</p>
+<h2 id="samples-and-splits">Samples and splits<a class="anchor" href="#samples-and-splits" aria-label="Link to this section">#</a></h2>
+<pre data-lang="python">events = shop[&quot;events&quot;]
+some = events.sample(fraction=0.01, seed=7)            # about 1% of the rows, the same 1% every time
+train, test = events.split(0.8, seed=7)                # every row in one of the two
+train, test = events.split(0.8, seed=7, on=&quot;user&quot;)     # each user&#x27;s rows on one side
+first = events.sample(1000, seed=7)                    # 1,000 rows, in a random order the seed fixes
+order = events.filter(col(&quot;lang&quot;) == &quot;en&quot;).shuffle(seed=7)</pre>
+<p>A row is in a sample by the hash of its key (<a href="sql.html#samples-splits-and-shuffles-hash"><code>hash</code></a>), or of the columns <code>on</code>, so a seed gives the same rows from a file and from a server, today and after more rows are written: the rows already sampled stay sampled. A smaller fraction's rows are among a larger's, and <code>split</code>'s two frames are the rows under the fraction and the rest. A frame without its table's key (a group-by's) names the columns with <code>on=</code>, and a row whose <code>on</code> is <code>NULL</code> is in no sample. <code>sample(n)</code> and <code>shuffle</code> sort the frame's rows by their hash, where the data is.</p>
+<h2 id="getting-the-rows">Getting the rows<a class="anchor" href="#getting-the-rows" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>to_arrow()</code>, <code>collect()</code></td>
+<td>a pyarrow Table</td>
+</tr>
+<tr>
+<td><code>to_polars()</code>, <code>pl.DataFrame(frame)</code></td>
+<td>a Polars DataFrame, sharing the Arrow memory</td>
+</tr>
+<tr>
+<td><code>to_pandas(arrow_dtypes=True)</code></td>
+<td>a pandas DataFrame backed by the Arrow columns (<code>False</code> copies into NumPy)</td>
+</tr>
+<tr>
+<td><code>to_numpy()</code></td>
+<td>a 2-D array of the columns, or of the one vector column, <code>(rows, dimensions)</code> float32: embeddings for a model</td>
+</tr>
+<tr>
+<td><code>to_dicts()</code>, <code>iter_batches(batch_size)</code></td>
+<td>a dict a row; RecordBatches</td>
+</tr>
+<tr>
+<td><code>count()</code>, <code>item()</code></td>
+<td>the number of rows (<code>COUNT(*)</code>, run where the data is); the one value of a one-row, one-column answer</td>
+</tr>
+</tbody>
+</table></div>
+<p>A frame streams Arrow (<code>__arrow_c_stream__</code>), so DuckDB reads it by name (<code>duckdb.sql("SELECT ... FROM frame")</code>) and <code>pa.table(frame)</code> runs it. In a notebook a frame shows its first ten rows.</p>
+<h2 id="writing">Writing<a class="anchor" href="#writing" aria-label="Link to this section">#</a></h2>
+<p>Writes are explicit; a frame never changes a table as a side effect.</p>
+<pre data-lang="python">orders.get(&quot;o5&quot;)                                               # a row by key
+orders.upsert(new_rows)                                        # rows in, replacing those of their keys
+orders.filter(col(&quot;id&quot;) == &quot;o5&quot;).update(status=&quot;void&quot;, amount=col(&quot;amount&quot;) * 0.9)
+orders.filter(col(&quot;ts&quot;) &lt; &quot;2025-01-01&quot;).delete()               # delete() of a whole table takes all=True</pre>
+<h2 id="what-runs-where">What runs where<a class="anchor" href="#what-runs-where" aria-label="Link to this section">#</a></h2>
+<p>A frame is one SQL statement, so it runs where the data is and only the answer moves: a group-by over a server's ten million rows sends back a row per group. <code>frame.sql()</code> shows the statement and <code>frame.explain()</code> the plan the store runs.</p>
+<ul>
+<li>A filter on an indexed field is answered by its index. A group-by on indexed KEYWORD, number, BOOL or TIMESTAMP columns (or parts of a timestamp) folds into the table's own query; any other key first computes its rows in a <code>WITH</code> step, with only the columns it reads.</li>
+<li>Joins are inner or left, between tables of one store. To join a server's table with a local one, copy one side with <code>write_to</code> first.</li>
+<li>A server answers at most <code>--max-result-window</code> rows a query (10,000 by default, <a href="server.html#limits">its limits</a>), so a frame reads a server's answer by a <a href="server.html#reading-past-the-window-scrolls">scroll</a>, a page of up to the window at a time, every page from one version: <code>to_arrow()</code> joins the pages, and <code>iter_batches()</code> yields them as they come. A sorted frame, or one that groups or joins, is held by the server between pages, at most its <code>--max-scroll-rows</code> (1,000,000) rows; a plain filter and select reads any number. Through a coordinator, a filter and select, or a frame sorted by a column, is merged from its shards' pages as they come, two pages held at most. A server from before scrolls reads a frame in one query, and needs a larger window for one of more rows.</li>
+<li>From a server, the answer comes back as an Arrow stream, its columns typed as a file's are, so the same frame gives the same table from either. A server too old for Arrow answers JSON, which the client types from the table's schema.</li>
+<li>Not there yet: right, full and cross joins, and <code>pivot</code> and <code>melt</code>.</li>
+</ul>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/frames.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="python.html">← Python</a><a href="javascript.html">JavaScript →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>
