@@ -28,7 +28,9 @@ export function mount(root, ctx) {
   if (!item) {
     el.append(page({ kicker: "More", title: "Everything else", sub: "The four goals are on Start. These are the tools around them." },
       h("nav", { class: "g-mlist" }, MORE.map(([k, ic, t, sub]) =>
-        h("a", { class: "more-row", href: `#/more/${k}` }, icon(ic), h("span", {}, t, h("small", {}, sub)), icon("chev", "i sm"))))));
+        h("a", { class: "more-row", href: `#/more/${k}` }, icon(ic), h("span", {}, t, h("small", {}, sub)), icon("chev", "i sm"))),
+        // On a phone the top bar has no room for the bell: Notifications is here.
+        h("button", { type: "button", class: "more-row g-nt", onclick: () => ctx.notifications && ctx.notifications() }, icon("bell"), h("span", {}, "Notifications", h("small", {}, "Notify me, quiet hours, a level per project")), icon("chev", "i sm")))));
   } else if (item === "time") level("flow");
   else if (item === "library") level("library");
   else if (item === "guide") level("guide");
@@ -38,16 +40,19 @@ export function mount(root, ctx) {
   else if (item === "settings") settings();
 
   // ------------------------------------------------------------ rules and grants
+  // Agent P's page (rules-suggest.js: suggested rules, every grant, Revoke),
+  // then Decide's rules, what every agent of the project is told.
   function rules() {
     const p = ctx.project;
-    const S = { rules: [], grants: null, busy: new Set(), err: null };
+    const S = { rules: [], busy: new Set() };
+    const top = h("div");
     const rulesHost = h("div");
-    const grantsHost = h("div");
-    el.append(page({ kicker: p ? p.project : "Rules and grants", title: "Rules and grants", wide: true,
-      sub: "Rules are what every agent of the project is told. Grants are what an agent may do without asking, written when you picked a “don't ask again” option." },
-    p ? null : h("p", { class: "g-dim" }, "Open a project first: rules and grants belong to one."),
-    h("div", { class: "gp-sec" }, pane("Grants", h("span", { class: "g-dim" }, "in each agent's .claude/settings.local.json"), grantsHost)),
-    h("div", { class: "gp-sec" }, rulesHost)));
+    el.append(top, h("div", { class: "g-told" }, rulesHost));
+    import("/goals/rules-suggest.js").then((m) => {
+      if (!alive) return;
+      views.push(m.mount(top, ctx));
+      ctx.crumbs([{ label: "Start", href: "#/" }, { label: "More", href: "#/more" }, { label: TITLES.rules, href: "#/more/rules" }]);
+    }).catch((e) => top.replaceChildren(h("p", { class: "g-bad" }, `This did not load: ${e.message}`)));
     if (!p) return;
     let panel = null;
     import("/levels/rules.js").then((m) => {
@@ -61,28 +66,8 @@ export function mount(root, ctx) {
       });
       drawRules();
     });
-    const drawRules = () => { if (panel && alive) rulesHost.replaceChildren(panel.view()); };
+    const drawRules = () => { if (panel && alive) rulesHost.replaceChildren(label("What every agent is told", h("span", { class: "num" }, String(S.rules.length))), panel.view()); };
     ctx.api(`/api/rules?repo=${enc(p.path)}`).then((r) => { S.rules = r.rules || []; drawRules(); }, () => {});
-    const loadGrants = () => ctx.api(`/api/grants?repo=${enc(p.path)}`).then((r) => { S.grants = r.grants || []; drawGrants(); }, (e) => { S.err = e.message; drawGrants(); });
-    const drawGrants = () => {
-      if (!alive) return;
-      if (S.err) { grantsHost.replaceChildren(h("p", { class: "g-bad bd" }, S.err)); return; }
-      if (!S.grants) { grantsHost.replaceChildren(h("p", { class: "g-dim bd" }, "Reading…")); return; }
-      if (!S.grants.length) { grantsHost.replaceChildren(h("p", { class: "g-dim bd" }, "No grants: every agent of this project asks before what Claude Code asks about.")); return; }
-      grantsHost.replaceChildren(h("table", { class: "tbl" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Rule"), h("th", {}, "Agent"), h("th", { class: "g-hide" }, "File"), h("th", { class: "r" }, ""))),
-        h("tbody", {}, S.grants.map((g) => h("tr", {},
-          h("td", {}, h("code", {}, g.rule)),
-          h("td", {}, g.name || g.agent),
-          h("td", { class: "g-hide g-path" }, g.file),
-          h("td", { class: "r" }, btn("Revoke", { sm: true, onclick: async (e) => {
-            e.target.closest("button").disabled = true;
-            try { await ctx.api("/api/grants/revoke", { method: "POST", body: { agent: g.agent, rule: g.rule } }); ctx.toast(`Revoked ${g.rule}: ${g.name || "the agent"} asks again`); loadGrants(); }
-            catch (err) { ctx.toast(`Not revoked: ${err.message}`, true); e.target.closest("button").disabled = false; }
-          } })))))));
-    };
-    drawGrants();
-    loadGrants();
   }
 
   // ------------------------------------------------------------ keys
@@ -129,6 +114,8 @@ const CSS = `
 .g-mlist{display:flex;flex-direction:column;border:var(--hair) solid var(--line);border-radius:var(--r);background:var(--surface);overflow:hidden}
 .g-mlist .more-row{border-bottom:var(--hair) solid var(--line)}
 .g-mlist .more-row:last-child{border-bottom:0}
+.g-mlist .more-row:nth-last-child(2){border-bottom:0}
+.g-mlist .g-nt{display:none;width:100%;border:0;background:none;font:inherit;text-align:left;cursor:pointer}
 .g-mlist .more-row>svg:last-child{margin-left:auto;color:var(--text-3)}
 .g-lv{min-height:100%}
 .g-keys{grid-template-columns:140px minmax(0,1fr);padding:var(--s-3) var(--s-4)}
@@ -141,5 +128,7 @@ const CSS = `
 .g-more .g-dim{color:var(--text-2)}
 .g-more .g-bad{color:var(--crit-ink)}
 .g-more .bd{padding:var(--s-3) var(--s-4)}
-@media (max-width:640px){.g-more .g-hide{display:none}.g-keys{grid-template-columns:minmax(0,1fr)}}
+.g-told{max-width:var(--page-w);padding:0 var(--s-7) 64px;margin-top:-32px}
+@media (max-width:1024px){.g-told{padding:0 var(--s-5) 48px;margin-top:-24px}}
+@media (max-width:640px){.g-mlist .g-nt{display:grid}.g-mlist .more-row:nth-last-child(2){border-bottom:var(--hair) solid var(--line)}.g-told{padding:0 var(--s-4) var(--s-6);margin-top:0}.g-more .g-hide{display:none}.g-keys{grid-template-columns:minmax(0,1fr)}}
 `;

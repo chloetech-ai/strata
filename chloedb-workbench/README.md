@@ -61,11 +61,63 @@ cargo build --release
 ```
 
 It prints a URL that carries a token (`http://127.0.0.1:7740/?token=...`).
-It does not open a browser for you. Open the URL and start an agent: give
-it a repository path and a task. To read a repository first, without any
-agent, open Search, Map, Trace or Library: each asks for the repository
-(**Open a repository**, with folder completion) and Workbench indexes it.
-The settings:
+It does not open a browser for you. Open the URL: Start asks what you want
+to do. The commands that take you somewhere:
+
+```bash
+chloedb-workbench serve ~/src/shop      # opens that project; the URL goes to it
+chloedb-workbench new ~/src/new-thing   # makes the folder (git init, a first commit)
+                                        # and prints the page that asks what to build
+chloedb-workbench open ~/src/shop       # the running server's URL for that project:
+                                        # Continue, or --review, --debug "why …", --continue
+```
+
+`open` and `new` talk to the server already running (the same `--addr`
+and `--data-dir`); they start nothing themselves.
+
+### The pages
+
+Every page answers one question, and the goal comes first:
+
+- **Start** (`#/`): start a new project, continue one, review and ship,
+  or find out why something went wrong, with your projects below and
+  what needs you at the side. On a first run it offers only: open a
+  project you have, or start a new one.
+- **New project** (`#/new`): four steps, the folder, what to build, who
+  builds it (one agent, or a lead that plans the parts), and the plan,
+  which you read before anything runs.
+- **Continue** (`#/p/<project>`): since you left, what needs you, what is
+  ready and what is still working. **Understand** asks about the project
+  and shows who is changing which file; **Start a change** says what
+  should change and how you will know it is done.
+- **The agent page** (`#/a/<agent>`): the agent, the question it asks, and
+  its tabs: Progress, Changes, Preview, Terminal, Events. On a phone the
+  terminal is read-only until **Type**.
+- **Review and ship** (`#/p/<project>/ship`) and **Debug** (`#/debug`):
+  below.
+- **Needs you** (`#/needs`, or `.` for the drawer): every question,
+  permission prompt, trust prompt and alert that asks you, across
+  projects, in one card each. Filter by project, agent and kind; sort by
+  the oldest or by the most work an answer unblocks. `x` selects cards
+  that run the identical command and `⇧` and a digit answers them alike,
+  after a check. An option that grants more than one call ("don't ask
+  again") opens a check first: the exact rule, where it is written, what
+  else it would have allowed, and a narrower choice.
+- **More** (`#/more`): all terminals, where the time went, the decisions
+  timeline, Library, Rules and grants, Settings, Guide, Keys, the setup
+  check, and on a phone Notifications.
+
+The top bar has the path you are on, Search (`/`), one count of what needs
+you, the agents (`a`, then a digit), the notifications bell and More. On a
+phone a tab bar has Start, Needs you, Projects and More. The old addresses
+(`#/mission`, `#/ship`, `#/trace`, `#<agent>` and the others) still work:
+they go to the page that replaced them. **More › Keys** (or `?`) lists the
+keys; in a terminal every key goes to the agent, and Ctrl-b first reaches
+Workbench (Ctrl-b Esc leaves it).
+
+To read a repository without any agent, open it from Start (**Open a
+project you have**, with folder completion): Workbench indexes it for
+Search, Understand and Debug. The settings:
 
 | flag | env | default |
 |---|---|---|
@@ -100,6 +152,9 @@ origin when that request would change something.
 
 - `GET /api/health`
 - `GET /api/agents?all=1`, `POST /api/agents`, `GET /api/agents/:id`
+  (`POST /api/agents` takes `permissions: {allow, ask, deny}`, Claude
+  Code's rules, written into that session's own settings; a rule Claude
+  Code would not read is refused)
 - `GET /api/agents/:id/events?after=&limit=&data=1`
 - `POST /api/agents/:id/input|resize|stop` (stop takes `{servers: true|false}`:
   whether the dev servers it started stop with it)
@@ -109,10 +164,19 @@ origin when that request would change something.
   `PUT /api/servers/policy {on_stop: "stop"|"keep"|""}`: the servers
   agents started (processes that listen on a port)
 - `GET /api/attention`: the agents that are waiting for you or idle
-- `GET /api/repos`, `POST /api/repos {path}`, `DELETE /api/repos?path=`:
+- `GET /api/repos`, `POST /api/repos {path, trust?, init?}`, `DELETE /api/repos?path=`:
   the repositories Workbench knows without an agent (opened in a picker,
-  or worked in by an agent); opening one indexes it for code search.
-  `GET /api/repos/dirs?q=` completes a folder path, git checkouts first
+  or worked in by an agent); opening one indexes it for code search. Each
+  has a short name (`project`), its agents counted by group (needs you,
+  working, ready, finished) and whether it is trusted: with `trust: true`
+  Workbench answers Claude Code's "trust this folder?" for it.
+  With `init: true` it makes a new project (the folder, `git
+  init`, a first commit). `GET /api/repos/dirs?q=` completes a folder
+  path, git checkouts first
+- `GET /api/needs`: everything that needs you, as one list and one count:
+  questions and permission prompts (with Claude Code's numbered options),
+  trust prompts, agents waiting on a prompt not read yet, and alerts that
+  ask you, oldest first
 - `GET /api/wait?agent=&until=idle|waiting|exited|any&timeout_s=`
 - `POST /api/hook`: what `chloedb-workbench hook` posts
 - `GET /api/stream`: server-sent events (`snapshot`, `agent`, `event`)
@@ -313,6 +377,9 @@ a model.
   agent per outcome, and `agents: [ids]` makes agents already running
   outcomes of the goal; `model` and `effort` (`low` to `max`, Claude
   Code's `--effort`) are the lead's or those agents'.
+  `plan: "draft"` returns the lead's plan (its parts, each with how you
+  will know it is done, the parts it waits for and its model) and starts
+  nothing: New project shows it before you start it.
   `GET /api/goals/:id` adds the goal's agents, open questions, what
   ChloeCtx learned in the last day (`chloectx sql --json`) and its pulse.
 - **Questions and rules**: the MCP tool `ask_human` asks you in Workbench

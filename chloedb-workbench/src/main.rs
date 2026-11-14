@@ -53,7 +53,6 @@ mod notify;
 mod rulesuggest;
 // The rewrite around goals (JOURNEYS.md): the one Needs-you count, and what
 // sessions were allowed without asking.
-mod grants;
 mod needs;
 
 use std::net::SocketAddr;

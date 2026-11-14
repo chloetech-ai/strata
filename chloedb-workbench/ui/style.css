@@ -190,6 +190,7 @@ kbd, .kc {
 .tb .avs .lv-av { width: 16px; height: 16px; border-radius: 50%; font-size: 9px; box-shadow: 0 0 0 1.5px var(--surface); }
 .tb .avs .lv-av + .lv-av { margin-left: -5px; }
 .tb.icon { width: 30px; padding: 0; justify-content: center; }
+.tb.nt-top.quiet { width: auto; padding: 0 var(--s-2); }
 .tb-back, .tb-title, .tb-search { display: none; }
 .conn { display: inline-flex; align-items: center; width: 14px; height: 14px; justify-content: center; flex: none; }
 .conn::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); }
@@ -874,7 +875,7 @@ button.flag.warn:hover { border-color: var(--warn-line); }
   :root { --top: 52px; }
   body { font-size: var(--fs-body); line-height: var(--lh-body); }
   .top { gap: var(--s-1); padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
-  .brand .bn, .crumbs, .search, #agents-btn, #more-btn, .top .conn, .wide-only, .ag-tabs .hint { display: none !important; }
+  .brand .bn, .crumbs, .search, #agents-btn, #more-btn, .nt-top, .top .conn, .wide-only, .ag-tabs .hint { display: none !important; }
   .tb-back { display: inline-flex; }
   .tb-back[hidden] { display: none; }
   .tb-title { display: block; flex: 1; min-width: 0; font: var(--w-title) var(--fs-md)/var(--lh-md) var(--sans); letter-spacing: var(--track-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 var(--s-1); }

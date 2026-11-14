@@ -195,7 +195,7 @@ const CSS = `
   .g-part{grid-template-columns:24px minmax(0,1fr)}
   .g-pa{grid-column:1/-1}
   .g-pt .field{height:44px}
-  .g-new .gp-main>.gp-head+*,.g-new .g-foot.plain,.g-new .pane .g-foot{display:none}
+  .g-new .g-foot.plain,.g-new .pane .g-foot{display:none}
   .g-mbar{display:flex;gap:var(--s-2);position:fixed;left:0;right:0;bottom:0;z-index:15;padding:var(--s-2) max(16px,env(safe-area-inset-right)) calc(var(--s-2) + env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));background:var(--glass);-webkit-backdrop-filter:var(--glass-blur);backdrop-filter:var(--glass-blur);border-top:var(--hair) solid var(--line)}
   .g-mbar .btn{height:var(--touch)}
   .g-mbar .btn.primary{flex:1}

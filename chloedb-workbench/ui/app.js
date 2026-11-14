@@ -2755,6 +2755,9 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && e.ctrlKey && !e.altKey && !e.metaKey && S.zoomed && !openDialog()) { e.preventDefault(); e.stopPropagation(); leaveTerminal(); return; }
   // A sheet (the grant check, a batch answer, Tell, the keys) has the keys while it is open.
   if (Shell.sheetOpen()) { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); Shell.closeSheet(); } return; }
+  // The other pages' sheets (the rules' grant check, Notifications, Review's
+  // merge and send-back) close themselves on Esc: leave them every key.
+  if (document.querySelector('.gs-scrim, .nt-scrim, [role="dialog"][aria-modal="true"]:not(dialog)')) return;
   if (e.key === "Escape" && e.target.id === "ask-q" && !openDialog()) { e.preventDefault(); e.target.blur(); if (!$("ask-out").hidden) $("ask-out").hidden = true; return; }
   // ⌘↵ on a page that has a goal to send (New project's steps).
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && G.view && G.view.onKey) { try { if (G.view.onKey(e)) { e.preventDefault(); return; } } catch (err) { console.error(err); } }
@@ -2811,7 +2814,9 @@ const L = { recent: [] };
 function levelCtx(param, extra = {}) {
   return {
     api,
+    // The old screens set it on update (flow.js): the live state wins, so a set is dropped.
     get state() { return levelState(); },
+    set state(_) { /* levelState() is always current */ },
     params: { agent: param || null, get repo() { return extra.repo || pickRepo() || null; }, ...Object.fromEntries(Object.entries(extra).filter(([k]) => k !== "repo")) },
     go,
     openWhy: ({ agent, path, line, text, commit }) => openLineCard(agent, path, line, { text, commit }),
@@ -2897,7 +2902,7 @@ function refreshNeeds() {
     N.items = j.items || [];
     N.by_repo = j.by_repo || {};
     const key = N.items.map((i) => i.id).join(",");
-    if (key !== NQ.key) { NQ.key = key; Z.headKey = ""; }
+    if (key !== NQ.key) { NQ.key = key; Z.headKey = ""; try { NOTIFY && NOTIFY.poke(); } catch (err) { console.error(err); } }
     schedule();
   }, () => {}).finally(() => { NQ.busy = null; if (NQ.again) { NQ.again = false; needsSoon(); } });
   return NQ.busy;
@@ -3019,7 +3024,10 @@ async function route(hash) {
   }
   closeDecisions();
   showView("goal-view");
-  const key = JSON.stringify([r.page, r.project, r.agent, r.step, r.item, r.rest, r.tab, r.query.toString()]);
+  // Review and Debug follow their own steps (their hashchange): a step
+  // within one of them keeps the page mounted.
+  const key = r.page === "ship" ? JSON.stringify([r.page, r.project]) : r.page === "debug" ? JSON.stringify([r.page])
+    : JSON.stringify([r.page, r.project, r.agent, r.step, r.item, r.rest, r.tab, r.query.toString()]);
   if (G.view && G.key === key) { G.ukey = ""; goalUpdate(); return; }
   unmountGoal();
   G.key = key;
@@ -3032,31 +3040,19 @@ async function route(hash) {
   const ctx = goalCtx(r);
   let m = null;
   try { m = await import(GOAL[r.page]); } catch (err) {
-    if (r.page !== "ship" && r.page !== "debug") { if (req === G.req) host.replaceChildren(h("div", { class: "lv-loading bad", text: `This page did not load: ${err.message || err}` })); return; }
+    if (req === G.req) host.replaceChildren(h("div", { class: "lv-loading bad", text: `This page did not load: ${err.message || err}` }));
+    return;
   }
   if (req !== G.req) return;
   host.replaceChildren();
   host.scrollTop = 0;
   try {
-    if (m) G.view = m.mount(host, ctx);
-    else G.view = await standIn(r, host, ctx);
+    G.view = m.mount(host, ctx);
     G.ukey = "";
   } catch (err) {
     console.error(err);
     host.replaceChildren(h("div", { class: "lv-loading bad", text: `This page did not load: ${err.message || err}` }));
   }
-}
-
-/** Until Review and Debug (R2) are served: the old Ship, Health and Trace screens. */
-async function standIn(r, host, ctx) {
-  const file = r.page === "ship" ? "ship" : r.rest && r.rest[0] === "failing" ? "health" : "trace";
-  const p = r.project ? projectByName(r.project) : currentProject();
-  ctx.crumbs(r.page === "ship"
-    ? [{ label: "Start", href: "#/" }, ...(p ? [{ label: p.project, href: `#/p/${p.project}` }] : []), { label: "Review and ship", href: location.hash }]
-    : [{ label: "Start", href: "#/" }, { label: "Debug", href: "#/debug" }]);
-  const m = await import(`/levels/${file}.js`);
-  const agent = r.agent || (r.page === "ship" && p && p.ready && p.ready[0] ? p.ready[0].id : null);
-  return m.mount(host, levelCtx(agent, { repo: p ? p.path : undefined, query: r.query }));
 }
 
 /** What a goal page is mounted with: the old screens' context, plus the
@@ -3076,7 +3072,8 @@ function goalCtx(r) {
     prefs: PREFS,
     levelCtx: (extra) => levelCtx(null, extra),
     restart: restartAgent,
-    notify: () => { try { NOTIFY && NOTIFY.away && NOTIFY.away(); } catch (err) { console.error(err); } },
+    notify: () => { try { NOTIFY && NOTIFY.poke(); } catch (err) { console.error(err); } },
+    notifications: () => { try { if (NOTIFY) NOTIFY.open(); else toast("Notifications did not load", true); } catch (err) { console.error(err); } },
     slot: (name) => slot(name, ctx),
     groupOf: Shell.groupOf,
     fleet: Shell.fleet,
@@ -3134,7 +3131,8 @@ Shell.initShell({
   refreshNeeds,
 });
 
-// Agent P's interrupt model (ui/goals/notify.js): loaded once, if served.
+// Agent P's interrupt model (ui/goals/notify.js): started once; its bell
+// sits in the top bar before More (on a phone, More lists Notifications).
 let NOTIFY = null;
 
 let started = false;
@@ -3147,7 +3145,10 @@ function start() {
     refreshNeeds();
     // ChloeCtx is required: say so up front when sessions would miss it.
     import("/levels/setup.js").then((m) => m.checkSetup(api)).catch(() => {});
-    import("/goals/notify.js").then((m) => { NOTIFY = m; m.init && m.init(goalCtx({ page: "notify", query: new URLSearchParams() })); }).catch(() => {});
+    import("/goals/notify.js").then((m) => {
+      NOTIFY = m.init(goalCtx({ page: "notify", query: new URLSearchParams() }));
+      if (NOTIFY && NOTIFY.control) { NOTIFY.control.classList.add("tb", "icon", "nt-top"); $("more-btn").before(NOTIFY.control); }
+    }).catch((err) => console.error(err));
   }
   // Settings › Open on the inbox.
   if ((!location.hash || location.hash === "#/") && PREFS.get("openOnInbox")) history.replaceState(history.state, "", "#/needs");

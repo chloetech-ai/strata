@@ -1050,6 +1050,135 @@ text rules, so the grants live under `/api/rules/grants`.
   built like the quiet one but has no test of its own; notifications have
   no action buttons, by design.
 
+## Built (R1): the shell and the goals
+
+The router, the shell and every goal page other than C and D. The pages
+are ES modules under `ui/goals/`, served at `/goals/<file>` without the
+token (the API still needs it) and compiled in through `GOALS` in
+`src/server.rs`.
+
+**Router** (`ui/goals/router.js`, `resolve(hash, {project, agentIds})`).
+Pure: it gives `{page, …params, query}` or `{redirect}`. The routes are the
+table under "URL routes", and every old hash redirects (`#<agent>`,
+`#/mission`, `#/ship/<agent>`, `#/trace?q=`, `#/map`, `#/health`, `#/flow`,
+`#/grid`, …). `app.js` mounts the page from its `GOAL` map into
+`#goal-view` with `mount(root, ctx)`. Exceptions: the agent page is the
+zoom view, All terminals is the grid and the Decisions timeline is its own
+view. Review and Debug stay mounted while you move between their steps,
+since they follow their own hash. `goalCtx(r)` is the old screens' ctx plus
+these: `project`, `crumbs(list)`, `toast`, `needs()`, `needCard(it)`,
+`projects()`, `projectByName`, `refreshProjects`, `prefs`, `levelCtx()`,
+`slot(name)`, `groupOf`, `fleet`, `merged(id)`, `stop`, `restart`,
+`notify`, `notifications` and `openDecisions`.
+
+**Global elements** (`ui/goals/shell.js`, `ui/index.html`).
+- The top bar has the back arrow (phone), the brand, the crumbs, Search,
+  Needs you, Agents, P's bell (`notify.init(ctx).control`, before More),
+  More and the connection dot.
+- One count of what needs you comes from `GET /api/needs` (`src/needs.rs`).
+  It is read again 400 ms after a change and every 10 s. The button, the
+  phone's tab badge, Start and Continue all show it.
+- The drawer and the switcher redraw only when what they show changes.
+- The switcher uses the same words for its groups everywhere (needs you,
+  working, ready, finished).
+- The grant sheet is P's `rules.grantSheet`, the `onGrant` of every
+  question card. It answers on Confirm, and the card goes.
+- The batch answer and Keys are sheets of the shell.
+
+**Start and First run** (`ui/goals/start.js`).
+- The four goals with their status lines, then your projects (state,
+  agents, last activity, Continue / Review), then what needs you at the
+  side.
+- With no project there are two choices: open a project you have, or start
+  a new one.
+- P's rules card goes in through `ctx.slot("rules-suggest")`.
+
+**A. New project** (`ui/goals/newproject.js`). Four steps:
+1. The folder: `POST /api/repos {path, init: true, trust}` makes it, runs
+   git init and makes a first commit.
+2. What to build.
+3. Who builds it: one agent, or a lead, with a permission profile.
+4. The plan: `POST /api/goals {plan: "draft"}`, which starts nothing, then
+   Start.
+
+On a phone, Back and Next sit in a bar at the bottom.
+
+**B. Continue** (`ui/goals/continue.js`). One module for four routes:
+- `#/p` opens a project (the Projects tab).
+- B1 is Since you left: the digest, what needs you, what is ready, what is
+  still working, the rules card, "I'm stepping away", and Ask about the
+  project (answered in a sheet, with Open in Debug).
+- B2 Understand puts the ask box over Map (`map.js` `mountBare`).
+- B3 Start a change is a composer drawn once, so it keeps what you typed.
+  Its inspector of running agents redraws on its own. Compact rows (`z`)
+  give one line per agent.
+
+**The agent page** (`ui/goals/agent.js` plus the zoom view in `app.js`).
+- The head: name, state, project, task, branch, churn, and one primary,
+  which is Review and ship when the agent is ready and Tell X… otherwise.
+  Stop / Restart / Events are folded in a menu.
+- The agent's question cards come next. A notification's `?q=` focuses
+  its card.
+- Then the tabs: Progress (`story.js` with `embed`), Changes, Preview,
+  Terminal and Events.
+- On a desktop the Terminal tab says that every key goes to the agent and
+  that Ctrl-b Esc leaves it. On a phone it is read-only until Type, which
+  brings a key bar (1, 2, 3, Send).
+
+**Needs you** (`ui/goals/needs.js`, power users 1 and 2).
+- Every card that asks you, across projects.
+- Filters by project, agent and kind (permission, question, trust, alert,
+  waiting), and a sort: oldest first, or "most work blocked" (agents
+  asking the identical command plus the agents they started). The filters
+  stay in the hash.
+- `x` selects cards and `⇧` with a digit answers them alike, for identical
+  commands only and never an option that grants more.
+
+**More** (`ui/goals/more.js`).
+- The list. On a phone it also has Notifications.
+- Where the time went, Library and Guide (the old modules).
+- Rules and grants: P's `rules.mount`, then Decide's rules under "What
+  every agent is told".
+- Keys and the setup check.
+- Settings (kept in this browser): open on the inbox, compact rows.
+- All terminals and Decisions are the app's own views.
+
+**Keys.** These work outside a text box and a terminal:
+- `/` searches, `.` opens Needs you and `a` opens the agents.
+- `g` then `s`, `c`, `r`, `d`, `t` or `n` goes to a page. `n` starts a
+  change in a project, `z` turns compact rows on or off and `?` shows the
+  keys.
+- On cards: `j` and `k` move, `]` and `[` go to the next or previous card
+  that needs you, a digit then Enter answers, `x` selects and `⇧`+digit
+  answers the selected cards.
+- `m` and `b` are Review's merge check and send-back note. When the merge
+  gate holds, `m` says why.
+- In a terminal every key goes to the agent; Ctrl-b first reaches
+  Workbench. A sheet of P's or R2's has every key while it is open.
+
+**Phone.** Breakpoints are at 640 and 1024 px.
+- The tab bar has Start, Needs you (with the count), Projects and More,
+  above the safe-area inset.
+- With a coarse pointer, targets are at least 44 px and inputs 16 px.
+- Nothing is hover-only.
+- No page scrolls sideways at 390 px (the screenshot run checks this).
+- The exceptions of a blast radius fold and say Show or Hide.
+
+**Server** (R1's part).
+- `GET /api/needs`.
+- `GET /api/repos` gives each project's short name, counts by group and
+  trust. `POST /api/repos` takes `trust` and `init`, and a trusted
+  project's folders get Claude Code's trust prompt answered.
+- `POST /api/agents` takes `permissions: {allow, ask, deny}`.
+- `POST /api/goals {plan: "draft"}` returns 200 and creates nothing.
+- `serve [PATH]`, `new [DIR]` and `open [PATH] [--continue|--review|--debug Q]`.
+- The goal pages and fonts are public.
+
+The grants are P's (`/api/rules/grants`); R1's own `/api/grants` was
+dropped when P's landed. The tokens that R2's harness took from
+`ui/dev/goals-tokens.css` are all in `ui/style.css`, so that file is
+gone.
+
 ## What the rewrite changes
 
 ### `ui/app.js`

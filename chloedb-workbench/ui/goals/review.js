@@ -347,6 +347,8 @@ export function mount(root, ctx) {
         if (!phone) next.setAttribute("data-primary", "");
         return h("div", { class: "rv-btns" }, next, btn(`Send ${name} back…`, { onclick: () => openSendBack() }));
       }
+      if (mergeBtn) mergeBtn.dataset.act = "merge";
+      backBtn.dataset.act = "back";
       for (const b of [mergeBtn, backBtn]) if (b && b.classList.contains("primary") && !phone) b.setAttribute("data-primary", "");
       return h("div", { class: "rv-btns" }, mergeFirst ? [mergeBtn, backBtn] : [backBtn, mergeBtn], prBtn);
     };
@@ -570,6 +572,16 @@ export function mount(root, ctx) {
 
   load();
   return {
+    /** `m` opens the merge check, `b` the send-back note (the shell's keys, JOURNEYS.md "Keyboard"). */
+    onKey(e) {
+      if (!alive || sheet || e.metaKey || e.ctrlKey || e.altKey || (e.key !== "m" && e.key !== "b")) return false;
+      const b = el.querySelector(`[data-act="${e.key === "m" ? "merge" : "back"}"]`);
+      if (!b) return false;
+      // A merge the gate holds says why, as its button does.
+      if (b.disabled) { if (ctx.toast) ctx.toast(b.title || "Not ready to merge", true); return true; }
+      b.click();
+      return true;
+    },
     update(state) { if (ctx.state && state) ctx.state.agents = state.agents || ctx.state.agents; if (child && child.update) child.update(state); },
     unmount() {
       alive = false;

@@ -84,7 +84,7 @@ const CSS = `
 .g-f{display:flex;flex-direction:column;gap:4px;font:var(--w-mid) var(--fs-xs)/var(--lh-xs) var(--mono);letter-spacing:var(--track-label);text-transform:uppercase;color:var(--text-2)}
 .g-f select{min-width:160px;text-transform:none;letter-spacing:0}
 .g-kinds{display:flex;gap:var(--s-1);flex-wrap:wrap}
-.g-kinds .chip{cursor:pointer}
+.g-kinds .chip{cursor:pointer;border:0;height:var(--ctl-h);padding:0 var(--s-3);font-size:var(--fs-sm);line-height:1;border-radius:var(--r-sm)}
 .g-kinds .chip.on{background:var(--text);color:var(--bg);border-color:var(--text)}
 .g-sort{display:flex;gap:var(--s-1)}
 .g-list{display:flex;flex-direction:column;gap:var(--s-4);max-width:900px}

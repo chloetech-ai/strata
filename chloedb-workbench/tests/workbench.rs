@@ -5436,9 +5436,11 @@ fn notifications_follow_the_level_quiet_holds_all_but_critical_and_a_digest_foll
     assert_eq!(p["digest"], Value::Null, "{p}");
     // Out of quiet with level all, the questions notify again.
     assert_eq!(p["notify"].as_array().unwrap().iter().filter(|x| x["kind"] == "question").count(), 2, "{p}");
+}
+
 // The rewrite (JOURNEYS.md): what needs you as one list, projects with
 // their counts, repo trust, a new project, the permission profile, the
-// draft plan, grants, the CLI's routes and the goal pages' files.
+// draft plan, the CLI's routes and the goal pages' files.
 
 #[test]
 fn needs_lists_permission_and_trust_prompts_oldest_first_in_the_prompts_order() {
@@ -5549,38 +5551,6 @@ fn a_draft_plan_starts_nothing() {
     assert!(goals["goals"].as_array().unwrap().is_empty(), "{goals}");
     let (_, agents) = s.get("/api/agents?all=1");
     assert!(agents["agents"].as_array().unwrap().is_empty(), "{agents}");
-}
-
-#[test]
-fn grants_are_listed_revoked_and_previewed_from_what_agents_asked() {
-    let s = Server::start(&[]);
-    let (_d, r) = repo();
-    let a = s.spawn(json!({ "repo": r, "task": "hello", "name": "wt" }));
-    let id = a["id"].as_str().unwrap().to_string();
-    let a = s.wait(&id, "idle");
-    let cwd = PathBuf::from(a["cwd"].as_str().unwrap());
-    assert_ne!(cwd, r);
-    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
-    std::fs::write(cwd.join(".claude/settings.local.json"), r#"{"permissions":{"allow":["Bash(npm test:*)","Bash(echo:*)"]},"other":1}"#).unwrap();
-    let (_, v) = s.get(&format!("/api/grants?repo={}", r.display()));
-    let rules: Vec<&str> = v["grants"].as_array().unwrap().iter().map(|g| g["rule"].as_str().unwrap()).collect();
-    assert_eq!(rules, ["Bash(npm test:*)", "Bash(echo:*)"], "{v}");
-    assert_eq!(v["grants"][0]["name"], "wt");
-    let (status, v) = s.post("/api/grants/revoke", json!({ "agent": id, "rule": "Bash(echo:*)" }));
-    assert_eq!(status, 200, "{v}");
-    let left: Value = serde_json::from_str(&std::fs::read_to_string(cwd.join(".claude/settings.local.json")).unwrap()).unwrap();
-    assert_eq!(left["permissions"]["allow"], json!(["Bash(npm test:*)"]));
-    assert_eq!(left["other"], 1, "the rest of the file stays");
-    // An agent in the repository's own checkout has no grants of Workbench's to revoke.
-    let b = s.spawn(json!({ "repo": r, "task": "PERM3 first", "worktree": false, "name": "here" }));
-    let bid = b["id"].as_str().unwrap().to_string();
-    open_prompt(&s, &bid);
-    assert_eq!(s.post("/api/grants/revoke", json!({ "agent": bid, "rule": "Bash(echo:*)" })).0, 400);
-    // What a "don't ask again for echo" would also allow: what was asked.
-    let (_, p) = s.get(&format!("/api/grants/preview?repo={}&prefix=echo", r.display()));
-    let cmds: Vec<&str> = p["commands"].as_array().unwrap().iter().map(|c| c["command"].as_str().unwrap()).collect();
-    assert_eq!(cmds, ["echo hi"], "{p}");
-    assert_eq!(p["commands"][0]["risky"], false);
 }
 
 #[test]

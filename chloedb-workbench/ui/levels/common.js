@@ -664,7 +664,7 @@ export function blastCompact({ verdict, tone = "warn", rings = [], exceptions = 
     actions ? h("div", { class: "blast-act" }, actions()) : null,
     rings.length ? bank(rings.length, ...rings.map(gauge)) : null,
     n ? h("details", { class: "pane blast-ex", open: !phone || null },
-      h("summary", { class: "hd" }, label("Exceptions", h("span", { class: "num" }, String(n)))),
+      h("summary", { class: "hd" }, label("Exceptions", h("span", { class: "num" }, String(n))), h("span", { class: "bx-o", "aria-hidden": "true" }, icon("chev", "i sm"))),
       exceptions.map((e) => h("div", { class: `ex ${e.tone || "info"}` }, h("span", { class: "gl" }), h("div", {}, h("b", {}, e.text), e.sub ? h("span", {}, e.sub) : null))),
       tests ? h("div", { class: "ex ok" }, h("span", { class: "gl" }), h("div", {}, h("b", {}, tests))) : null) : null);
 }
@@ -760,6 +760,7 @@ textarea.field{height:auto;min-height:96px;padding:var(--s-2) var(--s-3);line-he
 .qc-opt .ol{display:flex;flex-direction:column;min-width:0}
 .qc-opt small{color:var(--text-2);font-size:var(--fs-sm);line-height:var(--lh-sm)}
 .qc-opt.wide{border-top:var(--hair) solid var(--line-2);margin-top:var(--s-2)}
+.qc-opt:has(+ .qc-opt.wide){border-bottom:0}
 .qc-opt.sel{box-shadow:inset 0 0 0 1.5px var(--accent);background:var(--accent-soft)}
 .qc-opt.sel .kc{border-color:var(--accent-line);color:var(--accent-text)}
 .qc:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -798,6 +799,9 @@ textarea.field{height:auto;min-height:96px;padding:var(--s-2) var(--s-3);line-he
 .ticks i{flex:1;height:6px;background:var(--line-2);border-radius:1px}.ticks i.on{background:var(--text-2);height:12px}
 .gauge .names{margin-top:10px;color:var(--text-2);font-size:var(--fs-sm);line-height:var(--lh-sm);overflow-wrap:anywhere}
 .blast-ex summary{list-style:none;cursor:pointer}.blast-ex summary::-webkit-details-marker{display:none}
+.blast-ex summary .bx-o{margin-left:var(--s-3);display:inline-flex;align-items:center;gap:4px;color:var(--text-2);font:var(--w-mid) var(--fs-xs)/var(--lh-xs) var(--mono);letter-spacing:var(--track-label);text-transform:uppercase}
+.blast-ex summary .bx-o::before{content:"Show"}.blast-ex[open] summary .bx-o::before{content:"Hide"}
+.blast-ex summary .bx-o svg{transform:rotate(90deg);transition:transform .15s}.blast-ex[open] summary .bx-o svg{transform:rotate(-90deg)}
 .ex{display:grid;grid-template-columns:16px minmax(0,1fr);gap:10px;align-items:start;padding:10px var(--s-4);border-bottom:var(--hair) solid var(--line)}
 .ex:last-child{border-bottom:0}
 .ex .gl{width:8px;height:8px;border-radius:50%;margin:6px 4px 0;background:var(--text-3)}

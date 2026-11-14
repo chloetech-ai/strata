@@ -262,7 +262,7 @@ export function mount(root, ctx) {
 function openList(ctx) {
   const ps = ctx.projects();
   if (!ps.length) return null;
-  return pane("Projects Workbench knows", null, h("table", { class: "tbl" }, h("tbody", {}, ps.map((p) => h("tr", { "data-href": `#/p/${p.project}`, tabindex: "0", "data-nav": "", onclick: () => ctx.go(`#/p/${p.project}`) }, h("td", {}, h("b", {}, p.project)), h("td", { class: "g-dim" }, h("code", {}, p.path)), h("td", { class: "r" }, btn("Continue", { sm: true, href: `#/p/${p.project}` })))))));
+  return pane("Projects Workbench knows", null, h("table", { class: "tbl g-ptbl" }, h("tbody", {}, ps.map((p) => h("tr", { "data-href": `#/p/${p.project}`, tabindex: "0", "data-nav": "", onclick: () => ctx.go(`#/p/${p.project}`) }, h("td", {}, h("b", {}, p.project)), h("td", { class: "g-dim g-ppath" }, h("code", {}, p.path)), h("td", { class: "r" }, btn("Continue", { sm: true, href: `#/p/${p.project}` })))))));
 }
 
 function picker(ctx) {
@@ -273,6 +273,8 @@ function picker(ctx) {
 }
 
 const CSS = `
+.g-ptbl .g-ppath{white-space:normal;width:100%}.g-ptbl .g-ppath code{overflow-wrap:anywhere;word-break:break-all}
+@media (max-width:640px){.g-ptbl td.r{display:none}}
 .g-psteps{display:flex;gap:var(--s-5);border-bottom:var(--hair) solid var(--line);margin:0 0 var(--s-5);overflow-x:auto;align-items:center}
 .g-psteps a{padding:10px 0;font-size:var(--fs-body);color:var(--text-2);margin-bottom:-1px;border-bottom:1.5px solid transparent;text-decoration:none;white-space:nowrap;display:inline-flex;align-items:center;gap:4px}
 .g-psteps a.on{color:var(--text);font-weight:var(--w-mid);border-bottom-color:var(--text)}

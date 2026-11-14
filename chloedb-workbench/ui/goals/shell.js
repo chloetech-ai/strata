@@ -1,10 +1,11 @@
 // The shell (JOURNEYS.md, "Global elements" and "Phone"): the top bar
 // (brand, breadcrumb, Search, Needs you, Agents, More), the phone's tab bar,
 // the Needs-you drawer, the agent switcher, the More menu, and the sheets
-// every page shares: the grant sheet (a wide "don't ask again" answer),
-// the batch answer, the keys. One count of what needs you, one count of
+// every page shares: the grant sheet (a wide "don't ask again" answer,
+// agent P's), the batch answer, the keys. One count of what needs you, one count of
 // agents and one set of words for their groups, used on every page.
-import { h, useStyle, avatar, icon, kc, label, btn, stateDot, since, questionCard, optionsOf, grantOf, parseJSON, GROUP_WORDS, toMs } from "/levels/common.js";
+import { h, useStyle, avatar, icon, kc, label, btn, stateDot, since, questionCard, optionsOf, parseJSON, GROUP_WORDS, toMs } from "/levels/common.js";
+import * as rules from "/goals/rules-suggest.js";
 
 const $ = (id) => document.getElementById(id);
 const enc = encodeURIComponent;
@@ -294,36 +295,17 @@ export function sheet({ kicker, title, body, actions }) {
 export function sheetOpen() { return !!document.querySelector(".gs-ov"); }
 export function closeSheet() { const s = document.querySelector(".gs-ov"); if (s) { s.remove(); return true; } return false; }
 
-/** The grant sheet (UX critique, issue 2): before a wide answer is typed,
- *  the exact rule, the file it lands in, what else it would allow, and the
- *  narrower choice. */
+/** The grant sheet (UX critique, issue 2), agent P's (rules-suggest.js):
+ *  before a wide answer is typed, the exact rule, the file it lands in,
+ *  what else it would have allowed, and the narrower choice. It answers the
+ *  question itself on Confirm; this says what was sent and clears the card. */
 export async function grantSheet(it, i, o) {
-  const q = it.question;
-  const g = grantOf(q, o, it.agent) || { rule: o.label, where: "the session", lasting: true, says: o.grants };
-  const once = optionsOf(q).map((x, k) => [x, k]).find(([x]) => !x.grants && !x.no);
-  const also = h("ul", { class: "also" }, h("li", {}, "Reading what agents asked before…"));
-  const s = sheet({
-    kicker: `${it.agent ? it.agent.name : "The agent"} · option ${o.n}`,
-    title: g.lasting ? "Write a rule that stops it asking?" : "Stop asking for the rest of this session?",
-    body: [
-      h("p", {}, `“${o.label}” ${g.says || "grants more than this one call"}.`),
-      label(g.lasting ? "The rule Claude Code writes" : "What it turns on"), h("div", { class: "rule" }, g.rule),
-      g.lasting ? h("p", {}, "In ", h("code", {}, g.where), ". It lasts until you revoke it under More › Rules and grants.") : h("p", {}, "Until the session ends; nothing is written to a file."),
-      label("It would also allow, from what agents of this project asked"), also,
-    ],
-    actions: (done) => [
-      btn("Cancel", { onclick: done }),
-      once ? btn(`${once[0].n} ${once[0].label}, only this once`, { onclick: () => { done(); answer(it, once[1], once[0]); } }) : null,
-      btn(`${o.n} ${g.lasting ? "Write the rule" : "Turn it on"} and answer`, { danger: true, onclick: () => { done(); answer(it, i, o); } }),
-    ],
-  });
-  if (!g.prefix || !it.repo) { also.replaceChildren(h("li", {}, g.lasting ? "Any command that starts the same way." : "Everything of this kind, without asking.")); return s; }
-  try {
-    const r = await A.api(`/api/grants/preview?repo=${enc(it.repo)}&prefix=${enc(g.prefix)}`);
-    const cmds = (r.commands || []).filter((c) => c.command !== (parseJSON(q.detail, {}) || {}).command).slice(0, 3);
-    also.replaceChildren(...(cmds.length ? cmds.map((c) => h("li", { class: c.risky ? "risky" : null }, c.risky ? "⚠ " : "", c.command.split("\n")[0], c.agent ? h("span", {}, ` · ${c.agent}`) : null)) : [h("li", {}, `Any command that starts with “${g.prefix}”: no other one was asked for yet.`)]));
-  } catch { also.replaceChildren(h("li", {}, `Any command that starts with “${g.prefix}”.`)); }
-  return s;
+  const ctx = { api: A.api, get state() { return { agents: A.agents() }; }, project: it.repo ? { path: it.repo } : A.project(), go: (to) => { location.hash = to; } };
+  let r;
+  try { r = await rules.grantSheet(ctx, { question: it.question, option: i, agent: it.agent, repo: it.repo }); } catch (e) { A.toast(`The check did not open: ${e.message}`, true); return; }
+  const who = it.agent ? it.agent.name : "the agent";
+  if (r.choice === "confirm") { A.toast(`Sent “${o.n} ${o.label}” to ${who}${r.pattern ? `: ${r.pattern} is written` : ""}`); A.answered(it.id); }
+  else if (r.choice === "narrow") { A.toast(`Allowed ${who} this once, and wrote ${r.pattern} for this project's new agents`); A.answered(it.id); }
 }
 
 /** Batch answer (power users, 2): the selected cards run the identical

@@ -160,7 +160,6 @@ pub fn router(app: App) -> Router {
         // The rewrite around goals (JOURNEYS.md): the one Needs-you count,
         // and the permissions a session was granted.
         .merge(crate::needs::routes())
-        .merge(crate::grants::routes())
         .route("/guide.md", get(guide_md))
         // Sixth build: "I'm stepping away" and the presence heartbeat (src/digest.rs).
         .merge(crate::digest::routes())
