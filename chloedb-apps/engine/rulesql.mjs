@@ -382,7 +382,9 @@ export function compileSteps(text) {
 }
 
 // CREATE RULE name [(inputs)] [RETURNS ROWS | ROW | VALUE]
-//   [AFTER INSERT [OR UPDATE] [OR DELETE] ON table] AS body
+//   [AFTER INSERT [OR UPDATE] [OR DELETE] ON table [RUNS AS APP]] AS body
+// RUNS AS APP: a trigger that reaches every row, not only what the person
+// whose write fired it may (access.mjs).
 // -> { name, on, rule }
 export function compileRule(text) {
   seq = 0;
@@ -392,6 +394,15 @@ export function compileRule(text) {
   if (!m) fail('start with CREATE RULE name');
   let rest = src.slice(m[0].length);
   if (rest.startsWith('(')) rest = group(rest)[1].trim(); // the inputs, named for people: :name in the body
+  // RUNS AS APP | PERSON, before the AS of the body.
+  let runs = null;
+  const first = findWord(rest, 'AS');
+  if (first > 0 && /\bRUNS\s*$/i.test(rest.slice(0, first))) {
+    const who = rest.slice(first + 2).match(/^\s+(APP|PERSON|CALLER)\b/i);
+    if (!who) fail(`CREATE RULE ${m[1]}: RUNS AS takes APP (every row) or PERSON (what the person whose write fired it may reach)`);
+    runs = who[1].toUpperCase() === 'APP' ? 'app' : null;
+    rest = rest.slice(0, first).replace(/\bRUNS\s*$/i, ' ') + rest.slice(first + 2 + who[0].length);
+  }
   const as = findWord(rest, 'AS');
   if (as < 0) fail(`CREATE RULE ${m[1]}: AS is missing before the body`);
   const head = rest.slice(0, as).trim();
@@ -418,6 +429,7 @@ export function compileRule(text) {
   }
   if (h.trim()) fail(`CREATE RULE ${m[1]}: "${h.trim().slice(0, 40)}" is not understood; before AS come RETURNS ROW | VALUE, AFTER INSERT [OR UPDATE] [OR DELETE] ON table, and EVERY ...`);
   if (every && on) fail(`CREATE RULE ${m[1]}: a rule runs on a schedule (EVERY) or after writes (AFTER ... ON), not both`);
+  if (runs && !on) fail(`CREATE RULE ${m[1]}: RUNS AS APP is for a trigger (AFTER ... ON); a rule people call runs as them, and a schedule runs as the app`);
   if (!body) fail(`CREATE RULE ${m[1]}: the body after AS is empty`);
   const parts = splitTop(body, ';').filter((x) => x.trim());
   if (parts.length === 1 && SELECT_RE.test(parts[0])) {
@@ -428,7 +440,7 @@ export function compileRule(text) {
   if (ret) fail(`CREATE RULE ${m[1]}: RETURNS is for a rule that is one SELECT; steps give back a value with RETURN`);
   const steps = compileSteps(body);
   if (!steps.length) fail(`CREATE RULE ${m[1]}: no statements`);
-  return { name: m[1], on, every, rule: { steps } };
+  return { name: m[1], on, every, ...(runs ? { as: runs } : {}), rule: { steps } };
 }
 
 function everyOf(name, text) {
@@ -469,6 +481,7 @@ export function compileRuleStatements(plan, code) {
       f.rule = out.rule;
       f.on = out.on;
       f.every = out.every || null;
+      if (out.as) f.as = out.as; else delete f.as;
       if (out.source) f.source = true; else delete f.source;
       f.statement = code[f.slug].trim();
     } catch (e) {
@@ -601,9 +614,9 @@ function pullSql(p, as = '') {
 
 // A rule (its JSON, trigger and schedule) as a CREATE RULE (or CREATE
 // SOURCE) statement that compiles back into exactly that rule, or null.
-export function ruleStatement(slug, rule, on, every = null, source = false) {
+export function ruleStatement(slug, rule, on, every = null, source = false, as = null) {
   try {
-    const events = on && on.table ? ` AFTER ${[].concat(on.event || 'insert').map((e) => e.toUpperCase()).join(' OR ')} ON ${on.table}` : '';
+    const events = on && on.table ? ` AFTER ${[].concat(on.event || 'insert').map((e) => e.toUpperCase()).join(' OR ')} ON ${on.table}${as === 'app' ? ' RUNS AS APP' : ''}` : '';
     const when = every ? ` ${everyText(every)}` : '';
     let text;
     const one = rule && Array.isArray(rule.steps) && rule.steps.length === 1 ? rule.steps[0] : null;

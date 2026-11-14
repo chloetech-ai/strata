@@ -15,13 +15,15 @@ it behind two guards:
   cost in this studio, counted from what Claude Code reports per answer and
   kept in `DATA/spend.json` across restarts. Past it, every build and change
   fails with "this studio has reached its spending limit". Apps' own
-  questions (`app.ask`) have a share of it of their own
-  (`STRATA_APPS_ASK_CAP_USD`, a quarter by default) and builds the rest, so
-  a published app's visitors cannot stop the builds; one app's questions
-  stop at `STRATA_APPS_ASK_USD_PER_DAY` dollars a day (default 2). Calls
-  already running finish, so the total can pass the cap by a build or two.
-  `GET /api/status` shows the count (`spend`, with `asksUsd` and
-  `asksCap`).
+  questions (`app.ask`) count apart: all the apps together stop at
+  `STRATA_APPS_ASK_CAP_USD` dollars a day (a quarter of the cap by default,
+  $20 when there is no cap), and builds get the rest of the cap, so a
+  published app's visitors cannot stop the builds, nor one app's visitors
+  the other apps for more than a day; one app's questions stop at
+  `STRATA_APPS_ASK_USD_PER_DAY` dollars a day (default 2). Calls already
+  running finish, so the total can pass the cap by a build or two.
+  `GET /api/status` shows the count (`spend`, with `asksUsd`, `asksToday`
+  and `asksCap`).
 
 Also set `STRATA_APPS_EVOLVE=off`, so the studio builds nothing by itself
 from what people do.

@@ -1201,7 +1201,7 @@ __sa_ready();
             case 'me': value = null; break; // people sign in on the app's own page
             case 'companies': value = []; break;
             case 'company': value = null; break;
-            case 'signIn': case 'signUp': case 'signOut': case 'createCompany': case 'useCompany': case 'addToCompany': throw new Error('People sign in on the app’s own page; here you see the app as a visitor does');
+            case 'signIn': case 'signUp': case 'signOut': case 'createCompany': case 'useCompany': case 'addToCompany': case 'joinCompany': throw new Error('People sign in on the app’s own page; here you see the app as a visitor does');
             case 'people': value = (await api(`${base}/people`)).people; break;
             case 'files': value = (await post(`${base}/files/info`, { ids: a })).files.map((f) => ({ ...f, url: `${kit.base}${f.url}` })); break;
             case 'email': value = (await post(`${base}/email`, a)).email; break;

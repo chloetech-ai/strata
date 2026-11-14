@@ -26,7 +26,7 @@ for i in $(seq 1 60); do [ -e "$dev" ] && break; sleep 1; done
 blkid "$dev" >/dev/null 2>&1 || mkfs.ext4 -q "$dev"
 mkdir -p /mnt/ci
 mount -o discard,defaults,noatime "$dev" /mnt/ci
-install -d -o runner -g runner /mnt/ci/cargo/registry /mnt/ci/cargo/git
+install -d -o runner -g runner /mnt/ci/cargo/registry /mnt/ci/cargo/git /mnt/ci/sccache
 for d in registry git; do
   rm -rf "/home/runner/.cargo/$d"
   ln -s "/mnt/ci/cargo/$d" "/home/runner/.cargo/$d"
@@ -43,14 +43,30 @@ for i in $(seq 1 "$count"); do
   rm -rf "$dir"
   cp -a /opt/actions-runner "$dir"
   install -d -o runner -g runner "/mnt/ci/work-$i"
-  chown -R runner:runner "$dir"
+  # Each runner its own rustup and cargo homes, copied from the image's:
+  # two jobs starting at once on a fresh droplet ran rustup over the same
+  # ~/.cargo/bin, and one died of "Text file busy" on cargo while the other
+  # could not spawn rustc (11-14). The registry stays shared on the volume;
+  # cargo locks it.
+  rh=/opt/rust/$i
+  rm -rf "$rh"
+  install -d "$rh/cargo"
+  cp -a /home/runner/.rustup "$rh/rustup"
+  cp -a /home/runner/.cargo/bin "$rh/cargo/bin"
+  for d in registry git; do ln -s "/mnt/ci/cargo/$d" "$rh/cargo/$d"; done
+  chown -R runner:runner "$rh" "$dir"
   cd "$dir"
   sudo -u runner ./config.sh --unattended --replace --url "$repo_url" --token "$token" \
     --name "do-$(hostname)-$i" --labels "$label" --work "/mnt/ci/work-$i" --no-default-labels
   cat >> "$dir/.env" <<ENV
 ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci-runner/job-started.sh
 CI_RUNNER_CACHE=/mnt/ci/work-$i
+RUSTUP_HOME=$rh/rustup
+CARGO_HOME=$rh/cargo
 ENV
+  # The runner's PATH (written by config.sh) finds this runner's cargo first.
+  echo "$rh/cargo/bin:$(cat "$dir/.path" 2>/dev/null || echo /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)" > "$dir/.path"
+  chown runner:runner "$dir/.path"
   cat > "/etc/systemd/system/ci-runner-$i.service" <<UNIT
 [Unit]
 Description=GitHub Actions runner $i

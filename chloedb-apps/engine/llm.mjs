@@ -62,26 +62,38 @@ export function modelFor(provider, model) {
 // counted.
 //
 // Apps' own model calls (app.ask, which a published app's visitors set off)
-// count against a share of the cap of their own, `asksCap`
-// (STRATA_APPS_ASK_CAP_USD, by default a quarter of the cap), and builds
-// against the rest, so that traffic to apps never stops the studio's builds,
-// nor builds the apps (audit N-G3).
+// count apart from builds, so that traffic to apps never stops the studio's
+// builds, nor builds the apps (audit N-G3). All the apps together may spend
+// `asksCap` a day (STRATA_APPS_ASK_CAP_USD: by default a quarter of the cap,
+// and $20 when there is no cap, so a published app always has a dollar stop;
+// 0 is no daily stop), and each app a day of its own within it
+// (STRATA_APPS_ASK_USD_PER_DAY, reach.mjs). The share is a day's, not a
+// lifetime's: one app's visitors filling it stops the other apps until the
+// next day (UTC), not for good (audit 4, X-G5). Builds get the cap less
+// what the apps have spent, all told (asksUsd).
 const CAP = Number(process.env.STRATA_APPS_SPEND_CAP_USD) || 0;
-const ASKS_CAP = process.env.STRATA_APPS_ASK_CAP_USD !== undefined && process.env.STRATA_APPS_ASK_CAP_USD !== '' ? Math.max(0, Number(process.env.STRATA_APPS_ASK_CAP_USD) || 0) : CAP / 4;
-export const spend = { cap: CAP, asksCap: CAP ? Math.min(ASKS_CAP, CAP) : ASKS_CAP, usd: 0, asksUsd: 0, calls: 0, refused: 0, since: new Date().toISOString(), file: null };
+const ASKS_CAP = process.env.STRATA_APPS_ASK_CAP_USD !== undefined && process.env.STRATA_APPS_ASK_CAP_USD !== '' ? Math.max(0, Number(process.env.STRATA_APPS_ASK_CAP_USD) || 0) : CAP ? CAP / 4 : 20;
+const today = () => new Date().toISOString().slice(0, 10);
+export const spend = { cap: CAP, asksCap: CAP ? Math.min(ASKS_CAP, CAP) : ASKS_CAP, usd: 0, asksUsd: 0, asksDay: today(), asksDayUsd: 0, calls: 0, refused: 0, since: new Date().toISOString(), file: null };
+// The apps' spend today, from 0 when a new day starts.
+function asksToday() {
+  if (spend.asksDay !== today()) Object.assign(spend, { asksDay: today(), asksDayUsd: 0 });
+  return spend.asksDayUsd;
+}
 let saving = Promise.resolve();
 export async function useSpendFile(file) {
   spend.file = file;
   try {
     const j = JSON.parse(await readFile(file, 'utf8'));
     if (Number.isFinite(j.usd)) Object.assign(spend, { usd: j.usd, asksUsd: Number(j.asksUsd) || 0, calls: j.calls || 0, refused: j.refused || 0, since: j.since || spend.since });
+    if (j.asksDay === today()) spend.asksDayUsd = Number(j.asksDayUsd) || 0;
   } catch { /* first start */ }
   return spend;
 }
 function saveSpend() {
   if (!spend.file) return;
-  const { usd, asksUsd, calls, refused, since, cap, asksCap } = spend;
-  saving = saving.then(() => writeFile(`${spend.file}.tmp`, JSON.stringify({ usd, asksUsd, calls, refused, since, cap, asksCap }))
+  const { usd, asksUsd, asksDay, asksDayUsd, calls, refused, since, cap, asksCap } = spend;
+  saving = saving.then(() => writeFile(`${spend.file}.tmp`, JSON.stringify({ usd, asksUsd, asksDay, asksDayUsd, calls, refused, since, cap, asksCap }))
     .then(() => rename(`${spend.file}.tmp`, spend.file))).catch(() => {});
 }
 // Why a call of `bucket` ('build': the studio's own; 'asks': an app's
@@ -93,7 +105,8 @@ export function overCap(bucket = 'build') {
     return Object.assign(new Error(text), { status: 402, refused: true });
   };
   if (bucket === 'asks') {
-    if (spend.asksCap && spend.asksUsd >= spend.asksCap) return refuse(`this studio's apps have reached their share of its spending limit for the model ($${spend.asksUsd.toFixed(2)} of $${spend.asksCap}); the studio's builds go on; ask whoever runs it to raise STRATA_APPS_ASK_CAP_USD`);
+    const day = asksToday();
+    if (spend.asksCap && day >= spend.asksCap) return refuse(`this studio's apps have reached their spending limit for the model today ($${day.toFixed(2)} of $${spend.asksCap} a day); they can ask again tomorrow, and the studio's builds go on; ask whoever runs it to raise STRATA_APPS_ASK_CAP_USD`);
     if (spend.cap && spend.usd >= spend.cap) return refuse(`this studio has reached its spending limit for the model ($${spend.usd.toFixed(2)} of $${spend.cap}); ask whoever shared it to raise the limit`);
     return null;
   }
@@ -106,7 +119,7 @@ export function overCap(bucket = 'build') {
 
 function counted(cost, bucket) {
   spend.usd += cost;
-  if (bucket === 'asks') spend.asksUsd += cost;
+  if (bucket === 'asks') { asksToday(); spend.asksUsd += cost; spend.asksDayUsd += cost; }
   spend.calls++;
   saveSpend();
 }

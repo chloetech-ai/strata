@@ -7,7 +7,7 @@
 // self-signed one is shown by its SHA-256 and pinned once trusted) and the
 // key (/v1/whoami with it).
 
-import { h, icon, clear, fmt, api, toast, confirm, card, empty, failure, pill, copy, menu, connectionName } from "../core.js";
+import { h, icon, clear, fmt, api, toast, confirm, card, empty, failure, pill, copy, menu, connectionName, experimental } from "../core.js";
 
 export default {
   id: "connections", title: "Connections", icon: "key", group: "Change",
@@ -21,7 +21,8 @@ const short = (fp) => (fp ? fp.slice(0, 16).replace(/(..)(?=.)/g, "$1:") + "…"
 function render(page) {
   const list = h("div", { class: "stack" });
   const side = h("div", { class: "stack" });
-  page.append(h("div", { class: "conn-grid" }, list, side));
+  page.append(h("p", { class: "small dim", style: { margin: "0 0 12px" } }, experimental("The hub"), " Connections and the calls forwarded through them may change in any release."),
+    h("div", { class: "conn-grid" }, list, side));
   let hub = null;
   async function load() {
     try { hub = await api("/v1/admin/hub", { hub: true }); }

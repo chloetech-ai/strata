@@ -49,6 +49,40 @@ test('decisions: roles include the ones above them, scopes need a person or a co
   assert.deepEqual(decide(firm, 'read', { ...member, company: 'c1' }), { scope: [{ col: 'company_id', by: 'company' }] });
 });
 
+test('in an app that declares access, a table that declares none is read by everyone and written by its owner only (audit 4, X-G2)', () => {
+  const open = { name: 'products', columns: [] };
+  const visitor = { role: 'visitor', user: null };
+  const member = { role: 'member', user: { id: 'u1' } };
+  const owner = { role: 'owner', user: { id: 'u0' } };
+  for (const a of ['read', 'add', 'change', 'remove']) assert.deepEqual(decide(open, a, member), { all: true }, 'an app that declares nothing is as before');
+  assert.deepEqual(decide(open, 'read', visitor, { closed: true }), { all: true });
+  for (const a of ['add', 'change', 'remove']) {
+    for (const who of [visitor, member]) assert.throws(() => decide(open, a, who, { closed: true }), (e) => e.status === 403 && /products is read-only here: only the app's owner/.test(e.message));
+    assert.deepEqual(decide(open, a, owner, { closed: true }), { all: true });
+    assert.deepEqual(decide(open, a, null, { closed: true }), { all: true }, 'the studio');
+  }
+  const declared = { name: 'orders', access: ['ALLOW ADD ON orders TO everyone'] };
+  assert.deepEqual(decide(declared, 'add', visitor, { closed: true }), { all: true }, "a table's own statements hold");
+});
+
+test('a trigger runs as the person unless it says RUNS AS APP, and the statement keeps it (audit 4, X-G4)', async () => {
+  const { compileRule, ruleStatement } = await import('../engine/rulesql.mjs');
+  const { toSource } = await import('../engine/source.mjs');
+  const r = compileRule("CREATE RULE tally AFTER INSERT ON orders RUNS AS APP AS UPDATE totals SET n = n + 1 WHERE id = 'all'");
+  assert.equal(r.as, 'app');
+  assert.deepEqual(r.on, { table: 'orders', event: 'insert' });
+  assert.equal(compileRule("CREATE RULE tally AFTER INSERT ON orders AS UPDATE totals SET n = n + 1 WHERE id = 'all'").as, undefined);
+  assert.equal(compileRule("CREATE RULE tally AFTER INSERT ON orders RUNS AS PERSON AS UPDATE totals SET n = n + 1 WHERE id = 'all'").as, undefined);
+  assert.throws(() => compileRule("CREATE RULE x RUNS AS APP AS UPDATE totals SET n = 1 WHERE id = 'a'"), /RUNS AS APP is for a trigger/);
+  assert.throws(() => compileRule("CREATE RULE x AFTER INSERT ON orders RUNS AS ROOT AS UPDATE totals SET n = 1 WHERE id = 'a'"), /RUNS AS takes APP/);
+  const text = ruleStatement('tally', r.rule, r.on, null, false, 'app');
+  assert.match(text, /AFTER INSERT ON orders RUNS AS APP AS/);
+  assert.equal(compileRule(text).as, 'app');
+  assert.doesNotMatch(ruleStatement('tally', r.rule, r.on), /RUNS AS/);
+  assert.match(toSource({ kind: 'function', slug: 'tally', code: 'function run() {}', spec: { on: { table: 'orders', event: 'insert' }, as: 'app' } }), /^CREATE FUNCTION tally AFTER INSERT ON orders RUNS AS APP/);
+  assert.match(toSource({ kind: 'function', slug: 'tally', code: JSON.stringify(r.rule), spec: { rule: true, on: r.on, as: 'app' } }), /RUNS AS APP AS/);
+});
+
 test('a scope joins the WHERE of every SELECT that reads the table, so search and joins keep working', () => {
   const scope = (n) => (n === 'notes' ? { sql: (a, { left }) => (left ? `(${a}.owner_id = :sa_user_id OR ${a}.id IS NULL)` : `(${a}.owner_id = :sa_user_id)`) } : null);
   const rw = (q) => rewriteSql(q, ['notes', 'tags'], (t) => `app_x_${t}`, { scope }).sql;
@@ -170,7 +204,7 @@ test('a published app: visitors, members, row scopes by person and by company, e
     assert.equal(v.status, 401, JSON.stringify(v.body));
     assert.match(v.body.error, /^Sign in first/);
     assert.equal((await call('/insert', { table: 'receivables', row: { customer: 'Mallory' } })).status, 401);
-    // A table that declares nothing is as before.
+    // A table that declares nothing, in an app that declares access, is read by everyone.
     assert.deepEqual((await sql('SELECT name FROM products')).body.rows, [{ name: 'Widget' }]);
     // A function that needs :user_id, called by a visitor: a clean refusal.
     const fn = await call('/call', { name: 'mine', input: {} });
@@ -220,6 +254,7 @@ test('a published app: visitors, members, row scopes by person and by company, e
     assert.equal((await sql('SELECT title FROM invoices', B)).status, 403);
     assert.equal((await call('/companies/members', { company: acme.id, email: 'alice@example.com' }, B)).status, 403, 'only its admins add people');
     assert.equal((await call('/companies/members', { company: acme.id, email: 'bob@example.com', role: 'member' }, A)).status, 200);
+    assert.equal((await call('/companies/join', { company: acme.id }, B)).status, 200, 'an invitation, joined');
     assert.deepEqual((await sql('SELECT title FROM invoices', B)).body.rows, [{ title: 'Acme invoice' }]);
     const beta = (await call('/companies', { name: 'Beta' }, B)).body.company;
     assert.deepEqual((await sql('SELECT title FROM invoices', { ...B, company: beta.id })).body.rows, [], 'the company chosen now');
@@ -228,6 +263,155 @@ test('a published app: visitors, members, row scopes by person and by company, e
     assert.deepEqual((await sql('SELECT title FROM invoices', { ...B, company: 'not-mine' })).body.rows, [{ title: 'Acme invoice' }], 'a company one is not in falls back to one of theirs');
     const listed = (await call('/companies', undefined, B)).body;
     assert.deepEqual(listed.companies.map((c) => c.name).sort(), ['Acme', 'Beta']);
+  } finally {
+    if (engineProc) { engineProc.kill('SIGTERM'); await new Promise((r) => { if (engineProc.exitCode !== null) r(); else engineProc.on('exit', r); }); }
+    strata.kill();
+  }
+});
+
+// ---- audit 4, X-G2 to X-G5, over a real chloedb-server (ports 7951 and 7961)
+
+test('a published app: undeclared tables close once access is declared, invitations to companies, triggers as the person, email to the app\'s people', async (t) => {
+  const { findServerBinary, startServer } = await import('../engine/strata.mjs');
+  const { Store } = await import('../engine/store.mjs');
+  const bin = findServerBinary(join(import.meta.dirname, '..', '..'));
+  if (!bin) {
+    if (process.env.STRATA_APPS_NEED_SERVER === '1') throw new Error('no chloedb-server binary');
+    return t.skip('no chloedb-server binary');
+  }
+  const dir = mkdtempSync('/tmp/sa-access-');
+  const { child: strata, client } = await startServer({ bin, db: join(dir, 'apps.strata'), listen: '127.0.0.1:7951', log: () => {} });
+  let engineProc = null;
+  try {
+    const store = new Store(client, () => {});
+    await store.init();
+    const have = new Set(await store.tableNames());
+    const make = async (name, tables, functions = []) => {
+      const app = await store.createApp({ name });
+      const caps = [];
+      for (const spec of tables) {
+        await store.ensureTable(app, spec, have);
+        caps.push(await store.putCapability({ app, slug: spec.name, kind: 'table', title: spec.name, spec, code: '' }));
+      }
+      for (const f of functions) caps.push(await store.putCapability({ app, kind: 'function', title: f.slug, ...f }));
+      await store.writeComposition(app, caps, 'first', name);
+      await store.putSetting(app, 'publish', JSON.stringify({ on: true, name: name.toLowerCase(), access: 'add' }));
+      return app;
+    };
+    // A shop that declares access on its orders, and leaves products and
+    // totals undeclared; two triggers keep a count of every order, one as
+    // the person whose order fired it, one as the app.
+    const tally = (id) => `function run(input, app) { const n = app.sql('SELECT COUNT(*) AS n FROM orders')[0].n; app.insert('totals', { id: '${id}', n: Number(n) }); return n; }`;
+    const shop = await make('Shop', [
+      { name: 'orders', columns: [{ name: 'item', type: 'text' }, { name: 'company_id', type: 'keyword' }], access: ['ALLOW ADD ON orders TO everyone', 'ALLOW READ ON orders TO owner'] },
+      { name: 'products', columns: [{ name: 'name', type: 'text' }] },
+      { name: 'totals', columns: [{ name: 'n', type: 'int' }] },
+      { name: 'invoices', columns: [{ name: 'title', type: 'text' }, { name: 'company_id', type: 'keyword' }], access: ['ALLOW ALL ON invoices TO members WHERE company_id = :company_id'] },
+    ], [
+      { slug: 'tally-person', spec: { on: { table: 'orders', event: 'insert' } }, code: tally('person') },
+      { slug: 'tally-app', spec: { on: { table: 'orders', event: 'insert' }, as: 'app' }, code: tally('app') },
+      { slug: 'notify', spec: { on: null }, code: "function run(input, app) { return app.email({ to: input.to, subject: 'Hello', text: 'from the shop' }); }" },
+    ]);
+    // A board from before access was declared: the publish choice holds.
+    const board = await make('Board', [{ name: 'posts', columns: [{ name: 'text', type: 'text' }] }]);
+    await client.write([{ op: 'insert', table: `app_${shop}_products`, doc: { id: 'p1', name: 'Widget' } },
+      { op: 'insert', table: `app_${shop}_orders`, doc: { id: 'o0', item: 'earlier' } }]);
+
+    const TOKEN = 'access-test-token-2';
+    engineProc = spawn(process.execPath, [join(import.meta.dirname, '..', 'engine', 'server.mjs'), '--port', '7961', '--strata', 'http://127.0.0.1:7951', '--data', join(dir, 'engine')],
+      { env: { ...process.env, STRATA_APP_TOKEN: TOKEN, STRATA_APPS_SCHEDULES: 'off', STRATA_APPS_AUTOREPAIR: '0', STRATA_APPS_TILES: 'off', STRATA_APPS_GEOCODER: 'off' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    engineProc.stdout.on('data', (d) => { out += d; });
+    engineProc.stderr.on('data', (d) => { out += d; });
+    const base = 'http://127.0.0.1:7961';
+    for (let i = 0; ; i++) {
+      try { if ((await fetch(`${base}/healthz`)).ok) break; } catch { /* starting */ }
+      if (i > 600 || engineProc.exitCode !== null) throw new Error(`the engine did not start:\n${out.slice(-2000)}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const call = async (app, path, body, { cookie, studio, company } = {}) => {
+      const headers = { 'content-type': 'application/json', ...(cookie ? { cookie } : {}), ...(studio ? { authorization: `Bearer ${TOKEN}` } : {}), ...(company ? { 'x-sa-company': company } : {}) };
+      const res = await fetch(`${base}/api/apps/${app}${path}`, { method: body === undefined ? 'GET' : 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { status: res.status, body: await res.json().catch(() => ({})), cookie: (res.headers.get('set-cookie') || '').split(';')[0] };
+    };
+    const sql = (app, q, opts) => call(app, '/sql', { sql: q }, opts);
+
+    // X-G2: once the shop declares access, its undeclared tables are read by
+    // everyone and written by its owner only.
+    assert.deepEqual((await sql(shop, 'SELECT name FROM products')).body.rows, [{ name: 'Widget' }]);
+    const forged = await call(shop, '/insert', { table: 'products', row: { name: 'Free stuff' } });
+    assert.equal(forged.status, 403, JSON.stringify(forged.body));
+    assert.match(forged.body.error, /products is read-only here: only the app's owner/);
+    assert.equal((await call(shop, '/update', { table: 'products', id: 'p1', fields: { name: 'Mine now' } })).status, 403);
+    assert.equal((await call(shop, '/remove', { table: 'products', id: 'p1' })).status, 403);
+    const alice = await call(shop, '/signup', { email: 'alice@example.com', name: 'Alice', password: 'correct horse' });
+    const bob = await call(shop, '/signup', { email: 'bob@example.com', name: 'Bob', password: 'battery staple' });
+    const carol = await call(shop, '/signup', { email: 'carol@example.com', name: 'Carol', password: 'tr0ub4dor' });
+    const A = { cookie: alice.cookie };
+    const B = { cookie: bob.cookie };
+    const C = { cookie: carol.cookie };
+    assert.equal((await call(shop, '/insert', { table: 'products', row: { name: 'Free stuff' } }, A)).status, 403, 'a member too');
+    assert.equal((await call(shop, '/insert', { table: 'products', row: { name: 'New' } }, { studio: true })).status, 200, 'the studio has every row');
+    // The board declares nothing: a visitor adds, and edits only their own.
+    const post = await call(board, '/insert', { table: 'posts', row: { text: 'hello', created: '2001-01-01T00:00:00Z' } });
+    assert.equal(post.status, 200, JSON.stringify(post.body));
+    assert.notEqual(String(post.body.row.created).slice(0, 4), '2001', 'a visitor does not date their rows');
+    const theirs = await call(board, '/insert', { table: 'posts', row: { text: 'the owner\'s' } }, { studio: true });
+    assert.equal((await call(board, '/update', { table: 'posts', id: theirs.body.row.id, fields: { text: 'defaced' } })).status, 403);
+
+    // X-G4: a visitor's order fires both triggers. The one that runs as the
+    // visitor cannot read every order (only the owner may), so it writes
+    // nothing; the one that runs as the app keeps the count.
+    const order = await call(shop, '/insert', { table: 'orders', row: { item: 'tea' } });
+    assert.equal(order.status, 200, JSON.stringify(order.body));
+    let totals = [];
+    for (let i = 0; i < 100; i++) {
+      totals = (await sql(shop, 'SELECT id, n FROM totals ORDER BY id', { studio: true })).body.rows || [];
+      if (totals.length) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    totals = (await sql(shop, 'SELECT id, n FROM totals ORDER BY id', { studio: true })).body.rows;
+    assert.deepEqual(totals, [{ id: 'app', n: 2 }], 'only the trigger that runs as the app reads every order');
+    assert.equal((await sql(shop, 'SELECT item FROM orders')).status, 401, 'the visitor still reads no orders');
+
+    // X-G3: an admin of a company invites; the company is the person's only
+    // once they join it, so their rows do not land in it unasked.
+    const acme = (await call(shop, '/companies', { name: 'Acme' }, A)).body.company;
+    await call(shop, '/insert', { table: 'invoices', row: { id: 'i1', title: 'Acme invoice', company_id: acme.id } }, { studio: true });
+    const invited = await call(shop, '/companies/members', { company: acme.id, email: 'bob@example.com' }, A);
+    assert.equal(invited.status, 200, JSON.stringify(invited.body));
+    assert.equal(invited.body.member.invited, 'member');
+    const listed = (await call(shop, '/companies', undefined, B)).body;
+    assert.deepEqual(listed.companies.map((c) => [c.name, c.role, c.invited]), [['Acme', null, 'member']]);
+    assert.equal(listed.current, null, 'an invitation is not a company one works in');
+    assert.equal((await sql(shop, 'SELECT title FROM invoices', B)).status, 403);
+    assert.equal((await sql(shop, 'SELECT title FROM invoices', { ...B, company: acme.id })).status, 403, 'nor can it be chosen');
+    const written = await call(shop, '/insert', { table: 'invoices', row: { title: 'Bob, alone' } }, B);
+    assert.equal(written.status, 403, 'nothing Bob writes lands in Acme before he joins');
+    assert.equal((await call(shop, '/companies/members', { company: acme.id, email: 'carol@example.com' }, B)).status, 403, 'an invited person is no admin');
+    assert.equal((await call(shop, '/companies/join', { company: acme.id }, C)).status, 404, 'a company that did not invite you');
+    const joined = await call(shop, '/companies/join', { company: acme.id }, B);
+    assert.deepEqual(joined.body.member, { company: acme.id, role: 'member' });
+    assert.deepEqual((await sql(shop, 'SELECT title FROM invoices', B)).body.rows, [{ title: 'Acme invoice' }]);
+    // A member of two companies cannot move a row from one to the other.
+    const beta = (await call(shop, '/companies', { name: 'Beta' }, B)).body.company;
+    assert.equal((await call(shop, '/update', { table: 'invoices', id: 'i1', fields: { title: 'moved' } }, { ...B, company: beta.id })).status, 403);
+    assert.equal((await call(shop, '/update', { table: 'invoices', id: 'i1', fields: { company_id: beta.id } }, { ...B, company: acme.id })).status, 403);
+    assert.equal((await call(shop, '/remove', { table: 'invoices', id: 'i1' }, { ...B, company: beta.id })).status, 403);
+    // The admin changes a member's role at once.
+    assert.equal((await call(shop, '/companies/members', { company: acme.id, email: 'bob@example.com', role: 'admin' }, A)).body.member.role, 'admin');
+
+    // X-G5: a member writes only to the app's own people, from a view or
+    // through a function they call.
+    const toStranger = await call(shop, '/email', { to: 'stranger@example.org', subject: 'Buy now' }, B);
+    assert.equal(toStranger.status, 403, JSON.stringify(toStranger.body));
+    assert.match(toStranger.body.error, /writes only to its own people; stranger@example\.org is not one of them/);
+    assert.equal((await call(shop, '/email', { to: 'alice@example.com', subject: 'Lunch?' }, B)).status, 200);
+    assert.equal((await call(shop, '/call', { name: 'notify', input: { to: 'stranger@example.org' } }, B)).status, 403);
+    assert.equal((await call(shop, '/call', { name: 'notify', input: { to: 'stranger@example.org' } })).status, 403, 'a visitor too');
+    assert.equal((await call(shop, '/call', { name: 'notify', input: { to: 'carol@example.com' } }, B)).status, 200);
+    assert.equal((await call(shop, '/call', { name: 'notify', input: { to: 'stranger@example.org' } }, { studio: true })).status, 200, 'the studio writes to anyone');
   } finally {
     if (engineProc) { engineProc.kill('SIGTERM'); await new Promise((r) => { if (engineProc.exitCode !== null) r(); else engineProc.on('exit', r); }); }
     strata.kill();

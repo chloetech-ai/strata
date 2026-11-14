@@ -24,10 +24,14 @@ pub const CLASSIC: &str = include_str!("../ui/classic.html");
 
 const JS: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
+const SVG: &str = "image/svg+xml";
 
 /// Each file under `/ui/`: its path there, type and contents.
 pub const FILES: &[(&str, &str, &str)] = &[
     ("app.css", CSS, include_str!("../ui/app/app.css")),
+    ("brand/chloedb-icon.svg", SVG, include_str!("../ui/app/brand/chloedb-icon.svg")),
+    ("brand/chloedb-mark.svg", SVG, include_str!("../ui/app/brand/chloedb-mark.svg")),
+    ("brand/chloedb-mark-on-light.svg", SVG, include_str!("../ui/app/brand/chloedb-mark-on-light.svg")),
     ("core.js", JS, include_str!("../ui/app/core.js")),
     ("charts.js", JS, include_str!("../ui/app/charts.js")),
     ("data.js", JS, include_str!("../ui/app/data.js")),

@@ -1,0 +1,48 @@
+name: One-way doors
+
+# Whether a pull request's one-way-door box (.github/pull_request_template.md)
+# matches its diff: a change to a path of a door in .github/CODEOWNERS (the
+# on-disk format, the shard protocol and replication, authentication, what
+# people install) must tick "Yes" and say which door, and then waits for a
+# human review. .github/scripts/door_check.py has the rules and writes the
+# receipt (the doors, their paths, the box) into the job's summary.
+#
+# A workflow of its own, not a job of CI, so that editing the description
+# runs this check again (event `edited`) without running CI's matrix. It
+# reports the check `One-way doors`; it gates main once the ruleset requires
+# that check beside `CI result` (a repository setting, not this file).
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  # The merge queue's run passes: the box was checked on the pull request.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: doors-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  doors:
+    name: One-way doors
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: The rules and CODEOWNERS' doors
+        run: |
+          python3 .github/scripts/door_check.py --self-test
+          python3 .github/scripts/door_check.py --check-paths
+      - name: The box against the diff
+        if: github.event_name == 'pull_request'
+        env:
+          # The description through the environment, never into the script.
+          BODY: ${{ github.event.pull_request.body }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          printf '%s' "$BODY" > "$RUNNER_TEMP/body.md"
+          git fetch --no-tags --depth=1 origin "$BASE"
+          git diff --name-only "$BASE" HEAD > "$RUNNER_TEMP/changed"
+          python3 .github/scripts/door_check.py --body "$RUNNER_TEMP/body.md" < "$RUNNER_TEMP/changed"

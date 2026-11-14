@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>chloedb-apps: apps built from a description · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="chloedb-apps is a prototype app engine on ChloeDB. You describe an app in a sentence (&quot;a stock room: items, suppliers, what is low, purchase orders&quot;), and the engine has a model plan and write it, checks what it…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/apps.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -223,7 +226,7 @@ kubectl -n strata patch strata demo --type merge -p &#x27;{&quot;spec&quot;: {
 <ul>
 <li><strong>Run alone, the studio has no sign-in.</strong> Anyone who can reach it can change any app and spend on the model. Keep it on <code>127.0.0.1</code>, put it behind the shared-key gate in <code>chloedb-apps/deploy/</code> (a link with a key, kept in a cookie), or run it beside a cluster (<a href="#on-a-cluster">above</a>), where it signs in the cluster's admins.</li>
 <li><strong>An app is for the people who run the studio until its owner publishes it.</strong> Beside a cluster, an app's own pages need the studio's sign-in, so only the cluster's admins open them, until its owner publishes it (<a href="#on-a-cluster">above</a>): then anyone with its address uses it as far as the owner chose, and signs up and in with the engine's own accounts. Signing in with Google and others is planned.</li>
-<li><strong>Set a spending limit.</strong> <code>STRATA_APPS_SPEND_CAP_USD</code> stops the model once the engine has spent that much, counted from what Claude Code reports and kept across restarts. The apps' own questions have a share of it of their own (<code>STRATA_APPS_ASK_CAP_USD</code>, a quarter by default) and builds and checks the rest, so a published app's visitors cannot stop the studio's builds, nor builds the apps; one app's questions stop at $2 a day (<code>STRATA_APPS_ASK_USD_PER_DAY</code>). A published app suggests changes from its use rather than building them, unless its owner sets its mode to build.</li>
+<li><strong>Set a spending limit.</strong> <code>STRATA_APPS_SPEND_CAP_USD</code> stops the model once the engine has spent that much, counted from what Claude Code reports and kept across restarts. The apps' own questions count apart: together they stop at a day's share (<code>STRATA_APPS_ASK_CAP_USD</code>, a quarter of the limit by default, and $20 a day with no limit set), and builds and checks get the rest, so a published app's visitors cannot stop the studio's builds, nor builds the apps, nor one app the others for more than a day; one app's questions stop at $2 a day (<code>STRATA_APPS_ASK_USD_PER_DAY</code>). A published app suggests changes from its use rather than building them, unless its owner sets its mode to build.</li>
 <li><strong>App data is checked in code, not on the server.</strong> People sign in to apps, but row rules (<code>lib.access</code>) run in the app's views and functions; the server does not enforce them yet.</li>
 <li><strong>A piece that passes the checks can still be wrong.</strong> The engine opens every view after a build, draws each on a phone and a computer (with Playwright installed), fixes what its rules measure, and runs the app's tests; going back a version is the safety net for the rest.</li>
 </ul>
@@ -239,7 +242,7 @@ kubectl -n strata patch strata demo --type merge -p &#x27;{&quot;spec&quot;: {
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>
