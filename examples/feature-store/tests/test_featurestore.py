@@ -87,6 +87,11 @@ def test_the_app_is_listed_and_serves_its_view(demo):
 
 
 def test_point_in_time_and_leakage(demo):
+    # The random order reads no features (DAP-20: the Shop said 489 rows by
+    # key a request for it).
+    r = demo("/api/shop?user=u010")
+    assert r["model"] == "random" and r["rows"] == 0
+    assert demo("/api/state")["serve"]["rows"] == 0
     asof = demo("/api/train", {})
     leaky = demo("/api/train", {"leaky": True})
     assert asof["train_rows"] > 1000
@@ -104,6 +109,8 @@ def test_point_in_time_and_leakage(demo):
     demo("/api/deploy", {"id": asof["id"]})
     r = demo("/api/shop?user=u010")
     assert r["model"] == asof["id"] and len(r["items"]) == fs.K
+    # The shopper's row, two of each product's, one of each category's.
+    assert r["rows"] == 1 + 2 * r["candidates"] + len(demo("/api/users")["categories"])
     scores = [e["score"] for e in r["items"]]
     assert scores == sorted(scores, reverse=True)
 
@@ -183,6 +190,7 @@ def test_workflows_chain_search_train_and_serve(demo):
     demo("/api/deploy", {"id": m["id"]})
     r = demo("/api/shop?user=u010")
     assert r["model"] == m["id"] and len(r["items"]) == fs.K
+    assert r["rows"] > 0, "a model on the workflows reads its rows by key"
     demo("/api/wf/delete", {"name": "t_chain"})
     # The deployed model reads item_signals, which no workflow reads: its
     # delete is refused while the model serves (DAP-11: it dropped the

@@ -362,7 +362,7 @@ class App:
         self.model = None  # the deployed model, as a row (dict) with "m"
         self.changed = {"user": set(), "item": set(), "uc": set()}
         self.counts = {"impressions": 0, "clicks": 0, "writes": 0, "snap_rows": 0, "trend_runs": 0, "requests": 0}
-        self.serve_ms = Ring(2000)      # (t, total, fetch, transform, score)
+        self.serve_ms = Ring(2000)      # (t, total, fetch, transform, score, rows read by key)
         self.write_ms = Ring(2000)      # (t, ms, ops)
         self.fresh_ms = Ring(600)       # (t, ms): a click written to visible in the features
         self.jobs = Ring(200)           # {t, job, ms, rows}
@@ -464,7 +464,7 @@ class App:
         items = self.world.items
         if model is None:
             ids = random.sample([it["id"] for it in items], K)
-            return {"items": [{"id": i, "score": None} for i in ids], "model": "random", "ms": {"fetch": 0, "transform": 0, "score": 0, "total": (time.perf_counter() - t0) * 1000}}
+            return {"items": [{"id": i, "score": None} for i in ids], "model": "random", "ms": {"fetch": 0, "transform": 0, "score": 0, "total": (time.perf_counter() - t0) * 1000}, "rows": 0}
         if model.get("spec"):
             return self.rank_workflows(user_id, model, explain, t0)
         keys = [it["id"] for it in items]
@@ -497,7 +497,8 @@ class App:
                           "features": dict(zip(FEATURES, x)), "contrib": dict(zip(FEATURES, contributions(m, x)))})
             out.append(e)
         ms = {"fetch": (t2 - t1) * 1000, "transform": (t3 - t2) * 1000, "score": (t4 - t3) * 1000, "total": (t4 - t0) * 1000}
-        return {"items": out, "model": model["id"], "ms": ms, "candidates": len(items)}
+        # Rows read by key: the shopper's, two of each product's, one of each category's.
+        return {"items": out, "model": model["id"], "ms": ms, "candidates": len(items), "rows": 1 + len(io) + len(tr) + len(ucs)}
 
     def context(self, user_id, it):
         """What the shop knows of a request for each product: the columns of
@@ -511,6 +512,7 @@ class App:
         ctxs = [self.context(user_id, it) for it in items]
         t1 = time.perf_counter()
         got = {}
+        n_rows = 0
         for j in spec["joins"]:
             cols = [f.split(".", 1)[1] for f in feats if f.split(".", 1)[0] == j["workflow"]]
             if not cols:
@@ -519,6 +521,7 @@ class App:
                 raise ValueError(f"the shop does not know {j['on']} before an impression")
             keys = sorted({str(c[j["on"]]) for c in ctxs})
             got[j["workflow"]] = (j["on"], dict(zip(keys, self.db.get(wfm.target(j["workflow"]), keys, cols))))
+            n_rows += len(keys)
         t2 = time.perf_counter()
         X = []
         for c in ctxs:
@@ -544,7 +547,7 @@ class App:
                           "features": dict(zip(feats, x)), "contrib": dict(zip(feats, contributions(m, x)))})
             out.append(e)
         ms = {"fetch": (t2 - t1) * 1000, "transform": (t3 - t2) * 1000, "score": (t4 - t3) * 1000, "total": (t4 - t0) * 1000}
-        return {"items": out, "model": model["id"], "ms": ms, "candidates": len(items), "reads": len(got)}
+        return {"items": out, "model": model["id"], "ms": ms, "candidates": len(items), "reads": len(got), "rows": n_rows}
 
     def session_ops(self, now, ranked, user=None):
         w = self.world
@@ -655,7 +658,7 @@ class App:
                 t = time.perf_counter()
                 user = self.world.r.choices(self.world.users, self.world.weights)[0]
                 ranked = self.rank(user["id"])
-                self.serve_ms.add((int(time.time() * 1000), ranked["ms"]["total"], ranked["ms"]["fetch"], ranked["ms"]["transform"], ranked["ms"]["score"]))
+                self.serve_ms.add((int(time.time() * 1000), ranked["ms"]["total"], ranked["ms"]["fetch"], ranked["ms"]["transform"], ranked["ms"]["score"], ranked["rows"]))
                 self.counts["requests"] += 1
                 now = int(time.time() * 1000)
                 ops = self.session_ops(now, ranked if ranked["model"] != "random" else None, user)
@@ -898,7 +901,9 @@ class App:
             "now": now, "phase": self.phase, "running": self.running, "rate": self.rate, "error": self.error,
             "counts": self.counts, "model": self.model and self.model_view(self.model),
             "serve": {"p50": pct([x[1] for x in recent], 0.5), "p99": pct([x[1] for x in recent], 0.99),
-                      "fetch_p50": pct([x[2] for x in recent], 0.5), "n": len(recent)},
+                      "fetch_p50": pct([x[2] for x in recent], 0.5), "n": len(recent),
+                      # Rows read by key by the last request (0: the random order reads none).
+                      "rows": recent[-1][5] if recent else None},
             "write": {"p50": pct([x[1] for x in writes], 0.5), "p99": pct([x[1] for x in writes], 0.99)},
             "fresh": {"p50": pct(fresh, 0.5), "p99": pct(fresh, 0.99)},
             "rates": {"impressions": last[1], "clicks": last[2], "requests": last[3]},
