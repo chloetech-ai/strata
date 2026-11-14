@@ -261,7 +261,7 @@ jobs:
     # out of time starts the next one cold too: chloedb-server's tests took
     # 59 minutes from a cold build on the macOS runner on 11-08, and Clippy
     # after them did not fit in 60.
-    timeout-minutes: ${{ matrix.os == 'macos-latest' && 90 || 60 }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && (vars.MAC_RUNNER && 150 || 90) || 60 }}
     env: &test-env
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.crate == 'chloedb' && '-C target-cpu=x86-64-v3' || '' }}
       # On Linux, GitHub's runners and the on-demand one have Postgres, and
@@ -352,7 +352,9 @@ jobs:
   # `chloedb-mac`) when the repository variable MAC_RUNNER names that
   # label; unset, they run on macos-latest. macOS jobs run only on a push
   # to main, the nightly run and by hand, never on a pull request, so no
-  # outside code reaches the Mac. Unset the variable to switch back.
+  # outside code reaches the Mac. Unset the variable to switch back. The
+  # Mac runs two jobs at once beside its owner's work, so its jobs get
+  # twice the time (fault injection ran past 60 minutes there on 11-14).
   #
   # ChloeDB's tests on macOS for a push to main: the `test` job's steps, in
   # a job of its own that CI result does not wait for (see the top of this
@@ -367,7 +369,7 @@ jobs:
         os: [macos-latest]
         crate: [chloedb]
     runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     env: *test-env
     steps: *test-steps
 
@@ -539,7 +541,7 @@ jobs:
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
     steps:
@@ -839,7 +841,7 @@ jobs:
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -982,7 +984,7 @@ jobs:
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -1061,7 +1063,7 @@ jobs:
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
