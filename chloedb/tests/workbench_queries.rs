@@ -178,6 +178,28 @@ fn casts_and_values_of_no_table() {
     assert!(e.contains("CAST('abc' AS INT)") && e.contains("not a number"), "{e}");
     let e = error(&db, "SELECT CAST(1 AS MONEY)");
     assert!(e.contains("INT") && e.contains("FLOAT") && e.contains("TEXT"), "{e}");
+    // PRF-12: the plan of a SELECT of no table says it reads one row of
+    // none, rather than counting the first table's rows.
+    let plan: Vec<String> = rows(&db, "EXPLAIN SELECT 1 + 1").into_iter().flatten().map(|v| v.as_str().unwrap_or_default().to_string()).collect();
+    let plan = plan.join("\n");
+    assert!(plan.contains(chloedb::query::compound::NO_TABLE), "{plan}");
+}
+
+/// ONB-16: SHOW TABLES answers the tables' names, one a row, and leaves
+/// out the tables ChloeDB keeps for itself.
+#[test]
+fn show_tables_names_the_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = db(dir.path());
+    let names: Vec<Value> = rows(&db, "SHOW TABLES").into_iter().map(|r| r[0].clone()).collect();
+    assert!(names.contains(&Value::Str("products".into())) && names.contains(&Value::Str("brands".into())), "{names:?}");
+    assert!(names.iter().all(|n| !n.as_str().unwrap().starts_with('_')), "{names:?}");
+    match run(&db, "show tables") {
+        SqlResult::Rows(r) => assert_eq!(r.columns, vec!["name".to_string()]),
+        SqlResult::Written(_) => panic!("SHOW TABLES writes nothing"),
+    }
+    let e = error(&db, "SHOW FULL TABLES");
+    assert!(e.contains("not a statement ChloeDB runs"), "{e}");
 }
 
 #[test]
@@ -211,7 +233,8 @@ fn errors_say_where_why_and_what_to_write() {
     has("SELECT id FROM products WHERE price > 'abc'", &["price is a FLOAT", "'abc'"]);
     has("SELECT brand, AVG(brand) FROM products GROUP BY brand", &["brand"]);
     // Statements Strata does not run, and what does what they do.
-    has("SHOW TABLES", &["/v1/tables", "products"]);
+    has("SHOW DATABASES", &["SHOW TABLES", "/v1/tables", "products"]);
+    has("SELECT *", &["no columns to give", "SELECT 1 + 1"]);
     has("SELECT * FROM products, brands WHERE products.brand = brands.name", &["JOIN", "ON products.brand = brands.name"]);
     has("SELECT * FROM products CROSS JOIN brands", &["CROSS JOIN is not supported", "JOIN ... ON"]);
     // A parameter without a value, and a key taken.

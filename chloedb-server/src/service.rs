@@ -4225,6 +4225,14 @@ impl Service {
                 return Ok(SqlAnswer::Rows(a));
             }
             Command::Explain { .. } => return Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain")),
+            // ONB-16: the tables' names, as GET /v1/tables lists them for
+            // this key (a coordinator's from what its shards hold).
+            Command::ShowTables => {
+                let t0 = Instant::now();
+                let names: Vec<String> = self.tables_listed().await.iter().filter(|s| who.table_scope(&s.table).is_some_and(|x| x >= Scope::Read)).map(|s| s.table.clone()).collect();
+                let rs = chloedb::query::sql::table_list(&names);
+                return Ok(SqlAnswer::Rows(Answer { rs, took_ms: t0.elapsed().as_secs_f64() * 1e3, kind: "tables", missing: Vec::new(), lease: 0, arrow: Vec::new(), stale: false, cursor: None }));
+            }
             Command::CreateTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } | Command::Function(_) => true,
             Command::AlterTable { alters, .. } => {
                 // A coordinator's plans name a table's columns by their
@@ -6686,7 +6694,7 @@ pub fn has_source(op: &Json) -> bool {
 /// kind is named, so that a new one must say what it needs.
 pub fn command_scope(c: &Command) -> Scope {
     match c {
-        Command::Query | Command::Explain { .. } => Scope::Read,
+        Command::Query | Command::Explain { .. } | Command::ShowTables => Scope::Read,
         Command::Write { .. } => Scope::Write,
         Command::CreateTable { .. } | Command::AlterTable { .. } | Command::DropTable { .. } | Command::CreateRankProfile { .. } | Command::DropRankProfile { .. } | Command::Function(_) => Scope::Admin,
     }

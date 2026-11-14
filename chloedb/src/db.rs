@@ -1964,6 +1964,7 @@ impl Db {
         let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
         match bind_command(sql, &tables, params)? {
             Command::Query => self.query_with(sql, params, opts).map(SqlResult::Rows),
+            Command::ShowTables => Ok(SqlResult::Rows(qsql::table_list(&tables.iter().map(|t| t.table.as_str()).collect::<Vec<_>>()))),
             Command::Explain { json } => {
                 let sqlparser::ast::Statement::Explain { statement, .. } = qsql::parse_one(sql)? else { unreachable!("bound as EXPLAIN") };
                 let plan = self.explain_statement(&statement, params)?;

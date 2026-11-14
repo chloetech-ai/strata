@@ -57,21 +57,35 @@ pub fn no_column(schema: &Schema, name: &str) -> String {
     format!("no such column: {name} in {}{}; its columns are {}", schema.table, did_you_mean(name, names.iter().copied()), listing(&names, 30))
 }
 
-/// "no such table: x (did you mean y?); the tables are a, b". It starts
-/// with "no such table", which a coordinator looks for to ask its shards
-/// for their tables again.
+/// Whether table `name` is one ChloeDB keeps for itself: the first table
+/// of a database made with no tables ([`crate::schema::PLACEHOLDER_TABLE`])
+/// or a system table (`_functions`, `_sources`). Messages that list the
+/// tables and `SHOW TABLES` leave them out, as `GET /v1/tables` does.
+pub fn internal_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crate::schema::PLACEHOLDER_TABLE) || crate::storage::manifest::system_id(name).is_some()
+}
+
+/// "no such table: x (did you mean y?); the tables are a, b", the tables
+/// ChloeDB keeps for itself left out ([`internal_table`]). It starts with
+/// "no such table", which a coordinator looks for to ask its shards for
+/// their tables again.
 pub fn no_table<'a>(name: &str, tables: impl IntoIterator<Item = &'a str>) -> String {
     let tables: Vec<&str> = tables.into_iter().collect();
     if tables.is_empty() {
         return format!("no such table: {name}");
     }
+    let shown: Vec<&str> = tables.iter().copied().filter(|t| !internal_table(t)).collect();
     let lower = name.to_ascii_lowercase();
     let schemas = if ["information_schema", "pg_", "sqlite_", "sys."].iter().any(|p| lower.starts_with(p)) {
         "; ChloeDB has no system tables: GET /v1/tables lists the tables and their columns"
     } else {
         ""
     };
-    format!("no such table: {name}{}; the database's tables are {}{schemas}", did_you_mean(name, tables.iter().copied()), listing(&tables, 30))
+    let near = did_you_mean(name, tables.iter().copied());
+    if shown.is_empty() {
+        return format!("no such table: {name}{near}; the database has no tables yet (CREATE TABLE or an import makes one){schemas}");
+    }
+    format!("no such table: {name}{near}; the database's tables are {}{schemas}", listing(&shown, 30))
 }
 
 /// Why a row whose key `key` a table already holds is refused, and the
@@ -171,6 +185,17 @@ mod tests {
         assert_eq!(nearest("xyz", names), Vec::<&str>::new());
         assert_eq!(did_you_mean("brnd", names), " (did you mean brand?)");
         assert_eq!(did_you_mean("zzzz", names), "");
+    }
+
+    /// CCB-22, ONB-16: the tables ChloeDB keeps for itself are not listed
+    /// as the user's.
+    #[test]
+    fn no_table_lists_the_users_tables() {
+        let m = no_table("book", ["_placeholder", "books", "docs", "_functions", "_sources"]);
+        assert_eq!(m, "no such table: book (did you mean books?); the database's tables are books, docs");
+        assert_eq!(no_table("t", ["_placeholder"]), "no such table: t; the database has no tables yet (CREATE TABLE or an import makes one)");
+        assert_eq!(no_table("t", []), "no such table: t");
+        assert!(internal_table("_PLACEHOLDER") && internal_table("_functions") && !internal_table("_mine") && !internal_table("books"));
     }
 
     #[test]

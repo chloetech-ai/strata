@@ -1678,7 +1678,12 @@ async fn run() {
         chloedb_server::peers::start(&svc, chloedb_server::peers::own_url(a.peer_url.as_deref(), at, access.tls.is_some()));
     }
     let h = svc.health().await;
-    tracing::info!(table = %svc.schema.table, rows = %h["docs"], segments = %h["segments"], version = env!("CARGO_PKG_VERSION"), simd = %chloedb::simd::describe(), "serving");
+    // The tables served, not the one a database made with none starts
+    // with (ONB-16), and the rows of them all.
+    let names: Vec<String> = svc.catalog().iter().filter(|t| !chloedb::query::hint::internal_table(&t.table)).map(|t| t.table.clone()).collect();
+    let tables = if names.is_empty() { "none yet".to_string() } else { chloedb::query::hint::listing(&names, 10) };
+    let rows = if h["rows"].is_null() { &h["docs"] } else { &h["rows"] };
+    tracing::info!(tables = %tables, rows = %rows, segments = %h["segments"], version = env!("CARGO_PKG_VERSION"), simd = %chloedb::simd::describe(), "serving");
     let scheme = if access.tls.is_some() { "https" } else { "http" };
     let asks = if access.token.is_some() { " (it asks for the token)" } else { "" };
     tracing::info!("HTTP and UI on {scheme}://{}/{asks}", a.listen);

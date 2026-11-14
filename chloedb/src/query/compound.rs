@@ -60,6 +60,10 @@ use crate::value::Value;
 /// subquery, a `WITH` result).
 pub const MAX_ROWS: usize = 1_000_000;
 
+/// The name a SELECT of no table's one row has in its plan: a count of
+/// the first table that reads none of its rows (PRF-12).
+pub const NO_TABLE: &str = "one row of no table";
+
 fn err(m: impl Into<String>) -> Error {
     Error::Query(m.into())
 }
@@ -1666,8 +1670,11 @@ impl<'a> Planner<'a> {
     /// Why a SELECT with no table, or with several after FROM, is refused,
     /// and what to write instead.
     fn from_hint(&self, s: &sql::Select) -> String {
-        let tables: Vec<&str> = self.catalog.iter().map(|t| t.table.as_str()).collect();
+        let tables: Vec<&str> = self.catalog.iter().map(|t| t.table.as_str()).filter(|t| !hint::internal_table(t)).collect();
         let first = tables.first().copied().unwrap_or("t");
+        if s.from.is_empty() && tables.is_empty() {
+            return "this SELECT reads a table, and the database has none yet: CREATE TABLE or an import makes one".to_string();
+        }
         if s.from.is_empty() {
             return format!(
                 "a SELECT reads a table: add FROM and one of the database's tables ({}). A value of no table is a column of any of them: SELECT {} FROM {first} LIMIT 1",
@@ -1713,10 +1720,16 @@ impl<'a> Planner<'a> {
             b => return Err(err(format!("this form of query is not supported: {b}"))),
         };
         // SELECT 1, SELECT now(): values of no table, one row of them, as
-        // the one row a count of a table gives.
+        // the one row a count of a table gives. The count reads none of
+        // the table's rows, and the plan names it for what it is (PRF-12):
+        // Explain and Queries show no search of the table's rows. SELECT *
+        // of no table has no columns to give.
         if s.from.is_empty() && s.selection.is_none() && s.group_by == sql::GroupByExpr::Expressions(vec![], vec![]) && s.having.is_none() {
+            if s.projection.iter().any(|i| matches!(i, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))) {
+                return Err(err("SELECT * of no table has no columns to give: name the values (SELECT 1 + 1), or add FROM and a table"));
+            }
             if let Some(first) = self.catalog.first() {
-                let one = format!("SELECT COUNT(*) FROM {}", sql::Ident::with_quote('"', first.table.as_str()));
+                let one = format!("SELECT COUNT(*) AS {} FROM {} WHERE FALSE", sql::Ident::with_quote('"', NO_TABLE), sql::Ident::with_quote('"', first.table.as_str()));
                 let Some(sql::Statement::Query(one)) = super::parse::parse(&one)?.into_iter().next() else { return Err(err("a query of one row")) };
                 let mut q = q.clone();
                 if let sql::SetExpr::Select(s) = q.body.as_mut() {
