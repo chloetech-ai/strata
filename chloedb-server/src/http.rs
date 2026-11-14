@@ -1593,6 +1593,18 @@ fn table_json(svc: &crate::service::Service, s: &chloedb::schema::Schema) -> Jso
             "field": f.name, "from": d.from, "model": d.model,
             "loaded": svc.local_db().map(|db| db.deriver_in(&s.table, &f.name).is_some()),
         }))).collect::<Vec<_>>(),
+        // A rollup's table (experimental): the table it reads, and how its
+        // refreshes on this server went.
+        "rollup": svc.local_db().and_then(|db| {
+            let r = db.rollup(&s.table).ok().flatten()?;
+            let h = db.rollup_health(&s.table).unwrap_or_default();
+            Some(json!({
+                "of": r.base, "experimental": true,
+                "last_refresh": h.last_refresh.map(chloedb::timestamp::format),
+                "last_error": h.last_error.as_ref().map(|(_, e)| e), "failed_at": h.last_error.as_ref().map(|(t, _)| chloedb::timestamp::format(*t)),
+                "failures": h.failures,
+            }))
+        }),
     })
 }
 

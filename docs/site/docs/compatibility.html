@@ -157,7 +157,12 @@ refreshes both. 0.3.2 reads the new kind but cannot refresh it, so its
 definition carries the option <code>needs_chloedb_0_3_3</code>, which 0.3.2 refuses
 by name ("no option needs_chloedb_0_3_3"): a refresh by 0.3.2 fails with
 that message rather than leaving the rollup's newest buckets stale. Open a
-database whose rollups 0.3.3 made with 0.3.3 or later.</p>
+database whose rollups 0.3.3 made with 0.3.3 or later.
+A rollup made by 0.3.4 or later that counts a field's values (<code>COUNT(f)</code>,
+or <code>AVG(f)</code>, which keeps <code>count_f</code> so that its mean skips NULLs) has a
+column 0.3.3 does not write; its definition carries <code>needs_chloedb_0_3_4</code>,
+which 0.3.3 refuses by name in the same way. 0.3.4 refreshes a rollup made
+before with <code>AVG(f)</code> as it was made, without <code>count_f</code>.</p>
 <p><strong>Databases from before field ids.</strong> A database written before field ids
 (format 1, 2, or 3 without <code>field_ids</code>) no longer opens for use. <code>upgrade()</code>
 (<code>chloedb.upgrade(path)</code> in Python, <code>upgrade(path)</code> in JavaScript;
