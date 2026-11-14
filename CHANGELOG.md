@@ -11,6 +11,37 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
+### Cluster reads and operator upgrades (audit 4, wave 2)
+
+- **A read after a write checks the write's term (X-E1).** A write answers
+  `seq_term` (a coordinator `seq_terms`), and a read that passes it back as
+  `min_seq_term(s)` is served only by a copy whose transaction of that number
+  is of that term: a replica holding a deposed primary's transactions under
+  the number answers 503 and the coordinator asks the primary. A replica
+  asked to vote in a newer term serves no reads until that term's primary
+  calls. New gRPC fields only (`QueryRequest` 23-24, `GetRequest` 8-9,
+  `WriteResponse` 13-14); the shard protocol stays 21, and a server before
+  them reads by the number alone. The Python and JavaScript clients do not
+  send the terms yet.
+- **A primary started on a lost volume (N-E2, a primary's half).** A server
+  started as its shard's primary by `--replicas` on an empty database with
+  nothing kept beside it asks its replicas first. When one holds the shard's
+  transactions it starts as a replica (with `--failover-after-ms`), so that
+  the copies elect the one holding the data, or refuses to start (without),
+  saying which copy holds what.
+- **The app engine goes back to the image that served (X-E6).** With
+  `spec.upgrade.mode: on`, a new image of the engine's tag that is not ready
+  after `rollout.verifySeconds` (at least five minutes) is rejected
+  (`status.upgrade.appsRejected`) and the engine runs the last digest that
+  came up ready (`appsServing`).
+- **One coordinator with `coordinatorStorage` is warned of (X-E7)** in a
+  plan, in the cluster's status message and on Home's readiness card: a
+  StatefulSet of one leaves the API down for each rollout. Not refused.
+- **DirStore syncs its directories (X-A7).** An object written to a
+  directory store (tenants' `HEAD`, logs and bases) is durable once the write
+  returns: the directory is synced after the rename, and each directory made
+  for it after it is made.
+
 ## 0.3.3
 
 The afternoon audit's fixes, a ChloeCtx inspector organised by space, and

@@ -328,6 +328,11 @@ pub struct Replica {
     /// How many calls it refused for holding another transaction than its
     /// primary's under the term and number they follow ([`Self::follows`]).
     pub mismatches: u64,
+    /// The newest term a vote request named, granted or not
+    /// ([`Self::saw_vote`]): until a primary of that term or a newer one
+    /// calls, it serves no reads, since that term may have a primary
+    /// already whose writes it does not hold (X-E1).
+    pub asked_term: u64,
 }
 
 impl Replica {
@@ -344,7 +349,7 @@ impl Replica {
         let next = Kept { role: Some(KeptRole::Replica), member, ..kept.clone() };
         let save = (next != kept).then_some(next);
         let kept = save.clone().unwrap_or(kept);
-        (Replica { kept, called_at: None, serves_reads: false, opened: now, global_checkpoint: 0, heard: 0, voted_at: None, mismatches: 0 }, save)
+        (Replica { kept, called_at: None, serves_reads: false, opened: now, global_checkpoint: 0, heard: 0, voted_at: None, mismatches: 0, asked_term: 0 }, save)
     }
 
     /// How long since its primary last called or it granted a vote
@@ -362,6 +367,19 @@ impl Replica {
     /// kept, fences the primary it just elected.
     pub fn granted(&mut self, now: Instant) {
         self.voted_at = Some(now);
+    }
+
+    /// It was asked for a vote of `r` (not a pre-vote, which asks only
+    /// whether it would): a term newer than the one its primary ships in
+    /// may have a primary already, whose writes it does not hold. It stops
+    /// serving reads until a primary of that term or a newer one calls
+    /// (X-E1); a read then goes to another copy or the primary.
+    pub fn saw_vote(&mut self, r: &pb::VoteRequest) {
+        let following = self.kept.follows.as_ref().map_or(0, |f| f.1);
+        if !r.pre && r.term > following && r.term > self.asked_term {
+            self.asked_term = r.term;
+            self.serves_reads = false;
+        }
     }
 
     /// Answers vote `r` ([`decide`]) at `n`, and what to keep (the vote)
@@ -425,7 +443,7 @@ impl Replica {
     /// holds reaches the primary's last.
     pub fn applied(&mut self, term: u64, behind: bool, global_checkpoint: u64, applied: Result<Applied, ApiError>, db_term: u64) -> Result<pb::ReplicateResponse, ApiError> {
         let replica_term = db_term.max(term);
-        self.serves_reads = matches!(applied, Ok(Applied::At(_))) && !behind;
+        self.serves_reads = matches!(applied, Ok(Applied::At(_))) && !behind && term >= self.asked_term;
         Ok(match applied? {
             Applied::At(at) => {
                 self.global_checkpoint = global_checkpoint.min(at.seq);
@@ -1734,6 +1752,29 @@ impl Primary {
 
 #[cfg(test)]
 mod tests {
+    /// X-E1: a vote request of a newer term than the replica's primary
+    /// ships in, granted or not, stops its reads until a primary of that
+    /// term (or a newer one) calls; the old primary's calls do not bring
+    /// them back. A pre-vote does not stop them.
+    #[test]
+    fn a_replica_asked_to_vote_in_a_newer_term_serves_no_reads_until_its_primary_calls() {
+        let now = Instant::now();
+        let (mut r, _) = Replica::open(Kept { id: "r".into(), follows: Some(("p".into(), 1)), role: Some(KeptRole::Replica), ..Kept::default() }, now, false);
+        let at = Applied::At(chloedb::storage::SeqNo { term: 1, seq: 200 });
+        r.applied(1, false, 0, Ok(at), 1).unwrap();
+        assert!(r.readable().is_ok());
+        r.saw_vote(&ask(2, "x", (1, 150), true));
+        assert!(r.readable().is_ok(), "a pre-vote changes nothing");
+        r.saw_vote(&ask(2, "x", (1, 150), false));
+        assert!(r.readable().is_err(), "term 2 may have a primary already");
+        r.applied(1, false, 0, Ok(at), 1).unwrap();
+        assert!(r.readable().is_err(), "the primary of term 1 does not bring reads back");
+        r.applied(2, false, 0, Ok(at), 2).unwrap();
+        assert!(r.readable().is_ok(), "term 2's primary called and it caught up");
+        r.saw_vote(&ask(2, "y", (1, 150), false));
+        assert!(r.readable().is_ok(), "its primary's own term is not newer");
+    }
+
     #[test]
     fn a_copy_that_did_not_run_waits_a_delay_before_it_asks() {
         let after = Duration::from_millis(600);

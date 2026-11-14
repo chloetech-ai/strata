@@ -1293,6 +1293,16 @@ impl Cluster {
         super::upgrade::apps_image(u, &state, image)
     }
 
+    /// The digest the app engine's Deployment runs (as its template names
+    /// it) and whether it is ready on it: rolled out to every pod, and
+    /// every pod available. None when it is paused, names no digest, or
+    /// cannot be read.
+    async fn apps_engine(&self) -> Option<(String, bool)> {
+        let path = format!("{}/{}", ns_path(&self.ns, "apps/v1", "deployments"), self.apps_name());
+        let d = self.kube.get(&path).await.ok()??;
+        engine_state(&d)
+    }
+
     /// An app's two variables, its cluster `key` and its own API's
     /// `token`: from its credentials Secret, or the admin token.
     fn app_env(&self, app: &str, creds: Creds, key: &str, token: &str) -> Vec<Json> {
@@ -2051,6 +2061,21 @@ async fn rolled_back(kube: &Kube, c: &Json, spec: &Spec, history: &Json, f: &sup
     Ok(format!("rolling back to version {n}: the version failed ({}): {}", f.step, f.text))
 }
 
+/// What an app engine Deployment runs and whether it is ready on it
+/// ([`Cluster::apps_engine`]).
+fn engine_state(d: &Json) -> Option<(String, bool)> {
+    let want = d["spec"]["replicas"].as_u64().unwrap_or(1);
+    if want == 0 {
+        return None;
+    }
+    let image = d["spec"]["template"]["spec"]["containers"].as_array()?.iter().find(|c| c["name"] == "apps")?["image"].as_str()?;
+    let digest = super::upgrade::digest_of(image)?;
+    let st = &d["status"];
+    let seen = st["observedGeneration"].as_u64().unwrap_or(0) >= d["metadata"]["generation"].as_u64().unwrap_or(0);
+    let ready = seen && st["updatedReplicas"].as_u64().unwrap_or(0) >= want && st["availableReplicas"].as_u64().unwrap_or(0) >= want && st["replicas"].as_u64().unwrap_or(0) <= want;
+    Some((digest, ready))
+}
+
 /// The upgrader's step for a cluster ([`super::upgrade`]): every
 /// `checkMinutes` it asks the registry what the followed tag names, and
 /// with `mode: on` rolls a new image out (by its digest) once the cluster
@@ -2114,6 +2139,13 @@ pub async fn upgraded(cluster: &Cluster, c: &Json, out: &Outcome, rejected: Opti
     }
     if let Ok(r) = cluster.running_images().await {
         s.running = r;
+    }
+    // The app engine on a new image of its tag: kept once ready, rejected
+    // when it does not come up in time (X-E6).
+    if u.mode == Mode::On && s.apps.is_some() {
+        if let Some((deployed, ready)) = cluster.apps_engine().await {
+            s.engine_seen(&deployed, ready, now, super::upgrade::engine_verify_ms(spec.rollout.verify_seconds));
+        }
     }
     s.available = available(&s, &spec.image);
     let ready = out.phase == super::Phase::Ready && out.rollout.failed.is_none();
@@ -2484,6 +2516,25 @@ mod tests {
         assert_eq!(d["spec"]["template"]["spec"]["containers"][0]["args"][8], "hash:256");
         let paused = cluster(json!({"tokenSecret": "admin", "chloectx": {"paused": true}}));
         assert_eq!(paused.chloectx_deployment(paused.spec.chloectx.as_ref().unwrap(), Creds::default())["spec"]["replicas"], 0);
+    }
+
+    #[test]
+    fn the_app_engines_deployment_is_ready_once_its_new_pod_is_available() {
+        let d = format!("sha256:{}", "e".repeat(64));
+        let dep = |gen: u64, observed: u64, updated: u64, available: u64, replicas: u64| {
+            json!({"metadata": {"generation": gen}, "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "caddy", "image": "caddy:2"}, {"name": "apps", "image": format!("ghcr.io/x/apps@{d}")}]}}},
+                   "status": {"observedGeneration": observed, "updatedReplicas": updated, "availableReplicas": available, "replicas": replicas}})
+        };
+        assert_eq!(engine_state(&dep(3, 3, 1, 1, 1)), Some((d.clone(), true)));
+        assert_eq!(engine_state(&dep(3, 2, 1, 1, 1)), Some((d.clone(), false)), "the controller has not seen the change");
+        assert_eq!(engine_state(&dep(3, 3, 1, 0, 1)), Some((d.clone(), false)), "the new pod is not ready");
+        assert_eq!(engine_state(&dep(3, 3, 0, 1, 1)), Some((d.clone(), false)), "an old pod is the one available");
+        let mut paused = dep(3, 3, 0, 0, 0);
+        paused["spec"]["replicas"] = json!(0);
+        assert_eq!(engine_state(&paused), None);
+        let mut tag = dep(3, 3, 1, 1, 1);
+        tag["spec"]["template"]["spec"]["containers"][1]["image"] = json!("ghcr.io/x/apps:latest");
+        assert_eq!(engine_state(&tag), None, "a tag: not the upgrader's");
     }
 
     #[test]

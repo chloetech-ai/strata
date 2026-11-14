@@ -14,7 +14,7 @@
 //! | `POST /v1/sql` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?, log?}` | rows, or `{written, seq_no?, seq_nos?}` |
 //! | `POST /v1/rank_log/export` | `{table?, since?, until?, events?, history?, window?, grades?}` | NDJSON: one record per logged row ([`chloedb::rank_log::export`]) |
 //! | `POST /v1/rank_log/interleaving` | the export's body | `{pairs: [{variants, requests, acted, wins, ties, delta, p}], took_ms}`: which of two interleaved rankings the users preferred ([`chloedb::rank_log::Credit`]) |
-//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_nos?}` |
+//! | `POST /v1/write` | `{ops: [...]}` (see `proto/strata.proto`; each op writes the first table, or its `table`) | `{written, seq_no?, seq_term?, seq_nos?, seq_terms?}`: a read that passes them back as `min_seq_no(s)` and `min_seq_term(s)` sees the write from any copy |
 //! | `GET /v1/kv/:table/:key?min_seq_no=n` | | `{table, key, found, row?, seq_no?}`: the row with that primary key, read without SQL, as `SELECT *` answers it ([`Service::get_rows`]); 404 when no live row has it (or it has expired) |
 //! | `POST /v1/kv/get` | `{keys, table?, columns?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{table, columns, rows, seq_nos, took_ms}`: per key, in their order, its row as an object (null for none) and its number, of `columns` alone when given; a coordinator asks each key's shard |
 //! | `PUT /v1/kv/:table/:key?if_seq_no=n` | the row's fields as an object (the key may be left out) | `{written, seq_no?}`: the row written in place of any with the key (an upsert; with `if_seq_no`, only while the row's number is that) |
@@ -1381,7 +1381,7 @@ fn body_u64(b: &Json, k: &str) -> Result<u64, ApiError> {
 }
 
 /// The fields of a query's body (`POST /v1/query`).
-const QUERY_FIELDS: &[&str] = &["sql", "params", "timeout_ms", "shard", "stats", "snapshot", "partial", "min_seq_no", "min_seq_nos", "profile", "trace", "steps", "page_size", "keep_alive_ms", "cursor", "format", "log", "objects", "reason"];
+const QUERY_FIELDS: &[&str] = &["sql", "params", "timeout_ms", "shard", "stats", "snapshot", "partial", "min_seq_no", "min_seq_nos", "min_seq_term", "min_seq_terms", "profile", "trace", "steps", "page_size", "keep_alive_ms", "cursor", "format", "log", "objects", "reason"];
 
 /// A sentence for each field of body `b` that is not one of `known` (a
 /// misspelt `timeout_ms` would otherwise go unnoticed), for an answer's
@@ -1412,7 +1412,17 @@ fn after(b: &Json) -> Result<After, ApiError> {
         Some(Json::Array(a)) => a.iter().map(|v| seq(v, "each of min_seq_nos")).collect::<Result<_, _>>()?,
         Some(_) => return Err(ApiError::bad("min_seq_nos is a list of sequence numbers, one per shard, as a coordinator's write answers seq_nos")),
     };
-    After::of(min, mins)
+    // X-E1: the terms of those writes, as their answers gave them.
+    let term = match b.get("min_seq_term") {
+        None | Some(Json::Null) => 0,
+        Some(v) => v.as_u64().ok_or_else(|| ApiError::bad("min_seq_term is a term: a whole number from 0, as a server's write answers seq_term"))?,
+    };
+    let terms = match b.get("min_seq_terms") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Array(a)) => a.iter().map(|v| v.as_u64().ok_or_else(|| ApiError::bad("each of min_seq_terms is a term: a whole number from 0"))).collect::<Result<_, _>>()?,
+        Some(_) => return Err(ApiError::bad("min_seq_terms is a list of terms, one per shard, as a coordinator's write answers seq_terms")),
+    };
+    After::termed(min, mins, term, terms)
 }
 
 async fn health(State(app): State<App>) -> Response {
@@ -1618,7 +1628,7 @@ async fn query(State(app): State<App>, w: Option<axum::Extension<Principal>>, Ax
     };
     if given("cursor") {
         let cursor = b["cursor"].as_str().ok_or_else(|| ApiError::bad("cursor is the string a scroll's last page answered"))?;
-        if let Some(k) = ["sql", "params", "page_size", "log", "shard", "stats", "snapshot", "min_seq_no", "min_seq_nos", "profile", "partial"].into_iter().find(|k| given(k)) {
+        if let Some(k) = ["sql", "params", "page_size", "log", "shard", "stats", "snapshot", "min_seq_no", "min_seq_nos", "min_seq_term", "min_seq_terms", "profile", "partial"].into_iter().find(|k| given(k)) {
             return Err(ApiError::bad(format!("a scroll's next page takes its cursor alone (with format, keep_alive_ms or timeout_ms), not {k}: the query and its version are those it started with")));
         }
         let a = app.svc.scroll_next(cursor, &crate::service::scroll_owner(&who), keep_alive, body_u64(&b, "timeout_ms")?, None).await?;
@@ -1777,12 +1787,7 @@ async fn logged(app: &App, who: &Principal, req: QueryReq, log: &Json, objects: 
         j["teams"] = json!(served.teams);
     }
     let mut l = json!({"rows": w.rows});
-    if let Some(s) = w.seq_no {
-        l["seq_no"] = json!(s);
-    }
-    if !w.seq_nos.is_empty() {
-        l["seq_nos"] = json!(w.seq_nos);
-    }
+    seq_json(&mut l, &app.svc.termed(w));
     j["logged"] = l;
     Ok(AxJson(j))
 }
@@ -2115,7 +2120,7 @@ async fn sql(State(app): State<App>, w: Option<axum::Extension<Principal>>, head
         }
         Ok(SqlAnswer::Written { w, took_ms }) => {
             audit_ui_write(statement, Some(w.rows as u64), None);
-            Ok(AxJson(written(w, took_ms)).into_response())
+            Ok(AxJson(written(app.svc.termed(w), took_ms)).into_response())
         }
         Err(e) => {
             if writes {
@@ -2230,13 +2235,26 @@ fn written(w: Written, took_ms: f64) -> Json {
     if w.skipped > 0 {
         j["skipped"] = json!(w.skipped);
     }
+    seq_json(&mut j, &w);
+    j
+}
+
+/// A write's numbers in its answer: `seq_no` and `seq_term` from a server,
+/// `seq_nos` and `seq_terms` from a coordinator. A read passes them back
+/// as `min_seq_no(s)` and `min_seq_term(s)` (X-E1).
+fn seq_json(j: &mut Json, w: &Written) {
     if let Some(s) = w.seq_no {
         j["seq_no"] = json!(s);
+    }
+    if let Some(t) = w.seq_term {
+        j["seq_term"] = json!(t);
     }
     if !w.seq_nos.is_empty() {
         j["seq_nos"] = json!(w.seq_nos);
     }
-    j
+    if !w.seq_terms.is_empty() {
+        j["seq_terms"] = json!(w.seq_terms);
+    }
 }
 
 /// What a write's operations found ([`crate::service::Receipt`]):
@@ -2289,7 +2307,7 @@ async fn run_plan(State(app): State<App>, w: Option<axum::Extension<Principal>>,
             hide_hosts(&who, &mut a.rs.stats.steps);
             Ok(AxJson(answer_of(&b, &a)?))
         }
-        SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(w, took_ms))),
+        SqlAnswer::Written { w, took_ms } => Ok(AxJson(written(app.svc.termed(w), took_ms))),
     }
 }
 
@@ -2345,7 +2363,7 @@ async fn write(State(app): State<App>, w: Option<axum::Extension<Principal>>, he
     match r {
         Ok(w) => {
             note(Some(w.rows as u64), None);
-            Ok(AxJson(written(w, t0.elapsed().as_secs_f64() * 1e3)).into_response())
+            Ok(AxJson(written(app.svc.termed(w), t0.elapsed().as_secs_f64() * 1e3)).into_response())
         }
         Err(e) => {
             note(None, partial.as_ref().map(|p| &p["shards"]));
@@ -2364,6 +2382,13 @@ fn after_of_query(q: &std::collections::HashMap<String, String>) -> Result<After
     if let Some(v) = q.get("min_seq_nos") {
         let ns: Vec<u64> = v.split(',').map(|x| x.trim().parse::<u64>()).collect::<Result<_, _>>().map_err(|_| ApiError::bad("min_seq_nos is sequence numbers joined by commas, one per shard"))?;
         b["min_seq_nos"] = json!(ns);
+    }
+    if let Some(v) = q.get("min_seq_term") {
+        b["min_seq_term"] = json!(v.parse::<u64>().map_err(|_| ApiError::bad("min_seq_term is a term: a whole number from 0"))?);
+    }
+    if let Some(v) = q.get("min_seq_terms") {
+        let ts: Vec<u64> = v.split(',').map(|x| x.trim().parse::<u64>()).collect::<Result<_, _>>().map_err(|_| ApiError::bad("min_seq_terms is terms joined by commas, one per shard"))?;
+        b["min_seq_terms"] = json!(ts);
     }
     after(&b)
 }
@@ -2516,7 +2541,7 @@ async fn kv_put(
     let mut op = json!({"op": "upsert", "table": schema.table, "doc": doc});
     if_seq_no(&mut op, &q)?;
     let w = app.svc.write_ops(vec![op], idempotency(&headers)?).await?;
-    Ok(AxJson(written(w, t0.elapsed().as_secs_f64() * 1e3)))
+    Ok(AxJson(written(app.svc.termed(w), t0.elapsed().as_secs_f64() * 1e3)))
 }
 
 /// `DELETE /v1/kv/:table/:key`: deletes the row with that key.
@@ -2536,7 +2561,7 @@ async fn kv_delete(
         op["routing"] = json!(r);
     }
     let w = app.svc.write_ops(vec![op], idempotency(&headers)?).await?;
-    let mut j = written(w, t0.elapsed().as_secs_f64() * 1e3);
+    let mut j = written(app.svc.termed(w), t0.elapsed().as_secs_f64() * 1e3);
     j["deleted"] = json!(j["written"].as_u64().unwrap_or(0) > 0);
     Ok(AxJson(j))
 }
@@ -2985,12 +3010,7 @@ async fn flush(svc: &Arc<Service>, s: &mut Stream, batch: &mut Vec<Json>, read: 
         Ok(w) => {
             *done = read;
             let mut j = json!({"batch": s.batches, "ops": n, "written": w.rows, "skipped": w.skipped, "lines": read});
-            if let Some(q) = w.seq_no {
-                j["seq_no"] = json!(q);
-            }
-            if !w.seq_nos.is_empty() {
-                j["seq_nos"] = json!(w.seq_nos);
-            }
+            seq_json(&mut j, &svc.termed(w));
             let offsets = s.offsets();
             if !offsets.is_empty() {
                 j["offsets"] = Json::Object(offsets.into_iter().map(|(n, o)| (n, json!(o))).collect());

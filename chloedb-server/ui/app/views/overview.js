@@ -672,7 +672,15 @@ function render(page, r0) {
   const readyTitle = h("h3", {}, "Ready for production");
   const readySub = h("span", { class: "sub" });
   page.append(h("section", { class: "card home-ready" }, h("div", { class: "hd" }, readyTitle, readySub), h("div", { class: "bd" }, readyBody)));
-  let auditFile, auditKnown = false;
+  let auditFile, auditKnown = false, kubeSpec = null, kubeAsked = false;
+  // X-E7: run by the operator, its spec says whether the coordinators keep a
+  // volume each and how many there are. Asked once: a spec seldom changes.
+  async function loadKube() {
+    if (kubeAsked || !isCoordinator()) return;
+    kubeAsked = true;
+    try { const k = await api("/v1/kube", { timeout: 4000 }); kubeSpec = k?.managed === false ? null : (k?.spec || null); } catch { kubeSpec = null; }
+    drawReady();
+  }
   async function loadAudit() {
     if (!can("admin", "GET /v1/admin/audit")) { auditKnown = false; drawReady(); return; }
     try { const j = await api("/v1/admin/audit?limit=1", { timeout: 4000 }); auditFile = j.file || null; auditKnown = true; } catch { auditKnown = false; }
@@ -696,6 +704,12 @@ function render(page, r0) {
       single ? { ok: null, title: "One server: its disk holds the only copy of the data", fix: "Run a cluster with two or more copies a shard (or back the file up) before the data matters.", href: "#/cluster" }
         : { ok: shards.length ? shards.every((sh) => (sh.replicas || []).length >= 2) : null, title: shards.every((sh) => (sh.replicas || []).length >= 2) ? "Every shard has two copies or more" : (() => { const n = shards.filter((sh) => (sh.replicas || []).length < 2).length; return `${fmt.plural(n, "shard")} ${n === 1 ? "has" : "have"} one copy`; })(), fix: "Add a replica to each shard: a lost disk then loses nothing.", href: "#/cluster" },
     ];
+    // X-E7: a StatefulSet of one coordinator stops it before it starts the
+    // next, so each rollout leaves the cluster's API with none.
+    if (kubeSpec?.coordinatorStorage) {
+      const n = kubeSpec.coordinators ?? 1;
+      items.push({ ok: n >= 2, title: n >= 2 ? `${n} coordinators, each with a volume: a rollout restarts one at a time` : "One coordinator with a volume (coordinatorStorage): every rollout leaves the API down while it restarts", fix: "Set spec.coordinators to 2 or more: a StatefulSet stops its one pod before it starts the new one.", href: "#/cluster" });
+    }
     // LIV-6: copies of a shard on one node, while the cluster has others.
     if (!single) {
       const nodeOf = (rp) => rp.detail?.place?.node || null;
@@ -722,7 +736,7 @@ function render(page, r0) {
   function drawCluster() { drawHead(); drawWhere(); drawCapacity(); drawKpis(); drawBanner(); }
   drawFleet(); drawCluster(); drawCharts(); drawEvents(); drawWho(); drawReady(); drawStart();
   const offs = [
-    bus.on("alerts", drawReady), bus.on("whoami", () => { drawReady(); loadAudit(); }), bus.on("cluster", drawReady), every(60000, loadAudit),
+    bus.on("alerts", drawReady), bus.on("whoami", () => { drawReady(); loadAudit(); loadKube(); }), bus.on("cluster", drawReady), every(60000, loadAudit),
     bus.on("fleet", drawFleet), bus.on("cluster", drawCluster), bus.on("alerts", drawBanner),
     bus.on("points", () => { drawCharts(); drawKpis(); }), bus.on("range", () => { drawCharts(); drawHead(); loadEvents(); loadStats(); }),
     bus.on("fresh", () => { drawHead(); drawKpis(); drawWhere(); drawProblems(); chartsCard.classList.toggle("stale", !fresh("series").ok && !fresh("series").loading); }),

@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{corrupt, Error, Result};
 use crate::segment::Fetch;
+use crate::storage::io::sync_dir;
 use crate::storage::lock;
 use crate::storage::manifest::{ColdRef, Manifest};
 
@@ -167,19 +168,53 @@ impl DirStore {
         Ok(self.root.join(p))
     }
 
-    /// Writes an object under a temporary name, then renames it into place.
+    /// Makes `dir` and any of its parents under the root that are missing,
+    /// syncing the directory each new one was made in, so that a directory
+    /// an object is renamed into survives a power failure too.
+    fn make_dirs(&self, dir: &Path) -> std::io::Result<()> {
+        if dir.is_dir() {
+            return Ok(());
+        }
+        let mut missing = Vec::new();
+        let mut d = dir;
+        while !d.is_dir() && d != self.root {
+            missing.push(d);
+            match d.parent() {
+                Some(p) => d = p,
+                None => break,
+            }
+        }
+        for m in missing.into_iter().rev() {
+            match std::fs::create_dir(m) {
+                Ok(()) => {}
+                // Another writer made it first: it syncs its own parent.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+            if let Some(parent) = m.parent() {
+                sync_dir(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes an object under a temporary name, syncs it, renames it into
+    /// place and syncs the directory, so that once this returns the object
+    /// survives a power failure (tenants rely on the store for that: their
+    /// local file is not synced).
     fn write_with(&self, key: &str, write: impl FnOnce(&Path) -> std::io::Result<()>) -> Result<()> {
         let p = self.path(key)?;
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = p.parent().unwrap_or(&self.root).to_path_buf();
+        self.make_dirs(&parent)?;
         static N: AtomicU64 = AtomicU64::new(0);
         let tmp = p.with_extension(format!("tmp-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let done = write(&tmp).and_then(|()| File::open(&tmp)?.sync_all()).and_then(|()| std::fs::rename(&tmp, &p));
         if done.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
-        Ok(done?)
+        done?;
+        sync_dir(&parent)?;
+        Ok(())
     }
 }
 
@@ -1224,6 +1259,30 @@ impl Drop for ColdImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// X-A7: an object is durable only once the directory holding its new
+    /// name is synced, and each directory made for it once its parent is.
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_directory_store_syncs_the_directories_it_writes_into() {
+        use crate::storage::io;
+        let dir = std::env::temp_dir().join(format!("chloedb-dirstore-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = DirStore::new(&dir).unwrap();
+        io::arm(1);
+        s.put("a/b/HEAD", b"one").unwrap();
+        // `a` (synced in the root), `a/b` (in `a`), then `a/b` after the rename.
+        assert_eq!(io::calls(), 3);
+        s.put("a/b/HEAD", b"two").unwrap();
+        assert_eq!(io::calls(), 4, "an existing directory is synced once, after the rename");
+        let _ = io::crash();
+        // The last sync failing fails the write: it was not made durable.
+        io::arm(1);
+        io::fail_at(io::Fault { at: 1, errno: libc::EIO, sticky: false, crash: false });
+        assert!(s.put_if_version("a/b/HEAD", b"three", &version_of(b"two")).is_err());
+        let _ = io::crash();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_directory_store_writes_under_conditions() {

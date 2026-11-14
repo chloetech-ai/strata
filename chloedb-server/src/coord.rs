@@ -838,7 +838,7 @@ struct Read {
     /// The slot map's epoch, sent from protocol 4.
     epoch: u64,
     /// The write each shard's answer must see ([`Coordinator::after`]).
-    after: Vec<u64>,
+    after: Mins,
     /// Ask each shard for its steps' CPU time (`QueryRequest.profile`).
     profile: bool,
     /// Ask each shard to answer without its steps (`QueryRequest.skip_steps`).
@@ -855,11 +855,11 @@ impl Read {
             (true, Some(p)) => Some(plan_pb::to_pb_plan(p)),
             (true, None) => Some(plan_pb::to_pb_plan(&typed()?)),
         };
-        Ok(Read { sql: sql.to_string(), params: params_to_pb(params), plan_json: plan_json(given)?, plan, epoch, after: Vec::new(), profile: false, skip_steps: false })
+        Ok(Read { sql: sql.to_string(), params: params_to_pb(params), plan_json: plan_json(given)?, plan, epoch, after: Mins::default(), profile: false, skip_steps: false })
     }
 
     /// The read, seeing the writes `after` names, one per shard.
-    fn after(self, after: Vec<u64>) -> Read {
+    fn after(self, after: Mins) -> Read {
         Read { after, ..self }
     }
 
@@ -875,20 +875,39 @@ impl Read {
 
     /// The number of the write shard `i`'s answer must see (0: none).
     fn min(&self, i: usize) -> u64 {
-        self.after.get(i).copied().unwrap_or(0)
+        self.after.seq(i)
     }
 
     /// The request to shard `i` in `protocol`. A server before protocol 5
     /// passes over `min_seq_no` ([`Coordinator::reads_after`]).
     fn request(&self, protocol: u32, i: usize) -> pb::QueryRequest {
-        let min_seq_no = self.min(i);
+        let (min_seq_no, min_seq_term) = (self.min(i), self.after.term(i));
         match (&self.plan, protocol >= 2) {
             (Some(plan), true) => {
                 let epoch = if protocol >= 4 { self.epoch } else { 0 };
-                pb::QueryRequest { sql: self.sql.clone(), protocol, plan: Some(plan.clone()), epoch, min_seq_no, profile: self.profile, skip_steps: self.skip_steps, ..Default::default() }
+                pb::QueryRequest { sql: self.sql.clone(), protocol, plan: Some(plan.clone()), epoch, min_seq_no, min_seq_term, profile: self.profile, skip_steps: self.skip_steps, ..Default::default() }
             }
-            _ => pb::QueryRequest { sql: self.sql.clone(), params: self.params.clone(), plan_json: self.plan_json.clone(), protocol: 1, min_seq_no, profile: self.profile, skip_steps: self.skip_steps, ..Default::default() },
+            _ => pb::QueryRequest { sql: self.sql.clone(), params: self.params.clone(), plan_json: self.plan_json.clone(), protocol: 1, min_seq_no, min_seq_term, profile: self.profile, skip_steps: self.skip_steps, ..Default::default() },
         }
+    }
+}
+
+/// The write each shard's answer must see ([`Coordinator::after`]): its
+/// number, and its term when the client gave it (X-E1; 0: not given),
+/// one per shard (fewer: 0 for the rest).
+#[derive(Clone, Debug, Default)]
+struct Mins {
+    seqs: Vec<u64>,
+    terms: Vec<u64>,
+}
+
+impl Mins {
+    fn seq(&self, i: usize) -> u64 {
+        self.seqs.get(i).copied().unwrap_or(0)
+    }
+
+    fn term(&self, i: usize) -> u64 {
+        self.terms.get(i).copied().unwrap_or(0)
     }
 }
 
@@ -1461,6 +1480,8 @@ fn token_refused(mut j: Json, e: &tonic::Status) -> Json {
 struct Wrote {
     rows: u64,
     seq_no: u64,
+    /// The term of that transaction (0: a shard before the field).
+    seq_term: u64,
     skipped: u64,
     /// What its operations found, from a shard of [`RECEIPT_PROTOCOL`].
     receipt: Option<crate::service::Receipt>,
@@ -2025,11 +2046,11 @@ impl Coordinator {
     /// The number of the write each shard's answer must see: `min_seq_nos`
     /// as the coordinator's writes answer them (`seq_nos`), one per shard
     /// (fewer: 0 for the rest).
-    fn after(&self, t: &Topology, after: &After) -> Result<Vec<u64>, ApiError> {
-        let mins = match after {
-            After::Any => return Ok(Vec::new()),
-            After::Seq(_) => return Err(ApiError::bad("a coordinator takes min_seq_nos, one sequence number per shard, as its writes answer seq_nos; min_seq_no is a server's")),
-            After::Shards(v) => v,
+    fn after(&self, t: &Topology, after: &After) -> Result<Mins, ApiError> {
+        let (mins, terms) = match after {
+            After::Any => return Ok(Mins::default()),
+            After::Seq(..) => return Err(ApiError::bad("a coordinator takes min_seq_nos, one sequence number per shard, as its writes answer seq_nos; min_seq_no is a server's")),
+            After::Shards(v, terms) => (v, terms),
         };
         if mins.len() > t.replicas.len() {
             return Err(ApiError::bad(format!("min_seq_nos has {} numbers, and the coordinator {} shards", mins.len(), t.replicas.len())));
@@ -2037,7 +2058,7 @@ impl Coordinator {
         if let Some(i) = (0..mins.len()).find(|&i| mins[i] > 0 && !self.numbered_alike(t, i)) {
             return Err(ApiError::bad(format!("min_seq_nos names a write on shard {i}, whose replicas each number their own writes: its write answers 0 there")));
         }
-        Ok(mins.clone())
+        Ok(Mins { seqs: mins.clone(), terms: terms.clone() })
     }
 
     fn named(&self, url: &str, s: tonic::Status) -> ApiError {
@@ -2170,16 +2191,16 @@ impl Coordinator {
         let calls = asked.iter().enumerate().filter(|(_, a)| !a.is_empty()).map(|(i, a)| async move {
             let pb_keys: Vec<pb::Value> = a.iter().map(|&j| crate::grpc::to_pb(&keys[j])).collect();
             let got = self
-                .call(t, i, start, None, after.get(i).copied().unwrap_or(0), deadline, |r, mut c| {
+                .call(t, i, start, None, after.seq(i), deadline, |r, mut c| {
                     let pb_keys = pb_keys.clone();
                     async move {
                         let p = self.speak(t, i, r, &mut c, PROTOCOL).await?;
                         if p < GET_PROTOCOL {
                             return Err(tonic::Status::unimplemented(format!("it speaks protocol {p}, and reads by key need {GET_PROTOCOL}: upgrade it")));
                         }
-                        let min_seq_no = after.get(i).copied().unwrap_or(0);
+                        let min_seq_no = after.seq(i);
                         self.reads_after(t, i, r, min_seq_no)?;
-                        c.get(pb::GetRequest { table: schema.table.clone(), keys: pb_keys, timeout_ms: ms_left(deadline), protocol: p, epoch: t.epoch(), min_seq_no, ..Default::default() }).await
+                        c.get(pb::GetRequest { table: schema.table.clone(), keys: pb_keys, timeout_ms: ms_left(deadline), protocol: p, epoch: t.epoch(), min_seq_no, min_seq_term: after.term(i), ..Default::default() }).await
                     }
                 })
                 .await?;
@@ -2241,12 +2262,12 @@ impl Coordinator {
         let after = &self.after(t, after)?;
         let (sql, params) = (&call.sql(), &params_to_pb(params));
         let calls = (0..t.replicas.len()).map(|i| async move {
-            self.call(t, i, start, None, after.get(i).copied().unwrap_or(0), deadline, |r, mut c| async move {
+            self.call(t, i, start, None, after.seq(i), deadline, |r, mut c| async move {
                 let p = self.speak(t, i, r, &mut c, PROTOCOL).await?;
-                let min_seq_no = after.get(i).copied().unwrap_or(0);
+                let min_seq_no = after.seq(i);
                 self.reads_after(t, i, r, min_seq_no)?;
                 let epoch = if p >= 4 { t.epoch() } else { 0 };
-                c.query(pb::QueryRequest { sql: sql.clone(), params: params.clone(), protocol: p, epoch, min_seq_no, timeout_ms: ms_left(deadline), ..Default::default() }).await
+                c.query(pb::QueryRequest { sql: sql.clone(), params: params.clone(), protocol: p, epoch, min_seq_no, min_seq_term: after.term(i), timeout_ms: ms_left(deadline), ..Default::default() }).await
             })
             .await
         });
@@ -2945,7 +2966,7 @@ impl Coordinator {
         for a in join_all(calls).await {
             let a = a?.into_inner();
             let receipt = a.receipt.then_some(crate::service::Receipt { inserted: a.inserted, replaced: a.replaced, updated: a.updated, deleted: a.deleted, collapsed: a.collapsed, not_found: a.not_found });
-            written.get_or_insert(Wrote { rows: a.written, seq_no: a.seq_no.filter(|_| one).unwrap_or(0), skipped: a.skipped, receipt });
+            written.get_or_insert(Wrote { rows: a.written, seq_no: a.seq_no.filter(|_| one).unwrap_or(0), seq_term: a.seq_term.filter(|_| one).unwrap_or(0), skipped: a.skipped, receipt });
         }
         Ok(written.unwrap_or_default())
     }
@@ -2955,6 +2976,7 @@ impl Coordinator {
     /// one is 0).
     fn written(&self, t: &Topology, shards: Vec<(usize, Wrote)>) -> Written {
         let mut seq_nos = vec![0; t.replicas.len()];
+        let mut seq_terms = vec![0; t.replicas.len()];
         let (mut rows, mut skipped) = (0, 0);
         // Known while every shard written said what it found.
         let mut receipt = Some(crate::service::Receipt::default());
@@ -2963,6 +2985,7 @@ impl Coordinator {
             rows += w.rows;
             skipped += w.skipped;
             seq_nos[i] = w.seq_no;
+            seq_terms[i] = w.seq_term;
             match (&mut receipt, &w.receipt) {
                 (Some(all), Some(r)) => all.add(r),
                 _ => receipt = None,
@@ -2985,8 +3008,11 @@ impl Coordinator {
         if seq_nos.iter().all(|&s| s == 0) {
             seq_nos.clear();
         }
+        if seq_nos.is_empty() || seq_terms.iter().all(|&t| t == 0) {
+            seq_terms.clear();
+        }
         parts.sort_by_key(|p| p.shard);
-        Written { rows, seq_nos, skipped, receipt: receipt.filter(|_| !parts.is_empty()), shards: parts, ..Default::default() }
+        Written { rows, seq_nos, seq_terms, skipped, receipt: receipt.filter(|_| !parts.is_empty()), shards: parts, ..Default::default() }
     }
 
     /// An INSERT goes to the shards of its documents' keys (or their

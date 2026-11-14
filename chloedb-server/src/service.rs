@@ -300,32 +300,54 @@ pub struct QueryReq {
 /// until it has applied that write, up to [`crate::replication::READ_WAIT`],
 /// and refuses the read otherwise (503), so that a coordinator asks the
 /// shard's primary.
+///
+/// Each number may come with the term of its write (`min_seq_term`,
+/// `min_seq_terms`, as the write answered `seq_term`, `seq_terms`; 0: not
+/// given). Numbers are reused across a failover: a copy that holds a
+/// deposed primary's transactions under the number of the write holds
+/// more than the write's number and not the write. With the term, a copy
+/// serves only when its own transaction of that number is of that term
+/// (X-E1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum After {
     #[default]
     Any,
-    Seq(u64),
-    Shards(Vec<u64>),
+    /// A server's number, and its term (0: not given).
+    Seq(u64, u64),
+    /// A coordinator's numbers, one per shard, and their terms (fewer or
+    /// none: 0 for the rest).
+    Shards(Vec<u64>, Vec<u64>),
 }
 
 impl After {
     /// From a request's `min_seq_no` and `min_seq_nos` (0 and empty: not
     /// given), which are not both given.
     pub fn of(min_seq_no: u64, min_seq_nos: Vec<u64>) -> Result<After, ApiError> {
+        After::termed(min_seq_no, min_seq_nos, 0, Vec::new())
+    }
+
+    /// As [`Self::of`], with the terms of the writes: `term` of
+    /// `min_seq_no`, `terms` of each of `min_seq_nos`.
+    pub fn termed(min_seq_no: u64, min_seq_nos: Vec<u64>, term: u64, terms: Vec<u64>) -> Result<After, ApiError> {
         match (min_seq_no, min_seq_nos.is_empty()) {
-            (0, true) => Ok(After::Any),
-            (n, true) => Ok(After::Seq(n)),
-            (0, false) => Ok(After::Shards(min_seq_nos)),
+            (0, true) if term == 0 && terms.iter().all(|&t| t == 0) => Ok(After::Any),
+            (0, true) => Err(ApiError::bad("min_seq_term(s) is the term of the write min_seq_no(s) names: give the number too")),
+            (n, true) if terms.is_empty() => Ok(After::Seq(n, term)),
+            (_, true) => Err(ApiError::bad("min_seq_terms goes with min_seq_nos (a coordinator's); a server takes min_seq_term")),
+            (0, false) if term != 0 => Err(ApiError::bad("min_seq_term goes with min_seq_no (a server's); a coordinator takes min_seq_terms, one per shard")),
+            (0, false) if terms.len() > min_seq_nos.len() => Err(ApiError::bad(format!("min_seq_terms has {} terms for {} numbers", terms.len(), min_seq_nos.len()))),
+            (0, false) => Ok(After::Shards(min_seq_nos, terms)),
             _ => Err(ApiError::bad("a read takes min_seq_no (a server's sequence number) or min_seq_nos (a coordinator's, one per shard), not both")),
         }
     }
 
-    /// The number a read on a server must see (0: none).
-    fn seq(&self) -> Result<u64, ApiError> {
+    /// The number a read on a server must see (0: none), and its write's
+    /// term (0: not given).
+    fn seq(&self) -> Result<(u64, u64), ApiError> {
         match self {
-            After::Any => Ok(0),
-            After::Seq(n) => Ok(*n),
-            After::Shards(_) => Err(ApiError::bad("min_seq_nos is a coordinator's, one number per shard; a server takes min_seq_no, the number its write answered")),
+            After::Any => Ok((0, 0)),
+            After::Seq(n, t) => Ok((*n, *t)),
+            After::Shards(..) => Err(ApiError::bad("min_seq_nos is a coordinator's, one number per shard; a server takes min_seq_no, the number its write answered")),
         }
     }
 }
@@ -2507,7 +2529,7 @@ impl Service {
     /// a lease keeps its version, so one from before the write is refused
     /// too (409).
     async fn read_snapshot(&self, db: &Db, lease: u64, after: &After, deadline: Instant) -> Result<Snapshot, ApiError> {
-        let min = after.seq()?;
+        let (min, term) = after.seq()?;
         if min > 0 && db.storage().numbering().is_none() {
             return Err(ApiError::bad("min_seq_no needs a database that numbers its writes: start the server with --seq-no"));
         }
@@ -2517,13 +2539,55 @@ impl Service {
         };
         let at = snap.seq_no().unwrap_or(0);
         if at >= min {
+            self.holds_term(db, min, term)?;
             return Ok(snap);
         }
         match (&self.replication(), lease) {
-            (Replication::Replica(f), 0) => f.holding(min, deadline.min(Instant::now() + READ_WAIT)).await,
+            (Replication::Replica(f), 0) => {
+                let snap = f.holding(min, deadline.min(Instant::now() + READ_WAIT)).await?;
+                self.holds_term(db, min, term)?;
+                Ok(snap)
+            }
             (_, 0) => Err(conflict(format!("this server's last transaction is {at}: transaction {min} was not committed here"))),
             (_, l) => Err(conflict(format!("snapshot lease {l} keeps a version holding transactions up to {at}, before {min}"))),
         }
+    }
+
+    /// X-E1: whether this copy's transaction `seq` is of `term` (0: not
+    /// given, so any). Under one number two terms' transactions differ, and
+    /// with them every transaction before (a copy's history is its
+    /// primaries' up to the last number and term they share), so a copy
+    /// whose `seq` is of another term does not hold the write that number
+    /// and term name: a replica that holds a deposed primary's transactions
+    /// refuses (503, so a coordinator asks the shard's primary), and so
+    /// does a primary that stepped down unaware (409, as a number past its
+    /// last).
+    fn holds_term(&self, db: &Db, seq: u64, term: u64) -> Result<(), ApiError> {
+        if term == 0 || seq == 0 {
+            return Ok(());
+        }
+        let held = db.storage().numbering().map_or(0, |n| n.term_at(seq));
+        if held == term {
+            return Ok(());
+        }
+        let said = format!("this server's transaction {seq} is of term {held}, and the read must see transaction {seq} of term {term}");
+        match self.replication() {
+            Replication::Replica(f) => {
+                f.refused_a_read();
+                Err(ApiError { code: None, status: 503, message: format!("{said}: it holds another primary's history there, so read from the shard's primary") })
+            }
+            _ => Err(conflict(format!("{said}: that write is not in this server's history"))),
+        }
+    }
+
+    /// X-E1: `w` with the term of the transaction its `seq_no` names, from
+    /// a server that numbers its writes (a coordinator's carries each
+    /// shard's in `seq_terms` already).
+    pub fn termed(&self, mut w: Written) -> Written {
+        if let (Some(seq), None, Some(db)) = (w.seq_no, w.seq_term, self.local()) {
+            w.seq_term = db.storage().numbering().map(|n| n.term_at(seq)).filter(|&t| t > 0);
+        }
+        w
     }
 
 
@@ -4174,8 +4238,11 @@ impl Service {
                 if let SqlAnswer::Written { w, .. } = Box::pin(self.sql_in(who, &statement, &p, After::Any, timeout_ms, None, None)).await? {
                     total.rows += w.rows;
                     total.skipped += w.skipped;
-                    total.seq_no = w.seq_no.or(total.seq_no);
+                    if w.seq_no.is_some() {
+                        (total.seq_no, total.seq_term) = (w.seq_no, w.seq_term);
+                    }
                     total.seq_nos.extend(w.seq_nos);
+                    total.seq_terms.extend(w.seq_terms);
                 }
             }
             return Ok(SqlAnswer::Written { w: total, took_ms: t0.elapsed().as_secs_f64() * 1e3 });
@@ -5835,6 +5902,10 @@ pub struct Written {
     pub rows: u64,
     pub seq_no: Option<u64>,
     pub seq_nos: Vec<u64>,
+    /// The term of the transaction `seq_no` names ([`Service::termed`]),
+    /// and through a coordinator of each of `seq_nos` (X-E1).
+    pub seq_term: Option<u64>,
+    pub seq_terms: Vec<u64>,
     /// Operations not applied because their source offset was written
     /// already ([`op_source`]): a replay's.
     pub skipped: u64,
@@ -5924,9 +5995,11 @@ impl Written {
         self.shards.sort_by_key(|p| p.shard);
         if w.seq_no.is_some() {
             self.seq_no = w.seq_no;
+            self.seq_term = w.seq_term;
         }
         if !w.seq_nos.is_empty() {
             self.seq_nos = w.seq_nos;
+            self.seq_terms = w.seq_terms;
         }
     }
 }

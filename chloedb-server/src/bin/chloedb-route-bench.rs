@@ -377,7 +377,7 @@ async fn drive(svcs: &[Arc<Service>], coords: &[Arc<Coordinator>], queries: Arc<
                     };
                     let t = Instant::now();
                     let sql = format!("SELECT id, body FROM t WHERE id = {key}");
-                    let ok = match svc.query(QueryReq { sql, after: After::Shards(written.seq_nos), ..Default::default() }).await {
+                    let ok = match svc.query(QueryReq { sql, after: After::Shards(written.seq_nos, written.seq_terms), ..Default::default() }).await {
                         Ok(a) => a.rs.rows.first().and_then(|r| r.get(1)).and_then(|v| v.as_str()) == Some(body.as_str()),
                         Err(_) => false,
                     };

@@ -195,6 +195,10 @@ message GetRequest {
   uint64 min_seq_no = 6;
   // To a coordinator: the numbers its write answered, one per shard.
   repeated uint64 min_seq_nos = 7;
+  // The term of the write min_seq_no names, and to a coordinator of each
+  // of min_seq_nos, as for a query (X-E1).
+  uint64 min_seq_term = 8;
+  repeated uint64 min_seq_terms = 9;
 }
 
 message GetResponse {
@@ -620,6 +624,15 @@ message QueryRequest {
   // To a coordinator: the numbers its write answered, one per shard
   // (WriteResponse.seq_nos), instead of min_seq_no.
   repeated uint64 min_seq_nos = 14;
+  // The term of the write min_seq_no names (WriteResponse.seq_term; 0: not
+  // given), and to a coordinator of each of min_seq_nos
+  // (WriteResponse.seq_terms). Sequence numbers are reused across a
+  // failover, so a copy whose transaction of that number is of an older
+  // term holds a deposed primary's, not the write: it refuses the read as
+  // it refuses one past its last (X-E1). A server before this field reads
+  // by the number alone.
+  uint64 min_seq_term = 23;
+  repeated uint64 min_seq_terms = 24;
   // Measure the CPU time (and, with the server's counting allocator, the
   // allocations) of each step of the query's profile
   // (chloedb::query::steps), which costs a system call per step. A
@@ -1509,6 +1522,11 @@ message WriteResponse {
   uint64 deleted = 10;
   uint64 collapsed = 11;
   uint64 not_found = 12;
+  // The term of the transaction seq_no names, and from a coordinator of
+  // each of seq_nos (0 for a shard not written, or of a server before
+  // these fields). A read passes them with the numbers as min_seq_term(s).
+  optional uint64 seq_term = 13;
+  repeated uint64 seq_terms = 14;
 }
 
 message SourcesRequest {

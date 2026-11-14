@@ -493,6 +493,32 @@ pub struct State {
     /// as a new server image rolls the servers.
     pub apps: Option<Image>,
     pub apps_track: String,
+    /// The engine's last image (a digest) that came up ready with `on`: what
+    /// it goes back to when a newer one does not (X-E6).
+    pub apps_serving: Option<String>,
+    /// The engine's image it was moved to and has not come up ready on yet.
+    pub apps_trying: Option<Trying>,
+    /// The engine's images that did not come up ready in time: not run
+    /// again by the upgrader (a person may still name one in
+    /// `spec.apps.image`).
+    pub apps_rejected: Vec<Rejected>,
+}
+
+/// An image being tried, and since when.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Trying {
+    pub digest: String,
+    pub since_ms: u64,
+}
+
+/// How long the app engine has to come up ready on a new image of its tag
+/// before it goes back to the last one that served: the rollout's
+/// `verifySeconds`, and at least five minutes, since a pod of one that
+/// pulls a new image first and stops the old one (`Recreate`, for its
+/// volume) takes longer than a server.
+pub fn engine_verify_ms(verify_seconds: u64) -> u64 {
+    verify_seconds.max(300) * 1000
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -528,6 +554,48 @@ impl State {
         }
         self.available = false;
         self.note(at_ms, format!("{} failed and was rolled back: {why}", short(digest)));
+    }
+
+    /// What the app engine's Deployment runs (`deployed`, the digest its
+    /// template names) and whether it is ready on it, with `on` (X-E6). A
+    /// digest that comes up ready is the one to go back to; one that is
+    /// not ready `verify_ms` after the engine was moved to it is rejected,
+    /// and [`apps_image`] then names the last one that served. An engine
+    /// that served on a digest and stops being ready later is not an
+    /// upgrade's fault, so it is left alone.
+    pub fn engine_seen(&mut self, deployed: &str, ready: bool, now: u64, verify_ms: u64) {
+        if ready {
+            if self.apps_trying.as_ref().is_some_and(|t| t.digest == deployed) {
+                self.note(now, format!("App engine: {} came up ready", short(deployed)));
+            }
+            self.apps_trying = None;
+            self.apps_serving = Some(deployed.to_string());
+            return;
+        }
+        if self.apps_serving.as_deref() == Some(deployed) || self.apps_rejected.iter().any(|r| r.digest == deployed) {
+            self.apps_trying = None;
+            return;
+        }
+        let since = match &self.apps_trying {
+            Some(t) if t.digest == deployed => t.since_ms,
+            _ => {
+                self.apps_trying = Some(Trying { digest: deployed.to_string(), since_ms: now });
+                now
+            }
+        };
+        if now.saturating_sub(since) < verify_ms {
+            return;
+        }
+        let why = format!("not ready {} s after the engine was moved to it", verify_ms / 1000);
+        self.apps_rejected.push(Rejected { digest: deployed.to_string(), at_ms: now, why: why.clone() });
+        let over = self.apps_rejected.len().saturating_sub(20);
+        self.apps_rejected.drain(..over);
+        self.apps_trying = None;
+        let back = match &self.apps_serving {
+            Some(d) => format!("back to {}", short(d)),
+            None => "no earlier image served, so it stays; pin spec.apps.image to one that works".into(),
+        };
+        self.note(now, format!("App engine: {} was {why}; {back}", short(deployed)));
     }
 
     /// Whether the registry is due to be asked at `now`.
@@ -583,12 +651,17 @@ pub fn available(s: &State, image: &str) -> bool {
 /// The image the app engine runs (`spec.apps.image` is `image`): with
 /// `on`, the digest its tag named when the registry was last asked
 /// ([`State::apps`]), so that a new image of the tag restarts the engine
-/// on it; else (`off`, `suggest`, an image by digest, a tag not asked yet)
-/// `image` as it is.
+/// on it, unless that digest did not come up ready ([`State::engine_seen`]),
+/// when it is the last one that served; else (`off`, `suggest`, an image
+/// by digest, a tag not asked yet) `image` as it is.
 pub fn apps_image(u: &Upgrade, s: &State, image: &str) -> String {
     let Some(i) = s.apps.as_ref().filter(|_| u.mode == Mode::On && s.apps_track == image && digest_of(image).is_none()) else { return image.to_string() };
+    let digest = match &s.apps_serving {
+        Some(good) if s.apps_rejected.iter().any(|r| r.digest == i.digest) => good,
+        _ => &i.digest,
+    };
     match Ref::parse(image) {
-        Ok(r) => r.pinned(&i.digest),
+        Ok(r) => r.pinned(digest),
         Err(_) => image.to_string(),
     }
 }
@@ -691,6 +764,51 @@ mod tests {
         // Read back from a status written before the field existed.
         let old: State = serde_json::from_value(json!({"mode": "on", "track": "x:latest"})).unwrap();
         assert!(old.apps.is_none() && old.apps_track.is_empty());
+    }
+
+    /// X-E6: a new image of the engine's tag that does not come up ready
+    /// is rejected after the verify time, and the engine goes back to the
+    /// last image that served.
+    #[test]
+    fn the_app_engine_goes_back_to_the_image_that_served() {
+        let (good, bad) = (format!("sha256:{}", "1".repeat(64)), format!("sha256:{}", "2".repeat(64)));
+        let tag = "ghcr.io/chloetech-ai/chloedb-apps:latest";
+        let named = |d: &str| Image { image: format!("ghcr.io/chloetech-ai/chloedb-apps@{d}"), digest: d.to_string(), revision: None, created: None };
+        let on = Upgrade { mode: Mode::On, ..Upgrade::default() };
+        let mut s = State { apps: Some(named(&good)), apps_track: tag.into(), ..State::default() };
+        let verify = engine_verify_ms(60);
+        assert_eq!(verify, 300_000, "at least five minutes");
+        s.engine_seen(&good, true, 0, verify);
+        assert_eq!(s.apps_serving.as_deref(), Some(good.as_str()));
+        // The tag moves on: the engine is moved to the new digest.
+        s.apps = Some(named(&bad));
+        assert_eq!(apps_image(&on, &s, tag), format!("ghcr.io/chloetech-ai/chloedb-apps@{bad}"));
+        s.engine_seen(&bad, false, 1_000, verify);
+        s.engine_seen(&bad, false, 200_000, verify);
+        assert!(s.apps_rejected.is_empty(), "still within the verify time");
+        assert_eq!(s.apps_trying.as_ref().map(|t| t.since_ms), Some(1_000));
+        s.engine_seen(&bad, false, 301_000, verify);
+        assert_eq!(s.apps_rejected.iter().map(|r| r.digest.as_str()).collect::<Vec<_>>(), [bad.as_str()]);
+        assert!(s.log.last().unwrap().text.contains("back to 111111111111"), "{:?}", s.log.last());
+        // Back to the image that served, while the tag still names the bad one.
+        assert_eq!(apps_image(&on, &s, tag), format!("ghcr.io/chloetech-ai/chloedb-apps@{good}"));
+        // Not ready later on the good one is not an upgrade's fault.
+        s.engine_seen(&good, false, 900_000, verify);
+        s.engine_seen(&good, false, 2_000_000, verify);
+        assert_eq!(s.apps_rejected.len(), 1);
+        // A newer image of the tag is tried again.
+        let newer = format!("sha256:{}", "3".repeat(64));
+        s.apps = Some(named(&newer));
+        assert_eq!(apps_image(&on, &s, tag), format!("ghcr.io/chloetech-ai/chloedb-apps@{newer}"));
+        s.engine_seen(&newer, true, 2_100_000, verify);
+        assert_eq!(s.apps_serving.as_deref(), Some(newer.as_str()));
+        // With nothing that served before, a rejected image stays (there is
+        // nothing to go back to) and the log says to pin one.
+        let mut fresh = State { apps: Some(named(&bad)), apps_track: tag.into(), ..State::default() };
+        fresh.engine_seen(&bad, false, 0, verify);
+        fresh.engine_seen(&bad, false, verify, verify);
+        assert_eq!(apps_image(&on, &fresh, tag), format!("ghcr.io/chloetech-ai/chloedb-apps@{bad}"));
+        assert!(fresh.log.last().unwrap().text.contains("pin spec.apps.image"));
     }
 
     #[test]

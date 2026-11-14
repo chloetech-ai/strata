@@ -500,6 +500,15 @@ impl Spec {
         }
     }
 
+    /// X-E7: with `coordinatorStorage` the coordinators are a StatefulSet,
+    /// which stops a pod before it starts its replacement, so one
+    /// coordinator means no API for the length of each rollout. Not
+    /// refused: a cluster that runs so keeps its spec valid.
+    pub fn lone_coordinator_warning(&self) -> Option<&'static str> {
+        (self.coordinator_storage.is_some() && self.coordinators < 2)
+            .then_some("coordinatorStorage with one coordinator: every rollout (each image upgrade too) stops it before its replacement starts, so the cluster's API is down for the restart; run 2 coordinators or more")
+    }
+
     /// What is wrong with it, if anything.
     pub fn check(&self) -> Result<(), String> {
         if self.shards == 0 || self.replicas == 0 || self.coordinators == 0 {
@@ -1407,7 +1416,12 @@ async fn act<P: Platform>(
     if !short.is_empty() {
         return Ok(Outcome::new(Phase::Scaling, format!("shards {} wait for copies to start", short.join(", "))));
     }
-    Ok(Outcome::new(Phase::Ready, format!("{n} shards of {} copies", spec.replicas)))
+    let mut said = format!("{n} shards of {} copies", spec.replicas);
+    if let Some(w) = spec.lone_coordinator_warning() {
+        said.push_str("; ");
+        said.push_str(w);
+    }
+    Ok(Outcome::new(Phase::Ready, said))
 }
 
 /// A copy running older settings than `spec`'s that has not started (its
@@ -1978,6 +1992,9 @@ pub fn plan(old: &Spec, new: &Spec, shards_now: usize, copies_now: usize) -> Jso
     if new.schema != old.schema || new.demo != old.demo {
         warnings.push("the first table's schema (or the demo) makes new servers only: change the tables that exist through the coordinator (ALTER TABLE)".into());
     }
+    if let Some(w) = new.lone_coordinator_warning() {
+        warnings.push(w.into());
+    }
     if new.replicas == 1 {
         warnings.push("one copy a shard: losing its server loses the shard until it is back, and its writes stop".into());
     } else if new.replicas == 2 && new.write_acks != "primary" {
@@ -2309,6 +2326,21 @@ mod tests {
         j["appTokens"] = json!(credentials::TOKEN_DIR);
         assert_eq!(new.coordinator_config(), short_hash(&j));
         assert!(!serde_json::to_value(&none).unwrap().as_object().unwrap().contains_key("apps"));
+    }
+
+    /// X-E7: one coordinator with a volume each is warned of in a plan and
+    /// in the status, not refused; two are not warned of.
+    #[test]
+    fn one_coordinator_with_storage_is_warned_of() {
+        let plain: Spec = serde_json::from_value(json!({"demo": 10})).unwrap();
+        assert!(plain.lone_coordinator_warning().is_none());
+        let lone: Spec = serde_json::from_value(json!({"demo": 10, "coordinatorStorage": {"size": "2Gi"}})).unwrap();
+        assert!(lone.check().is_ok());
+        let p = plan(&plain, &lone, 1, 3);
+        assert!(p["refused"].is_null() && p["warnings"].to_string().contains("coordinatorStorage with one coordinator"), "{p}");
+        let two: Spec = serde_json::from_value(json!({"demo": 10, "coordinators": 2, "coordinatorStorage": {"size": "2Gi"}})).unwrap();
+        assert!(two.lone_coordinator_warning().is_none());
+        assert!(!plan(&plain, &two, 1, 3)["warnings"].to_string().contains("coordinatorStorage"));
     }
 
     #[test]

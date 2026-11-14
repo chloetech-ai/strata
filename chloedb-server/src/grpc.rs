@@ -246,6 +246,8 @@ pub fn write_response(w: crate::service::Written) -> pb::WriteResponse {
         written: w.rows,
         seq_no: w.seq_no,
         seq_nos: w.seq_nos,
+        seq_term: w.seq_term,
+        seq_terms: w.seq_terms,
         skipped: w.skipped,
         receipt: w.receipt.is_some(),
         inserted: r.inserted,
@@ -297,7 +299,7 @@ pub fn query_req(r: pb::QueryRequest) -> Result<QueryReq, ApiError> {
         plan: plan.map(Arc::new),
         hold: r.hold,
         release: r.release,
-        after: After::of(r.min_seq_no, r.min_seq_nos)?,
+        after: After::termed(r.min_seq_no, r.min_seq_nos, r.min_seq_term, r.min_seq_terms)?,
         // A coordinator's query that asked for its steps' CPU time; a shard
         // also measures it when set to for every query.
         profile: r.profile,
@@ -540,7 +542,7 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("TermStats", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
             let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
-            let after = After::of(r.min_seq_no, r.min_seq_nos)?;
+            let after = After::termed(r.min_seq_no, r.min_seq_nos, r.min_seq_term, r.min_seq_terms)?;
             let (stats, snapshot, version) = svc.term_stats(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
             Ok(pb::TermStatsResponse { stats_json: json_bytes(&stats), snapshot, version })
         })
@@ -551,7 +553,7 @@ impl pb::strata_server::Strata for Grpc {
         self.serve("GuardCounts", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
             let plan = request_plan(r.protocol, r.plan, &r.plan_json)?;
-            let after = After::of(r.min_seq_no, r.min_seq_nos)?;
+            let after = After::termed(r.min_seq_no, r.min_seq_nos, r.min_seq_term, r.min_seq_terms)?;
             let (need, counts) = svc.guard_counts(&r.sql, plan.as_ref(), &params_from_pb(r.params), &after, r.timeout_ms as u64).await?;
             Ok(pb::GuardCountsResponse { need: need as u32, counts })
         })
@@ -563,7 +565,7 @@ impl pb::strata_server::Strata for Grpc {
             let q = r.query.unwrap_or_default();
             svc.check_epoch(q.epoch)?;
             let plan = request_plan(q.protocol, q.plan, &q.plan_json)?;
-            let after = After::of(q.min_seq_no, q.min_seq_nos)?;
+            let after = After::termed(q.min_seq_no, q.min_seq_nos, q.min_seq_term, q.min_seq_terms)?;
             let next = svc.sid_next(&q.sql, plan.as_ref(), &params_from_pb(q.params), &r.field, &r.prefixes, &after, q.timeout_ms as u64).await?;
             let next = next.into_iter().map(|cs| {
                 let (codes, counts) = cs.into_iter().unzip();
@@ -613,7 +615,7 @@ impl pb::strata_server::Strata for Grpc {
                     crate::service::SqlAnswer::Rows(_) => return Err(ApiError::bad("Write takes INSERT, UPDATE or DELETE; use Query")),
                 }
             };
-            Ok(write_response(w))
+            Ok(write_response(svc.termed(w)))
         })
         .await
     }
@@ -656,7 +658,7 @@ impl pb::strata_server::Strata for Grpc {
                 .await;
                 match r {
                     Ok(w) => {
-                        let r = pb::WriteResponse { offsets: s.offsets().into_iter().collect(), ..write_response(w) };
+                        let r = pb::WriteResponse { offsets: s.offsets().into_iter().collect(), ..write_response(svc.termed(w)) };
                         if tx.send(Ok(r)).await.is_err() {
                             break;
                         }
@@ -838,7 +840,7 @@ impl pb::strata_server::Strata for Grpc {
     async fn get(&self, req: Request<pb::GetRequest>) -> Result<Response<pb::GetResponse>, Status> {
         self.serve("Get", req, |svc, _who, r| async move {
             svc.check_epoch(r.epoch)?;
-            let after = After::of(r.min_seq_no, r.min_seq_nos)?;
+            let after = After::termed(r.min_seq_no, r.min_seq_nos, r.min_seq_term, r.min_seq_terms)?;
             let table = Some(r.table).filter(|t| !t.is_empty());
             let keys = r.keys.into_iter().map(from_pb).collect();
             // A coordinator's read names the protocol it speaks; it counts

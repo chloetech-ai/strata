@@ -1712,7 +1712,7 @@ async fn a_read_that_names_a_write_skips_a_replica_that_would_not_wait() {
     let sold = |after: Vec<u64>| {
         let coord = coord.clone();
         async move {
-            let q = QueryReq { sql: "SELECT sold FROM products WHERE id = 'p0000003'".into(), after: After::Shards(after), ..Default::default() };
+            let q = QueryReq { sql: "SELECT sold FROM products WHERE id = 'p0000003'".into(), after: After::Shards(after, Vec::new()), ..Default::default() };
             coord.query(q).await.unwrap().rs.rows[0][0].as_i64().unwrap()
         }
     };
@@ -3745,7 +3745,7 @@ async fn conditional_writes_through_a_coordinator() {
     // a read cannot name one.
     let w = replicated.write_ops(vec![json!({"op": "set", "key": "p0000003", "field": "sold", "value": 8})], None).await.unwrap();
     assert!(w.seq_no.is_none() && w.seq_nos.is_empty(), "{w:?}");
-    let read = |after: Vec<u64>| QueryReq { sql: "SELECT sold FROM products WHERE id = 'p0000003'".into(), after: After::Shards(after), ..Default::default() };
+    let read = |after: Vec<u64>| QueryReq { sql: "SELECT sold FROM products WHERE id = 'p0000003'".into(), after: After::Shards(after, Vec::new()), ..Default::default() };
     let e = replicated.query(read(vec![0, 1])).await.err().unwrap();
     assert!(e.status == 400 && e.message.contains("whose replicas each number their own writes"), "{}", e.message);
     assert!(replicated.query(read(vec![0, 0])).await.is_ok());

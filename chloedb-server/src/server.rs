@@ -315,6 +315,35 @@ pub fn db_options(directory: bool) -> DbOptions {
 }
 
 /// Opens or creates the database, or connects to the shards.
+/// N-E2, a primary's half ([`replication::copies_holding`]): a server
+/// started as a primary by its flags (`--replicas`, without `--replica`
+/// or `--promote`) with nothing kept beside its database and nothing in
+/// it asks its replicas what they hold. When one holds a transaction,
+/// the shard served before and this server lost its volume:
+/// with automatic failover it starts as a replica (`Ok(Some)`), and the
+/// copies elect the one holding the data; without, it does not start, as
+/// a primary would otherwise ship its empty database over theirs.
+async fn lost_volume(o: &Options, db: &Arc<chloedb::db::Db>, file: &std::path::Path, ships: &PrimaryOptions) -> Result<Option<replication::Holding>, String> {
+    if o.replicas.is_empty() || o.replica || o.promote || file.exists() {
+        return Ok(None);
+    }
+    if db.storage().numbering().is_some_and(|n| n.last().seq > 0) {
+        return Ok(None);
+    }
+    let held = replication::copies_holding(&o.replicas, ships.token.as_ref(), ships.ca.as_deref(), ships.call_timeout.min(Duration::from_secs(3))).await;
+    let Some(h) = held.into_iter().max_by_key(|h| (h.term, h.seq)) else { return Ok(None) };
+    if o.failover_after_ms == 0 {
+        return Err(format!(
+            "{} is empty and keeps no part in replication, but copy {} of its shard holds transactions up to {} (term {}): this server lost its volume, or is new to the shard. Started as the primary it would ship its empty database over the copies' data. Start it with --replica and promote the copy holding the data (POST /v1/admin/promote on that copy), or start the shard with --failover-after-ms so that its copies elect it",
+            db.storage().path().display(),
+            h.url,
+            h.seq,
+            h.term
+        ));
+    }
+    Ok(Some(h))
+}
+
 pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
     let agent = AgentConfig { api_key: o.api_key.clone(), model: o.model.clone(), base_url: o.api_base.clone() };
     let timeout = Duration::from_millis(o.timeout_ms.max(1));
@@ -633,6 +662,14 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
                 (false, true) => tracing::info!("replica: a primary of a newer term replaced this one, which follows it"),
                 (false, false) => tracing::info!("replica, as kept beside the database: applies the writes its primary ships"),
             }
+        } else if let Some(h) = lost_volume(o, db, file, &ships).await? {
+            // N-E2: a primary by its flags on an empty volume, beside copies
+            // that hold the shard. It follows instead (not one of the
+            // shard's first copies: it counts once a primary caught it up),
+            // so that the copy holding the data is elected and copies it.
+            svc.set_replication(Replication::Replica(Arc::new(Follow::open(db.clone(), Some(file))?)));
+            svc.promote_options = Some(PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, ..ships });
+            tracing::warn!(copy = %h.url, term = h.term, seq_no = h.seq, "started as a primary by its flags on an empty database, while a copy of its shard holds transactions: its volume was lost (or it is new to the shard), so it starts as a replica and its shard's copies elect the one holding the data");
         } else if (!o.replicas.is_empty() && !o.replica) || o.promote {
             let opts = PrimaryOptions { replicas: o.replicas.clone(), acks: o.write_acks, promote: o.promote, ..ships };
             let p = Primary::start(db.clone(), Some(file), opts)?;
