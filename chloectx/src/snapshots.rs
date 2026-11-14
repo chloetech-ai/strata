@@ -138,7 +138,14 @@ impl Snapshots {
     }
 
     pub fn release(&self) {
-        let _ = self.holds.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1));
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut n = self.holds.load(Acquire);
+        while n > 0 {
+            match self.holds.compare_exchange_weak(n, n - 1, AcqRel, Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
     }
 
     /// Whether a forget holds snapshots off now.
