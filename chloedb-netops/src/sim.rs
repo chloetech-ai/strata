@@ -91,6 +91,9 @@ pub struct State {
     pub sources: Vec<Value>,
     /// Silences that are not over, by id.
     pub silences: BTreeMap<String, Row>,
+    /// What waits for a person now, and the carriers' notices on the
+    /// shift's worklist: the badges of My shift and Carriers.
+    pub badges: Option<(i64, i64)>,
 }
 
 pub struct Engine {
@@ -104,6 +107,12 @@ pub struct Engine {
     pub lock: tokio::sync::Mutex<()>,
     counter: AtomicU64,
     reset_done: AtomicBool,
+}
+
+/// A graph statement refused because the server is a coordinator, whose
+/// shards each hold only some of a row's edges.
+pub fn refuses_graphs(e: &Error) -> bool {
+    e.status == 400 && e.message.contains("coordinator")
 }
 
 pub fn now() -> i64 {
@@ -180,6 +189,7 @@ impl Engine {
                 tick_ms: 0.0,
                 sources: Vec::new(),
                 silences: BTreeMap::new(),
+                badges: None,
             }),
             lock: tokio::sync::Mutex::new(()),
             counter: AtomicU64::new(0),
@@ -189,6 +199,32 @@ impl Engine {
 
     pub fn st(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether to send graph statements (`REACHABLE`, `hops()`, `ppr`): not
+    /// to a coordinator, which refuses them. It is known from `/v1/health`
+    /// when the app starts, or from the first refusal, and remembered: the
+    /// app then walks its own copy of the graph and reads the rows by key.
+    pub fn walks_graphs(&self) -> bool {
+        self.st().graph_sql != Some(false)
+    }
+
+    /// Takes note of what a graph statement got back.
+    pub fn graph_answer<T>(&self, r: &Result<T>) {
+        let mut st = self.st();
+        match r {
+            Ok(_) if st.graph_sql.is_none() => st.graph_sql = Some(true),
+            Err(e) if refuses_graphs(e) => st.graph_sql = Some(false),
+            _ => {}
+        }
+    }
+
+    /// What the server's `/v1/health` says it is: a coordinator does not
+    /// walk graphs.
+    pub fn learn_role(&self, health: &Value) {
+        if health["role"].as_str() == Some("coordinator") {
+            self.st().graph_sql = Some(false);
+        }
     }
 
     pub fn next_id(&self) -> u64 {
@@ -234,6 +270,7 @@ impl Engine {
                         st.tick_ms = t0.elapsed().as_secs_f64() * 1000.0;
                         st.error = res.err().map(|e| { tracing::warn!("minute {}: {e}", iso(m)); format!("{}: {e}", iso(m)) });
                     }
+                    crate::daily::badges(&self).await;
                 }
                 tokio::time::sleep(Duration::from_secs((60 - now() % 60 + 1) as u64)).await;
             }
@@ -253,6 +290,7 @@ impl Engine {
                         self.st().error = Some(format!("{}: {e}", iso(m)));
                     }
                 }
+                crate::daily::badges(&self).await;
             }
             let wait = 60 - now() % 60 + 1;
             tokio::time::sleep(Duration::from_secs(wait as u64)).await;
@@ -261,7 +299,8 @@ impl Engine {
 
     async fn setup(&self) -> Result<()> {
         self.phase("Waiting for ChloeDB", 0.0);
-        self.db.health().await?;
+        let health = self.db.health().await?;
+        self.learn_role(&health);
         if self.opts.reset && !self.reset_done.swap(true, Ordering::SeqCst) {
             self.phase("Dropping the tables", 0.01);
             for name in schema::names().iter().rev() {

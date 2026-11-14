@@ -498,8 +498,32 @@ async fn detail(State(svc): State<Shared>, Query(a): Query<DetailQ>) -> Answer {
     }
     // What depends on it, for the map to light; and who is behind it.
     let walk = format!("REACHABLE({EDGES}, '{id}', hops => 6, dir => 'out', through => layer != 'core') AND layer != 'core'");
-    out["below"] = json!(q.soft("What depends on it, for the map (REACHABLE along the edges)", &format!("SELECT id FROM {NODES}\nWHERE {walk}\nLIMIT 4000"), json!({})).await.iter().map(|r| r.s("id")).collect::<Vec<_>>());
-    out["customers"] = json!(q.soft("The customers behind it (REACHABLE, grouped)", &format!("SELECT customer, COUNT(*) AS n, SUM(CASE WHEN state = 'ok' THEN 0 ELSE 1 END) AS hurt FROM {NODES}\nWHERE {walk} AND customer != ''\nGROUP BY customer ORDER BY n DESC LIMIT 20"), json!({})).await);
+    let at = q.e.estate.as_ref().and_then(|est| est.find(&id).map(|i| (est, i)));
+    match at.filter(|_| !q.e.walks_graphs()) {
+        // A coordinator does not walk graphs: the app walks its copy of the
+        // estate, and reads the states of what it reached that are not ok.
+        Some((est, i)) => {
+            let below: Vec<u32> = est.below(i, 200_000).into_iter().filter(|j| est.nodes[*j as usize].layer != "core").collect();
+            out["below"] = json!(below.iter().take(4000).map(|j| est.nodes[*j as usize].id.clone()).collect::<Vec<_>>());
+            let firms: Vec<u32> = below.iter().copied().filter(|j| !est.nodes[*j as usize].customer.is_empty()).collect();
+            let hurt = crate::estate::among(&q, "The customers' objects behind it that are not ok", est, &firms, "id", "state != 'ok'", json!({})).await.map(|a| a.rows).unwrap_or_default();
+            let hurt: std::collections::HashSet<String> = hurt.iter().map(|r| r.s("id")).collect();
+            let mut by: HashMap<&str, (i64, i64)> = HashMap::new();
+            for j in &firms {
+                let n = &est.nodes[*j as usize];
+                let c = by.entry(n.customer.as_str()).or_default();
+                c.0 += 1;
+                c.1 += i64::from(hurt.contains(&n.id));
+            }
+            let mut rows: Vec<(&str, i64, i64)> = by.into_iter().map(|(c, (n, h))| (c, n, h)).collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            out["customers"] = json!(rows.into_iter().take(20).map(|(c, n, h)| json!({"customer": c, "n": n, "hurt": h})).collect::<Vec<_>>());
+        }
+        None => {
+            out["below"] = json!(q.soft("What depends on it, for the map (REACHABLE along the edges)", &format!("SELECT id FROM {NODES}\nWHERE {walk}\nLIMIT 4000"), json!({})).await.iter().map(|r| r.s("id")).collect::<Vec<_>>());
+            out["customers"] = json!(q.soft("The customers behind it (REACHABLE, grouped)", &format!("SELECT customer, COUNT(*) AS n, SUM(CASE WHEN state = 'ok' THEN 0 ELSE 1 END) AS hurt FROM {NODES}\nWHERE {walk} AND customer != ''\nGROUP BY customer ORDER BY n DESC LIMIT 20"), json!({})).await);
+        }
+    }
     let words = [n.s("reason"), events.iter().find(|e| e.s("event") == "fault").map(|e| e.s("text")).unwrap_or_default()].into_iter().find(|s| !s.is_empty());
     if let Some(w) = words {
         let w = w.trim_start_matches("Behind ").to_string();

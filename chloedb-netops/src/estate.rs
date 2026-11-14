@@ -812,6 +812,127 @@ pub async fn diagnose(e: &Engine, incident: &str, m: i64) -> Result<()> {
     Ok(())
 }
 
+// ---- walking where the server does not (a coordinator)
+
+/// The most keys one statement names in `id IN (...)`: about 10,000
+/// characters of ids.
+pub const MAX_KEYS: usize = 400;
+/// Up to this many keys a walk is read by key, `MAX_KEYS` at a time, the
+/// batches at once; a larger one is read by the places that hold it.
+pub const BY_KEY: usize = 4 * MAX_KEYS;
+/// The most rows a walk's places are read for, a page at a time.
+pub const PLACE_ROWS: usize = 50_000;
+/// The rows of one page: as many as a query returns.
+const PAGE: usize = 10_000;
+/// The most places a condition on them names.
+const MAX_PLACES: usize = 60;
+
+/// The rows a walk found, read without a graph statement.
+pub struct Among {
+    pub rows: Vec<Row>,
+    /// How the rows were read, for the trace's reader.
+    pub how: &'static str,
+    /// Whether the read stopped at `PLACE_ROWS`, so that some are missing.
+    pub cut: bool,
+}
+
+impl Estate {
+    /// A condition on the places that hold every one of `set`: their hubs,
+    /// else their metros, else their regions, the first of those lists that
+    /// is short. `None` when none is (or the set is empty).
+    pub fn places_of(&self, set: &[u32]) -> Option<String> {
+        if set.is_empty() {
+            return None;
+        }
+        for (level, col) in [(2, "hub"), (1, "metro"), (0, "region")] {
+            let mut names: Vec<&str> = Vec::new();
+            let mut covered = true;
+            for &i in set {
+                let id = self.anc_ids(i)[level];
+                if id.is_empty() {
+                    covered = false;
+                    break;
+                }
+                if !names.contains(&id) {
+                    names.push(id);
+                    if names.len() > MAX_PLACES {
+                        covered = false;
+                        break;
+                    }
+                }
+            }
+            if covered {
+                names.sort_unstable();
+                return Some(format!("{col} IN ({})", names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")));
+            }
+        }
+        None
+    }
+
+    /// An object's region, metro, hub and site, as its row has them.
+    pub fn places(&self, i: u32) -> [&str; 4] {
+        self.anc_ids(i)
+    }
+}
+
+/// The rows of `cols` (which name `id`) among the objects of `set` that
+/// meet `cond`, read without a graph statement and without naming more
+/// than [`MAX_KEYS`] keys in one: by key in batches when the set is small,
+/// otherwise one plain query over the places that hold the set, whose rows
+/// the app keeps when they are in the set.
+pub(crate) async fn among(q: &Q, what: &str, est: &Estate, set: &[u32], cols: &str, cond: &str, params: Value) -> std::result::Result<Among, crate::api::ApiError> {
+    let and = if cond.trim().is_empty() { String::new() } else { format!("\n  AND {cond}") };
+    if set.is_empty() {
+        return Ok(Among { rows: Vec::new(), how: "by key", cut: false });
+    }
+    if set.len() <= BY_KEY {
+        let mut jobs = tokio::task::JoinSet::new();
+        let batches: Vec<&[u32]> = set.chunks(MAX_KEYS).collect();
+        let n = batches.len();
+        for (k, batch) in batches.into_iter().enumerate() {
+            let list = batch.iter().map(|&i| format!("'{}'", est.nodes[i as usize].id)).collect::<Vec<_>>().join(", ");
+            let sql = format!("SELECT {cols} FROM {NODES}\nWHERE id IN ({list}){and}\nLIMIT {}", batch.len());
+            let title = if n == 1 { format!("{what} (walked by the app, read by key)") } else { format!("{what} (walked by the app, read by key, {} of {n})", k + 1) };
+            let (db, trace, params) = (q.e.db.clone(), q.trace.clone(), params.clone());
+            jobs.spawn(async move { (k, db.traced(&trace, &title, &sql, params).await) });
+        }
+        let mut parts: Vec<(usize, Vec<Row>)> = Vec::new();
+        while let Some(done) = jobs.join_next().await {
+            let (k, r) = done.map_err(|e| bad(format!("a read stopped: {e}")))?;
+            parts.push((k, r?));
+        }
+        parts.sort_by_key(|p| p.0);
+        return Ok(Among { rows: parts.into_iter().flat_map(|p| p.1).collect(), how: "by key", cut: false });
+    }
+    let place = est.places_of(set);
+    let wh = match &place {
+        Some(p) => format!("{p}{and}"),
+        None if and.is_empty() => "layer != 'container'".to_string(),
+        None => cond.to_string(),
+    };
+    // Pages by the rows' number, as a query returns at most 10,000 rows.
+    let sql = format!("SELECT {cols}, num FROM {NODES}\nWHERE {wh}\n  AND num > :after\nORDER BY num LIMIT {PAGE}");
+    let inside: HashSet<u32> = set.iter().copied().collect();
+    let (mut rows, mut read, mut cut, mut after) = (Vec::new(), 0, false, -1);
+    for page in 1.. {
+        let mut p = params.clone();
+        p["after"] = json!(after);
+        let got = q.rows(&format!("{what} (walked by the app: the rows of the places that hold the walk, kept here when the walk reached them{})", if page > 1 { format!(", page {page}") } else { String::new() }), &sql, p).await?;
+        let n = got.len();
+        read += n;
+        after = got.last().map_or(after, |r| r.i("num"));
+        rows.extend(got.into_iter().filter(|r| est.find(&r.s("id")).is_some_and(|i| inside.contains(&i))));
+        if n < PAGE {
+            break;
+        }
+        if read >= PLACE_ROWS {
+            cut = true;
+            break;
+        }
+    }
+    Ok(Among { rows, how: "by place", cut })
+}
+
 // ---- the map
 
 pub fn routes() -> Router<Shared> {
@@ -978,10 +1099,13 @@ async fn node(State(svc): State<Shared>, Query(a): Query<NodeQ>) -> Answer {
         rows.sort_by_key(|r| (r.i("hop"), r.s("id")));
         rows
     };
-    let upstream: Vec<Row> = match e.db.traced(&q.trace, if core { "Its neighbours in the backbone (REACHABLE, one hop)" } else { "What it hangs from, nearest first (REACHABLE against the edges)" }, &up_sql, json!({})).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            let (Some(est), Some(i)) = (&e.estate, at) else { return Err(err.into()) };
+    // A coordinator does not walk graphs: once the app knows, it sends no
+    // graph statement and walks its own copy of the estate, reading the
+    // rows it reaches by key or by their places.
+    let upstream: Vec<Row> = match q.graph(if core { "Its neighbours in the backbone (REACHABLE, one hop)" } else { "What it hangs from, nearest first (REACHABLE against the edges)" }, &up_sql, json!({})).await? {
+        Some(rows) => rows,
+        None => {
+            let (Some(est), Some(i)) = (&e.estate, at) else { return Err(bad("this server does not walk graphs, and the app has no copy of the estate to walk")) };
             engine = "app";
             let ids: Vec<(u32, usize)> = if core { est.walk_hops(i, 1, 40, true, true).into_iter().filter(|(j, _)| est.nodes[*j as usize].layer == "core").collect() } else { est.walk_hops(i, 6, 40, false, true) };
             let (list, hop) = in_memory(ids);
@@ -993,12 +1117,20 @@ async fn node(State(svc): State<Shared>, Query(a): Query<NodeQ>) -> Answer {
     let downstream: Vec<Row> = if engine == "sql" {
         q.rows("What depends on it, by kind and state (REACHABLE along the edges, grouped)", &down_sql, json!({})).await?
     } else {
+        // The walk gives each object's kind; the rows that are not ok, read
+        // for the walk's places, give the states (NET-22: not all "").
         let est = e.estate.as_ref().expect("checked");
-        let mut by: HashMap<&str, i64> = HashMap::new();
-        for j in est.below(at.expect("checked"), 200_000).into_iter().filter(|j| est.nodes[*j as usize].layer != "core") {
-            *by.entry(est.nodes[j as usize].kind).or_default() += 1;
+        let below: Vec<u32> = est.below(at.expect("checked"), 200_000).into_iter().filter(|j| est.nodes[*j as usize].layer != "core").collect();
+        let hurt = among(&q, "What depends on it that is not ok", est, &below, "id, state", "state != 'ok'", json!({})).await?;
+        let state: HashMap<String, String> = hurt.rows.iter().map(|r| (r.s("id"), r.s("state"))).collect();
+        let mut by: HashMap<(&str, String), i64> = HashMap::new();
+        for j in &below {
+            let n = &est.nodes[*j as usize];
+            *by.entry((n.kind, state.get(n.id.as_str()).cloned().unwrap_or_else(|| "ok".into()))).or_default() += 1;
         }
-        by.into_iter().map(|(k, n)| json!({"kind": k, "state": "", "n": n}).as_object().cloned().unwrap_or_default()).collect()
+        let mut rows: Vec<Row> = by.into_iter().map(|((k, st), n)| json!({"kind": k, "state": st, "n": n}).as_object().cloned().unwrap_or_default()).collect();
+        rows.sort_by(|a, b| b.i("n").cmp(&a.i("n")).then(a.s("kind").cmp(&b.s("kind"))).then(a.s("state").cmp(&b.s("state"))));
+        rows
     };
     // What else is in trouble within three hops, either way.
     let near_sql = format!("SELECT {SEEN}, hops() AS hop FROM {NODES}\nWHERE REACHABLE({EDGES}, '{id}', hops => 3, dir => 'both', through => layer != 'core') AND state != 'ok'\nORDER BY hops(), id LIMIT 40");
@@ -1006,8 +1138,12 @@ async fn node(State(svc): State<Shared>, Query(a): Query<NodeQ>) -> Answer {
         q.rows("Trouble within three hops, either way (REACHABLE and a condition)", &near_sql, json!({})).await?
     } else {
         let est = e.estate.as_ref().expect("checked");
-        let (list, hop) = in_memory(est.walk_hops(at.expect("checked"), 3, 3000, true, true));
-        with_hops(q.rows("Trouble within three hops (walked by the app)", &format!("SELECT {SEEN} FROM {NODES}\nWHERE id IN ({list}) AND state != 'ok' LIMIT 40"), json!({})).await?, &hop)
+        let walked = est.walk_hops(at.expect("checked"), 3, 20_000, true, true);
+        let set: Vec<u32> = walked.iter().map(|w| w.0).collect();
+        let hop: HashMap<String, usize> = walked.iter().map(|&(i, d)| (est.nodes[i as usize].id.clone(), d)).collect();
+        let mut rows = with_hops(among(&q, "Trouble within three hops", est, &set, SEEN, "state != 'ok'", json!({})).await?.rows, &hop);
+        rows.truncate(40);
+        rows
     };
     // The neighbourhood whose history matters: itself, what it hangs from,
     // and what is one hop away.

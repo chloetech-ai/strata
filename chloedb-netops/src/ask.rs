@@ -19,6 +19,7 @@
 //! vocabulary ([`read`]), which is what answers when it has not. The
 //! answer says which read it and shows the plan and the SQL.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use axum::extract::{Query, State};
@@ -684,11 +685,11 @@ pub struct Compiled {
     pub read: Vec<Value>,
 }
 
-/// The plan as conditions of one query over the objects. `walked` is the
-/// graph condition's rows when the app walked the graph itself (a
-/// coordinator does not walk graphs yet): the condition is then a list of
-/// keys rather than `REACHABLE`.
-pub fn compile(p: &Plan, now: i64, walked: Option<&str>) -> Compiled {
+/// The plan as conditions of one query over the objects. `app_walks` when
+/// the app walks the graph itself (a coordinator does not walk graphs yet):
+/// the graph condition is then left out, and the app keeps the rows its
+/// walk reached.
+pub fn compile(p: &Plan, now: i64, app_walks: bool) -> Compiled {
     let mut c: Vec<String> = vec!["layer != 'container'".into()];
     let mut params = Map::new();
     let mut read: Vec<Value> = Vec::new();
@@ -777,11 +778,10 @@ pub fn compile(p: &Plan, now: i64, walked: Option<&str>) -> Compiled {
             "both" => "both",
             _ => "out",
         };
-        match walked {
-            Some(list) => c.push(format!("id IN ({list})")),
-            None => c.push(format!("REACHABLE({EDGES}, '{}', hops => {}, dir => '{dir}', through => layer != 'core')", clean(&g.from), g.hops.clamp(1, 8))),
+        if !app_walks {
+            c.push(format!("REACHABLE({EDGES}, '{}', hops => {}, dir => '{dir}', through => layer != 'core')", clean(&g.from), g.hops.clamp(1, 8)));
         }
-        said("graph", match dir { "out" => format!("depends on {}", g.from), "in" => format!("{} depends on it", g.from), _ => format!("within {} hops of {}", g.hops, g.from) }, if walked.is_some() { "walked by the app: a coordinator does not walk graphs yet" } else { "REACHABLE over the edge table" });
+        said("graph", match dir { "out" => format!("depends on {}", g.from), "in" => format!("{} depends on it", g.from), _ => format!("within {} hops of {}", g.hops, g.from) }, if app_walks { "walked by the app: a coordinator does not walk graphs yet" } else { "REACHABLE over the edge table" });
     }
     let order = match p.order.as_str() {
         "loss" => "loss DESC",
@@ -925,33 +925,64 @@ async fn ask(svc: Shared, a: AskQ, keep: bool) -> Answer {
     }
     let at = e.st().last_minute.max(now - 120);
     let statement = |c: &Compiled| format!("SELECT {FOUND} FROM {NODES}\nWHERE {}\nORDER BY {} LIMIT 300", c.conditions, c.order);
-    let mut c = compile(&plan, at, None);
-    let mut params = Value::Object(c.params.clone());
-    let mut sql = statement(&c);
-    let display = sql.clone();
-    let rows = match e.db.traced(&q.trace, "The search: every condition in one statement", &sql, params.clone()).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            // A server that does not walk graphs: the app walks, and the
-            // rest of the statement stays as it was.
-            let (Some(g), Some(est)) = (&plan.walk, &e.estate) else { return Err(err.into()) };
-            let Some(from) = est.find(&g.from) else { return Err(err.into()) };
-            let ids = est.walk_hops(from, g.hops as usize, 50_000, g.dir != "in", g.dir != "out");
-            let list = if ids.is_empty() { "''".to_string() } else { ids.iter().map(|(i, _)| format!("'{}'", est.nodes[*i as usize].id)).collect::<Vec<_>>().join(", ") };
-            c = compile(&plan, at, Some(&list));
-            params = Value::Object(c.params.clone());
-            sql = statement(&c);
-            q.rows("The search, the graph walked by the app", &sql, params.clone()).await?
-        }
-    };
-    let by_place = q.rows("Where the matches are, for the map at every zoom", &format!("SELECT region, metro, hub, asite, COUNT(*) AS n FROM {NODES}\nWHERE {}\nGROUP BY region, metro, hub, asite LIMIT 10000", c.conditions), params.clone()).await?;
+    let mut c = compile(&plan, at, false);
+    let display = statement(&c);
     let mut places: Map<String, Value> = Map::new();
     let mut total = 0;
-    for b in &by_place {
-        total += b.i("n");
-        for id in [b.s("region"), b.s("metro"), b.s("hub"), b.s("asite")].into_iter().filter(|s| !s.is_empty()) {
-            let p = places.entry(id).or_insert(json!(0));
-            *p = json!(p.as_i64().unwrap_or(0) + b.i("n"));
+    let mut cut = false;
+    let searched = if plan.walk.is_none() {
+        Some(q.rows("The search: every condition in one statement", &display, Value::Object(c.params.clone())).await?)
+    } else {
+        q.graph("The search: every condition in one statement", &display, Value::Object(c.params.clone())).await?
+    };
+    let app_walked = searched.is_none();
+    let rows = match searched {
+        Some(rows) => rows,
+        None => {
+            // A server that does not walk graphs: the app walks its copy of
+            // the estate, reads what meets the other conditions among what
+            // it reached (by key, or by the places that hold it, never a
+            // list of tens of thousands of keys), counts it by place and
+            // reads the first rows in full by key.
+            let (Some(g), Some(est)) = (&plan.walk, &e.estate) else { return Err(bad("this server does not walk graphs, and the app has no copy of the estate to walk")) };
+            let Some(from) = est.find(&g.from) else { return Err(bad(format!("{} is not an object of the estate", g.from))) };
+            c = compile(&plan, at, true);
+            let walked: Vec<u32> = est.walk_hops(from, g.hops as usize, 250_000, g.dir != "in", g.dir != "out").into_iter().map(|w| w.0).collect();
+            let col = c.order.split(' ').next().unwrap_or("latency_ms").to_string();
+            let found = crate::estate::among(&q, "The search, every other condition in one statement", est, &walked, &format!("id, {col}"), &c.conditions, Value::Object(c.params.clone())).await?;
+            cut = found.cut;
+            if cut {
+                note = [note.as_str(), &format!("the app read the first {} objects of the places its walk reached, and counted those", crate::estate::PLACE_ROWS)].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join("; ");
+            }
+            let mut hits: Vec<(f64, String)> = found.rows.iter().map(|r| (r.f(&col), r.s("id"))).collect();
+            total = hits.len() as i64;
+            for (_, id) in &hits {
+                let Some(i) = est.find(id) else { continue };
+                for p in est.places(i).into_iter().filter(|s| !s.is_empty()) {
+                    let n = places.entry(p.to_string()).or_insert(json!(0));
+                    *n = json!(n.as_i64().unwrap_or(0) + 1);
+                }
+            }
+            hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            hits.truncate(300);
+            let mut first = if hits.is_empty() { Vec::new() } else {
+                let list = hits.iter().map(|h| format!("'{}'", h.1)).collect::<Vec<_>>().join(", ");
+                q.rows("The first of them, in full, by key", &format!("SELECT {FOUND} FROM {NODES}\nWHERE id IN ({list})\nLIMIT {}", hits.len()), json!({})).await?
+            };
+            let rank: HashMap<&str, usize> = hits.iter().enumerate().map(|(k, h)| (h.1.as_str(), k)).collect();
+            first.sort_by_key(|r| rank.get(r.s("id").as_str()).copied().unwrap_or(usize::MAX));
+            first
+        }
+    };
+    let params = Value::Object(c.params.clone());
+    if !app_walked {
+        let by_place = q.rows("Where the matches are, for the map at every zoom", &format!("SELECT region, metro, hub, asite, COUNT(*) AS n FROM {NODES}\nWHERE {}\nGROUP BY region, metro, hub, asite LIMIT 10000", c.conditions), params.clone()).await?;
+        for b in &by_place {
+            total += b.i("n");
+            for id in [b.s("region"), b.s("metro"), b.s("hub"), b.s("asite")].into_iter().filter(|s| !s.is_empty()) {
+                let p = places.entry(id).or_insert(json!(0));
+                *p = json!(p.as_i64().unwrap_or(0) + b.i("n"));
+            }
         }
     }
     // What happened to each of the first matches, to show beside it.
@@ -966,11 +997,11 @@ async fn ask(svc: Shared, a: AskQ, keep: bool) -> Answer {
         }
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let shown = display.clone() + &format!("\n-- {}", Value::Object(compile(&plan, at, None).params));
+    let shown = display.clone() + &format!("\n-- {}", Value::Object(compile(&plan, at, false).params));
     save(json!({"id": id, "ts": iso(now), "asked": asked, "reader": reader, "plan": plan_json(&plan).to_string(), "sql_text": shown, "found": total, "ms": ms})).await?;
     // Words left unread make the count the answer to part of the question, and it says so.
     let partial = !ignored.is_empty();
-    q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": true, "partial": partial, "ignored": ignored, "corrected": corrected, "read": c.read, "plan": plan_json(&plan), "sql": display, "params": compile(&plan, at, None).params, "rows": rows, "why": why, "places": places, "total": total, "ms": ms}))
+    q.done(json!({"asked": asked, "reader": reader, "note": note, "understood": true, "partial": partial, "ignored": ignored, "corrected": corrected, "read": c.read, "plan": plan_json(&plan), "sql": display, "params": compile(&plan, at, false).params, "rows": rows, "why": why, "places": places, "total": total, "cut": cut, "ms": ms}))
 }
 
 /// The searches asked lately.
@@ -1056,14 +1087,14 @@ mod tests {
         // A customer by the whole of its name, not every customer sharing a word of it.
         let p = whole("Northwind Energy sites that are degraded");
         assert_eq!((p.customer.as_str(), p.customer_whole, p.states.clone()), ("Northwind Energy", true, s(&["degraded"])));
-        assert!(compile(&p, v.now, None).conditions.contains("customer = :customer"));
+        assert!(compile(&p, v.now, false).conditions.contains("customer = :customer"));
         let p = whole("customer Northwind Energy");
         assert_eq!((p.customer.as_str(), p.customer_whole), ("Northwind Energy", true));
         // "This month" is since the first of it: 12 days and 18 hours on 13 November.
         let p = whole("OLTs in London changed this month");
         let h = p.happened.clone().unwrap();
         assert_eq!((h.hours, h.period.as_str()), (12.0 * 24.0 + 18.25, "this month"));
-        assert!(compile(&p, v.now, None).read.iter().any(|r| r["text"] == "changed this month"));
+        assert!(compile(&p, v.now, false).read.iter().any(|r| r["text"] == "changed this month"));
         // A place it does not know is asked back, and a near spelling read and said.
         let (_, un) = read_all("olts in londres that are down", &v, &known);
         assert!(un.refused.contains("\"londres\"") && un.refused.contains("Did you mean London?"), "{un:?}");
@@ -1092,7 +1123,7 @@ mod tests {
         // Part of a name is a substring, and says so.
         let (p, un) = read_all("customer northwind that are down", &v, &known);
         assert_eq!((p.customer.as_str(), p.customer_whole, un.ignored.len()), ("northwind", false, 0));
-        assert!(compile(&p, v.now, None).conditions.contains("customer ILIKE :customer"));
+        assert!(compile(&p, v.now, false).conditions.contains("customer ILIKE :customer"));
         // A period with nothing that happened in it, and words it has no use for, are left and listed.
         let (p, un) = read_all("OLTs in London this month", &v, &known);
         assert_eq!((p.kinds, p.happened.is_none(), un.ignored.clone()), (vec!["olt".to_string()], true, vec!["this".to_string(), "month".to_string()]));
@@ -1112,7 +1143,7 @@ mod tests {
         let h = p.happened.clone().expect("what happened");
         assert_eq!((h.event.as_str(), h.about.as_str(), h.author.as_str(), h.hours, h.negate), ("change", "firmware upgrade", "m.rossi", 168.0, false));
         assert_eq!(p.readings, vec![Reading { field: "latency_ms", op: ">", value: Some(40.0) }]);
-        let c = compile(&p, 1_800_000_000, None);
+        let c = compile(&p, 1_800_000_000, false);
         assert!(c.conditions.contains("MATCH(text, :about)") && c.conditions.contains("author = :author") && c.conditions.contains("latency_ms > :latency_ms") && c.conditions.contains("id IN ("), "{}", c.conditions);
 
         let p = read("degraded Nokia OLTs in Frankfurt behind hr1-h03-ams with loss above 1%", &vocab(), &known);

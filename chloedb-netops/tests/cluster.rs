@@ -189,6 +189,9 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     let data = api.get("/v1/data").await;
     assert_eq!(len(&data["tables"]), 39);
     assert!(data["tables"].as_array().unwrap().iter().all(|t| t["rows"].as_i64().is_some()), "every table answers a count");
+    // NET-21: each count is in the SQL the page shows.
+    let counts = data["queries"].as_array().unwrap().iter().filter(|q| q["sql"].as_str().unwrap().starts_with("SELECT COUNT(*) AS n FROM netops_")).count();
+    assert_eq!(counts, 39, "every count is traced: {}", len(&data["queries"]));
 
     // The estate behind the backbone, as the map reads it: the places, what
     // is broken and where, a window at a level of detail, and one object
@@ -446,6 +449,18 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     let shift = api.get("/v1/shift").await;
     ran_sql(&shift, "shift");
     assert!(len(&shift["briefing"]) >= 3 && len(&shift["work"]) > 0 && len(&shift["notes"]) == 3, "shift: {}", shift["counts"]);
+    // NET-20: the tabs' badges are what the worklist holds (read again if
+    // a minute counted them between the two reads).
+    for tries in 1.. {
+        let shift = api.get("/v1/shift").await;
+        let st = api.get("/v1/status").await;
+        let work = shift["work"].as_array().unwrap();
+        let want = (Some(work.iter().filter(|w| w["urgency"] == 1).count() as i64), Some(work.iter().filter(|w| w["kind"] == "maintenance").count() as i64));
+        if (st["waiting"].as_i64(), st["notices"].as_i64()) == want {
+            break;
+        }
+        assert!(tries < 3, "the badges of My shift and Carriers: {} and {}, the worklist {want:?}", st["waiting"], st["notices"]);
+    }
     let note = api.post("/v1/shift/notes", json!({"who": "test", "body": "Do not touch ag1-ams tonight"})).await;
     assert!(api.get("/v1/shift").await["notes"].as_array().unwrap().iter().any(|n| n["id"] == note["id"]), "a note left for the next shift is read back");
 
@@ -592,5 +607,222 @@ async fn a_network_built_broken_diagnosed_and_read_back() {
     assert_eq!(notices["notices"].as_array().unwrap().len(), had + 1, "nothing invented for a real network");
     let data = api.get("/v1/data").await;
     assert!(data["sources"].as_array().unwrap().iter().any(|s| s["table_name"] == "netops_link_metrics" && s["status"] == "live"), "the source is seen arriving: {}", data["sources"]);
+    app.stop();
+}
+
+/// A cluster on this machine: shards and a coordinator over them, each a
+/// chloedb-server, stopped when dropped.
+struct Cluster {
+    kids: Vec<Child>,
+    url: String,
+}
+
+impl Cluster {
+    async fn start(dir: &std::path::Path, bin: &std::path::Path, shards: usize) -> Cluster {
+        let mut kids = Vec::new();
+        let mut grpcs = Vec::new();
+        let http = reqwest::Client::new();
+        let spawn = |args: Vec<String>, name: &str| {
+            let log = std::fs::File::create(dir.join(format!("{name}.log"))).unwrap();
+            Command::new(bin).args(args).env("CHLOEDB_START_APPS", "off").stdout(log.try_clone().unwrap()).stderr(log).spawn().expect("chloedb-server")
+        };
+        let up = |url: String| {
+            let http = http.clone();
+            async move {
+                let t0 = Instant::now();
+                while !http.get(format!("{url}/v1/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+                    assert!(t0.elapsed() < Duration::from_secs(60), "{url} did not start");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        };
+        let mut urls = Vec::new();
+        for i in 0..shards {
+            let (h, g) = (free_port(), free_port());
+            let db = dir.join(format!("shard-{i}.strata")).to_string_lossy().into_owned();
+            kids.push(spawn(vec!["--db".into(), db, "--seq-no".into(), "--listen".into(), format!("127.0.0.1:{h}"), "--grpc".into(), format!("127.0.0.1:{g}")], &format!("shard-{i}")));
+            grpcs.push(format!("http://127.0.0.1:{g}"));
+            urls.push(format!("http://127.0.0.1:{h}"));
+        }
+        for u in urls {
+            up(u).await;
+        }
+        let c = free_port();
+        kids.push(spawn(vec!["--shards".into(), grpcs.join(","), "--listen".into(), format!("127.0.0.1:{c}"), "--grpc".into(), "off".into()], "coordinator"));
+        let url = format!("http://127.0.0.1:{c}");
+        up(url.clone()).await;
+        Cluster { kids, url }
+    }
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for k in self.kids.iter_mut().rev() {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+    }
+}
+
+/// The objects within `hops` of `from` along the edges, downstream, as
+/// the app walks them: through nothing of the backbone but where it starts.
+fn walk(edges: &[(String, String)], core: &std::collections::HashSet<String>, from: &str, hops: usize) -> Vec<String> {
+    let mut down: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (a, b) in edges {
+        down.entry(a.as_str()).or_default().push(b.as_str());
+    }
+    let mut seen = std::collections::HashSet::from([from.to_string()]);
+    let mut queue = std::collections::VecDeque::from([(from.to_string(), 0)]);
+    let mut out = Vec::new();
+    while let Some((i, d)) = queue.pop_front() {
+        if d == hops || (i != from && core.contains(&i)) {
+            continue;
+        }
+        for j in down.get(i.as_str()).into_iter().flatten() {
+            if seen.insert(j.to_string()) {
+                out.push(j.to_string());
+                queue.push_back((j.to_string(), d + 1));
+            }
+        }
+    }
+    out
+}
+
+/// No graph statement, none refused and none longer than a bound: what a
+/// coordinator is sent while the app walks the estate itself (LIV-16, NET-7).
+fn bounded(j: &Value, what: &str) {
+    for q in j["queries"].as_array().unwrap_or_else(|| panic!("{what}: no queries listed")) {
+        let sql = q["sql"].as_str().unwrap_or("");
+        assert!(q["note"].as_str().unwrap_or("").is_empty(), "{what}: refused: {q}");
+        assert!(!sql.contains("REACHABLE(") && !sql.contains("ppr(") && !sql.contains("PATH("), "{what}: a graph statement went to the coordinator: {}", &sql[..sql.len().min(300)]);
+        assert!(sql.len() <= 20_000, "{what}: a statement of {} characters: {}", sql.len(), &sql[..300]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_estate_walked_through_a_coordinator() {
+    let Some(bin) = server_bin() else {
+        assert!(std::env::var_os("CHLOEDB_NETOPS_NEED_SERVER").is_none(), "no chloedb-server binary: build chloedb-server first, or set CHLOEDB_SERVER_BIN");
+        eprintln!("skipped: no chloedb-server binary (build chloedb-server, or set CHLOEDB_SERVER_BIN)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(dir.path(), &bin, 2).await;
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_chloedb-netops"))
+        .args(["serve", "--strata", &cluster.url, "--listen", &format!("127.0.0.1:{port}"), "--token", TOKEN])
+        .args(["--fault-every", "0", "--history-hours", "1", "--estate", "16000", "--rewrite-model", ""])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("chloedb-netops");
+    let app = App { child, url: format!("http://127.0.0.1:{port}"), strata: cluster.url.clone() };
+    let api = Api::ready(&app.url).await;
+    // It asked /v1/health once, and walks in the app from the start.
+    assert_eq!(api.get("/v1/status").await["graph"], "app", "a coordinator is known as one");
+
+    // The truth, read with plain queries: the edges and every object's state.
+    let sql = |s: String, p: Value| {
+        let (http, url) = (api.http.clone(), cluster.url.clone());
+        async move {
+            let j: Value = http.post(format!("{url}/v1/query")).json(&json!({"sql": s, "params": p, "objects": true})).send().await.unwrap().json().await.unwrap();
+            j["rows"].as_array().unwrap_or_else(|| panic!("{s}: {j}")).clone()
+        }
+    };
+    // Every row of a table, a scroll's page (at most 10,000 rows) at a time.
+    let every = |table: &'static str, cols: &'static str| {
+        let (http, url) = (api.http.clone(), cluster.url.clone());
+        async move {
+            let mut out = Vec::new();
+            let names: Vec<String> = format!("id, {cols}").split(", ").map(str::to_string).collect();
+            let mut body = json!({"sql": format!("SELECT id, {cols} FROM {table}"), "page_size": 10000});
+            loop {
+                let j: Value = http.post(format!("{url}/v1/query")).json(&body).send().await.unwrap().json().await.unwrap();
+                // A row is a list of the columns, in the order asked.
+                out.extend(j["rows"].as_array().unwrap_or_else(|| panic!("{table}: {j}")).iter().map(|r| Value::Object(names.iter().cloned().zip(r.as_array().unwrap().iter().cloned()).collect())));
+                match j["cursor"].as_str() {
+                    Some(c) => body = json!({"cursor": c}),
+                    None => return out,
+                }
+            }
+        }
+    };
+    let edges: Vec<(String, String)> = every("netops_estate_edges", "src, dst").await.iter().map(|r| (r["src"].as_str().unwrap().to_string(), r["dst"].as_str().unwrap().to_string())).collect();
+    let n_edges = sql("SELECT COUNT(*) AS n FROM netops_estate_edges".into(), json!({})).await[0]["n"].as_u64().unwrap() as usize;
+    assert_eq!(edges.len(), n_edges, "every edge read");
+    let truth = || async {
+        let rows = every("netops_estate_nodes", "layer, state").await;
+        rows.iter().map(|r| (r["id"].as_str().unwrap().to_string(), (r["layer"].as_str().unwrap().to_string(), r["state"].as_str().unwrap().to_string()))).collect::<std::collections::HashMap<_, _>>()
+    };
+    let nodes = truth().await;
+    let core: std::collections::HashSet<String> = nodes.iter().filter(|(_, (l, _))| l == "core").map(|(i, _)| i.clone()).collect();
+
+    // A hub router: three things behind it are made to fail.
+    let hub = "hr1-h01-ams";
+    let below: Vec<String> = walk(&edges, &core, hub, 6);
+    assert!(below.len() > 20, "{hub} has things behind it: {}", below.len());
+    let broken: Vec<&String> = below.iter().filter(|i| nodes[*i].0 == "access").take(3).collect();
+    let list = broken.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+    let r = api.http.post(format!("{}/v1/sql", cluster.url)).json(&json!({"sql": format!("UPDATE netops_estate_nodes SET state = 'down', reason = 'test' WHERE id IN ({list})")})).send().await.unwrap();
+    assert!(r.status().is_success(), "the update: {}", r.text().await.unwrap());
+    let not_ok = |nodes: &std::collections::HashMap<String, (String, String)>, set: &[String]| set.iter().filter(|i| nodes[*i].1 != "ok" && nodes[*i].0 != "container").count() as i64;
+
+    // NET-22: what depends on it, counted by its real states.
+    let before = not_ok(&truth().await, &below);
+    let node = api.get(&format!("/v1/map/node?id={hub}")).await;
+    let after = not_ok(&truth().await, &below);
+    bounded(&node, "the map's object");
+    assert_eq!(node["engine"], "app");
+    assert_eq!(node["downstream"]["total"].as_i64().unwrap(), below.len() as i64, "what depends on {hub}");
+    let seen = node["downstream"]["not_ok"].as_i64().unwrap();
+    assert!(seen >= 3 && (seen == before || seen == after), "of them not ok: {seen}, the tables say {before} then {after}: {}", node["downstream"]["rows"]);
+    assert!(node["near"].as_array().unwrap().iter().any(|n| broken.iter().any(|b| n["id"] == b.as_str())), "trouble near it: {}", node["near"]);
+    let detail = api.get(&format!("/v1/map/detail?id={hub}")).await;
+    bounded(&detail, "the inspector");
+    assert_eq!(len(&detail["below"]), below.len().min(4000), "what the map lights");
+
+    let ask = |q: String| { let api = &api; async move { let r = api.http.post(format!("{}/v1/map/ask", api.url)).json(&json!({"q": q})).bearer_auth(TOKEN).send().await.unwrap(); assert!(r.status().is_success(), "{q}: {}", r.status()); r.json::<Value>().await.unwrap() } };
+    // A small walk, read by key.
+    let before = not_ok(&truth().await, &below);
+    let found = ask(format!("everything behind {hub} that is not ok")).await;
+    let after = not_ok(&truth().await, &below);
+    bounded(&found, "a small walk");
+    let total = found["total"].as_i64().unwrap();
+    assert!(total >= 3 && (total == before || total == after), "behind {hub} and not ok: {total}, the tables say {before} then {after}");
+    assert!(found["rows"].as_array().unwrap().iter().any(|r| broken.iter().any(|b| r["id"] == b.as_str())), "the broken ones are found");
+    assert!(found["queries"].as_array().unwrap().iter().any(|q| q["what"].as_str().unwrap().contains("read by key")), "read by key: {}", found["queries"]);
+
+    // A large walk, everything a metro's aggregation router carries: read
+    // by the places that hold it, with no list of thousands of keys.
+    let ag = "ag1-ams";
+    let behind: Vec<String> = walk(&edges, &core, ag, 6).into_iter().filter(|i| nodes[i].0 != "container").collect();
+    assert!(behind.len() > 1600, "a walk larger than what is read by key: {}", behind.len());
+    let found = ask(format!("everything behind {ag}")).await;
+    bounded(&found, "a large walk");
+    assert_eq!(found["total"].as_i64().unwrap(), behind.len() as i64, "everything behind {ag}");
+    assert!(found["queries"].as_array().unwrap().iter().any(|q| q["what"].as_str().unwrap().contains("places that hold the walk")), "read by place: {}", found["queries"]);
+    let rows = found["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 300, "the first 300, in full");
+    assert!(rows.windows(2).all(|w| w[0]["latency_ms"].as_f64().unwrap() >= w[1]["latency_ms"].as_f64().unwrap()) && rows.iter().all(|r| r["name"].is_string()), "ordered by latency, every column");
+    assert_eq!(found["places"]["m-ams"].as_i64().unwrap(), behind.len() as i64, "counted where they are, for the map");
+    let found = ask(format!("everything behind {ag} that is not ok")).await;
+    bounded(&found, "a large walk with a condition");
+    assert!(found["total"].as_i64().unwrap() >= 3, "the broken ones behind {ag}: {}", found["total"]);
+
+    // Diagnose and the path between two devices walk the backbone in the app.
+    let path = api.get("/v1/topology/path?from=ag1-ams&to=ag1-fra").await;
+    bounded(&path, "a path");
+    assert!(path["engine"] == "app" && len(&path["path"]) >= 2, "a path: {path}");
+    let wh = api.get("/v1/where").await;
+    bounded(&wh, "Diagnose");
+
+    // And the coordinator was sent no graph statement at all.
+    let stats = api.http.get(format!("{}/v1/queries/stats?limit=5000", cluster.url)).send().await.unwrap().json::<Value>().await.unwrap();
+    let sent = stats["statements"].as_array().unwrap_or_else(|| panic!("the coordinator's statements: {stats}"));
+    assert!(sent.len() > 10, "the coordinator counts what it is sent");
+    for s in sent {
+        let t = s["sql"].as_str().unwrap_or("");
+        assert!(!t.contains("REACHABLE(") && !t.contains("ppr(") && !t.contains("PATH("), "a graph statement went to the coordinator: {}", &t[..t.len().min(300)]);
+    }
     app.stop();
 }

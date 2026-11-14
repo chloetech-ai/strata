@@ -76,6 +76,21 @@ impl Q {
     pub(crate) async fn soft(&self, what: &str, sql: &str, params: Value) -> Vec<Row> {
         self.e.db.traced(&self.trace, what, sql, params).await.unwrap_or_default()
     }
+    /// A graph statement's rows, or `None` when the server does not walk
+    /// graphs (a coordinator): then the statement is not sent at all, once
+    /// the app knows, and the caller walks its own copy of the graph.
+    pub(crate) async fn graph(&self, what: &str, sql: &str, params: Value) -> Result<Option<Vec<Row>>, ApiError> {
+        if !self.e.walks_graphs() {
+            return Ok(None);
+        }
+        let r = self.e.db.traced(&self.trace, what, sql, params).await;
+        self.e.graph_answer(&r);
+        match r {
+            Ok(rows) => Ok(Some(rows)),
+            Err(err) if crate::sim::refuses_graphs(&err) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
     pub(crate) fn done(&self, mut v: Value) -> Answer {
         v["queries"] = json!(self.trace.take());
         Ok(Json(v))
@@ -210,7 +225,7 @@ async fn status(State(svc): State<Shared>) -> Json<Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"), "ready": st.ready, "phase": st.phase, "progress": round(st.progress, 3), "error": st.error, "last_minute": iso(st.last_minute), "now": iso(now()),
         "semantic": st.semantic, "graph": match st.graph_sql { Some(true) => "sql", Some(false) => "app", None => "" }, "model": schema::MODEL,
-        "eval_ms": round(st.eval_ms, 1), "tick_ms": round(st.tick_ms, 1), "open_incidents": st.open.len(), "firing": st.alerts.len(), "estate": e.estate.as_ref().map(|x| json!({"objects": x.objects(), "broken": x.live.lock().unwrap_or_else(|p| p.into_inner()).len()})), "sim": sim, "local": svc.local,
+        "eval_ms": round(st.eval_ms, 1), "tick_ms": round(st.tick_ms, 1), "open_incidents": st.open.len(), "firing": st.alerts.len(), "waiting": st.badges.map(|b| b.0), "notices": st.badges.map(|b| b.1), "estate": e.estate.as_ref().map(|x| json!({"objects": x.objects(), "broken": x.live.lock().unwrap_or_else(|p| p.into_inner()).len()})), "sim": sim, "local": svc.local,
         "network": {"name": "Meridian", "sites": e.w.sites.len(), "devices": e.w.devices.len(), "links": e.w.links.iter().filter(|l| l.documented).count(), "services": e.w.services.len(), "customers": e.w.customers.len()},
     }))
 }
@@ -288,9 +303,9 @@ async fn path(State(svc): State<Shared>, Query(p): Query<HashMap<String, String>
         return Err(bad("from and to must be devices"));
     }
     let sql = "SELECT id, site, role, hops() AS hop FROM netops_devices\nWHERE PATH(netops_links, :a, :b, dir => 'both', max_hops => 12)\nORDER BY hops()";
-    let (hops, engine): (Vec<Value>, &str) = match q.e.db.traced(&q.trace, "Shortest path over the links table", sql, json!({"a": from, "b": to})).await {
-        Ok(rows) => (rows.into_iter().map(Value::Object).collect(), "sql"),
-        Err(_) => (q.e.graph.path(&from, &to).into_iter().enumerate().map(|(i, d)| json!({"id": d, "hop": i})).collect(), "app"),
+    let (hops, engine): (Vec<Value>, &str) = match q.graph("Shortest path over the links table", sql, json!({"a": from, "b": to})).await.ok().flatten() {
+        Some(rows) => (rows.into_iter().map(Value::Object).collect(), "sql"),
+        None => (q.e.graph.path(&from, &to).into_iter().enumerate().map(|(i, d)| json!({"id": d, "hop": i})).collect(), "app"),
     };
     q.done(json!({"from": from, "to": to, "path": hops, "engine": engine}))
 }
@@ -949,11 +964,19 @@ async fn action_decide(State(svc): State<Shared>, Path((id, decision)): Path<(St
 
 async fn data(State(svc): State<Shared>) -> Answer {
     let q = Q::new(&svc);
-    let mut tables = Vec::new();
-    for (name, ddl, what) in schema::tables() {
-        let n = q.e.db.query(&format!("SELECT COUNT(*) AS n FROM {name}"), json!({})).await.ok().and_then(|r| r.first().map(|r| r.i("n")));
-        tables.push(json!({"table": name, "what": what, "rows": n, "ddl": ddl, "telemetry": schema::TELEMETRY.contains(&name)}));
+    // Each table's rows: one COUNT each, all at once, each in the trace.
+    let mut counts = tokio::task::JoinSet::new();
+    for (k, (name, _, _)) in schema::tables().into_iter().enumerate() {
+        let (db, trace) = (q.e.db.clone(), q.trace.clone());
+        counts.spawn(async move { (k, db.traced(&trace, &format!("The rows of {name}"), &format!("SELECT COUNT(*) AS n FROM {name}"), json!({})).await.ok().and_then(|r| r.first().map(|r| r.i("n")))) });
     }
+    let mut n: HashMap<usize, i64> = HashMap::new();
+    while let Some(Ok((k, c))) = counts.join_next().await {
+        if let Some(c) = c {
+            n.insert(k, c);
+        }
+    }
+    let tables: Vec<Value> = schema::tables().into_iter().enumerate().map(|(k, (name, ddl, what))| json!({"table": name, "what": what, "rows": n.get(&k), "ddl": ddl, "telemetry": schema::TELEMETRY.contains(&name)})).collect();
     let sources = q.rows("Where each table's rows come from", "SELECT id, name, kind, table_name, via, status, rate, lag_s, last_seen, retention, note, snippet FROM netops_sources LIMIT 50", json!({})).await?;
     let health = q.e.db.health().await.ok();
     let (written, last_rows, semantic, graph, started) = {

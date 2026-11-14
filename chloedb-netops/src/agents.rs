@@ -105,21 +105,17 @@ impl<'a> Run<'a> {
     }
 
     pub(crate) async fn graph(&mut self, title: &str, sql: String, fallback: impl FnOnce() -> Vec<Row>) -> Vec<Row> {
-        if self.e.st().graph_sql != Some(false) {
+        if self.e.walks_graphs() {
             let t0 = Instant::now();
             let r = self.e.db.query(&sql, json!({})).await;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             self.queries += 1;
-            match r {
-                Ok(rows) => {
-                    self.e.st().graph_sql = Some(true);
-                    self.graph = "sql";
-                    self.rows += rows.len() as i64;
-                    self.step("graph", title, &sql, &json!({}), rows.len(), ms, "");
-                    return rows;
-                }
-                Err(err) if err.status == 400 => self.e.st().graph_sql = Some(false),
-                Err(_) => {}
+            self.e.graph_answer(&r);
+            if let Ok(rows) = r {
+                self.graph = "sql";
+                self.rows += rows.len() as i64;
+                self.step("graph", title, &sql, &json!({}), rows.len(), ms, "");
+                return rows;
             }
         }
         let t0 = Instant::now();
