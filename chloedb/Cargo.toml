@@ -82,7 +82,7 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # Parquet files in and out (`parquet`, `chloedb::parquet`), on the Arrow
 # that DataFusion brings: Snappy (Spark's and pandas' default), Zstandard
 # (what exports write), LZ4 and gzip (in Rust, zlib-rs).
-parquet = { version = "59.3", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "flate2-zlib-rs"], optional = true }
+parquet = { version = "60.1", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "flate2-zlib-rs"], optional = true }
 # Files on S3 and S3-compatible stores (`s3`, `chloedb::objects`): imports
 # read `s3://` URLs and exports write them.
 object_store = { version = "0.13.2", default-features = false, features = ["aws"], optional = true }
