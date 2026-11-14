@@ -167,15 +167,33 @@ async fn manifest() -> Json<Value> {
         "icon_svg": ICON,
         "view": "ui/view.js",
         "version": env!("CARGO_PKG_VERSION"),
+        // On the demo train: tested by the Demos workflow, not by CI's
+        // required check, and marked as a demo in the command center.
+        "maturity": "demo",
     }))
 }
 
-async fn view() -> Response {
-    let body = match std::env::var_os("CHLOEDB_NETOPS_UI_DIR") {
-        Some(d) => std::fs::read_to_string(std::path::Path::new(&d).join("view.js")).unwrap_or_else(|_| VIEW.into()),
+/// The view, with an ETag of its text: a client that has it asks again with
+/// If-None-Match and is answered 304 with no body.
+async fn view(headers: HeaderMap) -> Response {
+    let body: std::borrow::Cow<'static, str> = match std::env::var_os("CHLOEDB_NETOPS_UI_DIR") {
+        Some(d) => std::fs::read_to_string(std::path::Path::new(&d).join("view.js")).map(Into::into).unwrap_or(VIEW.into()),
         None => VIEW.into(),
     };
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+    let tag = etag(&body);
+    let fresh = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).is_some_and(|v| v.split(',').any(|t| t.trim().trim_start_matches("W/") == tag));
+    let head = [(header::CONTENT_TYPE, "text/javascript; charset=utf-8".to_string()), (header::CACHE_CONTROL, "no-cache".to_string()), (header::ETAG, tag)];
+    if fresh {
+        return (StatusCode::NOT_MODIFIED, head).into_response();
+    }
+    (head, body.into_owned()).into_response()
+}
+
+/// A strong ETag for a text: FNV-1a over its bytes, so it is the same in
+/// every process that serves the same view.
+pub fn etag(text: &str) -> String {
+    let h = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
+    format!("\"{h:016x}\"")
 }
 
 fn sim_state(e: &Engine) -> Value {

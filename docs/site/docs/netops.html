@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>chloedb-netops: network operations on ChloeDB · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="chloedb-netops is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/netops.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -86,6 +89,9 @@
     <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#the-pages">The pages</a></li><li><a href="#the-map">The map</a></li><li><a href="#where-is-it-broken">Where is it broken</a></li><li><a href="#an-incidents-board">An incident's board</a></li><li><a href="#the-agents">The agents</a></li><li><a href="#the-six-faults">The six faults</a></li><li><a href="#your-own-network">Your own network</a></li><li><a href="#the-tables">The tables</a></li><li><a href="#what-it-is-not">What it is not</a></li><li><a href="#test-it">Test it</a></li></ol></details>
     <div class="doc-body">
 
+<blockquote>
+<p><strong>A demo.</strong> chloedb-netops shows what ChloeDB can do; it is not part of ChloeDB's releases or their promises. It is tested on a train of its own (the <code>Demos</code> workflow, <code>.github/workflows/demos.yml</code>), outside CI's required check, so a fault in it does not hold a ChloeDB release, and the command center marks it as a demo (<a href="compatibility.html#demos">compatibility</a>).</p>
+</blockquote>
 <p><code>chloedb-netops</code> is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an incident and say what they looked at. It comes with a simulated carrier network, <em>Meridian</em> (10 sites, 64 devices, 120 links, 12 services), and a simulator that writes each minute of it and breaks it in six ways, so the whole app can be used, and its agents checked, without a network of your own.</p>
 <p>It is there to show what one database does for an operations team when search, SQL, graphs and time all live in it:</p>
 <ul>
@@ -102,7 +108,7 @@
 <p>Like <a href="crawler.html">the crawler</a> and <a href="sheets.html">the spreadsheets</a>, it is a program of its own, in Rust, that talks to chloedb-server over HTTP only, and the command center shows it as an app.</p>
 <p><img loading="lazy" decoding="async" alt="My shift: the handover written from the tables, what waits most urgent first, the changes and carrier windows coming up, and notes for the next shift" src="../../assets/img/netops-shift.png" /></p>
 <h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
-<p>Build both programs, then start chloedb-netops with a server of its own:</p>
+<p>Build both programs, then start chloedb-netops with a server of its own (releases after 0.3.2 carry it prebuilt too: the installer's <code>--with netops</code> puts it beside the server, which it then finds without <code>--server-bin</code>):</p>
 <pre data-lang="sh">(cd chloedb-server &amp;&amp; cargo build --release)
 cd chloedb-netops &amp;&amp; cargo build --release
 target/release/chloedb-netops serve --local ./netops-data --server-bin ../chloedb-server/target/release/chloedb-server</pre>
@@ -669,7 +675,7 @@ WHERE ts &gt;= &#x27;2026-11-13T03:00:00Z&#x27; GROUP BY link ORDER BY worst DES
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

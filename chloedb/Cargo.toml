@@ -4,7 +4,16 @@ version = "0.3.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "An embedded, single-file search database: full text, structured and vector indexes behind SQL"
-publish = false
+repository = "https://github.com/chloetech-ai/chloedb"
+homepage = "https://chloetech-ai.github.io/chloedb/"
+readme = "README.md"
+keywords = ["search", "database", "sql", "full-text", "vector"]
+categories = ["database-implementations", "text-processing"]
+# crates.io gets the library and its programs' sources only: the tests'
+# fixtures, the results, reports and notes stay here (they are about 60 MB,
+# and a crate may be 10 MB). `.github/workflows/crate-release.yml` packages
+# and verifies it, and publishes it on a run started by hand.
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/DESIGN.md"]
 
 [dependencies]
 memmap2 = "0.9"

@@ -1052,13 +1052,47 @@ pub fn bind_select(catalog: &[Arc<Schema>], sql: &str, params: &Params) -> Resul
     let tables: Vec<&Schema> = catalog.iter().map(|t| &**t).collect();
     let plan = compound::plan_read(sql, &tables, params, &|_, _| None)?;
     if plan.root.uses_operators() {
-        return Err(ApiError::bad(
-            "query error: a query of every server's logs reads one table, without joins, subqueries, WITH or DISTINCT; ask one server's store for those (\"scope\": \"local\")",
-        ));
+        return Err(ApiError::bad(format!("query error: {}", not_merged(&plan.root))));
     }
     let schema = catalog.iter().find(|t| t.table.eq_ignore_ascii_case(plan.table())).cloned().ok_or_else(|| ApiError::bad(format!("query error: no such table: {}", plan.table())))?;
     let select = plan.to_select(&schema)?;
     Ok((schema, select))
+}
+
+/// Why a query of every server's logs that plan `root` makes cannot be
+/// merged from the stores' answers, naming what in it does that and what
+/// to write instead (LIV-8: a `LIKE` was refused as a join, subquery,
+/// `WITH` or `DISTINCT`, which it is none of).
+fn not_merged(root: &chloedb::query::ir::Node) -> String {
+    use chloedb::query::ir::{Expr, Node};
+    fn find(n: &Node) -> Option<String> {
+        let what = match n {
+            Node::Join { .. } => Some("a join".to_string()),
+            Node::With { .. } | Node::Ref { .. } => Some("WITH".into()),
+            Node::Distinct { .. } | Node::DistinctOn { .. } => Some("DISTINCT".into()),
+            Node::Window { .. } => Some("a window function".into()),
+            Node::SetOp { .. } => Some("UNION, INTERSECT or EXCEPT".into()),
+            // A condition over the rows a scan read: one the index does
+            // not answer, such as LIKE on a text column.
+            Node::Filter { cond, .. } if cond.has_operators() => Some("a subquery".into()),
+            Node::Filter { input, cond } if matches!(**input, Node::Project { .. }) => {
+                let mut like = None;
+                cond.visit(&mut |e| {
+                    if let Expr::Like { case_insensitive, .. } = e {
+                        like.get_or_insert(if *case_insensitive { "ILIKE" } else { "LIKE" });
+                    }
+                });
+                Some(match like {
+                    Some(op) => format!("{op} on a text column, which each store would check row by row after reading every line, and which no answer of a store carries to be merged. Find the words with MATCH instead: MATCH(message, '\"alert firing\"') for a phrase, MATCH(message, 'alert firing') for both words, MATCH(message, 'alert*') for a prefix; LIKE 'abc%' works on a KEYWORD column (level, node, target, route, request_id)"),
+                    None => "a condition each store would check row by row after reading every line, on a value its index does not hold (a computed one, or a text column compared as a whole). Write it on a KEYWORD or number column, or find words with MATCH".into(),
+                })
+            }
+            _ => None,
+        };
+        what.or_else(|| n.inputs().into_iter().find_map(find))
+    }
+    let what = find(root).unwrap_or_else(|| "a subquery".into());
+    format!("a query of every server's logs runs on each server's store and merges their answers, so it reads one table with conditions the store's index answers, and this one has {what}")
 }
 
 /// What one server answered of a cluster's query of the logs.
@@ -1105,7 +1139,17 @@ struct NodeAnswer {
 pub async fn cluster_query(local: Option<&Arc<LogStore>>, coord: &Coordinator, sql: &str, params: &Params, timeout: Duration, peers: impl std::future::Future<Output = Vec<PeerAnswer>>) -> Result<Json, ApiError> {
     let t0 = Instant::now();
     let deadline = t0 + timeout;
-    let (_, select) = bind_select(schemas(), sql, params)?;
+    let (_, select) = bind_select(schemas(), sql, params).map_err(|mut e| {
+        // Any query runs on one server's own store: this coordinator's, of
+        // its own lines and its clients' queries, only when it keeps one.
+        if e.message.contains("a query of every server's logs") {
+            e.message += match local {
+                Some(_) => ". Any query runs on one server's own lines: send it with \"scope\": \"local\" to that server, or to this coordinator for its own lines and its clients' queries",
+                None => ". Any query runs on one server's own lines: send it with \"scope\": \"local\" to that server (this coordinator keeps no log store of its own: --log-store)",
+            };
+        }
+        e
+    })?;
     let mine = async {
         match local {
             Some(s) => {
@@ -1388,6 +1432,42 @@ mod tests {
             assert_eq!(got, want, "{sql}");
         }
         assert!(bind_select(schemas(), "SELECT l.message FROM logs l JOIN queries q ON l.request_id = q.request_id LIMIT 3", &Params::new()).is_err());
+    }
+
+    /// LIV-8: a LIKE on the message, through a coordinator, is refused for
+    /// what it is, and the MATCH the refusal suggests is merged from every
+    /// store, with the count LIKE gives on each.
+    #[tokio::test]
+    async fn a_like_is_refused_for_what_it_is_and_its_match_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (store(dir.path(), "a.logs", "a"), store(dir.path(), "b.logs", "b"));
+        let t = 1_793_400_000_000u64;
+        a.write_lines(&[line(t, "warn", "x", "an alert firing: p99", Map::new(), None), line(t + 1, "info", "x", "firing stopped, then the alert cleared", Map::new(), None)]).unwrap();
+        b.write_lines(&[line(t + 2, "warn", "x", "alert firing: disk", Map::new(), None), line(t + 3, "info", "x", "firing alert", Map::new(), None)]).unwrap();
+        for (sql, op) in [
+            ("SELECT COUNT(*) AS n FROM logs WHERE message LIKE '%alert firing%'", "LIKE on a text column"),
+            ("SELECT COUNT(*) AS n FROM logs WHERE message ILIKE 'alert firing%'", "ILIKE on a text column"),
+            ("SELECT ts, message FROM logs WHERE level = 'warn' AND message LIKE '%alert%' ORDER BY ts DESC LIMIT 5", "LIKE on a text column"),
+        ] {
+            let e = bind_select(schemas(), sql, &Params::new()).unwrap_err();
+            assert!(e.message.contains(op) && e.message.contains("MATCH(message, '\"alert firing\"')"), "{sql}: {}", e.message);
+            assert!(!e.message.contains("joins, subqueries"), "{}", e.message);
+        }
+        let e = bind_select(schemas(), "SELECT l.message FROM logs l JOIN queries q ON l.request_id = q.request_id LIMIT 3", &Params::new()).unwrap_err();
+        assert!(e.message.contains("this one has a join"), "{}", e.message);
+        // The phrase, and a keyword's prefix, merge from both stores.
+        for (sql, want) in [("SELECT COUNT(*) AS n FROM logs WHERE MATCH(message, '\"alert firing\"')", 2), ("SELECT COUNT(*) AS n FROM logs WHERE level LIKE 'wa%'", 2), ("SELECT COUNT(*) AS n FROM logs WHERE MATCH(message, 'alert firing')", 4)] {
+            let (_, select) = bind_select(schemas(), sql, &Params::new()).unwrap();
+            let mut sets = Vec::new();
+            for s in [&a, &b] {
+                sets.push(s.query(sql, &Params::new(), true, Duration::from_secs(5)).await.unwrap().0);
+            }
+            let rs = chloedb::cluster::merge(&select, sets).unwrap();
+            assert_eq!(rs.rows[0][0].as_i64(), Some(want), "{sql}");
+        }
+        // As one store answers LIKE itself.
+        let rs = a.query("SELECT COUNT(*) AS n FROM logs WHERE message LIKE '%alert firing%'", &Params::new(), false, Duration::from_secs(5)).await.unwrap().0;
+        assert_eq!(rs.rows[0][0].as_i64(), Some(1));
     }
 
     #[test]

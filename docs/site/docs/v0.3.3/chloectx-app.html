@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ChloeCtx as an app of a ChloeDB cluster · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloectx app runs ChloeCtx beside a ChloeDB cluster, as the crawler and Sheets do, and the command center shows it under Apps. Its memory is not a file on one laptop: it lives in the cluster&#x27;s tables, so any number…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/app.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html" aria-current="page">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Apps</span>
+      <h1>ChloeCtx as an app of a ChloeDB cluster</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloectx/app.md">docs/chloectx/app.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#start-it">Start it</a></li><li><a href="#where-the-memory-is">Where the memory is</a></li><li><a href="#the-api">The API</a></li><li><a href="#spaces-and-what-each-shows">Spaces and what each shows</a></li><li><a href="#a-demo-to-show-it">A demo to show it</a></li><li><a href="#seen-before">Seen before</a></li><li><a href="#create-an-app-from-a-space">Create an app from a space</a></li><li><a href="#tests">Tests</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloectx app</code> runs ChloeCtx beside a ChloeDB cluster, as the crawler and Sheets do, and the command center shows it under Apps. Its memory is not a file on one laptop: it lives in the cluster's tables, so any number of agents and people can write to it and ask it for context.</p>
+<p>Its first page lists every memory it can read, as <em>spaces</em> to pick from, and a space opens on what it knows now:</p>
+<ul>
+<li><strong>Team spaces.</strong> Memory that any agent writes notes and conversations to and asks for context before a task, within a token budget: a table of the cluster each. An answer is found by search alone (BM25 and vectors, no model call), and it says what went in, why, and what was left out.</li>
+<li><strong>Claude Code projects.</strong> What Claude Code sessions remembered: a project <code>chloectx sync</code> copied into the cluster (table <code>chloectx_memory</code>), and, with <code>--local-stores</code>, the stores of the machine the app runs on, where Receipts, Blame and capsules are too (<a href="chloectx-receipts.html#in-the-command-center">Receipts and blame</a>). A store and its synced copy show as one project.</li>
+<li><strong>Seen before</strong>, a page of its own: the cluster's firing alerts, each beside the past incidents it looks like and the fix that worked. One button hands the alert to the cluster's on-call agent with those incidents as its context.</li>
+</ul>
+<p><img loading="lazy" decoding="async" alt="A team space's Ask tab: the question &quot;Who approves a refund of 1,200 EUR?&quot;, answered first by the current refund decision with the 500 EUR version it replaced struck through, then the notes that also bear on it, the past conversations folded, and the context's size" src="../../../assets/img/chloectx-app-context.png" /></p>
+<p><em>The demo's team space, asked "Who approves a refund of 1,200 EUR?". The answer leads with the current decision (over 1000 EUR or 900 GBP, a second approver from finance) and what it replaced, then what else bears on it; the scores, what was left out and the context as the agent gets it are below. 14.4 ms, no model call.</em></p>
+<h2 id="start-it">Start it<a class="anchor" href="#start-it" aria-label="Link to this section">#</a></h2>
+<p>A chloedb-server with <code>chloectx</code> installed beside it (in the same directory, as an install puts them) starts it by itself, with a token and a key of its own (<a href="server.html#apps-the-server-starts">apps the server starts</a>); its key may make and write <code>ctx_*</code> tables and read <code>chloectx_memory</code>, so the on-call hand-off of Seen before, which needs an admin key, is refused there. Started by hand:</p>
+<pre data-lang="sh">cd chloectx &amp;&amp; cargo build --release
+./target/release/chloectx fetch-model                # the embedding model, 129 MB, once
+./target/release/chloectx app --server http://127.0.0.1:7700 --port 7760 --token &quot;$APP_TOKEN&quot;
+# and the coordinator shows it:
+CHLOEDB_APP_TOKEN=&quot;$APP_TOKEN&quot; chloedb-server --shards ... --app chloectx=http://127.0.0.1:7760</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>option</th>
+<th>default</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--server</code> (<code>CHLOEDB_URL</code>)</td>
+<td><code>http://127.0.0.1:7700</code></td>
+<td>the chloedb-server (a coordinator, or a server on its own) the spaces live in</td>
+</tr>
+<tr>
+<td><code>--key</code> (<code>CHLOEDB_KEY</code>)</td>
+<td>none</td>
+<td>its key for the app's reads and writes: an admin key, since a new space is a new table and the on-call agent takes admin calls</td>
+</tr>
+<tr>
+<td><code>--token</code> (<code>CHLOECTX_APP_TOKEN</code>)</td>
+<td>none</td>
+<td>the token every caller must send (<code>Authorization: Bearer</code>); chloedb-server sends its <code>CHLOEDB_APP_TOKEN</code></td>
+</tr>
+<tr>
+<td><code>--insecure</code></td>
+<td>off</td>
+<td>serve any caller with no token on an address other than loopback; without it, <code>chloectx app</code> refuses to start with <code>--host 0.0.0.0</code> (or any non-loopback address) and no token, since whoever reached the port could read and write every space and start model calls billed to its key</td>
+</tr>
+<tr>
+<td><code>--host</code>, <code>--port</code></td>
+<td><code>127.0.0.1</code>, <code>7760</code></td>
+<td>where it listens</td>
+</tr>
+<tr>
+<td><code>--embedder</code> (<code>CHLOECTX_EMBEDDER</code>)</td>
+<td><code>static</code></td>
+<td><code>hash:&lt;dim&gt;</code> for tests without the model</td>
+</tr>
+</tbody>
+</table></div>
+<p>Model calls (writing a conversation's notes down, drafting an incident from a postmortem) go to Anthropic's API when <code>ANTHROPIC_API_KEY</code> is set (model <code>CHLOECTX_APP_MODEL</code>, by default Haiku), else to the <code>claude</code> CLI when it is on the PATH (<code>CHLOECTX_DISTILL_MODEL</code>). <code>CHLOECTX_APP_MODEL=off</code> turns them off. Everything else, asking included, works without a model. At most four conversations are distilled at once and 256 wait; past that an exchange is stored without notes (its answer says <code>skipped</code>, and <code>/v1/info</code> counts it under <code>distill.skipped</code>). The app serves 64 requests at once and answers one more with 503.</p>
+<p>The app refuses requests that carry an <code>Origin</code> header: a browser reaches it only through chloedb-server, which checks the signed-in key and forwards with the app's token and who called (<code>x-chloedb-scope</code>, and <code>x-chloedb-tables</code> for a key limited to tables). The app's manifest says <code>"checks_callers": true</code>, and it refuses what the caller's key may not do itself: reading a space or asking it needs read on its table (<code>ctx_&lt;space&gt;</code>), adding or retiring notes and exchanges write there, making a space admin there (it makes the table), the incidents are the space <code>incidents</code>'s (<code>ctx_incidents</code>), and what is not a space's (building apps, handing an alert to the on-call agent, this machine's stores) needs an admin key of every table to change and a key of every table to read. So a write key records notes, and a key limited to <code>ctx_ops_*=write</code> writes the spaces <code>ops_*</code> and nothing else (<code>GET /v1/spaces</code> lists the spaces it reads). A request with none of those headers (a program calling the app itself with its token) may do anything, as before.</p>
+<h3 id="on-kubernetes">On Kubernetes<a class="anchor" href="#on-kubernetes" aria-label="Link to this section">#</a></h3>
+<p>A cluster the <a href="server.html#on-kubernetes">operator</a> runs gets ChloeCtx from its <code>StrataCluster</code>, with nothing to start by hand:</p>
+<pre data-lang="sh">kubectl -n strata patch strata demo --type merge -p &#x27;{&quot;spec&quot;: {&quot;chloectx&quot;: {}}}&#x27;</pre>
+<p>The operator runs <code>chloectx app</code> from the cluster's own image (it carries it, as it carries the crawler and the spreadsheets) as a Deployment of one pod, <code>&lt;cluster&gt;-chloectx</code>, behind a Service of that name on port 7760, and restarts the coordinators so that they list it: <strong>Apps → ChloeCtx</strong> appears in the command center. It reads and writes with the cluster's admin token (<code>tokenSecret</code>), which its API requires too, so the coordinators send it that token and nothing else reaches it (a cluster without a <code>tokenSecret</code> is open to whoever reaches it, and the operator starts its ChloeCtx with <code>--insecure</code> to match), and it calls the model with the cluster's <code>secretEnv</code> (<code>ANTHROPIC_API_KEY</code>; without one, everything but writing a conversation's notes down and drafting incidents works). The embedding model is not in the image, which every server pulls: an init container downloads it from Hugging Face (125 MB) into the pod's scratch volume each time the pod starts. The spaces are tables of the cluster, so a pod started again (a new image, a node replaced) has them all; the upgrader moves it with the servers, since it runs their image (from the image of 2026-11-10 on: an older one has no <code>chloectx</code>).</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th><code>spec.chloectx</code></th>
+<th>default</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>paused</code></td>
+<td><code>false</code></td>
+<td>no pod for now (the coordinators still list it, as an app that does not answer; the spaces stay)</td>
+</tr>
+<tr>
+<td><code>embedder</code></td>
+<td><code>static</code></td>
+<td><code>hash:&lt;dim&gt;</code> for a cluster that cannot reach Hugging Face: no download, vectors from hashed words. Notes keep the vectors they were written with, so after a change earlier ones match by their words only</td>
+</tr>
+<tr>
+<td><code>args</code>, <code>resources</code></td>
+<td></td>
+<td>more arguments of <code>chloectx app</code>, and its container's resources (50m CPU and 128 MiB asked, 1 GiB at most; it uses about 40 MiB)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Removing <code>spec.chloectx</code> deletes its Deployment and Service and restarts the coordinators without it; the spaces stay in <code>ctx_spaces</code> and <code>ctx_&lt;space&gt;</code>.</p>
+<h2 id="where-the-memory-is">Where the memory is<a class="anchor" href="#where-the-memory-is" aria-label="Link to this section">#</a></h2>
+<p>Each space is a table of the cluster, <code>ctx_&lt;space&gt;</code>, with ChloeCtx's own records (<a href="chloectx.html#the-data-model">the data model</a>): notes (<code>decision</code>, <code>preference</code> for rules, <code>fact</code>, <code>todo</code>, <code>note</code>), messages (<code>prompt</code>, <code>answer</code>), entities, and links between them. The spaces themselves are rows of <code>ctx_spaces</code>. A table per space keeps BM25's statistics per space, so one team's words do not weigh on another's ranking, and SQL reads a space like any table:</p>
+<pre data-lang="sql">SELECT kind, text, ts FROM ctx_billing WHERE kind IN (&#x27;decision&#x27;, &#x27;preference&#x27;) AND tag != &#x27;superseded&#x27; ORDER BY ts DESC LIMIT 20</pre>
+<p>The app keeps nothing of its own: a restart, or another copy of it, finds every space in the cluster. It numbers the records it writes, so one app writes to a cluster's spaces at a time.</p>
+<p>Notes are never overwritten. A note that <code>replaces</code> another marks the older one <code>superseded</code> and links them both ways (<code>supersedes</code>, <code>superseded_by</code>); a context shows the current version with what it changed, and the history keeps every version.</p>
+<h2 id="the-api">The API<a class="anchor" href="#the-api" aria-label="Link to this section">#</a></h2>
+<p>JSON over HTTP; through chloedb-server, the same paths under <code>/v1/apps/chloectx</code>.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>call</th>
+<th>body</th>
+<th>answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /v1/spaces</code>, <code>POST /v1/spaces</code></td>
+<td><code>{name, title?, description?, kind?}</code></td>
+<td>the spaces with their counts (<code>by_kind</code>, every record; <code>live_by_kind</code>, the notes not replaced, retired or done); the new space (one that exists is left as it is); <code>kind</code> is <code>notes</code> (the default) or <code>incidents</code>, a team's own incidents for Seen before</td>
+</tr>
+<tr>
+<td><code>DELETE /v1/spaces/:s</code></td>
+<td></td>
+<td>the space, deleted by an admin of its table: its table <code>ctx_&lt;space&gt;</code> dropped and its row of <code>ctx_spaces</code> removed, <code>{deleted, table, kind}</code>; it cannot be undone</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/notes</code></td>
+<td><code>{kind, text, replaces?, entities?, session?, when?}</code></td>
+<td>the note (<code>kind</code>: <code>decision</code>, <code>rule</code>, <code>fact</code>, <code>todo</code> or <code>note</code>); <code>when</code> (or <code>ts</code>) is when it happened, for a note written down after the fact: seconds since 1970, or ISO 8601 text (<code>2026-09-14</code>, <code>2026-09-14T03:10:00Z</code>); by default, now</td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/notes?kind=&amp;limit=&amp;all=1</code></td>
+<td></td>
+<td>the notes, newest first; the current ones unless <code>all=1</code></td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/notes/:id</code></td>
+<td></td>
+<td>the note, the versions it replaced and those that replaced it</td>
+</tr>
+<tr>
+<td><code>DELETE /v1/spaces/:s/notes/:id</code></td>
+<td></td>
+<td>the note, retired: kept, but in no context again</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/exchanges</code></td>
+<td><code>{user, assistant, distill?}</code></td>
+<td>the two messages; with a model, their decisions, rules and facts follow as notes in a few seconds (<code>GET /v1/info</code> counts them)</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/ask</code> (or <code>GET ?q=&amp;budget=</code>)</td>
+<td><code>{question, budget?}</code></td>
+<td><code>{context, tokens, ms, items, left_out}</code></td>
+</tr>
+<tr>
+<td><code>GET /v1/incidents?space=</code>, <code>POST /v1/incidents</code></td>
+<td><code>{title, symptom, cause, fix, alert?, replaces?, when?, space?}</code></td>
+<td>the incidents of every incidents space the key reads (or of <code>space</code>), each with its space and the fixes it replaced; the new one, in <code>incidents</code> or the team's <code>space</code>, dated <code>when</code> (the incident's own date)</td>
+</tr>
+<tr>
+<td><code>GET /v1/incidents/firing?space=</code></td>
+<td></td>
+<td>the cluster's firing and pending alerts, each with its closest incidents and the context the on-call agent would get</td>
+</tr>
+<tr>
+<td><code>GET /v1/incidents/match?q=&amp;alert=&amp;space=</code></td>
+<td></td>
+<td>the incidents closest to a description</td>
+</tr>
+<tr>
+<td><code>POST /v1/incidents/match</code></td>
+<td><code>{lines \| text, space?, alert?, n?}</code></td>
+<td>the incidents closest to log lines pasted from an outage (redacted as notes are, at most 4,000 characters)</td>
+</tr>
+<tr>
+<td><code>POST /v1/incidents/draft</code></td>
+<td><code>{text}</code> or <code>{run}</code></td>
+<td>incidents a model drafted from a postmortem or an on-call run's report; nothing is kept</td>
+</tr>
+<tr>
+<td><code>POST /v1/incidents/handoff</code></td>
+<td><code>{alert}</code></td>
+<td>the on-call agent's run, started with the closest incidents</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/apps/suggest</code></td>
+<td><code>{n?}</code> (2 or 3)</td>
+<td>apps a model suggests from the space's notes: <code>{apps:[{title, pitch, why, kinds, description}]}</code>; nothing is built</td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/apps/estimate</code></td>
+<td></td>
+<td>what a build costs: the median of the app engine's past first builds, its model and what is left of its cap</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/apps/items</code></td>
+<td><code>{kinds?, exclude?}</code></td>
+<td>the notes a build would copy</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/apps</code></td>
+<td><code>{title, description, kinds?, exclude?, confirm: true}</code></td>
+<td>the build, started (409 without <code>confirm</code>, 402 when the engine's cap is spent)</td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/apps</code></td>
+<td></td>
+<td>the space's builds: <code>building</code>, <code>loading</code>, <code>ready</code> or <code>failed</code>, with their cost and rows loaded</td>
+</tr>
+<tr>
+<td><code>POST /v1/spaces/:s/apps/:id/open</code></td>
+<td></td>
+<td>a one-time link into the app engine's studio, at the built app</td>
+</tr>
+</tbody>
+</table></div>
+<p>An answer of <code>ask</code> has, for each record in the context, its <code>section</code> (<code>rule</code>, <code>note</code>, <code>timeline</code> for a question about the whole history, <code>reply</code> and <code>excerpt</code> for past conversations), its <code>tokens</code> (about four characters each), its scores (<code>bm25</code> for the question's words, <code>cos</code> for its meaning) and, for a note that replaced another, <code>replaced</code>: what it changed. <code>left_out</code> names what the searches found and the context leaves out, and why: <code>superseded</code>, <code>uncertain</code>, or <code>budget</code>. The context is built as ChloeCtx's own <code>memory_ask</code> builds it for Claude Code (<a href="chloectx.html">how</a>), with its sizes scaled to the budget.</p>
+<h3 id="a-space-as-an-mcp-server">A space as an MCP server<a class="anchor" href="#a-space-as-an-mcp-server" aria-label="Link to this section">#</a></h3>
+<p><code>POST /v1/spaces/:s/mcp</code> speaks the Model Context Protocol (streamable HTTP, JSON answers; a <code>GET</code> gets 405) with three tools on that space: <code>ask</code> (<code>question</code>, <code>budget</code>: the context, as <code>ask</code> above, with the ids of its notes), <code>remember</code> (<code>kind</code>, <code>text</code>, <code>replaces?</code>, <code>entities?</code>: a note, session <code>mcp</code>) and <code>notes</code> (<code>kind?</code>, <code>limit?</code>: the current ones with their ids). A space that does not exist is 404, not a new space. To connect Claude Code, through chloedb-server:</p>
+<pre data-lang="sh">claude mcp add --transport http ctx-billing https://chloedb.example.com/v1/apps/chloectx/v1/spaces/billing/mcp \
+  --header &quot;Authorization: Bearer $KEY&quot;</pre>
+<p>A space's page in the command center has a <strong>Connect Claude Code</strong> card that makes the key and shows this line with it filled in: a key limited to the space's table, <code>ctx_billing=write</code>, which may read and write that space and nothing else (below).</p>
+<h3 id="keys-limited-to-tables">Keys limited to tables<a class="anchor" href="#keys-limited-to-tables" aria-label="Link to this section">#</a></h3>
+<p>chloedb-server lets a key limited to tables call the app, because the app's manifest says <code>"limited_keys": true</code>: it tells the app the key's grants (<code>x-chloedb-tables</code>), and the app, which writes with a key of its own, holds the caller to them: a space is its table <code>ctx_&lt;space&gt;</code> (read to read and ask it, MCP included, write to add, replace or retire notes and hand over exchanges), the incidents are <code>ctx_incidents</code> (read, write to record or draft), the Claude Code projects read <code>chloectx_memory</code>. Creating a space and building apps from one take an unlimited admin's key, and no limited key reads the machine's local stores (Receipts, Blame). <code>GET /v1/spaces</code> lists the spaces the key may read. A caller with no such header (an admin's key, the server's token) is not limited.</p>
+<h2 id="spaces-and-what-each-shows">Spaces and what each shows<a class="anchor" href="#spaces-and-what-each-shows" aria-label="Link to this section">#</a></h2>
+<p><code>#/app/chloectx</code> lists the spaces, grouped (team spaces; Claude Code projects) with what each holds, and a filter. A space's page (<code>#/app/chloectx/space/&lt;name&gt;</code>, <code>…/project/&lt;owner/name&gt;</code>, <code>…/store/&lt;store&gt;</code>) has a switcher to another space and these tabs:</p>
+<ul>
+<li><strong>Overview</strong>: how many rules, decisions, facts and open to-dos it holds now, its sessions and records, the rules (which go into every context), the latest decisions and facts, the open to-dos, <em>what changed</em> (notes that replaced an earlier one, with the old text struck through) and the latest sessions.</li>
+<li><strong>Ask</strong>: a question, answered as an agent would be: the note that answers it first, the rules that apply, what else bears on it and what past conversations said, then the scores behind each (BM25, cosine, section, tokens), what was left out and why, and the context as the agent gets it. A link carries the question (<code>…/ask/&lt;question&gt;</code>). A synced project, which has no store to build a context from, answers with its records ranked by BM25.</li>
+<li><strong>Memories</strong>: every note, by kind, current or with its history; a note opens on the versions it replaced and those that replaced it. A team space's notes can be replaced or retired here.</li>
+<li><strong>Sessions</strong>: each session titled by its first prompt, read as the conversation it recorded: turn by turn, the prompt, the tool calls (folded), the answer and the notes written down from the turn. <em>Every record</em> searches all of them (BM25) and filters by kind. A record opens in a drawer with its whole text (up to 4,000 characters), its context, files, links and id.</li>
+<li><strong>Graph</strong>: how its memory is connected: each note (a circle, by kind; a replaced one hollow), the subjects it is about (entities, larger the more notes name them), the files it touched, the session it came from (off by default) and the note it replaced (a dashed link). A click lights up a node's neighbours and lists them, with its history, its session, <em>Ask about it</em> or <em>Blame it</em>; a search finds a subject, file or note; the link carries the selected node (<code>…/graph/e:refund</code>).</li>
+<li><strong>Connect</strong>: how to use the space. A team space: the <code>claude mcp add</code> line with a key limited to its table, the HTTP calls and the SQL that read it, and apps built from it. A Claude Code project: its MCP tools, its CLI, and how to sync it here.</li>
+<li><strong>Receipts</strong>, <strong>Blame</strong>, <strong>Snapshots and capsules</strong>: a store of this machine only (<a href="chloectx-receipts.html#in-the-command-center">Receipts and blame</a>).</li>
+</ul>
+<p>The older links (<code>#/app/chloectx/inspector/&lt;project&gt;</code>, <code>…/receipts/&lt;store&gt;</code>, <code>…/blame/&lt;store&gt;</code>) open the same space's tab.</p>
+<p>Until a project is synced, the projects group offers a setup instead: a button (for an admin) makes the table <code>chloectx_memory</code> and a key that may write only it, and shows the <code>chloectx sync setup</code> command with the key filled in; <code>sync</code> needs ChloeCtx 0.2.0 or later. A project is its git repository, so every checkout shares one memory (<a href="chloectx-setup.html#keep-the-memory-on-a-chloedb-server">keep the memory on a ChloeDB server</a>).</p>
+<p>What the tabs read, beside the space calls above:</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>call</th>
+<th>answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /v1/spaces/:s/overview</code></td>
+<td><code>{records, sessions, first, last, by_kind, live, rules, decisions, facts, todos, changes, recent_sessions}</code>: <code>live</code> counts the current notes by kind, each list holds the newest 12, <code>changes</code> the notes that replaced another with <code>was</code> (the older texts)</td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/sessions</code></td>
+<td><code>{sessions: [{session, records, first, last, turns, title}], by_kind}</code>: the latest first; <code>title</code> is the first prompt's first line, <code>turns</code> its prompts</td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/records?session=&amp;kind=&amp;q=&amp;limit=&amp;before=</code></td>
+<td><code>{records, more}</code>: a session's in order, else the latest first (<code>before</code>, a <code>seq</code>, pages back), or the best matches for <code>q</code> (BM25); at most 500</td>
+</tr>
+<tr>
+<td><code>GET /v1/spaces/:s/graph</code></td>
+<td><code>{nodes, edges}</code>: nodes <code>{id, type, label}</code> of type <code>note</code> (with <code>kind</code>, <code>text</code>, <code>tag</code>, <code>current</code>, <code>ts</code>, <code>session</code>), <code>entity</code>, <code>file</code> (<code>f:&lt;path&gt;</code>) and <code>session</code> (<code>s:&lt;id&gt;</code>, its title); edges <code>{s, t, label}</code>: <code>about</code>, <code>touches</code>, <code>from</code> (the session) and <code>supersedes</code>; the newest 1,500 notes</td>
+</tr>
+<tr>
+<td><code>GET /v1/memory</code></td>
+<td><code>{table, exists, projects: [{project, records, sessions, last}], create}</code> (<code>create</code>: the table's <code>CREATE TABLE</code>)</td>
+</tr>
+<tr>
+<td><code>GET /v1/memory/overview?project=</code>, <code>/v1/memory/notes?project=&amp;kind=&amp;all=1</code>, <code>/v1/memory/graph?project=</code></td>
+<td>a synced project's overview, notes and graph, as a space's</td>
+</tr>
+<tr>
+<td><code>GET /v1/memory/sessions?project=</code>, <code>/v1/memory/records?project=&amp;…</code></td>
+<td>its sessions and records, as a space's</td>
+</tr>
+</tbody>
+</table></div>
+<p>A store of this machine answers the same calls under <code>/v1/local/:store/</code> (<a href="chloectx-receipts.html#in-the-command-center">the list</a>).</p>
+<h2 id="a-demo-to-show-it">A demo to show it<a class="anchor" href="#a-demo-to-show-it" aria-label="Link to this section">#</a></h2>
+<p><code>chloectx/demo/seed.py</code> plays a scripted Claude Code history into ChloeCtx, so every page has something to show: twenty sessions over four weeks on <em>harbor</em>, a made-up order and payments service (refunds, webhooks, rate limits, migrations, a double-refund incident, a release process), with corrections along the way (a refund limit raised twice, a currency added, a rate limit changed for partners, a debug print that logged a key). It runs the real hooks and daemon, each turn at its date in the story (<code>CHLOECTX_CLOCK_OFFSET</code>), with a scripted distiller (<code>demo/scripted_distill.py</code>) in place of the model, so it makes no model call and takes about 15 seconds:</p>
+<pre data-lang="sh">python3 chloectx/demo/seed.py --dir ~/chloectx-demo                 # a Claude Code store, with receipts and snapshots
+CHLOECTX_HOME=~/chloectx-demo/home chloectx app --server http://127.0.0.1:7700 --local-stores
+python3 chloectx/demo/seed.py --dir ~/chloectx-demo --no-local \
+  --server http://127.0.0.1:7700 --space harbor --sync               # the same story as a team space, and synced</pre>
+<p><code>--space</code> writes the story into a new team space through the API (<code>--space-reuse</code> adds to one that exists), <code>--sync</code> copies the store into the cluster's <code>chloectx_memory</code> as the project <code>acme/harbor</code>, and <code>--key-env</code> names the variable holding the server's key. All of it is made up: no transcript of anyone's sessions is in it.</p>
+<h2 id="seen-before">Seen before<a class="anchor" href="#seen-before" aria-label="Link to this section">#</a></h2>
+<p><img loading="lazy" decoding="async" alt="Seen before in the command center: four firing alerts of a local cluster, each with the past incidents it looks like; the disk alert's closest incident was recorded for the same alert" src="../../../assets/img/chloectx-app-seen-before.png" /></p>
+<p><em>Seen before on a two-shard cluster in the cloud container (the alerts are real: its disk was over 90% full, and a test load raised the p99). "Disk full within 12 hours" finds the incident recorded for the same alert first, and the p99 alert the merge incident, whose first fix (a restart) was replaced by a better one.</em></p>
+<p>An incident is a note in the space <code>incidents</code>, or in a team's own space of kind <code>incidents</code> (<code>POST /v1/spaces {name, kind: "incidents"}</code>): a title, the symptom, the cause, the fix, and the alert rule it fired, if one did. Seen before reads every incidents space the signed-in key may read, so a team that keeps its own sees its incidents beside the shared ones, and log lines pasted from an outage find the incidents that look like them as an alert does. For each firing alert, it searches the incidents with what the alert says (its name, metric, description and the copies it fires on). The incidents recorded for the same rule come first; another must be close in meaning (cosine 0.3, or 0.2 when it shares a word) and at least half as close as the closest. A match shows the fixes it replaced struck through, so an agent does not repeat one that was given up.</p>
+<p><strong>Hand to the on-call agent</strong> starts the cluster's on-call agent (<code>POST /v1/admin/oncall</code>) on the alert with the closest incidents and the incident space's rules in its question; the server needs a Claude key for it. When the run ends, <strong>keep what it found</strong> drafts an incident from its report for a person to check and record. A postmortem pasted into <strong>Record an incident</strong> is drafted the same way.</p>
+<h2 id="create-an-app-from-a-space">Create an app from a space<a class="anchor" href="#create-an-app-from-a-space" aria-label="Link to this section">#</a></h2>
+<p>A space's page has <strong>Create an app from this context</strong>. <strong>Suggest apps</strong> asks the model for apps the space's notes could become (one call, on at most 150 notes); each says why, and which kinds of notes it reads. <strong>Build this...</strong> opens the build: its name, the request the app engine gets (editable), the kinds of notes, and every note that goes in, each with a tick to leave it out. Before anything is spent it shows what a build costs, the median of the engine's past first builds (<code>sa_requests</code>), and what is left of the engine's cap; the build starts only on <strong>Build it</strong>, which sends <code>confirm: true</code>.</p>
+<p>The cluster's app engine (the app <code>apps</code>, <a href="https://github.com/chloetech-ai/chloedb/tree/chloedb-server-v0.3.3/chloedb-apps">chloedb-apps</a>) builds the app from the request and leaves out its example rows. When it is done, ChloeCtx maps the picked notes, 30 at a time, onto the new app's tables with its model and inserts them through the engine; a row that names a note it was not given, or a table the app does not have, is dropped. The app gets copies of the picked notes and nothing else: no exchanges, no notes of other spaces, and later notes do not follow. Builds are rows of <code>ctx_builds</code>, and a restart follows those still building. <strong>Open in the studio</strong> asks the engine for a one-time link to the app.</p>
+<h2 id="tests">Tests<a class="anchor" href="#tests" aria-label="Link to this section">#</a></h2>
+<p><code>chloectx/tests/app_cluster.rs</code> runs the app against two shard servers and a coordinator of this build, with a stub of Anthropic's API: spaces, notes replaced and retired, contexts within a budget, an exchange distilled, incidents matched to an alert rule that fires, a handoff refused without a key, an app suggested and built from a space against a stub of the app engine (refused without <code>confirm</code>), the inspector's overview, sessions and records of a space and of a local store, a capsule cut, and a restart. CI runs it in its server smoke test:</p>
+<pre data-lang="sh">cd chloedb-server &amp;&amp; cargo build --profile ci
+cd ../chloectx &amp;&amp; CHLOECTX_NEED_SERVER=1 cargo test --profile ci --test app_cluster</pre>
+<p><code>CHLOECTX_UI_DIR=chloectx/ui</code> serves the page from disk, without a rebuild.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloectx/app.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="chloectx-inspector.html">← ChloeCtx inspector</a><a href="chloectx-capsules.html">Context capsules →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

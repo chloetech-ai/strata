@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Quickstart: a first search in five minutes · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="This page takes you from nothing to a full-text search with SQL in about five minutes, with nothing to compile. You install ChloeDB&#x27;s server, make a table, put a few rows in it, search them, and open the command…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/quickstart.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -147,7 +150,7 @@ EOF</pre>
 {&quot;sql&quot;: &quot;SELECT category, COUNT(*), AVG(price) FROM products WHERE MATCH(body, &#x27;waterproof OR warm&#x27;) GROUP BY category ORDER BY 2 DESC&quot;}
 EOF</pre>
 <h2 id="5-open-the-command-center">5. Open the command center<a class="anchor" href="#5-open-the-command-center" aria-label="Link to this section">#</a></h2>
-<p>Open <a href="http://127.0.0.1:7700">http://127.0.0.1:7700</a> in a browser. In the command center, <strong>Start here</strong> walks through the first steps and ticks each one off once it is done. <strong>Tables</strong> lists <code>products</code>: its page searches it from one box (by words, by meaning, or both), shows its rows, how full each field is, and what uses it, and <strong>Save as a saved search</strong> keeps the query as a stored function that SQL, HTTP, Python, JavaScript and agents (over MCP) all call. The <strong>SQL workbench</strong> runs any SQL you type and shows the plan the planner chose; <strong>Ask</strong> (Ctrl+J) answers a question in words by querying the tables, with an Anthropic API key (the server's, or one you give the tab). The older query console is still at <a href="http://127.0.0.1:7700/classic">/classic</a>. With <code>--demo 20000</code>, a new database starts with a catalogue of 20,000 products to try it on; here a second server, on port 7710, so that both run at once:</p>
+<p>Open <a href="http://127.0.0.1:7700">http://127.0.0.1:7700</a> in a browser. The command center opens on <strong>Start here</strong>, which walks through the first steps and ticks each one off once it is done; once they are, the same address opens <strong>Home</strong>, the server's health. If the crawler, Sheets or ChloeCtx were installed beside <code>chloedb-server</code> (<code>install.sh --with</code>), the server started them too, as <a href="server.html#apps-the-server-starts">apps</a> (unless it was given <code>--start-apps off</code>), and their tables (<code>crawl_*</code>, <code>sheets_*</code>, <code>ctx_*</code>) are listed apart from yours, under Tables of apps. <strong>Tables</strong> lists <code>products</code>: its page searches it from one box (by words, by meaning, or both), shows its rows, how full each field is, and what uses it, and <strong>Save as a saved search</strong> keeps the query as a stored function that SQL, HTTP, Python, JavaScript and agents (over MCP) all call. The <strong>SQL workbench</strong> runs any SQL you type and shows the plan the planner chose; <strong>Ask</strong> (Ctrl+J) answers a question in words by querying the tables, with an Anthropic API key (the server's, or one you give the tab). The older query console is still at <a href="http://127.0.0.1:7700/classic">/classic</a>. With <code>--demo 20000</code>, a new database starts with a catalogue of 20,000 products to try it on; here a second server, on port 7710, so that both run at once:</p>
 <pre data-lang="sh">chloedb-server --db demo.chloedb --demo 20000 --listen 127.0.0.1:7710 --grpc off &gt; demo.log 2&gt;&amp;1 &amp;
 demo=$!
 until curl -sf http://127.0.0.1:7710/livez &gt; /dev/null; do sleep 0.2; done
@@ -202,7 +205,7 @@ EOF</pre>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

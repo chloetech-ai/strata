@@ -379,7 +379,12 @@ pub fn service_points(w: &World, fx: &Effects, t: i64) -> Vec<Value> {
             let e = fx.svc.get(&i).cloned().unwrap_or(SvcFx { lat_mult: 1.0, ..Default::default() });
             let curve = s.sites.iter().map(|x| diurnal(t, w.site(x).tz)).sum::<f64>() / s.sites.len() as f64;
             let requests = (s.rps * 60.0 * curve * (1.0 + 0.03 * r.normal())).max(1.0);
-            let rate = (0.00018 + 0.00012 * r.unit() + e.err * (0.75 + 0.5 * r.unit())).min(0.9);
+            // The background failures stay inside a quarter to a half of what
+            // the objective allows (99.99% allows 0.01%), so a calm network
+            // keeps to every objective and a fault is what spends the budget.
+            let u = r.unit();
+            let noise = (0.00018 + 0.00012 * u).min((1.0 - s.slo) * (0.25 + 0.25 * u));
+            let rate = (noise + e.err * (0.75 + 0.5 * r.unit())).min(0.9);
             let p50 = s.base_latency_ms * e.lat_mult * (1.0 + 0.04 * r.normal().abs());
             json!({"id": row_id("sm", s.id, minute), "ts": iso(t), "service": s.id, "requests": requests.round() as i64, "errors": (requests * rate).round() as i64,
                 "latency_p50": round(p50, 2), "latency_p95": round(p50 * (1.9 + 0.5 * r.unit()) * (1.0 + (e.lat_mult - 1.0) * 0.6), 2)})

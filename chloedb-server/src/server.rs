@@ -117,6 +117,11 @@ pub struct Options {
     /// Memory for answers kept between queries, in MiB (`None`:
     /// [`crate::answers::DEFAULT_MB`]; 0: none kept).
     pub answer_cache_mb: Option<usize>,
+    /// The longest statement a request may send, in bytes, and the most
+    /// elements it may hold (`None`: [`chloedb::query::parse::STATEMENT_BYTES`]
+    /// and [`chloedb::query::parse::STATEMENT_ELEMENTS`]; 0: no bound).
+    pub max_statement_bytes: Option<usize>,
+    pub max_statement_elements: Option<usize>,
     /// Write requests held at once before more are refused (0: no limit).
     pub max_queued_writes: usize,
     /// The largest write or import body, in MiB (0: 256).
@@ -509,6 +514,12 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         tracing::info!(memory_mib = b >> 20, "queries share a memory budget");
     }
     svc.query_memory = query_memory.map(crate::service::query_budget);
+    if let Some(n) = o.max_statement_bytes {
+        svc.max_statement_bytes = n;
+    }
+    if let Some(n) = o.max_statement_elements {
+        svc.max_statement_elements = n;
+    }
     svc.max_queued_writes = if o.max_queued_writes > 0 { o.max_queued_writes } else { usize::MAX };
     if o.max_body_mb > 0 {
         svc.max_body = o.max_body_mb.saturating_mul(1 << 20);
@@ -1258,7 +1269,10 @@ pub fn spawn_rollups(svc: &Arc<Service>, every: Duration) {
     }
     let svc = Arc::downgrade(svc);
     tokio::spawn(async move {
-        let mut reported = None;
+        // The error each rollup last reported, which is said again only
+        // once it changes.
+        let mut reported: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut listing: Option<String> = None;
         let mut tick: u64 = 0;
         loop {
             tokio::time::sleep(every).await;
@@ -1266,18 +1280,36 @@ pub fn spawn_rollups(svc: &Arc<Service>, every: Duration) {
             let full = tick % 60 == 59;
             tick += 1;
             match tokio::task::spawn_blocking(move || svc.refresh_rollups_due(full)).await {
-                Ok(Ok(n)) => {
-                    reported = None;
-                    if n > 0 {
-                        tracing::debug!(buckets = n, "refreshed rollups");
+                Ok(Ok(done)) => {
+                    listing = None;
+                    let names: std::collections::HashSet<String> = done.iter().map(|(n, _)| n.clone()).collect();
+                    reported.retain(|n, _| names.contains(n));
+                    for (name, res) in done {
+                        match res {
+                            Ok(s) => {
+                                if reported.remove(&name).is_some() {
+                                    tracing::info!(rollup = %name, "a rollup's refresh works again");
+                                }
+                                if s.folded > 0 {
+                                    tracing::debug!(rollup = %name, buckets = s.folded, "refreshed a rollup");
+                                }
+                            }
+                            Err(e) => {
+                                let why = e.to_string();
+                                if reported.get(&name) != Some(&why) {
+                                    tracing::warn!(rollup = %name, error = %why, "could not refresh a rollup; the others go on, and it is tried again in a few seconds");
+                                }
+                                reported.insert(name, why);
+                            }
+                        }
                     }
                 }
                 Ok(Err(e)) => {
                     let why = e.to_string();
-                    if reported.as_ref() != Some(&why) {
-                        tracing::warn!(error = %why, "could not refresh the rollups; the next try is in a few seconds");
+                    if listing.as_ref() != Some(&why) {
+                        tracing::warn!(error = %why, "could not read the rollups; the next try is in a few seconds");
                     }
-                    reported = Some(why);
+                    listing = Some(why);
                 }
                 Err(e) => tracing::error!(error = %e, "the rollups' refresher stopped"),
             }

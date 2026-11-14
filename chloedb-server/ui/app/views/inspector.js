@@ -161,7 +161,7 @@ function render(page, r) {
   function drawMap() {
     const c = data.cluster, st = c.stats;
     const copies = nodes().length;
-    const summary = st ? `${fmt.n(st.docs.live)} documents · ${fmt.bytes(st.bytes.total)} of data${c.copies_bytes > st.bytes.total ? `, ${fmt.bytes(c.copies_bytes)} with every copy` : ""}` : "no statistics";
+    const summary = st ? `${fmt.n(st.docs.live)} rows of ${data.table} · ${fmt.bytes(st.bytes.total)} of data${c.copies_bytes > st.bytes.total ? `, ${fmt.bytes(c.copies_bytes)} with every copy` : ""}` : "no statistics";
     const top = button("ix-cluster", { kind: "cluster" }, [h("strong", {}, data.role === "server" ? "This server" : "Whole cluster"), h("span", { class: "small muted ix-n" }, data.role === "server" ? `${data.server_role || "server"} · ${summary}` : `${fmt.plural(data.shards.length, "shard")} · ${fmt.plural(copies, "copy", "copies")} · ${summary}`)], "Whole cluster");
     if (data.role === "server") { clear(map, top); return; }
     if (data.shards.length <= MANY) {

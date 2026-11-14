@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The OpenSearch API · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="chloedb-server --opensearch-listen 127.0.0.1:9200 answers OpenSearch&#x27;s REST API on a port of its own: an application written for OpenSearch or Elasticsearch (Gitea, Mastodon, a client library) indexes into ChloeDB…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/opensearch.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html" aria-current="page">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Server and cluster</span>
+      <h1>The OpenSearch API</h1>
+      <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/chloedb/opensearch.md">docs/chloedb/opensearch.md</a>.</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#run-it">Run it</a></li><li><a href="#tested-with">Tested with</a></li><li><a href="#what-it-answers">What it answers</a></li><li><a href="#how-an-index-is-kept">How an index is kept</a></li><li><a href="#differences">Differences</a></li><li><a href="#numbers">Numbers</a></li></ol></details>
+    <div class="doc-body">
+
+<p><code>chloedb-server --opensearch-listen 127.0.0.1:9200</code> answers OpenSearch's REST API on a port of its own: an application written for OpenSearch or Elasticsearch (Gitea, Mastodon, a client library) indexes into ChloeDB and searches it without a change. Each index is a ChloeDB table; queries in OpenSearch's Query DSL become SQL.</p>
+<h2 id="run-it">Run it<a class="anchor" href="#run-it" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloedb-server --db search.chloedb --opensearch-listen 127.0.0.1:9200
+curl -s localhost:9200/                      # {&quot;version&quot;: {&quot;number&quot;: &quot;2.11.0&quot;, &quot;distribution&quot;: &quot;opensearch&quot;}, ...}
+curl -s -XPUT localhost:9200/books -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;mappings&quot;: {&quot;properties&quot;: {&quot;title&quot;: {&quot;type&quot;: &quot;text&quot;}, &quot;year&quot;: {&quot;type&quot;: &quot;long&quot;}}}}&#x27;
+curl -s -XPOST &#x27;localhost:9200/books/_doc/1?refresh=true&#x27; -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;title&quot;: &quot;The quick brown fox&quot;, &quot;year&quot;: 2026}&#x27;
+curl -s localhost:9200/books/_search -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;query&quot;: {&quot;match&quot;: {&quot;title&quot;: &quot;fox&quot;}}}&#x27;</pre>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>flag</th>
+<th>environment</th>
+<th>what</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--opensearch-listen ADDR</code></td>
+<td><code>CHLOEDB_OPENSEARCH_LISTEN</code></td>
+<td>where the API listens (off when not given)</td>
+</tr>
+<tr>
+<td><code>--opensearch-version V</code></td>
+<td><code>CHLOEDB_OPENSEARCH_VERSION</code></td>
+<td>the version <code>GET /</code> reports, <code>2.11.0</code> by default; a <code>7.x</code> version (<code>7.10.2</code>) answers as Elasticsearch 7 does, which clients of Elasticsearch 7 check for (elasticsearch-ruby 7.17, which Mastodon uses, refuses OpenSearch 2.x itself)</td>
+</tr>
+</tbody>
+</table></div>
+<p>It shares the server's TLS (<code>--tls-cert</code>), hosts (<code>--allow-host</code>) and credentials. With a token or keys, a request carries one as <code>Authorization: Bearer &lt;token&gt;</code>, or as the password of Basic authentication (any user name), which is how most OpenSearch clients send one: <code>http://user:&lt;token&gt;@host:9200</code>. Reads need a key of scope <code>read</code>, writes of documents <code>write</code>, and changes to indexes, mappings, aliases and settings <code>admin</code>; an index made by its first document needs <code>admin</code> too. On a coordinator, or beside one (<code>--coordinator-listen</code>), the indexes are tables of the cluster, split over its shards.</p>
+<h2 id="tested-with">Tested with<a class="anchor" href="#tested-with" aria-label="Link to this section">#</a></h2>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>client</th>
+<th>how</th>
+<th>result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://pypi.org/project/opensearch-py/">opensearch-py</a></td>
+<td>34 checks: indexes, <code>helpers.bulk</code>, searches, scroll, aggregations, documents, aliases, errors</td>
+<td>34 of 34 pass, as they do on OpenSearch 2.11</td>
+</tr>
+<tr>
+<td><a href="https://gitea.com">Gitea</a> 1.24.6</td>
+<td>its issue indexer and code indexer set to <code>elasticsearch</code> at this port, next to a second Gitea on OpenSearch 2.11, the same repository and issues in both</td>
+<td>42 of 42 searches find the same issues and files</td>
+</tr>
+<tr>
+<td><a href="https://joinmastodon.org">Mastodon</a> 4.3</td>
+<td>its four indexes (accounts, tags, statuses, public statuses: analyzers, mappings) and the searches its services make (account autocomplete and full search with follower boosts, hashtag search, status search over two indexes), replayed on 1,500 accounts, 1,200 tags and 4,000 statuses next to OpenSearch 2.11</td>
+<td>112 of 114 searches return the same hits in the same order; the other two differ in the order of two hits tied at score 0</td>
+</tr>
+<tr>
+<td>elasticsearch-ruby 7.17 (Mastodon's client, through Chewy)</td>
+<td>its product check, index creation, <code>_bulk</code>, a search with <code>script_score</code></td>
+<td>works with <code>--opensearch-version 7.10.2</code></td>
+</tr>
+<tr>
+<td>OpenSearch 2.11 itself</td>
+<td>100 requests sent to both, answers compared field by field</td>
+<td>96 identical; the others are listed under <a href="#differences">Differences</a></td>
+</tr>
+<tr>
+<td>OpenSearch 2.11 on <a href="#numbers">TREC-COVID</a></td>
+<td>3,000 searches of ten kinds over 171,332 abstracts</td>
+<td>every one finds as many hits; see <a href="#numbers">Numbers</a> for the first pages</td>
+</tr>
+</tbody>
+</table></div>
+<p>Gitea's <code>app.ini</code>:</p>
+<pre data-lang="ini">[indexer]
+ISSUE_INDEXER_TYPE = elasticsearch
+ISSUE_INDEXER_CONN_STR = http://127.0.0.1:9200
+REPO_INDEXER_ENABLED = true
+REPO_INDEXER_TYPE = elasticsearch
+REPO_INDEXER_CONN_STR = http://127.0.0.1:9200</pre>
+<p>Mastodon's <code>.env.production</code>: <code>ES_ENABLED=true</code>, <code>ES_HOST=localhost</code>, <code>ES_PORT=9200</code>, <code>ES_PRESET=single_node_cluster</code>, and the server started with <code>--opensearch-version 7.10.2</code>; then <code>tootctl search deploy</code>.</p>
+<h2 id="what-it-answers">What it answers<a class="anchor" href="#what-it-answers" aria-label="Link to this section">#</a></h2>
+<p><strong>APIs</strong>: <code>GET /</code>, <code>_cluster/health</code>, <code>_cluster/settings</code>, <code>_cluster/state</code>, <code>_nodes</code>, <code>_cat/indices|aliases|health|count</code> (text with <code>v</code>, <code>h</code>, <code>s</code>, or <code>format=json</code>), index <code>PUT</code>/<code>GET</code>/<code>HEAD</code>/<code>DELETE</code> (names, patterns with <code>*</code>, <code>_all</code>, comma lists, aliases), <code>_mapping</code> and <code>_settings</code> (read and add), <code>_aliases</code>/<code>_alias</code>, <code>_stats</code>, <code>_refresh</code>, <code>_flush</code>, <code>_forcemerge</code> (accepted; ChloeDB needs none of them), <code>_doc</code>, <code>_create</code>, <code>_update</code> (<code>doc</code>, <code>upsert</code>, <code>doc_as_upsert</code>, <code>detect_noop</code>), <code>_source</code>, <code>_mget</code>, <code>_bulk</code> (<code>index</code>, <code>create</code>, <code>update</code>, <code>delete</code>), <code>_search</code>, <code>_msearch</code>, <code>_count</code>, <code>_search/scroll</code>, <code>_delete_by_query</code>, <code>_update_by_query</code> (without a script), <code>if_seq_no</code>, <code>version_type=external</code>, <code>refresh</code>, <code>filter_path</code>, <code>pretty</code>, <code>_source</code> filtering, and gzip request bodies.</p>
+<p><strong>Queries</strong>: <code>bool</code> (<code>must</code>, <code>filter</code>, <code>should</code> with <code>minimum_should_match</code>, <code>must_not</code>), <code>match</code> (<code>operator</code>, <code>minimum_should_match</code>, <code>fuzziness</code>, <code>zero_terms_query</code>), <code>match_phrase</code>, <code>match_phrase_prefix</code>, <code>match_bool_prefix</code>, <code>multi_match</code> (<code>best_fields</code>, <code>most_fields</code>, <code>cross_fields</code>, <code>phrase</code>, <code>phrase_prefix</code>, <code>bool_prefix</code>, <code>field^boost</code>, <code>field.*</code>), <code>query_string</code> and <code>simple_query_string</code> (Lucene's syntax: fields, <code>AND</code>/<code>OR</code>/<code>NOT</code>, <code>+</code>/<code>-</code>, phrases, <code>*</code> and <code>~</code>), <code>term</code>, <code>terms</code>, <code>ids</code>, <code>range</code> (with date math: <code>now-7d/d</code>), <code>exists</code>, <code>prefix</code>, <code>wildcard</code> (a trailing <code>*</code>), <code>fuzzy</code>, <code>constant_score</code>, <code>dis_max</code>, <code>function_score</code> (<code>field_value_factor</code>, <code>gauss</code>/<code>exp</code>/<code>linear</code> on numbers and dates, <code>script_score</code>, <code>weight</code>, every <code>score_mode</code> and <code>boost_mode</code>), <code>script_score</code>, <code>nested</code> (as paths of objects), <code>knn</code> (with <code>filter</code>), <code>match_all</code>, <code>match_none</code>, and <code>term</code>/<code>terms</code> on <code>_index</code>.</p>
+<p><strong>Scripts</strong>: <code>script_score</code> runs the part of Painless that scoring scripts are written in: numbers, <code>params.x</code>, <code>doc['field'].value</code> of a number or a date, <code>_score</code>, <code>+ - * /</code>, <code>Math.log10</code>, <code>log</code>, <code>log1p</code>, <code>exp</code>, <code>sqrt</code>, <code>pow</code>, <code>abs</code>, <code>max</code>, <code>min</code>, and Painless's <code>saturation</code>, <code>sigmoid</code> and <code>decayNumericGauss|Exp|Linear</code>, with an optional <code>return</code> and <code>;</code>. Anything else is refused with a <code>script_exception</code> that names what it met.</p>
+<p><strong>Searches</strong>: <code>from</code>/<code>size</code> (to 10,000, or the index's <code>max_result_window</code>), <code>sort</code> (fields, <code>_score</code>, <code>_doc</code>, <code>missing</code>), <code>search_after</code>, <code>track_total_hits</code>, <code>post_filter</code>, <code>highlight</code> (<code>pre_tags</code>, <code>post_tags</code>, <code>fragment_size</code>, <code>number_of_fragments</code>, <code>encoder</code>), <code>fields</code>/<code>docvalue_fields</code>, <code>version</code>, <code>seq_no_primary_term</code>, <code>collapse</code> (the first hit of each value), scrolls (past 10,000 hits when in the documents' order), and searches of several indexes at once (<code>a,b/_search</code>, a pattern, an alias of several), which merge their hits in the search's order.</p>
+<p><strong>Aggregations</strong>: <code>terms</code> (<code>size</code>, <code>order</code>, <code>min_doc_count</code>, <code>missing</code>, <code>include</code>/<code>exclude</code> lists), <code>composite</code> (<code>terms</code> and <code>date_histogram</code> sources, <code>after</code>), <code>histogram</code>, <code>date_histogram</code> (<code>calendar_interval</code>, <code>fixed_interval</code>, <code>min_doc_count</code>, <code>extended_bounds</code>; in UTC), <code>range</code>, <code>date_range</code>, <code>filter</code>, <code>filters</code>, <code>global</code>, <code>missing</code>, <code>avg</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>value_count</code>, <code>cardinality</code> (exact), <code>stats</code>, <code>extended_stats</code>, <code>percentiles</code>, <code>top_hits</code>, nested in each other.</p>
+<h2 id="how-an-index-is-kept">How an index is kept<a class="anchor" href="#how-an-index-is-kept" aria-label="Link to this section">#</a></h2>
+<p>An index <code>books</code> is the table <code>os_books</code>: its key <code>_id</code>, <code>_version</code>, <code>_hash</code> (a hash of the id, the order scrolls page through), and <code>_source</code>, a JSON field holding the document, whose index answers term, range, prefix and exists queries and the aggregations on every keyword, number and boolean, mapped or not. Fields that need more have columns of their own: <code>text</code> a TEXT column, <code>date</code> a TIMESTAMP, <code>knn_vector</code> a VECTOR, and <code>long</code>/<code>double</code> an INT or FLOAT holding the field's smallest value, which scores read. A text field without a keyword sub-field is kept in its column alone, and put back into <code>_source</code> when read. The mappings, settings and aliases are rows of the table <code>opensearch_indices</code>. Dynamic mapping adds fields as OpenSearch does (<code>text</code> with a <code>keyword</code> sub-field, <code>long</code>, <code>float</code>, <code>boolean</code>, <code>date</code>, objects), adding their columns with <code>ALTER TABLE</code>; <code>dynamic: false</code> and <code>strict</code> are kept.</p>
+<p>Text is read by one of two of ChloeDB's analyzers, chosen from the field's: <code>english</code> for OpenSearch's <code>english</code> analyzer or a custom one with a stemmer, <code>simple</code> (lowercased, folded, nothing dropped) for the rest. Before ChloeDB reads it, the text is cut into words as the field's analyzer would:</p>
+<ul>
+<li>the <code>standard</code> tokenizer keeps <code>merge_segments</code>, <code>mastodon.social</code>, <code>children's</code>, <code>3.14</code>, a word with a soft hyphen in it and a word with combining marks, viramas or tone marks (<code>हिन्दी</code>, <code>ผู้ใหญ่</code>) whole, makes each emoji (<code>★</code>, <code>👩‍💻</code>, a flag), each ideograph (Chinese, Japanese) and each hiragana a word, and a run of katakana one, and cuts at <code>²</code>, <code>¼</code>, <code>①</code>, <code>☆</code> and <code>✓</code>. Each character from U+00A0 to U+1FBFF was compared with OpenSearch 2.11's <code>_analyze</code>: they differ only for a combining mark that follows a space;</li>
+<li>accents are kept (<code>sévère</code> is not <code>severe</code>), unless the analyzer has an <code>asciifolding</code> filter;</li>
+<li>the <code>english</code> analyzer, and a <code>stemmer</code> filter of <code>possessive_english</code>, drop a word's <code>'s</code>;</li>
+<li><code>whitespace</code> keeps every word between spaces whole, and <code>keyword</code> the whole text;</li>
+<li><code>word_delimiter_graph</code> cuts where case or digits change (<code>CatsOfMastodon2026</code> is <code>cats of mastodon 2026</code>);</li>
+<li>an <code>edge_ngram</code> or <code>ngram</code> tokenizer or token filter makes the field's column hold the n-grams themselves, each a word, so that a query's words match them and BM25 counts them as Lucene does (on Mastodon's account search, scores agree with OpenSearch's to five digits);</li>
+<li>a field's <code>search_analyzer</code> cuts the query's text.</li>
+</ul>
+<h2 id="differences">Differences<a class="anchor" href="#differences" aria-label="Link to this section">#</a></h2>
+<p>What a request gets that OpenSearch would answer otherwise:</p>
+<ul>
+<li><strong>Analysis</strong>: only what the list above names. Stop words other than English's, synonyms, other languages' stemmers, <code>pattern</code> tokenizers (taken as ChloeDB's words), <code>path_hierarchy</code>, <code>shingle</code>, phonetic filters and normalizers are not applied. Chinese and Japanese are cut a word per ideograph, as the <code>standard</code> tokenizer cuts them, not into the <code>cjk</code> analyzer's pairs or a dictionary's words.</li>
+<li><strong>Ranking</strong>: BM25 with OpenSearch's defaults (k1 1.2, b 0.75) over the same words and the same one-byte lengths, so scores agree to about five digits when the words do, and two documents of nearly equal scores can swap places. Hits of equal scores come in the order of their <code>_id</code> (OpenSearch's in the order they were written), which ChloeDB keeps the same on one server and over shards. A phrase (<code>match_phrase</code>, or one in <code>query_string</code>) scores the sum of its words' BM25, where OpenSearch scores how often the phrase itself occurs: phrase searches find the same documents and rank them otherwise. A ranked query lists the rows none of its words scores after the others, with score 0.</li>
+<li><strong>Queries</strong>: <code>wildcard</code> takes a trailing <code>*</code> alone; <code>match_phrase</code>'s <code>slop</code> is ignored; <code>nested</code> queries read the paths of objects, without matching inside one object; <code>regexp</code>, <code>terms</code> lookups, <code>geo_*</code>, <code>more_like_this</code>, <code>percolate</code>, <code>span_*</code>, <code>intervals</code>, <code>rank_feature</code> and <code>random_score</code> are refused, as are per-function <code>filter</code>s and <code>min_score</code>; a range's <code>time_zone</code> is not applied (dates are UTC).</li>
+<li><strong>Searches</strong>: aggregations read one index at a time; <code>collapse</code> takes no <code>inner_hits</code>; point-in-time searches are refused; <code>track_scores</code> is ignored (a field sort scores nothing); a scroll ordered by score or a field is limited to 10,000 hits.</li>
+<li><strong>Aggregations</strong>: <code>composite</code> returns at most 9,999 groups a page; <code>cardinality</code> is exact; a <code>histogram</code> of a number field that some documents hold an array of is refused; scripts are refused.</li>
+<li><strong>Documents</strong>: a keyword holds at most 256 bytes as a term; <code>_source</code> holds at most 1,000 values, objects 16 deep and paths of 256 bytes (a document past them is refused, naming the limit); a date field holds one date; versions are read before the write, so two writers of one document at once can both pass an <code>if_seq_no</code> check.</li>
+<li><strong>Cluster</strong>: one node and one shard are reported; settings other than <code>max_result_window</code> and the analysis are kept and ignored. A write is searchable once it returns, so <code>refresh</code> is accepted and needs no wait.</li>
+</ul>
+<h2 id="numbers">Numbers<a class="anchor" href="#numbers" aria-label="Link to this section">#</a></h2>
+<p>OpenSearch 2.11 (its default 1 GB heap) and ChloeDB's OpenSearch API on the same machine, one at a time, the other stopped: a cloud container of 4 vCPUs (Intel Xeon @ 2.10GHz) and 15.7 GB, 2026-11-08. <a href="https://huggingface.co/datasets/BeIR/trec-covid">BEIR's TREC-COVID</a> (171,332 abstracts) in one index, written with <code>_bulk</code>, then ten kinds of search 300 times each from one client, the same requests to both; OpenSearch's request cache off. The script, its output and how it was run: <a href="https://github.com/chloetech-ai/chloedb/tree/main/chloedb-server/results/opensearch"><code>chloedb-server/results/opensearch</code></a>.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>search</th>
+<th>OpenSearch p50 / p99 ms</th>
+<th>ChloeDB p50 / p99 ms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>match</code>, one word</td>
+<td>2.96 / 8.06</td>
+<td>1.70 / 3.06</td>
+</tr>
+<tr>
+<td><code>match</code>, a topic's words</td>
+<td>6.41 / 18.99</td>
+<td>2.22 / 4.79</td>
+</tr>
+<tr>
+<td><code>match</code> + <code>term</code> + <code>range</code> filters</td>
+<td>9.47 / 31.87</td>
+<td>3.69 / 7.57</td>
+</tr>
+<tr>
+<td><code>multi_match</code></td>
+<td>6.89 / 30.16</td>
+<td>4.10 / 9.75</td>
+</tr>
+<tr>
+<td><code>match_phrase</code></td>
+<td>2.97 / 5.84</td>
+<td>1.86 / 4.86</td>
+</tr>
+<tr>
+<td><code>term</code> filter</td>
+<td>2.00 / 7.00</td>
+<td>1.49 / 2.23</td>
+</tr>
+<tr>
+<td><code>range</code>, sorted by date</td>
+<td>2.96 / 6.46</td>
+<td>1.52 / 2.44</td>
+</tr>
+<tr>
+<td><code>terms</code> aggregation</td>
+<td>6.82 / 18.93</td>
+<td>4.30 / 5.56</td>
+</tr>
+<tr>
+<td><code>date_histogram</code> of every document</td>
+<td>9.73 / 15.50</td>
+<td>6.71 / 8.80</td>
+</tr>
+<tr>
+<td><code>match</code> + <code>highlight</code></td>
+<td>7.69 / 24.84</td>
+<td>3.27 / 5.66</td>
+</tr>
+</tbody>
+</table></div>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th></th>
+<th>OpenSearch</th>
+<th>ChloeDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>searches a second, 8 clients</td>
+<td>638</td>
+<td>1,183</td>
+</tr>
+<tr>
+<td><code>_bulk</code> of the 171,332 documents</td>
+<td>21.4 s</td>
+<td>39.0 s</td>
+</tr>
+<tr>
+<td>resident memory, empty</td>
+<td>1,348 MiB</td>
+<td>50 MiB</td>
+</tr>
+<tr>
+<td>resident memory, after the searches</td>
+<td>1,652 MiB</td>
+<td>726 MiB</td>
+</tr>
+<tr>
+<td>on disk</td>
+<td>415 MB (195 MB after a <code>_flush</code>)</td>
+<td>260 MB</td>
+</tr>
+</tbody>
+</table></div>
+<p>All 3,000 searches find as many hits on both. Of the 2,400 that return hits, 808 return the same first page in the same order, and 1,292 the same scores or dates in the same places, with ties in another order (ChloeDB's by <code>_id</code>); the 300 phrase searches find the same documents and rank them otherwise (<a href="#differences">Differences</a>).</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/chloedb/opensearch.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="connectors.html">← Connectors</a><a href="compatibility.html">Versions and compatibility →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

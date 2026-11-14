@@ -2,7 +2,9 @@
 //! (`--app crawler=http://127.0.0.1:7800`). An app answers
 //!
 //! - `GET /app.json`: its name, title, icon (`icon_svg`, the inside of a
-//!   24-unit outline icon), and `view`, the path of its view module;
+//!   24-unit outline icon), `view`, the path of its view module, and
+//!   optionally `maturity` (`"demo"`: the command center marks the app as
+//!   a demo, on a release train of its own);
 //! - its view module: JavaScript the command center loads and runs with
 //!   its own helpers (the app's code is trusted as the server's is: an
 //!   admin names it on the server's command line);
@@ -177,6 +179,9 @@ impl Apps {
                     "name": a.name, "url": a.url, "up": true,
                     "title": m["title"].as_str().unwrap_or(&a.name), "description": m["description"], "icon_svg": m["icon_svg"],
                     "view": m["view"].as_str().map(|v| format!("/v1/apps/{}/{}", a.name, v.trim_start_matches('/'))), "version": m["version"],
+                    // "demo" for an app on the demo train (netops, the
+                    // feature store, the swarm): the command center marks it.
+                    "maturity": m["maturity"],
                     "checks_callers": m["checks_callers"] == json!(true) || m["limited_keys"] == json!(true),
                 }),
                 Err(e) => json!({"name": a.name, "url": a.url, "up": false, "title": a.name, "error": e}),
@@ -258,7 +263,9 @@ impl Apps {
             }
         }
         let mut req = http.request(method, url).timeout(Duration::from_secs(120));
-        for h in [header::CONTENT_TYPE, header::ACCEPT] {
+        // The validators of what the browser holds go too, so that an app
+        // that tags its answers (`ETag`) can answer 304 without the body.
+        for h in [header::CONTENT_TYPE, header::ACCEPT, header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE] {
             if let Some(v) = headers.get(&h) {
                 req = req.header(h, v);
             }
@@ -275,15 +282,21 @@ impl Apps {
         };
         let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let ctype = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
-        // A download's name, and what an app says of its answer in its own
-        // headers (`x-app-*`: what an export left out), go back as they came.
+        // A download's name, what an app says of its answer in its own
+        // headers (`x-app-*`: what an export left out), and its validators
+        // (`ETag`, `Last-Modified`), go back as they came. The answer is
+        // still `no-cache`: the browser asks again each time, with the tag.
         let mut passed = HeaderMap::new();
         for (k, v) in r.headers() {
-            if k == reqwest::header::CONTENT_DISPOSITION || k.as_str().starts_with("x-app-") {
+            if k == reqwest::header::CONTENT_DISPOSITION || k == reqwest::header::ETAG || k == reqwest::header::LAST_MODIFIED || k.as_str().starts_with("x-app-") {
                 if let (Ok(k), Ok(v)) = (header::HeaderName::from_bytes(k.as_str().as_bytes()), header::HeaderValue::from_bytes(v.as_bytes())) {
                     passed.insert(k, v);
                 }
             }
+        }
+        // What the browser holds is current: no body.
+        if status == StatusCode::NOT_MODIFIED {
+            return (status, passed, [(header::CACHE_CONTROL, "no-cache")]).into_response();
         }
         if r.content_length().is_some_and(|n| n as usize > MAX_ANSWER) {
             return err(StatusCode::BAD_GATEWAY, format!("the app {name}'s answer is larger than {} MB", MAX_ANSWER >> 20));

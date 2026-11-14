@@ -41,6 +41,8 @@ pub struct Stats {
     /// (refused, unless [`super::Bug::InstallsALateCopy`] is put back).
     pub copies: u64,
     pub late_copies: u64,
+    /// Replicas that lost their volume ([`super::Config::lost_volumes`]).
+    pub lost_volumes: u64,
     /// Calls a replica refused for holding another transaction under the
     /// term and number they follow, and writes committed by a copy that
     /// stepped down ([`super::Bug::CommitsAfterSteppingDown`]).

@@ -11,27 +11,16 @@
 // with another question in the same conversation. The server keeps the
 // latest runs beside its audit log; proposals hold for an hour.
 
-import { h, icon, clear, fmt, card, api, toast, confirm, modal, seg, pill, empty, failure, store, can, needs, every, link, when, timeEl, copy, bus } from "../core.js";
-import { firingAlerts, refreshAlerts, state } from "../data.js";
+import { h, icon, clear, fmt, card, api, toast, confirm, modal, seg, pill, empty, failure, store, can, needs, every, link, when, timeEl, copy, bus, experimental } from "../core.js";
+import { firingAlerts, refreshAlerts, state, setPendingProposals } from "../data.js";
 
 export default {
   id: "oncall", title: "On-call agent", icon: "agent", group: "Operate",
   keywords: "on-call oncall agent claude ai llm investigate incident alert firing why slow root cause diagnose triage proposals approve reject contain cancel silence runbook change request changes inbox dry run plan stale",
-  render, onParams, badge,
+  render, onParams,
 };
-
-// ---------------------------------------------------------------- the badge
-// Proposals waiting for an admin: the navigation counts them.
-let pendingN = 0;
-export function badge() {
-  return pendingN ? { n: pendingN, tone: "warn", title: `${fmt.plural(pendingN, "proposal")} (the on-call agent's, and change requests) wait for an admin` } : null;
-}
-async function pollPending() {
-  if (!can("admin", "GET /v1/admin/oncall/proposals") || document.hidden) return;
-  try { pendingN = (await api("/v1/admin/oncall/proposals?state=pending")).proposals?.length || 0; } catch { /* an older server, or no key */ }
-}
-setInterval(pollPending, 20000);
-bus.on("whoami", () => { pendingN = 0; pollPending(); });
+// The navigation's count of proposals waiting for an admin is the shell's
+// (data.js pendingProposals), polled whether or not this view was opened.
 
 // ---------------------------------------------------------------- words
 const SUGGEST = [
@@ -194,7 +183,7 @@ function render(page, route) {
 
   async function load() {
     try { ov = await api("/v1/admin/oncall"); ovErr = null; } catch (e) { ovErr = e; }
-    try { pending = (await api("/v1/admin/oncall/proposals?state=pending")).proposals || []; pendingN = pending.length; } catch { /* shown with the runs */ }
+    try { pending = (await api("/v1/admin/oncall/proposals?state=pending")).proposals || []; setPendingProposals(pending.length); } catch { /* shown with the runs */ }
     if (!alive) return;
     // The open conversation's runs, fetched again when they moved.
     const want = new Set([selected, ...thread().map((r) => r.id)].filter(Boolean));
@@ -322,7 +311,7 @@ function render(page, route) {
       tools.push(h("a", { class: "btn sm", href: "#/oncall?new=1" }, icon("plus"), "New investigation"));
     }
     clear(head, h("div", { class: "page-head" },
-      h("div", {}, h("h1", {}, selected && runs.length ? titleOf(runs[0]) : "On-call agent"),
+      h("div", {}, h("h1", {}, selected && runs.length ? titleOf(runs[0]) : "On-call agent", " ", experimental("The on-call agent")),
         h("p", {}, selected ? h("a", { href: "#/oncall?new=1", class: "oc-back" }, icon("left"), "On-call agent") : "A Claude model looks into an alert or a question with read-only tools, and reports what it found. Each action it would take waits for an admin's approval here.")),
       h("div", { class: "tools" }, tools)));
   }

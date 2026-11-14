@@ -85,6 +85,8 @@ async fn role_keys_act_by_tier_with_reasons_and_caps() {
     assert_eq!(s, 200, "{j}");
     let (s, j) = call(&base, "POST", "/v1/write", &ops, &[], Some(json!({"rows": [{"id": "x"}]}))).await;
     assert_eq!((s, j["error_code"].as_str()), (403, Some("scope_refused")), "{j}");
+    // Beyond what ops reaches: the scope the route needs, and the change request.
+    assert!(j["error"].as_str().unwrap().contains("needs a key with the write scope") && j["error"].as_str().unwrap().contains("is ops"), "{j}");
     assert!(j["hint"].as_str().unwrap().contains("change request"), "{j}");
     assert!(j["docs"].as_str().unwrap().starts_with("https://"), "{j}");
 
@@ -92,6 +94,9 @@ async fn role_keys_act_by_tier_with_reasons_and_caps() {
     let rule = json!({"match": {"fingerprint": "ab12"}, "action": "refuse", "expires_s": 600});
     let (s, j) = call(&base, "POST", "/v1/admin/contain", &propose, &[("x-chloedb-reason", "x")], Some(rule.clone())).await;
     assert_eq!((s, j["error_code"].as_str()), (403, Some("scope_refused")), "{j}");
+    // CCW-11: it names the least key that would do (ops, not admin), and the change request.
+    let said = j["error"].as_str().unwrap();
+    assert!(said.contains("needs an ops key") && said.contains("is propose") && said.contains("POST /v1/admin/changes") && !said.contains("admin scope"), "{j}");
     let (s, j) = call(&base, "POST", "/v1/admin/contain", &ops, &[], Some(rule.clone())).await;
     assert_eq!((s, j["error_code"].as_str()), (400, Some("reason_required")), "{j}");
     let mut long = rule.clone();
@@ -220,6 +225,21 @@ async fn agents_find_routes_tools_jobs_events_and_runbooks() {
     assert!(c["errors"].as_array().unwrap().iter().any(|e| e["code"] == "plan_stale"), "{c}");
     let (_, c) = call(&base, "GET", "/v1/catalog?q=contain", &read, &[], None).await;
     assert!(c["routes"].as_array().unwrap().iter().all(|r| r["path"].as_str().unwrap().contains("contain")), "{c}");
+
+    // Experimental features: marked in the catalog, and their answers say so.
+    let oncall = routes.iter().find(|r| r["method"] == "GET" && r["path"] == "/v1/admin/oncall").unwrap();
+    assert_eq!(oncall["experimental"], "oncall", "{oncall}");
+    assert!(contain.get("experimental").is_none(), "{contain}");
+    let marked = |path: &'static str| {
+        let base = base.clone();
+        async move {
+            let r = chloedb_server::http_client().build().unwrap().get(format!("{base}{path}")).bearer_auth(ROOT).send().await.unwrap();
+            r.headers().get("x-chloedb-experimental").map(|v| v.to_str().unwrap().to_string())
+        }
+    };
+    assert_eq!(marked("/v1/admin/oncall").await.as_deref(), Some("oncall"));
+    assert_eq!(marked("/v1/admin/hub").await.as_deref(), Some("hub"));
+    assert_eq!(marked("/v1/health").await, None);
 
     // The operations tools are listed to a role key, not to a read key.
     let list = |auth: String| {

@@ -6,6 +6,8 @@
 import assert from "node:assert/strict";
 
 const noop = () => {};
+// What the modules listen for on the document (core.js: whether anybody is at the page).
+const docListeners = {};
 const el = () => ({ style: {}, dataset: {}, classList: { add: noop, remove: noop, toggle: noop }, append: noop, setAttribute: noop, addEventListener: noop, replaceChildren: noop, children: [] });
 Object.assign(globalThis, {
   window: globalThis,
@@ -13,7 +15,8 @@ Object.assign(globalThis, {
   matchMedia: () => ({ matches: false, addEventListener: noop }),
   sessionStorage: { getItem: () => null, setItem: noop, removeItem: noop },
   localStorage: { getItem: () => null, setItem: noop, removeItem: noop },
-  document: { addEventListener: noop, querySelector: () => null, querySelectorAll: () => [], documentElement: el(), body: el(), createElement: el, createElementNS: el, createTextNode: el },
+  document: { addEventListener: (ev, f) => (docListeners[ev] ||= []).push(f), querySelector: () => null, querySelectorAll: () => [], documentElement: el(), body: el(), createElement: el, createElementNS: el, createTextNode: el },
+  addEventListener: noop,
 });
 const app = new URL("../ui/app/", import.meta.url);
 const { fmt, ApiError } = await import(new URL("core.js", app));
@@ -150,6 +153,93 @@ assert.ok(!core.signInNeeded());
 await tick();
 assert.ok(ticks.length > 1, "it goes on once another key is given");
 stop();
+
+// LIV-14: cards that ask the same thing at once share one request, each
+// with its own copy of the answer; a change is never shared.
+let fetches = 0;
+globalThis.fetch = async () => { fetches++; await tick(); return { status: 200, ok: true, text: async () => '{"tables":[{"name":"t"}]}' }; };
+const [a1, a2] = await Promise.all([core.api("/v1/index/tables"), core.api("/v1/index/tables")]);
+assert.equal(fetches, 1, "one request for two cards");
+assert.deepEqual(a1, a2); assert.notEqual(a1, a2);
+await core.api("/v1/index/tables");
+assert.equal(fetches, 2, "a later read asks again");
+await Promise.all([core.api("/v1/x", { method: "POST", body: {} }), core.api("/v1/x", { method: "POST", body: {} })]);
+assert.equal(fetches, 4, "writes are each sent");
+
+// LIV-14: a page nobody touched for IDLE_MS polls IDLE_SLOW times less
+// often, and asks what is due as soon as someone is back.
+globalThis.fetch = async () => ({ status: 200, ok: true, text: async () => "{}" });
+const realNow = Date.now;
+const count = async (opts) => { let n = 0; const st = core.every(10, () => { n++; }, true, opts); await new Promise((r) => setTimeout(r, 200)); st(); return n; };
+const busy = await count();
+Date.now = () => realNow() + core.IDLE_MS + 1000;
+assert.ok(core.isIdle());
+const resting = await count();
+assert.ok(busy >= 8 && resting <= Math.ceil(busy / core.IDLE_SLOW) + 1, `polls while used ${busy}, while idle ${resting}`);
+assert.ok(await count({ always: true }) >= 8, "a change under way is followed at the full rate");
+let woke = 0;
+const st = core.every(10, () => { woke++; });
+await new Promise((r) => setTimeout(r, 30));
+const before = woke;
+for (const f of docListeners.pointermove || []) f();
+assert.ok(!core.isIdle());
+assert.equal(woke, before + 1, "someone back: what is due is asked at once");
+st();
+Date.now = realNow;
+
+// LIV-9: an alert firing now is a problem on Home, though the fleet's last
+// answer did not count it yet; an info alert tells but is no problem.
+const data = await import(new URL("data.js", app));
+data.state.fleet = { status: "ok", problems: [], checks: [] };
+data.state.alerts = { rules: [{ id: "p99-jump", name: "Query p99 doubled", severity: "warning" }], states: [{ rule: "p99-jump", state: "firing", since_ms: 1000, where: [] }] };
+assert.deepEqual(data.homeProblems().map((p) => [p.id, p.severity, p.title, p.next.view]), [["alerts", "warning", "1 alert is firing: Query p99 doubled", "alert/p99-jump"]]);
+assert.equal(data.homeStatus(), "warning");
+data.state.fleet = { status: "warning", problems: [{ id: "alerts", severity: "warning", title: "1 alert is firing: Query p99 doubled" }] };
+assert.equal(data.homeProblems().length, 1, "counted once when the fleet has it");
+data.state.fleet = { status: "ok", problems: [] };
+data.state.alerts.rules[0].severity = "info";
+assert.deepEqual([data.homeProblems(), data.homeStatus()], [[], "ok"]);
+data.state.fleet = null; data.state.alerts = null;
+
+// LIV-12: the apps' tables are the apps', not the owner's own: netops's and
+// ChloeCtx's fold away, and netops's syslog stays a source for Logs, named
+// as the app's.
+const owners = await import(new URL("owners.js", app));
+assert.deepEqual(["netops_sites", "chloectx_memory", "ctx_spaces", "fs_items", "products"].map((t) => owners.ownerOf(t)?.owner ?? null), ["Network operations", "ChloeCtx", "ChloeCtx", "Feature store", null]);
+assert.deepEqual(owners.byOwner(["products", "netops_sites", "netops_links"]).mine, ["products"]);
+const logsView = await import(new URL("views/logs.js", app));
+const syslog = { table: "netops_syslog", short: { fields: [{ name: "ts", type: "timestamp" }, { name: "body", type: "text" }] } };
+assert.deepEqual(logsView.logTables([syslog]).map((x) => x.table), ["netops_syslog"]);
+
+// LIV-11: a memory request is not a limit: no restart is foretold without
+// one, but a request under what a copy holds is said; a limit under it
+// restarts the copy.
+const { SETTINGS } = await import(new URL("spec.js", app));
+const memory = SETTINGS.find((x) => x.label === "Memory per server");
+const L = { rss: 608e6, file: 1e8 };
+const noLimit = { L, d: { resources: { requests: { memory: "512Mi" } } } };
+assert.match(memory.warn("512Mi", noLimit), /scheduler may put more on a node/);
+assert.doesNotMatch(memory.warn("512Mi", noLimit) + memory.effect("512Mi", noLimit), /restart(ed)? (it|by)/);
+const limited = { L, d: { resources: { requests: { memory: "512Mi" }, limits: { memory: "512Mi" } } } };
+assert.match(memory.warn("512Mi", limited), /a limit of 512Mi would restart it/);
+assert.equal(memory.warn("1Gi", { L, d: { resources: { requests: { memory: "1Gi" } } } }), null);
+
+// LIV-10: advice names the spec's field when an operator runs the cluster, the flag otherwise.
+assert.equal(data.howToSet({ flag: "--environment", field: "spec.environment", value: "production" }), "start the server with --environment production");
+data.state.kube = { managed: true, namespace: "chloedb", name: "e2e" };
+assert.equal(data.howToSet({ flag: "--environment", field: "spec.environment", value: "production", or: "staging" }), "set spec.environment: production (or staging) in the StrataCluster chloedb/e2e");
+data.state.kube = null;
+
+// CCW-10: the shell knows each view before its code loads: what views/index.js
+// says of a view (its title, icon, layout, the words the palette finds it by)
+// is what the view's module says, and each view's code loads.
+const { VIEWS, NAV } = await import(new URL("views/index.js", app));
+for (const v of VIEWS) {
+  const m = (await v.load()).default;
+  assert.equal(typeof m.render, "function", v.id);
+  for (const k of ["id", "title", "icon", "group", "parent", "nav", "hidden", "full", "range", "cluster", "keywords"]) assert.deepEqual(v[k], m[k], `views/index.js says ${v.id}.${k} = ${JSON.stringify(v[k])}, its module ${JSON.stringify(m[k])}`);
+}
+for (const [, list] of NAV) for (const e of list) assert.ok(VIEWS.some((v) => v.id === e.id || v.id === e.fallback), e.id);
 
 console.log("ok");
 process.exit(0);

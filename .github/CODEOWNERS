@@ -1,28 +1,46 @@
 # The one-way doors: changes here are hard or impossible to undo once
 # databases, replicas or clients depend on them (the on-disk format, the
-# shard protocol, replication and authentication). A pull request that
-# touches one names it in its description (.github/pull_request_template.md)
-# and waits for a human review.
+# shard protocol, replication, authentication, and what people install).
+# A pull request that touches one ticks "Yes" in the template's one-way-door
+# box (.github/pull_request_template.md), names the door, and waits for a
+# human review.
+#
+# Each section below starts with a line `# door: <name>`, and every path up
+# to the next such line belongs to that door. The check of the pull
+# request's box (.github/scripts/door_check.py, workflow One-way doors)
+# reads this file: a diff that touches a door's path with "No one-way door"
+# ticked fails it. The last section, `# not a door: ...`, is owned without
+# being a door.
 #
 # GitHub requests a review from the owners below; it enforces that review
 # only when the branch rule for main turns on "Require review from Code
 # Owners".
 
-# The on-disk format: manifest, write-ahead log, pages, directory layout,
-# segments, the fixtures that pin each format version, and the features a
-# file declares (query/ir.rs).
+# door: on-disk format
+# The manifest, write-ahead log, pages, directory layout, segments, the
+# fixtures that pin each format version, and the features a file declares
+# (query/ir.rs). The stored layouts of rollups, the substring index and the
+# analyzers' names a schema keeps (Analyzer::ALL), and the layouts of
+# archives (STRARC01) and tenants.
 /chloedb/src/storage/manifest.rs   @rkonow
 /chloedb/src/storage/wal.rs        @rkonow
 /chloedb/src/storage/pager.rs      @rkonow
 /chloedb/src/storage/dir.rs        @rkonow
 /chloedb/src/storage/ship.rs       @rkonow
+/chloedb/src/storage/arc.rs        @rkonow
 /chloedb/src/segment/              @rkonow
+/chloedb/src/substring/            @rkonow
 /chloedb/src/query/ir.rs           @rkonow
+/chloedb/src/db/rollup.rs          @rkonow
+/chloedb/src/query/rollup.rs       @rkonow
+/chloedb/src/text/analyzer.rs      @rkonow
+/chloedb/src/tenant.rs             @rkonow
 /chloedb/tests/fixtures/format*/   @rkonow
 # The locks and pins a writer and readers in other processes share a
 # database by, which every version that opens the files must keep to.
 /chloedb/src/storage/share.rs      @rkonow
 
+# door: shard protocol and replication
 # The shard protocol and replication between servers, and the decisions
 # the server replicates by (cores/shard.rs) and takes the cluster map and
 # moves slots by (cores/slots.rs).
@@ -32,10 +50,23 @@
 /chloedb-server/src/cores/shard.rs @rkonow
 /chloedb-server/src/cores/slots.rs @rkonow
 
-# Authentication and authorization.
+# door: authentication
+# Authentication and authorization: the server's keys and their sync, and
+# the app engine's keys and the access it grants apps to tables.
 /chloedb-server/src/auth.rs        @rkonow
 /chloedb-server/src/keys.rs        @rkonow
 /chloedb-server/src/keysync.rs     @rkonow
+/chloedb-apps/engine/appkeys.mjs   @rkonow
+/chloedb-apps/engine/access.mjs    @rkonow
 
-# The merge gate itself.
+# door: what people install
+# The install script `curl | sh` runs and the images clusters pull: a
+# change reaches every machine that installs next, before any review of
+# a release.
+/docs/install.sh                   @rkonow
+/install.sh                        @rkonow
+/chloedb-server/deploy/Dockerfile  @rkonow
+/chloedb-apps/deploy/Dockerfile    @rkonow
+
+# not a door: the merge gate itself
 /.github/                         @rkonow

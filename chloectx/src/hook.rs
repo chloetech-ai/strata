@@ -5,6 +5,11 @@
 //! `chloectx hook --user <event>` is the same hook from the user settings; it
 //! does nothing in a project that installs ChloeCtx itself, whose own hook
 //! handles the event.
+//!
+//! The plugin's hooks are `--user` hooks run by its launcher, which sets
+//! `CHLOECTX_PLUGIN=1`: they also step aside where the user settings hold
+//! the hooks of `chloectx install --user`, so that an install from before
+//! the plugin, left in place, does not record each event twice.
 
 use std::io::Read;
 use std::time::Duration;
@@ -48,6 +53,9 @@ pub fn run(event: &str, user: bool) -> i32 {
     let event = payload.get("hook_event_name").and_then(|v| v.as_str()).unwrap_or(event).to_string();
     let project = paths::project_dir(payload.get("cwd").and_then(|v| v.as_str()));
     if user && install::project_has_hooks(&project) {
+        return 0;
+    }
+    if crate::plugin::called_by_plugin() && install::user_has_hooks() {
         return 0;
     }
     let dir = paths::store_dir(&project);

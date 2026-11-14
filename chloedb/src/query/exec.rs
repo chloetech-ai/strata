@@ -600,6 +600,49 @@ impl ExecOptions {
     }
 }
 
+/// The multi-valued INT field whose ranges every condition of `cs` is, when
+/// there are several.
+fn ranges_of_one_list(schema: &Schema, cs: &[Pred]) -> Option<usize> {
+    let Some(Pred::IntRange { field, .. }) = cs.first() else { return None };
+    (cs.len() > 1 && schema.fields[*field].multi && cs.iter().all(|c| matches!(c, Pred::IntRange { field: f, .. } if f == field))).then_some(*field)
+}
+
+/// `cs`, the conditions of an `AND`, with the negated ranges of each
+/// multi-valued field that has several made one negation of their `OR`
+/// ([`ranges_of_one_list`]); `None` when no field has several.
+fn outside_lists(schema: &Schema, cs: &[Pred]) -> Option<Vec<Pred>> {
+    let negated_range = |c: &Pred| match c {
+        Pred::Not(r) => match &**r {
+            Pred::IntRange { field, .. } if schema.fields[*field].multi => Some(*field),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut count: HashMap<usize, usize> = HashMap::new();
+    for f in cs.iter().filter_map(negated_range) {
+        *count.entry(f).or_default() += 1;
+    }
+    if !count.values().any(|&n| n > 1) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cs.len());
+    let mut ranges: Vec<(usize, Vec<Pred>)> = Vec::new();
+    for c in cs {
+        match negated_range(c) {
+            Some(f) if count[&f] > 1 => {
+                let Pred::Not(r) = c else { unreachable!("a negated range") };
+                match ranges.iter_mut().find(|(g, _)| *g == f) {
+                    Some((_, rs)) => rs.push((**r).clone()),
+                    None => ranges.push((f, vec![(**r).clone()])),
+                }
+            }
+            _ => out.push(c.clone()),
+        }
+    }
+    out.extend(ranges.into_iter().map(|(_, rs)| Pred::Not(Box::new(Pred::Or(rs)))));
+    Some(out)
+}
+
 /// Counts the steps of a long loop and checks its query's deadline and
 /// cancel flag ([`ExecOptions::check`]) every `every` of them, so that a
 /// query stops within a few thousand steps instead of at its next segment.
@@ -2386,6 +2429,24 @@ impl<'a> Executor<'a> {
             Pred::Graph { id } => self.graph_set(*id, s.ord, n),
             Pred::Sub(_) => return Err(unresolved()),
             Pred::Not(c) => self.materialize(s, c)?.complement(),
+            // Ranges of one multi-valued field (`groups <@ :allowed` is
+            // NOT of those between the list's values): the documents of
+            // all their codes at once, not a set for each range unioned.
+            Pred::Or(cs) if ranges_of_one_list(&self.schema, cs).is_some() => {
+                let field = ranges_of_one_list(&self.schema, cs).expect("checked");
+                let kw = self.keyword(s, field)?;
+                let mut codes = Vec::new();
+                for c in cs {
+                    if let Pred::IntRange { lo, hi, .. } = c {
+                        codes.extend(kw.int_codes_exact(*lo, *hi));
+                    }
+                }
+                kw.docs_codes(&codes)
+            }
+            // Negated ranges of one multi-valued field, which `<@` is once
+            // its NOT is pushed down: one complement of their union rather
+            // than a complement and an intersection for each (finding N-B4).
+            Pred::And(cs) if outside_lists(&self.schema, cs).is_some() => self.materialize(s, &Pred::And(outside_lists(&self.schema, cs).expect("checked")))?,
             Pred::Or(cs) => {
                 let mut acc = DocSet::empty(n);
                 for c in cs {

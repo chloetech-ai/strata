@@ -441,3 +441,56 @@ async fn errors_outside_the_handlers_have_the_api_shape() {
         assert!(j["error"].as_str().unwrap().contains(says), "{says}: {j}");
     }
 }
+
+/// A statement longer than `--max-statement-bytes`, or holding more than
+/// `--max-statement-elements` words, values and symbols, is refused with a
+/// 400 query error before it is parsed, through `/v1/query`, `/v1/sql` and
+/// `/v1/explain`; the same list passed as a parameter is not counted. The
+/// defaults take a statement as long as the server's own tests send, and
+/// 0 lifts a bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_statement_too_long_or_too_large_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut svc = capped(open(dir.path(), "st.strata", |_| true));
+    assert_eq!((svc.max_statement_bytes, svc.max_statement_elements), (chloedb::query::parse::STATEMENT_BYTES, chloedb::query::parse::STATEMENT_ELEMENTS));
+    svc.max_statement_bytes = 64 << 10;
+    svc.max_statement_elements = 5_000;
+    let base = http(Arc::new(svc)).await;
+    let c = chloedb_server::http_client().build().unwrap();
+    let post = |path: &'static str, body: Json| {
+        let c = c.clone();
+        let base = base.clone();
+        async move {
+            let r = c.post(format!("{base}{path}")).json(&body).send().await.unwrap();
+            (r.status().as_u16(), r.json::<Json>().await.unwrap_or(Json::Null))
+        }
+    };
+    let ids = |n: usize| (0..n).map(|i| format!("'p{:07}'", i % N)).collect::<Vec<_>>().join(", ");
+    // 3,000 ids: 6,000 elements in 35 KB.
+    let many = format!("SELECT COUNT(*) FROM products WHERE id IN ({})", ids(3_000));
+    // A comment of 70 KB: one element, but too long.
+    let long = format!("SELECT COUNT(*) FROM products /* {} */", "x".repeat(70 << 10));
+    for (sql, says) in [(&many, "elements"), (&long, "bytes")] {
+        for path in ["/v1/query", "/v1/sql", "/v1/explain"] {
+            let (s, b) = post(path, json!({"sql": sql})).await;
+            assert_eq!(s, 400, "{path}: {b}");
+            assert_eq!(b["error_code"], "query_invalid", "{path}: {b}");
+            let e = b["error"].as_str().unwrap();
+            assert!(e.contains(says) && e.contains("--max-statement-") && e.contains(":ids"), "{path}: {e}");
+        }
+    }
+    // Under both: answered.
+    let (s, b) = post("/v1/query", json!({"sql": format!("SELECT COUNT(*) FROM products WHERE id IN ({})", ids(2_000))})).await;
+    assert_eq!((s, b["rows"][0][0].as_i64()), (200, Some(N as i64)), "{b}");
+    // As a parameter, any number.
+    let list: Vec<String> = (0..20_000).map(|i| format!("p{:07}", i % N)).collect();
+    let (s, b) = post("/v1/query", json!({"sql": "SELECT COUNT(*) FROM products WHERE id IN (:ids)", "params": {"ids": list}})).await;
+    assert_eq!((s, b["rows"][0][0].as_i64()), (200, Some(N as i64)), "{b}");
+    // 0: no bound.
+    let mut open_svc = capped(open(dir.path(), "st2.strata", |_| true));
+    open_svc.max_statement_bytes = 0;
+    open_svc.max_statement_elements = 0;
+    let base = http(Arc::new(open_svc)).await;
+    let r = c.post(format!("{base}/v1/query")).json(&json!({"sql": long})).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+}

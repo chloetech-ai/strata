@@ -291,6 +291,16 @@ impl Principal {
         }
     }
 
+    /// Refuses (403) a route a key for operations does not reach (CCW-11):
+    /// it names the least key that would, `ops` when that role reaches the
+    /// route (`ops_would`), and the change request a person approves, so
+    /// that an agent does not ask for an admin key it does not need.
+    pub fn may_by_role(&self, need: Scope, what: &str, ops_would: bool) -> Result<(), ApiError> {
+        let Some(role) = self.role.filter(|_| self.scope < need) else { return self.may(need, what) };
+        let least = if ops_would && role < Role::Ops { "an ops key".to_string() } else { format!("a key with the {} scope", need.name()) };
+        Err(ApiError { code: Some("scope_refused"), status: 403, message: format!("{what} needs {least} ({:?} is {}), or a change request (POST /v1/admin/changes) for a person to approve", self.name, role.name()) })
+    }
+
     /// The scope as keys are made with it: `ops` or `propose` for a key
     /// with a role, else its scope.
     pub fn scope_name(&self) -> &'static str {

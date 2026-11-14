@@ -227,14 +227,15 @@ pub fn looks_like_error(resp: &Json, text: &str) -> bool {
 }
 
 /// ChloeCtx's own tools, whose calls and answers are not recorded: the
-/// memory tools (named `mcp__engram__*` before the rename), and a mounted
+/// memory tools (named `mcp__engram__*` before the rename, and
+/// `mcp__plugin_chloectx_chloectx__*` when the plugin serves them), and a mounted
 /// capsule's, under whatever name its MCP server was given (`capsule` in
 /// the docs). A capsule's answers are another project's memory, possibly
 /// from someone else: recorded here they would outlive the mount, be
 /// recalled as this project's own history, be pushed by sync and be packed
 /// into the next capsule, where a forget in their own project cannot reach.
 pub fn is_own_tool(tool: &str) -> bool {
-    if tool.starts_with("mcp__chloectx__") || tool.starts_with("mcp__engram__") {
+    if tool.starts_with("mcp__chloectx__") || tool.starts_with("mcp__engram__") || tool.starts_with(crate::plugin::TOOL_PREFIX) {
         return true;
     }
     tool.strip_prefix("mcp__").and_then(|t| t.rsplit_once("__")).is_some_and(|(_, name)| matches!(name, "capsule_ask" | "capsule_search" | "capsule_timeline" | "capsule_sql"))
@@ -520,6 +521,7 @@ mod tests {
         assert!(d[0].text.starts_with("Edit src/a.rs"));
         assert!(tool_drafts("mcp__chloectx__memory_search", &json!({}), &json!({}), "/p").is_empty());
         assert!(tool_drafts("mcp__engram__memory_search", &json!({}), &json!({}), "/p").is_empty());
+        assert!(tool_drafts("mcp__plugin_chloectx_chloectx__memory_ask", &json!({}), &json!({}), "/p").is_empty());
     }
 
     #[test]

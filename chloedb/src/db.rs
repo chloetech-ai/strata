@@ -37,7 +37,7 @@ mod recommend;
 mod rollup;
 mod writes;
 pub use recommend::{RecommendSql, Recommended};
-pub use rollup::RefreshStats;
+pub use rollup::{RefreshStats, RollupHealth};
 pub use writes::{Footprints, WriteOp, WriteStats, GROUP_OPS};
 
 /// What [`Db::sql`] returns.
@@ -259,6 +259,9 @@ pub struct Db {
     /// A lock per gazetteer being read, so that one caller reads it while
     /// the others wait for it, or use the one before ([`Db::gazetteers_at`]).
     gazetteer_reads: std::sync::Mutex<HashMap<crate::query::understand::Key, Arc<std::sync::Mutex<()>>>>,
+    /// Each rollup's lock, held by its refresh, and how its refreshes went
+    /// ([`Db::rollup_health`]).
+    rollups: rollup::Rollups,
 }
 
 /// A gazetteer [`Db::gazetteers_at`] read: the stamp of its table's
@@ -364,6 +367,7 @@ impl Db {
             function_ddl: std::sync::Mutex::new(()),
             gazetteers: std::sync::Mutex::new(HashMap::new()),
             gazetteer_reads: std::sync::Mutex::new(HashMap::new()),
+            rollups: rollup::Rollups::default(),
         }
     }
 
@@ -2075,11 +2079,16 @@ impl Db {
             }
             Command::DropTable { tables, opts } => {
                 let names: Vec<&str> = tables.iter().map(|t| t.as_str()).collect();
+                // A rollup's table may not lose the table it reads; one
+                // dropped as a table loses its definition too.
+                let gone = self.rollups_dropped_with(&names)?;
                 self.drop_tables(&names, opts)?;
+                self.forget_rollups(&gone)?;
                 Ok(SqlResult::Written(0))
             }
             Command::AlterTable { table, alters } => {
                 if let Some(t) = table.filter(|_| !alters.is_empty()) {
+                    self.check_rollups_alter(&t, &alters)?;
                     self.alter_table(&t, &alters)?;
                 }
                 Ok(SqlResult::Written(0))

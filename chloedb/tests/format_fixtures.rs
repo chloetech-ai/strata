@@ -665,7 +665,12 @@ fn substring_fixture_answers_like_from_its_indexes() {
                     for (op, ci, negated) in [("LIKE", false, false), ("NOT LIKE", false, true), ("ILIKE", true, false), ("NOT ILIKE", true, true)] {
                         let holds = |v: &Value| {
                             let Value::Str(v) = v else { return false };
-                            let (t, p): (Vec<char>, Vec<char>) = if ci { (v.to_lowercase().chars().collect(), pattern.to_lowercase().chars().collect()) } else { (v.chars().collect(), pattern.chars().collect()) };
+                            // Each character lowercased alone, as ILIKE folds.
+                            let fold = |s: &str| s.chars().map(|c| match c.to_lowercase().next().unwrap() {
+                                'ς' => 'σ',
+                                c => c,
+                            }).collect::<String>();
+                            let (t, p): (Vec<char>, Vec<char>) = if ci { (fold(v).chars().collect(), fold(pattern).chars().collect()) } else { (v.chars().collect(), pattern.chars().collect()) };
                             like(&t, &p) != negated
                         };
                         let want: Vec<String> = written.iter().filter(|(_, d)| holds(&d[col])).map(|(_, d)| d[0].as_str().unwrap().to_string()).collect();

@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ChloeDB from JavaScript · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="The chloedb package opens a ChloeDB file inside a Node, Bun or Deno process, the way better-sqlite3 opens a SQLite file: no server, no configuration. It can also talk to a running chloedb-server from any JavaScript…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloedb/javascript.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -120,7 +123,7 @@
 </tbody>
 </table></div>
 <p>The workflow <a href="https://github.com/chloetech-ai/chloedb/blob/main/.github/workflows/js-release.yml"><code>js-release.yml</code></a> builds the tarballs on a <code>chloedb-js-v&lt;version&gt;</code> tag and runs each one in an empty app before attaching it to the release; <code>node scripts/pack.mjs &lt;platform&gt;</code> packs one by hand.</p>
-<p><code>chloedb</code> on npm is a placeholder (0.0.x) that holds the name until the releases are published there: a bare <code>npm install chloedb</code> installs it, and importing it throws an error that says how to install ChloeDB. From 0.3.3 the same workflow can publish to npm the way napi-rs packages are: <code>chloedb</code>, the JavaScript, with a package per platform holding its addon (<code>@chloedb/linux-x64-gnu</code>, <code>@chloedb/darwin-arm64</code>, ...) as optional dependencies, of which npm installs the one of your machine. Once it has (the workflow's header says what that needs), <code>npm install chloedb</code> is all it takes. <code>node scripts/pack.mjs --npm &lt;platform&gt;</code> and <code>--npm-main</code> pack those packages by hand.</p>
+<p><code>chloedb</code> on npm is a placeholder (0.0.x) that holds the name until the releases are published there: a bare <code>npm install chloedb</code> installs it, and importing it throws an error that says how to install ChloeDB. The same workflow builds what npm will get, the way napi-rs packages are laid out: <code>chloedb</code>, the JavaScript, with a package per platform holding its addon (<code>@chloedb/linux-x64-gnu</code>, <code>@chloedb/darwin-arm64</code>, ...) as optional dependencies, of which npm installs the one of your machine. A maintainer publishes them with a run started by hand on the release's tag (<code>gh workflow run js-release.yml --ref chloedb-js-v&lt;version&gt; -f npm=true</code>; the workflow's header says what it needs first). Once a release is there, <code>npm install chloedb</code> is all it takes, and this page will say so. <code>node scripts/pack.mjs --npm &lt;platform&gt;</code> and <code>--npm-main</code> pack those packages by hand.</p>
 <h3 id="from-source">From source<a class="anchor" href="#from-source" aria-label="Link to this section">#</a></h3>
 <p>It needs Rust (stable) and a C compiler.</p>
 <pre data-lang="sh">cd chloedb-js
@@ -375,7 +378,7 @@ npm test                                  # node --test</pre>
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

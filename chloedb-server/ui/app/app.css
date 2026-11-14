@@ -83,7 +83,12 @@ svg.i.lg { width: 20px; height: 20px; }
 .side { grid-row: 1 / 4; background: var(--surface); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; transition: width .18s; }
 .brand { height: 52px; display: flex; align-items: center; gap: 10px; padding: 0 14px; border: 0; border-bottom: 1px solid var(--line); background: none; font-weight: 700; letter-spacing: .01em; white-space: nowrap; overflow: hidden; width: 100%; text-align: left; cursor: pointer; flex: none; }
 .brand:hover { background: var(--surface-2); }
-.brand .mark { width: 28px; height: 28px; flex: none; }
+.brand .mark { width: 28px; height: 32px; flex: none; display: grid; place-items: center; }
+.brand .mark img { height: 32px; width: auto; }
+.brand .mark .on-dark { display: none; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .brand .mark .on-light { display: none; } :root:not([data-theme="light"]) .brand .mark .on-dark { display: block; } }
+:root[data-theme="dark"] .brand .mark .on-light { display: none; }
+:root[data-theme="dark"] .brand .mark .on-dark { display: block; }
 .brand .clu { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
 .brand .clu b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
 .brand .clu .chev { width: 13px; height: 13px; color: var(--muted); }
@@ -3736,3 +3741,7 @@ pre.code.diff > .del { background: color-mix(in srgb, var(--crit) 14%, transpare
   .card > .hd { flex-wrap: wrap; row-gap: 6px; }
   .card > .hd .tools { flex-wrap: wrap; max-width: 100%; margin-left: 0; }
 }
+
+/* CCW-10: a view whose code is still loading says so, after a moment (a quick load shows nothing). */
+.view-loading { padding: 24px 0; animation: view-loading-in 0s 0.2s both; }
+@keyframes view-loading-in { from { visibility: hidden; } to { visibility: visible; } }

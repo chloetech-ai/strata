@@ -58,7 +58,7 @@ export function copies(c = state.cluster) {
       url: r.url, name: copyName(r.url), node: r.node || null, zone: r.zone || null, shard: sh.shard, j, role: r.role, status: r.status, has: !!r.detail,
       p99: mi.p99_ms ?? ld.p99_ms, qps: mi.qps ?? ld.qps,
       cpu: mi.busy ?? (ld.cpu != null && cores ? ld.cpu / cores : null),
-      disk: ld.disk_used_ratio ?? mi.disk_used_ratio, segments: ld.segments ?? r.segments, docs: ld.docs ?? r.docs,
+      disk: ld.disk_used_ratio ?? mi.disk_used_ratio, segments: ld.segments ?? r.segments, docs: d.health?.rows ?? ld.docs ?? r.docs, // LIV-13: every table's rows, where the copy says them
       merge_failing: !!ld.merge_failing, flush_failing: !!ld.flush_failing, failing: !!ld.failing,
       behind: r.role === "primary" ? null : ld.replica_behind_max ?? null, out_of_sync: ld.replicas_out_of_sync, rss: ld.rss_bytes, wal: ld.wal_bytes, file: ld.file_bytes,
       deleted: ld.deleted_docs,

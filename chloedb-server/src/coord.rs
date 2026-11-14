@@ -4159,6 +4159,10 @@ impl Coordinator {
         let now = self.now_ms();
         let mut shards = Vec::new();
         let (mut docs, mut segments, mut all_up, mut every_shard) = (0, 0, true, true);
+        // LIV-13: the rows of every table, summed over the shards from the
+        // health each copy sends (`docs` counts the first table only); none
+        // when a shard does not say (an older server).
+        let mut tables: Option<serde_json::Map<String, Json>> = Some(Default::default());
         for (i, answers) in join_all(calls).await.into_iter().enumerate() {
             let mut replicas = Vec::new();
             // Counted from a replica that is "ok", else from any answering:
@@ -4168,10 +4172,13 @@ impl Coordinator {
                 let mut j = match a {
                     Ok(Ok(h)) => {
                         let h = h.into_inner();
-                        if h.status == "ok" {
-                            counted.get_or_insert((h.docs, h.segments));
+                        let per_table = || serde_json::from_str::<Json>(&h.detail).ok().and_then(|d| d["health"]["tables"].as_object().cloned());
+                        if h.status == "ok" && counted.is_none() {
+                            counted = Some((h.docs, h.segments, per_table()));
                         }
-                        answering.get_or_insert((h.docs, h.segments));
+                        if answering.is_none() {
+                            answering = Some((h.docs, h.segments, per_table()));
+                        }
                         json!({"url": r.url, "status": h.status, "docs": h.docs, "segments": h.segments, "txn": h.txn})
                     }
                     Ok(Err(e)) => token_refused(json!({"url": r.url, "status": "down", "error": e.message()}), &e),
@@ -4188,11 +4195,22 @@ impl Coordinator {
                 replicas.push(j);
             }
             let counted = counted.or(answering);
-            every_shard &= counted.is_some();
-            let (d, s) = counted.unwrap_or((0, 0));
+            let answered = counted.is_some();
+            every_shard &= answered;
+            // A shard that does not answer: its rows are not known, nor the sum.
+            let (d, s, per_table) = counted.unwrap_or((0, 0, None));
+            match (tables.as_mut(), per_table) {
+                (Some(all), Some(these)) => {
+                    for (t, n) in these {
+                        let sum = all.get(&t).and_then(Json::as_u64).unwrap_or(0) + n.as_u64().unwrap_or(0);
+                        all.insert(t, json!(sum));
+                    }
+                }
+                _ => tables = None,
+            }
             docs += d;
             segments += s;
-            let status = if counted.is_none() { "down" } else { "ok" };
+            let status = if answered { "ok" } else { "down" };
             let mut shard = json!({"url": t.shards[i], "status": status, "docs": d, "segments": s});
             // Two copies taking writes, each in its own term: the older
             // has not heard of the newer yet.
@@ -4214,10 +4232,15 @@ impl Coordinator {
             shards.push(shard);
         }
         let status = if all_up { "ok" } else if every_shard { "degraded" } else { "down" };
-        json!({
+        let mut h = json!({
             "status": status, "role": "coordinator", "docs": docs, "segments": segments, "txn": 0, "shards": shards,
             "retries": self.retries.load(Ordering::Relaxed), "hedges": self.hedges.load(Ordering::Relaxed), "protocol": t.protocol(), "slot_epoch": t.epoch(),
-        })
+        });
+        if let Some(tables) = tables {
+            h["rows"] = json!(tables.values().filter_map(Json::as_u64).sum::<u64>());
+            h["tables"] = Json::Object(tables);
+        }
+        h
     }
 }
 

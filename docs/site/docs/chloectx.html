@@ -4,17 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ChloeCtx: how it works · ChloeDB docs</title>
+<link rel="icon" href="../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../assets/brand/apple-touch-icon.png">
 <meta name="description" content="ChloeCtx, an application built on ChloeDB, gives a coding agent (Claude Code first) a memory that outlives its context window. It records every prompt, answer, tool call and compaction summary of a project into one…">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=422dc3d3ad">
+<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
 <!-- Written by docs/site/scripts/build_docs.py from docs/chloectx/index.md: edit that file and run the script, not this page. -->
 <header class="top gutter"><div class="wrap">
-  <a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a>
+  <a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
   <nav class="nav" aria-label="Site">
     <a href="../features.html">Features</a>
     <a href="../scale.html">Laptop to cloud</a>
@@ -357,7 +360,7 @@ $$</p>
 <p>Then the main search and a three-way gate: strong evidence injects the top records up to 4,000 characters; weak evidence injects three records up to 1,200, marked as a weak match; otherwise nothing.
 3. <strong><code>PreToolUse</code> on <code>Edit</code>/<code>Write</code>: file notes.</strong> Up to two older errors, decisions or rules anchored to that path, once per file per window. With <code>CHLOECTX_NEXT_FILES=1</code> (an experiment, off by default) the hook also names the files earlier sessions usually edited next: B follows A when an edit of B came within three edits after one of A (consecutive edits of one file count once), weighted by one over the gap and summed over sessions, and files above 1 are shown, at most two, each with its newest note. The daemon counts these from the edits the store holds as tool calls, reading only what was stored since it last looked, so nothing new is written. On the memory bench it changed neither how many tasks were solved nor which files were edited (<a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/chloectx/results.md#next-files">results</a>), so it stays off.
 4. <strong><code>PostToolUse</code> and <code>PostToolUseFailure</code> on <code>Bash</code>: error to fix.</strong> A command that fails and then passes, with edits or other commands between, is written down as a fix: an <code>error</code> record tagged <code>fix</code> holding the error's line, the steps (the last eight edits and commands that change something; <code>ls</code>, <code>grep</code>, <code>git status</code> and the like do not count) and what showed it fixed (the same command passed, or failed with another error). The same command means the same after <code>cd</code>, pipes, redirections, <code>timeout</code> and variable assignments are taken off (<code>cd x &amp;&amp; cargo test 2&gt;&amp;1 | tail</code> is <code>cargo test</code>); a failure is followed for 60 tool calls, and one that passes with nothing between is not a fix. When a command later fails with the same error, in any session of the project, its fixes come with the failure, at most two, once a session. Errors are matched by their signature: the telling line (a compiler's <code>error:</code>, a panic, the last line of a Python traceback, <code>fatal:</code>, ...) with numbers, hashes, temporary paths and the project's path masked, or one sharing four in five of its words. The fix links to the prompt of the turn that fixed it.
-5. <strong>Pull: MCP tools.</strong> <code>memory_ask</code> (by search alone, <a href="#answering-a-question">below</a>; with <code>deep</code>, the query engine), <code>memory_search</code>, <code>memory_timeline</code> (the neighbourhood of a hit), <code>memory_sql</code> (one read-only SELECT over <code>memory</code>, with no model calls, a 2-second deadline and a 1,000-row cap), <code>memory_remember</code> and <code>memory_forget</code> (<code>chloectx forget ID</code> from a shell).</p>
+5. <strong>Pull: MCP tools.</strong> <code>memory_ask</code> (by search alone, <a href="#answering-a-question">below</a>; with <code>deep</code>, the query engine), <code>memory_search</code>, <code>memory_timeline</code> (the neighbourhood of a hit), <code>memory_sql</code> (one read-only SELECT over <code>memory</code>, with no model calls, a 2-second deadline and a 1,000-row cap), <code>memory_remember</code> and <code>memory_forget</code> (<code>chloectx forget ID</code> from a shell, and <code>chloectx forget --everywhere TEXT</code> for a fact in every store, <a href="chloectx-setup.html#forget-something-chloectx-forget">setup</a>).</p>
 <p>The briefing also ends with a one-line index of the notes it had no room for ("31 older notes are not shown here, about: …"), so the model knows what to ask for.</p>
 <h3 id="ranking">Ranking<a class="anchor" href="#ranking" aria-label="Link to this section">#</a></h3>
 <p>BM25 and vector search each return their top <em>n</em> = 50 under the exclusion filter. Scores are min-max normalised over the union <em>C</em>, a missing score counting as 0:</p>
@@ -634,7 +637,7 @@ chloectx mount ./work.capsule                                             # serv
 </div></main>
 
 <footer class="foot gutter"><div class="wrap">
-  <div class="brand"><a class="mark" href="../index.html"><i><b></b><b></b><b></b><b></b></i>ChloeDB</a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div class="brand"><a class="mark" href="../index.html"><img class="on-light" src="../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
   <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
   <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>

@@ -456,6 +456,13 @@ pub fn project_has_hooks(project: &Path) -> bool {
     })
 }
 
+/// Whether the user settings hold the hooks of `chloectx install --user`.
+pub fn user_has_hooks() -> bool {
+    let settings = read_json(&crate::paths::user_settings());
+    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else { return false };
+    hooks.values().filter_map(|l| l.as_array()).flatten().any(is_user_hook)
+}
+
 /// The nearest folder above `p` that exists, for a mistyped path.
 fn nearest_existing(p: &Path) -> Option<&Path> {
     p.ancestors().skip(1).find(|a| a.is_dir() && a.parent().is_some())

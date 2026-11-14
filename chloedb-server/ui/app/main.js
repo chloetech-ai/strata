@@ -4,8 +4,8 @@
 // palette (Ctrl+K), which finds views, actions and the fleet's shards,
 // copies, nodes, tables, statements, alerts and keys, and the shortcuts.
 
-import { h, icon, clear, store, bus, api, at, connectionName, setToken, hasToken, signInNeeded, modal, toast, menu, seg, fmt, copy, connection, can, needs, link, when, whenTitle, span, copyName, copyTitle, isNarrow, logsLink, keyLabel } from "./core.js";
-import { state, start, setRange, setWindow, setZoom, setPaused, refreshWho, RANGES, rangeFromUrl, rangeParams, timeRange, firingAlerts, firingNow, fresh, clusterName, environment, isCoordinator, setPolls, overnight, isSandbox } from "./data.js";
+import { h, icon, clear, store, bus, api, at, connectionName, setToken, hasToken, signInNeeded, modal, toast, menu, seg, fmt, copy, connection, can, needs, link, when, whenTitle, span, copyName, copyTitle, isNarrow, logsLink, keyLabel, isIdle, IDLE_SLOW } from "./core.js";
+import { state, start, setRange, setWindow, setZoom, setPaused, refreshWho, pendingProposals, homeProblems, homeStatus, RANGES, rangeFromUrl, rangeParams, timeRange, firingAlerts, firingNow, fresh, clusterName, environment, isCoordinator, setPolls, overnight, isSandbox } from "./data.js";
 import { VIEWS, NAV, REDIRECTS } from "./views/index.js";
 import { loadApps, listApps, appIcon } from "./views/apps.js";
 import { openFeedback, setViewOf } from "./feedback.js";
@@ -17,6 +17,15 @@ const byId = Object.fromEntries(VIEWS.map((v) => [v.id, v]));
 const viewOf = (e) => byId[e.id] || (e.fallback && byId[e.fallback]) || null;
 const ENTRIES = NAV.flatMap(([g, list]) => list.map((e) => ({ ...e, group: g }))).filter((e) => viewOf(e));
 const entryOf = (id) => ENTRIES.find((e) => e.id === id || (!byId[e.id] && e.fallback === id));
+/**
+ * A view's code (CCW-10): imported the first time it opens, or when its
+ * link is pointed at; v.mod is the module's export once it is here.
+ */
+function loadView(v) {
+  if (!v || v.mod) return Promise.resolve(v?.mod);
+  v.loading ||= v.load().then((m) => (v.mod = m.default), (err) => { v.loading = null; throw err; });
+  return v.loading;
+}
 
 // ---------------------------------------------------------------- theme
 const applyTheme = (t) => { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; bus.emit("theme"); };
@@ -28,11 +37,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => bus.
 const brandName = h("b", {}, location.host);
 const brandSub = h("small", {}, "connecting…");
 const brand = h("button", { class: "brand", title: "Which cluster this is, and the others you used", "aria-haspopup": "menu" },
-  document.createElementNS("http://www.w3.org/2000/svg", "svg"),
+  h("span", { class: "mark" },
+    h("img", { class: "on-light", src: new URL("brand/chloedb-mark-on-light.svg", import.meta.url).href, alt: "" }),
+    h("img", { class: "on-dark", src: new URL("brand/chloedb-mark.svg", import.meta.url).href, alt: "" })),
   h("div", { class: "clu" }, h("span", { class: "row nw", style: { gap: "4px" } }, brandName, icon("down", "chev")), brandSub));
-const markSvg = brand.querySelector("svg");
-for (const [k, v] of Object.entries({ class: "mark", viewBox: "0 0 32 32", "aria-hidden": "true" })) markSvg.setAttribute(k, v);
-markSvg.innerHTML = '<defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="var(--s1)"/><stop offset="1" stop-color="var(--s7)"/></linearGradient></defs><rect x="2" y="2" width="28" height="28" rx="8" fill="url(#lg)"/><path d="M8 11.5 16 8l8 3.5-8 3.5z" fill="#fff" opacity=".95"/><path d="m8 16 8 3.5 8-3.5" stroke="#fff" stroke-width="2" fill="none" stroke-linejoin="round" opacity=".8"/><path d="m8 20.5 8 3.5 8-3.5" stroke="#fff" stroke-width="2" fill="none" stroke-linejoin="round" opacity=".6"/>';
 
 // Coordinators used from this browser, newest first. Each address keeps its
 // own list (storage is per address), so switching records both ends.
@@ -121,6 +129,9 @@ let labsOpen = store.get("labs.open", false);
 function navLink(e) {
   const v = viewOf(e);
   const a = h("a", { href: "#/" + e.id, dataset: { view: e.id }, title: e.title + (e.key ? ` (g then ${e.key})` : "") }, icon(e.icon || v.icon), h("span", { class: "t" }, e.title));
+  // Its code starts to load when the link is pointed at, so it is often here by the click.
+  const soon = () => { loadView(v).catch(() => { /* said when it opens */ }); };
+  a.addEventListener("pointerenter", soon); a.addEventListener("focus", soon); a.addEventListener("touchstart", soon, { passive: true });
   if (e.key) a.append(h("span", { class: "kb", "aria-hidden": "true" }, "g " + e.key));
   if (e.scope && state.whoami && !can(e.scope, e.route)) { a.classList.add("gated"); a.title = `${e.title}: you can look; changing anything here ${needs(e.scope, e.route)}`; a.append(h("span", { class: "lockic" }, icon("lock"))); }
   // The range goes along, so a view opens on the window in use.
@@ -184,7 +195,8 @@ function labItem(e, pinned) {
 // bell and Home show one count: the alerts firing now that nobody
 // silenced (firingNow).
 function shellBadge(id) {
-  if (id === "home") { const f = state.fleet; if (!f) return null; const n = (f.problems || []).length; return n ? { n, tone: f.status === "critical" ? "crit" : "warn", title: `${fmt.plural(n, "problem")} on Home` } : null; }
+  if (id === "oncall") { const n = pendingProposals(); return n ? { n, tone: "warn", title: `${fmt.plural(n, "proposal")} (the on-call agent's, and change requests) wait for an admin` } : null; }
+  if (id === "home") { const f = state.fleet; if (!f) return null; const n = homeProblems().length; return n ? { n, tone: homeStatus() === "critical" ? "crit" : "warn", title: `${fmt.plural(n, "problem")} on Home` } : null; }
   // Info alerts are counted, in a neutral tone: only a warning or worse turns the count amber or red (F2).
   if (id === "alerts") { const fa = firingNow(); const n = fa.length; return n ? { n, tone: fa.some((a) => a.severity === "critical") ? "crit" : fa.some((a) => a.severity === "warning") ? "warn" : "info", title: `${fmt.plural(n, "alert")} firing${fa.every((a) => a.severity === "info") ? " (info)" : ""}` } : null; }
   if (id === "cluster") {
@@ -204,7 +216,7 @@ function drawBadges() {
     const e = ENTRIES.find((x) => x.id === a.dataset.view);
     const v = e && viewOf(e);
     let b = null;
-    try { b = v?.badge && e?.id !== "alerts" ? v.badge() : shellBadge(e?.id); } catch (err) { console.warn(err); }
+    try { b = v?.mod?.badge && e?.id !== "alerts" && e?.id !== "oncall" ? v.mod.badge() : shellBadge(e?.id); } catch (err) { console.warn(err); }
     let el = a.querySelector(".count");
     if (!b || !b.n) { el?.remove(); continue; }
     if (!el) { el = h("span", { class: "count" }); a.querySelector(".t").after(el); }
@@ -219,7 +231,7 @@ function drawBadges() {
   bellCount.classList.toggle("info", !!n && !fa.some((a) => a.severity === "critical" || a.severity === "warning"));
   bell.title = n ? `${fmt.plural(n, "alert")} firing${bellCount.classList.contains("info") ? " (info only)" : ""}` : "Alerts: nothing firing";
 }
-for (const ev of ["alerts", "fleet", "cluster"]) bus.on(ev, drawBadges);
+for (const ev of ["alerts", "fleet", "cluster", "pending"]) bus.on(ev, drawBadges);
 bus.on("whoami", () => { drawNav(); drawBadges(); });
 // The server's apps, once it says who is signed in (the list needs a key on a closed server).
 bus.on("whoami", () => loadApps(true));
@@ -335,8 +347,9 @@ function drawLive() {
   else if (signInNeeded()) { cls = "stale"; ic = "lock"; text = "Signed out"; title = hasToken() ? "The server refused this key: nothing is asked of it until you enter another (click to sign in)" : "This server needs a key: nothing is asked of it until you enter one (click to sign in)"; }
   else if (state.paused) { cls = "paused"; ic = "play"; text = state.from != null ? "Fixed window" : `Paused at ${when(state.pausedAt)}`; title = "Nothing redraws while paused. Click to go live (p)"; }
   else if ((!f.ok && !f.loading) || (!fh.ok && !fh.loading)) { cls = "stale"; ic = "clock"; text = "Stale"; title = `No fresh data: ${(!f.ok ? f.error : fh.error) || "the last answers are old"}`; }
+  else if (isIdle()) { cls = "ok"; ic = null; text = "Live"; title = `Nobody has used this page for half a minute, so it asks the server ${IDLE_SLOW} times less often until you do. Click to pause (p)`; }
   else { cls = "ok"; ic = null; text = "Live"; title = "Live: the data follows now. Click to pause (p)"; }
-  const every = state.series.source === "load" ? "1 min" : (state.interval / 1000) + " s";
+  const every = state.series.source === "load" ? "1 min" : (state.interval * (isIdle() ? IDLE_SLOW : 1) / 1000) + " s";
   clear(liveBtn, cls === "ok" ? h("span", { class: "dot ok" }) : icon(ic), h("span", { class: "lt" }, text), cls === "ok" ? h("span", { class: "fresh" }, "· " + every) : null);
   liveBtn.setAttribute("aria-label", text);
   liveBtn.className = "btn sm live " + cls;
@@ -472,7 +485,9 @@ function markCurrent() {
 // detail) and the ones that show alerts; the others poll less (SH-11).
 const COPY_NUMBERS = new Set(["home", "cluster", "rollout", "system", "statement", "performance", "profile", "alerts", "autoscale"]);
 const ALERTS_SHOWN = new Set(["home", "alerts", "timeline", "logs", "statement"]);
-function route() {
+let routeSeq = 0;
+async function route() {
+  const seq = ++routeSeq;
   openNav(false);
   const r = parse();
   const { v, e, unknown } = resolve(r);
@@ -488,7 +503,24 @@ function route() {
   setPolls({ cluster: v.cluster || (COPY_NUMBERS.has(v.id) ? "full" : "brief"), alerts: ALERTS_SHOWN.has(v.id) ? "full" : "slow", series: v.range !== false });
   moreBtn.querySelector("svg").replaceWith(icon(v.range === false ? "dots" : "clock"));
   if (unknown && unknown !== "home") toast(`There is no view "${unknown}": this is Home`);
-  if (current === v && v.onParams) { v.onParams(r); return; }
+  if (!v.mod) {
+    // Its code is not here yet: the view before it goes, and a page says so if it takes a moment.
+    try { cleanup?.(); } catch (err) { console.error(err); }
+    cleanup = null; current = null;
+    drawCrumbs(v);
+    const wait = h("div", { class: "page" + (v.full ? " full" : "") }, h("div", { class: "muted small view-loading", role: "status" }, `Loading ${currentEntry?.title || v.title}…`));
+    clear(content, wait);
+    try { await loadView(v); }
+    catch (err) {
+      if (seq !== routeSeq) return;
+      console.error(err);
+      clear(wait, h("div", { class: "error" }, `${currentEntry?.title || v.title} did not load: ${err.message}. `, h("button", { class: "btn sm", onclick: () => location.reload() }, "Reload")));
+      return;
+    }
+    if (seq !== routeSeq) return;
+  }
+  const m = v.mod;
+  if (current === v && m.onParams) { m.onParams(r); return; }
   // An app's page: drawn again only when another app opens.
   if (current === v && v.id === "app" && route.app === r.rest[0]) return;
   route.app = v.id === "app" ? r.rest[0] : null;
@@ -500,7 +532,7 @@ function route() {
   if (v.full) page.style.cssText = "padding:0;max-width:none";
   clear(content, page);
   content.scrollTop = 0;
-  try { cleanup = v.render(page, r) || null; } catch (err) { console.error(err); page.append(h("div", { class: "error" }, "This view failed: " + err.message)); }
+  try { cleanup = m.render(page, r) || null; } catch (err) { console.error(err); page.append(h("div", { class: "error" }, "This view failed: " + err.message)); }
   // A view that names itself in its own heading leaves the crumb to the cluster (SH-12).
   const titled = () => !!page.querySelector(".page-head h1");
   crumbs.classList.toggle("titled", titled());
@@ -826,6 +858,14 @@ document.addEventListener("keydown", (e) => {
 
 // ---------------------------------------------------------------- start
 drawNav(); drawRange(); drawLive();
-start();
+// The first view's code loads while the server is asked who is signed in.
+loadView(resolve(parse()).v).catch(() => { /* said when it opens */ });
+const who = start();
 // Who is signed in decides what the views offer: ask that first (briefly).
-Promise.race([refreshWho(), new Promise((r) => setTimeout(r, 2500))]).then(() => { route(); drawBadges(); });
+// start() asks it once (CCW-18: it was asked twice).
+Promise.race([who, new Promise((r) => setTimeout(r, 2500))]).then(() => {
+  // ONB-11: a sandbox (one server on this machine, no environment named)
+  // opened at its bare address lands on Start here until its steps are done.
+  if (!location.hash.replace(/^#\/?/, "") && isSandbox() && !isCoordinator() && !store.get("start.done", false)) { try { history.replaceState(null, "", location.pathname + location.search + "#/start"); } catch { /* old browser */ } }
+  route(); drawBadges();
+});

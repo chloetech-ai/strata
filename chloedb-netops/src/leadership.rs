@@ -24,6 +24,23 @@ fn plural(n: usize, one: &str) -> String {
     if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") }
 }
 
+/// The objectives in the written week: the rate measured over the hours of
+/// telemetry kept, and the incident minutes of the period against what each
+/// objective allows, each with its own window.
+fn objectives_line(total: usize, below: &[&str], over: &[&str], kept_hours: f64, days: i64) -> String {
+    let measured = if below.is_empty() {
+        format!("all {total} services are inside their objective")
+    } else {
+        format!("{} of {total} {} ({})", below.len(), if below.len() == 1 { "service is below its objective" } else { "services are below their objective" }, below.join(", "))
+    };
+    let period = if over.is_empty() {
+        "no service has had more incident minutes than its objective allows".to_string()
+    } else {
+        format!("{} {} had more incident minutes than {} objective allows ({})", over.len(), if over.len() == 1 { "service has" } else { "services have" }, if over.len() == 1 { "its" } else { "their" }, over.join(", "))
+    };
+    format!("Objectives. Measured over the last {kept_hours} h of telemetry, {measured}. Over the {days} days of incidents, {period}.")
+}
+
 async fn leadership(State(svc): State<Shared>, Query(p): Query<HashMap<String, String>>) -> Answer {
     let q = Q::new(&svc);
     let e = q.e.clone();
@@ -191,7 +208,10 @@ async fn leadership(State(svc): State<Shared>, Query(p): Query<HashMap<String, S
     // ---- the week, in words
     let wk: Vec<&Row> = incidents.iter().filter(|i| parse_iso(&i.s("started")) >= week).collect();
     let worst = wk.iter().max_by(|a, b| (a.f("customers") * a.f("mttr_min")).partial_cmp(&(b.f("customers") * b.f("mttr_min"))).unwrap_or(std::cmp::Ordering::Equal));
-    let missed: Vec<&Value> = services.iter().filter(|s| s["period_used"].as_f64().unwrap_or(0.0) > 1.0 || s["met"] == false).collect();
+    // The two windows are said apart: a rate is measured over the telemetry
+    // kept (hours), incident minutes over the period (days).
+    let below: Vec<&str> = services.iter().filter(|s| s["met"] == false).map(|s| s["name"].as_str().unwrap_or("")).collect();
+    let over: Vec<&str> = services.iter().filter(|s| s["period_used"].as_f64().unwrap_or(0.0) > 1.0).map(|s| s["name"].as_str().unwrap_or("")).collect();
     let cannot: Vec<&Value> = failover.iter().filter(|f| f["survives"] == false).collect();
     let exposed_devices: i64 = advisories.iter().map(|a| a.i("devices")).sum();
     let mut report: Vec<String> = Vec::new();
@@ -200,8 +220,7 @@ async fn leadership(State(svc): State<Shared>, Query(p): Query<HashMap<String, S
     report.push(format!("Incidents. {} this week ({} sev1), against {:.1} a week over the last {days} days. Mean time to detect {:.0} s, to resolve {:.0} min.{}",
         wk.len(), wk.iter().filter(|i| i.s("severity") == "sev1").count(), n as f64 / (days as f64 / 7.0), mean(&|r| r.f("ttd_s"), &wk), mean(&|r| r.f("mttr_min"), &wk.iter().filter(|i| i.s("status") == "resolved").cloned().collect::<Vec<_>>()),
         worst.map(|i| format!(" The largest was {} ({}): {} customers for {:.0} minutes.", i.s("id"), i.s("title"), i.i("customers"), i.f("mttr_min"))).unwrap_or_default()));
-    report.push(if missed.is_empty() { format!("Objectives. All {} services are inside their objectives for the period.", services.len()) } else {
-        format!("Objectives. {} of {} services are outside their objective or have spent their error budget for the period: {}.", missed.len(), services.len(), missed.iter().map(|s| s["name"].as_str().unwrap_or("")).collect::<Vec<_>>().join(", ")) });
+    report.push(objectives_line(services.len(), &below, &over, round(kept_min / 60.0, 1), days));
     report.push(format!("Change. {} carried out in the period, {} rolled back ({:.0}% as planned); {} incident{} began with a change.", done + back, back, if done + back > 0 { 100.0 * done as f64 / (done + back) as f64 } else { 100.0 }, by_change.len(), if by_change.len() == 1 { "" } else { "s" }));
     report.push(format!("Risk. {} of {} backbone spans would not fit on one plane at their measured peak{}. {} on software with an open vendor advisory. {} within six months.",
         cannot.len(), failover.len(), cannot.first().map(|f| format!(" (the tightest is {} at {:.0}%)", f["span"].as_str().unwrap_or(""), f["load"].as_f64().unwrap_or(0.0) * 100.0)).unwrap_or_default(), plural(exposed_devices as usize, "device"), format!("{} {}", plural(expiring.len(), "carrier contract"), if expiring.len() == 1 { "ends" } else { "end" })));
@@ -218,4 +237,18 @@ async fn leadership(State(svc): State<Shared>, Query(p): Query<HashMap<String, S
         "change": {"completed": done, "rolled_back": back, "kinds": change_kinds, "ahead": ahead},
         "team": {"alerts_day": alerts_day, "loose": loose, "grouped": grouped, "agents": agents, "right": right, "judged": judged, "actions": actions},
         "report": report.join("\n")}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::objectives_line;
+
+    #[test]
+    fn the_objectives_say_which_window() {
+        let l = objectives_line(12, &[], &["MPLS L3VPN"], 6.0, 30);
+        assert_eq!(l, "Objectives. Measured over the last 6 h of telemetry, all 12 services are inside their objective. Over the 30 days of incidents, 1 service has had more incident minutes than its objective allows (MPLS L3VPN).");
+        let l = objectives_line(12, &["Recursive DNS", "Wavelength Transport"], &[], 5.5, 7);
+        assert!(l.starts_with("Objectives. Measured over the last 5.5 h of telemetry, 2 of 12 services are below their objective (Recursive DNS, Wavelength Transport)."), "{l}");
+        assert!(l.ends_with("Over the 7 days of incidents, no service has had more incident minutes than its objective allows."), "{l}");
+    }
 }

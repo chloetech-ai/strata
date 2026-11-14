@@ -276,11 +276,15 @@ fn rates(then: Option<&(u64, HashMap<String, Look>)>, table: &str, cur: &Look, s
 /// shards are, how far each copy is behind, and how much each table grew
 /// over a day and a week (the log store's hourly `tables` rows). No
 /// document is sampled; each table is one call to each copy. Kept
-/// [`TABLES_EVERY`].
+/// [`TABLES_EVERY`], unless a table was made or dropped since (ONB-11: a
+/// table made after the server started is not missing for 30 s).
 pub async fn tables(svc: &Arc<Service>) -> Result<Json, ApiError> {
     let mut kept = svc.tables_kept.lock().await;
     if let Some((at, j)) = kept.as_ref() {
-        if at.elapsed() < TABLES_EVERY {
+        let catalog = svc.catalog();
+        let known: std::collections::BTreeSet<&str> = catalog.iter().filter(|t| !t.is_placeholder()).map(|t| t.table.as_str()).collect();
+        let had: std::collections::BTreeSet<&str> = j["tables"].as_array().into_iter().flatten().filter_map(|t| t["table"].as_str()).collect();
+        if at.elapsed() < TABLES_EVERY && known == had {
             return Ok(j.clone());
         }
     }

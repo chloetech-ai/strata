@@ -2,7 +2,7 @@
 """Turn a scheduled workflow run on main into an issue that someone sees.
 
 Run by .github/workflows/nightly-report.yml after a nightly run of CI, Chaos,
-Fuzz, Supply chain, Perf or Docs URLs completes. One open issue per workflow, titled
+Fuzz, Supply chain, Perf, Docs URLs or Demos completes. One open issue per workflow, titled
 "Nightly <workflow> is failing on main" and labelled `nightly-failure`:
 
 - a failed run opens it, or comments on it when it is already open, with the

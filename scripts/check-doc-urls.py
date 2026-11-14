@@ -19,16 +19,27 @@ checks, over the network, each of:
 - `brew install <owner>/<tap>/<formula>`: the tap's repository has the formula;
 - `pip install chloedb[extras]`: PyPI's newest chloedb is the latest release
   the docs name, and has those extras;
+- `npm install chloedb` (or bun, pnpm, yarn): npm's chloedb is the latest
+  release, and so is each platform's addon package, @chloedb/<platform>;
+- `cargo add chloedb`, or `chloedb = "..."` in a Cargo.toml block: crates.io's
+  newest chloedb is the latest release;
 - the latest release named by docs/site/versions.json: its server, Python and
   JavaScript releases exist, PyPI has it, and so does the image.
 
     python3 scripts/check-doc-urls.py           # check, exit 1 if anything is missing
     python3 scripts/check-doc-urls.py --list    # what would be checked, and from where
+    python3 scripts/check-doc-urls.py --version 0.3.4 --drafts
+
+`--version` checks against that release instead of versions.json's, and
+`--drafts` counts a draft release as there (it sees drafts only with a token
+that can push to the repository): release-publish.yml runs it that way as
+the gate a release's drafts pass before they are published, and moves
+versions.json afterwards.
 
 GH_TOKEN or GITHUB_TOKEN, when set, is sent to api.github.com only (for its
-rate limit). The workflow Docs URLs (.github/workflows/docs-urls.yml) runs
-this when docs change on main, after each release workflow, every night,
-and by hand.
+rate limit, and to see drafts). The workflow Docs URLs
+(.github/workflows/docs-urls.yml) runs this when docs change on main, after
+each release is published, every night, and by hand.
 """
 import argparse
 import html
@@ -44,8 +55,13 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO = "chloetech-ai/chloedb"
 PLATFORMS = ["linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64"]
-INSTALL_WITH = {"crawl": "chloedb-crawl", "sheets": "chloedb-sheets", "ctx": "chloectx",
-                "chloedb-crawl": "chloedb-crawl", "chloedb-sheets": "chloedb-sheets", "chloectx": "chloectx"}
+INSTALL_WITH = {"crawl": "chloedb-crawl", "sheets": "chloedb-sheets", "ctx": "chloectx", "netops": "chloedb-netops",
+                "chloedb-crawl": "chloedb-crawl", "chloedb-sheets": "chloedb-sheets", "chloectx": "chloectx",
+                "chloedb-netops": "chloedb-netops"}
+# What `--with all` installs (docs/install.sh).
+WITH_ALL = ["chloedb-crawl", "chloedb-sheets", "chloectx"]
+# The platforms of the npm addon packages, @chloedb/<platform> (chloedb-js/scripts/pack.mjs).
+NPM_PLATFORMS = ["linux-x64-gnu", "linux-arm64-gnu", "darwin-arm64", "darwin-x64"]
 UA = "chloedb-doc-url-check"
 TIMEOUT = 30
 
@@ -95,6 +111,8 @@ IMAGE = re.compile(r"\bghcr\.io/([\w.-]+/[\w.-]+)(?::([\w][\w.-]*))?")
 BREW = re.compile(r"\bbrew install (?:--\S+ )*([\w-]+)/([\w-]+)/([\w@.+-]+)")
 PIP = re.compile(r"\bpip3? install (?:-U |--upgrade |-q )*[\"']?chloedb(?:\[([\w,-]+)\])?(?:==([\w.]+))?[\"']?(?=[\s;|&]|$)", re.M)
 INSTALLER = re.compile(r"install\.sh\b[^\n]*?--with[ =]([\w,-]+)")
+NPM = re.compile(r"\b(?:npm (?:install|i|add)|pnpm add|yarn add|bun add) (?:-\S+ )*chloedb(?:@([\w.]+))?(?=[\s;|&]|$)", re.M)
+CARGO = re.compile(r"\bcargo add (?:-\S+ )*chloedb(?:@([\w.]+))?(?=[\s;|&]|$)|^chloedb = (?:\"([\w.^~=]+)\"|\{[^\n}]*\bversion = \"([\w.^~=]+)\")", re.M)
 
 
 def unresolved(s):
@@ -145,6 +163,10 @@ def find(files):
             for m in PIP.finditer(text):
                 extras = tuple(sorted(x for x in (m.group(1) or "").split(",") if x))
                 add(("pypi", extras, m.group(2) or ""), at(m))
+            for m in NPM.finditer(text):
+                add(("npm", m.group(1) or ""), at(m))
+            for m in CARGO.finditer(text):
+                add(("crate", (m.group(1) or m.group(2) or m.group(3) or "").lstrip("^~=")), at(m))
             for m in INSTALLER.finditer(text):
                 for w in m.group(1).split(","):
                     add(("with", w), at(m))
@@ -154,9 +176,11 @@ def find(files):
 
 
 class Net:
-    def __init__(self):
+    def __init__(self, drafts=False):
         self.token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        self.drafts = drafts
         self.cache = {}
+        self.draft_tags = set()
 
     def get(self, url, headers=None, method="GET"):
         """(status, body bytes or None)."""
@@ -185,13 +209,49 @@ class Net:
         return None if status == 404 else {"__error__": status, "__body__": (body or b"").decode(errors="replace")[:200]}
 
     def release(self, repo, tag):
-        """The release's asset names, None if there is no such release."""
+        """The release's asset names, None if there is no such release. With
+        drafts, a draft release of the tag counts (GitHub's tag endpoint
+        shows published releases only; its list shows drafts too, to a token
+        that can push)."""
         r = self.json(f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(tag)}")
+        if r is None and self.drafts:
+            r = next((d for d in self.draft_releases(repo) if d.get("tag_name") == tag), None)
+            if r is not None:
+                self.draft_tags.add(tag)
         if r is None:
             return None
         if "__error__" in r:
             raise RuntimeError(f"api.github.com: HTTP {r['__error__']} for release {tag} {r['__body__']}")
         return {a["name"] for a in r.get("assets", [])}
+
+    def draft_releases(self, repo):
+        out = []
+        for page in range(1, 4):
+            r = self.json(f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}")
+            if r is None or isinstance(r, dict):
+                if isinstance(r, dict) and "__error__" in r:
+                    raise RuntimeError(f"api.github.com: HTTP {r['__error__']} listing releases {r['__body__']}")
+                break
+            out += [d for d in r if d.get("draft")]
+            if len(r) < 100:
+                break
+        return out
+
+    def npm(self, name, version):
+        """The version of the package npm has (`latest` when version is empty), or None."""
+        url = f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='@')}/{version or 'latest'}"
+        r = self.json(url, {"Accept": "application/json"})
+        if not r or "__error__" in r:
+            return None
+        return r.get("version")
+
+    def crate(self, name):
+        """crates.io's newest version of the crate, or None."""
+        r = self.json(f"https://crates.io/api/v1/crates/{name}", {"Accept": "application/json"})
+        if not r or "__error__" in r:
+            return None
+        c = r.get("crate", {})
+        return c.get("max_stable_version") or c.get("max_version")
 
     def image(self, name, tag):
         tok = self.json(f"https://ghcr.io/token?scope=repository:{name}:pull")
@@ -212,31 +272,39 @@ class Net:
         return self.json(url, {"Accept": "application/json"})
 
 
+def _ver(v):
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.+-]", v))
+
+
 def latest_release():
     return json.loads((ROOT / "docs" / "site" / "versions.json").read_text())["latest"]
 
 
-def check(found, net):
+def check(found, net, latest=None):
     """Yields (ok, what, where)."""
-    latest = latest_release()
+    latest = latest or latest_release()
     server_tag = f"chloedb-server-v{latest}"
-    vj = ["docs/site/versions.json"]
+    given = latest != latest_release()
+    vj = ["--version"] if given else ["docs/site/versions.json"]
 
     for tag in (server_tag, f"chloedb-py-v{latest}", f"chloedb-js-v{latest}"):
-        yield net.release(REPO, tag) is not None, f"release {tag} (the latest release, says versions.json)", vj
+        drafts = " or its draft" if net.drafts else ""
+        yield net.release(REPO, tag) is not None, (f"release {tag}{drafts} (the release checked)" if given else
+                                                   f"release {tag}{drafts} (the latest release, says versions.json)"), vj
 
     # The installer, and the programs pages install with it, on every platform.
     wanted = {w for (kind, *rest) in found if kind == "with" for w in rest}
     if wanted:
         progs = ["chloedb-server"]
         for w in sorted(wanted - {"server"}):
-            for p in (["chloedb-crawl", "chloedb-sheets", "chloectx"] if w == "all" else [INSTALL_WITH.get(w, w)]):
+            for p in (WITH_ALL if w == "all" else [INSTALL_WITH.get(w, w)]):
                 if p not in progs:
                     progs.append(p)
         assets = net.release(REPO, server_tag) or set()
         for prog in progs:
             where = sorted({x for (kind, *rest), ws in found.items() if kind == "with" for x in ws
-                            if prog == "chloedb-server" or INSTALL_WITH.get(rest[0]) == prog or rest[0] == "all"})
+                            if prog == "chloedb-server" or INSTALL_WITH.get(rest[0]) == prog
+                            or (rest[0] == "all" and prog in WITH_ALL)})
             missing = [f"{prog}-{p}.tar.gz{s}" for p in PLATFORMS for s in ("", ".sha256")
                        if f"{prog}-{p}.tar.gz{s}" not in assets]
             yield not missing, (f"install.sh installs {prog} {latest} on every platform"
@@ -274,6 +342,26 @@ def check(found, net):
             if extras:
                 yield not missing, (f"chloedb {have} on PyPI has the extras [{','.join(extras)}]"
                                     + (f": no {', '.join(missing)}" if missing else "")), where
+        elif kind == "npm":
+            # `npm install chloedb` takes npm's latest, and the addon of the
+            # machine from @chloedb/<platform> at the same version: npm skips
+            # an optional dependency it cannot find, and the import fails.
+            _, pinned = key
+            want = pinned or latest
+            have = net.npm("chloedb", pinned)
+            yield have == want, (f"npm install chloedb{'@' + pinned if pinned else ''} gives "
+                                 + (have or "nothing (npm has no such version)")
+                                 + ("" if pinned else f", the latest release the docs name is {latest}")), where
+            for p in NPM_PLATFORMS:
+                yield net.npm(f"@chloedb/{p}", want) == want, f"npm has @chloedb/{p}@{want}, the addon chloedb {want} loads there", where
+        elif kind == "crate":
+            _, pinned = key
+            have = net.crate("chloedb")
+            want = pinned or latest
+            # A requirement "0.3" is met by 0.3.x; "0.3.4" by 0.3.4 and later 0.3s.
+            ok = bool(have) and (have == want or (have.startswith(want + ".") if want.count(".") < 2 else
+                                                  _ver(have)[:2] == _ver(want)[:2] and _ver(have) >= _ver(want)))
+            yield ok, f"crates.io's chloedb is {have or 'missing'}, the docs ask for {want}", where
 
     # The image of the latest release (a version tag is pushed by image.yml).
     if any(k[0] == "image" and k[1] == "chloetech-ai/chloedb-server" for k in found):
@@ -283,23 +371,30 @@ def check(found, net):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--list", action="store_true", help="list what would be checked, without the network")
+    ap.add_argument("--version", help="the release to check against (0.3.4), instead of docs/site/versions.json's latest")
+    ap.add_argument("--drafts", action="store_true",
+                    help="a draft release counts as there (needs a token that can push, in GH_TOKEN)")
     args = ap.parse_args()
+    latest = (args.version or latest_release()).removeprefix("v")
     found = find(doc_files())
     if args.list:
-        print(f"latest release (docs/site/versions.json): {latest_release()}")
+        print(f"latest release ({'--version' if args.version else 'docs/site/versions.json'}): {latest}")
         for key, where in sorted(found.items()):
             print(" ".join(str(k) for k in key), "  <-", ", ".join(where))
         return 0
-    net = Net()
+    net = Net(drafts=args.drafts)
     bad = 0
     try:
-        for ok, what, where in check(found, net):
+        for ok, what, where in check(found, net, latest):
             print(("ok    " if ok else "FAIL  ") + what + ("" if ok else "\n      named in " + ", ".join(where)))
             bad += not ok
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    print(f"{bad} missing" if bad else "everything the docs install exists")
+    if net.draft_tags:
+        print("drafts (not public yet): " + ", ".join(sorted(net.draft_tags)))
+    print(f"{bad} missing" if bad else "everything the docs install exists"
+          + (" (counting the drafts)" if net.draft_tags else ""))
     return 1 if bad else 0
 
 

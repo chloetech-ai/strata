@@ -282,7 +282,7 @@ async fn rollups_over_http() {
     assert_eq!(r["columns"], json!(["rollup", "made", "filled", "buckets_folded", "rows_written", "note"]), "{r}");
     assert_eq!((r["rows"][0][1].as_bool(), r["rows"][0][2].as_bool(), r["rows"][0][3].as_i64()), (Some(true), Some(true), Some(2)), "{r}");
     let s = svc.clone();
-    assert_eq!(tokio::task::spawn_blocking(move || s.refresh_rollups_due(false)).await.unwrap().unwrap(), 0);
+    assert_eq!(tokio::task::spawn_blocking(move || s.refresh_rollups_due(false)).await.unwrap().unwrap().iter().map(|(_, r)| r.as_ref().unwrap().folded).sum::<u64>(), 0);
     let (status, r) = post(&c, &format!("{base}/v1/sql"), sql("CREATE ROLLUP IF NOT EXISTS logs_5m ON logs AS SELECT date_bin('5 minutes', ts), service, COUNT(*), SUM(latency)")).await;
     assert_eq!((status, r["rows"][0][1].as_bool()), (200, Some(false)), "{r}");
     let read = "SELECT bucket, service, count, sum_latency FROM logs_5m ORDER BY bucket, service";
@@ -300,9 +300,18 @@ async fn rollups_over_http() {
     let (status, _) = post(&c, &format!("{base}/v1/sql"), sql("INSERT INTO logs (ts, service, latency) VALUES ('2026-11-01T10:06:00Z', 'b', 1)")).await;
     assert_eq!(status, 200);
     let s = svc.clone();
-    assert_eq!(tokio::task::spawn_blocking(move || s.refresh_rollups_due(false)).await.unwrap().unwrap(), 1);
+    assert_eq!(tokio::task::spawn_blocking(move || s.refresh_rollups_due(false)).await.unwrap().unwrap().iter().map(|(_, r)| r.as_ref().unwrap().folded).sum::<u64>(), 1);
     let (_, r) = post(&c, &format!("{base}/v1/query"), sql(read)).await;
     assert_eq!(r["rows"][1][2].as_i64(), Some(2), "{r}");
+    // The rollup's table says what it reads and how its refreshes went.
+    let t: Json = c.get(format!("{base}/v1/tables")).send().await.unwrap().json().await.unwrap();
+    let roll = t["tables"].as_array().unwrap().iter().find(|t| t["table"] == "logs_5m").unwrap()["rollup"].clone();
+    assert!(roll["of"] == "logs" && roll["experimental"] == true && roll["last_refresh"].is_string() && roll["last_error"].is_null(), "{roll}");
+    let logs = t["tables"].as_array().unwrap().iter().find(|t| t["table"] == "logs").unwrap()["rollup"].clone();
+    assert!(logs.is_null(), "{logs}");
+    // Its table may not go while the rollup reads it.
+    let (status, r) = post(&c, &format!("{base}/v1/sql"), sql("DROP TABLE logs")).await;
+    assert!(status == 400 && r.to_string().contains("read by rollup logs_5m"), "{status} {r}");
     let (status, r) = post(&c, &format!("{base}/v1/sql"), sql("DROP ROLLUP logs_5m")).await;
     assert_eq!(status, 200, "{r}");
     let (status, _) = post(&c, &format!("{base}/v1/query"), sql(read)).await;

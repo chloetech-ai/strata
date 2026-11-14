@@ -87,8 +87,10 @@ jobs:
   # header lists the rules). A change to the documentation site, Markdown
   # files or benchmark results alone runs nothing; one only under an app or
   # a package (chloectx, chloedb-crawl, chloedb-sheets, chloedb-apps,
-  # chloedb-swarm, chloedb-py, chloedb-js, chloedb-java) runs that one's
-  # jobs and the jobs that use it; anything else (ChloeDB, chloedb-server,
+  # chloedb-py, chloedb-js, chloedb-java) runs that one's jobs and the jobs
+  # that use it; one only under a demo (chloedb-netops, chloedb-swarm,
+  # examples/feature-store, examples/parley) runs nothing here, since the
+  # demos are tested by demos.yml; anything else (ChloeDB, chloedb-server,
   # the workflows, the scripts, a file at the root) runs everything. The
   # nightly run and a run by hand always run everything.
   changes:
@@ -256,12 +258,12 @@ jobs:
         crate: ${{ fromJSON(needs.changes.outputs.run).crates }}
     # chloedb-server's and ChloeDB's tests, the longest jobs, run on the
     # on-demand runner when it is up (job `runner`).
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && (matrix.crate == 'chloedb-server' || matrix.crate == 'chloedb') && needs.runner.outputs.label || matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && (matrix.crate == 'chloedb-server' || matrix.crate == 'chloedb') && needs.runner.outputs.label || (matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os) }}
     # rust-cache saves only from a job that passed, so a macOS job that ran
     # out of time starts the next one cold too: chloedb-server's tests took
     # 59 minutes from a cold build on the macOS runner on 11-08, and Clippy
     # after them did not fit in 60.
-    timeout-minutes: ${{ matrix.os == 'macos-latest' && 90 || 60 }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && (vars.MAC_RUNNER && 150 || 90) || 60 }}
     env: &test-env
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.crate == 'chloedb' && '-C target-cpu=x86-64-v3' || '' }}
       # On Linux, GitHub's runners and the on-demand one have Postgres, and
@@ -348,6 +350,14 @@ jobs:
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --locked --release --all-targets ${{ matrix.crate == 'chloedb' && '--features sqlite' || '' }} -- -A clippy::style -A clippy::complexity -A clippy::perf -D warnings
 
+  # The macOS jobs run on the user's Mac (self-hosted runners labelled
+  # `chloedb-mac`) when the repository variable MAC_RUNNER names that
+  # label; unset, they run on macos-latest. macOS jobs run only on a push
+  # to main, the nightly run and by hand, never on a pull request, so no
+  # outside code reaches the Mac. Unset the variable to switch back. The
+  # Mac runs two jobs at once beside its owner's work, so its jobs get
+  # twice the time (fault injection ran past 60 minutes there on 11-14).
+  #
   # ChloeDB's tests on macOS for a push to main: the `test` job's steps, in
   # a job of its own that CI result does not wait for (see the top of this
   # file). A pull request and the merge queue skip it. In the nightly run
@@ -360,8 +370,8 @@ jobs:
       matrix:
         os: [macos-latest]
         crate: [chloedb]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     env: *test-env
     steps: *test-steps
 
@@ -532,8 +542,8 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
     steps:
@@ -695,7 +705,6 @@ jobs:
             chloedb-server
             chloedb-crawl
             chloedb-sheets
-            chloedb-netops
             chloectx
           key: chloedb-server-smoke
       # chloedb-server's binary from job server-bin.
@@ -758,17 +767,9 @@ jobs:
           CHLOEDB_SERVER_BIN: ${{ github.workspace }}/chloedb-server/target/release/chloedb-server
           CHLOEDB_SHEETS_NEED_SERVER: "1"
         run: cargo test --locked --profile ci --test cluster
-      # The network operations app on a server of this build: its 31
-      # tables, the topology found from logs, each of the simulator's six
-      # faults diagnosed and checked against its answer key, an action
-      # approved, and the same network read back after a restart.
-      - name: Network operations on a server
-        if: fromJSON(needs.changes.outputs.run).smoke_netops
-        working-directory: chloedb-netops
-        env:
-          CHLOEDB_SERVER_BIN: ${{ github.workspace }}/chloedb-server/target/release/chloedb-server
-          CHLOEDB_NETOPS_NEED_SERVER: "1"
-        run: cargo test --locked --profile ci --test cluster
+      # The demos (chloedb-netops, chloedb-swarm, examples/feature-store,
+      # examples/parley) are tested on a train of their own, demos.yml,
+      # outside CI result.
       # ChloeCtx as an app of a cluster of this build's servers (two shards
       # and a coordinator): spaces, notes, contexts within a budget, an
       # exchange distilled by a stub model, incidents matched to an alert
@@ -784,7 +785,7 @@ jobs:
       # plans, stored as SQL rows in a server of this build, run, tested and
       # searched; no model is called.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        if: fromJSON(needs.changes.outputs.run).smoke_apps || fromJSON(needs.changes.outputs.run).smoke_swarm
+        if: fromJSON(needs.changes.outputs.run).smoke_apps
         with:
           node-version: "22"
       - name: App engine against a server
@@ -811,18 +812,6 @@ jobs:
           STRATA_APPS_NEED_SERVER: "1"
           STRATA_APPS_TEST_SHARDS: "2"
         run: npm test
-      # Swarm (chloedb-swarm, Node): a run of simulated users with a scripted
-      # model in place of the API, each session in a sandbox server of this
-      # build, its checks, reviews and findings stored in another one.
-      - name: Swarm against a server
-        if: fromJSON(needs.changes.outputs.run).smoke_swarm
-        working-directory: chloedb-swarm
-        env:
-          CHLOEDB_SERVER_BIN: ${{ github.workspace }}/chloedb-server/target/release/chloedb-server
-          CHLOEDB_SWARM_NEED_SERVER: "1"
-        run: |
-          npm ci
-          npm test
 
   python:
     name: Python package on ${{ matrix.os }}
@@ -832,8 +821,8 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -975,8 +964,8 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -1054,8 +1043,8 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER || matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && vars.MAC_RUNNER && 120 || 60 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable

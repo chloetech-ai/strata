@@ -176,7 +176,7 @@ fn pattern(rng: &mut StdRng, vals: &[Option<String>]) -> String {
 
 /// The row evaluator's answer, written out.
 fn reference(pattern: &str, ci: bool, value: &str) -> bool {
-    let fold = |s: &str| if ci { s.to_lowercase() } else { s.to_string() };
+    let fold = |s: &str| if ci { crate::query::ir::eval::fold_case(s) } else { s.to_string() };
     crate::query::ir::eval::like(&fold(value).chars().collect::<Vec<_>>(), &fold(pattern).chars().collect::<Vec<_>>())
 }
 
@@ -221,6 +221,25 @@ fn ilike_finds_the_capitals_the_lowercase_hides() {
     let Plan::Pieces(pieces) = Like::new("%i\u{307}s%", true).plan() else { panic!("pieces") };
     assert_eq!(pieces.len(), 2);
     assert!(pieces[0].units[0].contains(&"İ".as_bytes().to_vec()) && pieces[0].units[0].contains(&b"I".to_vec()));
+}
+
+/// ILIKE folds a character at a time, as PostgreSQL does (finding N-B5):
+/// a capital sigma before a wildcard is the sigma inside a word, and a
+/// capital İ is one character, an i.
+#[test]
+fn ilike_folds_each_character_alone() {
+    for (value, pattern) in [("ΟΔΟΣΑ", "ΟΔΟΣ%"), ("ΟΔΟΣ", "%οσ"), ("ΟΔΟΣ", "%ος"), ("οδος", "ΟΔΟΣ"), ("ΟΔΟΣ ΑΘΗΝΑΣ", "%Σ_Α%"), ("İ", "_"), ("İstanbul", "istanbul")] {
+        assert!(Like::new(pattern, true).matches(value), "{value:?} ILIKE {pattern:?}");
+        assert!(reference(pattern, true, value), "{value:?} ILIKE {pattern:?} by the row evaluator");
+        // The index finds it, and only the values that match.
+        let vals = vec![Some(value.to_string()), Some("ΟΔΟ".to_string()), Some("x".to_string())];
+        let ix = index(&vals, 4, MAX_PART_BYTES);
+        let want: Vec<DocId> = vals.iter().enumerate().filter(|(_, v)| reference(pattern, true, v.as_ref().unwrap())).map(|(d, _)| d as DocId).collect();
+        assert!(want.contains(&0));
+        let got = like::eval(&ix, &Like::new(pattern, true), vals.len() as u32, &mut |d| Ok(vals[d as usize].clone()), 0, &mut Stats::default()).unwrap();
+        assert_eq!(got.to_sorted(), want, "{value:?} ILIKE {pattern:?} from the index");
+    }
+    assert!(!Like::new("ΟΔΟΣ%", false).matches("ΟΔΟσΑ"), "LIKE keeps case");
 }
 
 #[test]

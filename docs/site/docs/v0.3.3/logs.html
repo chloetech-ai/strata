@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Search your logs · ChloeDB docs</title>
+<link rel="icon" href="../../../assets/brand/chloedb-icon.svg" type="image/svg+xml">
+<link rel="icon" href="../../../assets/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="../../../assets/brand/apple-touch-icon.png">
+<meta name="description" content="ChloeDB keeps log lines in an ordinary table and finds them the way an on-call engineer looks at 3 a.m.: any part of a line (an interface name, an IP, an error code) from a substring index, the last 15 minutes with…">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../../assets/docs.css?v=fd8b9d06a7">
+</head>
+<body class="docs">
+<!-- Written by docs/site/scripts/build_docs.py from docs/guide/logs.md: edit that file and run the script, not this page. -->
+<header class="top gutter"><div class="wrap">
+  <a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a>
+  <nav class="nav" aria-label="Site">
+    <a href="../../features.html">Features</a>
+    <a href="../../scale.html">Laptop to cloud</a>
+    <a href="../../command-center.html">Command center</a>
+    <a href="../../benchmarks.html">Benchmarks</a>
+    <a href="../../use-cases.html">Use cases</a>
+  </nav>
+  <div class="top-links"><a href="index.html" aria-current="page">Docs</a><a href="https://github.com/chloetech-ai/chloedb">GitHub</a><a class="btn primary" href="quickstart.html">Get started</a></div>
+</div></header>
+
+<main class="gutter"><div class="wrap doc-layout">
+  <details class="doc-menu" open>
+    <summary>Documentation</summary>
+    <nav class="doc-nav" aria-label="Documentation">
+      <span class="h">Start</span>
+      <a href="index.html">Overview</a>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="concepts.html">Concepts</a>
+      <a href="build-an-app.html">Build an app on the HTTP API</a>
+      <span class="h">Search and SQL</span>
+      <a href="search.html">Search guide</a>
+      <a href="sql.html">SQL reference</a>
+      <a href="graphs.html">Graphs</a>
+      <a href="next-items.html">Next items</a>
+      <a href="slices.html">Search on the device</a>
+      <a href="design.html">How ChloeDB works</a>
+      <span class="h">Cookbook</span>
+      <a href="rag.html">Retrieval for RAG</a>
+      <a href="agent-memory.html">Memory for an agent</a>
+      <a href="crawl-to-search.html">Crawl a site into search</a>
+      <a href="logs.html" aria-current="page">Search your logs</a>
+      <span class="h">Clients</span>
+      <a href="python.html">Python</a>
+      <a href="frames.html">DataFrames</a>
+      <a href="javascript.html">JavaScript</a>
+      <a href="java.html">Java and JDBC</a>
+      <a href="frameworks.html">LangChain, LangGraph, LlamaIndex</a>
+      <a href="frameworks-reference.html">Framework adapters reference</a>
+      <span class="h">Server and cluster</span>
+      <a href="server.html">chloedb-server</a>
+      <a href="runbooks.html">Runbooks</a>
+      <a href="sqlite.html">SQLite in and out</a>
+      <a href="parquet.html">Parquet and S3</a>
+      <a href="postgres.html">Following Postgres</a>
+      <a href="connectors.html">Connectors</a>
+      <a href="opensearch.html">OpenSearch API</a>
+      <a href="compatibility.html">Versions and compatibility</a>
+      <span class="h">Apps</span>
+      <a href="apps.html">Apps on a cluster</a>
+      <a href="crawler.html">Crawler</a>
+      <a href="sheets.html">Sheets</a>
+      <a href="netops.html">Network operations</a>
+      <a href="chloectx.html">ChloeCtx</a>
+      <a href="chloectx-setup.html">Install ChloeCtx</a>
+      <a href="chloectx-inspector.html">ChloeCtx inspector</a>
+      <a href="chloectx-app.html">ChloeCtx on a cluster</a>
+      <a href="chloectx-capsules.html">Context capsules</a>
+      <a href="chloectx-receipts.html">Blame and receipts</a>
+      <a href="app-engine.html">App engine (prototype)</a>
+    </nav>
+  </details>
+  <article class="doc">
+    <div class="doc-head">
+      <span class="eyebrow">Cookbook</span>
+      <h1>Search your logs</h1>
+      <p class="doc-badge tested">Every example on this page runs in CI against the code it documents (<a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/guide/run.py">docs/guide/run.py</a>).</p>
+      <p class="doc-version">These docs describe release 0.3.3. <a href="../../docs/index.html">The docs of main</a> describe the code as it is now.</p>
+    </div>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#a-server">A server</a></li><li><a href="#a-table-for-log-lines">A table for log lines</a></li><li><a href="#a-key-for-the-on-call-engineer-and-the-log-shipper">A key for the on-call engineer and the log shipper</a></li><li><a href="#send-the-lines">Send the lines</a></li><li><a href="#the-first-five-queries-of-an-incident">The first five queries of an incident</a></li><li><a href="#the-log-explorer">The Log explorer</a></li></ol></details>
+    <div class="doc-body">
+
+<p>ChloeDB keeps log lines in an ordinary table and finds them the way an on-call engineer looks at 3 a.m.: any part of a line (an interface name, an IP, an error code) from a substring index, the last 15 minutes with <code>now() - INTERVAL '15 minutes'</code>, counts per host and minute with <code>time_bucket</code>. This page starts a server, makes a table for syslog, a key that may only write and read those tables, sends lines to it, and runs the first five queries of an incident. The command center's <strong>Log explorer</strong> does the same with a search box.</p>
+<p>You need <code>chloedb-server</code> on your <code>PATH</code> (<a href="quickstart.html">install</a>), and <code>curl</code> and <code>python3</code>.</p>
+<h2 id="a-server">A server<a class="anchor" href="#a-server" aria-label="Link to this section">#</a></h2>
+<pre data-lang="sh">chloedb-server --db ./logs.chloedb --listen 127.0.0.1:7700 --grpc off &gt; server.log 2&gt;&amp;1 &amp;
+until curl -sf http://127.0.0.1:7700/v1/health &gt; /dev/null; do sleep 0.2; done</pre>
+<p>A server with no token and no key is open to anything on this machine. Its first key, an admin key, closes it; keep that one for yourself:</p>
+<pre data-lang="sh">export ADMIN_KEY=$(curl -s -X POST localhost:7700/v1/admin/keys -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;name&quot;: &quot;admin&quot;, &quot;scope&quot;: &quot;admin&quot;}&#x27; | python3 -c &#x27;import json, sys; print(json.load(sys.stdin)[&quot;secret&quot;])&#x27;)</pre>
+<h2 id="a-table-for-log-lines">A table for log lines<a class="anchor" href="#a-table-for-log-lines" aria-label="Link to this section">#</a></h2>
+<p>A log table is any table with a <code>TIMESTAMP</code> and a text column. This one names its columns as OpenTelemetry does (<code>ts</code>, <code>severity</code>, <code>host</code>, <code>service</code>, <code>body</code>, <code>attributes</code>), so that the OpenTelemetry Collector and a JSON lines import both fill it. <code>substring = true</code> gives <code>host</code> and <code>body</code> a <a href="sql.html#substrings-like-and-ilike-anywhere-in-a-value">substring index</a>, which answers <code>LIKE</code> and <code>ILIKE</code> with <code>%</code> anywhere (<code>'%GigabitEthernet0/1%'</code>, <code>'%10.0.12.2%'</code>) from the index rather than by reading every line. <code>retain</code> drops lines older than 30 days. A log line has no key, so the table has none.</p>
+<pre data-lang="sql" data-title="logs_syslog.sql">CREATE TABLE logs_syslog (
+  ts TIMESTAMP NOT NULL,
+  severity KEYWORD,
+  host KEYWORD OPTIONS(substring = true),
+  service KEYWORD,
+  body TEXT OPTIONS(substring = true),
+  attributes JSON
+) OPTIONS(retain = &#x27;30 days&#x27;, compression = &#x27;zstd&#x27;)</pre>
+<p>Making a table takes an admin key:</p>
+<pre data-lang="sh">python3 -c &#x27;import json; print(json.dumps({&quot;sql&quot;: open(&quot;logs_syslog.sql&quot;).read()}))&#x27; \
+| curl -s localhost:7700/v1/sql -H &quot;authorization: Bearer $ADMIN_KEY&quot; -H &#x27;content-type: application/json&#x27; -d @- \
+| python3 -c &#x27;import json, sys; print(json.load(sys.stdin).get(&quot;error&quot;, &quot;made&quot;))&#x27;</pre>
+<pre data-lang="text" data-title="Output" class="output">made</pre>
+<h2 id="a-key-for-the-on-call-engineer-and-the-log-shipper">A key for the on-call engineer and the log shipper<a class="anchor" href="#a-key-for-the-on-call-engineer-and-the-log-shipper" aria-label="Link to this section">#</a></h2>
+<p>The <code>oncall</code> preset makes a key <a href="server.html#security">limited to tables</a>: it writes and reads the tables its prefix names (rows, imports and OpenTelemetry logs alike), writes notes into its <a href="chloectx-app.html">ChloeCtx</a> spaces <code>ctx_logs_*</code>, and reads the fleet's health, events, alerts and metrics. It cannot read other tables or change the server.</p>
+<pre data-lang="sh">export CHLOEDB_LOGS_KEY=$(curl -s -X POST localhost:7700/v1/admin/keys -H &quot;authorization: Bearer $ADMIN_KEY&quot; \
+  -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;name&quot;: &quot;netops&quot;, &quot;preset&quot;: &quot;oncall&quot;, &quot;prefix&quot;: &quot;logs_*&quot;}&#x27; \
+  | python3 -c &#x27;import json, sys; print(json.load(sys.stdin)[&quot;secret&quot;])&#x27;)
+curl -s localhost:7700/v1/whoami -H &quot;authorization: Bearer $CHLOEDB_LOGS_KEY&quot; \
+  | python3 -c &#x27;import json, sys; w = json.load(sys.stdin); print(w[&quot;name&quot;], w.get(&quot;preset&quot;), w[&quot;tables&quot;])&#x27;</pre>
+<pre data-lang="text" data-title="Output" class="output">netops oncall {&#x27;ctx_incidents&#x27;: &#x27;read&#x27;, &#x27;ctx_logs_*&#x27;: &#x27;write&#x27;, &#x27;logs_*&#x27;: &#x27;write&#x27;}</pre>
+<h2 id="send-the-lines">Send the lines<a class="anchor" href="#send-the-lines" aria-label="Link to this section">#</a></h2>
+<h3 id="from-an-opentelemetry-collector">From an OpenTelemetry Collector<a class="anchor" href="#from-an-opentelemetry-collector" aria-label="Link to this section">#</a></h3>
+<p><code>POST /v1/logs</code> takes OTLP over HTTP (protobuf or JSON, gzip or not), the protocol every OpenTelemetry SDK and the Collector export; <code>?table=</code> names the table, and a table that does not exist is made with <a href="server.html#opentelemetry-logs">OTLP's columns</a>. This Collector listens for syslog on UDP port 5514 and for OTLP from your applications, and sends both to <code>logs_syslog</code> with the key above in its environment (<code>otelcol-contrib --config collector.yaml</code>):</p>
+<pre data-lang="yaml">receivers:
+  syslog:
+    udp:
+      listen_address: 0.0.0.0:5514
+    protocol: rfc3164
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+
+exporters:
+  otlphttp/chloedb:
+    logs_endpoint: http://127.0.0.1:7700/v1/logs?table=logs_syslog
+    encoding: json
+    headers:
+      Authorization: Bearer ${env:CHLOEDB_LOGS_KEY}
+
+service:
+  pipelines:
+    logs:
+      receivers: [syslog, otlp]
+      processors: [batch]
+      exporters: [otlphttp/chloedb]</pre>
+<p>A Collector retries an export that failed, and a row has no key to tell a retry from a new line, so a retried export can leave a line twice.</p>
+<p>What the Collector sends is OTLP JSON, which <code>curl</code> can send too:</p>
+<pre data-lang="sh">now=$(python3 -c &#x27;import time; print(time.time_ns())&#x27;)
+curl -s &quot;localhost:7700/v1/logs?table=logs_syslog&quot; -H &quot;authorization: Bearer $CHLOEDB_LOGS_KEY&quot; \
+  -H &#x27;content-type: application/json&#x27; -d &#x27;{&quot;resourceLogs&quot;: [{
+    &quot;resource&quot;: {&quot;attributes&quot;: [{&quot;key&quot;: &quot;host.name&quot;, &quot;value&quot;: {&quot;stringValue&quot;: &quot;edge-sw-11&quot;}}]},
+    &quot;scopeLogs&quot;: [{&quot;logRecords&quot;: [{&quot;timeUnixNano&quot;: &quot;&#x27;$now&#x27;&quot;, &quot;severityText&quot;: &quot;WARN&quot;,
+      &quot;body&quot;: {&quot;stringValue&quot;: &quot;%STORM_CONTROL-3-FILTERED: A packet storm was detected on Gi1/0/7&quot;}}]}]}]}&#x27;
+echo</pre>
+<pre data-lang="text" data-title="Output" class="output">{}</pre>
+<p>An empty answer is OTLP's success: no record was refused (one refused is counted in <code>partialSuccess</code>).</p>
+<h3 id="from-a-file-json-lines">From a file: JSON lines<a class="anchor" href="#from-a-file-json-lines" aria-label="Link to this section">#</a></h3>
+<p><code>POST /v1/import?format=jsonl</code> takes one JSON object a line, with the table's columns. This script writes an hour of lines from five routers and switches, with an incident in its last ten minutes: <code>GigabitEthernet0/1</code> on <code>core-rtr-02</code> going down and up, its BGP session to 10.0.12.2 dropping each time, and OSPF on <code>core-rtr-03</code> losing the same neighbour.</p>
+<pre data-lang="python" data-title="make_logs.py">import json
+from datetime import datetime, timedelta, timezone
+
+now = datetime.now(timezone.utc)
+at = lambda s: (now - timedelta(seconds=s)).isoformat().replace(&quot;+00:00&quot;, &quot;Z&quot;)
+hosts = [&quot;core-rtr-01&quot;, &quot;core-rtr-02&quot;, &quot;core-rtr-03&quot;, &quot;edge-sw-11&quot;, &quot;fw-01&quot;]
+normal = [
+    (&quot;info&quot;, &quot;%SYS-5-CONFIG_I&quot;, &quot;Configured from console by admin on vty0 (192.168.{a}.{b})&quot;),
+    (&quot;info&quot;, &quot;%SEC-6-IPACCESSLOGP&quot;, &quot;list OUTSIDE permitted tcp 192.168.{a}.{b}(5{a}{b}) -&gt; 10.0.0.{a}(443), 1 packet&quot;),
+    (&quot;debug&quot;, &quot;%OSPF-7-HELLO&quot;, &quot;hello from 192.168.{a}.{b} on GigabitEthernet0/{a}&quot;),
+    (&quot;warn&quot;, &quot;%SYS-4-CPUHOG&quot;, &quot;Task is running for ({b}00)msecs, more than (2000)msecs&quot;),
+    (&quot;info&quot;, &quot;%DHCPD-6-ADDRESS_ASSIGN&quot;, &quot;Interface Vlan1{a} assigned DHCP address 192.168.{a}.{b}, mask 255.255.255.0&quot;),
+]
+lines = []
+for i in range(600):  # one line every 6 seconds for an hour
+    sev, mn, text = normal[i % 5]
+    host = hosts[i % 4] if i % 50 != 25 else &quot;fw-01&quot;
+    if i % 50 == 25:
+        sev, mn, text = &quot;error&quot;, &quot;%FW-3-DENY&quot;, &quot;Deny tcp src outside:203.0.113.{b}/4{a}{b} dst inside:10.0.0.{a}/22&quot;
+    lines.append({&quot;ts&quot;: at(i * 6 + 3), &quot;severity&quot;: sev, &quot;host&quot;: host, &quot;service&quot;: &quot;syslog&quot;,
+                  &quot;body&quot;: f&quot;{mn}: &quot; + text.format(a=i % 7, b=10 + i % 89), &quot;attributes&quot;: {&quot;mnemonic&quot;: mn}})
+for k in range(12):  # the flap: down and up every 50 seconds, the last ten minutes
+    down = 590 - k * 50
+    lines.append({&quot;ts&quot;: at(down), &quot;severity&quot;: &quot;error&quot;, &quot;host&quot;: &quot;core-rtr-02&quot;, &quot;service&quot;: &quot;syslog&quot;,
+                  &quot;body&quot;: &quot;%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to down&quot;,
+                  &quot;attributes&quot;: {&quot;mnemonic&quot;: &quot;%LINK-3-UPDOWN&quot;, &quot;iface&quot;: &quot;Gi0/1&quot;}})
+    lines.append({&quot;ts&quot;: at(down - 2), &quot;severity&quot;: &quot;error&quot;, &quot;host&quot;: &quot;core-rtr-02&quot;, &quot;service&quot;: &quot;syslog&quot;,
+                  &quot;body&quot;: &quot;%BGP-3-NOTIFICATION: sent to neighbor 10.0.12.2 4/0 (hold time expired) 0 bytes&quot;,
+                  &quot;attributes&quot;: {&quot;mnemonic&quot;: &quot;%BGP-3-NOTIFICATION&quot;, &quot;peer&quot;: &quot;10.0.12.2&quot;}})
+    lines.append({&quot;ts&quot;: at(down - 3), &quot;severity&quot;: &quot;warn&quot;, &quot;host&quot;: &quot;core-rtr-03&quot;, &quot;service&quot;: &quot;syslog&quot;,
+                  &quot;body&quot;: &quot;%OSPF-5-ADJCHG: Process 1, Nbr 10.0.12.2 on GigabitEthernet0/2 from FULL to DOWN, Neighbor Down: Dead timer expired&quot;,
+                  &quot;attributes&quot;: {&quot;mnemonic&quot;: &quot;%OSPF-5-ADJCHG&quot;, &quot;iface&quot;: &quot;Gi0/2&quot;}})
+    lines.append({&quot;ts&quot;: at(down - 25), &quot;severity&quot;: &quot;notice&quot;, &quot;host&quot;: &quot;core-rtr-02&quot;, &quot;service&quot;: &quot;syslog&quot;,
+                  &quot;body&quot;: &quot;%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up&quot;,
+                  &quot;attributes&quot;: {&quot;mnemonic&quot;: &quot;%LINK-3-UPDOWN&quot;, &quot;iface&quot;: &quot;Gi0/1&quot;}})
+with open(&quot;syslog.jsonl&quot;, &quot;w&quot;) as f:
+    f.writelines(json.dumps(x) + &quot;\n&quot; for x in lines)
+print(len(lines), &quot;lines&quot;)</pre>
+<pre data-lang="sh">python3 make_logs.py
+curl -s &quot;localhost:7700/v1/import?table=logs_syslog&amp;format=jsonl&quot; -H &quot;authorization: Bearer $CHLOEDB_LOGS_KEY&quot; \
+  -H &#x27;content-type: application/x-ndjson&#x27; --data-binary @syslog.jsonl
+echo</pre>
+<pre data-lang="text" data-title="Output" class="output">648 lines
+{&quot;receipt&quot;:{&quot;collapsed&quot;:0,&quot;deleted&quot;:0,&quot;inserted&quot;:648,...</pre>
+<p>The same call imports lines from a script or a cron job: <code>printf '%s\n' '{"ts": "...", "host": "...", "body": "..."}' | curl ... --data-binary @-</code>.</p>
+<h2 id="the-first-five-queries-of-an-incident">The first five queries of an incident<a class="anchor" href="#the-first-five-queries-of-an-incident" aria-label="Link to this section">#</a></h2>
+<p>Every query here runs with the on-call key, through <code>POST /v1/sql</code>. This shell function sends one and prints its rows:</p>
+<pre data-lang="sh">sql() {
+  python3 -c &#x27;import json, sys; print(json.dumps({&quot;sql&quot;: sys.argv[1]}))&#x27; &quot;$1&quot; \
+  | curl -s localhost:7700/v1/sql -H &quot;authorization: Bearer $CHLOEDB_LOGS_KEY&quot; -H &#x27;content-type: application/json&#x27; -d @- \
+  | python3 -c &#x27;
+import json, sys
+j = json.load(sys.stdin)
+if &quot;error&quot; in j: sys.exit(j[&quot;error&quot;])
+print(&quot; | &quot;.join(j[&quot;columns&quot;]))
+for r in j[&quot;rows&quot;]: print(&quot; | &quot;.join(&quot;&quot; if v is None else str(v) for v in r))&#x27;
+}</pre>
+<p><strong>1. What failed in the last 15 minutes, and where.</strong> <code>now() - INTERVAL '15 minutes'</code> is one time for the whole statement, so the index on <code>ts</code> answers the range:</p>
+<pre data-lang="sh">sql &quot;SELECT host, count(*) AS errors FROM logs_syslog
+     WHERE severity = &#x27;error&#x27; AND ts &gt; now() - INTERVAL &#x27;15 minutes&#x27;
+     GROUP BY host ORDER BY errors DESC&quot;</pre>
+<pre data-lang="text" data-title="Output" class="output">host | errors
+core-rtr-02 | 24
+fw-01 | 3</pre>
+<p><strong>2. Per host per minute.</strong> <code>time_bucket('1 minute', ts)</code> is the start of each line's minute (<code>'5 minutes'</code>, <code>'1 hour'</code> for wider buckets), grouped by the executor from the <code>ts</code> column:</p>
+<pre data-lang="sh">sql &quot;SELECT time_bucket(&#x27;1 minute&#x27;, ts) AS minute, host, count(*) AS lines FROM logs_syslog
+     WHERE ts &gt; now() - INTERVAL &#x27;15 minutes&#x27; AND severity IN (&#x27;error&#x27;, &#x27;warn&#x27;)
+     GROUP BY minute, host ORDER BY minute DESC LIMIT 6&quot;</pre>
+<pre data-lang="text" data-title="Output" class="output">minute | host | lines
+...</pre>
+<p><strong>3. An interface flapping.</strong> <code>LIKE</code> with <code>%</code> on both sides is answered from the substring index of <code>body</code>, whatever the pattern. A link that changed state more than 3 times in 5 minutes is flapping:</p>
+<pre data-lang="sh">sql &quot;SELECT host, count(*) AS changes FROM logs_syslog
+     WHERE body LIKE &#x27;%LINK-3-UPDOWN%&#x27; AND body LIKE &#x27;%GigabitEthernet0/1,%&#x27;
+       AND ts &gt; now() - INTERVAL &#x27;5 minutes&#x27;
+     GROUP BY host HAVING count(*) &gt; 3&quot;</pre>
+<pre data-lang="text" data-title="Output" class="output">host | changes
+core-rtr-02 | 12</pre>
+<p><strong>4. Everything about one IP</strong>, on every host. An IP is not a word the text analyzer keeps whole, so it is found as a substring:</p>
+<pre data-lang="sh">sql &quot;SELECT host, attributes.mnemonic AS kind, count(*) AS lines FROM logs_syslog
+     WHERE body LIKE &#x27;%10.0.12.2 %&#x27; AND ts &gt; now() - INTERVAL &#x27;1 hour&#x27;
+     GROUP BY host, kind ORDER BY lines DESC&quot;</pre>
+<pre data-lang="text" data-title="Output" class="output">host | kind | lines
+core-rtr-02 | %BGP-3-NOTIFICATION | 12
+core-rtr-03 | %OSPF-5-ADJCHG | 12</pre>
+<p><strong>5. The top kinds of line.</strong> Syslog names the kind of each line (<code>%LINK-3-UPDOWN</code>); kept as a path of the JSON column, it is a group like a column:</p>
+<pre data-lang="sh">sql &quot;SELECT attributes.mnemonic AS kind, count(*) AS lines FROM logs_syslog
+     WHERE ts &gt; now() - INTERVAL &#x27;2 hours&#x27;
+     GROUP BY kind ORDER BY lines DESC LIMIT 5&quot;</pre>
+<pre data-lang="text" data-title="Output" class="output">kind | lines
+%DHCPD-6-ADDRESS_ASSIGN | 120
+%OSPF-7-HELLO | 120
+%SEC-6-IPACCESSLOGP | 120
+%SYS-4-CPUHOG | 120
+%SYS-5-CONFIG_I | 108</pre>
+<p>A line without such a name is grouped by its text with the numbers, addresses, ids and times taken out, which the Log explorer's <strong>Patterns</strong> does in the page (SQL has no regular expressions to do it).</p>
+<p>The key may not read a table outside <code>logs_*</code>:</p>
+<pre data-lang="sh">sql &quot;SELECT count(*) FROM audit&quot; || true</pre>
+<pre data-lang="text" data-title="Output" class="output">a query touches table audit, which the key &quot;netops&quot; may not: it is limited to logs_* (write), ctx_logs_* (write), ctx_incidents (read)</pre>
+<h2 id="the-log-explorer">The Log explorer<a class="anchor" href="#the-log-explorer" aria-label="Link to this section">#</a></h2>
+<p>The command center (the server's address in a browser, here http://127.0.0.1:7700/#/explorer) has a <strong>Log explorer</strong> under Operate. Sign in with the on-call key and it lists the tables the key reads that hold log lines (a <code>TIMESTAMP</code> and a text column), and shows one of them:</p>
+<ul>
+<li><strong>a search box</strong>: words and <code>"a phrase"</code> find the line's text (<code>ILIKE '%...%'</code> on a column with a substring index, <code>MATCH</code> on one without, or pick Substring or Words), <code>host:core-rtr-02</code> a column's value (<code>*</code> for any text), <code>attributes.iface:Gi0/1</code> a JSON path, <code>code&gt;=4</code> a comparison, <code>level&gt;=warn</code> the levels at or above warn as the table spells them, <code>-debug</code> leaves lines out, and <code>WHERE ...</code> takes a SQL condition as written;</li>
+<li><strong>the time range</strong>: the last 15 minutes, hour, day or week (<code>ts &gt; now() - INTERVAL '15 minutes'</code>), or a window from and to;</li>
+<li><strong>lines over time</strong>: a count per minute (per 5 or 15 minutes, or 2 hours, over longer ranges) with errors and warnings apart, <code>time_bucket</code> grouped by the server; a click on a bar zooms into it;</li>
+<li><strong>the lines</strong>, newest first, followed live every 3 seconds (Pause stops it), and for a line clicked, the lines before and after it on the same host;</li>
+<li><strong>patterns</strong>: the newest 2,000 matching lines grouped by their text with numbers, addresses, ids and times as placeholders, most frequent first; a click shows a pattern's lines;</li>
+<li><strong>the SQL it ran</strong>, each statement to copy or open in the SQL workbench.</li>
+</ul>
+<p>Without a log table, it shows how to send logs here: the table above, the Collector's settings with this server's address, the key, and the JSON lines import, with buttons that make the table and the key for an admin.</p>
+    </div>
+    <footer class="doc-foot">
+      <a href="https://github.com/chloetech-ai/chloedb/edit/chloedb-server-v0.3.3/docs/guide/logs.md">Edit this page on GitHub</a>
+      <span class="pager"><a href="crawl-to-search.html">← Crawl a site into search</a><a href="python.html">Python →</a></span>
+    </footer>
+  </article>
+</div></main>
+
+<footer class="foot gutter"><div class="wrap">
+  <div class="brand"><a class="mark" href="../../index.html"><img class="on-light" src="../../../assets/brand/chloedb-mark-on-light.svg" alt="" width="27" height="32"><img class="on-dark" src="../../../assets/brand/chloedb-mark.svg" alt="" width="26" height="32">Chloe<span class="db">DB</span></a><p>Search engine, database and recommender in one, from a file in your app to a cluster. Apache-2.0.</p></div>
+  <div><h4>Start</h4><ul><li><a href="quickstart.html">Quickstart</a></li><li><a href="concepts.html">Concepts</a></li><li><a href="search.html">Search guide</a></li><li><a href="sql.html">SQL reference</a></li></ul></div>
+  <div><h4>Cookbook</h4><ul><li><a href="rag.html">Retrieval for RAG</a></li><li><a href="agent-memory.html">Memory for an agent</a></li><li><a href="crawl-to-search.html">Crawl a site into search</a></li></ul></div>
+  <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/chloedb-server-v0.3.3/docs/reproduce.md">Reproduce the results</a></li></ul></div>
+</div></footer>
+<script src="../../assets/site.js?v=142c29c3e0"></script>
+<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+
+</body>
+</html>

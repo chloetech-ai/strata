@@ -9,6 +9,7 @@
 //! chloedb-sim --cluster --forgetful     # coordinators forget, crashing, the map they may have given
 //! chloedb-sim --no-pauses --no-slow-links   # without those two faults
 //! chloedb-sim --late-copies --seeds 0..1000  # copies of the primary often arriving late
+//! chloedb-sim --lost-volume --seeds 0..1000  # a replica losing its volume as its primary stops
 //! ```
 //!
 //! A seed that fails is run again to check that it replays exactly (the
@@ -64,6 +65,7 @@ fn main() {
     let mut racing = false;
     let mut forgetful = false;
     let mut late_copies = false;
+    let mut lost_volume = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -104,6 +106,7 @@ fn main() {
             "--racing" => racing = true,
             "--forgetful" => forgetful = true,
             "--late-copies" => late_copies = true,
+            "--lost-volume" => lost_volume = true,
             "--trace" => trace = true,
             "--verbose" | "-v" => verbose = true,
             _ => usage(),
@@ -111,7 +114,11 @@ fn main() {
         i += 1;
     }
     let config = |s: u64| {
-        let c = if late_copies { Config::late_copies(s) } else { Config::of(s) };
+        let c = match (late_copies, lost_volume) {
+            (true, _) => Config::late_copies(s),
+            (_, true) => Config::lost_volume(s),
+            _ => Config::of(s),
+        };
         Config {
             bugs: bugs.clone(),
             promote_ppm: promote_ppm.unwrap_or(c.promote_ppm),
@@ -200,6 +207,6 @@ fn print_report(r: &Found) {
 
 fn usage() -> ! {
     let bugs: Vec<&str> = Bug::ALL.iter().map(|b| b.name()).chain(cluster::Bug::ALL.iter().map(|b| b.name())).collect();
-    eprintln!("usage: chloedb-sim [--seeds A..B | --seed N] [--trace] [--jobs N] [--verbose] [--promote-ppm N] [--drop-ppm N] [--no-pauses] [--no-slow-links] [--late-copies] [--bug {}] [--cluster [--racing] [--forgetful]]", bugs.join(" | "));
+    eprintln!("usage: chloedb-sim [--seeds A..B | --seed N] [--trace] [--jobs N] [--verbose] [--promote-ppm N] [--drop-ppm N] [--no-pauses] [--no-slow-links] [--late-copies | --lost-volume] [--bug {}] [--cluster [--racing] [--forgetful]]", bugs.join(" | "));
     std::process::exit(2)
 }
