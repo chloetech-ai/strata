@@ -1,5 +1,7 @@
 # chloedb-netops: network operations on ChloeDB
 
+> **A demo.** chloedb-netops shows what ChloeDB can do; it is not part of ChloeDB's releases or their promises. It is tested on a train of its own (the `Demos` workflow, `.github/workflows/demos.yml`), outside CI's required check, so a fault in it does not hold a ChloeDB release, and the command center marks it as a demo ([compatibility](../compatibility.md#demos)).
+
 `chloedb-netops` is a network operations center kept in ChloeDB: the inventory, the topology, a point a minute of telemetry, device logs, alerts, incidents, changes, configurations, runbooks, and agents that work an incident and say what they looked at. It comes with a simulated carrier network, *Meridian* (10 sites, 64 devices, 120 links, 12 services), and a simulator that writes each minute of it and breaks it in six ways, so the whole app can be used, and its agents checked, without a network of your own.
 
 It is there to show what one database does for an operations team when search, SQL, graphs and time all live in it:

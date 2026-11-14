@@ -11,7 +11,7 @@
 // with another question in the same conversation. The server keeps the
 // latest runs beside its audit log; proposals hold for an hour.
 
-import { h, icon, clear, fmt, card, api, toast, confirm, modal, seg, pill, empty, failure, store, can, needs, every, link, when, timeEl, copy, bus } from "../core.js";
+import { h, icon, clear, fmt, card, api, toast, confirm, modal, seg, pill, empty, failure, store, can, needs, every, link, when, timeEl, copy, bus, experimental } from "../core.js";
 import { firingAlerts, refreshAlerts, state } from "../data.js";
 
 export default {
@@ -322,7 +322,7 @@ function render(page, route) {
       tools.push(h("a", { class: "btn sm", href: "#/oncall?new=1" }, icon("plus"), "New investigation"));
     }
     clear(head, h("div", { class: "page-head" },
-      h("div", {}, h("h1", {}, selected && runs.length ? titleOf(runs[0]) : "On-call agent"),
+      h("div", {}, h("h1", {}, selected && runs.length ? titleOf(runs[0]) : "On-call agent", " ", experimental("The on-call agent")),
         h("p", {}, selected ? h("a", { href: "#/oncall?new=1", class: "oc-back" }, icon("left"), "On-call agent") : "A Claude model looks into an alert or a question with read-only tools, and reports what it found. Each action it would take waits for an admin's approval here.")),
       h("div", { class: "tools" }, tools)));
   }

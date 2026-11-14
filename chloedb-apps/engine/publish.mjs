@@ -25,7 +25,9 @@
 //   Reach; no writes;
 // - add: also add rows, upload files and run its functions, and edit or
 //   delete the rows they added themselves (as told by sa_events), never
-//   anyone else's;
+//   anyone else's; once the app declares access on a table (access.mjs),
+//   its statements say who writes it, and a table that declares none is
+//   written by the owner only;
 // - change: edit and delete any row, only when its owner chose it.
 // Not publishing at all ("only me") stays the default; a publish that names
 // no access starts at look, and so does an app published before the choice
@@ -57,7 +59,7 @@ const APP_CALLS = [
   ['GET', '', 'look'], ['GET', '/me', 'look'], ['GET', '/people', 'look'],
   ['POST', '/sql', 'look'], ['POST', '/insert', 'add'], ['POST', '/update', 'add'], ['POST', '/remove', 'add'], ['POST', '/call', 'add'],
   ['POST', '/signup', 'look'], ['POST', '/signin', 'look'], ['POST', '/files', 'add'], ['POST', '/files/info', 'look'],
-  ['GET', '/companies', 'look'], ['POST', '/companies', 'add'], ['POST', '/companies/members', 'add'], ['POST', '/companies/members/remove', 'add'],
+  ['GET', '/companies', 'look'], ['POST', '/companies', 'add'], ['POST', '/companies/members', 'add'], ['POST', '/companies/members/remove', 'add'], ['POST', '/companies/join', 'add'],
   ['POST', '/people/role', 'look'],
   ['POST', '/track', 'look'], ['POST', '/error', 'look'], ['POST', '/email', 'add'], ['POST', '/ask', 'look'], ['POST', '/fetch', 'look'],
 ];

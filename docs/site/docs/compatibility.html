@@ -86,7 +86,7 @@
       <p class="doc-badge">Reference, rendered from <a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/compatibility.md">docs/compatibility.md</a>.</p>
       <p class="doc-version">These docs describe release 0.3.3.</p>
     </div>
-    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-database-file">The database file</a></li><li><a href="#the-packages-and-the-engine">The packages and the engine</a></li><li><a href="#a-cluster-of-mixed-versions">A cluster of mixed versions</a></li><li><a href="#old-names">Old names</a></li><li><a href="#not-promised-yet">Not promised yet</a></li></ol></details>
+    <details class="doc-toc" open><summary>On this page</summary><ol><li><a href="#the-database-file">The database file</a></li><li><a href="#the-packages-and-the-engine">The packages and the engine</a></li><li><a href="#a-cluster-of-mixed-versions">A cluster of mixed versions</a></li><li><a href="#old-names">Old names</a></li><li><a href="#experimental-features">Experimental features</a></li><li><a href="#demos">Demos</a></li><li><a href="#not-promised-yet">Not promised yet</a></li></ol></details>
     <div class="doc-body">
 
 <p>What this code promises about the files it reads and writes, the protocol
@@ -338,6 +338,63 @@ and the app engine in <code>chloedb-apps/</code>. The default models directory i
 before); a machine that has the old folder and no <code>~/.local/share/chloedb</code>
 keeps using it, as a machine that already has ChloeCtx's old folder,
 <code>~/.local/share/engram</code>, does.</p>
+<h2 id="experimental-features">Experimental features<a class="anchor" href="#experimental-features" aria-label="Link to this section">#</a></h2>
+<p>These parts of chloedb-server work and are documented, but carry no
+compatibility promise yet: their routes, settings and what they store may
+change in any release, including a patch release, with no upgrade path
+promised. Each answer of their routes carries the header
+<code>x-chloedb-experimental: &lt;feature&gt;</code>, <code>GET /v1/catalog</code> marks their routes
+(<code>"experimental": "&lt;feature&gt;"</code>, and the features under <code>experimental</code>), and
+the command center marks their pages.</p>
+<div class="doc-table"><table>
+<thead>
+<tr>
+<th>feature</th>
+<th>routes</th>
+<th>what it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cloud</code></td>
+<td><code>/v1/admin/cloud/*</code>, <code>/v1/admin/aws/*</code>, <code>/v1/admin/digitalocean/*</code></td>
+<td><a href="server.html#in-the-cloud">clusters made on AWS or DigitalOcean</a> from the command center</td>
+</tr>
+<tr>
+<td><code>hub</code></td>
+<td><code>/v1/admin/hub/*</code>, <code>/c/&lt;name&gt;/</code></td>
+<td><a href="server.html#many-clusters-from-one-command-center">the hub</a>: a book of other clusters, and calls forwarded to them</td>
+</tr>
+<tr>
+<td><code>autoscale</code></td>
+<td><code>/v1/admin/kube/autoscale/*</code>, <code>/v1/admin/autoscale/*</code>, the <code>StrataCluster</code>'s <code>spec.autoscale</code></td>
+<td><a href="server.html#autoscaling">the operator's autoscaler</a></td>
+</tr>
+<tr>
+<td><code>oncall</code></td>
+<td><code>/v1/admin/oncall/*</code></td>
+<td><a href="server.html#the-on-call-agent">the on-call agent</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>The list is <code>EXPERIMENTAL</code> in <code>chloedb-server/src/catalog.rs</code>. A feature
+leaves it when its shape is settled; the changelog says so.</p>
+<h2 id="demos">Demos<a class="anchor" href="#demos" aria-label="Link to this section">#</a></h2>
+<p>These apps show what ChloeDB can do and are not part of its releases or
+their promises:</p>
+<ul>
+<li><code>chloedb-netops</code>, network operations on a simulated carrier network;</li>
+<li><code>chloedb-swarm</code>, simulated users, an internal test instrument;</li>
+<li><code>examples/feature-store</code>, a shop ranked on features ChloeDB keeps;</li>
+<li><code>examples/parley</code>, a social network of LLM agents.</li>
+</ul>
+<p>They are on a release train of their own. CI's required check, <code>CI result</code>,
+does not test them, and a change only under them runs nothing there; the
+<code>Demos</code> workflow (<code>.github/workflows/demos.yml</code>) tests them against a
+chloedb-server of the same commit, on a pull request that touches one and
+every night. A fault in a demo does not hold a ChloeDB release, and fixing
+one does not wait for the engine's tests. An app whose manifest says
+<code>"maturity": "demo"</code> is marked as a demo in the command center.</p>
 <h2 id="not-promised-yet">Not promised yet<a class="anchor" href="#not-promised-yet" aria-label="Link to this section">#</a></h2>
 <ul>
 <li>Semantic versioning, or any version bump rule.</li>

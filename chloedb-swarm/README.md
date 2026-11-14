@@ -1,5 +1,7 @@
 # chloedb-swarm: simulated users for ChloeDB
 
+> **A demo.** Swarm, an internal test instrument, shows what ChloeDB can do; it is not part of ChloeDB's releases or their promises. It is tested on a train of its own (the `Demos` workflow, `.github/workflows/demos.yml`), outside CI's required check, so a fault in it does not hold a ChloeDB release, and the command center marks it as a demo ([compatibility](../docs/compatibility.md#demos)).
+
 Swarm plays a set of people (personas) doing tasks with ChloeDB, many at
 once, and reports what worked and what did not. Each person is a model
 told who they are and what they want; it uses ChloeDB the way that person

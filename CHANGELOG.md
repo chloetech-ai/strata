@@ -11,6 +11,26 @@ changes collect under "Unreleased".
 
 ## Unreleased
 
+- **Experimental marks.** The cloud provisioners, the hub, the autoscaler
+  and the on-call agent are marked experimental: no compatibility promise
+  yet. Their answers carry `x-chloedb-experimental: <feature>`,
+  `GET /v1/catalog` marks their routes (`experimental`) and lists the
+  features, and their command-center pages say so
+  ([compatibility](docs/compatibility.md#experimental-features)).
+- **Demos on a train of their own.** chloedb-netops, chloedb-swarm,
+  examples/feature-store and examples/parley are tested by the new `Demos`
+  workflow (on a pull request that touches one, and every night), not by
+  `CI result`; a fault in one no longer holds a release. An app's manifest
+  may say `"maturity": "demo"`, and the command center marks it
+  ([compatibility](docs/compatibility.md#demos)).
+- **One-way doors checked.** `.github/CODEOWNERS` names each door in a
+  `# door:` section and adds the paths audit 4 found missing (rollup
+  layouts, the substring index, analyzers, archives, tenants, the app
+  engine's keys and access, the install scripts and the Dockerfiles). The
+  new check `One-way doors` fails a pull request whose template box says
+  "No one-way door" (or nothing) while its diff touches one, and writes a
+  receipt of the doors touched into the run's summary.
+
 ## 0.3.3
 
 The afternoon audit's fixes, a ChloeCtx inspector organised by space, and
