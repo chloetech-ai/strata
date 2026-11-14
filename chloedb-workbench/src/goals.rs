@@ -224,7 +224,7 @@ pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub struct GoalBody {
     pub repo: Option<String>,
     pub text: Option<String>,
-    pub plan: Option<bool>,
+    pub plan: Option<PlanMode>,
     pub model: Option<String>,
     pub worktree: Option<bool>,
     pub effort: Option<String>,
@@ -233,13 +233,22 @@ pub struct GoalBody {
     pub agents: Option<Vec<String>>,
 }
 
+/// `plan`: `true` starts a lead that plans; `"draft"` only drafts the
+/// parts and starts nothing (JOURNEYS.md, "A. Start a new project", Plan it).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PlanMode {
+    On(bool),
+    Mode(String),
+}
+
 /// An outcome the person names: its title, or the title with how to tell
 /// it is done and what its agent is to do.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum OutcomeSpec {
     Title(String),
-    Full { title: String, detail: Option<String>, task: Option<String> },
+    Full { title: String, detail: Option<String>, task: Option<String>, after: Option<usize> },
 }
 
 impl OutcomeSpec {
@@ -251,7 +260,7 @@ impl OutcomeSpec {
                 Some((title, done)) => (title.trim().to_string(), Some(done.trim().to_string()).filter(|d| !d.is_empty()), None),
                 None => (t.trim().to_string(), None, None),
             },
-            OutcomeSpec::Full { title, detail, task } => (title.trim().to_string(), clean(detail), clean(task)),
+            OutcomeSpec::Full { title, detail, task, .. } => (title.trim().to_string(), clean(detail), clean(task)),
         }
     }
 }
@@ -345,9 +354,18 @@ pub fn create(sup: &Arc<Supervisor>, lv: &Levels, b: GoalBody) -> Result<Json, A
         return Err(ApiError::bad(format!("effort {e:?} is one of {}", EFFORTS.join(", "))));
     }
     let model = b.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
-    let specs: Vec<(String, Option<String>, Option<String>)> = b.outcomes.unwrap_or_default().iter().map(OutcomeSpec::parts).filter(|o| !o.0.is_empty()).collect();
+    let given = b.outcomes.unwrap_or_default();
+    // A part that waits for another (the draft plan's `after`): by index
+    // among the outcomes that have a title.
+    let afters: Vec<Option<usize>> = given.iter().filter(|o| !o.parts().0.is_empty()).map(|o| match o { OutcomeSpec::Full { after, .. } => *after, _ => None }).collect();
+    let specs: Vec<(String, Option<String>, Option<String>)> = given.iter().map(OutcomeSpec::parts).filter(|o| !o.0.is_empty()).collect();
     let attach: Vec<String> = b.agents.unwrap_or_default().into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
-    let plan = b.plan.unwrap_or(false);
+    let plan = match &b.plan {
+        None | Some(PlanMode::On(false)) => false,
+        Some(PlanMode::On(true)) => true,
+        Some(PlanMode::Mode(m)) if m == "draft" => return Ok(draft(sup, &repo, &text, model.as_deref())),
+        Some(PlanMode::Mode(m)) => return Err(ApiError::bad(format!("plan is true, false or \"draft\", not {m:?}"))),
+    };
     if plan && (!specs.is_empty() || !attach.is_empty()) {
         return Err(ApiError::bad("plan starts a lead that finds the outcomes itself: with outcomes or agents given, leave plan off"));
     }
@@ -388,10 +406,18 @@ pub fn create(sup: &Arc<Supervisor>, lv: &Levels, b: GoalBody) -> Result<Json, A
     }
     // The person's own outcomes, one agent each and no planner.
     let mut taken: HashSet<String> = HashSet::new();
-    for (title, detail, task) in &specs {
-        let added = add_outcome(sup, lv, OutcomeBody { goal: Some(g.id.clone()), title: Some(title.clone()), detail: detail.clone(), after: None }, None)?;
+    let mut oids: Vec<String> = Vec::new();
+    for (k, (title, detail, task)) in specs.iter().enumerate() {
+        let after = afters.get(k).copied().flatten().filter(|&i| i < k).and_then(|i| oids.get(i).cloned());
+        let waits = after.is_some();
+        let added = add_outcome(sup, lv, OutcomeBody { goal: Some(g.id.clone()), title: Some(title.clone()), detail: detail.clone(), after }, None)?;
         let oid = added["outcome"]["id"].as_str().unwrap_or("").to_string();
+        oids.push(oid.clone());
         if !b.start.unwrap_or(true) {
+            continue;
+        }
+        if waits {
+            missing.push(format!("{title}: waits for the part before it; start it when that one is done"));
             continue;
         }
         let name = outcome_name(sup, &repo, title, &taken);
@@ -680,6 +706,103 @@ pub fn spawn(sup: &Arc<Supervisor>, lv: &Levels, mut req: SpawnRequest) -> Resul
     Ok(agent)
 }
 
+
+// The draft plan (`plan: "draft"`).
+
+const DRAFT_SYSTEM: &str = "You split what a developer wants built into the parts that coding agents will build, one agent per part. Answer with JSON only, no prose: {\"parts\":[{\"title\":\"...\",\"done\":\"how to tell it is done: a command that passes, in backticks, or what you will see\",\"after\":[indexes of parts it waits for, from 0],\"model\":\"haiku|sonnet|opus\"}]}. Two to six parts, the smallest first; a part waits for another only when it needs that one's code. Use the developer's words and names; invent no service they did not name.";
+
+/// Runs `claude -p` with a timeout; its stdout.
+fn run_print(bin: &str, args: &[String], cwd: &std::path::Path, timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {bin}: {e}"))?;
+    let mut out = child.stdout.take().ok_or("no output")?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        s
+    });
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("the model took over {} s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    reader.join().map_err(|_| "the output was lost".to_string())
+}
+
+/// The parts a model drafted, from its answer: `None` when it is not the JSON asked for.
+fn parts_of_answer(raw: &str) -> Option<Vec<Json>> {
+    let res = raw.lines().rev().find_map(|l| serde_json::from_str::<Json>(l.trim()).ok().filter(|v| v.get("result").is_some())).or_else(|| serde_json::from_str::<Json>(raw.trim()).ok())?;
+    let text = res["result"].as_str()?.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim().to_string();
+    let v: Json = serde_json::from_str(&text).ok()?;
+    let parts = v["parts"].as_array()?;
+    let n = parts.len();
+    let out: Vec<Json> = parts
+        .iter()
+        .filter_map(|p| {
+            let title = p["title"].as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let after: Vec<usize> = p["after"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).map(|x| x as usize).filter(|&x| x < n).collect();
+            let model = p["model"].as_str().filter(|m| ["haiku", "sonnet", "opus"].contains(m));
+            let done = p["done"].as_str().map(|d| one_line(d.trim(), 300)).filter(|d| !d.is_empty());
+            Some(json!({ "title": one_line(title, 300), "done": done, "after": after, "model": model }))
+        })
+        .take(8)
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// The parts, from the person's own words: one per line or sentence.
+fn parts_of_words(text: &str) -> Vec<Json> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['-', '*', '•']).trim();
+        for s in line.split_inclusive(['.', ';']).map(|s| s.trim().trim_end_matches(['.', ';']).trim()) {
+            if s.split_whitespace().count() >= 2 && out.len() < 6 {
+                out.push(json!({ "title": one_line(s, 300), "done": null, "after": [], "model": null }));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(json!({ "title": one_line(text.trim(), 300), "done": null, "after": [], "model": null }));
+    }
+    out
+}
+
+/// A draft plan: the parts and their order, from a fast model or from the
+/// person's words. Nothing is created and no agent starts.
+pub fn draft(sup: &Supervisor, repo: &std::path::Path, text: &str, model: Option<&str>) -> Json {
+    let m = model.unwrap_or("haiku").to_string();
+    let args: Vec<String> = ["-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--settings", "{\"disableAllHooks\":true}", "--no-session-persistence", "--model", &m, "--system-prompt", DRAFT_SYSTEM]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(text.to_string()))
+        .collect();
+    let (parts, by, missing) = match run_print(&sup.cfg.claude_bin, &args, repo, Duration::from_secs(45)) {
+        Ok(raw) => match parts_of_answer(&raw) {
+            Some(p) => (p, "model", Vec::<String>::new()),
+            None => (parts_of_words(text), "words", vec!["the model's answer was not a plan: these parts are your own sentences".to_string()]),
+        },
+        Err(e) => (parts_of_words(text), "words", vec![format!("{e}: these parts are your own sentences")]),
+    };
+    json!({ "draft": true, "repo": repo.to_string_lossy(), "text": text, "parts": parts, "drafted_by": by, "model": if by == "model" { Some(m) } else { None }, "missing": missing })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

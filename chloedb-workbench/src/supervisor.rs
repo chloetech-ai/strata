@@ -154,6 +154,70 @@ pub struct SpawnRequest {
     /// Ask before edits, tests and git in its own worktree (by default
     /// it does them there without asking: `flow::worktree_allow`).
     pub ask_edits: Option<bool>,
+    /// What it may do without asking, must ask about, or may not do
+    /// (JOURNEYS.md, "Start a change"): Claude Code rules such as `Read`,
+    /// `Bash(python3 -m pytest:*)`, written into the session's settings.
+    pub permissions: Option<PermissionProfile>,
+}
+
+/// A session's permission profile: Claude Code's `permissions.allow`,
+/// `ask` and `deny` rules.
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionProfile {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl PermissionProfile {
+    /// Each rule is a tool name (`Read`, `mcp__chloectx__memory_search`),
+    /// optionally with a specifier in parentheses (`Bash(npm test:*)`).
+    pub fn check(&self) -> Result<(), String> {
+        let all = self.allow.iter().chain(&self.ask).chain(&self.deny);
+        if self.allow.len() + self.ask.len() + self.deny.len() > 200 {
+            return Err("a permission profile has at most 200 rules".into());
+        }
+        for r in all {
+            let r = r.trim();
+            let (tool, spec) = match r.find('(') {
+                Some(i) if r.ends_with(')') => (&r[..i], Some(&r[i + 1..r.len() - 1])),
+                Some(_) => return Err(format!("permission rule {r:?} opens a parenthesis it does not close")),
+                None => (r, None),
+            };
+            let tool_ok = tool.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if !tool_ok || r.len() > 400 || spec.is_some_and(|s| s.trim().is_empty() || s.contains('\n')) {
+                return Err(format!("{r:?} is not a permission rule: a tool name such as Read, or Tool(specifier) such as Bash(npm test:*)"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Settings with these rules merged in. Read-only wins: its allow list
+    /// is not widened.
+    pub fn apply(&self, mut settings: Json, read_only: bool) -> Json {
+        if !settings["permissions"].is_object() {
+            settings["permissions"] = json!({});
+        }
+        for (key, rules) in [("allow", &self.allow), ("ask", &self.ask), ("deny", &self.deny)] {
+            if key == "allow" && read_only {
+                continue;
+            }
+            let mut list = settings["permissions"][key].as_array().cloned().unwrap_or_default();
+            for r in rules.iter().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+                if !list.contains(&json!(r)) {
+                    list.push(json!(r));
+                }
+            }
+            if !list.is_empty() {
+                settings["permissions"][key] = Json::Array(list);
+            }
+        }
+        settings
+    }
 }
 
 /// An exited agent started again: same name, task, worktree and model,
@@ -437,6 +501,9 @@ impl Supervisor {
         if req.repo.trim().is_empty() {
             return Err(ApiError::bad("repo is required: the path of a git checkout"));
         }
+        if let Some(p) = &req.permissions {
+            p.check().map_err(ApiError::bad)?;
+        }
         let path = expand_home(req.repo.trim());
         if !path.is_absolute() {
             return Err(ApiError::bad(format!("repo must be an absolute path, not {}", req.repo)));
@@ -567,13 +634,17 @@ impl Supervisor {
             &cwd,
             {
                 let s = crate::flow::with_allowed(settings_json(&exe), &self.allowed(&co.main.to_string_lossy()));
-                if read_only {
+                let s = if read_only {
                     // Read-only wins: no worktree defaults that allow edits.
                     crate::guarded::read_only_settings(s)
                 } else if worktree && !req.ask_edits.unwrap_or(false) {
                     crate::flow::with_worktree_defaults(s, &cwd)
                 } else {
                     s
+                };
+                match &req.permissions {
+                    Some(p) => p.apply(s, read_only),
+                    None => s,
                 }
             },
             mcp_json(&exe, &self.cfg.url, &token, &id),

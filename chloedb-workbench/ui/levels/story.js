@@ -147,8 +147,11 @@ export function mount(root, ctx) {
       h("div", { class: "sy-row" }, h("button", { class: "btn sm", "data-key": "retry", onclick: () => load() }, "Try again"), h("button", { class: "btn sm ghost", "data-key": "back", onclick: () => ctx.go("#/mission") }, "Mission"))));
     if (!S.story) return h("div", { class: "sy-wrap" }, agentsBar(), h("div", { class: "sy-main" }, h("div", { class: "sy-skel" }), h("div", { class: "sy-skel short" }), h("div", { class: "sy-skel tall" })));
     const a = agentOf();
-    return h("div", { class: "sy-wrap" }, agentsBar(),
-      h("div", { class: "sy-main" }, header(a), intentLevel(a), storyLevel(), stepsLevel(), terminalLevel(a)),
+    // Embedded in the agent page (JOURNEYS.md, Progress): no agent picker,
+    // no second header with level pills, no terminal of its own.
+    const embed = !!(ctx.params && ctx.params.embed);
+    return h("div", { class: `sy-wrap${embed ? " embed" : ""}` }, embed ? null : agentsBar(),
+      h("div", { class: "sy-main" }, embed ? null : header(a), intentLevel(a), storyLevel(), stepsLevel(), embed ? null : terminalLevel(a)),
       h("aside", { class: "sy-side" }, dejaVu(a), knewCard(), talkCard(a)));
   }
 

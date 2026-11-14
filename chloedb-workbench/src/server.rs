@@ -111,6 +111,8 @@ pub fn router(app: App) -> Router {
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
         .route("/levels/:file", get(ui_level))
+        .route("/goals/:file", get(ui_goal))
+        .route("/fonts/:file", get(ui_font))
         .route("/api/health", get(health))
         .route("/api/agents", get(list).post(spawn))
         .route("/api/agents/:id", get(agent))
@@ -155,6 +157,10 @@ pub fn router(app: App) -> Router {
         .merge(crate::complete::routes())
         // Sixth build: repositories without an agent, and the user guide.
         .merge(crate::repos::routes())
+        // The rewrite around goals (JOURNEYS.md): the one Needs-you count,
+        // and the permissions a session was granted.
+        .merge(crate::needs::routes())
+        .merge(crate::grants::routes())
         .route("/guide.md", get(guide_md))
         // Sixth build: "I'm stepping away" and the presence heartbeat (src/digest.rs).
         .merge(crate::digest::routes())
@@ -164,7 +170,6 @@ pub fn router(app: App) -> Router {
         // The rewrite: suggested rules and grants, and the interrupt model.
         .merge(crate::rulesuggest::routes())
         .merge(crate::notify::routes())
-        .route("/goals/:file", get(ui_goal))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -240,6 +245,15 @@ const GOALS: &[(&str, &str)] = &[
     ("notify.js", include_str!("../ui/goals/notify.js")),
     ("review.js", include_str!("../ui/goals/review.js")),
     ("debug.js", include_str!("../ui/goals/debug.js")),
+    // The shell and the goal pages around them (R1).
+    ("router.js", include_str!("../ui/goals/router.js")),
+    ("shell.js", include_str!("../ui/goals/shell.js")),
+    ("start.js", include_str!("../ui/goals/start.js")),
+    ("newproject.js", include_str!("../ui/goals/newproject.js")),
+    ("continue.js", include_str!("../ui/goals/continue.js")),
+    ("agent.js", include_str!("../ui/goals/agent.js")),
+    ("more.js", include_str!("../ui/goals/more.js")),
+    ("needs.js", include_str!("../ui/goals/needs.js")),
 ];
 
 async fn ui_goal(State(app): State<App>, Path(file): Path<String>) -> Response {
@@ -260,6 +274,19 @@ async fn guide_md(State(app): State<App>) -> Response {
             Err(_) => ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], GUIDE).into_response(),
         },
         None => ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], GUIDE).into_response(),
+    }
+}
+
+/// Geist and Geist Mono (SIL Open Font License), the faces of style C.
+const FONTS: &[(&str, &[u8])] = &[
+    ("Geist-normal.woff2", include_bytes!("../ui/fonts/Geist-normal.woff2")),
+    ("GeistMono-normal.woff2", include_bytes!("../ui/fonts/GeistMono-normal.woff2")),
+];
+
+async fn ui_font(Path(file): Path<String>) -> Response {
+    match FONTS.iter().find(|(n, _)| *n == file) {
+        Some((_, body)) => ([(header::CONTENT_TYPE, "font/woff2"), (header::CACHE_CONTROL, "public, max-age=604800")], *body).into_response(),
+        None => ApiError::not_found("no such font").into_response(),
     }
 }
 

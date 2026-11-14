@@ -1,7 +1,15 @@
 // ChloeDB Workbench: the page. One module, no build step. State comes from
 // /api/stream (server-sent events); terminals are WebSockets to
 // /api/agents/:id/pty drawn with xterm.js (window.Terminal, loaded by
-// index.html from the pinned CDN URL). SPEC.md is the contract.
+// index.html from the pinned CDN URL). SPEC.md is the contract; JOURNEYS.md
+// says what each page is for. The pages are modules: ui/goals/ (Start, New
+// project, Continue, the inbox, the agent page's parts, More; the shell:
+// top bar, tab bar, the drawer and the switcher) mounted into #goal-view by
+// the router (ui/goals/router.js); the agent page, All terminals and the
+// Decisions timeline are views of this file.
+import { resolve } from "/goals/router.js";
+import * as Shell from "/goals/shell.js";
+import * as AG from "/goals/agent.js";
 
 const TOKEN_KEY = "chloedb-workbench-token";
 const REPO_KEY = "chloedb-workbench-repo";
@@ -244,6 +252,8 @@ function upsert(a) {
     S.tiles.get(a.id)?.flash();
   }
   if (!prev && a.running) followLive(a);
+  // What needs you and the projects' groups follow the agents' states.
+  if (!prev || prev.state !== a.state || prev.waiting_for !== a.waiting_for || prev.running !== a.running) { needsSoon(); projectsSoon(); }
   schedule();
 }
 
@@ -258,26 +268,27 @@ function liveId(id) {
 }
 function followLive(a) {
   if (!a.restarted_from) return; // only a restart moves a view that is open
-  if (S.zoomed && S.zoomed === a.restarted_from) zoom(a.id, { history: "replace" });
-  else if (L.screen && (L.screen === "preview" || L.screen === "ship") && L.param === a.restarted_from) openLevel(L.screen, a.id, { how: "replace", query: L.query || "" });
+  if (S.zoomed && S.zoomed === a.restarted_from) replaceHash(location.hash.replace(`/a/${a.restarted_from}`, `/a/${a.id}`));
+  else if (G.r && G.r.agent === a.restarted_from) replaceHash(location.hash.replace(a.restarted_from, a.id));
 }
 
+/** "Restart with the same task" (the switcher's Finished rows, the agent
+ *  page): POST /api/agents/:id/restart, then open the agent that runs now. */
 async function restartAgent(id) {
   const a = S.agents.get(id);
-  if (!a || a.running) return;
-  $("z-restart").disabled = true;
+  if (!a || a.running) return null;
   try {
     const r = await api(`/api/agents/${encodeURIComponent(id)}/restart`, { method: "POST", body: {} });
     if (r && r.agent) {
       upsert(r.agent);
-      if (S.zoomed !== r.agent.id && (S.zoomed === id || !S.zoomed)) zoom(r.agent.id, { history: "replace" });
       toast(r.resumed ? `Restarted ${nameOf(r.agent)}: it continues its session` : `Restarted ${nameOf(r.agent)} with its task (no session to continue)`);
+      if (S.zoomed === id || !S.zoomed) go(`#/a/${r.agent.id}`);
+      return r.agent;
     }
   } catch (e) {
     toast(`Could not restart it: ${e.message}`, true);
-  } finally {
-    $("z-restart").disabled = false;
   }
+  return null;
 }
 
 async function loadAll() {
@@ -288,15 +299,8 @@ async function loadAll() {
   } catch (e) {
     if (e.status !== 401) console.warn("agents:", e.message);
   }
-  if (S.pendingDec) {
-    S.pendingDec = false;
-    openDecisions({ history: "replace" });
-  }
-  if (S.pendingZoom && S.agents.has(S.pendingZoom)) {
-    const id = S.pendingZoom;
-    S.pendingZoom = null;
-    zoom(id, { history: "replace" });
-  }
+  // An agent page opened by its address before the agent was known.
+  if (G.r && G.r.page === "agent" && !S.zoomed && S.agents.has(G.r.agent)) route(location.hash);
 }
 
 // ---------------------------------------------------------------- stream
@@ -510,7 +514,7 @@ class Tile {
       h("div", { class: "tile-head" }, this.idx, this.nm, h("span", { class: "sep" }), this.chip),
       h("div", { class: "meta" }, this.br, this.model, this.kids, this.since),
       this.task, this.pv, this.foot);
-    this.el.addEventListener("click", () => zoom(this.id));
+    this.el.addEventListener("click", () => go(`#/a/${this.id}/terminal`));
     this.el.addEventListener("focus", () => select(this.id, { focus: false }));
     this.key = "";
   }
@@ -576,44 +580,14 @@ function render() {
   const all = [...S.agents.values()];
   const running = all.filter((a) => a.running).sort(byCreated);
   const exited = all.filter((a) => !a.running).sort((a, b) => (toMs(b.ended || b.state_since) || 0) - (toMs(a.ended || a.state_since) || 0));
-  const attention = running.filter((a) => a.state === "waiting" || a.state === "idle").sort(bySince);
   S.order = running.map((a) => a.id);
   if (S.selected && !S.agents.has(S.selected)) S.selected = null;
 
-  // top bar
-  $("run-n").textContent = String(running.length);
-  $("run-max").textContent = S.health?.max_agents ? ` of ${S.health.max_agents}` : "";
-  const waiting = attention.filter((a) => a.state === "waiting").length;
-  $("need-pill").hidden = !attention.length;
-  $("need-n").textContent = String(attention.length);
-  $("need-pill").classList.toggle("warn", waiting > 0);
-  document.title = waiting ? `(${waiting}) Workbench` : "Workbench";
-
-  renderRail(attention);
-  renderGrid(running);
-  renderExited(exited);
+  Shell.update(); // the one count of what needs you, the agents, the title
+  if (!$("grid-view").hidden) { renderGrid(running); renderExited(exited); }
   if (S.zoomed) renderZoom();
-  renderLevels();
-}
-
-function renderRail(list) {
-  const ol = $("rail-list");
-  $("rail-empty").hidden = list.length > 0;
-  const n = $("rail-n");
-  n.textContent = list.length ? String(list.length) : "";
-  n.classList.toggle("warn", list.some((a) => a.state === "waiting"));
-  const items = list.map((a) => {
-    const ago = h("span", { class: "ago" });
-    since(ago, a.state_since);
-    const last = a.last_event && !/^turn (finished|over)/i.test(a.last_event) ? `: ${a.last_event}` : "";
-    const why = a.state === "waiting" ? cap(a.waiting_for) || "Waiting for you" : `Turn finished${last}`;
-    return h("li", null, h("button", {
-      class: `ritem ${a.state}${S.zoomed === a.id ? " sel" : ""}`,
-      title: `Zoom ${nameOf(a)}`,
-      onclick: () => zoom(a.id),
-    }, h("span", { class: "dot" }), h("span", { class: "nm", text: nameOf(a) }), ago, h("span", { class: "why", text: why })));
-  });
-  ol.replaceChildren(...items);
+  if (G.view) { try { G.view.update && G.view.update(levelState()); } catch (err) { console.error(err); } }
+  for (const v of Z.views) { try { v && v.update && v.update(levelState()); } catch (err) { console.error(err); } }
 }
 
 function renderGrid(running) {
@@ -638,7 +612,7 @@ function renderExited(list) {
   const rows = list.slice(0, 200).map((a) => {
     const c = h("span");
     chip(c, a);
-    return h("button", { class: "xrow", title: `Open ${nameOf(a)}'s terminal and events`, onclick: () => zoom(a.id) },
+    return h("button", { class: "xrow", title: `Open ${nameOf(a)}`, onclick: () => go(`#/a/${a.id}`) },
       h("span", { class: "nm", text: nameOf(a) }), c,
       h("span", { class: "t", text: a.task || "No task" }),
       h("span", { class: "br", text: a.branch || "" }),
@@ -669,7 +643,7 @@ function move(dir) {
     const i = ids.indexOf(S.zoomed);
     const step = dir === "left" || dir === "up" ? -1 : 1;
     const next = ids[((i < 0 ? 0 : i + step) + ids.length) % ids.length];
-    zoom(next, { history: "replace" });
+    replaceHash(`#/a/${next}${Z.tab === "progress" ? "" : "/" + (Z.tab === "term" ? "terminal" : Z.tab)}`);
     return;
   }
   const cur = S.tiles.get(S.selected);
@@ -697,62 +671,75 @@ function move(dir) {
 
 // ------------------------------------------------------------------ zoom
 
-const Z = { id: null, term: null, fit: null, sock: null, ro: null, events: [], live: [], loaded: false, factsKey: "" };
+// The agent page (JOURNEYS.md, "The agent page"): #/a/<id>[/<tab>]. Its
+// header, question and tabs come from ui/goals/agent.js; the terminal, the
+// diff and the events are this file's. `tab` is progress, changes, preview,
+// term or events; `typing` is the phone's Type (read-only until then).
+const Z = { id: null, term: null, fit: null, sock: null, ro: null, events: [], live: [], loaded: false, factsKey: "", tab: "progress", views: [], hosted: {}, typing: false, headKey: "" };
+const PHONE = matchMedia("(max-width: 640px)");
 
-function zoom(id, { history: how = "push", tab } = {}) {
+function zoom(id, { tab = "progress" } = {}) {
   const a = S.agents.get(id);
   if (!a) return;
   S.selected = id;
-  if (L.screen) leaveLevels();
-  if (Z.id === id && !$("zoom-view").hidden) { if (tab) setTab(tab, { focus: true }); else Z.term?.focus(); return; }
-  if (D.open) {
-    D.open = false;
-    $("dec-view").hidden = true;
-    $("dec-btn").setAttribute("aria-pressed", "false");
+  if (Z.id !== id || $("zoom-view").hidden) {
+    closeZoomTerm();
+    unmountTabs();
+    S.zoomed = id;
+    Z.typing = false;
+    Z.factsKey = Z.headKey = "";
+    $("zoom-view").hidden = false;
+    openZoomTerm(id);
+    loadEvents(id);
+    loadChanges(id, { quiet: true }); // its count shows on the tab
   }
-  const wasZoomed = !!S.zoomed;
-  closeZoomTerm();
-  S.zoomed = id;
-  if (how === "push" && !wasZoomed) history.pushState({ zoom: id }, "", `#${id}`);
-  else if (how !== "none") history.replaceState({ zoom: id, root: !wasZoomed && how === "replace" ? true : history.state?.root }, "", `#${id}`);
-  $("grid-view").hidden = true;
-  $("zoom-view").hidden = false;
-  setTab(tab || "term", { focus: !!tab });
-  Z.factsKey = "";
-  openZoomTerm(id);
-  loadEvents(id);
-  loadChanges(id, { quiet: true }); // its count shows on the tab
+  setTab(tab, { focus: tab === "changes" || (tab === "term" && !PHONE.matches) });
   render();
 }
 
-function unzoom({ fromHistory = false } = {}) {
+/** Leaves the agent page (the router opens what comes next). */
+function unzoom() {
   if (!S.zoomed) return;
-  if (!fromHistory) {
-    if (history.state?.zoom && !history.state.root) { history.back(); return; } // popstate comes back here
-    history.replaceState(null, "", location.pathname + location.search);
-  }
-  const id = S.zoomed;
   closeZoomTerm();
+  unmountTabs();
   S.zoomed = null;
+  Z.typing = false;
   $("zoom-view").hidden = true;
-  $("grid-view").hidden = false;
-  render();
-  requestAnimationFrame(() => {
-    const t = S.tiles.get(id);
-    if (t) { select(id); t.preview?.scale(); }
-    for (const tile of S.tiles.values()) tile.preview?.scale();
-  });
 }
 
-window.addEventListener("popstate", () => {
-  if (location.hash.startsWith("#/")) { route(location.hash); return; }
-  if (L.screen) leaveLevels();
-  const id = location.hash.slice(1);
-  if (id === "decisions") { if (S.zoomed) unzoom({ fromHistory: true }); openDecisions({ history: "none" }); return; }
-  if (D.open) closeDecisions({ fromHistory: true });
-  if (id && S.agents.has(id)) zoom(id, { history: "none" });
-  else unzoom({ fromHistory: true });
-});
+function unmountTabs() {
+  for (const v of Z.views) { try { v && v.unmount && v.unmount(); } catch (err) { console.error(err); } }
+  Z.views = [];
+  Z.hosted = {};
+  $("ag-progress").replaceChildren();
+  $("ag-preview").replaceChildren();
+}
+
+/** Progress (the story, embedded) and Preview mount the first time they show. */
+function hostTab(kind) {
+  if (Z.hosted[kind] || !S.zoomed) return;
+  const id = S.zoomed;
+  Z.hosted[kind] = true;
+  AG.mountTab(kind, $(kind === "preview" ? "ag-preview" : "ag-progress"), levelCtx(id)).then((v) => { if (S.zoomed === id) Z.views.push(v); else v?.unmount?.(); })
+    .catch((err) => { $(kind === "preview" ? "ag-preview" : "ag-progress").replaceChildren(h("div", { class: "lv-loading bad", text: `This did not load: ${err.message || err}` })); });
+}
+
+/** The phone's Type: the terminal takes keys only after it. */
+function setTyping(on) {
+  Z.typing = !!on;
+  const a = S.agents.get(S.zoomed);
+  if (Z.term) Z.term.options.disableStdin = !a?.running || (PHONE.matches && !Z.typing);
+  $("keybar").hidden = PHONE.matches ? !Z.typing : true;
+  if (Z.typing) Z.term?.focus(); else if (PHONE.matches) Z.term?.blur();
+  drawTermNote();
+  requestAnimationFrame(() => { try { Z.fit?.fit(); } catch { /* hidden */ } });
+}
+function drawTermNote() {
+  const a = S.agents.get(S.zoomed);
+  if (!a) return;
+  $("termnote").replaceChildren(...AG.termNote(a, { phone: PHONE.matches, typing: Z.typing, onType: () => setTyping(true), onDone: () => setTyping(false) }));
+}
+PHONE.addEventListener("change", () => { if (S.zoomed) setTyping(false); });
 
 function overlay(text) {
   const o = $("z-overlay");
@@ -775,7 +762,7 @@ function openZoomTerm(id) {
   const a = S.agents.get(id);
   const term = new window.Terminal({
     fontFamily: MONO, fontSize: 13, lineHeight: 1.0, cursorBlink: true, scrollback: 10000,
-    theme: termTheme(), macOptionIsMeta: true, allowProposedApi: false, disableStdin: !a.running,
+    theme: termTheme(), macOptionIsMeta: true, allowProposedApi: false, disableStdin: !a.running || (PHONE.matches && !Z.typing),
   });
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
@@ -810,7 +797,7 @@ function openZoomTerm(id) {
   let fitRaf = 0;
   Z.ro = new ResizeObserver(() => { cancelAnimationFrame(fitRaf); fitRaf = requestAnimationFrame(doFit); });
   Z.ro.observe(host);
-  if (a.running) setTimeout(() => { if (Z.term === term && $("z-body").dataset.tab === "term") term.focus(); }, 0);
+  if (a.running && !PHONE.matches) setTimeout(() => { if (Z.term === term && $("z-body").dataset.tab === "term") term.focus(); }, 0);
 }
 
 function closeZoomTerm() {
@@ -824,25 +811,33 @@ function closeZoomTerm() {
 function renderZoom() {
   const a = S.agents.get(S.zoomed);
   if (!a) return;
-  $("z-name").textContent = nameOf(a);
-  chip($("z-chip"), a);
-  $("z-branch").replaceChildren(icon("branch"), document.createTextNode(a.branch || "no branch"));
-  $("z-branch").title = a.cwd || "";
-  since($("z-since"), a.state_since);
-  $("z-since").title = "Time in this state";
-  const ask = a.state === "waiting";
-  $("z-ask").hidden = !ask;
-  $("z-ask-text").textContent = cap(a.waiting_for) || "Waiting for you";
-  $("z-stop").hidden = !a.running;
-  $("z-restart").hidden = a.running;
-  if (Z.term) Z.term.options.disableStdin = !a.running;
+  const proj = P.list.find((p) => p.path === a.repo);
+  const ready = proj && (proj.ready || []).find((r) => r.id === a.id);
+  const files = C.id === a.id && C.data ? (C.data.files || []).length : 0;
+  const mine = N.items.filter((it) => it.agent && it.agent.id === a.id);
+  const group = Shell.groupOf(a);
+  const headKey = JSON.stringify([a.name, a.state, a.state_since, a.task, a.branch, a.model, a.running, a.read_only, group, proj && proj.project, ready, Z.tab, files, mine.map((it) => it.id)]);
+  if (headKey !== Z.headKey) {
+    Z.headKey = headKey;
+    $("ag-head").replaceChildren(AG.head(a, {
+      group, project: proj && proj.project,
+      stat: ready ? { files: ready.files, added: ready.added, removed: ready.removed } : null,
+      ship: proj ? `#/p/${proj.project}/ship/${a.id}` : null,
+      onStop: () => confirmStop(a.id), onRestart: () => restartAgent(a.id), onTell: () => tellSheet(a),
+    }));
+    // The question it asks comes first (JOURNEYS.md): the one question card.
+    $("ag-q").replaceChildren(...mine.map((it) => Shell.needCard(it, { big: true })));
+    $("ag-tabs").replaceChildren(...AG.tabs(a, Z.tab === "term" ? "terminal" : Z.tab, { n: files }));
+    drawTermNote();
+  }
+  if (Z.term) Z.term.options.disableStdin = !a.running || (PHONE.matches && !Z.typing);
 
   const key = JSON.stringify([a.task, a.repo, a.cwd, a.branch, a.model, a.parent, a.children, a.pid, a.session_id, a.created, a.ended, a.exit_code, a.depth, a.read_only, a.restarted_from, a.resumed]);
   if (key === Z.factsKey) return;
   Z.factsKey = key;
   const link = (id) => {
     const o = S.agents.get(id);
-    return h("a", { onclick: () => zoom(id, { history: "replace" }), title: o?.task || id, text: o ? nameOf(o) : id });
+    return h("a", { href: `#/a/${id}`, title: o?.task || id, text: o ? nameOf(o) : id });
   };
   const rows = [];
   const fact = (k, v, title) => { if (v == null || v === "" || (Array.isArray(v) && !v.length)) return; rows.push(h("dt", { text: k }), h("dd", { title: title || (typeof v === "string" ? v : null) }, v)); };
@@ -950,16 +945,18 @@ function onEvent(ev) {
 }
 
 function setTab(tab, { focus = false } = {}) {
+  Z.tab = tab;
+  Z.headKey = "";
   $("z-body").dataset.tab = tab;
-  $("tab-term").setAttribute("aria-selected", String(tab === "term"));
-  $("tab-changes").setAttribute("aria-selected", String(tab === "changes"));
-  $("tab-events").setAttribute("aria-selected", String(tab === "events"));
-  if (tab === "term") requestAnimationFrame(() => { try { Z.fit?.fit(); } catch { /* hidden */ } });
+  if (tab === "progress" || tab === "preview") hostTab(tab);
+  if (tab !== "term" && Z.typing) setTyping(false);
+  $("keybar").hidden = !(PHONE.matches && Z.typing && tab === "term");
+  if (tab === "term") requestAnimationFrame(() => { try { Z.fit?.fit(); } catch { /* hidden */ } if (focus && !PHONE.matches) Z.term?.focus(); });
+  else if (Z.term?.textarea === document.activeElement) Z.term.blur();
   if (tab === "changes" && S.zoomed) {
     if (C.id !== S.zoomed || (!C.data && !C.err) || C.stale) loadChanges(S.zoomed, { fresh: C.stale });
     else if (C.want) renderChanges();
     if (focus) {
-      if (Z.term?.textarea === document.activeElement) Z.term.blur();
       requestAnimationFrame(() => {
         if (C.rows.length) setCursor(C.cursor >= 0 ? C.cursor : Math.max(0, C.rows.findIndex((r) => r.kind === "+")));
         else $("ch-scroll").focus({ preventScroll: true });
@@ -967,19 +964,30 @@ function setTab(tab, { focus = false } = {}) {
     }
   }
 }
-$("tab-term").addEventListener("click", () => { setTab("term"); Z.term?.focus(); });
-$("tab-changes").addEventListener("click", () => setTab("changes", { focus: true }));
-$("tab-events").addEventListener("click", () => setTab("events"));
 
-const KEYBAR = { esc: "\x1b", tab: "\t", stab: "\x1b[Z", up: "\x1b[A", down: "\x1b[B", cc: "\x03", enter: "\r" };
+/** "Tell X…": a sentence typed into its terminal, with Enter. */
+function tellSheet(a) {
+  const box = h("textarea", { class: "field", rows: 3, placeholder: `What should ${nameOf(a)} do next?`, "aria-label": `Tell ${nameOf(a)}` });
+  const send = async (done) => {
+    const text = box.value.trim();
+    if (!text) { box.focus(); return; }
+    try { await api(`/api/agents/${encodeURIComponent(a.id)}/input`, { method: "POST", body: { text, enter: true } }); toast(`Sent to ${nameOf(a)}`); noteActive(); done(); }
+    catch (e) { toast(`Not sent: ${e.message}`, true); }
+  };
+  const s = Shell.sheet({ kicker: nameOf(a), title: `Tell ${nameOf(a)}`, body: [box, h("p", { text: "Typed into its terminal with Enter, as if you typed it there." })],
+    actions: (done) => [h("button", { class: "btn", type: "button", onclick: done }, "Cancel"), h("button", { class: "btn primary", type: "button", onclick: () => send(done) }, "Send")] });
+  box.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(s.close); } });
+  requestAnimationFrame(() => box.focus());
+}
+
+// The keys under the terminal on a phone: the digits insert a digit and
+// need Send (UX critique, issue 5); Send is Enter.
+const KEYBAR = { esc: "\x1b", tab: "\t", stab: "\x1b[Z", up: "\x1b[A", down: "\x1b[B", cc: "\x03", enter: "\r", 1: "1", 2: "2", 3: "3" };
 $("keybar").addEventListener("pointerdown", (e) => e.preventDefault()); // keep the terminal's focus
 $("keybar").addEventListener("click", (e) => {
   const k = e.target.closest("button")?.dataset.k;
-  if (k && Z.sock) Z.sock.send(KEYBAR[k]);
+  if (k && Z.sock && Z.typing) Z.sock.send(KEYBAR[k]);
 });
-
-$("z-back").addEventListener("click", () => unzoom());
-$("z-stop").addEventListener("click", () => S.zoomed && confirmStop(S.zoomed));
 
 // --------------------------------------------------------------- dialogs
 
@@ -990,16 +998,14 @@ for (const d of document.querySelectorAll("dialog")) {
     if (e.target.closest("[data-close]") || e.target === d) d.close();
   });
   d.addEventListener("close", () => {
-    if (S.zoomed && S.agents.get(S.zoomed)?.running) Z.term?.focus();
+    if (S.zoomed && S.agents.get(S.zoomed)?.running && Z.tab === "term" && !PHONE.matches) Z.term?.focus();
     else if (S.selected) S.tiles.get(S.selected)?.el.focus({ preventScroll: true });
   });
 }
 
 function showHelp() {
-  if (openDialog()) return;
-  const v = S.health?.version;
-  $("help-version").textContent = v ? `chloedb-workbench ${v}` : "";
-  $("help-dialog").showModal();
+  if (openDialog() || Shell.sheetOpen()) return;
+  Shell.keysSheet();
 }
 
 function recentRepos() {
@@ -1007,112 +1013,11 @@ function recentRepos() {
   return Array.isArray(list) ? list.filter((x) => typeof x === "string") : [];
 }
 
-function branchHelp() {
-  const name = $("f-name").value || "<name>";
-  const help = $("wt-help");
-  help.replaceChildren();
-  if ($("f-wt").checked) {
-    help.append("A new branch ", h("code", { text: `wb/${name}` }), " from the repository's HEAD, so agents don't step on each other.");
-  } else {
-    help.append("Off: the session runs in the repository's own checkout, on its current branch.");
-  }
-}
-
-function openNew() {
-  if (openDialog()) return;
-  const repo = store("local", REPO_KEY) || "";
-  $("f-repo").value = repo;
-  $("f-repo").removeAttribute("aria-invalid");
-  $("f-task").value = "";
-  $("f-name").value = "";
-  $("f-model").value = store("local", MODEL_KEY) || "";
-  $("f-wt").checked = true;
-  $("f-ro").checked = false;
-  $("f-ask").checked = false; askHelp(); // Sixth build: Ask before edits, off
-  $("new-err").hidden = true;
-  $("new-go").disabled = false;
-  branchHelp();
-  $("new-dialog").showModal();
-  (repo ? $("f-task") : $("f-repo")).focus();
-}
-
-$("f-name").addEventListener("input", (e) => {
-  const el = e.target;
-  const clean = el.value.toLowerCase().replace(/[\s_]+/g, "-").replace(/[^a-z0-9-]/g, "").slice(0, 32);
-  if (clean !== el.value) el.value = clean;
-  branchHelp();
-});
-$("f-wt").addEventListener("change", branchHelp);
-// Sixth build, E: the servers agents start, the stop choice and the repository box (ui/levels/lifecycle.js).
+// Sixth build, E: the servers agents start and the stop choice (ui/levels/lifecycle.js).
 let LC = null;
-import("/levels/lifecycle.js").then((m) => { LC = m; m.attachRepoBox($("f-repo"), { api, recent: recentRepos, next: () => $("f-task").focus() }); }).catch(() => {});
-// Sixth build: what an agent may do in its worktree without asking (flow::worktree_allow).
-function askHelp() {
-  const wt = $("f-wt").checked;
-  $("f-ask").disabled = !wt;
-  $("ask-help").textContent = !wt ? "Without its own worktree it asks as Claude Code does."
-    : $("f-ask").checked ? "On: it asks you before each edit, test run and git command, as Claude Code does."
-    : "Off: in its own worktree it edits and reads files, runs the tests, uses git locally (no push) and Workbench's and ChloeCtx's tools without asking. Guarded commands, and anything outside the worktree, still ask.";
-}
-$("f-wt").addEventListener("change", askHelp);
-$("f-ask").addEventListener("change", askHelp);
-// Model routing: which model tasks like this one did best on (ui/levels/route-hint.js).
-import("/levels/route-hint.js").then((m) => m.attach($("new-dialog"), { api })).catch(() => {});
-// Fifth build: autocomplete and intent checks for the task and Ask why (ui/levels/complete.js).
-import("/levels/complete.js").then((m) => { const c = { api, go: (hash) => { if ($("new-dialog").open) $("new-dialog").close(); route(hash, { push: true }); } }; m.attachComplete($("f-task"), { field: "task", ctx: c, repo: () => $("f-repo").value.trim(), checkExtra: () => ($("f-ro").checked ? { read_only: true } : {}), onSet: (set) => { if (set.read_only != null) $("f-ro").checked = !!set.read_only; } }); m.attachComplete($("ask-q"), { field: "why", ctx: c, repo: () => D.repo || "" }); }).catch(() => {});
-$("f-task").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("new-form").requestSubmit(); }
-});
-
-function newError(text) {
-  $("new-err").textContent = text;
-  $("new-err").hidden = false;
-}
-
-$("new-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const repo = $("f-repo").value.trim();
-  const task = $("f-task").value.trim();
-  const name = $("f-name").value.trim();
-  const model = $("f-model").value.trim();
-  const worktree = $("f-wt").checked;
-  const readOnly = $("f-ro").checked;
-  $("new-err").hidden = true;
-  if (!repo || !(repo.startsWith("/") || /^[A-Za-z]:[\\/]/.test(repo))) {
-    $("f-repo").setAttribute("aria-invalid", "true");
-    $("f-repo").focus();
-    newError("The repository is an absolute path, such as /home/you/src/project.");
-    return;
-  }
-  $("f-repo").removeAttribute("aria-invalid");
-  if (name && !/^[a-z0-9-]{1,32}$/.test(name)) { newError("A name is lowercase letters, digits and hyphens, at most 32."); return; }
-  const body = { repo, worktree };
-  if (worktree && $("f-ask").checked) body.ask_edits = true;
-  if (task) body.task = task;
-  if (name) body.name = name;
-  if (model) body.model = model;
-  if (readOnly) body.read_only = true;
-  $("new-go").disabled = true;
-  try {
-    const { agent } = await api("/api/agents", { method: "POST", body });
-    store("local", REPO_KEY, repo);
-    store("local", REPOS_KEY, JSON.stringify([repo, ...recentRepos().filter((r) => r !== repo)].slice(0, 8)));
-    store("local", MODEL_KEY, model || null);
-    $("new-dialog").close();
-    if (agent) {
-      upsert(agent);
-      toast(`Started ${nameOf(agent)}${agent.branch ? ` on ${agent.branch}` : ""}`);
-      if (!task) zoom(agent.id); // it waits at a prompt: take the user there
-      else requestAnimationFrame(() => { select(agent.id); S.tiles.get(agent.id)?.flash(); });
-    }
-  } catch (err) {
-    const max = S.health?.max_agents;
-    if (err.status === 429) newError(`${err.message}${max ? ` (at most ${max} run at once)` : ""}. Stop one first.`);
-    else newError(err.message);
-  } finally {
-    $("new-go").disabled = false;
-  }
-});
+import("/levels/lifecycle.js").then((m) => { LC = m; }).catch(() => {});
+// Fifth build: autocomplete and intent checks for Ask why (ui/levels/complete.js).
+import("/levels/complete.js").then((m) => { const c = { api, go }; m.attachComplete($("ask-q"), { field: "why", ctx: c, repo: () => D.repo || "" }); }).catch(() => {});
 
 let confirmFor = null;
 function confirmStop(id) {
@@ -1143,16 +1048,11 @@ async function doStop() {
   }
 }
 $("confirm-yes").addEventListener("click", doStop);
-$("z-restart").addEventListener("click", () => { if (S.zoomed) restartAgent(S.zoomed); });
 $("confirm-no").addEventListener("click", () => { confirmFor = null; $("confirm-dialog").close(); });
 $("confirm-dialog").addEventListener("keydown", (e) => {
   if (e.key === "y" || e.key === "Y") { e.preventDefault(); doStop(); }
   else if (e.key === "n" || e.key === "N") { e.preventDefault(); confirmFor = null; $("confirm-dialog").close(); }
 });
-
-$("new-btn").addEventListener("click", openNew);
-$("empty-new").addEventListener("click", openNew);
-$("help-btn").addEventListener("click", showHelp);
 
 // -------------------------------------------------------- decision trail
 // SPEC.md, "Decision trail": the Changes tab (the agent's diff), the
@@ -1226,7 +1126,8 @@ function ancestry(a) {
 function goAgent(a, opts) {
   if (!a) return;
   if (!S.agents.has(a.id)) upsert({ ...a });
-  zoom(a.id, opts);
+  const t = opts && opts.tab;
+  go(`#/a/${a.id}${t ? "/" + (t === "term" ? "terminal" : t) : ""}`);
 }
 
 function agentChip(a, { self = false, keepSheet = false } = {}) {
@@ -1276,7 +1177,7 @@ function showBlastSummary(id, fresh) {
   blastSummary ||= import("/levels/blast-summary.js").then((m) => {
     const host = h("div", { class: "ch-blast" });
     $("ch-scroll").before(host);
-    return m.mount(host, { api, go: (hash) => route(hash, { push: true }) });
+    return m.mount(host, { api, go });
   }).catch((err) => { console.error(err); return null; });
   blastSummary.then((s) => s && s.show(id, { fresh }));
 }
@@ -1313,7 +1214,7 @@ function statusOf(s) {
 
 function renderChanges() {
   const box = $("ch-scroll");
-  const badge = $("tab-changes-n");
+  const badge = document.querySelector("#ag-tabs .n") || { textContent: "" };
   const sum = $("ch-sum");
   const cur = C.rows[C.cursor];
   const keep = cur ? { path: cur.path, n: cur.n, old: cur.old, kind: cur.kind } : null;
@@ -1839,7 +1740,7 @@ async function enrichFromDecisions(card) {
 
 function showInChanges(a, path, line) {
   C.want = { path, n: line, kind: "+" };
-  if (S.zoomed === a.id) { setTab("changes"); if (C.data && C.id === a.id) renderChanges(); return; }
+  if (S.zoomed === a.id && Z.tab === "changes") { if (C.data && C.id === a.id) renderChanges(); return; }
   goAgent(a, { tab: "changes" });
 }
 
@@ -2241,85 +2142,67 @@ const TL_LINKS = $("tl-links");
 const TL_HOT = $("tl-hot");
 const D = { open: false, repo: null, list: [], missing: [], req: 0, prevZoom: null, lanes: [], cur: -1, cards: [], focus: null, loading: false, err: null };
 
-// Sixth build (ui/levels/repos.js, src/repos.rs): repositories opened
-// without an agent. `opened` is the one the picker opened last: the
-// screens read it unless an agent is zoomed; `server` is GET /api/repos.
-const RP = { opened: store("local", "chloedb-workbench-open-repo") || null, server: [] };
-function loadRepos() { if (S.token) api("/api/repos").then((j) => { RP.server = j.repos || []; }, () => {}); }
+// Sixth build (ui/levels/repos.js, src/repos.rs): a project opened with the
+// picker (the window event `wb-repo`) becomes the project in focus.
 window.addEventListener("wb-repo", (e) => {
-  RP.opened = e.detail || null;
-  loadRepos();
-  if (D.open && RP.opened && RP.opened !== D.repo) { D.repo = RP.opened; fillRepos(); loadDecisions(); }
-  // The screen in view reads the repository again.
-  if (L.screen) { const [s, p, q] = [L.screen, L.param, L.query || ""]; closeLevelView(); openLevel(s, p, { how: "none", query: q }); }
+  if (e.detail) store("local", PROJECT_KEY, e.detail);
+  refreshProjects().then(() => { if (D.open && e.detail && e.detail !== D.repo) { D.repo = e.detail; fillRepos(); loadDecisions(); } });
 });
 
 function knownRepos() {
   const seen = new Map();
   for (const a of S.agents.values()) if (a.repo) seen.set(a.repo, Math.max(seen.get(a.repo) || 0, toMs(a.state_since) || 0, toMs(a.created) || 0));
-  for (const r of RP.server) if (r.path && r.exists !== false) seen.set(r.path, Math.max(seen.get(r.path) || 0, r.last_ms || 0));
+  for (const r of P.list) if (r.path && r.exists !== false) seen.set(r.path, Math.max(seen.get(r.path) || 0, r.last_activity_ms || r.last_ms || 0));
   for (const r of recentRepos()) if (!seen.has(r)) seen.set(r, 0);
   if (D.repo && !seen.has(D.repo)) seen.set(D.repo, 0);
   return [...seen.entries()].sort((x, y) => y[1] - x[1]).map(([r]) => r);
 }
 
+/** The repository the old screens read: the agent page's, else the project in focus. */
 function pickRepo() {
-  const z = S.agents.get(S.zoomed || D.prevZoom || (RP.opened ? null : S.selected));
+  const z = S.agents.get(S.zoomed);
   if (z?.repo) return z.repo;
-  if (RP.opened) return RP.opened;
+  const p = currentProject();
+  if (p) return p.path;
   const saved = store("local", DEC_REPO_KEY);
   const list = knownRepos();
   if (saved && list.includes(saved)) return saved;
   return list[0] || saved || null;
 }
 
-function openDecisions({ history: how = "push", repo, focus, open = false } = {}) {
+/** The Decisions timeline (More › Decisions timeline, #/more/decisions). */
+function openDecisions({ repo, focus, open = false } = {}) {
   if (focus) { D.focus = focus; D.focusOpen = open; }
-  const wanted = repo || (D.open ? D.repo : pickRepo());
-  if (D.open) {
-    if (wanted && wanted !== D.repo) { D.repo = wanted; fillRepos(); loadDecisions(); } else if (focus) { highlightDecision(focus, { open }); D.focus = null; }
-    return;
-  }
-  if (T.open && T.kind === "line") closeSheet({ focus: false });
-  if (L.screen) leaveLevels();
-  D.prevZoom = S.zoomed;
-  if (S.zoomed) {
-    closeZoomTerm();
-    S.zoomed = null;
-    $("zoom-view").hidden = true;
-  }
-  $("grid-view").hidden = true;
-  $("dec-view").hidden = false;
-  D.open = true;
-  $("dec-btn").setAttribute("aria-pressed", "true");
-  if (how === "push") history.pushState({ decisions: true }, "", "#decisions");
-  else if (how === "replace") history.replaceState({ decisions: true, root: true }, "", "#decisions");
-  D.repo = wanted;
-  fillRepos();
-  loadDecisions();
-  render();
+  if (!D.open) { if (repo) D.want = repo; go("#/more/decisions"); return; }
+  const wanted = repo || D.repo;
+  if (wanted && wanted !== D.repo) { D.repo = wanted; fillRepos(); loadDecisions(); } else if (focus) { highlightDecision(focus, { open }); D.focus = null; }
 }
 
-function closeDecisions({ fromHistory = false } = {}) {
+/** The router shows it. */
+function showDecisions() {
+  if (T.open && T.kind === "line") closeSheet({ focus: false });
+  $("dec-view").hidden = false;
+  if (D.open) return;
+  D.open = true;
+  D.repo = D.want || pickRepo();
+  D.want = null;
+  fillRepos();
+  loadDecisions();
+}
+
+function closeDecisions() {
   if (!D.open) return;
-  if (!fromHistory && history.state?.decisions && !history.state.root) { history.back(); return; }
-  if (!fromHistory) history.replaceState(null, "", location.pathname + location.search);
   D.open = false;
-  $("dec-btn").setAttribute("aria-pressed", "false");
   $("dec-view").hidden = true;
   if (T.open && T.kind === "decision") closeSheet({ focus: false });
-  const back = D.prevZoom;
-  D.prevZoom = null;
-  if (!fromHistory && back && S.agents.has(back)) { zoom(back, { history: "replace" }); return; }
-  if (!S.zoomed) $("grid-view").hidden = false;
-  render();
 }
 
 function fillRepos() {
   const sel = $("dec-repo");
   const list = knownRepos();
-  sel.replaceChildren(...list.map((r) => h("option", { value: r, text: shortPath(r) })));
-  if (!list.length) sel.append(h("option", { value: "", text: "no repository yet" }));
+  const names = projectNames();
+  sel.replaceChildren(...list.map((r) => h("option", { value: r, text: names[r] || shortPath(r) })));
+  if (!list.length) sel.append(h("option", { value: "", text: "no project yet" }));
   sel.value = D.repo || "";
   sel.title = D.repo || "";
 }
@@ -2331,8 +2214,6 @@ $("dec-repo").addEventListener("change", (e) => {
   $("ask-out").hidden = true;
   loadDecisions();
 });
-$("dec-back").addEventListener("click", () => closeDecisions());
-$("dec-btn").addEventListener("click", () => (D.open ? closeDecisions() : openDecisions()));
 
 async function loadDecisions(fresh = false) {
   const req = ++D.req;
@@ -2720,9 +2601,8 @@ function trailKey(e) {
   if (T.open && T.player && k === "e") { T.player.key(e); return true; }
   if (T.open && (k === "f" || k === "F")) { toggleWide(); return true; }
   if (T.open && k === "Backspace" && T.stack.length) { sheetBack(); return true; }
-  if (k === "d") { if (D.open) closeDecisions(); else openDecisions(); return true; }
-  if (S.zoomed && k === "c") { setTab("changes", { focus: true }); return true; }
-  if (S.zoomed && k === "t") { setTab("term"); Z.term?.focus(); return true; }
+  if (S.zoomed && k === "c" && !e.target.closest?.("#ag-q")) { go(`#/a/${S.zoomed}/changes`); return true; }
+  if (S.zoomed && k === "t" && !e.target.closest?.("#ag-q")) { go(`#/a/${S.zoomed}/terminal`); return true; }
   if (changesVisible() && !inSheet && changesKey(e)) return true;
   if (D.open && !inSheet && decisionsKey(e)) return true;
   return false;
@@ -2744,28 +2624,39 @@ const ARROWS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDow
 
 function target() { return S.zoomed || S.selected || S.order[0] || null; }
 
+/** n: Start a change in the project in focus, else a new project. */
+function newHere() {
+  const p = currentProject();
+  go(p ? `#/p/${p.project}/change` : "#/new");
+}
+
+/** Out of the terminal, to the agent's Progress. */
+function leaveTerminal() {
+  if (!S.zoomed) return;
+  if (Z.term?.textarea === document.activeElement) Z.term.blur();
+  if (Z.typing) setTyping(false);
+  go(`#/a/${S.zoomed}`);
+}
+
+/** After Ctrl-b (it works everywhere, inside a terminal too). */
 function runCommand(e) {
   const k = e.key;
-  if (k === "n") return openNew(), true;
+  if (k === "n") return newHere(), true;
   if (k === "?" || (k === "/" && e.shiftKey)) return showHelp(), true;
-  if (k === "z") {
-    if (S.zoomed) unzoom();
-    else if (target()) zoom(target());
-    return true;
-  }
+  if (k === "Escape" || k === "z") { leaveTerminal(); return true; }
   if (k === "x") { const id = target(); if (id) confirmStop(id); return true; }
-  if (k === "d") { if (D.open) closeDecisions(); else openDecisions(); return true; }
-  if (k === "c" && S.zoomed) { setTab("changes", { focus: true }); return true; }
-  if (k === "t" && S.zoomed) { setTab("term"); Z.term?.focus(); return true; }
+  if (k === "d") { go("#/more/decisions"); return true; }
+  if (k === ".") { Shell.toggle("needs"); return true; }
+  if (k === "c" && S.zoomed) { go(`#/a/${S.zoomed}/changes`); return true; }
+  if (k === "t" && S.zoomed) { go(`#/a/${S.zoomed}/terminal`); return true; }
   if (ARROWS[k]) return move(ARROWS[k]), true;
-  if (/^[1-9]$/.test(k)) { const id = S.order[Number(k) - 1]; if (id) zoom(id, { history: S.zoomed ? "replace" : "push" }); return true; }
+  if (/^[1-9]$/.test(k)) { const id = S.order[Number(k) - 1]; if (id) go(`#/a/${id}/terminal`); return true; }
   return false;
 }
 
-/** Whether the zoomed agent's terminal shows and its agent runs. */
+/** Whether the agent page's terminal shows and its agent runs. */
 function zoomTermShown() {
-  const tab = $("z-body").dataset.tab;
-  return !!S.zoomed && !$("zoom-view").hidden && (!tab || tab === "term") && !!S.agents.get(S.zoomed)?.running;
+  return !!S.zoomed && !$("zoom-view").hidden && Z.tab === "term" && !!S.agents.get(S.zoomed)?.running;
 }
 
 /** Esc typed into a busy agent's terminal: say what it did, and how to leave. */
@@ -2773,18 +2664,81 @@ let escNoted = 0;
 function escapeNote(a) {
   if (!a || !["working", "waiting"].includes(a.state) || Date.now() - escNoted < 8000) return;
   escNoted = Date.now();
-  toast(`Esc went to ${nameOf(a)}: Claude Code stops what it is doing. To leave the terminal, press Ctrl-Esc.`);
+  toast(`Esc went to ${nameOf(a)}: Claude Code stops what it is doing. To leave the terminal, press Ctrl-b Esc.`);
+}
+
+// The goal pages' keys (UX critique, issue 6; power users, 4): j/k between
+// cards, ] [ to the next card that needs you, a digit then Enter answers
+// (the card's own keys), x selects, Shift and a digit answers the selected
+// alike, g and a letter goes to a goal, . the drawer, a the agents.
+const CARD = ".qc, .alert-card, .wait-card";
+function surface() {
+  if (Shell.isOpen()) return $("ov");
+  if (!$("zoom-view").hidden) return $("zoom-view");
+  if (!$("grid-view").hidden) return $("grid-view");
+  return $("goal-view");
+}
+function visible(list) { return list.filter((c) => c.offsetParent !== null); }
+function moveIn(sel, d) {
+  const list = visible([...surface().querySelectorAll(sel)]);
+  if (!list.length) return false;
+  const cur = document.activeElement && document.activeElement.closest ? document.activeElement.closest(sel) : null;
+  const i = list.indexOf(cur);
+  const j = i < 0 ? (d > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, i + d));
+  list[j].focus({ preventScroll: true });
+  list[j].scrollIntoView({ block: "nearest", behavior: "smooth" });
+  return true;
+}
+const GP = { g: false, t: 0 };
+function goalKey(e) {
+  const k = e.key;
+  if (GP.g) {
+    GP.g = false;
+    const p = currentProject();
+    const to = { s: "#/", c: p ? `#/p/${p.project}` : "#/p", r: p ? `#/p/${p.project}/ship` : "#/p", d: "#/debug", t: "#/more/terminals", n: "#/needs" }[k];
+    if (to) { go(to); return true; }
+    return false;
+  }
+  if (k === "g") { GP.g = true; clearTimeout(GP.t); GP.t = setTimeout(() => { GP.g = false; }, 1500); return true; }
+  if (G.view && G.view.onKey) { try { if (G.view.onKey(e)) return true; } catch (err) { console.error(err); } }
+  if (k === ".") { Shell.toggle("needs"); return true; }
+  if (k === "a") { Shell.toggle("agents"); return true; }
+  if (k === "?") { showHelp(); return true; }
+  if (k === "n") { newHere(); return true; }
+  if (k === "z" && !S.zoomed) { PREFS.set("compact", !PREFS.get("compact")); toast(PREFS.get("compact") ? "Compact rows: one line per agent" : "Compact rows off"); return true; }
+  if (e.shiftKey && /^Digit[1-9]$/.test(e.code)) { Shell.batchAnswer(e.code.slice(5)); return true; }
+  if (k === "x") { const c = document.activeElement?.closest?.(CARD); if (c) { Shell.toggleSelect(c); return true; } return false; }
+  if (k === "j" || k === "k") return moveIn(CARD, k === "j" ? 1 : -1) || moveIn("[data-nav], [data-href]", k === "j" ? 1 : -1);
+  if (k === "]" || k === "[") {
+    if (moveIn(CARD, k === "]" ? 1 : -1)) return true;
+    if (!Shell.isOpen() && N.count) { Shell.open("needs"); return true; }
+    return false;
+  }
+  if (k === "Enter") {
+    const t = e.target.closest?.("[data-href]");
+    if (t && !e.target.closest("a, button")) { go(t.dataset.href); return true; }
+  }
+  return false;
+}
+
+/** Esc outside a terminal: close what is open, else up one level. */
+function escape() {
+  if (Shell.closeSheet()) return;
+  if (Shell.close()) return;
+  if (T.open) { closeSheet(); return; }
+  const c = Shell.crumbs();
+  if (c.length > 1) go(c[c.length - 2].href);
 }
 
 window.addEventListener("keydown", (e) => {
   if (e.isComposing || !$("gate").hidden) return;
+  noteActive();
   if (S.prefix) {
     if (["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(e.key)) return;
     e.preventDefault();
     e.stopPropagation();
     setPrefix(false);
     if (e.ctrlKey && (e.key === "b" || e.key === "B")) { Z.sock?.send("\x02"); return; } // C-b C-b: a literal C-b
-    if (e.key === "Escape") { if (S.zoomed) unzoom(); return; }
     runCommand(e);
     return;
   }
@@ -2795,42 +2749,38 @@ window.addEventListener("keydown", (e) => {
     setPrefix(true);
     return;
   }
-  // Sixth build: Ctrl-Esc leaves a zoomed terminal from anywhere, the
-  // terminal included; Esc there is the agent's (Claude Code interrupts
-  // with it), so leaving never sends it.
-  if (e.key === "Escape" && e.ctrlKey && !e.altKey && !e.metaKey && S.zoomed && !openDialog()) { e.preventDefault(); e.stopPropagation(); unzoom(); return; }
+  // Ctrl-Esc leaves the terminal from anywhere, the terminal included; Esc
+  // there is the agent's (Claude Code interrupts with it), so leaving never
+  // sends it.
+  if (e.key === "Escape" && e.ctrlKey && !e.altKey && !e.metaKey && S.zoomed && !openDialog()) { e.preventDefault(); e.stopPropagation(); leaveTerminal(); return; }
+  // A sheet (the grant check, a batch answer, Tell, the keys) has the keys while it is open.
+  if (Shell.sheetOpen()) { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); Shell.closeSheet(); } return; }
   if (e.key === "Escape" && e.target.id === "ask-q" && !openDialog()) { e.preventDefault(); e.target.blur(); if (!$("ask-out").hidden) $("ask-out").hidden = true; return; }
+  // ⌘↵ on a page that has a goal to send (New project's steps).
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && G.view && G.view.onKey) { try { if (G.view.onKey(e)) { e.preventDefault(); return; } } catch (err) { console.error(err); } }
+  if (e.key === "Escape" && inField(e.target) && !openDialog() && !e.target.closest(".qc")) { e.target.blur(); return; }
   if (openDialog() || inField(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
   const inTerm = e.target.classList?.contains("xterm-helper-textarea");
   // Every other key belongs to the agent, Esc included, while it runs: no
-  // single-key shortcut fires in a terminal (a zoomed one, or one a screen
-  // shows).
+  // single-key shortcut fires in a terminal.
   if (inTerm && (!S.zoomed || S.agents.get(S.zoomed)?.running)) {
     if (e.key === "Escape" && S.zoomed) escapeNote(S.agents.get(S.zoomed));
     return;
   }
-  if (e.key === "Escape" && T.open) { e.preventDefault(); closeSheet(); return; }
-  if (e.key === "Escape" && D.open) { e.preventDefault(); closeDecisions(); return; }
-  if (e.key === "Escape" && S.zoomed) { e.preventDefault(); unzoom(); return; }
-  // In a zoomed terminal, typing goes to the agent even when the focus has
-  // left the terminal (a sentence once began with "n", New agent): a
-  // printable key focuses the terminal and is typed there. Workbench's own
-  // keys there take Ctrl-b; [ and ] still move between levels.
-  if (zoomTermShown() && !T.open && !D.open && e.key.length === 1 && e.key !== "[" && e.key !== "]") {
+  if (e.key === "Escape") { e.preventDefault(); escape(); return; }
+  // On a desktop, typing on the Terminal tab goes to the agent even when the
+  // focus has left the terminal (a sentence once began with "n").
+  if (zoomTermShown() && !PHONE.matches && !T.open && !Shell.isOpen() && !e.target.closest?.("#ag-q, #ag-head, #ag-tabs") && e.key.length === 1 && e.key !== "[" && e.key !== "]") {
     e.preventDefault(); e.stopPropagation();
     Z.term?.focus();
     Z.sock?.send(e.key);
     return;
   }
-  if (!inTerm && L.screen && !T.open && levelKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
   if (!inTerm && trailKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
-  if (!inTerm && !T.open && (e.key === "[" || e.key === "]") && levelKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
-  if (e.key === "Enter" && !S.zoomed && e.target.closest?.(".tile")) { e.preventDefault(); zoom(e.target.closest(".tile").dataset.id); return; }
-  if (!S.zoomed && !D.open && ARROWS[e.key] && (e.target.closest?.(".tile") || e.target === document.body)) { e.preventDefault(); move(ARROWS[e.key]); return; }
-  if (e.key === "/" && !inTerm && !T.open && L.screen !== "library") { e.preventDefault(); openQuickSearch(); return; }
-  // Without the prefix only n, z and ? act: stop, digits and (in zoom) arrows
-  // need it, so a stray key never stops or switches an agent.
-  if ((e.key === "n" || e.key === "z" || e.key === "?") && runCommand(e)) e.preventDefault();
+  if (e.key === "Enter" && !$("grid-view").hidden && e.target.closest?.(".tile")) { e.preventDefault(); go(`#/a/${e.target.closest(".tile").dataset.id}/terminal`); return; }
+  if (!$("grid-view").hidden && ARROWS[e.key] && (e.target.closest?.(".tile") || e.target === document.body)) { e.preventDefault(); move(ARROWS[e.key]); return; }
+  if (e.key === "/" && !T.open && !(G.r && G.r.page === "more" && G.r.item === "library")) { e.preventDefault(); openQuickSearch(); return; }
+  if (goalKey(e)) { e.preventDefault(); e.stopPropagation(); }
 }, true);
 
 // A click anywhere drops an armed prefix, as a key would.
@@ -2845,167 +2795,34 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   T.player?.retheme();
 });
 
-
-// ---------------------------------------------------------------- levels
+// ---------------------------------------------------------------- the pages
 //
-// SPEC.md, "Levels (third build)": the screens above the terminal, each an
-// ES module in ui/levels/ mounted into #level-view. Routes are hashes,
-// #/mission, #/story/<agent>, …; the top bar's level switch and [ ] move
-// between Intent, Plan, Story, Changes and Terminal for what is in focus.
+// JOURNEYS.md, "URL routes": the hash names a page (ui/goals/router.js);
+// the old hashes redirect. A goal page is a module with mount(root, ctx)
+// in ui/goals/ (Review and Debug are R2's, review.js and debug.js; until
+// they are served the old Ship, Trace and Health screens stand in).
 
-// Sixth build: "guide", GUIDE.md (ui/levels/guide.js).
-const SCREENS = ["mission", "decide", "map", "story", "preview", "flow", "away", "health", "ship", "library", "trace", "guide"];
-const LEVEL_OF = { mission: 0, away: 0, guide: 0, decide: 1, flow: 1, health: 1, library: 1, trace: 1, story: 2, map: 3, preview: 3, ship: 3, grid: 4, zoom: 4 };
 // Search (fourth build): the top bar's quick search over code, docs and decisions; `/` opens it.
-const quickCtx = () => ({ api, go: (hash) => route(hash, { push: true }), openWhy: ({ agent, path, line, text, commit }) => openLineCard(agent, path, line, { text, commit }), repo: () => pickRepo() || "", openDecisions: () => openDecisions() });
+const quickCtx = () => ({ api, go, openWhy: ({ agent, path, line, text, commit }) => openLineCard(agent, path, line, { text, commit }), repo: () => pickRepo() || "", openDecisions: () => openDecisions() });
 function openQuickSearch() { import("/levels/quicksearch.js").then((m) => m.open(quickCtx())).catch((err) => console.error(err)); }
 import("/levels/quicksearch.js").then((m) => m.install(quickCtx())).catch(() => {});
-const L = { screen: null, param: null, view: null, req: 0, recent: [], focus: null };
+const L = { recent: [] };
 
-function levelCtx(param) {
+/** The context the old screens (ui/levels/) are mounted with. */
+function levelCtx(param, extra = {}) {
   return {
     api,
-    state: levelState(),
-    // The repository: read when a screen asks, so it follows the agents the
-    // stream has brought in by then.
-    params: { agent: param || null, get repo() { return pickRepo() || null; } },
-    go: (hash) => route(hash, { push: true }),
+    get state() { return levelState(); },
+    params: { agent: param || null, get repo() { return extra.repo || pickRepo() || null; }, ...Object.fromEntries(Object.entries(extra).filter(([k]) => k !== "repo")) },
+    go,
     openWhy: ({ agent, path, line, text, commit }) => openLineCard(agent, path, line, { text, commit }),
     openRewind: (o) => openRewindCard(o),
-    zoom: (id) => zoom(id),
+    zoom: (id) => go(`#/a/${id}/terminal`),
   };
 }
 
 function levelState() {
   return { agents: [...S.agents.values()], events: L.recent };
-}
-
-/** The agent the levels are about: the zoomed one, the story's, or the selected one. */
-function focusAgent() {
-  if (S.zoomed) return S.zoomed;
-  if ((L.screen === "story" || L.screen === "preview" || L.screen === "ship") && L.param) return liveId(L.param);
-  const id = L.focus || S.selected || null;
-  return id ? liveId(id) : null;
-}
-
-function hideOtherViews() {
-  if (S.zoomed) { closeZoomTerm(); S.zoomed = null; $("zoom-view").hidden = true; }
-  if (D.open) { D.open = false; $("dec-view").hidden = true; $("dec-btn").setAttribute("aria-pressed", "false"); }
-  $("grid-view").hidden = true;
-}
-
-async function openLevel(screen, param, { how = "push", query = "" } = {}) {
-  if (!SCREENS.includes(screen)) return;
-  if ((screen === "story" || screen === "preview" || screen === "ship") && !param) {
-    param = focusAgent() || [...S.agents.values()].filter((a) => a.running).sort(byCreated).find((a) => a.state === "working")?.id
-      || [...S.agents.values()].sort(byCreated)[0]?.id || null;
-  }
-  if ((screen === "preview" || screen === "ship") && param) param = liveId(param);
-  // A screen's own parameters ride after "?" (#/trace?q=…) and stay in the hash.
-  const hash = `#/${screen}${param ? "/" + param : ""}${query ? "?" + query : ""}`;
-  if (how === "push" && location.hash !== hash) history.pushState({ level: hash }, "", hash);
-  else if (how === "replace") history.replaceState({ level: hash, root: true }, "", hash);
-  // Only an agent is a focus: #/library/code and #/health/<incident> are not
-  // (sixth build: Story said "There is no agent code").
-  if (param && (screen === "story" || screen === "preview" || screen === "ship")) L.focus = param;
-  if (L.screen === screen && L.param === param && L.view && (L.query || "") === query) { markLevels(); return; }
-  hideOtherViews();
-  closeLevelView();
-  L.screen = screen;
-  L.param = param;
-  L.query = query;
-  document.body.classList.add("levels-on");
-  const host = $("level-view");
-  host.hidden = false;
-  host.replaceChildren(h("div", { class: "lv-loading", text: "Loading…" }));
-  markLevels();
-  const req = ++L.req;
-  try {
-    // The agents first (the stream's snapshot), so a screen opened by its
-    // address knows the fleet and its repository.
-    const [mod] = await Promise.all([import(`/levels/${screen}.js`), Promise.race([firstSnapshot, new Promise((r) => setTimeout(r, 3000))])]);
-    if (req !== L.req) return;
-    host.replaceChildren();
-    L.view = mod.mount(host, levelCtx(param));
-  } catch (err) {
-    if (req !== L.req) return;
-    host.replaceChildren(h("div", { class: "lv-loading bad", text: `This screen did not load: ${err.message || err}` }));
-  }
-}
-
-function closeLevelView() {
-  try { L.view?.unmount(); } catch (err) { console.error(err); }
-  L.view = null;
-  L.screen = null;
-  L.param = null;
-  L.req++;
-  $("level-view").hidden = true;
-  $("level-view").replaceChildren();
-  document.body.classList.remove("levels-on");
-}
-
-/** Leaves the level screens for the grid (or whatever opens next). */
-function leaveLevels() {
-  if (!L.screen) return;
-  closeLevelView();
-  markLevels();
-}
-
-function currentLevel() {
-  if (L.screen) return LEVEL_OF[L.screen];
-  if (D.open) return 1;
-  if (S.zoomed) return $("z-body")?.dataset.tab === "changes" ? 3 : 4;
-  return 4;
-}
-
-function markLevels() {
-  const cur = currentLevel();
-  for (const b of document.querySelectorAll("#levels button")) b.setAttribute("aria-selected", String(Number(b.dataset.level) === cur));
-  const screen = L.screen || (S.zoomed ? "grid" : D.open ? null : "grid");
-  for (const a of document.querySelectorAll("#lvnav a")) {
-    if (a.dataset.screen === screen) a.setAttribute("aria-current", "page");
-    else a.removeAttribute("aria-current");
-  }
-}
-
-/** Goes to a level: for one agent when one is in focus, else for the fleet. */
-function goLevel(n) {
-  n = Math.max(0, Math.min(4, n));
-  const id = focusAgent();
-  if (n === 0) return route("#/mission", { push: true });
-  if (n === 1) return route(L.screen === "flow" ? "#/flow" : "#/decide", { push: true });
-  if (n === 2) return route(id ? `#/story/${id}` : "#/story", { push: true });
-  if (n === 3) {
-    if (id && S.agents.has(id)) { leaveLevels(); zoom(id, { tab: "changes" }); markLevels(); return; }
-    return route("#/map", { push: true });
-  }
-  if (id && S.agents.has(id)) { leaveLevels(); zoom(id, { tab: "term" }); markLevels(); return; }
-  route("#/grid", { push: true });
-}
-
-/** Opens what a hash names: #/<screen>[/<param>], #/grid, #/zoom/<id>, #decisions or #<agent id>. */
-function route(hash, { push = false } = {}) {
-  const how = push ? "push" : "none";
-  if (hash.startsWith("#/")) {
-    const qi = hash.indexOf("?");
-    const query = qi >= 0 ? hash.slice(qi + 1) : "";
-    const [screen, param] = (qi >= 0 ? hash.slice(2, qi) : hash.slice(2)).split("/");
-    if (screen === "grid") {
-      leaveLevels();
-      if (S.zoomed) unzoom({ fromHistory: true });
-      if (D.open) closeDecisions({ fromHistory: true });
-      $("grid-view").hidden = false;
-      if (push) history.pushState({ level: hash }, "", hash);
-      markLevels();
-      render();
-      return;
-    }
-    if (screen === "zoom" && param) { leaveLevels(); zoom(param, { history: push ? "push" : "none" }); markLevels(); return; }
-    openLevel(screen, param ? decodeURIComponent(param) : null, { how, query });
-    return;
-  }
-  leaveLevels();
-  return false;
 }
 
 /** A Rewind of any moment ({agent, from_ms, to_ms, edit_ms?, label?}) in the side sheet. */
@@ -3021,84 +2838,304 @@ function openRewindCard(o) {
   T.player = new Rewind(host, { agent: o.agent, from: o.from_ms, to: o.to_ms, edit: o.edit_ms ?? o.to_ms - 3000, name: a ? nameOf(a) : o.agent, onWrite: () => {} });
 }
 
-for (const b of document.querySelectorAll("#levels button")) b.addEventListener("click", () => goLevel(Number(b.dataset.level)));
-for (const a of document.querySelectorAll("#lvnav a")) a.addEventListener("click", (e) => {
-  e.preventDefault();
-  const s = a.dataset.screen;
-  route(s === "story" || s === "preview" || s === "ship" ? `#/${s}${focusAgent() ? "/" + focusAgent() : ""}` : `#/${s}`, { push: true });
-});
+// ------------------------------------------------------- settings, kept here
 
-function levelKey(e) {
-  const d = e.key === "[" ? -1 : e.key === "]" ? 1 : 0;
-  // A screen with levels of its own (Story) moves through them first.
-  if (d && L.view && typeof L.view.levelKey === "function") {
-    try { if (L.view.levelKey(d)) return true; } catch (err) { console.error(err); }
-  }
-  if (d < 0) { goLevel(currentLevel() - 1); return true; }
-  if (d > 0) { goLevel(currentLevel() + 1); return true; }
-  if (L.screen && e.key === "Escape" && L.screen !== "mission") { route("#/mission", { push: true }); return true; }
-  return false;
+const PREFS_KEY = "chloedb-workbench-prefs";
+const PREFS = {
+  v: (() => { const x = parse(store("local", PREFS_KEY) || "{}"); return x && typeof x === "object" ? x : {}; })(),
+  get(k) { return !!this.v[k]; },
+  set(k, on) { this.v[k] = !!on; store("local", PREFS_KEY, JSON.stringify(this.v)); G.ukey = ""; schedule(); },
+};
+
+// ------------------------------------------------------------- projects
+// GET /api/repos: each project's short name, its agents' groups, what is
+// ready, its unmerged branches, its last activity and what needs you.
+
+const PROJECT_KEY = "chloedb-workbench-open-repo"; // the project in focus (ui/levels/repos.js writes it too)
+const P = { list: [], at: 0, busy: null, timer: 0 };
+let gotProjects;
+const firstProjects = new Promise((r) => { gotProjects = r; });
+function refreshProjects() {
+  if (!S.token) return Promise.resolve();
+  if (P.busy) return P.busy;
+  P.busy = api("/api/repos").then((j) => { P.list = j.repos || []; P.at = Date.now(); Z.headKey = ""; }, () => {})
+    .finally(() => { P.busy = null; gotProjects(); schedule(); });
+  return P.busy;
+}
+function projectsSoon() { clearTimeout(P.timer); P.timer = setTimeout(refreshProjects, 1500); }
+function projectNames() { return Object.fromEntries(P.list.map((p) => [p.path, p.project])); }
+function projectByName(n) { return P.list.find((p) => p.project === n) || null; }
+function projectOf(path) { return path ? P.list.find((p) => p.path === path) || P.list.find((p) => path.startsWith(p.path + "/")) || null : null; }
+function groups() { return Object.assign({}, ...P.list.map((p) => p.groups || {})); }
+/** The project in focus: the page's, the agent page's, the last opened, else the most active. */
+function currentProject() {
+  if (G.r && G.r.project) { const p = projectByName(G.r.project); if (p) return p; }
+  const z = S.agents.get(S.zoomed);
+  if (z) { const p = projectOf(z.repo); if (p) return p; }
+  return projectOf(store("local", PROJECT_KEY)) || P.list[0] || null;
+}
+/** After a merge (R2's hook): the next ready branch of the project, else the project. */
+function nextReady(after) {
+  return refreshProjects().then(() => {
+    const p = currentProject();
+    if (!p) { go("#/"); return; }
+    const next = (p.ready || []).find((x) => x.id !== after);
+    go(next ? `#/p/${p.project}/ship/${next.id}` : `#/p/${p.project}`);
+  });
 }
 
-function renderLevels() {
-  const waiting = [...S.agents.values()].filter((a) => a.running && a.state === "waiting").length;
-  const badge = $("lvn-decide");
-  badge.hidden = !waiting;
-  badge.textContent = String(waiting);
-  renderHealth();
-  if (L.view) {
-    try { L.view.update(levelState()); } catch (err) { console.error(err); }
+// --------------------------------------------------------- what needs you
+// GET /api/needs: the one list and the one count, on the top bar, the tab
+// bar, the drawer, Start, Continue, the inbox and the agent page.
+
+const N = { count: 0, items: [], by_repo: {} };
+const NQ = { busy: null, again: false, timer: 0, key: "" };
+function refreshNeeds() {
+  if (!S.token) return Promise.resolve();
+  if (NQ.busy) { NQ.again = true; return NQ.busy; }
+  NQ.busy = api("/api/needs").then((j) => {
+    N.count = j.count || 0;
+    N.items = j.items || [];
+    N.by_repo = j.by_repo || {};
+    const key = N.items.map((i) => i.id).join(",");
+    if (key !== NQ.key) { NQ.key = key; Z.headKey = ""; }
+    schedule();
+  }, () => {}).finally(() => { NQ.busy = null; if (NQ.again) { NQ.again = false; needsSoon(); } });
+  return NQ.busy;
+}
+function needsSoon() { clearTimeout(NQ.timer); NQ.timer = setTimeout(refreshNeeds, 400); }
+setInterval(() => { if (S.token && document.visibilityState === "visible") refreshNeeds(); }, 10000);
+/** An answer went through: the card goes at once, the counts follow, and
+ *  "Since you left" reads the digest again. */
+function answered(id, { quiet = false } = {}) {
+  N.items = N.items.filter((i) => i.id !== id);
+  N.count = N.items.length;
+  NQ.key = N.items.map((i) => i.id).join(",");
+  Z.headKey = "";
+  G.ukey = "";
+  noteActive();
+  schedule();
+  if (!quiet) {
+    needsSoon();
+    projectsSoon();
+    try { G.view && G.view.reload && G.view.reload(); } catch (err) { console.error(err); }
   }
 }
 
-// Health (SPEC.md, "Fourth build", row 4): the open incidents' count on
-// the Health link, and those a rule's notify or ask put in Needs you as
-// items of the rail, after the agents'. Fetched at most every 15 s.
-const HL = { at: 0, busy: false, open: [] };
-function renderHealth() {
-  if (!S.token) return;
-  if (!HL.busy && Date.now() - HL.at > 15000) {
-    HL.busy = true;
-    api("/api/incidents?state=open").then((j) => { HL.open = j.incidents || []; }, () => {}).finally(() => { HL.at = Date.now(); HL.busy = false; renderHealth(); });
+// ---------------------------------------------------------------- router
+
+const G = { r: null, view: null, req: 0, key: "", ukey: "" };
+const GOAL = {
+  start: "/goals/start.js", new: "/goals/newproject.js", needs: "/goals/needs.js",
+  open: "/goals/continue.js", continue: "/goals/continue.js", understand: "/goals/continue.js", change: "/goals/continue.js",
+  ship: "/goals/review.js", debug: "/goals/debug.js", more: "/goals/more.js",
+};
+
+function go(hash) {
+  if (location.hash === hash || (!location.hash && hash === "#/")) route(hash);
+  else location.hash = hash;
+}
+function replaceHash(hash) {
+  history.replaceState(history.state, "", hash);
+  route(hash);
+}
+window.addEventListener("hashchange", () => route(location.hash));
+
+function showView(id) {
+  for (const v of ["goal-view", "grid-view", "zoom-view", "dec-view"]) $(v).hidden = v !== id;
+}
+
+function unmountGoal() {
+  try { G.view && G.view.unmount && G.view.unmount(); } catch (err) { console.error(err); }
+  G.view = null;
+  G.key = "";
+  G.req++;
+}
+
+/** Whether a redraw now would take something from under the person: a
+ *  text box with the focus, or an option picked in a card. */
+function busy() {
+  const a = document.activeElement;
+  if (!a || a === document.body) return false;
+  if (!$("goal-view").contains(a)) return false;
+  return inField(a) || !!(a.closest(".qc") && a.closest(".qc").querySelector(".qc-opt.sel"));
+}
+function goalUpdate() {
+  if (!G.view || !G.view.update) return;
+  const k = JSON.stringify([NQ.key, P.at, [...S.agents.values()].map((a) => `${a.id}${a.state}${a.running ? 1 : 0}`).join(), PREFS.v]);
+  if (k === G.ukey || busy()) return;
+  G.ukey = k;
+  try { G.view.update(levelState()); } catch (err) { console.error(err); }
+}
+
+async function route(hash) {
+  hash = hash || "#/";
+  const r = resolve(hash, { project: currentProject()?.project || null, agentIds: [...S.agents.keys()] });
+  if (r.redirect) { replaceHash(r.redirect); return; }
+  Shell.close();
+  Shell.closeSheet();
+  if (T.open) closeSheet({ focus: false });
+  document.body.classList.remove("stepping");
+  G.r = r;
+  if (r.project) { const p = projectByName(r.project); if (p) store("local", PROJECT_KEY, p.path); }
+
+  if (r.page === "agent") {
+    unmountGoal();
+    closeDecisions();
+    if (!S.agents.has(r.agent)) {
+      await Promise.race([firstSnapshot, new Promise((ok) => setTimeout(ok, 3000))]);
+      if (G.r !== r) return;
+    }
+    if (!S.agents.has(r.agent)) {
+      unzoom();
+      showView("goal-view");
+      Shell.setCrumbs([{ label: "Start", href: "#/" }, { label: r.agent, href: hash }]);
+      $("goal-view").replaceChildren(h("div", { class: "gp" }, h("div", { class: "gp-main" }, h("h1", { class: "gp-title", text: "No such agent" }), h("p", { class: "gp-sub", text: `Workbench knows no agent ${r.agent}.` }), h("a", { class: "btn", href: "#/" }, "Start"))));
+      return;
+    }
+    showView("zoom-view");
+    const a = S.agents.get(r.agent);
+    const p = projectOf(a.repo);
+    zoom(r.agent, { tab: r.tab === "terminal" ? "term" : r.tab });
+    Shell.setCrumbs([{ label: "Start", href: "#/" }, ...(p ? [{ label: p.project, href: `#/p/${p.project}` }] : []), { label: nameOf(a), href: `#/a/${a.id}` }]);
+    return;
   }
-  const badge = $("lvn-health");
-  if (badge) { badge.hidden = !HL.open.length; badge.textContent = String(HL.open.length); }
-  const ol = $("rail-list");
-  if (!ol) return;
-  for (const el of ol.querySelectorAll("li.hl-rail")) el.remove();
-  const need = HL.open.filter((i) => i.needs_you);
-  for (const i of need) {
-    const ago = h("span", { class: "ago" });
-    since(ago, i.updated || i.started);
-    ol.append(h("li", { class: "hl-rail" }, h("button", {
-      class: "ritem waiting",
-      title: "Open its board in Health",
-      onclick: () => route(`#/health/${i.id}`, { push: true }),
-    }, h("span", { class: "dot" }), h("span", { class: "nm", text: `▲ ${i.severity || "alert"}` }), ago, h("span", { class: "why", text: i.title }))));
+  unzoom();
+  if (r.page === "more" && r.item === "terminals") {
+    unmountGoal();
+    closeDecisions();
+    showView("grid-view");
+    Shell.setCrumbs([{ label: "Start", href: "#/" }, { label: "More", href: "#/more" }, { label: "All terminals", href: hash }]);
+    render();
+    requestAnimationFrame(() => { for (const t of S.tiles.values()) t.preview?.scale(); });
+    return;
   }
-  if (need.length) $("rail-empty").hidden = true;
+  if (r.page === "more" && r.item === "decisions") {
+    unmountGoal();
+    showView("dec-view");
+    showDecisions();
+    Shell.setCrumbs([{ label: "Start", href: "#/" }, { label: "More", href: "#/more" }, { label: "Decisions timeline", href: hash }]);
+    return;
+  }
+  closeDecisions();
+  showView("goal-view");
+  const key = JSON.stringify([r.page, r.project, r.agent, r.step, r.item, r.rest, r.tab, r.query.toString()]);
+  if (G.view && G.key === key) { G.ukey = ""; goalUpdate(); return; }
+  unmountGoal();
+  G.key = key;
+  const req = G.req;
+  const host = $("goal-view");
+  host.replaceChildren(h("div", { class: "lv-loading", text: "Loading…" }));
+  // The agents and the projects first, so a page opened by its address knows them.
+  await Promise.race([Promise.all([firstSnapshot, firstProjects]), new Promise((ok) => setTimeout(ok, 3000))]);
+  if (req !== G.req) return;
+  const ctx = goalCtx(r);
+  let m = null;
+  try { m = await import(GOAL[r.page]); } catch (err) {
+    if (r.page !== "ship" && r.page !== "debug") { if (req === G.req) host.replaceChildren(h("div", { class: "lv-loading bad", text: `This page did not load: ${err.message || err}` })); return; }
+  }
+  if (req !== G.req) return;
+  host.replaceChildren();
+  host.scrollTop = 0;
+  try {
+    if (m) G.view = m.mount(host, ctx);
+    else G.view = await standIn(r, host, ctx);
+    G.ukey = "";
+  } catch (err) {
+    console.error(err);
+    host.replaceChildren(h("div", { class: "lv-loading bad", text: `This page did not load: ${err.message || err}` }));
+  }
+}
+
+/** Until Review and Debug (R2) are served: the old Ship, Health and Trace screens. */
+async function standIn(r, host, ctx) {
+  const file = r.page === "ship" ? "ship" : r.rest && r.rest[0] === "failing" ? "health" : "trace";
+  const p = r.project ? projectByName(r.project) : currentProject();
+  ctx.crumbs(r.page === "ship"
+    ? [{ label: "Start", href: "#/" }, ...(p ? [{ label: p.project, href: `#/p/${p.project}` }] : []), { label: "Review and ship", href: location.hash }]
+    : [{ label: "Start", href: "#/" }, { label: "Debug", href: "#/debug" }]);
+  const m = await import(`/levels/${file}.js`);
+  const agent = r.agent || (r.page === "ship" && p && p.ready && p.ready[0] ? p.ready[0].id : null);
+  return m.mount(host, levelCtx(agent, { repo: p ? p.path : undefined, query: r.query }));
+}
+
+/** What a goal page is mounted with: the old screens' context, plus the
+ *  project, the crumbs, the needs, the projects and the shell's cards. */
+function goalCtx(r) {
+  const p = r.project ? projectByName(r.project) : null;
+  const ctx = levelCtx(r.agent || null, { repo: p ? p.path : undefined });
+  Object.defineProperty(ctx, "params", { value: { ...r, agent: r.agent || null, repo: p ? p.path : pickRepo(), page: r.page, project: r.project || null, query: r.query }, enumerable: true });
+  return Object.assign(ctx, {
+    project: p || (r.project ? null : currentProject()),
+    crumbs: (list) => Shell.setCrumbs(list),
+    toast,
+    needs: () => N,
+    needCard: (it, o) => Shell.needCard(it, o),
+    projects: () => P.list,
+    projectNames, projectByName, projectOf, refreshProjects,
+    prefs: PREFS,
+    levelCtx: (extra) => levelCtx(null, extra),
+    restart: restartAgent,
+    notify: () => { try { NOTIFY && NOTIFY.away && NOTIFY.away(); } catch (err) { console.error(err); } },
+    slot: (name) => slot(name, ctx),
+    groupOf: Shell.groupOf,
+    fleet: Shell.fleet,
+    merged: (agentId) => nextReady(agentId),
+    stop: (id) => confirmStop(id),
+    openDecisions,
+  });
+}
+
+/** A place on a page another module fills (agent P's rules-suggest.js): empty until it loads. */
+function slot(name, ctx) {
+  const host = h("div", { class: `slot slot-${name}` });
+  import(`/goals/${name}.js`).then((m) => Promise.resolve(m.card ? m.card(ctx) : m.mount ? m.mount(host, ctx) : null))
+    .then((el) => { if (el instanceof Node) host.append(el); }).catch(() => {});
+  return host;
 }
 
 // ----------------------------------------------------------------- start
 
-/** You stop looking: the page is hidden or left. The digest (Away) counts
- *  from here. */
+/** The last time you did something here: a key, a click, an answer, a
+ *  return to the page. "Since you left" counts from it (power users, 6). */
+let lastActive = Date.now();
+function noteActive() { lastActive = Date.now(); }
+for (const k of ["pointerdown", "keydown", "wheel", "touchstart"]) document.addEventListener(k, noteActive, { passive: true, capture: true });
+window.addEventListener("focus", noteActive);
+
+/** You stop looking: the page is hidden or left. The digest counts from
+ *  your last real presence, not from the moment the tab went away. */
 function markSeen() {
   if (!S.token) return;
   try {
-    fetch("/api/seen", { method: "POST", keepalive: true, headers: { Authorization: `Bearer ${S.token}`, "Content-Type": "application/json" }, body: "{}" }).catch(() => {});
+    fetch("/api/seen", { method: "POST", keepalive: true, headers: { Authorization: `Bearer ${S.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ ts_ms: lastActive }) }).catch(() => {});
   } catch { /* leaving: nothing to do */ }
 }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") markSeen(); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") markSeen(); else { noteActive(); refreshNeeds(); } });
 window.addEventListener("pagehide", markSeen);
-// Sixth build: while the page is shown and used, say so once a minute, so
-// Away does not call a morning at the desk "away" (src/digest.rs).
-let lastInput = Date.now();
-for (const k of ["pointerdown", "keydown", "wheel"]) document.addEventListener(k, () => { lastInput = Date.now(); }, { passive: true, capture: true });
+// While the page is shown and used, say so once a minute, so a morning at
+// the desk is not "away" (src/digest.rs).
 setInterval(() => {
-  if (!S.token || document.visibilityState !== "visible" || Date.now() - lastInput > 120000) return;
+  if (!S.token || document.visibilityState !== "visible" || Date.now() - lastActive > 120000) return;
   fetch("/api/here", { method: "POST", headers: { Authorization: `Bearer ${S.token}`, "Content-Type": "application/json" }, body: "{}" }).catch(() => {});
 }, 60000);
+
+Shell.initShell({
+  api,
+  agents: () => [...S.agents.values()],
+  needs: () => N,
+  groups,
+  project: currentProject,
+  projectNames,
+  restart: restartAgent,
+  openSearch: openQuickSearch,
+  toast,
+  answered,
+  refreshNeeds,
+});
+
+// Agent P's interrupt model (ui/goals/notify.js): loaded once, if served.
+let NOTIFY = null;
 
 let started = false;
 function start() {
@@ -3106,28 +3143,17 @@ function start() {
     started = true;
     setInterval(tickTimes, 1000);
     fetch("/api/health").then((r) => r.json()).then((j) => { S.health = j; schedule(); }).catch(() => {});
-    loadRepos();
+    refreshProjects();
+    refreshNeeds();
     // ChloeCtx is required: say so up front when sessions would miss it.
     import("/levels/setup.js").then((m) => m.checkSetup(api)).catch(() => {});
+    import("/goals/notify.js").then((m) => { NOTIFY = m; m.init && m.init(goalCtx({ page: "notify", query: new URLSearchParams() })); }).catch(() => {});
   }
-  const id = location.hash.slice(1);
-  if (id.startsWith("/")) route(location.hash);
-  else if (!id) {
-    // Away when you were gone over 30 minutes and something happened since,
-    // else Mission once a goal exists, else the grid (SPEC.md, Levels).
-    const open = (hash) => { if (location.hash) return; history.replaceState({ level: hash, root: true }, "", hash); route(hash); };
-    const digest = api("/api/digest").catch(() => null);
-    api("/api/goals").then(async (g) => {
-      const d = await digest;
-      if (d && d.happened && (d.away_ms || 0) > 30 * 60 * 1000) open("#/away");
-      else if ((g.goals || []).some((x) => x.state === "active")) open("#/mission");
-    }, () => {});
-  }
-  else if (id === "decisions") S.pendingDec = true;
-  else if (id) S.pendingZoom = id;
+  // Settings › Open on the inbox.
+  if ((!location.hash || location.hash === "#/") && PREFS.get("openOnInbox")) history.replaceState(history.state, "", "#/needs");
   connectStream();
+  route(location.hash || "#/");
   render();
-  markLevels();
 }
 
 S.token = readToken();

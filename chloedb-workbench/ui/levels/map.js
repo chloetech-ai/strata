@@ -56,6 +56,9 @@ import { withHeat } from "./hotspots.js";
 // Sixth build: a repository read without an agent (ui/levels/repos.js).
 import { repoPicker, repoSwitch, needsRepo } from "./repos.js";
 export const mount = timeTravel(withHeat(mountMap), { screen: "map" });
+/** The map without the time bar, its own title or a repository switch
+ *  (JOURNEYS.md, Understand): `ctx.params.embed` set. */
+export const mountBare = (root, ctx) => withHeat(mountMap)(root, { ...ctx, params: { ...(ctx.params || {}), embed: true } });
 function mountMap(root, ctx) {
   const S = { data: null, err: null, path: "", sel: null, focus: null, sent: new Map(), busy: new Set(), needRepo: false, unfold: new Set() };
   const I = { nodes: new Map(), changed: new Map(), read: new Map(), coll: new Map(), pins: new Map(), agents: new Map(), agg: new Map() };
@@ -159,6 +162,7 @@ function mountMap(root, ctx) {
   }
 
   function head() {
+    if (ctx.params && ctx.params.embed) return h("header", { class: "lv-head" }, h("span", { class: "lv-sub" }, "Who is changing which file · size = lines · ", h("span", { class: "mp-dia", "aria-hidden": "true" }), " = a decision ChloeCtx can explain"));
     return h("header", { class: "lv-head" },
       h("h1", { class: "lv-h1" }, "Territory"),
       h("span", { class: "lv-sub" }, "who is working where · size = lines · ", h("span", { class: "mp-dia", "aria-hidden": "true" }), " = a decision ChloeCtx can explain"),

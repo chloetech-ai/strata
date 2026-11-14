@@ -288,6 +288,42 @@ pub fn diff(dir: &Path, base: &str) -> Result<Vec<Json>, String> {
     Ok(files)
 }
 
+/// What a worktree changed that its repository's main checkout does not
+/// have yet (the journeys' "ready to review", JOURNEYS.md): files and
+/// lines added and removed since the merge base of the two, committed or
+/// not, untracked files counted as added. `None` when git cannot say.
+pub fn change_stat(worktree: &Path, main: &Path) -> Option<(usize, i64, i64)> {
+    let head = rev_parse(main, "HEAD")?;
+    let base = git(worktree, &["merge-base", &head, "HEAD"]).ok().filter(|s| !s.is_empty())?;
+    let num = git(worktree, &["diff", "--numstat", "--no-color", "--no-ext-diff", "--no-textconv", &base, "--"]).ok()?;
+    let (mut files, mut add, mut del) = (0usize, 0i64, 0i64);
+    for l in num.lines() {
+        let mut it = l.split('\t');
+        let (a, d) = (it.next().unwrap_or("0"), it.next().unwrap_or("0"));
+        files += 1;
+        add += a.parse::<i64>().unwrap_or(0);
+        del += d.parse::<i64>().unwrap_or(0);
+    }
+    let untracked = git(worktree, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    for p in untracked.split('\0').filter(|p| !p.is_empty()) {
+        files += 1;
+        let full = worktree.join(p);
+        if std::fs::metadata(&full).map(|m| m.is_file() && m.len() <= UNTRACKED_MAX).unwrap_or(false) {
+            add += std::fs::read(&full).map(|b| if b.contains(&0) { 0 } else { String::from_utf8_lossy(&b).lines().count() as i64 }).unwrap_or(0);
+        }
+    }
+    Some((files, add, del))
+}
+
+/// The local branches under `prefix` (such as `wb/`) whose commits the
+/// checked-out branch of `repo` does not have, newest first.
+pub fn unmerged_branches(repo: &Path, prefix: &str) -> Vec<String> {
+    let pattern = format!("refs/heads/{prefix}*");
+    git(repo, &["for-each-ref", "--sort=-committerdate", "--no-merged", "HEAD", "--format=%(refname:short)", &pattern])
+        .map(|s| s.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

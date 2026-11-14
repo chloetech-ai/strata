@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>Workbench</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='2' y='2' width='9' height='9' rx='2.5' fill='%232f5bd3'/%3E%3Crect x='13' y='2' width='9' height='9' rx='2.5' fill='%2396a3b8'/%3E%3Crect x='2' y='13' width='9' height='9' rx='2.5' fill='%2396a3b8'/%3E%3Crect x='13' y='13' width='9' height='9' rx='2.5' fill='%23e3a008'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1.5' y='1.5' width='13' height='13' rx='2.5' fill='none' stroke='%2318181b' stroke-width='1.6'/%3E%3Crect x='4' y='4' width='3.4' height='8' rx='1' fill='%2318181b'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
@@ -45,88 +45,48 @@
 </svg>
 
 <header class="top">
-  <div class="brand">
-    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="2" width="9" height="9" rx="2.5" fill="var(--accent)"/><rect x="13" y="2" width="9" height="9" rx="2.5" fill="var(--line-2)"/><rect x="2" y="13" width="9" height="9" rx="2.5" fill="var(--line-2)"/><rect x="13" y="13" width="9" height="9" rx="2.5" fill="var(--warn)"/></svg>
-    <span>Workbench</span><span class="sub">ChloeDB</span>
-  </div>
-  <div class="counts">
-    <span class="pill run-pill" id="run-pill" title="Agents running now"><b id="run-n">0</b><span id="run-max"></span> running</span>
-    <span class="pill warn" id="need-pill" hidden><b id="need-n">0</b> need you</span>
-  </div>
-  <div class="sep"></div>
-  <div class="levels" id="levels" role="tablist" aria-label="Level">
-    <button role="tab" data-level="0" title="Intent: goals and outcomes">Intent</button><button role="tab" data-level="1" title="Plan: decisions and flow">Plan</button><button role="tab" data-level="2" title="Story: one agent, chapter by chapter">Story</button><button role="tab" data-level="3" title="Changes: the map, the preview, the diff">Changes</button><button role="tab" data-level="4" title="Terminal: the sessions themselves">Terminal</button>
-    <span class="lv-keys wide-only"><kbd>[</kbd><kbd>]</kbd></span>
-  </div>
+  <a class="tb icon tb-back" id="tb-back" href="#/" hidden aria-label="Back"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></a>
+  <a class="brand" href="#/" title="Start (g s)"><span class="mk" aria-hidden="true"></span><span class="bn">Workbench</span></a>
+  <span class="tb-title" id="tb-title">Workbench</span>
+  <nav class="crumbs" id="crumbs" aria-label="Where you are"></nav>
+  <span class="sp"></span>
+  <button class="search" id="search-btn" type="button" title="Search code, docs and decisions (/)"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4"/></svg><span>Search code, docs, decisions</span><kbd class="kc">/</kbd></button>
+  <button class="tb icon tb-search" id="tb-search" type="button" aria-label="Search"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4"/></svg></button>
   <span class="prefix-ind" id="prefix-ind" hidden title="Prefix armed: press a key, ? for the list">C-b</span>
+  <button class="tb need" id="needs-btn" type="button" aria-expanded="false" aria-haspopup="dialog"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg><span class="n" id="needs-n" hidden>0</span><span class="lb" id="needs-lb">Nothing needs you</span></button>
+  <button class="tb" id="agents-btn" type="button" aria-expanded="false" aria-haspopup="dialog" title="Agents (a)"><span class="avs" id="agents-avs"></span><span class="lb" id="agents-lb">0 agents</span></button>
+  <button class="tb icon" id="more-btn" type="button" aria-expanded="false" aria-haspopup="menu" aria-label="More"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg></button>
   <span class="conn" id="conn" data-state="connecting" title="The live stream of changes"><span id="conn-text">connecting</span></span>
-  <button class="btn" id="dec-btn" title="Decisions: every decision of the repository, by agent (d)" aria-label="Decisions"><svg class="i"><use href="#i-trail"/></svg><span class="wide-only">Decisions</span><kbd class="wide-only">d</kbd></button>
-  <button class="btn ghost icon" id="help-btn" title="Keys (Ctrl-b ?)" aria-label="Keyboard shortcuts"><svg class="i"><use href="#i-key"/></svg></button>
-  <button class="btn primary" id="new-btn" title="New agent (n)"><svg class="i"><use href="#i-plus"/></svg><span class="wide-only">New agent</span><span class="narrow-only">New</span><kbd class="wide-only">n</kbd></button>
 </header>
 
 <div class="shell">
-  <nav class="lvnav" id="lvnav" aria-label="Screens">
-    <a href="#/mission" data-screen="mission"><svg class="i"><use href="#i-target"/></svg><span>Mission</span></a>
-    <a href="#/decide" data-screen="decide"><svg class="i"><use href="#i-ask"/></svg><span>Decide</span><b class="lvn" id="lvn-decide" hidden></b></a>
-    <a href="#/trace" data-screen="trace" title="Trace: when, why and how something changed"><svg class="i"><use href="#i-trail"/></svg><span>Trace</span></a>
-    <a href="#/map" data-screen="map"><svg class="i"><use href="#i-map"/></svg><span>Map</span></a>
-    <a href="#/story" data-screen="story"><svg class="i"><use href="#i-book"/></svg><span>Story</span></a>
-    <a href="#/preview" data-screen="preview"><svg class="i"><use href="#i-eye"/></svg><span>Preview</span></a>
-    <a href="#/ship" data-screen="ship"><svg class="i"><use href="#i-branch"/></svg><span>Ship</span></a>
-    <a href="#/flow" data-screen="flow"><svg class="i"><use href="#i-act"/></svg><span>Flow</span></a>
-    <a href="#/health" data-screen="health"><svg class="i"><use href="#i-bell"/></svg><span>Health</span><b class="lvn" id="lvn-health" hidden></b></a>
-    <a href="#/library" data-screen="library"><svg class="i" viewBox="0 0 24 24"><path d="M4 4h4v16H4zM10 4h4v16h-4zM15.6 5.1l3.8-1 3.6 15.4-3.8 1z"/></svg><span>Library</span></a>
-    <a href="#/away" data-screen="away"><svg class="i"><use href="#i-rewind"/></svg><span>Away</span></a>
-    <a href="#/grid" data-screen="grid"><svg class="i"><use href="#i-grid"/></svg><span>Terminals</span></a>
-    <a href="#/guide" data-screen="guide" title="Guide: what each screen is for, and the first ten minutes" aria-label="Guide"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M9.3 9.2a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.4-2.7 4.1"/><path d="M12 17.6h.01"/></svg><span>Guide</span></a>
-  </nav>
-  <aside class="rail" aria-label="Needs you">
-    <div class="rail-head"><h2>Needs you</h2><span class="n" id="rail-n"></span></div>
-    <ol id="rail-list"></ol>
-    <div class="rail-empty" id="rail-empty"><svg class="i"><use href="#i-check"/></svg>Nothing is waiting for you.</div>
-    <div class="rail-foot">
-      <span><kbd>C-b</kbd><kbd>?</kbd> keys</span>
-      <span><kbd>z</kbd> zoom</span>
-      <span><kbd>n</kbd> new</span>
-    </div>
-  </aside>
-
   <main>
-    <section class="view" id="grid-view" aria-label="Agents">
+    <section class="view" id="goal-view" aria-label="Page"></section>
+
+    <section class="view" id="grid-view" hidden aria-label="All terminals">
+      <div class="gv-head">
+        <div><h1>All terminals</h1><p>Every running session side by side. Click one to open it.</p></div>
+        <span class="sp"></span>
+      </div>
       <div class="grid" id="grid"></div>
       <div class="empty" id="empty" hidden>
-        <svg class="art" viewBox="0 0 84 64" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="36" height="26" rx="5"/><rect x="46" y="2" width="36" height="26" rx="5"/><rect x="2" y="36" width="36" height="26" rx="5"/><rect x="46" y="36" width="36" height="26" rx="5" stroke-dasharray="4 4"/><path d="M10 12h12M10 18h18M54 12h10M10 46h14"/></svg>
         <h3>No agents running</h3>
-        <p>Start a Claude Code session in its own worktree. Each one gets a real terminal you can watch here and step into.</p>
-        <button class="btn primary" id="empty-new"><svg class="i"><use href="#i-plus"/></svg>New agent<kbd>n</kbd></button>
+        <p>Start one from a project's Start a change. Each one gets a real terminal you can watch here and step into.</p>
+        <a class="btn" href="#/" id="empty-new">Start</a>
       </div>
       <details class="fold" id="fold" hidden>
-        <summary><svg class="i sm"><use href="#i-chev"/></svg>Exited <span id="fold-n"></span></summary>
+        <summary><svg class="i sm"><use href="#i-chev"/></svg>Ended <span id="fold-n"></span></summary>
         <div class="exited" id="exited"></div>
       </details>
     </section>
 
     <section class="view" id="zoom-view" hidden aria-label="Agent">
-      <div class="zhead">
-        <button class="btn ghost icon" id="z-back" title="Back to the grid (Ctrl-Esc, or Ctrl-b z)" aria-label="Back to the grid"><svg class="i"><use href="#i-back"/></svg></button>
-        <span class="nm" id="z-name"></span>
-        <span class="chip" id="z-chip"></span>
-        <span class="brk"></span>
-        <span class="br" id="z-branch"></span>
-        <span class="since" id="z-since"></span>
-        <span class="sep"></span>
-        <div class="ztabs" role="tablist" aria-label="View">
-          <button role="tab" id="tab-term" aria-selected="true" title="Terminal (t)">Terminal</button>
-          <button role="tab" id="tab-changes" aria-selected="false" title="Changes: what it changed from its base (c)">Changes<span class="tabn" id="tab-changes-n"></span></button>
-          <button role="tab" id="tab-events" aria-selected="false" class="narrow-tab">Events</button>
-        </div>
-        <span class="hint"><kbd>Ctrl</kbd><kbd>Esc</kbd> back</span>
-        <button class="btn sm" id="z-stop" title="Stop (Ctrl-b x)"><svg class="i sm"><use href="#i-stop"/></svg><span>Stop</span></button>
-        <button class="btn sm primary" id="z-restart" title="Start it again: same name, task and worktree, continuing its session" hidden><span>Restart</span></button>
-      </div>
-      <div class="zask" id="z-ask" hidden><svg class="i"><use href="#i-bell"/></svg><span id="z-ask-text"></span></div>
-      <div class="zbody" id="z-body" data-tab="term">
+      <div id="ag-head"></div>
+      <div class="ag-q" id="ag-q"></div>
+      <nav class="ag-tabs" id="ag-tabs" role="tablist" aria-label="Agent"></nav>
+      <div class="zbody" id="z-body" data-tab="progress">
+        <div class="ag-host" id="ag-progress"></div>
+        <div class="ag-host" id="ag-preview"></div>
         <div class="termbox" id="termbox"><div class="xt" id="z-term"></div><div class="overlay" id="z-overlay" hidden></div></div>
         <div class="changes" id="z-changes" aria-label="Changes">
           <div class="ch-head">
@@ -143,20 +103,20 @@
           <ol class="events" id="z-events"></ol>
         </aside>
       </div>
-      <div class="keybar" id="keybar" aria-label="Keys for the terminal">
+      <div class="termnote" id="termnote"></div>
+      <div class="keybar" id="keybar" aria-label="Keys for the terminal" hidden>
+        <button data-k="1" class="digit">1</button><button data-k="2" class="digit">2</button><button data-k="3" class="digit">3</button>
         <button data-k="esc">Esc</button><button data-k="tab">Tab</button><button data-k="stab">⇧Tab</button>
-        <button data-k="up">↑</button><button data-k="down">↓</button><button data-k="cc">^C</button><button data-k="enter">⏎</button>
+        <button data-k="up">↑</button><button data-k="down">↓</button><button data-k="cc">^C</button><button data-k="enter">Send ⏎</button>
       </div>
     </section>
-
-    <section class="view" id="level-view" hidden aria-label="Level"></section>
 
     <section class="view" id="dec-view" hidden aria-label="Decisions">
       <div class="dec-top">
         <div class="dec-title">
-          <button class="btn ghost icon" id="dec-back" title="Back (Esc)" aria-label="Back"><svg class="i"><use href="#i-back"/></svg></button>
+          <a class="btn ghost icon" id="dec-back" href="#/more" title="Back to More" aria-label="Back"><svg class="i"><use href="#i-back"/></svg></a>
           <h2>Decisions</h2>
-          <select id="dec-repo" aria-label="Repository"></select>
+          <select id="dec-repo" aria-label="Project"></select>
           <span class="dec-n" id="dec-n"></span>
           <span class="sep"></span>
           <span class="dec-legend" id="dec-legend"></span>
@@ -164,8 +124,7 @@
         <form class="ask" id="ask-form" autocomplete="off">
           <svg class="i"><use href="#i-ask"/></svg>
           <input type="text" id="ask-q" placeholder="Ask why: why do we round tax half up?" aria-label="Ask ChloeCtx why" spellcheck="false">
-          <kbd class="ask-k">/</kbd>
-          <button class="btn primary sm" type="submit" id="ask-go">Ask why</button>
+          <button class="btn sm" type="submit" id="ask-go">Ask why</button>
         </form>
         <div class="answer" id="ask-out" hidden></div>
       </div>
@@ -173,6 +132,15 @@
     </section>
   </main>
 </div>
+
+<nav class="tabbar" id="tabbar" aria-label="Goals">
+  <a href="#/" data-tab="start"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7M6 9.5V20h12V9.5"/></svg><span>Start</span></a>
+  <a href="#/needs" data-tab="needs"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg><span>Needs you</span><b class="badge" id="tab-badge"></b></a>
+  <a href="#/p" data-tab="projects"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span>Projects</span></a>
+  <a href="#/more" data-tab="more"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h.01M12 12h.01M19 12h.01"/></svg><span>More</span></a>
+</nav>
+
+<div class="ov" id="ov" hidden></div>
 
 <aside class="sheet" id="sheet" hidden aria-labelledby="sh-title" tabindex="-1">
   <div class="sh-head">
@@ -186,86 +154,6 @@
   <div class="sh-body" id="sh-body"></div>
 </aside>
 
-<dialog id="new-dialog" aria-labelledby="new-title">
-  <form id="new-form" method="dialog" novalidate>
-    <div class="dhead"><h2 id="new-title">New agent</h2><button type="button" class="btn ghost icon" data-close aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button></div>
-    <div class="dbody">
-      <div class="field">
-        <label for="f-repo">Repository</label>
-        <textarea class="mono lc-repo" id="f-repo" name="repo" rows="1" placeholder="/home/you/src/project" autocomplete="off" spellcheck="false" required></textarea>
-        <span class="help">The absolute path of a git checkout: type to complete it, git repositories first. Remembered for next time.</span>
-      </div>
-      <div class="field">
-        <label for="f-task">Task <span class="opt">optional</span></label>
-        <textarea id="f-task" name="task" placeholder="What should it do? Leave empty to start at a prompt."></textarea>
-      </div>
-      <div class="two">
-        <div class="field">
-          <label for="f-name">Name <span class="opt">optional</span></label>
-          <input type="text" class="mono" id="f-name" name="name" placeholder="picked for you" maxlength="32" autocomplete="off" spellcheck="false" pattern="[a-z0-9-]{1,32}">
-        </div>
-        <div class="field">
-          <label for="f-model">Model <span class="opt">optional</span></label>
-          <input type="text" class="mono" id="f-model" name="model" list="model-list" placeholder="Claude Code's default" autocomplete="off" spellcheck="false">
-          <datalist id="model-list"><option value="opus"><option value="sonnet"><option value="haiku"></datalist>
-        </div>
-      </div>
-      <label class="check" for="f-wt">
-        <input type="checkbox" id="f-wt" name="worktree" checked>
-        <span><b>Own worktree</b><span id="wt-help">A new branch <code>wb/&lt;name&gt;</code> from the repository's HEAD, so agents don't step on each other.</span></span>
-      </label>
-      <label class="check" for="f-ro">
-        <input type="checkbox" id="f-ro" name="read_only">
-        <span><b>Read-only</b><span>It reads and answers, and changes no file: no Edit or Write, and Bash only for commands that read. Anything else comes to you as a request.</span></span>
-      </label>
-      <label class="check" for="f-ask">
-        <input type="checkbox" id="f-ask" name="ask_edits">
-        <span><b>Ask before edits</b><span id="ask-help">Off: in its own worktree it edits and reads files, runs the tests, uses git locally (no push) and Workbench's and ChloeCtx's tools without asking. Guarded commands, and anything outside the worktree, still ask.</span></span>
-      </label>
-      <div class="err" id="new-err" hidden></div>
-    </div>
-    <div class="dfoot">
-      <span class="left"><kbd>Ctrl</kbd><kbd>Enter</kbd> start</span>
-      <button type="button" class="btn" data-close>Cancel</button>
-      <button type="submit" class="btn primary" id="new-go">Start agent</button>
-    </div>
-  </form>
-</dialog>
-
-<dialog id="help-dialog" aria-labelledby="help-title">
-  <div class="dhead"><h2 id="help-title">Keys</h2><button type="button" class="btn ghost icon" data-close aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button></div>
-  <div class="dbody">
-    <dl class="keys">
-      <dt><kbd>Ctrl</kbd><kbd>b</kbd></dt><dd>The prefix, as in tmux. It works everywhere, inside a terminal too.</dd>
-      <dt><span class="then">then</span><kbd>n</kbd></dt><dd>New agent</dd>
-      <dt><span class="then">then</span><kbd>z</kbd></dt><dd>Zoom the selected agent, or back to the grid</dd>
-      <dt><span class="then">then</span><kbd>←</kbd><kbd>↑</kbd><kbd>→</kbd><kbd>↓</kbd></dt><dd>Move between tiles (in zoom: the previous or next agent)</dd>
-      <dt><span class="then">then</span><kbd>1</kbd>…<kbd>9</kbd></dt><dd>Zoom agent number 1 to 9</dd>
-      <dt><span class="then">then</span><kbd>x</kbd></dt><dd>Stop the agent (asks first)</dd>
-      <dt><span class="then">then</span><kbd>Ctrl</kbd><kbd>b</kbd></dt><dd>Send a literal Ctrl-b to the terminal</dd>
-      <dt><span class="then">then</span><kbd>?</kbd></dt><dd>This list</dd>
-      <dt><span class="then">then</span><kbd>c</kbd> <kbd>t</kbd></dt><dd>In zoom: the agent's Changes, or its Terminal</dd>
-      <dt><span class="then">then</span><kbd>d</kbd></dt><dd>Decisions: the repository's decisions, one lane per agent</dd>
-      <dt><kbd>n</kbd> <kbd>z</kbd> <kbd>c</kbd> <kbd>t</kbd> <kbd>d</kbd> <kbd>?</kbd></dt><dd>The same without the prefix, outside a terminal</dd>
-      <dt><kbd>Esc</kbd></dt><dd>Close the card, or back, outside a terminal</dd>
-      <dt><kbd>Ctrl</kbd><kbd>Esc</kbd></dt><dd>Leave a zoomed terminal, from inside it too</dd>
-    </dl>
-    <h3 class="keyh">Changes and the decision card</h3>
-    <dl class="keys">
-      <dt><kbd>j</kbd> <kbd>k</kbd> <kbd>↓</kbd> <kbd>↑</kbd></dt><dd>Move between lines (between decisions on the Decisions screen)</dd>
-      <dt><kbd>]</kbd> <kbd>[</kbd></dt><dd>Next or previous file</dd>
-      <dt><kbd>y</kbd> or <kbd>Alt</kbd>-click</dt><dd>Why? The decision card of an added line: who, when, where, what it knew</dd>
-      <dt><kbd>r</kbd></dt><dd>Rewind: play the agent's terminal as it wrote the line</dd>
-      <dt><kbd>Space</kbd> <kbd>←</kbd> <kbd>→</kbd></dt><dd>Pause or play the Rewind, two seconds back or on</dd>
-      <dt><kbd>1</kbd> <kbd>2</kbd> <kbd>4</kbd> <kbd>f</kbd></dt><dd>Its speed, and theatre (a wider card)</dd>
-      <dt><kbd>/</kbd></dt><dd>On the Decisions screen: Ask why</dd>
-    </dl>
-    <p class="keynote">In a zoomed terminal every key goes to the agent, Esc included (Claude Code uses it to interrupt), and typing there goes to the agent even when the focus has left the terminal: no single-key shortcut fires there, nor in a text box. Use <kbd>Ctrl</kbd><kbd>Esc</kbd> (or <kbd>Ctrl</kbd><kbd>b</kbd> <kbd>z</kbd>) to leave.</p>
-    <p class="keynote">What each screen is for, and a first ten minutes: <a href="#/guide" data-close>the Guide</a> (the <b>?</b> at the bottom of the left rail).</p>
-  </div>
-  <div class="dfoot"><span class="left" id="help-version"></span><button type="button" class="btn" data-close autofocus>Close</button></div>
-</dialog>
-
 <dialog id="confirm-dialog" aria-labelledby="confirm-title">
   <div class="dhead"><h2 id="confirm-title">Stop agent?</h2></div>
   <div class="dbody"><p id="confirm-text"></p><div id="confirm-servers" hidden></div></div>
@@ -274,7 +162,7 @@
 
 <div class="gate" id="gate" hidden>
   <div class="gate-card">
-    <div class="brand"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="2" width="9" height="9" rx="2.5" fill="var(--accent)"/><rect x="13" y="2" width="9" height="9" rx="2.5" fill="var(--line-2)"/><rect x="2" y="13" width="9" height="9" rx="2.5" fill="var(--line-2)"/><rect x="13" y="13" width="9" height="9" rx="2.5" fill="var(--warn)"/></svg><span>Workbench</span></div>
+    <div class="brand"><span class="mk" aria-hidden="true"></span><span>Workbench</span></div>
     <h2 id="gate-title">Open the link the server printed</h2>
     <p id="gate-text"><code>chloedb-workbench serve</code> prints a URL with a token in it. Open that URL, or paste it (or the token) here.</p>
     <form id="gate-form"><input type="password" id="gate-input" placeholder="http://127.0.0.1:7740/?token=…" autocomplete="off" spellcheck="false" aria-label="URL or token"><button class="btn primary" type="submit">Connect</button></form>

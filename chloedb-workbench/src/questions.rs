@@ -798,7 +798,10 @@ fn act(sup: &Arc<Supervisor>, lv: &Arc<Levels>, id: &str, w: Waits, held: Durati
                     _ => close_question(sup, lv, &q.id, &format!("{}'s screen shows another prompt now", a.name)),
                 }
             }
-            if m.kind == MenuKind::Trust && workbench_worktree(sup, &a.cwd) && st.trusted.insert(sig.clone()) {
+            // A Workbench worktree, or a folder of a repository the person
+            // trusted when they opened it (POST /api/repos with trust).
+            let trusted = workbench_worktree(sup, &a.cwd) || (std::path::Path::new(&a.cwd).starts_with(&a.repo) && crate::repos::trusted(sup, &a.repo));
+            if m.kind == MenuKind::Trust && trusted && st.trusted.insert(sig.clone()) {
                 trust_later(sup, lv, id, m);
                 return;
             }

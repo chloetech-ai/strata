@@ -345,6 +345,8 @@ impl StateDb {
         db.sql(crate::repos::TABLE, &Params::new()).map_err(e)?;
         // The rewrite: Workbench's grants (src/rulesuggest.rs).
         db.sql(crate::rulesuggest::TABLE, &Params::new()).map_err(e)?;
+        // The journeys: a repository whose own checkout agents may work in (src/repos.rs).
+        db.sql(crate::repos::TRUST_TABLE, &Params::new()).map_err(e)?;
         let db = Arc::new(db);
         db.spawn_flusher();
         db.spawn_merger(MergerOptions { threads: 1, ..MergerOptions::default() });

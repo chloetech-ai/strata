@@ -106,7 +106,7 @@ export function repoPicker(ctx, opts = {}) {
     if (!path) { input.focus(); return; }
     S.busy = true; go.disabled = true; err.hidden = true;
     try {
-      const r = await ctx.api("/api/repos", { method: "POST", body: { path } });
+      const r = await ctx.api("/api/repos", { method: "POST", body: { path, ...(opts.body ? opts.body() : {}) } });
       cache = null;
       const repo = r.repo?.path || path;
       chooseRepo(repo);
