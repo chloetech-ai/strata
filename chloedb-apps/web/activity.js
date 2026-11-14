@@ -619,7 +619,7 @@ function timeline(m, st, rerender) {
 const RANGES = [[1, '24 hours'], [7, '7 days'], [30, '30 days'], [0, 'All']];
 
 export function mountActivity(box, { appId, api, onClose, openScreen }) {
-  const st = { days: 30, metric: 'done', filter: 'all', person: 'all', shown: 12, open: new Set(), closed: new Set(), data: null, sig: '', at: 0, error: null, loading: true };
+  const st = { days: 30, metric: 'done', filter: 'all', person: 'all', mine: false, shown: 12, open: new Set(), closed: new Set(), data: null, sig: '', at: 0, error: null, loading: true };
   try { const v = Number(sessionStorage.getItem(`sa-act-days-${appId}`)); if ([1, 7, 30, 0].includes(v) && sessionStorage.getItem(`sa-act-days-${appId}`) !== null) st.days = v; } catch {}
   const root = h('div', { class: 'act' });
   box.append(root);
@@ -645,6 +645,11 @@ export function mountActivity(box, { appId, api, onClose, openScreen }) {
     tip.hide();
     const scroll = root.scrollTop;
     const width = Math.max(300, root.clientWidth - 48);
+    // The owner's own tries of the app (src "owner": the studio, the command
+    // center) are not people's use: left out unless asked for.
+    const mine = (st.data?.events || []).filter((e) => e.src === 'owner').length;
+    const mineBtn = mine ? h('button', { class: 'act-mine', 'aria-pressed': String(st.mine), title: st.mine ? 'Leave out what you did yourself in the studio and the command center' : 'Show what you did yourself in the studio and the command center',
+      onclick: () => { st.mine = !st.mine; st.shown = 12; st.person = 'all'; render(); } }, st.mine ? `Your ${plural(mine, 'event')} shown · Hide` : `Your ${plural(mine, 'event')} left out · Show`) : null;
     const head = h('header', { class: 'act-head' },
       h('div', { class: 'act-title' },
         h('h1', 'Activity'),
@@ -652,15 +657,17 @@ export function mountActivity(box, { appId, api, onClose, openScreen }) {
         st.data?.app.brief ? h('p', { class: 'act-brief' }, `Made for ${st.data.app.brief.who}, to ${st.data.app.brief.job.replace(/^to /i, '')}, ${st.data.app.brief.often}, on ${st.data.app.brief.device === 'both' ? 'a phone and a computer' : `a ${st.data.app.brief.device === 'desktop' ? 'computer' : 'phone'}`}.`) : null,
         h('div', { class: 'act-live' }, h('i'), h('span', st.at ? `Updated ${ago(st.at)}` : 'Loading'))),
       h('div', { class: 'act-tools' },
+        mineBtn,
         h('div', { class: 'act-seg', role: 'tablist', 'aria-label': 'Period' }, RANGES.map(([d, label]) => h('button', { class: st.days === d ? 'on' : '', role: 'tab', 'aria-selected': String(st.days === d), onclick: () => { st.days = d; st.shown = 12; try { sessionStorage.setItem(`sa-act-days-${appId}`, String(d)); } catch {} load(true); } }, label))),
         h('button', { class: 'act-btn', title: 'Refresh', 'aria-label': 'Refresh', onclick: () => load(true) }, icon('refresh', 15)),
         onClose ? h('button', { class: 'act-btn', title: 'Back to the app', 'aria-label': 'Back to the app', onclick: onClose }, icon('close', 15)) : null));
     if (st.error) { root.replaceChildren(head, h('div', { class: 'act-empty' }, `The activity could not be read: ${st.error}`)); return; }
     if (!st.data) { root.replaceChildren(head, h('div', { class: 'act-empty' }, h('span', { class: 'spin' }), ' Reading what people did...')); return; }
-    const m = model(st.data);
+    const m = model(st.mine || !mine ? { ...st.data, ux: st.data.uxAll || st.data.ux } : { ...st.data, events: st.data.events.filter((e) => e.src !== 'owner') });
     if (!m.events.length) {
       root.replaceChildren(head, h('div', { class: 'act-hello' }, h('div', { class: 'act-hello-ico' }, icon('spark', 22)),
         h('h2', st.days ? 'Nothing happened in this period' : 'Nobody has used it yet'),
+        mine ? h('p', `Only you have tried it (${plural(mine, 'event')}), in the studio or the command center.`) : null,
         h('p', `Open ${st.data.app.name}'s screens, add something or search: each shows up here as it happens, in the app's own words.`),
         st.days ? h('button', { class: 'act-more', onclick: () => { st.days = 0; load(true); } }, 'Show all time') : null));
       return;
@@ -674,7 +681,7 @@ export function mountActivity(box, { appId, api, onClose, openScreen }) {
     const easy = ease(m);
     root.replaceChildren(head,
       tiles(m, bk),
-      easy ? card('How easy it is', `${plural(st.data.ux.sittings, 'visit')}, against what it is for`, ...easy) : null,
+      easy ? card('How easy it is', `${plural(m.d.ux.sittings, 'visit')}, against what it is for`, ...easy) : null,
       h('div', { class: `act-two${wide ? '' : ' one'}` },
         card(`${METRICS[st.metric].label} ${bk.unit === 'hour' ? 'by hour' : bk.unit === 'week' ? 'by week' : 'by day'}`, null, metricSeg, columnChart(bk, st.metric, chartW, tip)),
         card('When people use it', 'by weekday and hour', punchCard(m, wide ? Math.floor(width * 0.4) - 40 : width - 32, tip))),

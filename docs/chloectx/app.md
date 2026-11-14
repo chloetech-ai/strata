@@ -78,9 +78,9 @@ JSON over HTTP; through chloedb-server, the same paths under `/v1/apps/chloectx`
 | `POST /v1/spaces/:s/notes` | `{kind, text, replaces?, entities?, session?, when?}` | the note (`kind`: `decision`, `rule`, `fact`, `todo` or `note`); `when` (or `ts`) is when it happened, for a note written down after the fact: seconds since 1970, or ISO 8601 text (`2026-09-14`, `2026-09-14T03:10:00Z`); by default, now |
 | `GET /v1/spaces/:s/notes?kind=&limit=&all=1` | | the notes, newest first; the current ones unless `all=1` |
 | `GET /v1/spaces/:s/notes/:id` | | the note, the versions it replaced and those that replaced it |
-| `DELETE /v1/spaces/:s/notes/:id` | | the note, retired: kept, but in no context again |
+| `DELETE /v1/spaces/:s/notes/:id` | | the note, retired: kept, tagged `retired` (not `superseded`: nothing replaced it), and in no context again |
 | `POST /v1/spaces/:s/exchanges` | `{user, assistant, distill?}` | the two messages; with a model, their decisions, rules and facts follow as notes in a few seconds (`GET /v1/info` counts them) |
-| `POST /v1/spaces/:s/ask` (or `GET ?q=&budget=`) | `{question, budget?}` | `{context, tokens, ms, items, left_out}` |
+| `POST /v1/spaces/:s/ask` (or `GET ?q=&budget=`) | `{question, budget?}` | `{context, tokens, ms, items, left_out}`; `budget` is 200 to 50,000 tokens (4,000 left out), and one outside that is refused |
 | `GET /v1/incidents?space=`, `POST /v1/incidents` | `{title, symptom, cause, fix, alert?, replaces?, when?, space?}` | the incidents of every incidents space the key reads (or of `space`), each with its space and the fixes it replaced; the new one, in `incidents` or the team's `space`, dated `when` (the incident's own date) |
 | `GET /v1/incidents/firing?space=` | | the cluster's firing and pending alerts, each with its closest incidents and the context the on-call agent would get |
 | `GET /v1/incidents/match?q=&alert=&space=` | | the incidents closest to a description |
@@ -94,7 +94,7 @@ JSON over HTTP; through chloedb-server, the same paths under `/v1/apps/chloectx`
 | `GET /v1/spaces/:s/apps` | | the space's builds: `building`, `loading`, `ready` or `failed`, with their cost and rows loaded |
 | `POST /v1/spaces/:s/apps/:id/open` | | a one-time link into the app engine's studio, at the built app |
 
-An answer of `ask` has, for each record in the context, its `section` (`rule`, `note`, `timeline` for a question about the whole history, `reply` and `excerpt` for past conversations), its `tokens` (about four characters each), its scores (`bm25` for the question's words, `cos` for its meaning) and, for a note that replaced another, `replaced`: what it changed. `left_out` names what the searches found and the context leaves out, and why: `superseded`, `uncertain`, or `budget`. The context is built as ChloeCtx's own `memory_ask` builds it for Claude Code ([how](index.md)), with its sizes scaled to the budget.
+An answer of `ask` has, for each record in the context, its `section` (`rule`, `note`, `timeline` for a question about the whole history, `reply` and `excerpt` for past conversations), its `tokens` (about four characters each), its scores (`bm25` for the question's words, `cos` for its meaning) and, for a note that replaced another, `replaced`: what it changed. `left_out` names what the searches found and the context leaves out, and why: `superseded` (a later note replaced it), `retired`, `uncertain`, or `budget`. The context is built as ChloeCtx's own `memory_ask` builds it for Claude Code ([how](index.md)), with its sizes scaled to the budget.
 
 ### A space as an MCP server
 

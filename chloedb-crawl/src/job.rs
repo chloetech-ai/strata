@@ -977,6 +977,23 @@ impl Job {
                 json!({"path": path, "share": share, "type": ty, "example": example, "column": column})
             })
             .collect();
+        // Each column's `fill` is the share of the pages it was decided on;
+        // `filled` the share of every page read so far, which moves as the
+        // crawl goes (DAP-22: the page showed the sample's share throughout).
+        let plan = g.plan.as_ref().map(|p| {
+            let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+            if let Some(cols) = v.get_mut("columns").and_then(Value::as_array_mut) {
+                for (c, j) in p.columns.iter().zip(cols) {
+                    let path = match &c.source {
+                        Source::Path(path) => path.clone(),
+                        Source::Rule(r) => format!("rule.{r}"),
+                        _ => continue,
+                    };
+                    j["filled"] = json!(g.stats.share(&path));
+                }
+            }
+            v
+        });
         json!({
             "id": self.id,
             "table": self.table,
@@ -991,7 +1008,7 @@ impl Job {
             "why_done": g.why_done,
             "rate": rate(&g.series),
             "series": g.series.iter().rev().take(600).rev().collect::<Vec<_>>(),
-            "plan": g.plan,
+            "plan": plan,
             "sql": g.plan.as_ref().map(Plan::create_sql),
             "template": g.template,
             "fields": fields,
@@ -1230,5 +1247,30 @@ mod tests {
         assert_eq!(j.beyond_depth(), 2);
         assert_eq!(j.why_done(), "it reached max depth (3): 2 links on the deepest pages were not followed; raise max depth to reach them");
         assert_eq!(j.status()["beyond_depth"], 2);
+    }
+
+    /// A column's Filled is the share of every page read so far, not only
+    /// of the sample it was decided on (DAP-22).
+    #[test]
+    fn a_columns_fill_follows_the_pages_read() {
+        let j = job(100);
+        let seen = |g: &mut State, pages: u64, with: u64| {
+            g.stats.pages = pages;
+            let f = g.stats.fields.entry("meta.author".into()).or_default();
+            f.pages = with;
+        };
+        {
+            let mut g = j.st();
+            seen(&mut g, 10, 10);
+            g.plan = Some(Plan::from_sample("t", &g.stats, &[], 0.5, None));
+        }
+        let author = |s: &Value| s["plan"]["columns"].as_array().unwrap().iter().find(|c| c["name"] == "author").cloned().unwrap();
+        let a = author(&j.status());
+        assert_eq!((a["fill"].as_f64(), a["filled"].as_f64()), (Some(1.0), Some(1.0)), "{a}");
+        seen(&mut j.st(), 40, 10);
+        let a = author(&j.status());
+        assert_eq!((a["fill"].as_f64(), a["filled"].as_f64()), (Some(1.0), Some(0.25)), "the sample's share stays, and the share so far moves: {a}");
+        let url = j.status()["plan"]["columns"].as_array().unwrap().iter().find(|c| c["name"] == "url").cloned().unwrap();
+        assert!(url.get("filled").is_none(), "a base column has none: {url}");
     }
 }

@@ -11,7 +11,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../assets/site.css?v=3871c230ea">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
@@ -203,7 +203,7 @@
 </tr>
 <tr>
 <td><code>POST /v1/connectors/NAME/push</code></td>
-<td>a system's push: any body (JSON, or a raw email), written with the sender's key</td>
+<td>a system's push: any body (JSON, or a raw email), written with the sender's key. A body with no records at the connector's <code>records</code> path (Alertmanager's: <code>$.alerts</code>), or with no message for a mail connector, is refused with 422, which says what the body has instead (its top-level keys), so that a sender set up wrong finds out; an empty list there is a push of no records, answered 200</td>
 </tr>
 </tbody>
 </table></div>
@@ -221,12 +221,16 @@
 <td>the last run went well (and, for a pull, within three times its interval or 15 minutes)</td>
 </tr>
 <tr>
+<td><code>warning</code></td>
+<td>the last run went well but found something wrong: <code>state.last_warning</code> (and the run's <code>warning</code>) says what. An <code>http_json</code> pull whose <code>records</code> path matched nothing in an answer that had a body (no key of that name, as against an empty list) reads 0 records and says so: "the records path $.items matched nothing; the top-level keys are data, next". A dry run answers it as <code>warning</code> too</td>
+</tr>
+<tr>
 <td><code>invalid</code></td>
 <td>its row fails the API's checks (<code>invalid</code> says why): it does not run</td>
 </tr>
 <tr>
 <td><code>failing</code></td>
-<td>the last run failed: <code>state.last_error</code> says why, <code>state.failures</code> how many in a row (an error names a URL without its query, and a secret's value nowhere: it reads <code>***</code>, since a read key reads these tables)</td>
+<td>the last run failed: <code>state.last_error</code> says why, <code>state.failures</code> how many in a row (a request that failed says why, from its causes: the connection refused, a name that does not resolve, TLS, a timeout; an error names a URL without its query, and a secret's value nowhere: it reads <code>***</code>, since a read key reads these tables)</td>
 </tr>
 <tr>
 <td><code>stale</code></td>
@@ -234,7 +238,7 @@
 </tr>
 <tr>
 <td><code>pending</code>, <code>waiting</code></td>
-<td>a pull not run yet; a push connector nothing was pushed to yet</td>
+<td>a pull not run yet (one run by hand, <code>every_s</code> 0, too); a push connector nothing was pushed to yet</td>
 </tr>
 <tr>
 <td><code>running</code>, <code>disabled</code></td>
@@ -243,7 +247,7 @@
 </tbody>
 </table></div>
 <h2 id="configured-as-rows">Configured as rows<a class="anchor" href="#configured-as-rows" aria-label="Link to this section">#</a></h2>
-<p>Each connector is a row of <code>chloedb_connectors</code> (<code>id</code> its name, <code>kind</code>, <code>target</code>, <code>enabled</code>, <code>every_s</code>, <code>config</code> as JSON text, <code>push_key</code> its key's id, <code>note</code>, <code>created</code>, <code>updated</code>), each run a row of <code>chloedb_connector_runs</code> (trigger, started, took, ok, records read, rows written, records that made no row, columns left out, error, cursor after; kept 30 days), and each connector's cursor and counts a row of <code>chloedb_connector_state</code>. The tables are made with the first connector, with <code>updated_by</code>, who changed the config last. SQL reads them, and only the server writes them: a statement or a write that changes one of them (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>, <code>/v1/write</code>, <code>/v1/kv</code>) answers 403 <code>server_owned</code> for every key, an admin's too, since a row would choose the URL a connector sends its credentials to and the table its run's key writes. Change a connector through the API (<code>POST /v1/admin/connectors/NAME {"enabled": false}</code> turns one off), which checks it and writes the change in the audit log. The schedule reads <code>chloedb_connectors</code> again every 10 seconds and checks each row as the API does: a row that fails (one written with the server's own token, say, or by an older server) is shown with health <code>invalid</code> and why, and is neither pulled nor pushed to until an admin changes or deletes it.</p>
+<p>Each connector is a row of <code>chloedb_connectors</code> (<code>id</code> its name, <code>kind</code>, <code>target</code>, <code>enabled</code>, <code>every_s</code>, <code>config</code> as JSON text, <code>push_key</code> its key's id, <code>note</code>, <code>created</code>, <code>updated</code>), each run a row of <code>chloedb_connector_runs</code> (trigger, started, took, ok, records read, rows written, records that made no row, columns left out, error, cursor after, <code>warning</code>; kept 30 days), and each connector's cursor and counts a row of <code>chloedb_connector_state</code> (its <code>rows_total</code> counts every row each run wrote, an upsert of a row already there too, so it can be more than the target's rows; the Connectors page's column says "rows written"). The tables are made with the first connector, with <code>updated_by</code>, who changed the config last, and the runs' <code>warning</code> and the state's <code>last_warning</code> (a server adds the columns it lacks to older tables). SQL reads them, and only the server writes them: a statement or a write that changes one of them (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>, <code>/v1/write</code>, <code>/v1/kv</code>) answers 403 <code>server_owned</code> for every key, an admin's too, since a row would choose the URL a connector sends its credentials to and the table its run's key writes. Change a connector through the API (<code>POST /v1/admin/connectors/NAME {"enabled": false}</code> turns one off), which checks it and writes the change in the audit log. The schedule reads <code>chloedb_connectors</code> again every 10 seconds and checks each row as the API does: a row that fails (one written with the server's own token, say, or by an older server) is shown with health <code>invalid</code> and why, and is neither pulled nor pushed to until an admin changes or deletes it.</p>
 <pre data-lang="sql">SELECT connector, COUNT(*) AS runs, SUM(rows_) AS rows, AVG(took_ms) AS ms
 FROM chloedb_connector_runs WHERE ok = false AND started &gt; &#x27;2026-11-13&#x27; GROUP BY connector;</pre>
 <h2 id="what-a-connector-reaches">What a connector reaches<a class="anchor" href="#what-a-connector-reaches" aria-label="Link to this section">#</a></h2>
@@ -370,7 +374,11 @@ FROM chloedb_connector_runs WHERE ok = false AND started &gt; &#x27;2026-11-13&#
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>
 </div></footer>
 <script src="../assets/site.js?v=142c29c3e0"></script>
-<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+<script>
+// On a narrow screen the sidebar and, on a phone, "On this page" start closed, so the page's text is in the first screen.
+if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;
+if (window.matchMedia("(max-width: 760px)").matches) document.querySelectorAll(".doc-toc").forEach(function (d) { d.open = false; });
+</script>
 
 </body>
 </html>

@@ -153,8 +153,8 @@ pub fn pack(store: &Store, embedder_spec: &str, project: &str, out: &Path, opts:
     for r in &recs {
         *by_kind.entry(r.kind.as_str().to_string()).or_insert(0u64) += 1;
         for l in &r.links {
-            if let Some(n) = names.get(&l.to) {
-                *topics.entry(n.clone()).or_insert(0) += 1;
+            if let Some(n) = names.get(&l.to).and_then(|n| topic_name(&l.to, n, project)) {
+                *topics.entry(n).or_insert(0) += 1;
             }
         }
     }
@@ -205,6 +205,34 @@ pub fn pack(store: &Store, embedder_spec: &str, project: &str, out: &Path, opts:
     };
     std::fs::write(out.join(MANIFEST), serde_json::to_string_pretty(&m)?)?;
     Ok(m)
+}
+
+/// An entity's name as a capsule's topic: a file of the project by its path
+/// in the project, and a path outside it (`/home/someone/notes.txt`, a
+/// system file the sessions read) by its file name alone: the manifest
+/// travels with the capsule, and such a path says whose machine it was and
+/// what is on it.
+fn topic_name(id: &str, name: &str, project: &str) -> Option<String> {
+    let n = name.trim();
+    let proj = project.trim_end_matches(['/', '\\']);
+    if !proj.is_empty() {
+        if let Some(r) = n.strip_prefix(proj).and_then(|r| r.strip_prefix(['/', '\\'])) {
+            return Some(r.to_string()).filter(|r| !r.is_empty());
+        }
+    }
+    let b = n.as_bytes();
+    let outside = n.starts_with('/')
+        || n.starts_with('~')
+        || n.starts_with("\\\\")
+        || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
+        || n.split(['/', '\\']).any(|p| p == "..");
+    // A name of a file, or a name that is one word (not a sentence that
+    // happens to start with a slash).
+    let path = id.starts_with("f:") || !n.contains(' ');
+    if !(path && outside) {
+        return Some(n.to_string());
+    }
+    n.rsplit(['/', '\\']).find(|p| !p.is_empty() && *p != ".." && *p != "~").map(str::to_string)
 }
 
 /// The longest title, topic, and the most topics a manifest is read with.

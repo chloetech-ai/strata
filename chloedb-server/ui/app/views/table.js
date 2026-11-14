@@ -7,7 +7,7 @@
 // search (a stored function, an endpoint, an agent's tool) from here.
 // #/table lists the tables, the user's own first.
 
-import { h, icon, clear, api, card, empty, failure, fmt, toast, copy, seg, gate, can, sqlBlock, store, debounce, table } from "../core.js";
+import { h, icon, clear, api, card, empty, failure, fmt, toast, copy, seg, gate, can, sqlBlock, store, debounce, table, bus, ApiError } from "../core.js";
 import { tables, cached, table as tableOf, isStored, isTestModel, typeBadge, invalidate } from "../catalog.js";
 import { ownerOf, isMine, folded } from "../owners.js";
 import { quoteName } from "../sqledit.js";
@@ -20,6 +20,8 @@ import inspector from "./inspector.js";
 export default { id: "table", title: "Tables", icon: "table", group: "Build", range: false, keywords: "tables table home search find rows data quality filled empty used by keys storage index meaning vectors semantic", render, onParams };
 
 const TABS = [["search", "Search"], ["data", "Data"], ["quality", "Quality"], ["used", "Used by"], ["storage", "Storage"]];
+/** Tables largest first, as the List sorts them by its Rows; those not counted last, by name. */
+export const tilesOrder = (ts, sizes) => [...ts].sort((a, b) => (sizes[b.table] ?? -1) - (sizes[a.table] ?? -1) || a.table.localeCompare(b.table));
 let again = null;
 function onParams(r) { again?.(r); }
 
@@ -212,7 +214,7 @@ function render(page, r) {
       const text = proseFields(t), vecs = meaningFields(t);
       const o = ownerOf(t.table);
       return h("a", { class: "tbl-tile", href: `#/table/${encodeURIComponent(t.table)}` },
-        h("div", { class: "row nw" }, icon("table"), h("b", { class: "grow ellipsis" }, t.table), sizes[t.table] != null ? h("span", { class: "small muted" }, fmt.si(sizes[t.table]) + " rows") : null),
+        h("div", { class: "row nw" }, icon("table"), h("b", { class: "grow ellipsis" }, t.table), sizes[t.table] != null ? h("span", { class: "small muted nowrap" }, fmt.plural(sizes[t.table], "row")) : null),
         h("div", { class: "small dim ellipsis" }, `${fmt.plural(fs.length, "field")}${text.length ? " · search " + text.map((f) => f.name).join(", ") : " · no text to search"}`),
         idx[t.table] ? h("div", { class: "small muted ellipsis", title: "on disk, and the use of the last 5 minutes" }, use(idx[t.table])) : null,
         h("div", { class: "row nw small", style: { gap: "6px", marginTop: "4px" } },
@@ -234,7 +236,10 @@ function render(page, r) {
     ], { rows: ts, sortKey: "docs", desc: true, onRow: (t) => { location.hash = `#/table/${encodeURIComponent(t.table)}`; } });
     let how = store.get("tables.how", "tiles");
     const host = h("div");
-    const draw = () => clear(host, how === "list" ? h("section", { class: "card" }, h("div", { class: "bd flush" }, listView())) : h("div", { class: "tbl-tiles" }, folded(ts, tile, { key: "tablehome", nameOf: (t) => t.table, label: "Tables of apps" })));
+    // Tiles in the List's order, largest first, their rows counted as the
+    // List counts them (CCB-24).
+    const bySize = tilesOrder(ts, sizes);
+    const draw = () => clear(host, how === "list" ? h("section", { class: "card" }, h("div", { class: "bd flush" }, listView())) : h("div", { class: "tbl-tiles" }, folded(bySize, tile, { key: "tablehome", nameOf: (t) => t.table, label: "Tables of apps" })));
     const total = Object.values(idx).reduce((a, x) => a + (x.bytes || 0), 0);
     const head = h("div", { class: "row", style: { gap: "12px", flexWrap: "wrap" } },
       h("span", { class: "small muted grow" }, `${fmt.plural(ts.length, "table")}${mine.length !== ts.length ? `, ${mine.length} yours` : ""}${total ? ` · ${fmt.bytes(total)} on disk` : ""}${Object.keys(idx).length ? " · use over the last 5 minutes" : ""}`),
@@ -454,15 +459,27 @@ function render(page, r) {
         count.textContent = n ? `rows ${fmt.n(from)}–${fmt.n(to)}${total != null ? ` of ${fmt.n(total)}${where.trim() ? " matching" : ""}` : ""}` : where.trim() ? "no row matches" : "";
         next.disabled = n < size || (total != null && to >= total);
         clear(exp, n ? exportMenu(j, t.table) : null);
-        clear(out, n ? h("div", { class: "tbl-wrap" }, grid(j, { max: size })) : where.trim() ? empty("search", "No row matches", `Nothing in ${t.table} has ${where.trim()}.`, h("button", { class: "btn", onclick: () => { filter.value = where = ""; page = 0; keep(); load(); } }, "Clear the filter")) : empty("table", "No rows yet", "Import a file into it, or write rows from code.", gate(h("a", { class: "btn", href: "#/import" }, icon("import"), "Import into it"), "write")));
+        clear(out, n ? h("div", { class: "tbl-wrap" }, grid(j, { max: size, first: page * size + 1 })) : where.trim() ? empty("search", "No row matches", `Nothing in ${t.table} has ${where.trim()}.`, h("button", { class: "btn", onclick: () => { filter.value = where = ""; page = 0; keep(); load(); } }, "Clear the filter")) : empty("table", "No rows yet", "Import a file into it, or write rows from code.", gate(h("a", { class: "btn", href: "#/import" }, icon("import"), "Import into it"), "write")));
       } catch (e) {
         if (my !== seq) return;
+        // A refused condition or a server that does not answer leaves no
+        // page: not the last one's rows and count beside the error, nor a
+        // Next to a page that cannot be read (CCB-19).
+        failed = !(e instanceof ApiError && e.answered);
+        last = null; total = null;
         err.hidden = false;
-        clear(err, icon("warn"), " ", e.message, where.trim() ? h("span", { class: "muted" }, " · a condition is what follows WHERE: brand = 'x' AND price > 10") : null);
-        if (!last) clear(out);
+        clear(err, icon("warn"), " ", e.message, where.trim() && !failed ? h("span", { class: "muted" }, " · a condition is what follows WHERE: brand = 'x' AND price > 10") : null);
+        count.textContent = "";
+        next.disabled = true;
+        clear(exp);
+        clear(out, failed ? h("div", { class: "small muted", style: { padding: "12px" } }, "The rows show again once the server answers.") : null);
       } finally { if (my === seq) out.style.opacity = ""; }
     }
+    // A page the server did not answer is read again when it answers.
+    let failed = false;
+    const off = bus.on("connection", (c) => { if (c.ok && failed) { failed = false; load(); } });
     load();
+    return off;
   }
 
   // ---------------------------------------------------------- Quality
@@ -554,7 +571,7 @@ function render(page, r) {
     const host = h("div");
     pane.append(host);
     try {
-      const c = inspector.render(host, { id: "inspector", rest: [], params: new URLSearchParams({ table: t.table }) });
+      const c = inspector.render(host, { id: "inspector", rest: [], params: new URLSearchParams({ table: t.table }), embedded: true });
       return typeof c === "function" ? c : null;
     } catch (e) { clear(host, failure(e, "The storage")); return null; }
   }

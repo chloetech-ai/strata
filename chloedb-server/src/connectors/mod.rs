@@ -42,7 +42,7 @@
 //!   never a replica or a shard (`--connectors off` turns them off). A
 //!   push goes to any coordinator.
 //! - **Health.** `GET /v1/admin/connectors` answers each connector's
-//!   health (ok, failing, stale, waiting, pending, disabled), its last
+//!   health (ok, warning, failing, stale, waiting, pending, disabled), its last
 //!   runs and its counts; the command center's Connectors page shows it.
 
 pub mod kinds;
@@ -76,8 +76,8 @@ pub const STATE: &str = "chloedb_connector_state";
 
 const SCHEMAS: &[(&str, &str)] = &[
     (CONFIGS, "CREATE TABLE IF NOT EXISTS chloedb_connectors (id KEYWORD PRIMARY KEY, kind KEYWORD, target KEYWORD, enabled BOOL, every_s INT, config TEXT OPTIONS(indexed = false), push_key KEYWORD, note TEXT, created TIMESTAMP, updated TIMESTAMP, updated_by KEYWORD)"),
-    (RUNS, "CREATE TABLE IF NOT EXISTS chloedb_connector_runs (id KEYWORD PRIMARY KEY, connector KEYWORD, kind KEYWORD, target KEYWORD, trigger KEYWORD, started TIMESTAMP, ended TIMESTAMP, took_ms INT, ok BOOL, records INT, rows_ INT, skipped INT, dropped KEYWORD[], error TEXT, cursor TEXT OPTIONS(indexed = false), more BOOL) OPTIONS(retain = '30 days', retain_by = 'started')"),
-    (STATE, "CREATE TABLE IF NOT EXISTS chloedb_connector_state (id KEYWORD PRIMARY KEY, cursor TEXT OPTIONS(indexed = false), last_run TIMESTAMP, last_ok TIMESTAMP, last_error TEXT, failures INT, runs INT, records_total INT, rows_total INT, last_rows INT, more BOOL)"),
+    (RUNS, "CREATE TABLE IF NOT EXISTS chloedb_connector_runs (id KEYWORD PRIMARY KEY, connector KEYWORD, kind KEYWORD, target KEYWORD, trigger KEYWORD, started TIMESTAMP, ended TIMESTAMP, took_ms INT, ok BOOL, records INT, rows_ INT, skipped INT, dropped KEYWORD[], error TEXT, cursor TEXT OPTIONS(indexed = false), more BOOL, warning TEXT) OPTIONS(retain = '30 days', retain_by = 'started')"),
+    (STATE, "CREATE TABLE IF NOT EXISTS chloedb_connector_state (id KEYWORD PRIMARY KEY, cursor TEXT OPTIONS(indexed = false), last_run TIMESTAMP, last_ok TIMESTAMP, last_error TEXT, failures INT, runs INT, records_total INT, rows_total INT, last_rows INT, more BOOL, last_warning TEXT)"),
 ];
 
 /// `rows` in writes of [`BATCH`] rows or about 4 MB at most.
@@ -283,6 +283,9 @@ pub struct State {
     pub last_rows: u64,
     /// The last run stopped at its limit.
     pub more: bool,
+    /// What the last run, which went well, found wrong (a records path
+    /// that matched nothing).
+    pub last_warning: Option<String>,
 }
 
 impl State {
@@ -300,6 +303,7 @@ impl State {
             rows_total: n("rows_total"),
             last_rows: n("last_rows"),
             more: r["more"].as_bool().or_else(|| r["more"].as_i64().map(|x| x != 0)).unwrap_or(false),
+            last_warning: r["last_warning"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         }
     }
 
@@ -309,6 +313,7 @@ impl State {
             "id": name, "cursor": self.cursor.clone().unwrap_or_default(), "last_run": t(self.last_run_ms), "last_ok": t(self.last_ok_ms),
             "last_error": self.last_error.clone().unwrap_or_default(), "failures": self.failures, "runs": self.runs,
             "records_total": self.records_total, "rows_total": self.rows_total, "last_rows": self.last_rows, "more": self.more,
+            "last_warning": self.last_warning.clone().unwrap_or_default(),
         })
     }
 }
@@ -585,11 +590,13 @@ impl Connectors {
                 self.own_sql(svc, ddl, json!({})).await.map_err(|e| format!("making {t}: {e}"))?;
             }
         }
-        // Who changed a config last: a column the tables of 0.3.3 and
-        // before lack.
-        if let Ok(s) = svc.table(CONFIGS).await {
-            if !s.fields.iter().any(|f| f.name == "updated_by") {
-                self.own_sql(svc, &format!("ALTER TABLE {CONFIGS} ADD COLUMN updated_by KEYWORD"), json!({})).await.map_err(|e| format!("adding updated_by to {CONFIGS}: {e}"))?;
+        // Who changed a config last, and a run's warning: columns the
+        // tables of 0.3.3 and before lack.
+        for (t, col, ty) in [(CONFIGS, "updated_by", "KEYWORD"), (RUNS, "warning", "TEXT"), (STATE, "last_warning", "TEXT")] {
+            if let Ok(s) = svc.table(t).await {
+                if !s.fields.iter().any(|f| f.name == col) {
+                    self.own_sql(svc, &format!("ALTER TABLE {t} ADD COLUMN {col} {ty}"), json!({})).await.map_err(|e| format!("adding {col} to {t}: {e}"))?;
+                }
             }
         }
         self.tables_made.store(true, Ordering::SeqCst);
@@ -714,6 +721,10 @@ impl Connectors {
         let now_us = started_ms as i64 * 1000;
         let reach = kinds::reach_of(c);
         let ctx = kinds::Ctx { c, cursor: st.cursor.clone(), secrets: &secrets, http: self.http(c), reach: &reach, now_us, limit: RUN_LIMIT, max_bytes: kinds::max_bytes(c) };
+        // The tables of an older server get the columns this one writes.
+        if let Err(e) = self.make_tables(svc).await {
+            tracing::warn!(connector = %c.name, error = %e, "cannot update the connectors' tables");
+        }
         // Checked again here: the row may have been written past the API.
         let fetched = match (c.check(), push) {
             (Err(why), _) => Err(format!("connector {} does not run: {why} (change it with POST /v1/admin/connectors/{}, or delete it)", c.name, c.name)),
@@ -726,6 +737,9 @@ impl Connectors {
         let mut report = json!({"connector": c.name, "kind": c.kind, "target": c.target, "trigger": trigger.name(), "started_ms": started_ms});
         let outcome: Result<(usize, usize, usize, Vec<String>, Option<String>, bool), String> = async {
             let f = fetched?;
+            if let Some(w) = &f.warning {
+                report["warning"] = json!(kinds::redact(w, &secrets));
+            }
             let records = f.records.len();
             let (rows, skipped, dropped, first_err) = self.rows_of(svc, c, &f.records, now_us).await?;
             let key_owned;
@@ -784,6 +798,7 @@ impl Connectors {
                 st.rows_total += *rows as u64;
                 st.last_rows = *rows as u64;
                 st.more = *more;
+                st.last_warning = report["warning"].as_str().map(str::to_string);
                 // None keeps the last; an empty one clears it.
                 if let Some(cur) = cursor {
                     st.cursor = Some(cur.clone()).filter(|c| !c.is_empty());
@@ -793,6 +808,7 @@ impl Connectors {
             Err(e) => {
                 st.failures += 1;
                 st.last_error = Some(e.clone());
+                st.last_warning = None;
                 st.more = false;
                 (false, Some(e.clone()))
             }
@@ -807,6 +823,7 @@ impl Connectors {
             "started": chloedb::timestamp::format(started_ms as i64 * 1000), "ended": chloedb::timestamp::format(now_ms() as i64 * 1000),
             "took_ms": took_ms, "ok": ok, "records": report["records"], "rows_": report["rows"], "skipped": report["skipped"],
             "dropped": report["dropped"], "error": error.unwrap_or_default(), "cursor": st.cursor.clone().unwrap_or_default(), "more": st.more,
+            "warning": st.last_warning.clone().unwrap_or_default(),
         });
         let ops = vec![json!({"op": "upsert", "table": STATE, "doc": st.row(&c.name)}), json!({"op": "insert", "table": RUNS, "doc": run_row})];
         if let Err(e) = self.own_write(svc, ops).await {
@@ -856,7 +873,9 @@ impl Connectors {
             return "running";
         }
         if st.runs == 0 {
-            return if c.pulls() { "pending" } else { "waiting" };
+            // A pull run by hand (every_s 0) has not run yet; it waits for
+            // no push (DAP-18).
+            return if kinds::kind(&c.kind).is_some_and(|k| k.pull) { "pending" } else { "waiting" };
         }
         if st.failures > 0 {
             return "failing";
@@ -866,6 +885,9 @@ impl Connectors {
             if now_ms().saturating_sub(st.last_ok_ms) > late {
                 return "stale";
             }
+        }
+        if st.last_warning.is_some() {
+            return "warning";
         }
         "ok"
     }
@@ -1198,7 +1220,7 @@ pub async fn test(svc: &Arc<Service>, b: &Json) -> Result<Json, ApiError> {
         None if kinds::kind(&c.kind).is_some_and(|k| k.pull) => kinds::pull(&ctx).await,
         None => Err(format!("a {} connector is tested with a \"sample\" of what a system sends it", c.kind)),
     };
-    let f = fetched.map_err(|e| ApiError { code: None, status: 502, message: e })?;
+    let f = fetched.map_err(|e| ApiError { code: None, status: if e.starts_with(kinds::NO_RECORDS) { 422 } else { 502 }, message: e })?;
     let target = svc.table(&c.target).await.ok();
     let m = kinds::map_of(&c);
     let mut fitted = map::Fitted::default();
@@ -1218,7 +1240,7 @@ pub async fn test(svc: &Arc<Service>, b: &Json) -> Result<Json, ApiError> {
     }
     Ok(json!({
         "connector": c.name, "kind": c.kind, "target": c.target, "target_exists": target.is_some(),
-        "records": f.records.len(), "cursor": f.cursor, "more": f.more, "took_ms": t0.elapsed().as_millis() as u64,
+        "records": f.records.len(), "cursor": f.cursor, "more": f.more, "warning": f.warning.map(|w| kinds::redact(&w, &secrets)), "took_ms": t0.elapsed().as_millis() as u64,
         "sample_records": f.records.iter().take(3).cloned().collect::<Vec<_>>(), "rows": rows, "errors": errors, "dropped": fitted.dropped,
         "map": m.map_or(Json::Null, Json::Object),
     }))
@@ -1249,6 +1271,8 @@ pub async fn push(svc: &Arc<Service>, name: &str, auth: Option<&HeaderValue>, co
         Some(e) => {
             let status = if e.starts_with(TOO_MANY) {
                 413
+            } else if e.starts_with(kinds::NO_RECORDS) {
+                422
             } else if e.contains("403:") {
                 403
             } else if e.contains("401:") {

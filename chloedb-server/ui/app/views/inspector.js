@@ -66,7 +66,13 @@ function render(page, r) {
   const content = h("div", {}, card({ title: "Where to look", sub: "the cluster, a shard or a copy: every number below follows", body: map, attrs: { style: { marginBottom: "14px" } } }), tiles, body,
     h("p", { class: "small muted ix-foot" }, "Documents, bytes, segments, index sizes and distinct terms are read from every segment (terms of large fields are estimated with a HyperLogLog sketch, which also merges across shards). Value sizes, fill and document sizes come from documents drawn at random from each server, weighted to its whole table; tokens per document come from every document's length norm, exact under 24 tokens and rounded down by at most 12.5% above. Reads are counted in memory since each server started or was reset: the top lists keep each table's 256 most read keys (Space-Saving, each count at most its error too high), coverage and the frequency chart come from a hash sample of keys that halves itself to stay under 4,096. A coordinator counts what each copy served through it, and each server what it answered its own clients, so nothing is counted twice.", readsTail));
   const title = h("h1", {}, "Table details");
-  page.append(h("div", { class: "page-head" }, h("div", {}, h("div", { class: "small" }, h("a", { class: "wl-link", href: "#/tables" }, "Tables and storage"), h("span", { class: "muted" }, " › one table")), title, h("p", {}, "What the table holds, how big each part of it is, how fresh it is, and how often its documents and keys are read. Reads are counted since each server started (Reset reads starts them again).")),
+  // Inside a table's home (its Storage tab) the page is a tab's body: no
+  // breadcrumb, heading or table picker of its own (CCB-21).
+  if (r?.embedded) page.append(h("div", { class: "row", style: { gap: "8px", flexWrap: "wrap", marginBottom: "12px" } },
+    h("span", { class: "small muted", style: { flex: "1 1 360px" } }, "How big each part of the table is, how fresh, and how often its documents and keys are read (since each server started). ",
+      h("a", { href: `#/inspector?table=${encodeURIComponent(want.table || "")}` }, "Open in Tables and storage")),
+    h("span", { class: "row", style: { gap: "8px", flexWrap: "wrap", justifyContent: "flex-end" } }, stamp, sizes, reset, again)), content);
+  else page.append(h("div", { class: "page-head" }, h("div", {}, h("div", { class: "small" }, h("a", { class: "wl-link", href: "#/tables" }, "Tables and storage"), h("span", { class: "muted" }, " › one table")), title, h("p", {}, "What the table holds, how big each part of it is, how fresh it is, and how often its documents and keys are read. Reads are counted since each server started (Reset reads starts them again).")),
     h("div", { class: "tools" }, stamp, h("label", { class: "small muted" }, "Table"), pick, sizes, reset, again)), content);
 
   async function loadTables() {

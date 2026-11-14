@@ -111,6 +111,8 @@ pub fn check_statement(who: &Principal, text: &str, command: &Command, tables: &
     }
     match command {
         Command::Query | Command::Explain { .. } => check_reads(who, text, tables, functions),
+        // It lists only the tables the key reads ([`crate::service::Service::sql_in`]).
+        Command::ShowTables => Ok(()),
         Command::Write { table, .. } => {
             who.may_table(Scope::Write, table, "a write")?;
             check_reads(who, text, tables, functions)

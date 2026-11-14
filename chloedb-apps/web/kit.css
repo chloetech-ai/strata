@@ -483,7 +483,8 @@ tr:has(> td.tick input:checked) > td.tick + td { text-decoration: line-through; 
 :root[data-look="native"] input:focus, :root[data-look="native"] select:focus, :root[data-look="native"] textarea:focus { border-color: transparent; box-shadow: 0 0 0 3px var(--accent-soft); }
 :root[data-look="native"] .chips { background: color-mix(in srgb, var(--fg) 8%, var(--bg)); border: 0; border-radius: 10px; padding: 2px; }
 :root[data-look="native"] .chip { border-radius: 8px; color: var(--fg); background: transparent; }
-:root[data-look="native"] .chip.on { background: var(--card); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+/* the chosen segment: the card in light, a lighter grey in dark (--seg-on), as a phone's */
+:root[data-look="native"] .chip.on { background: var(--seg-on); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
 @media (max-width: 560px) {
   :root[data-look="native"] .chips { align-self: stretch; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   :root[data-look="native"] .chips:not(:has(> :nth-child(5))) { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }

@@ -127,6 +127,29 @@ async fn parameters_read_the_queried_table_and_no_other() {
     assert_eq!((s, &j["rows"][0][0]), (200, &json!("b")), "{j}");
 }
 
+/// ONB-16: SHOW TABLES through /v1/sql answers the tables' names, without
+/// ChloeDB's own, and for a key limited to tables those it reads alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn show_tables_names_the_tables_a_key_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _svc) = start(dir.path(), Vec::new()).await;
+    ok(&base, "CREATE TABLE swarm_x (id KEYWORD PRIMARY KEY, title TEXT)").await;
+    ok(&base, "CREATE FUNCTION bump(x INT) RETURNS INT AS :x + 1").await;
+    let names = |j: &Json| j["rows"].as_array().unwrap().iter().map(|r| r[0].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let (s, j) = call(&base, "POST", "/v1/sql", ROOT, Some(json!({"sql": "SHOW TABLES"}))).await;
+    assert_eq!((s, &j["columns"]), (200, &json!(["name"])), "{j}");
+    let mut all = names(&j);
+    all.sort();
+    assert_eq!(all, ["products", "swarm_x"], "{j}");
+    let k = key(&base, json!({"name": "swarm", "tables": {"swarm_*": "read"}})).await;
+    let (s, j) = call(&base, "POST", "/v1/sql", Some(&k), Some(json!({"sql": "show tables"}))).await;
+    assert_eq!((s, names(&j)), (200, vec!["swarm_x".to_string()]), "{j}");
+    // /v1/query takes queries alone, and says where SHOW TABLES goes.
+    let (s, j) = call(&base, "POST", "/v1/query", ROOT, Some(json!({"sql": "SHOW TABLES"}))).await;
+    assert_eq!(s, 400, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("/v1/sql"), "{j}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_limited_key_uses_its_own_tables_routes() {
     let dir = tempfile::tempdir().unwrap();

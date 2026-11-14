@@ -36,8 +36,19 @@ async function usage() {
     };
   } catch { return null; }
 }
+/** A text with its runs of white space made one space, for comparing definitions. */
+const squash = (s) => String(s || "").replace(/\s+/g, " ").trim();
+/**
+ * Whether a function's version `v` (as GET /v1/functions lists it) is the
+ * definition a save would write: its name, parameters, body and
+ * description, white space aside. The server makes no version for it.
+ */
+export function sameDefinition(v, { name, params, body, description }) {
+  const sig = `${name}(${params.map((p) => `${p.name} ${p.ty}${p.default != null ? ` DEFAULT ${p.default}` : ""}`).join(", ")})`;
+  return !!v && v.body != null && squash(v.body) === squash(body) && (v.description || "") === String(description || "").trim() && squash(v.signature) === squash(sig);
+}
 /** A line diff of two texts: [kind, line] with kind " ", "-" or "+". */
-function diff(a, b) {
+export function diff(a, b) {
   const x = (a || "").split("\n"), y = (b || "").split("\n");
   const n = x.length, m = y.length, L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
   for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
@@ -48,7 +59,13 @@ function diff(a, b) {
   while (j < m) out.push(["+", y[j++]]);
   return out;
 }
-const diffView = (a, b) => h("pre", { class: "code diff" }, diff(a, b).map(([k, l]) => h("div", { class: k === "+" ? "add" : k === "-" ? "del" : "" }, `${k} ${l}`)));
+/**
+ * Two versions' difference, a clause a line: the server keeps each
+ * definition on one line, so both are laid out by `format` (the
+ * workbench's formatSql) before their lines are compared (CCB-18).
+ */
+export const versionDiff = (a, b, format = (s) => s) => diff(format(a || "").trimEnd(), format(b || "").trimEnd());
+const diffView = (lines) => h("pre", { class: "code diff" }, lines.map(([k, l]) => h("div", { class: k === "+" ? "add" : k === "-" ? "del" : "" }, `${k} ${l}`)));
 const origin = () => location.origin;
 const js = (v) => JSON.stringify(v);
 /** A parameter's sample value, for code. */
@@ -100,16 +117,22 @@ export function saveSearch({ suggested = "", description = "", params, body, tab
     const nameIn = h("input", { class: "input", value: slug(suggested), spellcheck: "false", style: { width: "100%" } });
     const aboutIn = h("input", { class: "input", value: description, placeholder: "What it finds, for people and agents", style: { width: "100%" } });
     const pre = h("div");
+    // The functions there now, by name: each one's current version.
     let existing = null;
-    api("/v1/functions").then((j) => { existing = new Set((j.functions || []).filter((f) => f.current != null).map((f) => f.name)); sync(); }).catch(() => {});
+    const current = (fs) => new Map((fs || []).filter((f) => f.current != null).map((f) => [f.name, f.versions.find((v) => v.version === f.current) || {}]));
+    api("/v1/functions").then((j) => { existing = current(j.functions); sync(); }).catch(() => {});
     const sig = params.map((p) => `${p.name} ${p.ty}${p.default != null ? ` DEFAULT ${p.default}` : ""}`).join(", ");
     const sqlOf = () => `CREATE ${existing?.has(slug(nameIn.value)) ? "OR REPLACE " : ""}FUNCTION ${slug(nameIn.value)}(${sig}) RETURNS TABLE OPTIONS(description = '${aboutIn.value.trim().replace(/'/g, "''")}') AS\n${body}`;
     const ok = h("button", { class: "btn primary" }, "Save");
+    // A save of the definition there now writes nothing (CCB-17): the
+    // server keeps the version it has, so the dialog says so.
+    const sameAs = (n) => sameDefinition(existing?.get(n), { name: n, params, body, description: aboutIn.value });
     function sync() {
-      const n = slug(nameIn.value);
-      clear(pre, existing?.has(n) ? h("div", { class: "small", style: { color: "var(--serious)" } }, icon("warn"), ` ${n} exists: saving makes its next version (the old ones stay, and can come back).`) : null,
+      const n = slug(nameIn.value), same = sameAs(n);
+      clear(pre, same ? h("div", { class: "small muted" }, icon("okc"), ` ${n} is this search already (version ${existing.get(n).version}): saving it again makes no new version.`)
+        : existing?.has(n) ? h("div", { class: "small", style: { color: "var(--serious)" } }, icon("warn"), ` ${n} exists: saving makes its next version (the old ones stay, and can come back).`) : null,
         h("details", {}, h("summary", { class: "small muted" }, "The statement"), sqlBlock(sqlOf())));
-      ok.textContent = existing?.has(n) ? "Save a new version" : "Save";
+      ok.textContent = same ? "Keep it" : existing?.has(n) ? "Save a new version" : "Save";
     }
     nameIn.oninput = sync; aboutIn.oninput = sync;
     const m = modal({
@@ -122,10 +145,15 @@ export function saveSearch({ suggested = "", description = "", params, body, tab
       const n = slug(nameIn.value);
       if (!aboutIn.value.trim()) { toast("Say what it finds: agents choose a tool by it", "bad"); aboutIn.focus(); return; }
       ok.disabled = true;
+      const was = existing?.get(n)?.version;
       try {
         await api("/v1/sql", { body: { sql: sqlOf() } });
         m.close();
-        toast(`Saved as ${n}`, "ok");
+        // Whether a version was made is the server's to say: the same
+        // definition again leaves the current one.
+        const now = await api("/v1/functions").then((j) => current(j.functions).get(n)?.version).catch(() => undefined);
+        if (was != null && now === was) toast(`${n} is unchanged: it stays at version ${was}`, "info");
+        else toast(now != null && now > 1 ? `Saved ${n} as version ${now}` : `Saved as ${n}`, "ok");
         resolve(n);
       } catch (e) { ok.disabled = false; toast(e.message, "bad"); }
     };
@@ -225,7 +253,7 @@ function render(page, r) {
     const versions = h("div", { class: "saved-versions" }, [...f.versions].reverse().map((x) => h("details", { open: x.version === f.current },
       h("summary", {}, h("b", {}, `Version ${x.version}`), x.version === f.current ? h("span", { class: "badge accent" }, "current") : null, x.dropped ? h("span", { class: "badge" }, "dropped") : null,
         h("span", { class: "small muted" }, ` ${x.created ? fmt.ago(Date.parse(x.created)) : ""}${x.created_by ? " by " + x.created_by : ""}`), h("span", { class: "grow" }),
-        x.version !== f.current && !x.dropped && v.sql && x.sql ? h("button", { class: "btn xs", title: "The lines that differ from the current version", onclick: (e) => { e.preventDefault(); const d = e.currentTarget.closest("details"); d.open = true; const box = d.querySelector(".ver-body"); box.dataset.diff = box.dataset.diff === "1" ? "" : "1"; clear(box, box.dataset.diff ? [h("div", { class: "small muted" }, `version ${x.version} (−) against the current, ${f.current} (+)`), diffView(x.sql, v.sql)] : sqlBlock(x.sql)); } }, icon("layers"), "Compare") : null,
+        x.version !== f.current && !x.dropped && v.sql && x.sql ? h("button", { class: "btn xs", title: "The lines that differ from the current version", onclick: async (e) => { e.preventDefault(); const d = e.currentTarget.closest("details"); d.open = true; const box = d.querySelector(".ver-body"); box.dataset.diff = box.dataset.diff === "1" ? "" : "1"; const { formatSql } = box.dataset.diff ? await import("./sql.js") : {}; clear(box, box.dataset.diff ? [h("div", { class: "small muted" }, `version ${x.version} (−) against the current, ${f.current} (+)`), diffView(versionDiff(x.sql, v.sql, formatSql))] : sqlBlock(x.sql)); } }, icon("layers"), "Compare") : null,
         x.version !== f.current && !x.dropped ? gate(h("button", { class: "btn xs", title: "Make this version the current one again: saved as a new version with its definition", onclick: (e) => { e.preventDefault(); back(x.version); } }, icon("refresh"), "Bring back"), "admin") : null),
       h("div", { class: "ver-body" }, x.sql ? sqlBlock(x.sql) : h("div", { class: "small muted" }, "A drop: the function was removed here.")))));
     function usageCard() {

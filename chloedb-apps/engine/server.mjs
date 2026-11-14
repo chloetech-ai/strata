@@ -876,12 +876,13 @@ const routes = [
     // open and leave name a screen (leave with the time spent on it); abandon
     // is a form typed into and closed unsaved; an action is anything else an
     // app records (a search with the words and how many rows they found).
+    // A beacon sends no headers: the studio's says it is the owner's in its body.
     const kind = ['open', 'leave', 'abandon'].includes(b.kind) ? b.kind : 'action';
     const detail = kind === 'action' ? `${String(b.action || '').slice(0, 60)}${b.detail ? ` ${String(b.detail).slice(0, 200)}` : ''}` : String(b.detail || '');
     const where = cx.where(b.session);
     const screen = kind === 'open' || kind === 'leave' ? String(b.detail || '') : where.screen || b.screen;
     const q = kind === 'action' && /^(search|filter)$/.test(String(b.action || '')) ? (b.q ?? b.detail) : null;
-    await engine.store.track(id, kind, String(b.cap || ''), detail, { person: await cx.who(id), v: (await engine.view(id)).comp.n, ...where, taps: null, screen, tbl: b.table, q, results: b.results, ms: b.ms });
+    await engine.store.track(id, kind, String(b.cap || ''), detail, { person: await cx.who(id), v: (await engine.view(id)).comp.n, ...where, taps: null, screen, tbl: b.table, q, results: b.results, ms: b.ms, src: cx.owner || (!cx.public && b.owner === true) ? 'owner' : null });
     noteActivity(id);
     return { ok: true };
   }],
@@ -1081,8 +1082,12 @@ const server = http.createServer(async (req, res) => {
       return { role: user ? user.role || 'member' : 'visitor', user, company: user ? await companyOf(appId) : null };
     };
     const who = async (appId) => (await personOf(appId))?.id || visitorOf(req);
-    const writer = async (appId) => ({ user: await personOf(appId), who: await who(appId), visitor: !!cx0.public, ownRows: cx0.access === 'add', ...where(), pub: !!cx0.public, as: await asOf(appId), company: await companyOf(appId) });
-    const cx = { ...cx0, req, res, where, user: personOf, who, as: asOf, company: companyOf, writer };
+    // The app's owner trying it: the studio (which says so, x-sa-owner) or
+    // the command center (through chloedb-server), never a published app's
+    // visitor. Usage tells their events apart from people's (src "owner").
+    const owner = !cx0.public && (login.fromServer(req) || req.headers['x-sa-owner'] === '1');
+    const writer = async (appId) => ({ user: await personOf(appId), who: await who(appId), visitor: !!cx0.public, ownRows: cx0.access === 'add', ...where(), pub: !!cx0.public, as: await asOf(appId), company: await companyOf(appId), owner });
+    const cx = { ...cx0, req, res, where, user: personOf, who, as: asOf, company: companyOf, writer, owner };
     // ?v=N runs a request on version N of the app (a version built to try).
     const v = Number(url.searchParams.get('v')) || null;
     for (const [method, re, fn] of routes) {

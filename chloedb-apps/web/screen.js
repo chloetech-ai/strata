@@ -601,6 +601,13 @@
       const half = ref >= 0 && HALF.test(name(cols[ref], ref));
       return { raw, tick, badge, numeric, title, ref, fig, half };
     }
+    const money = (t, c) => /^[-−]?\s*[$€£¥₹]|[$€£¥₹]$|\b(USD|EUR|GBP)\b/.test(t) || /money|currency|price/i.test(String(c?.format || ''));
+    // A number by its column's name: "Every (days)" and 3 is "Every 3 days",
+    // "Reorder at" and 200 "Reorder at 200".
+    const figPhrase = (head, t) => {
+      const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(String(head || ''));
+      return m && m[1] ? `${m[1]} ${t} ${m[2]}` : head ? `${head} ${t}` : t;
+    };
     // One row's parts as text: its state and tone, and its other words,
     // short: names as they are, numbers and dates with their column's name
     // ("Reorder at 200").
@@ -612,7 +619,7 @@
         if (i === R.tick || i === R.badge || i === R.title || i === R.fig) return null;
         const t = text(i).trim();
         if (!t) return null;
-        return R.numeric[i] || c.format ? `${heads[i]} ${t}` : t;
+        return R.numeric[i] || c.format ? figPhrase(heads[i], t) : t;
       }).filter(Boolean).slice(0, 4);
       return { text, state, tone, sub };
     }
@@ -661,9 +668,10 @@
 
     // Native, on a phone: a table's rows as cells of grouped lists, a group
     // per state (the worst first: out, then low, then the rest), each cell
-    // an icon in the state's color (or the row's initials), its name, one
-    // line of detail led by its number when its state needs doing, and on
-    // the right its next step, or its number.
+    // the row's initials in the state's color, its name, one line of detail
+    // (led by its number when the number is what needs doing: "None left",
+    // "$650 owed"; else the number by its column's words, "Every 3 days"),
+    // and on the right its next step, or its number.
     const TONE_ORDER = ['bad', 'warn', 'info', '', 'ok'];
     const NEEDS_DOING = /\b(out|low|overdue|late|due|unpaid|owed|owing|missing|expired|expiring|failed|reorder|to order|urgent|behind|blocked)\b/i;
     const GLYPH = { bad: '✕', warn: '!', ok: '✓', info: '•' };
@@ -699,7 +707,8 @@
       };
       return h('div', { class: 'rgroups' }, groups.map((g) => h('section', { class: 'rgroup' },
         g.key ? h('h3', { class: 'rgroup-t' }, cap(g.key)) : null,
-        h('div', { class: 'rgroup-list' }, g.items.map(({ r, text, tone, sub }) => {
+        h('div', { class: 'rgroup-list' }, g.items.map(({ r, text, tone, sub: sub0 }) => {
+          let sub = sub0;
           const who = rowName(r);
           const name = (R.title >= 0 ? text(R.title) : '') || who || 'Untitled';
           const figText = R.fig >= 0 ? text(R.fig).trim() : '';
@@ -707,16 +716,21 @@
           // "None left", "4 left" for a count of things; "$650 owed" for the rest.
           const figName = String(heads[R.fig] || '').toLowerCase();
           const counted = /(stock|qty|quantity|on hand|left|remaining|units|count|in store)/.test(figName);
-          const leadText = !figText ? '' : counted ? (Number(R.raw(cols[R.fig], R.fig, r)) === 0 ? 'None left' : `${figText} left`) : `${figText} ${figName}`.trim();
+          // The number leads only when it is what needs doing: a count left, an
+          // amount ("$650 owed"), a column named for it ("Days overdue").
+          // Otherwise it is said by its column's words ("Every 3 days").
+          const pointed = counted || money(figText, cols[R.fig]) || NEEDS_DOING.test(figName);
+          const leadText = !figText || !pointed ? '' : counted ? (Number(R.raw(cols[R.fig], R.fig, r)) === 0 ? 'None left' : `${figText} left`) : `${figText} ${figName}`.trim();
           const lead = needs && leadText ? h('span', { class: 'lead' }, leadText) : null;
+          if (figText && !pointed) sub = [figPhrase(heads[R.fig], figText), ...sub].slice(0, 4);
           const { main, more, tap } = rowActions(acts, r, who, s, path, (l) => `rc-pill${SOFT.test(l) ? ' soft' : ''}`, !onRow);
           const open = onRow ? () => run(onRow, [r], `${path}.onRow`) : tap;
           const tickEl = tickOf(R, r, cols, fns, heads, cell, who);
           const day = needs ? null : dayOf(name);
           const icon = tickEl ? h('label', { class: 'tap rc-tick' }, tickEl)
             : day ? h('span', { class: 'rc-icon rc-day', 'aria-hidden': 'true' }, h('small', null, day.mon), h('b', null, String(day.day)))
-            : h('span', { class: `rc-icon${tone ? ` t-${tone}` : ''}`, 'aria-hidden': 'true' }, GLYPH[tone] || initials(name) || '•');
-          const end = main || (figText && !lead ? h('span', { class: 'rc-val' }, figText) : null);
+            : h('span', { class: `rc-icon${tone ? ` t-${tone}` : ''}`, 'aria-hidden': 'true' }, initials(name) || GLYPH[tone] || '•');
+          const end = main || (figText && pointed && !lead ? h('span', { class: 'rc-val' }, figText) : null);
           return h('div', { class: `rcell${tone ? ` t-${tone}` : ''}${tickEl && tickEl.checked ? ' done' : ''}${open ? ' tappable' : ''}`,
             onclick: open ? (e) => { if (!e.target.closest('button, summary, input, label, a')) open(); } : null },
             icon,

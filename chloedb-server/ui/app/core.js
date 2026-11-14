@@ -233,7 +233,14 @@ function answered() {
   Object.assign(conn, { ok: true, since_ms: null, status: null, message: null, path: null });
   bus.emit("connection", connection());
 }
+// An app's own request (/v1/apps/<name>/...) that fails says nothing of the
+// server: the server forwards it and answers for an app that is down, so a
+// request lost on its way (an app page's load cut off, a blocked request)
+// is that page's to say, not the whole command center's (APC-27). If the
+// server itself is gone, its own polls say so.
+const APP_PATH = /^\/v1\/apps\/[^/]+\/./;
 function notAnswering(status, message, path) {
+  if (APP_PATH.test(String(path || "").split("?")[0])) return;
   const now = Date.now();
   conn.last_fail_ms = now;
   const was = conn.ok;

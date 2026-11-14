@@ -390,8 +390,7 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         };
         let db_options = |directory: bool| DbOptions { cold: cold.clone(), ..db_options(directory) };
         let db = if path.exists() {
-            let db = Db::open(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, recover: o.recover, verify_checksums: o.verify_checksums, ship_log_bytes, ..db_options(o.directory) })
-                .map_err(|e| format!("open {}: {e}", path.display()))?;
+            let db = open_existing(&path, DbOptions { wal_drop_damaged: o.wal_drop_damaged, recover: o.recover, verify_checksums: o.verify_checksums, ship_log_bytes, ..db_options(o.directory) })?;
             if let Some(what) = db.storage().damaged() {
                 // Also in /v1/health ("degraded") and /v1/admin/check (an
                 // error) until the database is opened clean again.
@@ -400,17 +399,20 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
             db
         } else if let Some(n) = o.demo {
             fill = Some(Fill::Demo(n));
-            Db::create_in(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
+            folder_of(&path)?;
+            Db::create_in(&path, demo::schema(n), DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| format!("create {}: {e}", path.display()))?
         } else if let Some(s) = &o.schema {
             let (s, text) = schema_arg(s)?;
             let schema = Schema::from_json(&text).map_err(|e| format!("{s}: {e}"))?;
             fill = o.copy_from.clone().map(Fill::Copy);
-            Db::create_in(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| e.to_string())?
+            folder_of(&path)?;
+            Db::create_in(&path, schema, DbOptions { ship_log_bytes, ..db_options(o.directory) }, &o.models).map_err(|e| format!("create {}: {e}", path.display()))?
         } else {
             // No schema: a database with no tables yet, which CREATE TABLE
             // and the imports that create tables fill.
+            folder_of(&path)?;
             tracing::info!(db = %path.display(), "creating the database with no tables: create one with CREATE TABLE or an import");
-            Db::create_empty(&path, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| e.to_string())?
+            Db::create_empty(&path, DbOptions { ship_log_bytes, ..db_options(o.directory) }).map_err(|e| format!("create {}: {e}", path.display()))?
         };
         // Copies a transfer left when this server was stopped during it.
         if replicating || o.seq_no {
@@ -954,6 +956,36 @@ pub fn schema_arg(s: &Path) -> Result<(String, String), String> {
     }
     let text = std::fs::read_to_string(s).map_err(|e| format!("--schema {}: {e}", s.display()))?;
     Ok((s.display().to_string(), text))
+}
+
+/// Opens the database that is at `path`, and says plainly why not
+/// (ONB-13): a folder that holds no database in the directory layout is
+/// refused before anything is written in it, and an open that fails
+/// leaves nothing beside the file (the readers' folder it made).
+pub fn open_existing(path: &Path, opts: DbOptions) -> Result<Db, String> {
+    if path.is_dir() && !path.join(chloedb::storage::dir::CURRENT).exists() {
+        return Err(format!(
+            "open {}: a folder that holds no ChloeDB database: --db names a database file, a folder the directory layout (--directory) made, or a new path to create one",
+            path.display()
+        ));
+    }
+    let readers = chloedb::storage::share::share_dir(path, false);
+    let made = path.is_file() && !readers.exists();
+    Db::open(path, opts).map_err(|e| {
+        if made {
+            let _ = std::fs::remove_dir_all(&readers);
+        }
+        format!("open {}: {e}", path.display())
+    })
+}
+
+/// Whether the folder a new database at `path` goes in is there: a
+/// missing one is named, with what makes it (ONB-13).
+fn folder_of(path: &Path) -> Result<(), String> {
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(p) if !p.is_dir() => Err(format!("create {}: its folder {} does not exist: make it first (mkdir -p {}), or give --db another path", path.display(), p.display(), p.display())),
+        _ => Ok(()),
+    }
 }
 
 /// `chloedb-server import`: loads `files` into the database at `path`, rows

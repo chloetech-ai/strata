@@ -284,8 +284,8 @@ async fn trace(State(svc): State<Shared>, Query(p): Query<HashMap<String, String
         return Err(bad("from and to are each a device, a customer (name, id, circuit) or a site"));
     };
     let sql = "SELECT id, hops() AS hop FROM netops_devices\nWHERE PATH(netops_links, :a, :b, dir => 'both', max_hops => 12)\nORDER BY hops()";
-    let (devs, engine): (Vec<String>, &str) = match e.db.traced(&q.trace, "Shortest path over the links table", sql, json!({"a": from, "b": to})).await {
-        Ok(rows) if !rows.is_empty() => (rows.iter().map(|r| r.s("id")).collect(), "sql"),
+    let (devs, engine): (Vec<String>, &str) = match q.graph("Shortest path over the links table", sql, json!({"a": from, "b": to})).await.ok().flatten() {
+        Some(rows) if !rows.is_empty() => (rows.iter().map(|r| r.s("id")).collect(), "sql"),
         _ => (e.graph.path(&from, &to), "app"),
     };
     if devs.is_empty() {
@@ -413,15 +413,17 @@ async fn investigate(State(svc): State<Shared>, Query(p): Query<HashMap<String, 
     seeds.truncate(40);
     let s = seedsql(&seeds);
     let sql = format!("SELECT id, ppr(netops_links, {s}) AS score FROM netops_devices\nORDER BY ppr(netops_links, {s}) DESC LIMIT 6");
-    let (suspects, engine): (Vec<Value>, &str) = match e.db.traced(&q.trace, "The devices everything alerting is closest to (personalised PageRank over the links table)", &sql, json!({})).await {
-        Ok(rows) => (rows.into_iter().map(Value::Object).collect(), "sql"),
-        Err(_) => (e.graph.ppr(&seeds).into_iter().take(6).map(|(id, v)| json!({"id": id, "score": v})).collect(), "app"),
+    // A coordinator does not walk graphs: the app walks its own copy of the
+    // backbone instead, and sends neither statement.
+    let (suspects, engine): (Vec<Value>, &str) = match q.graph("The devices everything alerting is closest to (personalised PageRank over the links table)", &sql, json!({})).await.ok().flatten() {
+        Some(rows) => (rows.into_iter().map(Value::Object).collect(), "sql"),
+        None => (e.graph.ppr(&seeds).into_iter().take(6).map(|(id, v)| json!({"id": id, "score": v})).collect(), "app"),
     };
     let d = seedsql(&devices);
     let sql = format!("SELECT id, hops() AS h FROM netops_devices\nWHERE REACHABLE(netops_links, {d}, hops => 2, dir => 'both')\nORDER BY hops(), id LIMIT 200");
-    let near: Vec<(String, i64)> = match e.db.traced(&q.trace, "Devices within two hops (REACHABLE over the links table)", &sql, json!({})).await {
-        Ok(rows) => rows.iter().map(|r| (r.s("id"), r.i("h"))).collect(),
-        Err(_) => e.graph.reach(&devices, 2).into_iter().map(|(id, h)| (id, h as i64)).collect(),
+    let near: Vec<(String, i64)> = match q.graph("Devices within two hops (REACHABLE over the links table)", &sql, json!({})).await.ok().flatten() {
+        Some(rows) => rows.iter().map(|r| (r.s("id"), r.i("h"))).collect(),
+        None => e.graph.reach(&devices, 2).into_iter().map(|(id, h)| (id, h as i64)).collect(),
     };
     let services = q.rows("Services that ride on it (INT[] overlap)", &format!("SELECT id, name, tier, revenue_per_min, customers FROM netops_services\nWHERE device_nums && [{nums}]\nORDER BY tier LIMIT 20"), json!({})).await?;
     let one_hop: Vec<String> = devices.iter().cloned().chain(near.iter().filter(|x| x.1 == 1).map(|x| x.0.clone())).collect();

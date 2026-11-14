@@ -327,6 +327,10 @@ const CSS = `
 .no-map-zoom { position: absolute; right: 12px; top: 10px; display: flex; gap: 4px; }
 .no-map-legend { position: absolute; left: 12px; bottom: 10px; display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-2); background: color-mix(in srgb, var(--surface) 88%, transparent); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 4px 10px; max-width: 60%; }
 .no-map-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+.no-map-foot { position: absolute; left: 12px; right: 12px; bottom: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; pointer-events: none; }
+.no-map-foot-row { display: flex; width: 100%; justify-content: space-between; align-items: flex-end; gap: 6px 8px; flex-wrap: wrap; pointer-events: none; }
+.no-map-foot .no-map-legend, .no-map-foot .no-map-stats { position: static; pointer-events: auto; }
+.no-map-foot .no-map-stats { margin-left: auto; text-align: right; }
 .no-map-stats { position: absolute; right: 12px; bottom: 10px; font-size: 11.5px; color: var(--text-2); background: color-mix(in srgb, var(--surface) 88%, transparent); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 4px 10px; font-variant-numeric: tabular-nums; }
 .no-map-tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line-2, var(--line)); border-radius: var(--r-sm); padding: 6px 10px; font-size: 12px; max-width: 250px; box-shadow: 0 4px 14px rgba(0,0,0,.12); z-index: 2; }
 .no-map-side { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); overflow-y: auto; min-width: 0; padding-bottom: 12px; }
@@ -827,7 +831,12 @@ function actionCard(app, a, after) {
   };
   const open = a.status === "proposed";
   const state = { executed: ["ok", "carried out"], done: ["ok", "done"], approved: ["ok", "approved"], rejected: ["disabled", "rejected"], expired: ["disabled", "no longer needed"], failed: ["bad", "failed"] }[a.status] || ["info", a.status];
-  const yes = h("button", { class: "btn sm primary", onclick: () => decide(true, yes) }, C.icon("check"), "Approve and run");
+  // A high-risk action is carried out on a second, deliberate click.
+  const approve = async () => {
+    if (a.risk === "high" && !(await C.confirm({ title: `Run a high-risk action: ${a.title}?`, body: a.command ? `It runs ${a.command.split("\n").length > 1 ? "these commands" : "this command"} on the network now: ${a.command.split("\n")[0]}${a.command.split("\n").length > 1 ? " …" : ""}` : "It is carried out on the network now.", ok: "Approve and run", danger: true }))) return;
+    decide(true, yes);
+  };
+  const yes = h("button", { class: "btn sm primary", onclick: approve }, C.icon("check"), "Approve and run");
   const no = h("button", { class: "btn sm", onclick: () => decide(false, no) }, "Reject");
   return h("div", { class: "no-act" + (open ? "" : " done") },
     h("div", { class: "row between" }, h("b", {}, a.title), h("span", { class: "row nw", style: { gap: "6px" } }, a.risk ? riskPill(app, a.risk) : null, open ? null : C.pill(state[0], state[1]))),
@@ -2259,6 +2268,8 @@ const MAP_EXAMPLES = [
   "customer routers in Frankfurt changed in the last month about QoS with high latency",
   "hub routers that failed in the last month about a line card",
 ];
+/** "3 access switches", "1 OLT": a kind's name for a count of it. */
+const kindsOf = (kind, n) => { const name = (KIND_NAME[kind] || kind).toLowerCase().replace(/^olt$/, "OLT").replace(/^ont$/, "ONT"); return n === 1 ? name : name + (/(s|x|ch|sh)$/.test(name) ? "es" : "s"); };
 const KIND_NAME = { region: "Region", metro: "Metro", hub: "Hub", site: "Site", core: "Core router", border: "Border router", agg: "Aggregation router", firewall: "Firewall", spine: "Spine switch", leaf: "Leaf switch", "hub-router": "Hub router", power: "Power plant", olt: "OLT", cell: "Cell site router", switch: "Access switch", ont: "ONT", radio: "Radio", cpe: "Customer router" };
 const STATE_PILL = { ok: "ok", down: "bad", degraded: "warn", impacted: "serious" };
 const fms = (v) => (v == null ? "–" : v >= 100 ? v.toFixed(0) + " ms" : v.toFixed(1) + " ms");
@@ -2281,10 +2292,13 @@ function mapPage(body, app, path) {
   const zoomBtn = (label, title, fn) => h("button", { class: "btn sm", title, onclick: fn }, label);
   const legend = h("div", { class: "no-map-legend" },
     [["var(--crit)", "down or incident"], ["var(--warn)", "degraded"], ["var(--serious)", "behind a fault"], ["var(--accent)", "search match"]].map(([c, t]) => h("span", {}, h("i", { style: { background: c } }), t)));
-  const shapes = h("div", { class: "no-map-legend", style: { bottom: "42px", maxWidth: "none", flexWrap: "nowrap", whiteSpace: "nowrap" } },
+  const shapes = h("div", { class: "no-map-legend", style: { maxWidth: "none", flexWrap: "nowrap", whiteSpace: "nowrap" } },
     [["■", "backbone"], ["◆", "router"], ["▼", "power"], ["●", "OLT, ONT"], ["▲", "cell, sector"], ["▢", "switch, CPE"]].map(([c, t]) => h("span", {}, h("b", { style: { marginRight: "4px" } }, c), t)));
-  const stage = h("div", { class: "no-map-stage" }, canvas, crumbs, shapes,
-    h("div", { class: "no-map-zoom" }, zoomBtn("+", "Zoom in", () => zoomBy(1.8)), zoomBtn("−", "Zoom out", () => zoomBy(1 / 1.8)), zoomBtn("Fit", "The whole network", () => fit(true))), legend, stats, tip);
+  // The legends and the counts share one footer, so that a long count
+  // goes to a line of its own rather than over the legend.
+  const stage = h("div", { class: "no-map-stage" }, canvas, crumbs,
+    h("div", { class: "no-map-zoom" }, zoomBtn("+", "Zoom in", () => zoomBy(1.8)), zoomBtn("−", "Zoom out", () => zoomBy(1 / 1.8)), zoomBtn("Fit", "The whole network", () => fit(true))),
+    h("div", { class: "no-map-foot" }, shapes, h("div", { class: "no-map-foot-row" }, legend, stats)), tip);
   body.append(h("div", { class: "no-map" },
     h("div", { class: "no-map-bar", style: { display: "none" } }, input, askBtn),
     h("div", { class: "no-map-eg" }, h("span", { class: "muted small" }, "Try:"), MAP_EXAMPLES.map((q) => h("button", { class: "chip", onclick: () => { input.value = q; app.bar?.set(q, "search"); ask(q); } }, q))),
@@ -2727,7 +2741,7 @@ function mapPage(body, app, path) {
       h("div", { class: "no-map-head" }, h("h3", {}, "Where it is red"), h("div", { class: "muted small" }, base ? `${C.fmt.n(base.objects)} objects and ${C.fmt.n(base.links)} links in ChloeDB tables. Zoom in, or click anything.` : "")),
       h("div", { class: "no-map-kpis" }, [[hot.incidents.length, "open incidents"], [faults.length, "broken objects"], [C.fmt.n(behind), "behind them"]].map(([n, l]) => h("div", {}, h("b", {}, String(n)), h("span", {}, l)))),
       hot.incidents.length ? sec("Incidents on the backbone", null, hot.incidents.map((i) => h("a", { class: "no-map-row", onclick: () => { const m = cont.get(i.metros[0]); if (m) flyToPlace(m); } }, dot("down"), h("span", { class: "t" }, h("b", {}, i.title), h("span", {}, `${i.id} · ${i.severity} · ${i.devices.slice(0, 3).join(", ")}`)), h("button", { class: "btn xs", onclick: (e) => { e.stopPropagation(); app.go("incidents", i.id); } }, "Open")))) : null,
-      sec("Broken now", "state IN ('down', 'degraded')", faults.length ? faults.slice(0, 60).map((f) => row(f, f.name === f.id ? f.id : `${f.name}`, `${f.reason} · ${where(f)} · ${C.fmt.ago(T(f.since))}`, () => { flyToNode(f); select(f.id); })) : h("div", { class: "muted small" }, "Nothing is broken right now.")));
+      sec("Broken now", "state IN ('down', 'degraded')", faults.length ? faults.slice(0, 60).map((f) => row(f, f.name === f.id ? f.id : `${f.name} (${f.id})`, `${f.reason} · ${where(f)} · ${C.fmt.ago(T(f.since))}`, () => { flyToNode(f); select(f.id); })) : h("div", { class: "muted small" }, "Nothing is broken right now.")));
   };
 
   const select = async (id) => {
@@ -2741,7 +2755,10 @@ function mapPage(body, app, path) {
     const detailP = app.call(`/v1/map/detail?id=${encodeURIComponent(id)}`);
     detailP.then((d) => { if (!dead && sel && sel.id === id && app.autoLight !== false) { light(id, d.below, true); } }).catch(() => {});
     draw();
-    const n = j.node, qms = (i) => (j.queries[i] ? C.fmt.ms(j.queries[i].ms) : "");
+    // Each part's time, found by what it read: the app's walk on a
+    // coordinator reads in other steps than REACHABLE does.
+    const n = j.node, qms = (re) => { const qs = j.queries.filter((x) => re.test(x.what || "")); return qs.length ? C.fmt.ms(Math.max(...qs.map((x) => x.ms))) : ""; };
+    const sqlWalk = j.engine !== "app";
     const cause = j.cause && j.cause.id ? j.cause : null;
     const elsewhere = cause && cause.id !== n.id;
     const goto = (o) => { flyToNode(o); select(o.id); };
@@ -2759,17 +2776,17 @@ function mapPage(body, app, path) {
       cause || j.suspect ? h("div", { class: "no-map-verdict" + (cause ? "" : " calm") },
         cause ? h("div", {}, h("b", {}, elsewhere ? `The trouble is ${cause.hop} ${cause.hop === 1 ? "hop" : "hops"} up: ${cause.id}` : "The trouble starts here"), h("div", { class: "small" }, cause.incident ? `${cause.incident.id}: ${cause.incident.title}` : cause.reason), elsewhere ? h("button", { class: "btn xs", style: { marginTop: "6px" }, onclick: () => goto(cause) }, "Go to it") : null) : null,
         j.suspect ? h("div", { class: "small", style: { marginTop: cause ? "8px" : 0 } }, h("b", {}, `Changed ${j.suspect.minutes_before} min before it began: `), `${j.suspect.text} (${j.suspect.author}, ${j.suspect.ticket}, on ${j.suspect.node === n.id ? "this object" : j.suspect.node})`) : null) : null,
-      sec(n.layer === "core" ? "Its neighbours in the backbone" : "What it hangs from", `REACHABLE against the edges · ${qms(1)}`,
+      sec(n.layer === "core" ? "Its neighbours in the backbone" : "What it hangs from", `${sqlWalk ? "REACHABLE against the edges" : "walked by the app, read by key"} · ${qms(/^(Its neighbours|What it hangs from)/)}`,
         j.upstream.length ? j.upstream.map((u) => row(u, u.id, `${u.hop} ${u.hop === 1 ? "hop" : "hops"} · ${KIND_NAME[u.kind] || u.kind}${u.state !== "ok" ? " · " + u.state : ""}`, () => goto(u))) : h("div", { class: "muted small" }, "Nothing above it.")),
-      sec("What depends on it", `REACHABLE along the edges, grouped · ${qms(2)}`,
+      sec("What depends on it", `${sqlWalk ? "REACHABLE along the edges, grouped" : "walked by the app, states read by key or place"} · ${qms(/^What depends on it/)}`,
         j.downstream.total ? [h("div", { class: "small" }, h("b", {}, C.fmt.n(j.downstream.total)), " objects", j.downstream.not_ok ? [", ", h("b", { style: { color: "var(--crit-ink)" } }, C.fmt.n(j.downstream.not_ok)), " of them not ok"] : null),
-          h("div", { style: { marginTop: "6px" } }, Object.entries(byKind).sort((a, b) => b[1].n - a[1].n).map(([kd, b]) => h("span", { class: "chip", style: { marginRight: "4px" } }, `${C.fmt.n(b.n)} ${(KIND_NAME[kd] || kd).toLowerCase()}${b.n === 1 ? "" : "s"}`)))] : h("div", { class: "muted small" }, n.layer === "core" ? "The backbone carries everyone: see Diagnose for its services and customers." : "Nothing is behind it.")),
-      j.near.length ? sec("Trouble within three hops", `REACHABLE both ways AND state != 'ok' · ${qms(3)}`, j.near.slice(0, 8).map((o) => row(o, o.name === o.id ? o.id : `${o.name} (${o.id})`, `${o.hop} ${o.hop === 1 ? "hop" : "hops"} · ${o.state} · ${o.reason}`, () => goto(o))), j.near.length > 8 ? h("div", { class: "muted small" }, `and ${j.near.length - 8} more`) : null) : null,
-      sec("Changes and faults, here and around it", `events of the walk's rows, 30 days · ${qms(5)}`,
+          h("div", { style: { marginTop: "6px" } }, Object.entries(byKind).sort((a, b) => b[1].n - a[1].n).map(([kd, b]) => h("span", { class: "chip", style: { marginRight: "4px" } }, `${C.fmt.n(b.n)} ${kindsOf(kd, b.n)}`)))] : h("div", { class: "muted small" }, n.layer === "core" ? "The backbone carries everyone: see Diagnose for its services and customers." : "Nothing is behind it.")),
+      j.near.length ? sec("Trouble within three hops", `${sqlWalk ? "REACHABLE both ways AND state != 'ok'" : "walked by the app, state != 'ok'"} · ${qms(/^Trouble within three hops/)}`, j.near.slice(0, 8).map((o) => row(o, o.name === o.id ? o.id : `${o.name} (${o.id})`, `${o.hop} ${o.hop === 1 ? "hop" : "hops"} · ${o.state} · ${o.reason}`, () => goto(o))), j.near.length > 8 ? h("div", { class: "muted small" }, `and ${j.near.length - 8} more`) : null) : null,
+      sec("Changes and faults, here and around it", `events of the walk's rows, 30 days · ${qms(/^Changes and faults on it/)}`,
         j.history.length ? h("div", { class: "no-map-hist" }, j.history.slice(0, 14).map((e) => h("div", { class: e.event }, h("span", { class: "when" }, C.fmt.ago(T(e.ts))), h("span", {}, h("b", {}, e.event === "change" ? "Change" : "Fault"), " ", e.text, h("span", { class: "muted" }, ` · ${e.relation === "this object" ? "here" : e.node + ", " + e.relation}${e.author ? " · " + e.author : ""}${e.ticket ? " · " + e.ticket : ""}`))))) : h("div", { class: "muted small" }, "Nothing in thirty days."),
         j.changes.length ? h("div", { class: "small", style: { marginTop: "6px" } }, "Backbone changes that name it: ", j.changes.map((c) => app.link(c.id, "changes")).flatMap((a, i) => (i ? [", ", a] : [a]))) : null),
       j.before.words ? sec("How this went before", `BM25 over ${C.fmt.n((base.events || []).reduce((a, e) => a + e.n, 0))} events`,
-        ended.length ? h("div", { class: "small" }, `On ${(KIND_NAME[j.before.kind] || j.before.kind).toLowerCase()}s, faults cleared in: `, ended.map((e) => `${mins(e.minutes)} (${e.cause}, ${C.fmt.n(e.n)} times)`).join(", ")) : null,
+        ended.length ? h("div", { class: "small" }, `On ${kindsOf(j.before.kind, 2)}, faults cleared in: `, ended.map((e) => `${mins(e.minutes)} (${e.cause}, ${C.fmt.n(e.n)} times)`).join(", ")) : null,
         (j.before.like || []).map((e) => h("a", { class: "no-map-row", onclick: () => goto({ id: e.node, x: e.x, y: e.y }) }, dot("ok"), h("span", { class: "t" }, h("b", {}, e.node), h("span", {}, `${C.fmt.ago(T(e.ts))} · ${e.text}`))))) : null,
       j.engine !== "sql" ? h("div", { class: "muted small" }, "The walks ran in the app: a coordinator does not walk graphs yet.") : null);
     // The panel becomes tabs: the walk above is the overview.
@@ -2925,7 +2942,7 @@ function inspectorTabs(app, j, detailP, overview, hooks) {
       j.downstream.total ? h("li", { class: "below" }, `${C.fmt.n(j.downstream.total)} below it`, j.downstream.not_ok ? h("span", { style: { color: "var(--crit-ink)" } }, ` · ${C.fmt.n(j.downstream.not_ok)} not ok`) : null) : null);
     return [sec("How it is connected", "REACHABLE against the edges and along them", chain,
       h("div", { class: "row", style: { gap: "6px", marginTop: "8px" } }, h("button", { class: "btn xs" + (lit ? " primary" : ""), onclick: () => { hooks.toggleLight(); drawBody(); } }, C.icon("layers"), lit ? "Lit on the map: clear" : "Light it on the map"), h("span", { class: "muted small" }, lit ? `${C.fmt.n(lit)} objects lit, the rest dimmed` : ""))),
-      Object.keys(byKind).length ? sec("What depends on it", null, h("div", {}, Object.entries(byKind).sort((a, b) => b[1].n - a[1].n).map(([kd, b]) => h("span", { class: "chip", style: { margin: "0 4px 4px 0" } }, `${C.fmt.n(b.n)} ${(KIND_NAME[kd] || kd).toLowerCase()}${b.n === 1 ? "" : "s"}`, b.bad ? h("b", { style: { color: "var(--crit-ink)" } }, ` · ${C.fmt.n(b.bad)}`) : null)))) : null,
+      Object.keys(byKind).length ? sec("What depends on it", null, h("div", {}, Object.entries(byKind).sort((a, b) => b[1].n - a[1].n).map(([kd, b]) => h("span", { class: "chip", style: { margin: "0 4px 4px 0" } }, `${C.fmt.n(b.n)} ${kindsOf(kd, b.n)}`, b.bad ? h("b", { style: { color: "var(--crit-ink)" } }, ` · ${C.fmt.n(b.bad)}`) : null)))) : null,
       (d.customers || []).length ? sec("Customers behind it", "REACHABLE, grouped by customer", h("div", { class: "no-cust" }, d.customers.slice(0, 12).map((c) => h("div", {}, h("span", {}, c.customer), h("span", { class: "muted" }, `${c.n} ${c.n === 1 ? "site" : "sites"}`), c.hurt ? h("b", { style: { color: "var(--crit-ink)" } }, `${c.hurt} hurt`) : h("span")))) ) : null,
       (j.near || []).length ? sec("Trouble within three hops", null, j.near.slice(0, 8).map((o) => h("a", { class: "no-map-row", onclick: () => hooks.go(o) }, h("i", { class: "no-map-dot", style: { background: o.state === "down" ? "var(--crit)" : o.state === "degraded" ? "var(--warn)" : "var(--serious)" } }), h("span", { class: "t" }, h("b", {}, o.id), h("span", {}, `${o.hop} ${o.hop === 1 ? "hop" : "hops"} · ${o.state}`))))) : null];
   };
@@ -3116,7 +3133,7 @@ function run(app, text, it) {
   if (!sentence && (page !== "map" || /[a-z].*-.*\d|\d.*-.*[a-z]/i.test(text))) { lookupDrawer(app, text); return; }
   // A kind: or state: filter reads as words the map's reader knows; the place in view narrows it.
   const s = app.scope();
-  let asked = text.replace(/\bkind:([\w-]+)/g, (_, k) => KIND_NAME[k] ? KIND_NAME[k].toLowerCase() + "s" : k).replace(/\bstate:not-?ok\b/g, "that are not ok").replace(/\bstate:(\w+)/g, "that are $1").replace(/\bvendor:(\S+)/g, "$1").replace(/\bin:(\S+)/g, (_, m) => "in " + m.replace(/-/g, " "));
+  let asked = text.replace(/\bkind:([\w-]+)/g, (_, k) => KIND_NAME[k] ? kindsOf(k, 2) : k).replace(/\bstate:not-?ok\b/g, "that are not ok").replace(/\bstate:(\w+)/g, "that are $1").replace(/\bvendor:(\S+)/g, "$1").replace(/\bin:(\S+)/g, (_, m) => "in " + m.replace(/-/g, " "));
   const t = app.target();
   if (t && !/\b(behind|under)\b/.test(asked) && it?.kind !== "history" && /^(everything|all|what|objects?)\b/i.test(asked)) asked += ` behind ${t.id}`;
   else if (s && !/\bin [A-Z]/.test(asked) && !/\bbehind\b/.test(asked) && !/\bh\d\d-/.test(asked)) asked += placeWords(s);
@@ -3308,7 +3325,7 @@ async function answer(app, text, hooks) {
       for (const r of j.downstream.rows) { const b = (byKind[r.kind] ||= { n: 0, bad: 0 }); b.n += r.n; if (r.state && r.state !== "ok") b.bad += r.n; }
       const body = [p(h("b", {}, `${C.fmt.n(j.downstream.total)} objects depend on ${n.id}`), j.downstream.not_ok ? `, ${C.fmt.n(j.downstream.not_ok)} not ok now.` : ", all ok now.")];
       const kinds = Object.entries(byKind).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
-      if (kinds.length) body.push(h("ul", { class: "no-ag-ul" }, kinds.map(([k, b]) => h("li", {}, `${C.fmt.n(b.n)} ${(KIND_NAME[k] || k).toLowerCase()}${b.n === 1 ? "" : "s"}${b.bad ? `, ${C.fmt.n(b.bad)} not ok` : ""}`))));
+      if (kinds.length) body.push(h("ul", { class: "no-ag-ul" }, kinds.map(([k, b]) => h("li", {}, `${C.fmt.n(b.n)} ${kindsOf(k, b.n)}${b.bad ? `, ${C.fmt.n(b.bad)} not ok` : ""}`))));
       if (cust.length) body.push(p(h("b", {}, `${cust.length}${cust.length >= 20 ? "+" : ""} customers behind ${cause && cause.id !== n.id ? cause.id : "it"}: `), cust.slice(0, 6).map((c) => `${c.customer} (${c.n} ${c.n === 1 ? "site" : "sites"}${c.hurt ? `, ${c.hurt} hurt` : ""})`).join(", "), cust.length > 6 ? "…" : "", "."));
       else body.push(p("No customer sits behind it."));
       return { body, acts: [show(n.id), h("button", { class: "btn xs", onclick: () => app.map?.light(n.id, d.below) }, C.icon("layers"), "Light them on the map")], queries, how: "REACHABLE along the edges, grouped by kind and by customer" };
@@ -3323,7 +3340,7 @@ async function answer(app, text, hooks) {
         if (cause && cause.id !== n.id) steps.push(`Work on ${cause.id}, not on ${n.id}: it is ${cause.hop} ${cause.hop === 1 ? "hop" : "hops"} up and is ${cause.state}.`);
         if (j.suspect) steps.push(`Check the change ${j.suspect.minutes_before} min before it began (${j.suspect.ticket || j.suspect.text}) and roll it back if it touched ${j.suspect.node}.`);
         const ended = (j.before?.ended || [])[0];
-        if (ended) steps.push(`Of the ${C.fmt.n(j.before.matched ?? ended.n)} faults on ${(KIND_NAME[j.before.kind] || j.before.kind).toLowerCase()}s that read most like this one, ${C.fmt.n(ended.n)} were ${ended.cause} and cleared in ${mins(ended.minutes)} on average.`);
+        if (ended) steps.push(`Of the ${C.fmt.n(j.before.matched ?? ended.n)} faults on ${kindsOf(j.before.kind, 2)} that read most like this one, ${C.fmt.n(ended.n)} were ${ended.cause} and cleared in ${mins(ended.minutes)} on average.`);
         if (j.incident || cause?.incident) steps.push(`It is part of ${(j.incident || cause.incident).id}: post in its room rather than opening a new one.`);
         else if (j.downstream.not_ok >= 20) steps.push(`${C.fmt.n(j.downstream.not_ok)} objects behind it are not ok: open an incident and tell the customers' account teams.`);
       }
@@ -3337,7 +3354,7 @@ async function answer(app, text, hooks) {
       const body = [];
       if (!b.words) body.push(p(`${n.id} has had no fault to compare in thirty days.`));
       else {
-        body.push(p(`The ${b.matched != null ? C.fmt.n(b.matched) + " " : ""}faults on ${(KIND_NAME[b.kind] || b.kind).toLowerCase()}s that read most like “${b.words}”, by how they ended:`));
+        body.push(p(`The ${b.matched != null ? C.fmt.n(b.matched) + " " : ""}faults on ${kindsOf(b.kind, 2)} that read most like “${b.words}”, by how they ended:`));
         if ((b.ended || []).length) body.push(h("ul", { class: "no-ag-ul" }, b.ended.slice(0, 5).map((e) => h("li", {}, `${e.cause}: ${C.fmt.n(e.n)} times, cleared in ${mins(e.minutes)} on average, ${mins(e.longest)} at the longest`))));
         if ((b.like || []).length) body.push(p(h("b", {}, "The closest: "), b.like.slice(0, 3).map((e) => `${e.node} ${C.fmt.ago(T(e.ts))} (${e.text})`).join("; "), "."));
       }

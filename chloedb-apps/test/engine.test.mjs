@@ -3291,7 +3291,7 @@ test('a call nobody answered is not an error of the app: no record, no repair', 
 
 // A screen in a frame made as the studio makes one, its calls answered by
 // the test as the studio would: rows, a refusal, or no answer at all.
-async function screenInFrame(t, spec, { access = null, answer }) {
+async function screenInFrame(t, spec, { access = null, answer, head = '' }) {
   const { readFileSync } = await import('node:fs');
   const { loadPlaywright } = await import('../engine/checks.mjs');
   const pw = loadPlaywright();
@@ -3302,7 +3302,7 @@ async function screenInFrame(t, spec, { access = null, answer }) {
     : Array.isArray(v) ? v.map(walk) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)])) : v);
   const compiled = walk(spec);
   const close = (x) => x.replace(/<\/(script)/gi, '<\\/$1');
-  const doc = `<!doctype html><html><head><meta charset="utf-8"></head><body><div id="root"></div>
+  const doc = `<!doctype html><html><head><meta charset="utf-8">${head}</head><body><div id="root"></div>
 <script>window.__SA = ${JSON.stringify({ slug: 'list', cap: 'a1/view/list@1', app: 'a1', origin: 'https://studio.test', params: {}, access })};</script>
 <script>${close(web('frame.js'))}</script><script>${close(web('screen.js'))}</script>
 <script>window.__SA_EXPR = []; window.__SA_EXPR_SRC = ${JSON.stringify(exprs)};</script>
@@ -3370,6 +3370,23 @@ test('a visitor who may only look is offered no form and no write; a refusal is 
   assert.deepEqual((await own.seen()).filter((x) => x.kind === 'error'), [], 'and not reported as an error');
 });
 
+test('a phone\'s list cell says a number by its column\'s words and keeps the row\'s initials (APC-17)', async (t) => {
+  // The native look on a phone (the frame is 300 px wide): rows as cells.
+  const spec = { data: { plants: 'SELECT * FROM plants' },
+    body: [{ table: '=plants', columns: [{ key: 'name' }, { key: 'status', badge: true }, { key: 'every', label: 'Every (days)' }, { key: 'room' }],
+      actions: [{ label: 'Water', do: "=row => app.update('plants', row.id, { watered: app.today() })" }] }] };
+  const rows = [{ id: '1', name: 'Monstera', status: 'Today', every: 7, room: 'Living room' }, { id: '2', name: 'Fern', status: 'Soon', every: 3, room: 'Bathroom' }, { id: '3', name: 'Pothos', status: 'Later', every: 10, room: 'Kitchen' }];
+  const f = await screenInFrame(t, spec, { head: '<style>:root { --look: native; }</style>', answer: () => ({ value: rows }) });
+  if (!f) return;
+  await f.page.waitForTimeout(600);
+  const cells = await f.frame().$$eval('.rcell', (xs) => xs.map((x) => ({ icon: x.querySelector('.rc-icon')?.textContent, text: x.querySelector('.rc-name')?.innerText })));
+  const fern = cells.find((c) => /Fern/.test(c.text || ''));
+  assert.ok(fern, JSON.stringify(cells));
+  assert.doesNotMatch(fern.text, /every \(days\)/i, 'not "3 every (days)"');
+  assert.match(fern.text, /Every 3 days/, JSON.stringify(cells));
+  assert.equal(fern.icon, 'F', 'the row keeps its initials; its state is the cell\'s color');
+});
+
 test('an app is named shortly from its description, and one whose first build failed says so (APC-4)', async () => {
   const { shortName, firstBuildStatus } = await import('../engine/store.mjs');
   assert.equal(shortName('A tiny reading list: links with a title and a note, and whether I read them.'), 'Tiny reading list');
@@ -3429,4 +3446,98 @@ test('a screen written as JSON gets :today as a CREATE SCREEN does: in the build
   if (!f) return;
   await f.page.waitForTimeout(500);
   assert.match(params?.today || '', /^\d{4}-\d{2}-\d{2}$/);
+});
+
+test('the chosen chip of a native screen stands out in dark mode (APC-18)', async (t) => {
+  const { readFileSync } = await import('node:fs');
+  const { designCss, PRESETS } = await import('../web/design.js');
+  const kit = readFileSync(join(import.meta.dirname, '..', 'web', 'kit.css'), 'utf8');
+  const spec = { body: [{ chips: 'sort', options: ['Next watering', 'Name'] }] };
+  const lumOf = (c) => {
+    const n = (c.match(/[\d.]+/g) || []).map(Number);
+    const [r, g, b] = /^color\(srgb/.test(c) ? n.slice(0, 3) : n.slice(0, 3).map((x) => x / 255);
+    const lin = (x) => (x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+  };
+  for (const scheme of ['dark', 'light']) {
+    const css = designCss({ ...PRESETS[0], look: 'native', scheme });
+    const f = await screenInFrame(t, spec, { head: `<style>${kit}</style><style>${css}</style>`, answer: () => ({ value: [] }) });
+    if (!f) return;
+    await f.page.waitForTimeout(500);
+    await f.frame().click('.chip:text("Next watering")');
+    await f.page.waitForTimeout(200);
+    const got = await f.frame().evaluate(() => {
+      const bg = (el) => getComputedStyle(el).backgroundColor;
+      return { track: bg(document.querySelector('.chips')), on: bg(document.querySelector('.chip.on')), look: document.documentElement.dataset.look };
+    });
+    assert.equal(got.look, 'native');
+    const [a, b] = [lumOf(got.on), lumOf(got.track)];
+    const ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    // a phone's light segmented control is its white card on a grey track
+    if (scheme === 'light') assert.equal(got.on, 'rgb(255, 255, 255)');
+    else assert.ok(ratio >= 1.4, `${scheme}: the chosen chip ${got.on} on its track ${got.track} is ${ratio.toFixed(2)}:1`);
+  }
+});
+
+// Against a real chloedb-server and the engine's own server (skipped without one).
+test('the owner\'s own tries of an app are told apart from people\'s, and Usage leaves them out (APC-15)', async (t) => {
+  const { findServerBinary, startServer } = await import('../engine/strata.mjs');
+  const { Store } = await import('../engine/store.mjs');
+  const { spawn } = await import('node:child_process');
+  const bin = findServerBinary(join(import.meta.dirname, '..', '..'));
+  if (!bin) return noServer(t);
+  const free = () => new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
+  const dir = mkdtempSync(join(tmpdir(), 'sa-owner-'));
+  const port = await free();
+  const { child, client } = await startServer({ bin, db: join(dir, 'apps.strata'), listen: `127.0.0.1:${port}`, log: () => {} });
+  let engineProc = null;
+  try {
+    const store = new Store(client, () => {});
+    await store.init();
+    const app = await store.createApp({ name: 'Plants' });
+    const spec = { name: 'plants', columns: [{ name: 'name', type: 'text' }] };
+    await store.ensureTable(app, spec, new Set(await store.tableNames()));
+    const caps = [await store.putCapability({ app, slug: 'plants', kind: 'table', title: 'plants', spec, code: '' }),
+      await store.putCapability({ app, slug: 'list', kind: 'view', title: 'List', spec: { order: 1 }, code: '{"body": []}' })];
+    await store.writeComposition(app, caps, 'first', 'plants');
+    await store.putSetting(app, 'publish', JSON.stringify({ on: true, name: 'plants', access: 'add' }));
+    const TOKEN = 'owner-test-token';
+    const ePort = await free();
+    engineProc = spawn(process.execPath, [join(import.meta.dirname, '..', 'engine', 'server.mjs'), '--port', String(ePort), '--strata', `http://127.0.0.1:${port}`, '--data', join(dir, 'engine')],
+      { env: { ...process.env, STRATA_APP_TOKEN: TOKEN, STRATA_APPS_SCHEDULES: 'off', STRATA_APPS_AUTOREPAIR: '0', STRATA_APPS_TILES: 'off', STRATA_APPS_GEOCODER: 'off', STRATA_APPS_CLAUDE: '/bin/false' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    engineProc.stdout.on('data', (d) => { out += d; });
+    engineProc.stderr.on('data', (d) => { out += d; });
+    const base = `http://127.0.0.1:${ePort}`;
+    for (let i = 0; ; i++) {
+      try { if ((await fetch(`${base}/healthz`)).ok) break; } catch { /* starting */ }
+      if (i > 600 || engineProc.exitCode !== null) throw new Error(`the engine did not start:\n${out.slice(-2000)}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const call = async (path, body, headers = {}) => {
+      const res = await fetch(`${base}/api/apps/${app}${path}`, { method: body === undefined ? 'GET' : 'POST', headers: { 'content-type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { status: res.status, body: await res.json().catch(() => ({})) };
+    };
+    const studio = { authorization: `Bearer ${TOKEN}` };
+    // The owner, from the command center (through chloedb-server) and the
+    // studio's leave beacon; a visitor of the published app, who cannot
+    // say they are the owner.
+    assert.equal((await call('/track', { kind: 'open', detail: 'list' }, studio)).status, 200);
+    assert.equal((await call('/insert', { table: 'plants', row: { name: 'Fern' } }, studio)).status, 200);
+    assert.equal((await call('/track', { kind: 'leave', detail: 'list', ms: 4000, session: 'tab1', owner: true }, studio)).status, 200);
+    assert.equal((await call('/track', { kind: 'open', detail: 'list', session: 'v1' }, { 'x-sa-session': 'v1', 'x-sa-owner': '1' })).status, 200);
+    assert.equal((await call('/insert', { table: 'plants', row: { name: 'Pothos' } }, { 'x-sa-session': 'v1', 'x-sa-owner': '1' })).status, 200);
+    assert.equal((await call('/track', { kind: 'leave', detail: 'list', ms: 3000, session: 'v1', owner: true })).status, 200);
+    await new Promise((r) => setTimeout(r, 300));
+    const act = (await call('/activity?days=0', undefined, studio)).body;
+    const owners = act.events.filter((e) => e.src === 'owner').map((e) => e.kind).sort();
+    const people = act.events.filter((e) => e.src !== 'owner').map((e) => e.kind).sort();
+    assert.deepEqual(owners, ['insert', 'leave', 'open'], JSON.stringify(act.events));
+    assert.deepEqual(people, ['insert', 'leave', 'open'], 'a visitor\'s say-so is not the owner\'s');
+    assert.equal(act.ux.sittings, 1, 'how easy it is, by people\'s visits');
+    assert.ok(act.uxAll.sittings >= 2, 'and with the owner\'s');
+  } finally {
+    engineProc?.kill();
+    child.kill();
+  }
 });

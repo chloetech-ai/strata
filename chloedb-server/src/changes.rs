@@ -59,7 +59,7 @@ pub fn sql_tier(sql: &str, tables: &[Arc<chloedb::Schema>]) -> (Tier, Json) {
         return (0, checked);
     };
     let tier = match &cmd {
-        Command::Query | Command::Explain { .. } => 0,
+        Command::Query | Command::Explain { .. } | Command::ShowTables => 0,
         Command::Write { write: Write::Delete { select }, .. } | Command::Write { write: Write::Update { select, .. }, .. } if select.filter == chloedb::query::logical::Pred::True => 3,
         Command::Write { .. } => 2,
         Command::DropTable { .. } | Command::DropRankProfile { .. } => 3,

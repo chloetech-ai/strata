@@ -784,6 +784,7 @@ pub fn check_sql(sql: &str, tables: &[std::sync::Arc<chloedb::Schema>]) -> Resul
         Command::DropRankProfile { table, name, .. } => json!({"statement": "drop rank profile", "table": table, "name": name, "needs": "an admin key"}),
         Command::Function(f) => json!({"statement": if matches!(f, chloedb::query::function::Statement::Drop { .. }) { "drop function" } else { "create function" }, "name": f.name(), "needs": "an admin key"}),
         Command::Explain { json } => json!({"statement": "explain", "json": json, "note": "run it with query: it answers the plan without running the statement"}),
+        Command::ShowTables => json!({"statement": "show tables", "note": "the names of the tables, a row each"}),
     })
 }
 

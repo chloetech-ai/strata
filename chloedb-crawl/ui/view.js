@@ -40,6 +40,13 @@ const CSS = `
   .cr-list li { grid-template-columns: 56px minmax(0, 1fr); }
   .cr-list li > :nth-child(2) { display: none; }
   .cr-url { max-width: 240px; }
+}
+/* a phone keeps a crawl's table, phase, rows and start in view: pages,
+   queued and pages/s are on the crawl's own page */
+@media (max-width: 600px) {
+  .cr-crawls th:nth-child(3), .cr-crawls td:nth-child(3), .cr-crawls th:nth-child(5), .cr-crawls td:nth-child(5), .cr-crawls th:nth-child(6), .cr-crawls td:nth-child(6) { display: none; }
+  .cr-crawls .cr-url { max-width: 120px; }
+  .cr-crawls td:first-child { max-width: 144px; overflow-wrap: anywhere; }
 }`;
 
 const PHASE = { sampling: ["info", "reading a sample"], crawling: ["ok", "crawling"], paused: ["warn", "paused"], stopping: ["pending", "stopping"], done: ["good", "done"], stopped: ["", "stopped"], failed: ["bad", "failed"] };
@@ -274,6 +281,7 @@ function homePage(root, ctx) {
     { key: "rate", label: "Pages/s", num: true, sort: (c) => c.rate?.fetched, render: (c) => (ACTIVE.has(c.phase) ? fmt.si(c.rate?.fetched || 0) : "–") },
     { key: "started_ms", label: "Started", num: true, render: (c) => h("span", { title: fmt.datetime(c.started_ms) }, fmt.ago(c.started_ms)) },
   ], { rows: [], empty: empty("route", "No crawls yet", "Start one above: the table and its shards show here as it fills."), onRow: (c) => { location.hash = ctx.href(c.id); } });
+  crawls.classList.add("cr-crawls");
   const cluster = h("div");
   const growEvents = h("div");
   const policy = h("span", { class: "sub" });
@@ -360,7 +368,8 @@ function columnTable(core, cols) {
     { key: "name", label: "Column", render: (c) => h("b", { class: "mono" }, c.name) },
     { key: "ty", label: "Type", render: (c) => h("span", { class: "badge mono" }, String(c.ty).toUpperCase()) },
     { key: "source", label: "From", sort: sourceText, render: (c) => h("span", { class: "small mono dim" }, sourceText(c)) },
-    { key: "fill", label: "Filled", num: true, render: (c) => (c.source?.kind === "base" ? "–" : fmt.pct(c.fill, 0)) },
+    { key: "fill", label: "Filled", num: true, title: "Of the pages read so far, the share that has it", sort: (c) => c.filled ?? c.fill,
+      render: (c) => (c.source?.kind === "base" ? "–" : h("span", { title: `${fmt.pct(c.filled ?? c.fill, 1)} of the pages read so far; ${fmt.pct(c.fill, 1)} of the pages it was decided on` }, fmt.pct(c.filled ?? c.fill, 0))) },
     { key: "added_at", label: "Since", num: true, title: "When the column was added: with the table, or at a page of the crawl", render: (c) => (c.added_at ? h("span", { class: "badge accent", title: `added at page ${c.added_at}` }, `page ${fmt.n(c.added_at)}`) : h("span", { class: "muted small" }, "the start")) },
   ], { rows: cols, compact: true, maxHeight: "420px" });
 }
@@ -390,7 +399,10 @@ function crawlPage(root, ctx, id) {
   const sqlLink = h("a", { class: "btn sm", title: "Open the table in the SQL workbench" }, icon("sql"), "Query");
   const forgetBtn = h("button", { class: "btn sm ghost", title: "Take it off the list (the table stays)", onclick: () => forget() }, icon("trash"), "Forget");
   root.append(h("div", { class: "page-head" },
-    h("div", {}, h("a", { class: "small", href: ctx.href() }, "← Crawls"), h("div", { class: "row", style: { gap: "10px" } }, title, phase), sub),
+    // The page's heading is the crawl's table, so the app's name is in the
+    // link back (the command center's top bar leaves a titled page's name
+    // to its heading: DAP-22).
+    h("div", {}, h("a", { class: "small", href: ctx.href() }, "← Crawler · all crawls"), h("div", { class: "row", style: { gap: "10px" } }, title, phase), sub),
     h("div", { class: "tools" }, pauseBtn, stopBtn, sqlLink, forgetBtn)));
   const errorBox = h("div"), whyBox = h("div");
   const bar = h("i", { style: { width: "0%" } });
@@ -481,7 +493,7 @@ function crawlPage(root, ctx, id) {
     } catch (e) { if (!gone) hits.replaceChildren(h("div", { class: "error" }, e.message)); }
   }
 
-  let lastEvents = -1, lastCols = -1, lastFields = "", searched = false;
+  let lastEvents = -1, lastCols = -1, lastColsKey = null, lastFields = "", searched = false;
   async function tick() {
     let s;
     try { s = await ctx.api(`/v1/crawls/${encodeURIComponent(id)}`, { timeout: 8000 }); }
@@ -533,9 +545,15 @@ function crawlPage(root, ctx, id) {
     shardsBox.replaceChildren(shardBars(core, g));
 
     schemaSub.textContent = s.plan ? `${s.plan.data ? "every field in data JSON" : ""}${s.plan.embed ? ` · emb from title and body (${s.plan.embed})` : ""} · read from ${fmt.plural(s.pages_seen, "page")}` : `made after ${s.spec.sample} pages`;
+    // Drawn again when a column comes or its fill moves by a point, not
+    // only when their number changes: Filled % went stale (DAP-22).
+    const ckey = s.plan ? cols.map((x) => `${x.name}:${x.source?.kind === "base" ? "" : Math.round((x.filled ?? x.fill ?? 0) * 100)}`).join() : "";
+    if (ckey !== lastColsKey) {
+      lastColsKey = ckey;
+      colsBox.replaceChildren(s.plan ? columnTable(core, cols) : empty("clock", "Reading a sample", `The table is made from the first ${s.spec.sample} pages.`));
+    }
     if (cols.length !== lastCols) {
       lastCols = cols.length;
-      colsBox.replaceChildren(s.plan ? columnTable(core, cols) : empty("clock", "Reading a sample", `The table is made from the first ${s.spec.sample} pages.`));
       sqlBox.replaceChildren(s.sql ? sqlBlock(s.sql) : h("div", { class: "small muted" }, "–"));
       templateBox.replaceChildren(...((s.template || []).length ? [h("div", { class: "cr-sub" }, "Learned from the site's template"), h("div", { class: "row", style: { gap: "6px" } }, s.template.map((t) => h("span", { class: "badge mono", title: `on ${fmt.pct(t.share, 0)} of the sample` }, `${t.name} ← ${t.selector}`)))] : []));
     }
@@ -548,9 +566,10 @@ function crawlPage(root, ctx, id) {
     problemsSub.textContent = s.problems?.length ? `the last ${s.problems.length}` : "";
     if (!searched && s.plan && c.written > 0) { searched = true; search(); }
   }
-  // Every second while it runs, every 10 s after.
+  // Every 2 s while it runs (each answer is some 30 KB: the series, the
+  // pages read last, the fields; a hidden tab asks nothing), every 10 s after.
   let asked = 0;
-  const stopTick = every(1000, async () => {
+  const stopTick = every(2000, async () => {
     if (gone || (st && !ACTIVE.has(st.phase) && Date.now() - asked < 10000)) return;
     asked = Date.now();
     await tick();

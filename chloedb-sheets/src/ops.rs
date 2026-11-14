@@ -579,6 +579,16 @@ fn summarize(b: &mut Book, sheet: u32, area: Rect, by: &[i32], values: &[Agg], h
     if by.is_empty() && values.is_empty() {
         return Err("summarize: group by a column, or aggregate one".into());
     }
+    // `by` and `values` name a sheet's columns (A is 1), not the area's:
+    // one outside it grouped by empty values (DAP-24).
+    let (c0, c1) = (area.col.max(1), area.last_col());
+    for c in by.iter().copied().chain(values.iter().map(|a| a.col)) {
+        if c < c0 || c > c1 {
+            let range = format!("{}:{}", crate::book::cell_ref(area.row.max(1), c0), crate::book::cell_ref(area.last_row(), c1));
+            let name = if c >= 1 { crate::book::col_name(c) } else { c.to_string() };
+            return Err(format!("summarize: column {name} is outside {range} (by and values name the sheet's columns, A being 1, within the area)"));
+        }
+    }
     let (r0, r1) = (area.row, area.last_row());
     let m = b.engine.get_model();
     let ws = m.workbook.worksheet(sheet)?;
@@ -768,6 +778,21 @@ mod tests {
         assert_eq!((shown(&b, n, 2, 1), shown(&b, n, 2, 2), shown(&b, n, 2, 3)), ("North".into(), "17.5".into(), "2".into()));
         assert_eq!(shown(&b, n, 3, 2), "5");
         assert_eq!(shown(&b, n, 4, 2), "22.5");
+    }
+
+    #[test]
+    fn a_summary_refuses_a_column_outside_its_area() {
+        let mut b = book();
+        run(&mut b, json!({"op": "set_many", "sheet": 0, "row": 1, "col": 1, "values": [["Region", "Sales", "Other"], ["North", "10", "x"]]}));
+        let sheets = b.engine.get_worksheets_properties().len();
+        let area = json!({"row": 1, "col": 1, "width": 2, "height": 2});
+        for (by, values) in [(json!([3]), json!([])), (json!([1]), json!([{"col": 3, "agg": "sum"}])), (json!([0]), json!([]))] {
+            let op = serde_json::from_value(json!({"op": "summarize", "sheet": 0, "area": area, "by": by, "values": values})).unwrap();
+            let e = apply(&mut b, op).err().expect("refused");
+            assert!(e.contains("is outside A1:B2"), "{e}");
+        }
+        assert!(apply(&mut b, serde_json::from_value(json!({"op": "summarize", "sheet": 0, "area": area, "by": [3], "values": []})).unwrap()).err().expect("refused").contains("column C is outside A1:B2"));
+        assert_eq!(b.engine.get_worksheets_properties().len(), sheets, "no sheet is added");
     }
 
     #[test]

@@ -46,6 +46,7 @@ pub fn check(svc: &Service, sql: &str, params: &Params) -> Json {
             answer("query", r)
         }
         Command::Explain { .. } => answer("explain", Err(ApiError::bad("query error: EXPLAIN runs through POST /v1/explain"))),
+        Command::ShowTables => answer("query", Ok(Vec::new())),
         Command::AlterTable { alters, .. } if cluster && alters.iter().any(|a| matches!(a, Alter::DropField(_))) => {
             answer("ddl", Err(ApiError::bad("ALTER TABLE ... DROP COLUMN does not run through a coordinator yet (its plans name columns by place); ADD COLUMN and RENAME COLUMN do")))
         }

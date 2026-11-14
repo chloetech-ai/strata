@@ -449,7 +449,7 @@ export class Engine extends EventEmitter {
       if (batch && !ctx.batch) out = await this.exclusive(appId, async () => { const r = await rule(); await batch.commit(); return r; });
       else if (fn.spec.rule) out = await rule();
       else out = await runFunction(fn.code, input, host, { user, helpers: view.helpers.map((c) => ({ name: c.slug, code: c.code })) });
-      if (!ctx.depth && !ctx.test) this.store.track(appId, 'call', fn.id, slug, { person: ctx.who || user?.id, v: view.comp.n, session: ctx.session, screen: ctx.screen, ms: out.ms, taps: ctx.taps }).catch(() => {});
+      if (!ctx.depth && !ctx.test) this.store.track(appId, 'call', fn.id, slug, { person: ctx.who || user?.id, v: view.comp.n, session: ctx.session, screen: ctx.screen, ms: out.ms, taps: ctx.taps, src: ctx.owner ? 'owner' : null }).catch(() => {});
       return out;
     } catch (e) {
       // A rule's refusal ("Only 2 left") is for the person, not a repair.
@@ -552,7 +552,7 @@ export class Engine extends EventEmitter {
     // A build's own checks (checks.mjs, ctx.test) are not anyone's use of the app.
     if (!ctx.depth && !ctx.test) {
       const detail = event === 'update' && ctx.changed ? `${table}: ${ctx.changed.join(', ')}` : table;
-      const where = { person: ctx.who || ctx.user?.id, v: view.comp.n, session: ctx.session, screen: ctx.screen, tbl: table, rid: row?.id, fields: event === 'update' ? ctx.changed : null, taps: ctx.taps };
+      const where = { person: ctx.who || ctx.user?.id, v: view.comp.n, session: ctx.session, screen: ctx.screen, tbl: table, rid: row?.id, fields: event === 'update' ? ctx.changed : null, taps: ctx.taps, src: ctx.owner ? 'owner' : null };
       const tracked = Promise.resolve(this.dbOf(appId)).then((db) => rowLabel(db, appId, table, row, tablesOf(view))).catch(() => null)
         .then((label) => this.store.track(appId, event, '', detail, { ...where, label })).catch(() => {});
       // A visitor's insert is how their own rows are told (ownedBy): kept before the answer.

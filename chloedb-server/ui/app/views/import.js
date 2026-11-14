@@ -244,11 +244,17 @@ function render(page) {
       h("option", { value: "", selected: !st.clusterBy }, "the order rows come in"),
       st.cols.filter(clusterable).map((c) => h("option", { value: c.name, selected: st.clusterBy === c.name }, c.name)));
     const shardEmpty = st.shardBy ? emptyIn(st.shardBy) : 0;
+    // A single server has no shards (CCB-16): only the order of each
+    // segment is asked there.
+    const sharded = isCoordinator();
+    if (!sharded) st.shardBy = null;
     const placeRow = st.mode === "new" ? h("div", { class: "stack", style: { gap: "6px" } },
       h("div", { class: "row", style: { gap: "16px" } },
-        h("label", { class: "row nw small dim", style: { gap: "6px" } }, "Shard by", shardSel),
+        sharded ? h("label", { class: "row nw small dim", style: { gap: "6px" } }, "Shard by", shardSel) : null,
         h("label", { class: "row nw small dim", style: { gap: "6px" } }, "Order each segment by", clusterSel)),
-      h("div", { class: "small muted" }, st.shardBy
+      h("div", { class: "small muted" }, !sharded
+        ? (st.clusterBy ? `Rows with the same ${st.clusterBy} sit together in each segment, so reading one ${st.clusterBy}'s rows reads a few blocks.` : "Pick a column you read rows by (a user, a time) to keep its rows together in each segment.")
+        : st.shardBy
         ? `Rows with the same ${st.shardBy} live on one shard, so reading or joining one ${st.shardBy}'s rows asks one shard. ${st.shardBy} becomes NOT NULL.`
         : `Rows are spread over the shards by ${st.key ? "their key" : "their id"}. Pick a column you look rows up or join by (a user, an item) to keep its rows on one shard.`),
       shardEmpty ? h("div", { class: "error small" }, `${fmt.plural(shardEmpty, "row")} of the ${fmt.n(s.objs.length)} read here ${shardEmpty === 1 ? "has" : "have"} no ${st.shardBy}: a row needs one to be placed, and is refused without it.`) : null) : null;

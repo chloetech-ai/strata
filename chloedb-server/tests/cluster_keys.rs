@@ -237,6 +237,29 @@ async fn an_open_shard_is_not_cut_off_by_keys() {
     assert!(s0.keys.is_empty());
 }
 
+/// LIV-19: a coordinator's health, without a credential, says whether it
+/// is up and nothing of its copies (their internal addresses, roles and
+/// counts); with the admin's token or a key, it is whole. The route still
+/// takes no credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coordinators_health_shows_its_copies_only_to_a_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let shard = Access { cluster: cluster(), ..Default::default() };
+    let (_s0, u0) = serve(create(d, "s0.strata", |_| true), d, "s0.strata", shard, |_| {}).await;
+    let (_c, _svc, base) = coordinator(&[u0.clone()], cluster(), Access { token: Some(Secret::new(ADMIN)), cluster: cluster(), ..Default::default() }).await;
+    let (status, h) = http(&base, "GET", "/v1/health", None, None).await;
+    assert_eq!((status, &h), (200, &json!({"status": "ok"})), "{h}");
+    let (status, h) = http(&base, "GET", "/v1/health", Some("not-a-key"), None).await;
+    assert_eq!((status, &h), (200, &json!({"status": "ok"})), "{h}");
+    let (status, whole) = http(&base, "GET", "/v1/health", Some(ADMIN), None).await;
+    assert_eq!(status, 200);
+    assert!(whole.to_string().contains(&u0) && whole["docs"].as_u64() == Some(N as u64), "{whole}");
+    let (_, j) = http(&base, "POST", "/v1/admin/keys", Some(ADMIN), Some(json!({"name": "feed", "scope": "feed"}))).await;
+    let (status, h) = http(&base, "GET", "/v1/health", j["secret"].as_str(), None).await;
+    assert_eq!((status, h["docs"].as_u64()), (200, Some(N as u64)), "{h}");
+}
+
 /// A primary passes its keys to its replicas and takes theirs, so that a
 /// replica promoted to primary admits its primary's keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

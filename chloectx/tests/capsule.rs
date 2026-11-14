@@ -204,3 +204,33 @@ fn a_private_temporary_directory_is_its_owners_alone() {
     std::fs::remove_dir(&a).unwrap();
     std::fs::remove_dir(&b).unwrap();
 }
+
+#[test]
+fn a_manifest_names_no_path_outside_the_project() {
+    // CTX-18: the topics are the files the notes are about; one outside
+    // the project goes by its file name, one inside by its path there.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("memory.strata"), Arc::new(HashEmbedder { dim: 32 }), StoreOptions { sync: false, ..Default::default() }).unwrap();
+    let files = ["/home/someone/audit/fx.rs", "/home/someone/work/stockroom/src/inventory.rs", "src/count.rs", "../shared/lib.rs", "/etc/hosts"];
+    store
+        .append(
+            "s1",
+            1,
+            1_700_000_000,
+            vec![
+                Draft::new(Kind::Decision, "Counts are rounded down; the exchange rates come from fx.rs.").files(files.iter().map(|f| f.to_string()).collect()),
+                Draft::new(Kind::Fact, "The stock count runs nightly.").files(files.iter().map(|f| f.to_string()).collect()),
+            ],
+        )
+        .unwrap();
+    store.flush().unwrap();
+    let out = dir.path().join("cap");
+    let m = capsule::pack(&store, "hash:32", "/home/someone/work/stockroom", &out, &PackOptions::default()).unwrap();
+    let mut topics = m.topics.clone();
+    topics.sort();
+    assert_eq!(topics, ["fx.rs", "hosts", "lib.rs", "src/count.rs", "src/inventory.rs"], "{:?}", m.topics);
+    let manifest = std::fs::read_to_string(out.join("manifest.json")).unwrap();
+    for leak in ["/home/someone", "/etc", "../shared"] {
+        assert!(!manifest.contains(leak), "{leak} in {manifest}");
+    }
+}

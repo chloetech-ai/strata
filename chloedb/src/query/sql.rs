@@ -148,6 +148,17 @@ pub enum Command {
     /// ([`crate::query::ir`]), as lines of text or as JSON, made when it
     /// runs ([`crate::db::Db::explain`]).
     Explain { json: bool },
+    /// `SHOW TABLES`: the names of the database's tables, those ChloeDB
+    /// keeps for itself left out ([`table_list`]).
+    ShowTables,
+}
+
+/// The answer of `SHOW TABLES` over tables named `names`: a row each, of
+/// one column, `name`, in the order given, without the tables ChloeDB
+/// keeps for itself ([`hint::internal_table`]).
+pub fn table_list<S: AsRef<str>>(names: &[S]) -> crate::query::exec::ResultSet {
+    let rows = names.iter().map(|n| n.as_ref()).filter(|n| !hint::internal_table(n)).map(|n| vec![Value::Str(n.to_string())]).collect();
+    crate::query::exec::ResultSet { columns: vec!["name".into()], rows, keys: Vec::new(), scores: Vec::new(), parts: None, stats: Default::default() }
 }
 
 /// Parses one statement.
@@ -166,6 +177,7 @@ pub(crate) fn parse_one(sql_text: &str) -> Result<sql::Statement> {
 pub(crate) fn parse_query(sql_text: &str) -> Result<Box<sql::Query>> {
     match parse_one(sql_text)? {
         sql::Statement::Query(q) => Ok(q),
+        sql::Statement::ShowTables { .. } => Err(err("SHOW TABLES runs as a statement, not as a query: POST /v1/sql (db.sql in code) answers it, and GET /v1/tables lists the tables with their columns")),
         _ => Err(err("only SELECT is supported")),
     }
 }
@@ -255,6 +267,13 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
     let write = |schema: &Schema, write: Write| Command::Write { table: schema.table.clone(), write };
     Ok(match stmt {
         sql::Statement::Query(_) => Command::Query,
+        // ONB-16: the first statement many type. Its other forms (FULL,
+        // FROM a database, LIKE) are refused as before.
+        sql::Statement::ShowTables { terse: false, history: false, extended: false, full: false, external: false, show_options }
+            if show_options.show_in.is_none() && show_options.starts_with.is_none() && show_options.limit.is_none() && show_options.limit_from.is_none() && show_options.filter_position.is_none() =>
+        {
+            Command::ShowTables
+        }
         sql::Statement::Explain { describe_alias: _, analyze, verbose, query_plan: _, estimate, statement, format, options } => {
             if *analyze || *verbose || *estimate {
                 return Err(err("EXPLAIN shows a statement's plan without running it: ANALYZE, VERBOSE and ESTIMATE are not supported (POST /v1/explain runs a query and reports what it did)"));
@@ -349,12 +368,12 @@ pub(crate) fn bind_statement(stmt: &sql::Statement, tables: &[&Schema], params: 
 /// same: the tables and their columns are in `GET /v1/tables`.
 fn unsupported_statement(stmt: &sql::Statement, tables: &[&Schema]) -> String {
     let supported = "ChloeDB runs SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE RANK PROFILE, DROP RANK PROFILE, CREATE FUNCTION, DROP FUNCTION and EXPLAIN";
-    let names: Vec<&str> = tables.iter().map(|t| t.table.as_str()).collect();
+    let names: Vec<&str> = tables.iter().map(|t| t.table.as_str()).filter(|t| !hint::internal_table(t)).collect();
     let listing = if names.is_empty() { String::new() } else { format!(" (the tables are {})", hint::listing(&names, 20)) };
     let first = word_of(stmt);
     match stmt {
         sql::Statement::ShowTables { .. } | sql::Statement::ShowDatabases { .. } | sql::Statement::ShowSchemas { .. } | sql::Statement::ShowObjects(_) => {
-            format!("{first} is not a statement ChloeDB runs: GET /v1/tables lists the tables and their columns{listing}, and so does the SQL workbench's sidebar")
+            format!("{first} is not a statement ChloeDB runs: SHOW TABLES lists the tables' names, GET /v1/tables the tables and their columns{listing}, and so does the SQL workbench's sidebar")
         }
         sql::Statement::ShowColumns { .. } | sql::Statement::ExplainTable { .. } | sql::Statement::ShowCreate { .. } => format!(
             "{first} is not a statement ChloeDB runs: GET /v1/tables gives each table's columns and the CREATE TABLE that makes it{listing}; SELECT * FROM t LIMIT 0 names the columns a query returns"

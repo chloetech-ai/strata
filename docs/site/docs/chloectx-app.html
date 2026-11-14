@@ -11,7 +11,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css?v=ea539cbc99">
+<link rel="stylesheet" href="../assets/site.css?v=3871c230ea">
 <link rel="stylesheet" href="../assets/docs.css?v=fd8b9d06a7">
 </head>
 <body class="docs">
@@ -223,7 +223,7 @@ CHLOEDB_APP_TOKEN=&quot;$APP_TOKEN&quot; chloedb-server --shards ... --app chloe
 <tr>
 <td><code>DELETE /v1/spaces/:s/notes/:id</code></td>
 <td></td>
-<td>the note, retired: kept, but in no context again</td>
+<td>the note, retired: kept, tagged <code>retired</code> (not <code>superseded</code>: nothing replaced it), and in no context again</td>
 </tr>
 <tr>
 <td><code>POST /v1/spaces/:s/exchanges</code></td>
@@ -233,7 +233,7 @@ CHLOEDB_APP_TOKEN=&quot;$APP_TOKEN&quot; chloedb-server --shards ... --app chloe
 <tr>
 <td><code>POST /v1/spaces/:s/ask</code> (or <code>GET ?q=&amp;budget=</code>)</td>
 <td><code>{question, budget?}</code></td>
-<td><code>{context, tokens, ms, items, left_out}</code></td>
+<td><code>{context, tokens, ms, items, left_out}</code>; <code>budget</code> is 200 to 50,000 tokens (4,000 left out), and one outside that is refused</td>
 </tr>
 <tr>
 <td><code>GET /v1/incidents?space=</code>, <code>POST /v1/incidents</code></td>
@@ -297,7 +297,7 @@ CHLOEDB_APP_TOKEN=&quot;$APP_TOKEN&quot; chloedb-server --shards ... --app chloe
 </tr>
 </tbody>
 </table></div>
-<p>An answer of <code>ask</code> has, for each record in the context, its <code>section</code> (<code>rule</code>, <code>note</code>, <code>timeline</code> for a question about the whole history, <code>reply</code> and <code>excerpt</code> for past conversations), its <code>tokens</code> (about four characters each), its scores (<code>bm25</code> for the question's words, <code>cos</code> for its meaning) and, for a note that replaced another, <code>replaced</code>: what it changed. <code>left_out</code> names what the searches found and the context leaves out, and why: <code>superseded</code>, <code>uncertain</code>, or <code>budget</code>. The context is built as ChloeCtx's own <code>memory_ask</code> builds it for Claude Code (<a href="chloectx.html">how</a>), with its sizes scaled to the budget.</p>
+<p>An answer of <code>ask</code> has, for each record in the context, its <code>section</code> (<code>rule</code>, <code>note</code>, <code>timeline</code> for a question about the whole history, <code>reply</code> and <code>excerpt</code> for past conversations), its <code>tokens</code> (about four characters each), its scores (<code>bm25</code> for the question's words, <code>cos</code> for its meaning) and, for a note that replaced another, <code>replaced</code>: what it changed. <code>left_out</code> names what the searches found and the context leaves out, and why: <code>superseded</code> (a later note replaced it), <code>retired</code>, <code>uncertain</code>, or <code>budget</code>. The context is built as ChloeCtx's own <code>memory_ask</code> builds it for Claude Code (<a href="chloectx.html">how</a>), with its sizes scaled to the budget.</p>
 <h3 id="a-space-as-an-mcp-server">A space as an MCP server<a class="anchor" href="#a-space-as-an-mcp-server" aria-label="Link to this section">#</a></h3>
 <p><code>POST /v1/spaces/:s/mcp</code> speaks the Model Context Protocol (streamable HTTP, JSON answers; a <code>GET</code> gets 405) with three tools on that space: <code>ask</code> (<code>question</code>, <code>budget</code>: the context, as <code>ask</code> above, with the ids of its notes), <code>remember</code> (<code>kind</code>, <code>text</code>, <code>replaces?</code>, <code>entities?</code>: a note, session <code>mcp</code>) and <code>notes</code> (<code>kind?</code>, <code>limit?</code>: the current ones with their ids). A space that does not exist is 404, not a new space. To connect Claude Code, through chloedb-server:</p>
 <pre data-lang="sh">claude mcp add --transport http ctx-billing https://chloedb.example.com/v1/apps/chloectx/v1/spaces/billing/mcp \
@@ -393,7 +393,11 @@ cd ../chloectx &amp;&amp; CHLOECTX_NEED_SERVER=1 cargo test --profile ci --test 
   <div><h4>Source</h4><ul><li><a href="https://github.com/chloetech-ai/chloedb">GitHub</a></li><li><a href="https://github.com/chloetech-ai/chloedb/blob/main/docs/reproduce.md">Reproduce the results</a></li></ul></div>
 </div></footer>
 <script src="../assets/site.js?v=142c29c3e0"></script>
-<script>if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;</script>
+<script>
+// On a narrow screen the sidebar and, on a phone, "On this page" start closed, so the page's text is in the first screen.
+if (window.matchMedia("(max-width: 900px)").matches) document.querySelector(".doc-menu").open = false;
+if (window.matchMedia("(max-width: 760px)").matches) document.querySelectorAll(".doc-toc").forEach(function (d) { d.open = false; });
+</script>
 
 </body>
 </html>

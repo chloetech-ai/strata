@@ -120,3 +120,60 @@ fn help_is_short_and_grouped() {
     }
     assert!(long.contains("--hedge-ms") && long.contains("--db"));
 }
+
+/// What a start that fails says, and that it leaves nothing behind
+/// (ONB-13): an address in use or no address at all is found before the
+/// database is made, a folder that holds no database and a file that is
+/// not one are refused without a readers' folder beside them, and a
+/// missing folder is named.
+#[test]
+fn a_start_that_fails_says_why_and_leaves_no_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = |db: &std::path::Path, listen: &str| {
+        let out = bin()
+            .arg("--db")
+            .arg(db)
+            .args(["--listen", listen, "--grpc", "off", "--log", "warn", "--start-apps", "off", "--no-fetch-models"])
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{} started", db.display());
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    let files = |d: &std::path::Path| {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    };
+    let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+
+    // A port in use: the hint, and no database.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = taken.local_addr().unwrap().to_string();
+    let e = start(&dir.path().join("a.chloedb"), &addr);
+    assert!(e.contains("in use") && e.contains("--listen") && e.contains("lsof"), "{e}");
+    assert_eq!(files(dir.path()), Vec::<String>::new());
+    // A port that is no port.
+    let e = start(&dir.path().join("a.chloedb"), "127.0.0.1:99999");
+    assert!(e.contains("127.0.0.1:99999") && e.contains("--listen"), "{e}");
+    assert_eq!(files(dir.path()), Vec::<String>::new());
+
+    // A folder that holds no database.
+    let empty = dir.path().join("adir");
+    std::fs::create_dir(&empty).unwrap();
+    let e = start(&empty, &free());
+    assert!(e.contains("adir") && e.contains("holds no ChloeDB database"), "{e}");
+    assert_eq!(files(&empty), Vec::<String>::new());
+
+    // A file that is not a database: refused, and no readers' folder.
+    let text = dir.path().join("notdb.txt");
+    std::fs::write(&text, "not a database\n").unwrap();
+    let e = start(&text, &free());
+    assert!(e.contains("notdb.txt"), "{e}");
+    assert_eq!(files(dir.path()), ["adir", "notdb.txt"]);
+
+    // A folder that is not there: named, with what makes it.
+    let e = start(&dir.path().join("no/such/x.chloedb"), &free());
+    assert!(e.contains("no/such") && e.contains("mkdir -p"), "{e}");
+    assert_eq!(files(dir.path()), ["adir", "notdb.txt"]);
+}

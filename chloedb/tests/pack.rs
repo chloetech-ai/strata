@@ -353,3 +353,33 @@ fn query_leaf_runs_pack() {
         _ => panic!("rows"),
     }
 }
+
+/// Rows of a title and a description need room for both and an excerpt:
+/// once what is left is less, every row is turned away, and the pack stops
+/// reading rather than ranking up to 1,000 rows only to skip them (PRF-11:
+/// PACK 500 TOKENS over rrf had a p95 eight times its p50).
+#[test]
+fn a_budget_too_small_for_the_rows_left_stops_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = empty_db(dir.path());
+    run(&db, "CREATE TABLE items (id INT PRIMARY KEY, title TEXT, description TEXT)");
+    let title = "quiet leather camera for travel, with a strap and a case of waxed canvas";
+    let description = "a quiet camera in leather for travel and the city, ".repeat(4);
+    let description = description.trim_end();
+    let values: Vec<String> = (0..3000).map(|i| format!("({i}, '{title}', '{description}')")).collect();
+    run(&db, &format!("INSERT INTO items (id, title, description) VALUES {}", values.join(", ")));
+    // Eight rows whole, then a little more than an excerpt's 32 tokens
+    // but less than the title and an excerpt: no row fits any more.
+    let (rest, full) = (count_tokens(title), count_tokens(title) + count_tokens(description));
+    let budget = 8 * full + 32 + rest / 2;
+    assert!(rest >= 4 && full > 32 + rest, "{rest} {full}");
+    let sql = format!("SELECT id, title, description FROM items ORDER BY rrf(bm25(description, 'quiet camera'), bm25(title, 'leather camera')) DESC PACK {budget} TOKENS WITH RECEIPT");
+    let p = db.pack(&sql, &Params::new()).unwrap();
+    let summary = format!("{} of {budget} tokens, {} rows decided, {} queries", p.receipt.used, p.receipt.rows.len(), p.receipt.queries);
+    assert_eq!(p.receipt.rows.iter().filter(|d| d.taken).count(), 8, "{summary}");
+    assert_eq!(budget - p.receipt.used, 32 + rest / 2, "{summary}");
+    // The first read's rows were enough to see that: no deeper read.
+    assert_eq!(p.receipt.queries, 1, "{summary}");
+    assert_eq!(p.receipt.rows.len(), 64, "{summary}");
+    assert!(p.receipt.rows[8..].iter().all(|d| d.decision == "skip: over budget"), "{summary}");
+}

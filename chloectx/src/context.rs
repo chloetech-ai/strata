@@ -99,8 +99,8 @@ pub struct Built {
     /// Why each of `records` is shown (one each, in the same order).
     pub picks: Vec<Pick>,
     /// Records the searches found that the context leaves out, and why:
-    /// `superseded` (a later note replaced it), `uncertain`, or `budget`
-    /// (no room left).
+    /// `superseded` (a later note replaced it), `retired` (retired by hand,
+    /// with nothing in its place), `uncertain`, or `budget` (no room left).
     pub left_out: Vec<(Record, &'static str)>,
 }
 
@@ -280,6 +280,8 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
     };
     let store = &store.pinned();
     let with = |kinds: &[Kind]| Filter { kinds: kinds.to_vec(), ..filter.clone() };
+    // Rules the vector search reads: fewer back means every rule was read.
+    let rule_n = (p.rules * 3).max(50);
     // Each search's scores, for the picks' reasons.
     let signals: std::sync::Mutex<HashMap<String, (Option<f64>, Option<f64>)>> = Default::default();
     let one = |q: &str, f: &Filter, n: usize| -> Result<Vec<Record>> {
@@ -296,7 +298,7 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
         let answers = s.spawn(|| if p.replies > 0 { one(question, &with(&[Kind::Answer]), p.excerpts * 2) } else { Ok(Vec::new()) });
         let rules = s.spawn(|| -> Result<Vec<(Record, f64)>> {
             let qv = store.embedder.embed_query(question)?;
-            store.vector_top(&qv, (p.rules * 3).max(50), &with(&[Kind::Preference]))
+            store.vector_top(&qv, rule_n, &with(&[Kind::Preference]))
         });
         let j = |h: std::thread::ScopedJoinHandle<'_, Result<Vec<Record>>>| h.join().unwrap_or_else(|_| Err(crate::err("search panicked")));
         (
@@ -308,16 +310,32 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
     });
     let (notes, messages, answers, rules) = (notes?, messages?, answers?, rules?);
     let signals = signals.into_inner().unwrap_or_else(|e| e.into_inner());
-    let live = |r: &Record| r.tag != "superseded" && r.tag != "uncertain" && r.tag != "cue";
+    let live = |r: &Record| !crate::record::closed_tag(&r.tag) && r.tag != "uncertain" && r.tag != "cue";
     let mut left_out: Vec<(Record, &'static str)> = Vec::new();
     let mut gone: HashSet<String> = HashSet::new();
     for r in notes.iter().chain(rules.iter().filter(|(_, c)| *c >= p.rule_min_cos).map(|(r, _)| r)) {
         if !live(r) && r.tag != "cue" && gone.insert(r.id.clone()) {
-            left_out.push((r.clone(), if r.tag == "superseded" { "superseded" } else { "uncertain" }));
+            left_out.push((r.clone(), match r.tag.as_str() {
+                "superseded" => "superseded",
+                crate::record::RETIRED => "retired",
+                _ => "uncertain",
+            }));
         }
     }
     let rule_cos: HashMap<String, f64> = rules.iter().map(|(r, c)| (r.id.clone(), *c)).collect();
-    let rules: Vec<Record> = rules.into_iter().filter(|(r, c)| *c >= p.rule_min_cos && live(r)).map(|(r, _)| r).take(p.rules).collect();
+    // The rules section: the rules close in meaning to the question, then
+    // the ones its search for notes found by their words, then, in a space
+    // with no more rules than the section holds, every other rule: a rule
+    // a context shows is in it, not among the notes after "Rules that
+    // apply come first" (APC-24).
+    let every_rule = rules.len() < rule_n && rules.iter().filter(|(r, _)| live(r)).count() <= p.rules;
+    let mut picked_rules: Vec<Record> = rules.iter().filter(|(r, c)| *c >= p.rule_min_cos && live(r)).map(|(r, _)| r.clone()).collect();
+    for r in notes.iter().filter(|r| r.kind == Kind::Preference && live(r)).chain(rules.iter().filter(|_| every_rule).map(|(r, _)| r).filter(|r| live(r))) {
+        if !picked_rules.iter().any(|x| x.id == r.id) {
+            picked_rules.push(r.clone());
+        }
+    }
+    let rules: Vec<Record> = picked_rules.into_iter().take(p.rules).collect();
     let notes: Vec<Record> = notes.into_iter().filter(|r| live(r) && !rules.iter().any(|x| x.id == r.id)).collect();
     // A broad question's timeline: every live note.
     let all_notes: Vec<Record> = if is_broad && p.broad_timeline > 0 {
@@ -463,7 +481,7 @@ pub fn build(store: &Store, question: &str, filter: &Filter, p: &ContextParams) 
             (ts.div_euclid(86_400), seq)
         });
         text += if every { "Every note" } else { "Notes" };
-        text += " from earlier conversations with the user, in their current versions, oldest first (date, kind, note; what it replaced in brackets). Rules come first; a later note can change what an earlier one says:\n";
+        text += " from earlier conversations with the user, in their current versions, oldest first (date, kind, note; what it replaced in brackets). Rules that apply come first; a later note can change what an earlier one says:\n";
         let rule_ids: HashSet<String> = rule_lines.iter().map(|(r, _)| r.id.clone()).collect();
         for (r, l) in rule_lines.into_iter().chain(picked[0].drain(..)) {
             let section = if rule_ids.contains(&r.id) {
@@ -566,6 +584,28 @@ mod tests {
         let rule = b.text.find("rule: Always confirm").expect("the rule");
         let fact = b.text.find("fact: The user's holiday gift budget is 450").unwrap();
         assert!(rule < fact, "{}", b.text);
+    }
+
+    /// APC-24: a rule a context shows is in the rules section, before the
+    /// notes, whether or not it is close in meaning to the question; a
+    /// retired one is left out as retired.
+    #[test]
+    fn a_rule_shown_is_a_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.append("s1", 0, DAY, vec![Draft::new(Kind::Fact, "Refunds above 500 EUR are approved by the finance team.").tag("distilled")]).unwrap();
+        s.append("s2", 0, 2 * DAY, vec![Draft::new(Kind::Preference, "Never refund to a different card than the one charged.")]).unwrap();
+        s.append("s3", 0, 3 * DAY, vec![Draft::new(Kind::Preference, "Refunds over 100 EUR are always sent by bank transfer.").tag(crate::record::RETIRED)]).unwrap();
+        s.flush().unwrap();
+        // The test embedder's cosines are low: the live rule is not close in meaning.
+        let b = build(&s, "Who approves a refund of 700 EUR?", &Filter::default(), &ContextParams::default()).unwrap();
+        let rule = b.records.iter().position(|r| r.text.starts_with("Never refund")).unwrap_or_else(|| panic!("the space's one rule: {}", b.text));
+        assert_eq!(b.picks[rule].section, "rule", "{}", b.text);
+        assert!(b.text.find("rule: Never refund").unwrap() < b.text.find("fact: Refunds above 500").unwrap(), "{}", b.text);
+        assert!(b.text.contains("Rules that apply come first"), "{}", b.text);
+        assert!(!b.text.contains("bank transfer"), "{}", b.text);
+        let close = build(&s, "Who approves a refund of 700 EUR?", &Filter::default(), &ContextParams { rule_min_cos: -1.0, ..Default::default() }).unwrap();
+        assert!(close.left_out.iter().any(|(r, why)| r.text.contains("bank transfer") && *why == "retired"), "{:?}", close.left_out.iter().map(|(r, w)| (&r.text, w)).collect::<Vec<_>>());
     }
 
     /// A note merged late is dated and placed by the message it came from.

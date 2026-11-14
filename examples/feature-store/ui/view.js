@@ -235,7 +235,7 @@ function ctrChart(ctx, host) {
 function latencyChart(ctx, host, onState) {
   const chart = ctx.charts.timeChart({ height: 210, fmt: (v) => ctx.core.fmt.ms(v), min: 0,
     series: [
-      { name: "serving p50 (4 reads by key, 489 rows, transforms, model)", color: "var(--s2)", get: (p) => p.serve_p50 },
+      { name: "serving p50 (reads by key, transforms, model)", color: "var(--s2)", get: (p) => p.serve_p50 },
       { name: "serving p99", color: "var(--s5)", get: (p) => p.serve_p99, dash: true },
       { name: "write p50 (impressions + streaming features, one transaction)", color: "var(--s1)", get: (p) => p.write_p50 },
       { name: "click to feature p50", color: "var(--s3)", get: (p) => p.fresh_p50 },
@@ -355,7 +355,9 @@ function pipelinePage(root, ctx, onState) {
   });
   onState((st) => {
     kRate.set([fmt.si(st.counts.impressions), h("small", {}, `${fmt.si(st.rates.impressions)}/s`)], `${fmt.si(st.counts.clicks)} clicks, the labels`);
-    kServe.set(fmt.ms(st.serve.p50), `p99 ${fmt.ms(st.serve.p99)}; 489 rows by key a request`);
+    // The rows the last ranking read by key: none for the random order.
+    const reads = st.serve.rows == null ? "" : st.serve.rows ? `; ${fmt.n(st.serve.rows)} rows by key` : "; random: no reads";
+    kServe.set(fmt.ms(st.serve.p50), `p99 ${fmt.ms(st.serve.p99)}${reads}`);
     kFresh.set(fmt.ms(st.fresh.p50), `p99 ${fmt.ms(st.fresh.p99)}; the next ranking sees it`);
     kAuc.set(st.model ? st.model.auc_true.toFixed(3) : "random", st.model ? `${st.model.name}, ${st.model.join_kind}` : "train one on the Training tab");
     if (ctr2) {

@@ -34,7 +34,7 @@
 //! | `POST /v1/spaces/:s/notes` | `{kind, text, replaces?, entities?, session?, ts?}` | the note; `replaces` marks the older one superseded |
 //! | `GET /v1/spaces/:s/notes?kind=&limit=&all=` | | `{notes}`, the newest first (live ones unless `all=1`) |
 //! | `GET /v1/spaces/:s/notes/:id` | | the note and its history: what it replaced and what replaced it |
-//! | `DELETE /v1/spaces/:s/notes/:id` | | the note, retired (superseded by nothing) |
+//! | `DELETE /v1/spaces/:s/notes/:id` | | the note, retired: tagged `retired`, which no context shows (nothing replaced it) |
 //! | `POST /v1/spaces/:s/exchanges` | `{user, assistant, session?, ts?, distill?}` | the two messages stored; notes follow when a model is set |
 //! | `GET /v1/spaces/:s/ask?q=&budget=`, `POST` the same | `{question, budget?}` | `{context, tokens, ms, items, left_out}` |
 //! | `GET /v1/incidents`, `POST /v1/incidents` | `{title, symptom, cause, fix, alert?, when?, replaces?}` | `{incidents}`; the incident |
@@ -423,7 +423,7 @@ impl App {
                 }
             }
             // The notes a context still shows: not replaced, retired or done.
-            let live = self.cluster.query(&format!("SELECT kind, COUNT(*) FROM {} WHERE tag NOT IN ('superseded', 'done') GROUP BY kind LIMIT 50", table_of(&name)), &Default::default()).map(|c| c.rows).unwrap_or_default();
+            let live = self.cluster.query(&format!("SELECT kind, COUNT(*) FROM {} WHERE tag NOT IN ('superseded', 'retired', 'done') GROUP BY kind LIMIT 50", table_of(&name)), &Default::default()).map(|c| c.rows).unwrap_or_default();
             let live: serde_json::Map<String, Json> = live.iter().filter_map(|c| Some((c.first()?.as_str()?.to_string(), json!(c.get(1)?.as_i64()?)))).collect();
             out.push(json!({"name": name, "title": s(1), "description": s(2), "kind": s(3), "created": r.get(4).and_then(|v| v.as_i64()).unwrap_or(0), "table": table_of(&name), "records": total, "by_kind": by, "live_by_kind": live}));
         }
@@ -439,7 +439,7 @@ impl App {
             return Err(bad("a note needs \"text\""));
         }
         let (kind, tag) = note_kind(b["kind"].as_str().unwrap_or("note")).ok_or_else(|| bad("kind is decision, rule, fact, todo or note"))?;
-        let tag = b["tag"].as_str().filter(|t| !t.is_empty() && *t != "superseded").unwrap_or(tag);
+        let tag = b["tag"].as_str().filter(|t| !t.is_empty() && !crate::record::closed_tag(t)).unwrap_or(tag);
         let entities: Vec<String> = b["entities"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_string)).take(12).collect();
         let mut d = Draft::new(kind, text).tag(tag).entities(entities);
         let replaces = b["replaces"].as_str().filter(|s| !s.is_empty());
@@ -478,11 +478,12 @@ impl App {
         Ok(json!({"deleted": name, "table": table_of(name), "kind": row["kind"]}))
     }
 
-    /// Retires a note: superseded by nothing.
+    /// Retires a note: tagged `retired`, which no context shows. Nothing
+    /// replaced it, so it is not `superseded`.
     pub fn retire(&self, space: &str, id: &str) -> Answer {
         let store = self.space(space)?;
         let mut r = store.get(&[id.to_string()])?.pop().ok_or_else(|| Fail(404, format!("no note {id} in {space}")))?;
-        r.tag = "superseded".into();
+        r.tag = crate::record::RETIRED.into();
         store.insert(&[r.clone()])?;
         Ok(record_json(&r))
     }
@@ -589,7 +590,7 @@ impl App {
             .0
             .into_iter()
             .map(|h| h.record)
-            .filter(|r| r.tag != "superseded" && r.tag != "done")
+            .filter(|r| !crate::record::closed_tag(&r.tag) && r.tag != "done")
             .map(|r| (r.id, r.kind, r.text))
             .collect();
         let prompt = distill::prompt_for(user, assistant, &[], &known, first.ts);
@@ -620,6 +621,9 @@ impl App {
         let store = self.space(space)?;
         if question.trim().is_empty() {
             return Err(bad("ask needs a question (q)"));
+        }
+        if !BUDGETS.contains(&budget) {
+            return Err(bad(format!("budget is 200 to 50000 tokens, not {budget}")));
         }
         let mut j = view::ask(&store, question, budget)?;
         j["space"] = json!(space);
@@ -663,7 +667,7 @@ impl App {
         j["id"] = json!(r.id);
         j["space"] = json!(space);
         j["ts"] = json!(r.ts);
-        j["live"] = json!(r.tag != "superseded");
+        j["live"] = json!(!crate::record::closed_tag(&r.tag));
         // The fixes it replaced, newest first.
         let mut earlier = Vec::new();
         let mut next: Vec<String> = r.linked("supersedes").map(String::from).collect();
@@ -832,7 +836,7 @@ impl App {
         let mut rules: Vec<(Record, f64)> = Vec::new();
         for space in spaces {
             let store = self.incidents_of(space)?;
-            rules.extend(store.vector_top(&qv, 20, &Filter { kinds: vec![Kind::Preference], ..Default::default() })?.into_iter().filter(|(r, c)| *c >= 0.3 && r.tag != "superseded"));
+            rules.extend(store.vector_top(&qv, 20, &Filter { kinds: vec![Kind::Preference], ..Default::default() })?.into_iter().filter(|(r, c)| *c >= 0.3 && !crate::record::closed_tag(&r.tag)));
         }
         rules.sort_by(|a, b| b.1.total_cmp(&a.1));
         let rules: Vec<Record> = rules.into_iter().map(|(r, _)| r).take(3).collect();
@@ -948,6 +952,28 @@ impl App {
             "local": self.local.is_some(),
         })
     }
+}
+
+/// The budgets a context may be asked with, in tokens: one outside is
+/// refused, not changed in silence.
+pub const BUDGETS: std::ops::RangeInclusive<usize> = 200..=50_000;
+
+/// The budget a request gives, as `?budget=` or a body's `budget`: 4,000
+/// when it gives none; a value that is not a whole number is refused.
+fn budget_of(raw: Option<String>) -> std::result::Result<usize, Fail> {
+    match raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        None => Ok(4000),
+        Some(s) => s.parse::<usize>().map_err(|_| bad(format!("budget is 200 to 50000 tokens, not {s:?}"))),
+    }
+}
+
+/// A body's `budget`, as [`budget_of`] reads it.
+fn body_budget(b: &Json) -> std::result::Result<usize, Fail> {
+    budget_of(match &b["budget"] {
+        Json::Null => None,
+        Json::String(s) => Some(s.clone()),
+        v => Some(v.to_string()),
+    })
 }
 
 /// A token budget as the context's parameters: the defaults hold about
@@ -1201,10 +1227,10 @@ fn route(app: &Arc<App>, req: &Request) -> Answer {
         ("GET", ["v1", "spaces", s, "graph"]) => app.space_view(s, &json!({"what": "graph"})),
         ("GET", ["v1", "spaces", s, "sessions"]) => app.space_view(s, &json!({"what": "sessions"})),
         ("GET", ["v1", "spaces", s, "records"]) => app.space_view(s, &view_args(req, "records")),
-        ("GET", ["v1", "spaces", s, "ask"]) => app.ask(s, req.param("q").unwrap_or(""), num("budget", 4000)),
+        ("GET", ["v1", "spaces", s, "ask"]) => app.ask(s, req.param("q").unwrap_or(""), budget_of(req.param("budget").map(String::from))?),
         ("POST", ["v1", "spaces", s, "ask"]) => {
             let b = body_json(req)?;
-            app.ask(s, b["question"].as_str().or(b["q"].as_str()).unwrap_or(""), b["budget"].as_u64().map_or(4000, |n| n as usize))
+            app.ask(s, b["question"].as_str().or(b["q"].as_str()).unwrap_or(""), body_budget(&b)?)
         }
         ("GET", ["v1", "incidents"]) => app.incidents(&incident_spaces(app, &caller, req.param("space"))?),
         ("POST", ["v1", "incidents"]) => {
@@ -1248,7 +1274,11 @@ fn route(app: &Arc<App>, req: &Request) -> Answer {
         ("GET", ["v1", "local", st, "notes", id]) => app.local_rpc(st, &json!({"op": "view", "what": "history", "id": id}), 60),
         ("POST", ["v1", "local", st, "ask"]) => {
             let b = body_json(req)?;
-            app.local_rpc(st, &json!({"op": "view", "what": "ask", "question": b["question"].as_str().or(b["q"].as_str()).unwrap_or(""), "budget": b["budget"].as_u64().unwrap_or(4000)}), 60)
+            let budget = body_budget(&b)?;
+            if !BUDGETS.contains(&budget) {
+                return Err(bad(format!("budget is 200 to 50000 tokens, not {budget}")));
+            }
+            app.local_rpc(st, &json!({"op": "view", "what": "ask", "question": b["question"].as_str().or(b["q"].as_str()).unwrap_or(""), "budget": budget}), 60)
         }
         ("GET", ["v1", "local", st, "capsules"]) => app.local_rpc(st, &json!({"op": "capsule", "what": "list"}), 30),
         ("POST", ["v1", "local", st, "capsules"]) => {

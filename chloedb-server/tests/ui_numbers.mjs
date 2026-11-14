@@ -230,6 +230,26 @@ data.state.kube = { managed: true, namespace: "chloedb", name: "e2e" };
 assert.equal(data.howToSet({ flag: "--environment", field: "spec.environment", value: "production", or: "staging" }), "set spec.environment: production (or staging) in the StrataCluster chloedb/e2e");
 data.state.kube = null;
 
+// CCB-17: a save of the definition there now makes no version, and the
+// dialog knows it; another body, or another description, does.
+const savedView = await import(new URL("views/saved.js", app));
+const v1 = { version: 3, signature: "jacket_search(q TEXT, k INT DEFAULT 10)", description: "Finds jackets.", body: "SELECT id, score() FROM products ORDER BY bm25(body, :q) DESC LIMIT :k" };
+const jacket = { name: "jacket_search", params: [{ name: "q", ty: "TEXT" }, { name: "k", ty: "INT", default: 10 }], body: "SELECT id, score()\nFROM products\nORDER BY bm25(body, :q) DESC\nLIMIT :k", description: " Finds jackets. " };
+assert.ok(savedView.sameDefinition(v1, jacket));
+assert.ok(!savedView.sameDefinition(v1, { ...jacket, body: jacket.body.replace("LIMIT", "WHERE price < 9 LIMIT") }));
+assert.ok(!savedView.sameDefinition(v1, { ...jacket, description: "Finds coats." }));
+assert.ok(!savedView.sameDefinition(undefined, jacket));
+// CCB-18: two versions, each kept on one line, compare a clause a line:
+// what both share is not marked.
+const oldDef = "CREATE FUNCTION f(q TEXT) RETURNS TABLE AS SELECT id, title, score() FROM products ORDER BY bm25(body, :q) DESC LIMIT 10";
+const newDef = "CREATE FUNCTION f(q TEXT) RETURNS TABLE AS SELECT id, title, score() FROM products WHERE price < 200 ORDER BY bm25(body, :q) DESC LIMIT 10";
+const lines = savedView.versionDiff(oldDef, newDef, sqlView.formatSql);
+assert.deepEqual(lines.filter(([k]) => k !== " ").map(([k, l]) => k + l), ["+WHERE price < 200"]);
+assert.ok(lines.length >= 5, JSON.stringify(lines));
+
+// CCB-24: the tiles are in the List's order, largest first.
+assert.deepEqual(tableView.tilesOrder([{ table: "products" }, { table: "events" }, { table: "notes" }, { table: "a" }], { products: 1200, events: 20000, notes: 3 }).map((t) => t.table), ["events", "products", "notes", "a"]);
+
 // CCW-10: the shell knows each view before its code loads: what views/index.js
 // says of a view (its title, icon, layout, the words the palette finds it by)
 // is what the view's module says, and each view's code loads.
@@ -240,6 +260,24 @@ for (const v of VIEWS) {
   for (const k of ["id", "title", "icon", "group", "parent", "nav", "hidden", "full", "range", "cluster", "keywords"]) assert.deepEqual(v[k], m[k], `views/index.js says ${v.id}.${k} = ${JSON.stringify(v[k])}, its module ${JSON.stringify(m[k])}`);
 }
 for (const [, list] of NAV) for (const e of list) assert.ok(VIEWS.some((v) => v.id === e.id || v.id === e.fallback), e.id);
+
+// APC-27: a request of an app's page that is lost on its way says nothing of
+// the server (it forwards the app's requests); the server's own does.
+{
+  const { api, connection } = await import(new URL("core.js", app));
+  globalThis.fetch = async () => ({ status: 200, ok: true, text: async () => "{}" });
+  await api("/v1/health");
+  assert.equal(connection().ok, true);
+  globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
+  await assert.rejects(api("/v1/apps/netops/api/status"), (e) => e.status === 0 && e.answered === false);
+  await assert.rejects(api("/v1/apps/apps/api/apps/a1/sql", { method: "POST", body: {} }));
+  assert.equal(connection().ok, true, "an app's lost request is the app page's to say");
+  await assert.rejects(api("/v1/health"));
+  assert.equal(connection().ok, false, "the server's own lost request says it is not answering");
+  globalThis.fetch = async () => ({ status: 200, ok: true, text: async () => "{}" });
+  await api("/v1/health");
+  assert.equal(connection().ok, true);
+}
 
 console.log("ok");
 process.exit(0);

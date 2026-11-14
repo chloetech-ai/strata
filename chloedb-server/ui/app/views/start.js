@@ -105,10 +105,10 @@ function render(page) {
 
   function modeCard() {
     const env = environment();
-    if (isSandbox()) return h("div", { class: "mode-card sandbox" }, icon("check"), h("div", {}, h("b", {}, "Sandbox"), h("div", { class: "small" }, "No environment is set and this page is opened on this machine: writes, imports and drops run without a second ask. Nothing here is treated as production.")));
+    if (isSandbox()) return h("div", { class: "mode-card sandbox" }, icon("check"), h("div", {}, h("b", {}, "Sandbox"), h("div", { class: "small" }, "No environment is set and this page is opened on this machine: writes, imports and drops are on without asking for a reason first, and a write in the SQL workbench still shows the rows it changes before it runs. Nothing here is treated as production.")));
     // LIV-10: the same advice as below, for a cluster run by hand or by the operator.
     if (env == null && isProduction()) return h("div", { class: "mode-card prod" }, icon("lock"), h("div", {}, h("b", {}, "Treated as production"), h("div", { class: "small" }, "No environment is set and this page is not on localhost, so writes in the workbench wait for a check. Name the environment to say what it is (", managed() ? [h("code", {}, "spec.environment"), ` in the StrataCluster ${specName()}`] : h("code", {}, "--environment NAME"), "): production keeps the checks; staging or dev drops them, for a cluster that holds nothing that matters.")));
-    return h("div", { class: "mode-card" + (isProduction() ? " prod" : "") }, icon(isProduction() ? "lock" : "info"), h("div", {}, h("b", {}, `Environment: ${env}`), h("div", { class: "small" }, isProduction() ? "Production: writes and drops ask first and are kept in the audit log." : "Not production: writes run without a second ask.")));
+    return h("div", { class: "mode-card" + (isProduction() ? " prod" : "") }, icon(isProduction() ? "lock" : "info"), h("div", {}, h("b", {}, `Environment: ${env}`), h("div", { class: "small" }, isProduction() ? "Production: writes and drops ask first and are kept in the audit log." : "Not production: writes are on without asking for a reason first, and a write in the SQL workbench still shows the rows it changes before it runs.")));
   }
 
   kubeInfo();

@@ -52,7 +52,7 @@ pub fn record_full(r: &Record) -> Json {
 }
 
 fn current(r: &Record) -> bool {
-    r.tag != "superseded" && r.tag != "done"
+    !crate::record::closed_tag(&r.tag) && r.tag != "done"
 }
 
 fn int(v: Option<&Value>) -> i64 {
@@ -321,7 +321,7 @@ pub fn graph_of(notes: &[GraphNote], names: &HashMap<String, String>, titles: &H
         }
     };
     for n in notes {
-        let current = n.tag != "superseded" && n.tag != "done" && !replaced.contains(n.id.as_str());
+        let current = !crate::record::closed_tag(&n.tag) && n.tag != "done" && !replaced.contains(n.id.as_str());
         add(&n.id, json!({"id": n.id, "type": "note", "kind": n.kind, "label": clip(&n.text, 140).0, "text": clip(&n.text, 600).0, "tag": n.tag, "current": current, "ts": n.ts, "session": n.session}), &mut nodes);
         for (label, to) in &n.links {
             match label.as_str() {

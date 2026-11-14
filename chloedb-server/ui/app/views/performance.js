@@ -58,6 +58,13 @@ function figures(ps) {
 let onTab = null;
 function onParams(r) { onTab?.(r.params.get("tab")); }
 const tabOf = (k) => (TABS.some(([t]) => t === k) ? k : null);
+/** This page's address with the tab shown, though it came from this browser's last visit and not the link (LIV-18). */
+function linkTo(tab) {
+  const [path, query = ""] = location.hash.split("?");
+  const q = new URLSearchParams(query);
+  q.set("tab", tab);
+  return location.href.split("#")[0] + path + "?" + q;
+}
 
 function render(page, r) {
   let rules = null, stmts = null, stmtsErr = null, prev = null, prevKey = "", load = undefined, routes = null, routesErr = null, showOwnRoutes = false;
@@ -126,7 +133,7 @@ function render(page, r) {
 
   page.append(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Performance"), scope),
-      h("div", { class: "tools" }, h("span", { class: "small dim al-wide-only" }, "Compare with"), baseSeg, h("button", { class: "btn sm", onclick: () => copy(location.href, "Link copied") }, icon("link"), "Copy link"))),
+      h("div", { class: "tools" }, h("span", { class: "small dim al-wide-only" }, "Compare with"), baseSeg, h("button", { class: "btn sm", onclick: () => copy(linkTo(tab), "Link copied") }, icon("link"), "Copy link"))),
     kpis, findBox,
     h("div", { class: "grid g2", style: { marginBottom: "14px" } }, latC, failC, qpsCard, hmCard),
     copiesBox, slowerBox, tabs, tabBody);

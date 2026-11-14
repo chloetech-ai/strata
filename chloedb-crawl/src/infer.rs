@@ -535,6 +535,11 @@ impl Stats {
         }
     }
 
+    /// The share of the pages read so far that have `path` (0 for none).
+    pub fn share(&self, path: &str) -> f64 {
+        self.fields.get(path).map_or(0.0, |s| s.pages as f64 / self.pages.max(1) as f64)
+    }
+
     /// The fields by how many pages have them, the most first.
     pub fn top(&self, n: usize) -> Vec<(String, f64, Option<Ty>, Option<Value>)> {
         let mut v: Vec<_> = self.fields.iter().map(|(k, s)| (k.clone(), s.pages as f64 / self.pages.max(1) as f64, s.ty(), s.example.clone())).collect();

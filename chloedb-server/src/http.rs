@@ -111,7 +111,8 @@
 //!
 //! With a token or a cluster token set, or an API key made, every route but
 //! `/`, `/livez`, `/readyz` and `/v1/health` needs `Authorization: Bearer
-//! <token or key>`, and a key the scope of its route ([`route_scope`]). Every route checks the `Host` header
+//! <token or key>`, and a key the scope of its route ([`route_scope`]); a
+//! coordinator answers `/v1/health` without one with `{status}` alone. Every route checks the `Host` header
 //! and, on a request that can change something, the `Origin` header
 //! ([`crate::auth`]).
 
@@ -1422,9 +1423,18 @@ fn after(b: &Json) -> Result<After, ApiError> {
     After::of(min, mins)
 }
 
-async fn health(State(app): State<App>) -> Response {
+async fn health(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let h = app.svc.health().await;
     let code = if matches!(h["status"].as_str(), Some("down" | "failing")) { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
+    // A coordinator's health names its copies' internal addresses, roles
+    // and counts (LIV-19): a request without a credential it takes reads
+    // whether it is up, and no more. The route still takes no credential.
+    if app.svc.coordinator().is_ok() {
+        let token = header_str(&headers, header::AUTHORIZATION).or_else(|| header_str(&headers, header::HeaderName::from_static(crate::hub::VIA_PROXY_AUTH)));
+        if app.svc.keys.resolve(app.token.as_ref(), app.cluster.as_ref(), token).is_none() {
+            return (code, AxJson(json!({"status": h["status"]}))).into_response();
+        }
+    }
     (code, AxJson(h)).into_response()
 }
 

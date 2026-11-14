@@ -17,6 +17,9 @@
 .act-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .act-btn { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--line-2, var(--line)); background: var(--card); color: var(--fg); border-radius: var(--radius-control, 9px); cursor: pointer; }
 .act-btn:hover { border-color: var(--accent); }
+.act-mine { min-height: 36px; padding: 0 12px; border: 1px solid var(--line-2, var(--line)); background: var(--card); color: var(--muted); border-radius: var(--radius-control, 9px); cursor: pointer; font: inherit; font-size: 13px; }
+.act-mine:hover { border-color: var(--accent); color: var(--fg); }
+.act-mine[aria-pressed="true"] { color: var(--fg); background: var(--accent-soft, var(--card)); }
 .act-seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--fill, var(--soft)); border: 1px solid var(--line); border-radius: calc(var(--radius-control, 9px) + 3px); max-width: 100%; overflow-x: auto; scrollbar-width: none; }
 .act-seg button { border: 0; background: transparent; color: var(--muted); padding: 5px 12px; min-height: 30px; border-radius: var(--radius-control, 9px); cursor: pointer; font: inherit; font-size: 13px; font-weight: 500; white-space: nowrap; }
 .act-seg button:hover { color: var(--fg); }

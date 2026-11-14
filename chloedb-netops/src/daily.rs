@@ -1152,6 +1152,21 @@ async fn note_done(State(svc): State<Shared>, Path(id): Path<String>) -> Answer 
 
 async fn shift(State(svc): State<Shared>) -> Answer {
     let q = Q::new(&svc);
+    let v = shift_of(&q).await?;
+    q.done(v)
+}
+
+/// The tab badges of My shift and Carriers (NET-20): what waits for a
+/// person now, and the carriers' notices on the worklist. The engine
+/// counts them each minute, and every read of the shift counts them again.
+pub(crate) async fn badges(e: &std::sync::Arc<crate::sim::Engine>) {
+    let q = Q { e: e.clone(), trace: crate::strata::Trace::new() };
+    if let Err(err) = shift_of(&q).await {
+        tracing::debug!("counting the shift's work: {}", err.1);
+    }
+}
+
+async fn shift_of(q: &Q) -> std::result::Result<Value, ApiError> {
     let e = q.e.clone();
     let m = q.last();
     // Shifts are the on-call table's: twelve hours, changing at 00:00 and
@@ -1168,7 +1183,7 @@ async fn shift(State(svc): State<Shared>) -> Answer {
     let done = q.rows("Changes carried out since", "SELECT id, title, status, executed, owner, outcome, devices FROM netops_changes\nWHERE executed >= :since AND executed <= :now\nORDER BY executed DESC LIMIT 20", p.clone()).await?;
     let next = q.rows("Changes in progress, or planned for the next twelve hours", "SELECT id, title, kind, risk, status, window_start, window_end, owner, devices, started, started_by FROM netops_changes\nWHERE status = 'in_progress' OR (status IN ('approved', 'scheduled') AND window_start <= :until AND window_end >= :now)\nORDER BY window_start LIMIT 20", json!({"until": iso(m + 43200), "now": iso(m)})).await?;
     let notices = q.rows("Carriers' notices that are not over", "SELECT * FROM netops_maintenance\nWHERE status != 'completed' AND window_end >= :now\nORDER BY window_start LIMIT 30", json!({"now": iso(m)})).await?;
-    let found = conflicts(&q, &notices).await?;
+    let found = conflicts(q, &notices).await?;
     let tickets = q.rows("Open tickets", "SELECT id, title, status, priority, assignee, queue, customer, device, opened FROM netops_tickets\nWHERE status != 'closed'\nORDER BY priority, opened LIMIT 30", json!({})).await?;
     let notes = q.rows("Notes left for the shift", "SELECT id, ts, author, body, done FROM netops_handovers\nWHERE kind = 'note' AND ts >= :since\nORDER BY ts DESC LIMIT 20", json!({"since": iso(m - 2 * 86400)})).await?;
     let hot = q.rows("The fullest links of the last twelve hours", "SELECT link, MAX(util) AS peak FROM netops_link_metrics\nWHERE ts >= :since AND up = 1\nGROUP BY link ORDER BY peak DESC LIMIT 3", p.clone()).await?;
@@ -1191,11 +1206,27 @@ async fn shift(State(svc): State<Shared>) -> Answer {
     for c in next.iter().filter(|c| c.s("status") == "in_progress") {
         add(1, c.s("started"), "change", format!("{} is in progress: verify it and close it", c.s("id")), format!("{}; started {} by {}", c.s("title"), hhmm(parse_iso(&c.s("started"))), c.s("started_by")), json!({"page": "changes", "id": c.s("id")}), Value::Null);
     }
+    // A pair of notices on the two planes of one span is one thing to do,
+    // listed once, under the first of the two.
+    let mut paired: HashSet<String> = HashSet::new();
     for n in &notices {
         let id = n.s("id");
         if let Some(cs) = found.get(&id) {
             let worst = cs.iter().find(|c| c["severity"] == "critical").or(cs.first()).cloned().unwrap_or(Value::Null);
-            add(if worst["severity"] == "critical" { 1 } else { 2 }, n.s("window_start"), "maintenance", format!("{} {} on {} collides with something", n.s("provider"), id, n.s("circuit")), worst["text"].as_str().unwrap_or("").to_string(), json!({"page": "carriers", "id": id}), Value::Null);
+            let with = worst["with"].as_str().unwrap_or("").to_string();
+            if worst["kind"] == "both_planes" && !paired.insert(id.clone()) {
+                continue;
+            }
+            let title = match worst["kind"].as_str().unwrap_or("") {
+                "both_planes" => {
+                    paired.insert(with.clone());
+                    format!("{} {id} and {with} take both planes of {} down at once", n.s("provider"), n.s("circuit"))
+                }
+                "change" => format!("{} {id} on {} falls in the window of change {with}", n.s("provider"), n.s("circuit")),
+                "capacity" => format!("{} {id} on {} leaves {with} carrying both planes", n.s("provider"), n.s("circuit")),
+                _ => format!("{} {id} on {} collides with {with}", n.s("provider"), n.s("circuit")),
+            };
+            add(if worst["severity"] == "critical" { 1 } else { 2 }, n.s("window_start"), "maintenance", title, worst["text"].as_str().unwrap_or("").to_string(), json!({"page": "carriers", "id": id}), Value::Null);
         } else if n.s("status") == "new" {
             add(2, n.s("window_start"), "maintenance", format!("New notice from {}: {} on {}", n.s("provider"), n.s("impact"), n.s("circuit")), format!("window {} to {} UTC; nobody has acknowledged it", n.s("window_start").replace('T', " ").trim_end_matches(":00Z"), hhmm(parse_iso(&n.s("window_end")))), json!({"page": "carriers", "id": id}), Value::Null);
         }
@@ -1219,6 +1250,7 @@ async fn shift(State(svc): State<Shared>) -> Answer {
     }
     work.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let work: Vec<Value> = work.into_iter().map(|x| x.2).collect();
+    e.st().badges = Some((work.iter().filter(|w| w["urgency"] == 1).count() as i64, work.iter().filter(|w| w["kind"] == "maintenance").count() as i64));
 
     // The briefing, in sentences.
     let recent: Vec<&Row> = incidents.iter().filter(|i| parse_iso(&i.s("started")) >= since).collect();
@@ -1247,7 +1279,7 @@ async fn shift(State(svc): State<Shared>) -> Answer {
     if let Some(h) = hot.first() {
         lines.push(format!("The fullest link was {} at {:.0}% of its capacity.", h.s("link"), h.f("peak") * 100.0));
     }
-    q.done(json!({"at": iso(m), "began": iso(began), "since": iso(since), "oncall": oncall, "before": before, "briefing": lines, "work": work,
+    Ok(json!({"at": iso(m), "began": iso(began), "since": iso(since), "oncall": oncall, "before": before, "briefing": lines, "work": work,
         "incidents": incidents, "pending": pending, "flaps": flapping, "done": done, "next": next, "notices": notices, "conflicts": found, "tickets": tickets,
         "notes": notes, "silences": active, "counts": {"firing": firing, "silenced": silenced, "loose": loose.len(), "open": open_now}}))
 }

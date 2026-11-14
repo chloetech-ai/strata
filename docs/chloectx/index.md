@@ -213,7 +213,7 @@ The weights come from a logistic fit on LongMemEval-S (`chloectx/scripts/fit_gat
 
 | search | over | what the context shows |
 |---|---|---|
-| rules | preferences, by vector, cosine at least 0.3 | at most four, first, in at most a fifth of the budget |
+| rules | preferences, by vector, cosine at least 0.3; with them the rules the notes search finds, and every rule of a store that has at most four | at most four, first, in at most a fifth of the budget |
 | notes | decisions, rules, facts, plans (hybrid) | current versions only, each with the note it replaced ("changed DATE; was: …"), dated and ordered by the message each came from (a merged note by its newest source) |
 | replies | the assistant's answers (hybrid) | the three exchanges these hits rank first: the start of the user's message (200 characters) and the part of the reply closest to the question (1,000) |
 | excerpts | prompts and answers (hybrid) | the 400 characters of each closest to the question |
